@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // nmc::coin::aux_merkle_root KAT (P1 — AuxPow merkle-proof walk).
 //
@@ -27,6 +28,8 @@
 #include <stdexcept>
 #include <vector>
 #include <filesystem>
+#include <atomic>
+#include <unistd.h>
 
 #include <core/hash.hpp>
 #include <core/pack.hpp>
@@ -1249,9 +1252,21 @@ using nmc::coin::IndexEntry;
 using nmc::coin::IndexEntryDiskV1;
 
 // A fresh, empty on-disk path for one test (prior contents wiped).
+//
+// gtest_add_tests(... AUTO) registers each TEST as its own ctest entry, so the
+// persist KATs run as separate processes under `ctest -j`. A fixed per-test dir
+// name lets a sibling worker (or a not-yet-reaped retry) still hold the LevelDB
+// LOCK file when this call's remove_all + reopen races it, surfacing as
+// "LevelDB open failed ... LOCK: Resource temporarily unavailable". Make every
+// path globally unique to THIS process and call so no two opens can ever share
+// a datadir, regardless of ctest scheduling.
 static std::string fresh_db_dir(const std::string& name)
 {
-    std::filesystem::path p = std::filesystem::path(testing::TempDir()) / name;
+    static std::atomic<uint64_t> seq{0};
+    const std::string unique = name + "_pid" +
+        std::to_string(static_cast<long long>(::getpid())) + "_n" +
+        std::to_string(seq.fetch_add(1));
+    std::filesystem::path p = std::filesystem::path(testing::TempDir()) / unique;
     std::error_code ec;
     std::filesystem::remove_all(p, ec);
     return p.string();

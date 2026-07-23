@@ -1,0 +1,68 @@
+name: Prune runner workspace
+description: >
+  Post-job disk hygiene for the VM905 self-hosted Linux runners. Removes the
+  per-repo checkout payload (<_work>/c2pool/**, keeping .git so the checkout
+  post-step still works) and the contents of <_work>/_temp. Deliberately never
+  touches _actions/, _tool/, _update/, _update.sh or ~/.cache -- _actions and
+  _tool are reuse caches whose removal re-downloads on every job, and runner -2
+  is mid-update with _update/ live in its _work.
+
+  No-ops on github-hosted runners, which are ephemeral already.
+
+runs:
+  using: composite
+  steps:
+    - name: Prune workspace
+      if: runner.environment == 'self-hosted' && runner.os == 'Linux'
+      shell: bash
+      run: |
+        set -uo pipefail
+        work_root="$(dirname "$RUNNER_WORKSPACE")"
+
+        echo "::group::disk before prune"
+        df -h "$work_root"
+        du -sh "$RUNNER_WORKSPACE" 2>/dev/null
+        echo "::endgroup::"
+
+        # Refuse on any layout that is not the expected <_work>/<repo>. This is
+        # the guard that keeps a bad env from turning `rm -rf` loose on $HOME.
+        case "$GITHUB_WORKSPACE" in "$RUNNER_WORKSPACE"/*) ;; *) bad=1 ;; esac
+        if [ "$(basename "$work_root")" != "_work" ] || [ ! -d "$RUNNER_WORKSPACE" ] || [ -n "${bad:-}" ]; then
+          echo "unexpected layout (work_root=$work_root workspace=$RUNNER_WORKSPACE) -- not pruning"
+          exit 0
+        fi
+
+        cd /
+
+        # Everything under the workspace except the checkout's .git. Keeping .git
+        # (~230 MiB) lets actions/checkout's post-step unset its auth header
+        # instead of erroring, and lets the next job fetch incrementally. The
+        # build trees, which are the actual ~5 GiB, all go.
+        find "$RUNNER_WORKSPACE" -mindepth 1 -maxdepth 1 ! -path "$GITHUB_WORKSPACE" -exec rm -rf -- {} +
+        find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf -- {} +
+
+        # _temp: empty it, keep the directory itself -- the runner holds it open
+        # for the remainder of the job. conan2/ is exempt: release.yml's linux
+        # packaging job and build.yml's linux-package job restore actions/cache
+        # at ${{ runner.temp }}/conan2 WITHOUT a github-hosted guard, and that
+        # action's post-step saves from the path after this step has run. On
+        # self-hosted CONAN_HOME lives in ~/.conan2-ci/$RUNNER_NAME anyway, so
+        # the exemption costs ~nothing (_temp measures ~100 KiB on VM905).
+        if [ -d "$work_root/_temp" ]; then
+          find "$work_root/_temp" -mindepth 1 -maxdepth 1 ! -name conan2 -exec rm -rf -- {} +
+        fi
+
+        echo "::group::preserved caches"
+        for keep in _actions _tool _update _update.sh; do
+          if [ -e "$work_root/$keep" ]; then
+            echo "PRESENT  $work_root/$keep"
+          else
+            echo "absent   $work_root/$keep"
+          fi
+        done
+        echo "::endgroup::"
+
+        echo "::group::disk after prune"
+        df -h "$work_root"
+        du -sh "$RUNNER_WORKSPACE" 2>/dev/null
+        echo "::endgroup::"

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DOGE HeaderChain — Phase 5.2
 // Copy of LTC header_chain.hpp with DOGE-specific difficulty (DigiShield v3)
 // and chain parameters. Reuses scrypt PoW, LevelDB persistence, and P2P sync.

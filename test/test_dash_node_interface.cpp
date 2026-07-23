@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase S8 — Dash coin-daemon node-interface seam KATs
 ///
 /// Exercises src/impl/dash/coin/node_interface.hpp — the dash::interfaces::Node

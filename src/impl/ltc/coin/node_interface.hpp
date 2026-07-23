@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 #include <map>
@@ -34,5 +35,3 @@ struct Node
 } // namespace interfaces
 
 } // namespace ltc::coin
-
-

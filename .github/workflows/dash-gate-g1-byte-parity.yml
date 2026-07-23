@@ -1,0 +1,111 @@
+name: DASH gate G1 — byte-parity KAT
+
+# ci-steward 2026-07-04. Required-gate for DASH G1: byte-for-byte Known-Answer
+# -Test parity of consensus-serialized structures against the reference
+# testnet3 X11 vectors (#596). CI plumbing only — carries NO consensus
+# knowledge. The dash lane owns the vectors, the test binary
+# (test/test_dash_x11_kat.cpp), and the gate entrypoint script.
+#
+# WIRED 2026-07-04 to the canonical dash-lane entrypoint from PR #620
+# (dash/ci-gate-entrypoints): TEST_ENTRYPOINT is tests/gates/g1_byte_parity_kat.sh.
+# The script self-locates, cold-build self-configures (conan + cmake, override
+# via BUILD_DIR), runs the real gtest suite by NAME (ctest -R '^DashX11Kat\.')
+# — not by executable name / bare -R regex — and hard-fails the empty-suite
+# trap by demanding a parsed positive test count. continue-on-error stays
+# removed now the entrypoint is real.
+#
+# Neutral-skip: on branches predating #620 the entrypoint is absent and the job
+# is a green no-op (forward/backward-compat). Registered as a required check
+# only after a confirmed non-hollow green rollup on the runner.
+
+on:
+  push:
+    branches: [master, dash-spv-embedded]
+  pull_request:
+    branches: [master, dash-spv-embedded]
+
+jobs:
+  g1-byte-parity-kat:
+    name: DASH gate G1 — byte-parity KAT
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set per-job Conan home
+        run: |
+          # github-hosted: ephemeral per-job home, warmed by actions/cache below.
+          # self-hosted:   PERSISTENT home keyed on the runner instance. A runner
+          # executes one job at a time, so this home is never contended (no
+          # sqlite "failed to acquire database lock in 20s") while still keeping
+          # the per-job isolation of #704/#710 -- no two concurrent jobs share it.
+          # Being persistent, it also takes the GH cache-service restore off the
+          # hot path: that restore times out on VM905 ("Failed to restore: The
+          # operation cannot be completed in timeout") and its miss cascaded into
+          # a cold from-source Boost rebuild on all 8 runners at once.
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+          else
+            echo "CONAN_HOME=$HOME/.conan2-ci/$RUNNER_NAME" >> "$GITHUB_ENV"
+          fi
+
+      - name: Check gate entrypoint presence
+        id: presence
+        run: |
+          if [ -f "tests/gates/g1_byte_parity_kat.sh" ]; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+            echo "::notice::G1 entrypoint present — running byte-parity KAT gate."
+          else
+            echo "exists=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::tests/gates/g1_byte_parity_kat.sh not on this branch — neutral skip (expected until #620 lands)."
+          fi
+
+      - name: Install system dependencies
+        if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            g++ cmake make libleveldb-dev libsecp256k1-dev
+
+      - uses: actions/setup-python@v6
+        if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'
+        with: { python-version: '3.12' }
+
+      - name: Install Conan 2
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
+
+      - name: Show committed Conan profile
+        if: steps.presence.outputs.exists == '1'
+        run: conan profile show -pr:a=ci/conan/linux-gcc13.profile
+
+      - name: Restore Conan cache (github-hosted only)
+        if: runner.environment == 'github-hosted' && steps.presence.outputs.exists == '1'
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/conan2
+          key: conan2-ubuntu24-gcc13-dash-g1-${{ hashFiles('conanfile.txt', 'ci/conan/linux-gcc13.profile', 'conan.lock') }}
+          restore-keys: |
+            conan2-ubuntu24-gcc13-dash-g1-
+            conan2-ubuntu24-gcc13-
+
+      - name: Clean stale build dir (self-hosted workspace is reused)
+        if: steps.presence.outputs.exists == '1' && runner.environment != 'github-hosted'
+        run: rm -rf build_g1
+
+      - name: Run G1 byte-parity KAT gate (dash-lane TEST_ENTRYPOINT)
+        if: steps.presence.outputs.exists == '1'
+        env:
+          BUILD_DIR: ${{ github.workspace }}/build_g1
+        run: bash tests/gates/g1_byte_parity_kat.sh
+
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace

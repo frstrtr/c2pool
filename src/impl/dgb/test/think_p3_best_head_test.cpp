@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // FENCED, additive KAT pinning the think() Phase-3 per-tail best-head
 // selection in think_p3_best_head.hpp vs the p2pool data.py think() oracle
 // (max(verified.tails[t], key=verified.get_work), first-max tiebreak).

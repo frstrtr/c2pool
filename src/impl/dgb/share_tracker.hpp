@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 #include <cstdint>
@@ -685,7 +686,7 @@ public:
         std::set<NetService> bad_peer_addresses;
 
         // Phase 1: Verify unverified heads, remove bad shares.
-        // Exact translation of p2pool data.py:2077-2108.
+        // C++ implementation of the p2pool think() unverified-head walk.
         // For each unverified head: walk backward, try to verify.
         // If verification fails: remove the share (it's bad).
         // If no verification possible and chain unrooted: request parents.
@@ -917,10 +918,9 @@ public:
 
             auto [last_height, last_last_hash] = chain.get_height_and_last(last_hash);
 
-            // p2pool data.py:2098-2103 EXACTLY:
-            //   want = max(self.net.CHAIN_LENGTH - head_height, 0)
-            //   can = max(last_height - 1 - self.net.CHAIN_LENGTH, 0) if last_last_hash is not None else last_height
-            //   get = min(want, can)
+            // Bounded backfill window: request as many shares as the chain is
+            // short of CHAIN_LENGTH (want), capped by how many the rooted peer
+            // can actually supply (can); to_get = min(want, can).
             auto CL = static_cast<int32_t>(PoolConfig::chain_length());
             auto want = std::max(CL - head_height, 0);
             auto can = last_last_hash.IsNull()
@@ -1266,9 +1266,8 @@ public:
             timestamp_cutoff = static_cast<uint32_t>(now_seconds()) - 24 * 60 * 60;
         }
 
-        // Filter desired by timestamp cutoff — p2pool data.py:2374 EXACTLY:
-        //   return best, [(peer_addr, hash) for peer_addr, hash, ts, targ in desired
-        //                  if ts >= timestamp_cutoff]
+        // Filter the desired list by timestamp cutoff: keep only entries whose
+        // timestamp is at or after the cutoff.
         // This prevents requesting shares from stale/pruned chain tails that
         // peers no longer have. Without this, we hammer peers with unanswerable
         // requests and they eventually drop us.
@@ -1528,19 +1527,23 @@ public:
                 auto excess = time_since_share - emergency_threshold;
                 auto halvings = excess / half_life;
                 auto remainder = excess % half_life;
-                // 2^halvings with linear interpolation for fractional part
-                uint256 eased = prev_max_target;
-                if (halvings < 256)
-                    eased <<= halvings;
-                else
-                    eased = MAX_TARGET;
-                // Linear interpolation: eased = eased * (half_life + remainder) / half_life
+                // Step 3 (emergency ease): 2^halvings with linear interpolation.
+                // Shift in the wider uint288 accumulator, saturating at
+                // MAX_TARGET as we go so no uint256- OR uint288-representable
+                // wrap can occur. The old uint256 `eased <<= halvings` wrapped
+                // mod 2^256, collapsing the eased target to a hard value and
+                // stalling the DAA stall-path (~50-68min death-spiral hole).
                 uint288 eased_288;
-                eased_288.SetHex(eased.GetHex());
-                eased_288 = eased_288 * static_cast<uint32_t>(half_life + remainder);
-                eased_288 = eased_288 / static_cast<uint32_t>(half_life);
+                eased_288.SetHex(prev_max_target.GetHex());
                 uint288 max_288;
                 max_288.SetHex(MAX_TARGET.GetHex());
+                for (uint64_t i = 0; i < static_cast<uint64_t>(halvings) && i < 288 && eased_288 <= max_288; ++i)
+                    eased_288 <<= 1;
+                if (eased_288 > max_288)
+                    eased_288 = max_288;
+                // Linear interpolation: eased = eased * (half_life + remainder) / half_life
+                eased_288 = eased_288 * static_cast<uint32_t>(half_life + remainder);
+                eased_288 = eased_288 / static_cast<uint32_t>(half_life);
                 if (eased_288 > max_288)
                     clamp_ref_target = MAX_TARGET;
                 else
@@ -2593,7 +2596,7 @@ public:
         if (total_weight.IsNull() || subsidy == 0)
             return result;
 
-        // Integer division matching p2pool exactly (using uint288 throughout
+        // Integer division matching p2pool's payout arithmetic (using uint288 throughout
         // to avoid uint64 truncation — total_weight routinely exceeds 2^64):
         // donation_amount = subsidy * donation_weight // total_weight
         uint288 subsidy288(subsidy);

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 #include <memory>
@@ -29,6 +30,7 @@ class Node : public btc::interfaces::Node
 
     std::unique_ptr<NodeRPC> m_rpc;
     std::unique_ptr<NodeP2P<config_t>> m_p2p;
+    bool m_request_mempool_on_connect{false};  // BIP 35 pull on (re)connect
 
     void init_p2p()
     {
@@ -79,9 +81,48 @@ public:
     void start_p2p(const NetService& addr)
     {
         m_p2p = std::make_unique<NodeP2P<config_t>>(m_context, this, m_config);
+        if (m_request_mempool_on_connect)
+            m_p2p->enable_mempool_request();
         m_p2p->connect(addr);
         LOG_INFO << "Coin P2P broadcaster connecting to " << addr.to_string();
     }
+
+    /// Opt into the BIP 35 `mempool` request on (re)connect. Without this the
+    /// embedded mempool only learns txs announced via `inv` AFTER we connect,
+    /// so any tx already resident in the peer mempool at connect time is never
+    /// pulled -> coinbase-only templates. Mirrors main_dgb. Idempotent; applies
+    /// to the current peer immediately and to any peer start_p2p creates later.
+    /// NOTE: the peer must advertise NODE_BLOOM (regtest: -peerbloomfilters=1)
+    /// or NodeP2P skips the request to avoid a disconnect.
+    void enable_mempool_request()
+    {
+        m_request_mempool_on_connect = true;
+        if (m_p2p)
+            m_p2p->enable_mempool_request();
+    }
+
+    /// Arm the submitblock RPC BACKUP leg (ARM B of the dual-path broadcaster)
+    /// WITHOUT the getwork side effect init_rpc() carries. connect() runs the
+    /// read-only liveness/softfork probe check() (getblockheader + getblockchaininfo
+    /// + getnetworkinfo, results discarded by c2pool's own template path) but
+    /// never getwork, so an external bitcoind we drive purely for submitblock
+    /// arms cleanly and the embedded/daemonless template path is unperturbed.
+    /// OPT-IN: main_btc calls
+    /// this only when bitcoin.conf creds resolve (rpcpassword stays off the
+    /// process table); otherwise m_rpc stays null, has_rpc()==false, and
+    /// submit_block_hex returns false LOUDLY -- byte-identical to the daemonless
+    /// default. Mirrors main_dgb's NodeRPC arming (the #82 reference). The
+    /// embedded P2P relay (ARM A) remains the always-primary daemonless path.
+    void arm_submit_rpc(const NetService& addr, const std::string& userpass)
+    {
+        m_rpc = std::make_unique<NodeRPC>(m_context, this, m_config->coin()->m_testnet);
+        m_rpc->connect(addr, userpass);
+        LOG_INFO << "[BTC] submitblock RPC backup ARMED: NodeRPC -> "
+                 << addr.to_string() << " (creds from bitcoin.conf)";
+    }
+
+    /// True once arm_submit_rpc has bound the submitblock backup leg.
+    bool has_rpc() const { return m_rpc != nullptr; }
 
     /// Submit a block via P2P directly (faster propagation than RPC).
     void submit_block_p2p(BlockType& block)
@@ -110,7 +151,11 @@ public:
     {
         if (!m_rpc)
             return false;
-        return m_rpc->submit_block_hex(HexStr(block_bytes), /*ignore_failure=*/true);
+        // MSVC: disambiguate HexStr overload (std::vector<unsigned char> is viable
+        // for all span overloads). Feed the exact byte span the uint8_t overload wants.
+        return m_rpc->submit_block_hex(
+            HexStr(Span<const uint8_t>(block_bytes.data(), block_bytes.size())),
+            /*ignore_failure=*/true);
     }
 
     /// Broadcast a WON block with FALLBACK semantics: P2P relay is primary,

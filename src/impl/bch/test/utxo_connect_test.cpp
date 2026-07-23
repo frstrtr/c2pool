@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // bch::coin UTXO-connect / Phase-4 revalidate test (M5 full-block body, (a)).
 //

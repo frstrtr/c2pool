@@ -1,0 +1,9 @@
+[Unit]
+Description=c2pool D-MINER.5 daily-summary emission (per-worker, from daily rollup)
+Documentation=https://github.com/frstrtr/c2pool/blob/master/docs/design/d-miner-5-notify-engine.md
+After=c2pool-miner-rollup.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/c2pool/miner.env
+ExecStart=/usr/bin/env python3 ${C2POOL_MINER_SCRIPTS}/miner_notify_engine.py daily --db ${C2POOL_MINER_DB} --smtp-host ${SMTP_HOST} --smtp-port ${SMTP_PORT} --sender ${NOTIFY_SENDER}

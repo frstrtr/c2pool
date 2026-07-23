@@ -1,11 +1,33 @@
 # c2pool — P2Pool rebirth in C++
 
 [![CI](https://github.com/frstrtr/c2pool/actions/workflows/build.yml/badge.svg)](https://github.com/frstrtr/c2pool/actions/workflows/build.yml)
+[![Claude for Open Source](https://img.shields.io/badge/Claude%20for%20Open%20Source-supported-D97757?logo=claude&logoColor=white)](https://claude.com/contact-sales/claude-for-oss)
 
-C++ reimplementation of [forrestv/p2pool](https://github.com/p2pool/p2pool) targeting the **V36 share format** with Litecoin + multi-chain merged mining (DOGE, PEP, BELLS, LKY, JKC, SHIC). DigiByte Scrypt support planned as an additional parent chain.
+C++ reimplementation of [forrestv/p2pool](https://github.com/p2pool/p2pool) targeting the **V36 share format**, with **per-coin binaries** for five parent chains and their merged-mining children: **Litecoin** (flagship — LTC + DOGE, PEP, BELLS, LKY, JKC, SHIC), **Bitcoin** (+ Namecoin), **DigiByte** (Scrypt), **Bitcoin Cash**, and **Dash**. See [Supported chains](#supported-chains) for the full matrix and status.
 
 Bitcoin wiki: <https://en.bitcoin.it/wiki/P2Pool>
+
 Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
+
+## Supported chains
+
+c2pool builds one binary per **parent chain** (`c2pool-<coin>`). Several parents also merge-mine **AuxPoW child chains** in the same coinbase.
+
+| Parent chain | Algorithm | Merged-mining children | Status |
+|---|---|---|---|
+| **Litecoin** (LTC) | Scrypt | DOGE, PEP, BELLS, LKY, JKC, SHIC — external daemons | **Production** (V36; live LTC+DOGE blocks) |
+| **Bitcoin** (BTC) | SHA256d | Namecoin (NMC) | Supported; NMC embedded merged mining in development |
+| **DigiByte** (DGB) | Scrypt¹ | DOGE (embedded, `-DAUX_DOGE`) | In development |
+| **Bitcoin Cash** (BCH) | SHA256d | — | In development |
+| **Dash** (DASH) | X11 | — | In development (embedded coin-state) |
+
+¹ DigiByte is a MultiAlgo chain; c2pool runs its **Scrypt** algorithm as a standalone parent — it is **not** an AuxPoW child of Litecoin.
+
+## Credits
+
+c2pool is an independent C++ implementation of the P2Pool sharechain concept originally created by Forrest Voight (forrestv, <https://github.com/forrestv/p2pool>).
+
+Development is supported by Anthropic's [Claude for Open Source](https://claude.com/contact-sales/claude-for-oss) program (2026). The design, the consensus rules, and responsibility for every byte shipped remain with the maintainers.
 
 > **First merged-mined DOGE block:** [#6135703](https://blockchair.com/dogecoin/block/f84500c25a4cce2a08887f29763726bd5ecec7b66fed65a88b181fb0b0ab2383) (2026-03-23) — decentralized LTC+DOGE merged mining via P2Pool V36, cross-validated with c2pool on shared share chain
 >
@@ -14,6 +36,14 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 > **First V36 Twin Block:** LTC [#3085349](https://blockchair.com/litecoin/block/3085349) + DOGE [#6154761](https://blockchair.com/dogecoin/block/6154761) (2026-04-05) — simultaneous LTC+DOGE block found by v36-signalling nodes running p2pool v36 producing V35 shares with `desired_version=36`; detected and displayed by c2pool's embedded block scanner
 >
 > **Sharechain Transparency Explorer** (2026-04-07) — defragmenter-style sharechain visualization with interactive PPLNS treemaps, animated hover effects, per-miner LTC+DOGE payout breakdown, V36 upgrade pressure for V35 miners
+> 
+> **Recent Bitcoin Block Mined by P2pool** (2026-06-27 05:34:44 UTC) BTC [#955609](https://blockchair.com/bitcoin/block/955609)
+> 
+> **Recent Bitcoin Block Mined by P2pool** (2025-03-07 06:08:22 UTC) BTC [#886688](https://blockchair.com/bitcoin/block/886688)
+>
+> **First DASH block, c2pool** (2026-07-20 01:15:15 UTC) DASH [#2507753](https://blockchair.com/dash/block/2507753) — a solo X11 block. The DIP4 coinbase pays the masternode the network requires at that height, and dashd accepted it. The payee is checked against the template before the block is broadcast; work built on a stale template is discarded, not mined.
+>
+> **DASH block at a full-payment height** (2026-07-20 23:25:32 UTC) DASH [#2508254](https://blockchair.com/dash/block/2508254) — six transactions, three consensus-mandated payments in the coinbase. The full payee set was assembled and verified against the template before submission, and dashd accepted the block. The demanding case takes the same path as the trivial one.
 
 ---
 
@@ -23,20 +53,19 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 |----|---------|----------|-------|------|--------|
 | Ubuntu | 24.04.4 LTS | GCC 13.3 | 1.90 (Conan) | x86_64 | Working |
 | macOS | 26.3.1 (Tahoe) | Apple Clang 21.0 | 1.90 (Homebrew) | x86_64 Intel | Working |
-| macOS | — | Apple Clang | 1.90 (Homebrew) | arm64 (M-series) | Supported, untested |
+| macOS | 26.3.1 (Tahoe) | Apple Clang 21.0 | 1.90 (Homebrew) | arm64 (M-series) | Working |
 | Windows | 11 (26100) | MSVC 2022 | 1.90 (Conan) | x86_64 | Working |
 
 ---
 
 ## Download
 
-Pre-built binaries are available on the [Releases page](https://github.com/frstrtr/c2pool/releases).
+Pre-built binaries are available on the [Releases page](https://github.com/frstrtr/c2pool/releases). The current release line is **v0.2.x** (V36). Packages are built **per parent chain** and named `c2pool-<coin>-<version>-<platform>` (`ltc`, `btc`, `dgb`, `dash`, `bch`).
 
 | Platform | Package | Notes |
 |----------|---------|-------|
 | Linux x86_64 | `.tar.gz` | Extract and run `./start.sh` |
-| macOS Intel | `.zip` | Bundled dylibs, no Homebrew needed |
-| macOS Apple Silicon | `.zip` | Native arm64 binary |
+| macOS (universal) | `.dmg` or `.zip` | Single universal arm64 + x86_64 build (lipo-merged); bundled dylibs, no Homebrew needed |
 | Windows x86_64 | `.zip` or `setup.exe` | Installer bundles VC++ Runtime + firewall rules |
 
 ### Verify downloads
@@ -56,7 +85,7 @@ Get-FileHash c2pool-*-setup.exe -Algorithm SHA256
 
 All release binaries are built from the tagged git commit. To verify a binary matches the source:
 
-1. Check the git tag: `git log v0.1.1-alpha --oneline -1`
+1. Check the git tag: `git log v0.2.0 --oneline -1`
 2. Build from that tag following the platform-specific guide
 3. Compare the SHA256 of your binary with the release `SHA256SUMS`
 
@@ -96,7 +125,7 @@ cmake --build . --target c2pool -j$(sysctl -n hw.ncpu)
 
 **Windows (setup.exe or build from source)**
 
-Download `c2pool-VERSION-windows-x86_64-setup.exe` from [Releases](https://github.com/frstrtr/c2pool/releases) and run the installer. Or build from source — see [doc/build-windows.md](doc/build-windows.md).
+Download `c2pool-ltc-VERSION-windows-x86_64-setup.exe` from [Releases](https://github.com/frstrtr/c2pool/releases) and run the installer. Or build from source — see [doc/build-windows.md](doc/build-windows.md).
 
 That's it. No litecoind, no dogecoind, no config file. The node starts in
 **integrated P2P pool mode** with embedded LTC and DOGE SPV nodes, connects
@@ -107,6 +136,8 @@ Miners connect to stratum and set their LTC payout address as the username
 (p2pool convention). No `--address` flag needed.
 
 Full step-by-step guides: [Linux](doc/build-unix.md) | [macOS](doc/build-macos.md) | [Windows](doc/build-windows.md)
+
+Common operator questions (merged coins, payouts, dashboard): [docs/FAQ.md](docs/FAQ.md)
 
 ---
 
@@ -199,8 +230,8 @@ Running `c2pool` with no arguments is equivalent to:
 
 ```
 --integrated --embedded-ltc --embedded-doge --wait-for-peers
---header-checkpoint 3079000:862daf...
---doge-header-checkpoint 6140000:743b7e...
+--header-checkpoint 3088000:4a7fc8d4...
+--doge-header-checkpoint 6160000:51efd04d...
 ```
 
 | Setting | Default | Override |
@@ -208,8 +239,8 @@ Running `c2pool` with no arguments is equivalent to:
 | Operating mode | Integrated P2P pool | `--solo`, `--custodial`, `--sharechain`, `--standalone` |
 | LTC backend | Embedded SPV (DNS seeds) | `--no-embedded-ltc` (requires RPC daemon) |
 | DOGE backend | Embedded SPV | `--no-embedded-doge` (disables merged mining) |
-| LTC bootstrap | Block 3,079,000 | `--header-checkpoint HEIGHT:HASH` |
-| DOGE bootstrap | Block 6,140,000 | `--doge-header-checkpoint HEIGHT:HASH` |
+| LTC bootstrap | Block 3,088,000 | `--header-checkpoint HEIGHT:HASH` |
+| DOGE bootstrap | Block 6,160,000 | `--doge-header-checkpoint HEIGHT:HASH` |
 | Startup mode | Wait for peers (persist=true) | `--genesis` or `--startup-mode auto` |
 | Coin daemon | Not required | `--coind-address` / `--coind-rpc-port` |
 | `--address` | Optional (miners use stratum username) | Required only for `--custodial` |
@@ -217,6 +248,13 @@ Running `c2pool` with no arguments is equivalent to:
 | Stratum port | 9327 | `-w PORT` |
 | P2P port | 9326 | `--p2pool-port PORT` |
 | Web port | 8080 | `--web-port PORT` |
+| Data directory | `~/.c2pool` (`%APPDATA%\c2pool` on Windows) | `--data-dir PATH` |
+
+> **Running two instances on one host?** Give each its own `--data-dir`.
+> All per-instance on-disk state — the sharechain LevelDB, address store,
+> whitelist, logs, ratchet, and found-blocks db — is rooted there, so
+> co-located instances never contend the same LevelDB `LOCK`. Leaving it
+> unset keeps the historical `~/.c2pool` path, byte-for-byte unchanged.
 
 ### Testnet overrides
 
@@ -307,7 +345,7 @@ complete examples with all options documented.
 | `--no-embedded-ltc` | | | Disable embedded LTC, use RPC daemon |
 | `--embedded-doge` | `embedded_doge` | **true** | Embedded DOGE SPV for merged mining |
 | `--no-embedded-doge` | | | Disable embedded DOGE |
-| `--net` | -- | litecoin | Blockchain: `litecoin`, `bitcoin`, `dogecoin` |
+| `--net` | -- | litecoin | Blockchain: `litecoin`, `digibyte`, `bitcoin`, `dogecoin` |
 | `--testnet` | `testnet` | false | Enable testnet mode |
 | `--config FILE` | -- | -- | YAML config file path |
 | `--address` | `solo_address` | -- | Node operator payout address (optional) |
@@ -330,16 +368,16 @@ complete examples with all options documented.
 | `--rpcuser` | `ltc_rpc_user` | -- | RPC username |
 | `--rpcpassword` | `ltc_rpc_password` | -- | RPC password |
 | `--max-conns` | -- | 8 | Target outbound P2P peers |
-| `--stratum-min-diff` | `min_difficulty` | 0.001 | Vardiff floor |
+| `--stratum-min-diff` | `min_difficulty` | 0.0005 | Vardiff floor |
 | `--stratum-max-diff` | `max_difficulty` | 65536 | Vardiff ceiling |
-| `--stratum-target-time` | `target_time` | 10 | Seconds between pseudoshares |
+| `--stratum-target-time` | `target_time` | 3.0 | Seconds between pseudoshares |
 | `--no-vardiff` | `vardiff_enabled` | true | Disable auto-difficulty |
 | `--max-coinbase-outputs` | `max_coinbase_outputs` | 4000 | Max coinbase outputs |
 | `--network-id` | `network_id` | 0 | Private chain identifier (hex) |
-| `--log-level` | `log_level` | INFO | trace/debug/info/warning/error |
+| `--log-level` | `log_level` | trace | trace/debug/info/warning/error |
 | `--log-file` | `log_file` | debug.log | Log filename |
 | `--log-rotation-mb` | `log_rotation_size_mb` | 100 | Log rotation threshold (MB) |
-| `--log-max-mb` | `log_max_total_mb` | 50 | Max rotated log space (MB) |
+| `--log-max-mb` | `log_max_total_mb` | 1000 | Total size cap across all rotated log files (MB) |
 | `--p2p-max-peers` | `p2p_max_peers` | 30 | Max total P2P peers |
 | `--ban-duration` | `ban_duration` | 300 | P2P ban duration (seconds) |
 | `--rss-limit-mb` | `rss_limit_mb` | 4000 | RSS memory abort limit (MB) |
@@ -357,7 +395,7 @@ complete examples with all options documented.
 | -- | `explorer_depth_doge` | 1440 | DOGE blocks to keep in explorer store |
 | `--coinbase-text` | `coinbase_text` | /c2pool/ | Custom coinbase scriptSig text |
 | `--message-blob-hex` | -- | -- | V36 authority message blob |
-| `--doge-testnet4alpha` | -- | false | Use DOGE testnet4alpha |
+| `--doge-testnet4alpha` | `doge_testnet4alpha` | false | Use DOGE testnet4alpha |
 
 ---
 
@@ -371,7 +409,7 @@ complete examples with all options documented.
 | `/recent_blocks` | Recently found blocks |
 | `/connected_miners` | Connected stratum workers |
 | `/stratum_stats` | Per-worker stratum statistics (hashrate, difficulty, accepted/rejected) |
-| `/sharechain_stats` | Share chain state |
+| `/sharechain/stats` | Share chain state |
 | `/miner_thresholds` | Minimum viable hashrate, dust range |
 | `/merged_stats` | Merged mining block statistics |
 | `/current_merged_payouts` | Current merged mining payouts |
@@ -382,7 +420,8 @@ complete examples with all options documented.
 | `/api/explorer/getblock` | Full block JSON by hash or height (loopback-only) |
 
 See [docs/DASHBOARD_INTEGRATION.md](docs/DASHBOARD_INTEGRATION.md) for the
-complete API reference.
+complete REST API reference and dashboard/explorer integration guide (and
+[docs/FAQ.md](docs/FAQ.md) for common questions).
 
 **Web dashboard** — served from `web-static/` by default:
 
@@ -474,7 +513,7 @@ See [above](#configuration-reference) for details.
 
 | Target | Description |
 |--------|-------------|
-| `c2pool` | Primary binary |
+| `c2pool-ltc` | Primary binary — release packages ship this per-coin name (`c2pool` is the dev-build alias) |
 | `test_hardening` | Softfork gate + reply-matcher regression tests |
 | `test_share_messages` | V36 authority message decrypt/verify tests |
 | `test_coin_broadcaster` | Coin peer-manager and broadcaster tests |
@@ -489,8 +528,8 @@ cd build && ctest --output-on-failure -j$(nproc)
 
 | Area | Status |
 |---|---|
-| V36 share format (LTC parent chain) | Active development |
-| V36 share format (DGB Scrypt parent chain) | Planned |
+| V36 share format (LTC parent chain) | Released (v0.2.0); prod cutover gated on crossing soak |
+| V36 share format (DGB Scrypt parent chain) | In development |
 | Merged mining (DOGE, PEP, BELLS, LKY, JKC, SHIC) | Working |
 | Embedded LTC SPV node | Working |
 | Embedded DOGE SPV node | Working |
@@ -500,7 +539,7 @@ cd build && ctest --output-on-failure -j$(nproc)
 | Payout / PPLNS | Working |
 | Authority message blobs (V36) | Working |
 | Solo / Custodial modes | Working |
-| Test suite | 501 tests passing |
+| Test suite | 1,875 test cases across 194 suites |
 
 > **Need a pool running today?**
 > [frstrtr/p2pool-merged-v36](https://github.com/frstrtr/p2pool-merged-v36) — production Python V36 pool (LTC + DGB + DOGE, Docker, dashboard).
@@ -513,6 +552,21 @@ cd build && ctest --output-on-failure -j$(nproc)
 - Discord: <https://discord.gg/yb6ujsPRsv>
 
 ---
+
+## V37 development
+
+- **V37 Purple Paper** (Work Receipts design): https://frstrtr.github.io/c2pool/purple-paper.html
+- Dev chat (Telegram): https://t.me/c2pooldev
+- V37 dev-branch primitives (diff): https://github.com/frstrtr/c2pool/compare/master...v37-dev
+
+---
+
+## License
+
+- **c2pool daemon** (this repository): [AGPL-3.0-or-later](LICENSE). Network use triggers the AGPL source-provision obligation.
+- **c2pool-core-engine** (extracted primitive layer): Apache-2.0, in the separate [c2pool-core-engine](https://github.com/frstrtr/c2pool-core-engine) repository.
+- **Bundled `src/btclibs/` and third-party crypto**: retain their original MIT licenses (notices preserved in-file).
+- **V37 Purple Paper** (frstrtr.github.io/c2pool): MIT License (as with the Bitcoin whitepaper). The remaining site articles are © technocore.one, all rights reserved.
 
 ### Install guides
 - [Ubuntu / Debian / Linux](doc/build-unix.md)

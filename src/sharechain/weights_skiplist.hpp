@@ -1,11 +1,13 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // weights_skiplist.hpp — O(log n) PPLNS weight computation via skip list
 //
-// Faithful port of:
-//   p2pool/util/skiplist.py  — SkipList base class (__call__ loop)
-//   p2pool/data.py           — WeightsSkipList subclass
+// C++ implementation of the p2pool skip-list PPLNS-weight design.
+// Algorithm originally by forrestv (github.com/forrestv/p2pool); the
+// SkipList base (__call__ loop) and WeightsSkipList subclass are the
+// reference for this independent implementation, not copied source.
 //
 // Skip levels are built LAZILY during query walks via the "updates"
-// mechanism (skiplist.py lines 24-34, 54-56).  Level 0 is created
+// mechanism.  Level 0 is created
 // on first visit; higher levels are filled in as future walks pass
 // through predecessor nodes.
 //
@@ -77,7 +79,7 @@ struct CumulativeWeightsResult
 // ============================================================================
 // WeightsSkipList — O(log n) PPLNS weight accumulator
 //
-// Faithful port of p2pool SkipList.__call__ + WeightsSkipList.
+// C++ implementation of the p2pool SkipList.__call__ + WeightsSkipList design.
 //
 // Storage: m_skips[hash] = (skip_length, levels_deque)
 //   skip_length: geometric random height (max levels this node can have)
@@ -108,8 +110,8 @@ public:
     void clear()                     { m_skips.clear(); }
 
     // ------------------------------------------------------------------
-    // query — faithful port of SkipList.__call__ (skiplist.py:13-56)
-    // + WeightsSkipList.apply_delta/judge/finalize (data.py:1912-1935)
+    // query — C++ implementation of the p2pool SkipList.__call__ query
+    // plus WeightsSkipList apply_delta/judge/finalize.
     //
     // Walks tail-ward from `start`, accumulating PPLNS weights until
     // either max_shares shares are traversed or desired_weight is

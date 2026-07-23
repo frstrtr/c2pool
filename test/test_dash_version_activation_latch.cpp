@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase v36-migration-std — DASH Component A persisted activation LATCH KATs.
 ///
 /// Exercises src/impl/dash/version_activation_latch.hpp — the persisted
@@ -113,5 +114,5 @@ TEST(DashVersionActivationLatch, JsonRoundTrips)
 TEST(DashVersionActivationLatch, DefaultSpanIsTwoChainLen)
 {
     ActivationLatch l;
-    EXPECT_EQ(l.confirm_span, 2ull * dash::PoolConfig::CHAIN_LENGTH);
+    EXPECT_EQ(l.confirm_span, 2ull * dash::SharechainConfig::CHAIN_LENGTH);
 }

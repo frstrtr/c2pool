@@ -17,16 +17,42 @@ on:
   pull_request:
     branches: [master, btc-embedded, dash-spv-embedded, dgb/slice4-skeleton, dgb/pool-pillars-port]
 
+# Concurrency: a newer run on the same ref cancels the stale in-progress
+# one, cutting concurrent load on the shared self-hosted pool (the OOM/
+# oversubscription root cause, not just queue depth). Per-ref group so
+# distinct PRs/branches never cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+
 jobs:
   coin:
     name: ${{ matrix.coin }} smoke (Linux x86_64)
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     strategy:
       fail-fast: false
       matrix:
         coin: [ltc, doge, dash, btc, dgb, bch]
     steps:
       - uses: actions/checkout@v6
+
+      - name: Set per-job Conan home
+        run: |
+          # github-hosted: ephemeral per-job home, warmed by actions/cache below.
+          # self-hosted:   PERSISTENT home keyed on the runner instance. A runner
+          # executes one job at a time, so this home is never contended (no
+          # sqlite "failed to acquire database lock in 20s") while still keeping
+          # the per-job isolation of #704/#710 -- no two concurrent jobs share it.
+          # Being persistent, it also takes the GH cache-service restore off the
+          # hot path: that restore times out on VM905 ("Failed to restore: The
+          # operation cannot be completed in timeout") and its miss cascaded into
+          # a cold from-source Boost rebuild on all 8 runners at once.
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+          else
+            echo "CONAN_HOME=$HOME/.conan2-ci/$RUNNER_NAME" >> "$GITHUB_ENV"
+          fi
 
       - name: Check source presence
         id: presence
@@ -40,7 +66,7 @@ jobs:
           fi
 
       - name: Install system dependencies
-        if: steps.presence.outputs.exists == '1'
+        if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
@@ -52,31 +78,60 @@ jobs:
 
       - name: Install Conan 2
         if: steps.presence.outputs.exists == '1'
-        run: pip install "conan>=2.0,<3.0"
-
-      - name: Detect Conan profile
-        if: steps.presence.outputs.exists == '1'
         run: |
-          conan profile detect --force
-          sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' "$(conan profile path default)"
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
 
-      - name: Restore Conan cache
+      - name: Show committed Conan profile
         if: steps.presence.outputs.exists == '1'
+        run: conan profile show -pr:a=ci/conan/linux-gcc13.profile
+
+      - name: Restore Conan cache (github-hosted only)
+        if: runner.environment == 'github-hosted' && steps.presence.outputs.exists == '1'
         uses: actions/cache@v5
         with:
-          path: ~/.conan2
-          key: conan2-ubuntu24-gcc13-${{ matrix.coin }}-${{ hashFiles('conanfile.txt') }}
+          path: ${{ runner.temp }}/conan2
+          key: conan2-ubuntu24-gcc13-${{ matrix.coin }}-${{ hashFiles('conanfile.txt', 'ci/conan/linux-gcc13.profile', 'conan.lock') }}
           restore-keys: |
             conan2-ubuntu24-gcc13-${{ matrix.coin }}-
             conan2-ubuntu24-gcc13-
 
+      - name: Clean stale build dir (self-hosted workspace is reused)
+        if: steps.presence.outputs.exists == '1' && runner.environment != 'github-hosted'
+        run: rm -rf build_${{ matrix.coin }}
+
+      - name: Clear orphaned Conan download tempfiles (self-hosted cache is reused)
+        if: steps.presence.outputs.exists == '1' && runner.environment != 'github-hosted'
+        # An interrupted or racing conan download can leave a partial conan_package.tgz
+        # in $CONAN_HOME that makes the next `conan install` abort with
+        # "the file to download already exists". Delete these staging archives so a
+        # missing binary package can be re-fetched cleanly; extracted packages are untouched.
+        run: |
+          find "$CONAN_HOME/p" -type f \( -name 'conan_package.tgz' -o -name 'conan_sources.tgz' \) -delete 2>/dev/null || true
+
       - name: Conan install
         if: steps.presence.outputs.exists == '1'
         run: |
-          conan install . \
-            --build=missing \
-            --output-folder=build_${{ matrix.coin }} \
-            --settings=build_type=Release
+          # Bounded retry: remote package downloads are the only network step
+          # left here; a transient CDN/remote hiccup must not red a good PR.
+          for attempt in 1 2 3; do
+            if \
+            conan install . \
+              -pr:a=ci/conan/linux-gcc13.profile \
+              --lockfile=conan.lock \
+              --build=missing \
+              --output-folder=build_${{ matrix.coin }} \
+              --settings=build_type=Release
+            then exit 0; fi
+            echo "conan install failed (attempt $attempt/3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          echo "conan install failed after 3 attempts" >&2
+          exit 1
 
       - name: Configure
         if: steps.presence.outputs.exists == '1'
@@ -106,3 +161,9 @@ jobs:
             build_${{ matrix.coin }}/CMakeFiles/CMakeError.log
           retention-days: 7
           if-no-files-found: ignore
+
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace

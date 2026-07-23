@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // dgb::coin::add_witness_commitment / assemble_won_block witness-commitment KAT
 // (#82 broadcaster-gate, POPULATED-block witness slice, 2026-06-25).

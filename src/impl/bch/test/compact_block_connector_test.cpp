@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // bch::coin BlockConnector compact-block test (M5 full-block body, slice (b):
 // BIP152 compact-block depth on the connector seam).

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // ---------------------------------------------------------------------------
@@ -54,6 +55,25 @@ inline std::string trim(const std::string& s)
     const auto e = s.find_last_not_of(ws);
     return s.substr(b, e - b + 1);
 }
+
+// Parse a TCP port from a conf value WITHOUT ever throwing. A raw std::stoi on
+// junk (e.g. rpcport=abc) throws std::invalid_argument / std::out_of_range which,
+// uncaught, ABORTS the node at startup -- and the default conf is read with no
+// flags, so a malformed digibyte.conf would crash operators who never opted in
+// (#744/#787 B2, first found in the BTC twin). On any non-numeric / out-of-range
+// / zero value, leave `out` untouched and return false so the caller degrades to
+// UNARMED, never crashes.
+inline bool parse_port(const std::string& val, uint16_t& out)
+{
+    if (val.empty()) return false;
+    for (char c : val) if (c < '0' || c > '9') return false;   // digits only
+    unsigned long n = 0;
+    try { n = std::stoul(val); }
+    catch (...) { return false; }
+    if (n == 0 || n > 65535) return false;
+    out = static_cast<uint16_t>(n);
+    return true;
+}
 } // namespace conf_detail
 
 // Parse rpcuser/rpcpassword/rpcport/rpcconnect from a digibyte.conf-style file
@@ -75,7 +95,7 @@ inline bool load_rpc_conf(const std::string& path, RpcConf& out)
         if (val.empty()) continue;
         if      (key == "rpcuser"     || key == "dgb_rpc_user")     out.user = val;
         else if (key == "rpcpassword" || key == "dgb_rpc_password") out.pass = val;
-        else if (key == "rpcport")    out.port = static_cast<uint16_t>(std::stoi(val));
+        else if (key == "rpcport")    conf_detail::parse_port(val, out.port);  // junk => leave 0 (caller fills default), never throw
         else if (key == "rpcconnect") out.host = val;
     }
     return !out.user.empty() && !out.pass.empty();
@@ -91,7 +111,9 @@ inline void apply_endpoint_override(const std::string& hostport, RpcConf& out)
     if (colon == std::string::npos) { out.host = hostport; return; }
     out.host = hostport.substr(0, colon);
     const std::string p = hostport.substr(colon + 1);
-    if (!p.empty()) out.port = static_cast<uint16_t>(std::stoi(p));
+    // Junk port (e.g. --coin-rpc host:notaport) is IGNORED, never a throw/abort:
+    // parse_port leaves out.port unchanged so the conf/default value stands.
+    conf_detail::parse_port(p, out.port);
 }
 
 } // namespace coin

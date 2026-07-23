@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 /// BCH Mempool — Phase 2 + UTXO fee computation
@@ -169,6 +170,42 @@ public:
                      << " fee=" << (stored.fee_known ? std::to_string(stored.fee) : "?")
                      << (evicted > 0 ? " evict=" + std::to_string(evicted) : "");
         }
+        return true;
+    }
+
+    /// Add a transaction with a KNOWN fee supplied by an authoritative source
+    /// (BCHN GBT transactions[].fee). Used by the embedded-daemon RPC mempool
+    /// sync: BCHN already validated the tx and computed its exact fee, so we set
+    /// fee_known=true and index it for template selection. Without this the tx
+    /// lands with fee_known=false and get_sorted_txs_with_fees() excludes it
+    /// (empty template -> coinbase-only won blocks, nTx=1). Fee accuracy matches
+    /// p2pool, which sources fees from the same daemon GBT.
+    bool add_tx_with_known_fee(const MutableTransaction& tx, uint64_t fee) {
+        uint256 txid = compute_txid(tx);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_pool.count(txid))
+            return false;
+        MempoolEntry entry;
+        entry.tx         = tx;
+        entry.txid       = txid;
+        entry.byte_size  = compute_tx_byte_size(tx);
+        entry.time_added = std::time(nullptr);
+        entry.fee        = fee;
+        entry.fee_known  = true;
+        int evicted = 0;
+        while (m_total_bytes + entry.byte_size > m_max_bytes && !m_time_index.empty()) {
+            auto oldest = m_time_index.begin();
+            evict_one_locked(oldest->second);
+            ++evicted;
+        }
+        m_pool[txid] = std::move(entry);
+        auto& stored = m_pool[txid];
+        m_time_index.emplace(stored.time_added, txid);
+        m_total_bytes += stored.byte_size;
+        for (const auto& vin : stored.tx.vin) {
+            m_spent_outputs[std::make_pair(vin.prevout.hash, vin.prevout.index)] = txid;
+        }
+        m_feerate_index.emplace(stored.feerate(), txid);
         return true;
     }
 

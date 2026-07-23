@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // Portable 128-bit multiply-shift: (a * b) >> shift
@@ -547,7 +548,9 @@ public:
                 if constexpr (requires { s->m_pubkey_hash; })
                     miner = s->m_pubkey_hash.GetHex();
                 else if constexpr (requires { s->m_address; })
-                    miner = HexStr(s->m_address.m_data);
+                    // MSVC: disambiguate HexStr overload (std::vector<unsigned char> is viable
+                    // for all span overloads). Feed the exact byte span the uint8_t overload wants.
+                    miner = HexStr(Span<const uint8_t>(s->m_address.m_data.data(), s->m_address.m_data.size()));
                 m_on_share_difficulty(diff, miner);
             });
         }
@@ -678,7 +681,7 @@ public:
         std::set<NetService> bad_peer_addresses;
 
         // Phase 1: Verify unverified heads, remove bad shares.
-        // Exact translation of p2pool data.py:2077-2108.
+        // C++ implementation of the p2pool think() unverified-head walk.
         // For each unverified head: walk backward, try to verify.
         // If verification fails: remove the share (it's bad).
         // If no verification possible and chain unrooted: request parents.
@@ -925,10 +928,9 @@ public:
 
             auto [last_height, last_last_hash] = chain.get_height_and_last(last_hash);
 
-            // p2pool data.py:2098-2103 EXACTLY:
-            //   want = max(self.net.CHAIN_LENGTH - head_height, 0)
-            //   can = max(last_height - 1 - self.net.CHAIN_LENGTH, 0) if last_last_hash is not None else last_height
-            //   get = min(want, can)
+            // Bounded backfill window: request as many shares as the chain is
+            // short of CHAIN_LENGTH (want), capped by how many the rooted peer
+            // can actually supply (can); to_get = min(want, can).
             auto CL = static_cast<int32_t>(PoolConfig::chain_length());
             auto want = std::max(CL - head_height, 0);
             auto can = last_last_hash.IsNull()
@@ -1294,9 +1296,8 @@ public:
             timestamp_cutoff = static_cast<uint32_t>(now_seconds()) - 24 * 60 * 60;
         }
 
-        // Filter desired by timestamp cutoff — p2pool data.py:2374 EXACTLY:
-        //   return best, [(peer_addr, hash) for peer_addr, hash, ts, targ in desired
-        //                  if ts >= timestamp_cutoff]
+        // Filter the desired list by timestamp cutoff: keep only entries whose
+        // timestamp is at or after the cutoff.
         // This prevents requesting shares from stale/pruned chain tails that
         // peers no longer have. Without this, we hammer peers with unanswerable
         // requests and they eventually drop us.
@@ -2610,7 +2611,7 @@ public:
         if (total_weight.IsNull() || subsidy == 0)
             return result;
 
-        // Integer division matching p2pool exactly (using uint288 throughout
+        // Integer division matching p2pool's payout arithmetic (using uint288 throughout
         // to avoid uint64 truncation — total_weight routinely exceeds 2^64):
         // donation_amount = subsidy * donation_weight // total_weight
         uint288 subsidy288(subsidy);

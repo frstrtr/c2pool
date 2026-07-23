@@ -32,6 +32,15 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string for package names (e.g. 0.2.0). Blank = derive from ref."
+        required: false
+        default: ""
+      coins:
+        description: "JSON array of coins to build (e.g. [\"ltc\"]). Blank = all five."
+        required: false
+        default: ""
 
 concurrency:
   group: release-${{ github.ref }}
@@ -46,18 +55,20 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   linux:
     name: ${{ matrix.coin }} package (Linux x86_64)
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     strategy:
       fail-fast: false
       matrix:
-        coin: [btc, ltc, dgb, dash, bch]
+        coin: ${{ fromJSON(github.event.inputs.coins || '["btc","ltc","dgb","dash","bch"]') }}
     steps:
       - uses: actions/checkout@v6
 
       - name: Resolve version
         id: ver
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           else
             echo "version=0.0.0-${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
@@ -74,9 +85,22 @@ jobs:
             echo "::warning::c2pool-${{ matrix.coin }} source not on this ref — no ${{ matrix.coin }} Linux package will be produced."
           fi
 
+      # Per-coin-cell Conan home; RUNNER_TEMP is step-scope only, so export via
+      # $GITHUB_ENV (job-level `env: runner.temp` fails to parse). See build.yml.
+      - name: Set per-job Conan home
+        run: echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+
       - name: Install system dependencies
         if: steps.presence.outputs.exists == '1'
+        # Serialize apt across the concurrent coin package jobs sharing the one
+        # c2pool-build self-hosted host. Without this, the 5 Linux matrix cells
+        # race on /var/lib/apt/lists/lock (and corrupt srcpkgcache.bin), and the
+        # loser fails before the build starts (e.g. LTC on v0.2.0, run
+        # 29148852306). flock on a host-wide lock makes apt atomic; on
+        # github-hosted runners the lock is per-VM and uncontended, so no-op.
         run: |
+          exec {lockfd}>/tmp/c2pool-apt.lock
+          flock "$lockfd"
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             g++ cmake make libleveldb-dev libsecp256k1-dev
@@ -87,20 +111,24 @@ jobs:
 
       - name: Install Conan 2
         if: steps.presence.outputs.exists == '1'
-        run: pip install "conan>=2.0,<3.0"
-
-      - name: Detect Conan profile
-        if: steps.presence.outputs.exists == '1'
         run: |
-          conan profile detect --force
-          sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' "$(conan profile path default)"
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
+
+      - name: Show committed Conan profile
+        if: steps.presence.outputs.exists == '1'
+        run: conan profile show -pr:a=ci/conan/linux-gcc13.profile
 
       - name: Restore Conan cache
         if: steps.presence.outputs.exists == '1'
         uses: actions/cache@v5
         with:
-          path: ~/.conan2
-          key: conan2-ubuntu24-gcc13-${{ matrix.coin }}-${{ hashFiles('conanfile.txt') }}
+          path: ${{ runner.temp }}/conan2
+          key: conan2-ubuntu24-gcc13-${{ matrix.coin }}-${{ hashFiles('conanfile.txt', 'ci/conan/linux-gcc13.profile', 'conan.lock') }}
           restore-keys: |
             conan2-ubuntu24-gcc13-${{ matrix.coin }}-
             conan2-ubuntu24-gcc13-
@@ -109,16 +137,30 @@ jobs:
         if: steps.presence.outputs.exists == '1'
         run: |
           conan install . \
+            -pr:a=ci/conan/linux-gcc13.profile \
+            --lockfile=conan.lock \
             --build=missing \
-            --output-folder=build_${{ matrix.coin }} \
-            --settings=build_type=Release
+            --output-folder=build_${{ matrix.coin }}
 
       - name: Configure
         if: steps.presence.outputs.exists == '1'
         run: |
+          # DGB ships the -DAUX_DOGE=ON build: DGB parent + embedded DOGE aux as ONE
+          # binary, the direct parallel to c2pool-ltc carrying DOGE. Gated to the dgb
+          # cell; inert for the other coins. Merged-mining path per #603/#614/#589/#395.
           cmake -S . -B build_${{ matrix.coin }} \
             -DCMAKE_TOOLCHAIN_FILE=build_${{ matrix.coin }}/conan_toolchain.cmake \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release \
+            ${{ matrix.coin == 'dgb' && '-DAUX_DOGE=ON' || '' }}
+
+      # Boost header-integrity + version gate: a torn/mixed Boost tree or an
+      # apt-Boost fallback fails HERE (fast, one TU), not deep in the coin
+      # packaging build. Same gate build.yml runs. See ci-boost-stream.md.
+      - name: Boost sentinel
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          cmake --build build_${{ matrix.coin }} --target boost_sentinel -j$(nproc)
+          ctest --test-dir build_${{ matrix.coin }} -R '^boost_sentinel$' --output-on-failure
 
       - name: Build c2pool-${{ matrix.coin }}
         if: steps.presence.outputs.exists == '1'
@@ -140,13 +182,23 @@ jobs:
           mkdir -p "${PKG}/lib" "${PKG}/config" "${PKG}/web-static" "${PKG}/explorer"
           cp "build_${COIN}/src/c2pool/c2pool-${COIN}" "${PKG}/"
           strip "${PKG}/c2pool-${COIN}"
-          for lib in libleveldb.so.1 libsecp256k1.so.2 libsnappy.so.1; do
-            found=$(find /usr/lib -name "${lib}*" -type f 2>/dev/null | head -1)
-            [ -n "$found" ] && cp "$found" "${PKG}/lib/"
+          # Bundle the real runtime shared-library closure resolved from the freshly
+          # built binary via ldd (SONAME-agnostic). v0.2.3 shipped every Linux tarball
+          # DOA: this step hardcoded libsecp256k1.so.2 while the runner's
+          # libsecp256k1-dev provides .so.1 — find matched nothing and the binary's
+          # only dynamic non-glibc dependency went unbundled. Resolve, don't guess.
+          ldd "${PKG}/c2pool-${COIN}" | awk '/=> \//{print $3}' | while read -r so; do
+            case "$(basename "$so")" in
+              libc.so*|libm.so*|libdl.so*|librt.so*|libpthread.so*|ld-linux*|libstdc++.so*|libgcc_s.so*|libresolv.so*) continue ;;
+            esac
+            cp -Lv "$so" "${PKG}/lib/"
           done
           cp start.sh "${PKG}/" && chmod +x "${PKG}/start.sh"
-          cp config/c2pool_mainnet.yaml "${PKG}/config/c2pool_mainnet.yaml.example" || true
-          cp config/c2pool_testnet.yaml "${PKG}/config/" || true
+          cp "config/${COIN}/c2pool_mainnet.yaml" "${PKG}/config/c2pool_mainnet.yaml.example"
+          cp "config/${COIN}/c2pool_testnet.yaml" "${PKG}/config/c2pool_testnet.yaml"
+          # Fail-fast packaging tripwires (BUG A / BUG B regression guards):
+          ls "${PKG}/lib/" | grep -q '^libsecp256k1\.so' || { echo "PKG-ASSERT FAIL: libsecp256k1 not bundled in ${PKG}/lib"; exit 1; }
+          head -1 "${PKG}/config/c2pool_mainnet.yaml.example" | grep -qi "${COIN}" || { echo "PKG-ASSERT FAIL: ${PKG} config header does not identify ${COIN}"; exit 1; }
           cp -r web-static/* "${PKG}/web-static/"
           cp explorer/explorer.py "${PKG}/explorer/"
           tar czf "${PKG}.tar.gz" "${PKG}/"
@@ -157,6 +209,12 @@ jobs:
         with:
           name: pkg-linux-${{ matrix.coin }}
           path: c2pool-*-linux-x86_64.tar.gz
+
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace
 
   # ════════════════════════════════════════════════════════════════════════════
   # macOS universal (arm64 + x86_64) — operator decision 2026-06-11.
@@ -172,11 +230,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        coin: [btc, ltc, dgb, dash, bch]
+        coin: ${{ fromJSON(github.event.inputs.coins || '["btc","ltc","dgb","dash","bch"]') }}
         arch: [arm64, x86_64]
         include:
           - arch: arm64
-            runner: macos-14
+            runner: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","c2pool-mac-arm"]') || 'macos-14' }}
           - arch: x86_64
             runner: [self-hosted, macOS, X64, c2pool-mac-intel]
     steps:
@@ -185,7 +243,9 @@ jobs:
       - name: Resolve version
         id: ver
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           else
             echo "version=0.0.0-${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
@@ -222,7 +282,8 @@ jobs:
 
       - name: Configure
         if: steps.presence.outputs.exists == '1'
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        # DGB: -DAUX_DOGE=ON -> DGB parent + embedded DOGE (mirrors c2pool-ltc). Inert for other coins.
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.coin == 'dgb' && '-DAUX_DOGE=ON' || '' }}
 
       - name: Build c2pool-${{ matrix.coin }}
         if: steps.presence.outputs.exists == '1'
@@ -259,7 +320,8 @@ jobs:
             install_name_tool -id "@executable_path/lib/$(basename $lib)" "$lib"
           done
           cp start.sh "${PKG}/" && chmod +x "${PKG}/start.sh"
-          cp config/c2pool_mainnet.yaml "${PKG}/config/c2pool_mainnet.yaml.example" || true
+          cp "config/${COIN}/c2pool_mainnet.yaml" "${PKG}/config/c2pool_mainnet.yaml.example"
+          cp "config/${COIN}/c2pool_testnet.yaml" "${PKG}/config/c2pool_testnet.yaml"
           cp -r web-static/* "${PKG}/web-static/"
           cp explorer/explorer.py "${PKG}/explorer/"
 
@@ -281,18 +343,20 @@ jobs:
     name: ${{ matrix.coin }} package (macOS universal)
     needs: macos
     if: always()
-    runs-on: macos-14
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","c2pool-mac-arm"]') || 'macos-14' }}
     strategy:
       fail-fast: false
       matrix:
-        coin: [btc, ltc, dgb, dash, bch]
+        coin: ${{ fromJSON(github.event.inputs.coins || '["btc","ltc","dgb","dash","bch"]') }}
     steps:
       - uses: actions/checkout@v6
 
       - name: Resolve version
         id: ver
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           else
             echo "version=0.0.0-${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
@@ -360,65 +424,115 @@ jobs:
           name: pkg-macos-${{ matrix.coin }}
           path: c2pool-*-macos-universal.zip
 
+      - name: Build DMG installer
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          COIN="${{ matrix.coin }}"
+          bash installer/macos/create-dmg.sh \
+            --staged "c2pool-${COIN}-${VERSION}-macos-universal" \
+            --name "c2pool-${COIN}" \
+            --version "${VERSION}" \
+            --arch universal
+
+      - name: Upload DMG installer
+        if: steps.presence.outputs.exists == '1'
+        uses: actions/upload-artifact@v7
+        with:
+          name: pkg-macos-dmg-${{ matrix.coin }}
+          path: c2pool-*-macos-universal.dmg
+
   # ════════════════════════════════════════════════════════════════════════════
   # Windows x86_64 (MSVC 2022, Conan)
   # ════════════════════════════════════════════════════════════════════════════
   windows:
     name: ${{ matrix.coin }} package (Windows x86_64)
-    runs-on: windows-2022
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Windows","X64","c2pool-build"]') || 'windows-2022' }}
+    defaults:
+      run:
+        # VM217 Windows PowerShell runs at ExecutionPolicy=Restricted and has no
+        # Git-bash on the runner-service PATH (shell:bash -> "bash: command not
+        # found"). Use the ExecutionPolicy-Bypass PowerShell shell proven green
+        # by build.yml's Windows lane (probe 28679257030). cmd steps override.
+        shell: powershell -ExecutionPolicy Bypass -Command ". '{0}'"
     strategy:
       fail-fast: false
       matrix:
-        coin: [btc, ltc, dgb, dash, bch]
+        coin: ${{ fromJSON(github.event.inputs.coins || '["btc","ltc","dgb","dash","bch"]') }}
     steps:
       - uses: actions/checkout@v6
 
+      # Per-coin-cell Conan home; RUNNER_TEMP is step-scope only, so export via
+      # $GITHUB_ENV (job-level `env: runner.temp` fails to parse). PowerShell form.
+      - name: Set per-job Conan home
+        run: echo "CONAN_HOME=$env:RUNNER_TEMP/conan2" | Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Resolve version
         id: ver
-        shell: bash
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-          else
-            echo "version=0.0.0-${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
-          fi
+          if ("${{ github.event.inputs.version }}") {
+            "version=${{ github.event.inputs.version }}" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } elseif ("${env:GITHUB_REF}" -like "refs/tags/v*") {
+            "version=$("${env:GITHUB_REF_NAME}".TrimStart('v'))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            "version=0.0.0-$("${env:GITHUB_SHA}".Substring(0,8))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
 
       - name: Check source presence
         id: presence
-        shell: bash
         run: |
-          if [ -f "src/c2pool/main_${{ matrix.coin }}.cpp" ] && [ -d "src/impl/${{ matrix.coin }}" ]; then
-            echo "exists=1" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=0" >> "$GITHUB_OUTPUT"
-            echo "::warning::c2pool-${{ matrix.coin }} source not on this ref — no ${{ matrix.coin }} Windows package will be produced."
-          fi
+          if ((Test-Path "src/c2pool/main_${{ matrix.coin }}.cpp") -and (Test-Path "src/impl/${{ matrix.coin }}")) {
+            "exists=1" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            "exists=0" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "::warning::c2pool-${{ matrix.coin }} source not on this ref -- no ${{ matrix.coin }} Windows package will be produced."
+          }
 
       - uses: actions/setup-python@v6
-        if: steps.presence.outputs.exists == '1'
+        if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'
         with: { python-version: '3.12' }
 
       - name: Install Conan 2
         if: steps.presence.outputs.exists == '1'
-        run: pip install "conan>=2.0,<3.0"
-
-      - name: Detect Conan profile
-        if: steps.presence.outputs.exists == '1'
         run: |
-          conan profile detect --force
-          $profile = conan profile path default
-          (Get-Content $profile) -replace 'compiler.cppstd=14','compiler.cppstd=20' | Set-Content $profile
+          # VM217 exposes neither conan nor a bare python on the runner-service
+          # PATH (setup-python is gated off self-hosted); resolve an interpreter
+          # via the Windows py launcher (py -> python3 -> python), pip-install
+          # conan, and export its Scripts dir(s) through GITHUB_PATH. On the
+          # github-hosted fork fallback py/python resolve normally.
+          $py = $null
+          foreach ($cand in @('py','python3','python')) {
+            if (Get-Command $cand -ErrorAction SilentlyContinue) { $py = $cand; break }
+          }
+          if (-not $py) {
+            Write-Host "No Python interpreter on PATH. Diagnostics:"
+            & where.exe python 2>&1; & where.exe py 2>&1; & where.exe python3 2>&1
+            Write-Host "PATH=$env:PATH"
+            throw "VM217 has no Python interpreter on the runner-service PATH"
+          }
+          Write-Host "Using interpreter: $py"
+          & $py -m pip install "conan>=2.0,<3.0"
+          $scripts = & $py -c "import sysconfig; print(sysconfig.get_path('scripts'))"
+          $userScripts = & $py -c "import sysconfig; print(sysconfig.get_path('scripts','nt_user'))"
+          $env:PATH = "$scripts;$userScripts;$env:PATH"
+          Add-Content -Path $env:GITHUB_PATH -Value $scripts
+          Add-Content -Path $env:GITHUB_PATH -Value $userScripts
+          conan --version
+
+      - name: Show committed Conan profile
+        if: steps.presence.outputs.exists == '1'
+        run: conan profile show -pr:a=ci/conan/windows-msvc.profile
 
       - name: Restore Conan cache
         if: steps.presence.outputs.exists == '1'
         uses: actions/cache@v5
         with:
-          path: ~/.conan2
-          key: conan2-windows-msvc194-${{ hashFiles('conanfile.txt') }}
+          path: ${{ runner.temp }}/conan2
+          key: conan2-windows-msvc194-${{ hashFiles('conanfile.txt', 'ci/conan/windows-msvc.profile', 'conan.lock') }}
 
       - name: Conan install
         if: steps.presence.outputs.exists == '1'
-        run: conan install . --build=missing --output-folder=build_ci
+        run: conan install . -pr:a=ci/conan/windows-msvc.profile --lockfile=conan.lock --build=missing --output-folder=build_ci
 
       - name: Build secp256k1
         if: steps.presence.outputs.exists == '1'
@@ -431,18 +545,39 @@ jobs:
       - name: Configure
         if: steps.presence.outputs.exists == '1'
         shell: cmd
-        run: cmake -S . -B build_ci -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_PREFIX_PATH="%GITHUB_WORKSPACE%/secp256k1" -DCMAKE_CXX_FLAGS="/D_WIN32_WINNT=0x0A00"
+        # DGB: -DAUX_DOGE=ON -> DGB parent + embedded DOGE (mirrors c2pool-ltc). Inert for other coins.
+        run: cmake -S . -B build_ci -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_PREFIX_PATH="%GITHUB_WORKSPACE%/secp256k1" -DCMAKE_CXX_FLAGS="/D_WIN32_WINNT=0x0A00" ${{ matrix.coin == 'dgb' && '-DAUX_DOGE=ON' || '' }}
+
+      # Boost header-integrity + version gate (VS multi-config -> --config/-C Release).
+      # A torn/mixed Boost tree fails HERE, before the coin packaging build.
+      - name: Boost sentinel
+        if: steps.presence.outputs.exists == '1'
+        shell: cmd
+        run: |
+          cmake --build build_ci --target boost_sentinel --config Release -j %NUMBER_OF_PROCESSORS%
+          ctest --test-dir build_ci -R "^boost_sentinel$" -C Release --output-on-failure
 
       - name: Build c2pool-${{ matrix.coin }}
         if: steps.presence.outputs.exists == '1'
         shell: cmd
-        run: cmake --build build_ci --target c2pool-${{ matrix.coin }} --config Release -j %NUMBER_OF_PROCESSORS%
+        # VM217 has a fixed 2GB pagefile; a 16-way MSVC parallel build of the
+        # heavy btc+NMC (and dgb+DOGE) TU set drives commit charge past the
+        # 32GB+2GB wall. The failure surfaces as an orphaned MSBuild with NO
+        # C####/LNK diagnostic. Cap MSBuild /maxcpucount (cmake -j -> /maxcpucount
+        # on the VS generator) to bound concurrent cl.exe and keep committed
+        # memory under the wall. Conservative 8; tune up only if headroom allows.
+        run: cmake --build build_ci --target c2pool-${{ matrix.coin }} --config Release -j 8
 
       - name: Smoke test (--help)
         if: steps.presence.outputs.exists == '1'
         run: |
           Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-6.dll" build_ci/src/c2pool/Release/
-          build_ci/src/c2pool/Release/c2pool-${{ matrix.coin }}.exe --help 2>&1 | Select-Object -First 5
+          $ErrorActionPreference = 'SilentlyContinue'
+          # --help writes usage to stderr; buffer first so Select-Object truncation
+          # cannot break the pipe and surface a NativeCommandError (false red).
+          $out = & build_ci/src/c2pool/Release/c2pool-${{ matrix.coin }}.exe --help 2>&1
+          $out | Select-Object -First 5 | Write-Host
+          exit 0
 
       - name: Package
         if: steps.presence.outputs.exists == '1'
@@ -459,8 +594,8 @@ jobs:
           Copy-Item start.bat "${PKG}/"
           Copy-Item -Recurse web-static/* "${PKG}/web-static/"
           Copy-Item explorer/explorer.py "${PKG}/explorer/"
-          Copy-Item config/c2pool_mainnet.yaml "${PKG}/config/c2pool_mainnet.yaml.example"
-          Copy-Item config/c2pool_testnet.yaml "${PKG}/config/" -ErrorAction SilentlyContinue
+          Copy-Item "config/${COIN}/c2pool_mainnet.yaml" "${PKG}/config/c2pool_mainnet.yaml.example"
+          Copy-Item "config/${COIN}/c2pool_testnet.yaml" "${PKG}/config/c2pool_testnet.yaml"
           Compress-Archive -Path "${PKG}" -DestinationPath "${PKG}.zip"
 
       - name: Upload package
@@ -470,6 +605,47 @@ jobs:
           name: pkg-windows-${{ matrix.coin }}
           path: c2pool-*-windows-x86_64.zip
 
+      # Installer is a NICE-TO-HAVE: the portable .zip (uploaded above) is the
+      # must-have deliverable. If Inno Setup is unavailable on the runner (e.g.
+      # VM217 where choco cannot write C:\ProgramData\chocolatey\lib-bad), warn
+      # and skip so the job still succeeds and the .zip ships. Durable fix is a
+      # persistent Inno Setup 6 install on the runner (ISCC on PATH).
+      - name: Build setup.exe installer (Inno Setup)
+        if: steps.presence.outputs.exists == '1'
+        shell: cmd
+        continue-on-error: true
+        run: |
+          set "ISCC=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if not exist "%ISCC%" (
+            echo Inno Setup not found; attempting install via chocolatey...
+            choco install innosetup -y --no-progress || echo WARNING: choco install innosetup failed
+          )
+          if not exist "%ISCC%" (
+            echo ::warning::Inno Setup unavailable on this runner; skipping setup.exe. Portable .zip already uploaded.
+            exit /b 0
+          )
+          set "PKG=c2pool-${{ matrix.coin }}-${{ steps.ver.outputs.version }}-windows-x86_64"
+          for /f "delims=" %%i in ('powershell -NoProfile -Command "(Get-ChildItem -Path 'C:\Program Files\Microsoft Visual Studio\2022' -Recurse -Filter vc_redist.x64.exe -ErrorAction SilentlyContinue | Select-Object -First 1).FullName"') do set "VCREDIST=%%i"
+          "%ISCC%" installer\windows\c2pool-setup.iss ^
+            /DPACKAGE_DIR="%CD%\%PKG%" ^
+            /DVCREDIST_PATH="%VCREDIST%" ^
+            /DMyAppName=c2pool-${{ matrix.coin }} ^
+            /DMyAppVersion=${{ steps.ver.outputs.version }} ^
+            /DMyAppExeName=c2pool-${{ matrix.coin }}.exe ^
+            /DOutputBase=%PKG%-setup
+          copy "installer\windows\Output\%PKG%-setup.exe" .
+
+      - name: Upload setup.exe installer
+        if: steps.presence.outputs.exists == '1'
+        uses: actions/upload-artifact@v7
+        with:
+          name: pkg-windows-setup-${{ matrix.coin }}
+          path: c2pool-*-windows-x86_64-setup.exe
+          # warn (not ignore): if ISCC ran but produced no .exe, surface it as a
+          # run annotation instead of silently shipping a draft with no installer.
+          # Still non-fatal — the portable .zip remains the must-have deliverable.
+          if-no-files-found: warn
+
   # ════════════════════════════════════════════════════════════════════════════
   # Aggregate: single SHA256SUMS over every produced package; on tags,
   # attach everything to a DRAFT release (operator publishes manually).
@@ -478,7 +654,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   checksums:
     name: SHA256SUMS + draft release
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     needs: [linux, macos-universal, windows]
     if: always()
     permissions:
@@ -504,13 +680,33 @@ jobs:
           name: SHA256SUMS
           path: dist/SHA256SUMS
 
-      - name: Create draft release
+      # Idempotent draft assembly: a v-tag draft may already exist from a prior
+      # re-run of this job. gh release create is NOT idempotent -- it spawns a
+      # SECOND draft with the same tag_name, so repeated runs pile up duplicate
+      # "vX.Y.Z" drafts. Refresh ONE canonical draft instead: upload --clobber
+      # if the release exists, else create it fresh.
+      - name: Assemble draft release (idempotent)
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            --draft \
-            --title "c2pool ${GITHUB_REF_NAME}" \
-            --notes "Draft assembled by release.yml — operator reviews and publishes manually." \
-            dist/*
+          TAG="${GITHUB_REF_NAME}"
+          REPO="${{ github.repository }}"
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Draft $TAG already exists -- refreshing assets in place (--clobber)."
+            gh release upload "$TAG" dist/* --clobber --repo "$REPO"
+          else
+            echo "No release for $TAG -- creating fresh draft."
+            gh release create "$TAG" \
+              --repo "$REPO" \
+              --draft \
+              --title "c2pool $TAG" \
+              --notes "Draft assembled by release.yml -- operator reviews and publishes manually." \
+              dist/*
+          fi
+
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace

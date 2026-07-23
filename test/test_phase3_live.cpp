@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase 3 — Live daemon integration tests
 ///
 /// Connects to a real LTC testnet P2P port, syncs headers + mempool, then

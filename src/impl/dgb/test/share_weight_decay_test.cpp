@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // dgb::coin::weight_decay -- V36 PPLNS exponential weight-decay KAT.
 //
 // FENCED conformance test (no production code touched). Pins the decay-rate

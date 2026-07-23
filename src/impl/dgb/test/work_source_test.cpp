@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#include <cmath>
 // dgb::stratum::DGBWorkSource — Stage 4a skeleton construction + contract test.
 //
 // Proves the work source instantiates against the live coin types
@@ -354,6 +356,25 @@ TEST(DgbWorkSource, ComputeShareDifficultyReturnsNotYetSentinel)
     EXPECT_DOUBLE_EQ(diff, 0.0);
 }
 
+// Stage 4b/4c live: a well-formed reconstruct (valid hex, header == 80B) is now
+// SCORED -- scrypt_1024_1_1_256(header) bridged to core uint256 via the
+// u256_be_display_hex SSOT and returned as chain::target_to_difficulty(pow),
+// the SAME unit the coin-agnostic StratumServer vardiff/pool gate compares. A
+// positive score is exactly what lets a real share clear the gate and reach
+// mining_submit (the 0.0 stub silently rejected every share pre-fix).
+TEST(DgbWorkSource, ComputeShareDifficultyScoresValidHeader)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    const std::string prevhash(64, '0');  // 32 zero bytes (BE display hex)
+    double diff = ws->compute_share_difficulty(
+        "01000000", "00000000", "00", "00", "5f5e1000", "0000abcd",
+        /*version=*/0x20000000u, prevhash, "1e0ffff0",
+        /*merkle_branches=*/{});
+    EXPECT_GT(diff, 0.0);
+    EXPECT_TRUE(std::isfinite(diff));
+}
+
 // Stage 4c coinbasevalue wire: the work template surfaces the NEXT-block
 // height and its coinbasevalue, the latter derived THROUGH the #207 SSOT
 // (subsidy_func) keyed on next_block_height() == tip.height + 1 (#209). An
@@ -572,6 +593,69 @@ dgb::coin::ConnCoinbasePplnsInputs sample_pplns_inputs()
     in.ref_hash = uint256(std::vector<unsigned char>(32, 0xab));
     in.last_txout_nonce = 0x0102030405060708ULL;
     return in;
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// External-daemon GBT tip fallback (set_gbt_tip_fn) -- the empty-embedded-chain
+// path that unblocks a freshly-stood-up :5025 node whose Scrypt-only HeaderChain
+// has not yet ingested a tip. Fixture's HeaderChain is default-constructed
+// (tip_hash()==nullopt), so these exercise exactly the live fallback condition.
+// ─────────────────────────────────────────────────────────────────────────────
+
+using GbtTip = dgb::stratum::DGBWorkSource::GbtTip;
+
+TEST(DgbWorkSource, GbtTipFallbackPopulatesPrevhashAndBitsWhenChainEmpty)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    // Values mirror the live testnet GBT the integrator confirmed (h123 tip).
+    const std::string kPrev =
+        "ce2fd8d332d667c009e6e031fec6cba0e4d12c963d2c84f824d6c1ae676e7de9";
+    const std::string kBits = "2003ffff";
+    int calls = 0;
+    ws->set_gbt_tip_fn([&]() -> std::optional<GbtTip> {
+        ++calls;
+        return GbtTip{kPrev, kBits};
+    });
+
+    // mining.notify prevhash source (stratum_server get_current_gbt_prevhash).
+    EXPECT_EQ(ws->get_current_gbt_prevhash(), kPrev);
+
+    // The assembled GBT template carries BOTH previousblockhash and the
+    // daemon-authoritative bits from the same fallback snapshot.
+    auto tmpl = ws->get_current_work_template();
+    ASSERT_TRUE(tmpl.contains("previousblockhash"));
+    EXPECT_EQ(tmpl["previousblockhash"].get<std::string>(), kPrev);
+    ASSERT_TRUE(tmpl.contains("bits"));
+    EXPECT_EQ(tmpl["bits"].get<std::string>(), kBits);
+
+    // TTL cache: the two accessors above must not each trigger a fresh RPC.
+    EXPECT_LE(calls, 1);
+}
+
+TEST(DgbWorkSource, GbtTipFallbackAbsentWhenSeamUnbound)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    // No set_gbt_tip_fn -> truthful absence (byte-identical to pre-wire).
+    EXPECT_TRUE(ws->get_current_gbt_prevhash().empty());
+    auto tmpl = ws->get_current_work_template();
+    EXPECT_FALSE(tmpl.contains("previousblockhash"));
+    EXPECT_FALSE(tmpl.contains("bits"));
+}
+
+TEST(DgbWorkSource, GbtTipFallbackNulloptStaysAbsent)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    // Seam bound but declining (RPC down / no template yet) -> same absence as
+    // unbound; never a fabricated prevhash/bits.
+    ws->set_gbt_tip_fn([]() -> std::optional<GbtTip> { return std::nullopt; });
+    EXPECT_TRUE(ws->get_current_gbt_prevhash().empty());
+    auto tmpl = ws->get_current_work_template();
+    EXPECT_FALSE(tmpl.contains("previousblockhash"));
+    EXPECT_FALSE(tmpl.contains("bits"));
 }
 
 }  // namespace

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ============================================================================
 // conn_pplns_producer.hpp — per-connection PPLNS-inputs producer-assembly SSOT.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #include "node.hpp"
 
 #include <core/common.hpp>
@@ -309,12 +310,17 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
             peer->write(std::move(getaddrs_msg));
         }
 
-        // Reject peers running too-old protocol
-        if (msg->m_version < m_tracker.m_params->minimum_protocol_version)
+        // Reject peers running too-old protocol. The floor is the RUNTIME
+        // ratcheted value (cold 1400, lifted to 3500 once >=95% of window work
+        // desires the best share's version -- apply_min_protocol_ratchet), NOT the
+        // immutable config floor. Read lock-free; compute thread publishes via store.
+        const uint32_t min_proto =
+            m_runtime_min_protocol_version.load(std::memory_order_relaxed);
+        if (msg->m_version < min_proto)
         {
             LOG_WARNING << "Peer " << msg->m_addr_from.m_endpoint.to_string()
                         << " protocol " << msg->m_version
-                        << " < minimum " << m_tracker.m_params->minimum_protocol_version
+                        << " < minimum " << min_proto
                         << ", disconnecting";
             throw std::runtime_error("peer protocol too old");
         }
@@ -790,7 +796,7 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
 void NodeImpl::notify_local_share(const uint256& share_hash)
 {
     // p2pool: set_best_share() → think() synchronously on the reactor thread.
-    // Use think() for ALL best_share decisions, matching p2pool exactly.
+    // Use think() for ALL best_share decisions, as p2pool does.
     if (share_hash.IsNull() || !m_tracker.chain.contains(share_hash))
         return;
 
@@ -804,6 +810,58 @@ void NodeImpl::notify_local_share(const uint256& share_hash)
 
     // Trigger async think() — will pick up the local share through scoring.
     run_think();
+}
+
+void NodeImpl::apply_min_protocol_ratchet()
+{
+    // Runtime wiring of the accept-floor ratchet #602 landed as a pure function.
+    // Mirrors oracle main.py:213-216 (run on each best-share advance) + data.py:857
+    // update_min_protocol_version: over the window [CHAIN_LENGTH*9/10, CHAIN_LENGTH]
+    // behind the best share's PARENT, lift the inbound P2P accept-floor 1400 -> 3500
+    // once the best share's VERSION holds >=95% of the work-weighted desired-version
+    // tally. Runtime sibling of the 60% version-switch gate (share_check.hpp step 2),
+    // reading the SAME window. MUST be called under exclusive m_tracker_mutex.
+    const uint32_t target  = PoolConfig::SHARE_MINIMUM_PROTOCOL_VERSION;  // 3500
+    const uint32_t current =
+        m_runtime_min_protocol_version.load(std::memory_order_relaxed);
+    if (current >= target)                    // already ratcheted -> latched, no-op
+        return;
+    if (m_best_share_hash.IsNull() || !m_tracker.chain.contains(m_best_share_hash))
+        return;
+
+    // best share's VERSION (share TYPE version) + its parent hash
+    // (oracle: previous_share = shares[best_share.previous_share_hash]).
+    int64_t best_version = 0;
+    uint256 prev_hash;
+    m_tracker.chain.get_share(m_best_share_hash).invoke([&](auto* obj) {
+        best_version = std::remove_pointer_t<decltype(obj)>::version;
+        prev_hash    = obj->m_prev_hash;
+    });
+    if (prev_hash.IsNull() || !m_tracker.chain.contains(prev_hash))
+        return;
+
+    const int32_t CL            = static_cast<int32_t>(m_tracker.m_params->chain_length);
+    const int32_t parent_height = m_tracker.chain.get_height(prev_hash);
+
+    // Sample the SAME window the 60% switch gate reads (share_check.hpp:1610):
+    // anchor = nth_parent(parent, CHAIN_LENGTH*9/10), size = CHAIN_LENGTH/10.
+    const uint32_t window_start = (static_cast<uint32_t>(CL) * 9) / 10;
+    const uint32_t window_size  =  static_cast<uint32_t>(CL) / 10;
+    auto anchor  = m_tracker.chain.get_nth_parent_key(prev_hash, window_start);
+    auto weights = m_tracker.get_desired_version_weights(
+        anchor, static_cast<int32_t>(window_size));
+
+    // apply_min_protocol_ratchet_decision applies the main.py:212 full-window
+    // guard (parent_height >= CHAIN_LENGTH) the pure ratchet omits, then delegates.
+    const uint32_t lifted = dgb::apply_min_protocol_ratchet_decision(
+        parent_height, CL, weights, best_version, current, target);
+    if (lifted != current) {
+        m_runtime_min_protocol_version.store(lifted, std::memory_order_relaxed);
+        LOG_INFO << "[min-proto-ratchet] MINIMUM_PROTOCOL_VERSION " << current
+                 << " -> " << lifted << " (>=95% window work desires v"
+                 << best_version << ", best="
+                 << m_best_share_hash.GetHex().substr(0, 16) << ")";
+    }
 }
 
 uint256 NodeImpl::best_share_hash()
@@ -964,7 +1022,7 @@ void NodeImpl::readvertise_best_share()
 
 void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_hash)
 {
-    // p2pool node.py:108-141 download_shares() — exact translation.
+    // download_shares(): C++ implementation of the p2pool share-download loop.
     //
     // Key differences from old c2pool implementation:
     // 1. RANDOM peer selection (not the reporting peer)
@@ -1325,7 +1383,7 @@ void NodeImpl::start_outbound_connections()
 
 void NodeImpl::prune_shares(const uint256& /*best_share*/)
 {
-    // Matches p2pool node.py:381-398 tail-dropping exactly:
+    // Tail-dropping (as in p2pool's clean_tracker):
     // - Check each tail: if min(height(head) for heads) < 2*CL+10 → skip
     // - Remove ONE child of qualifying tail per iteration
     // - Loop up to 1000 times (gradual, not bulk)
@@ -1465,6 +1523,7 @@ void NodeImpl::run_think()
         if (!result.best.IsNull()) {
             best_changed = (m_best_share_hash != result.best);
             m_best_share_hash = result.best;
+            apply_min_protocol_ratchet();  // oracle main.py:216 (per best-share advance)
         }
 
         // Phase 1c: drive the whale-departure detector with the fresh best
@@ -1791,7 +1850,7 @@ void NodeImpl::heartbeat_log()
 }
 
 // Periodic maintenance: eat stale heads, drop tails.
-// Direct translation of p2pool node.py:355-402 clean_tracker().
+// C++ implementation of the p2pool clean_tracker() design (stale-head eating + tail dropping).
 //
 // Runs on the compute thread under exclusive lock — matching p2pool where
 // clean_tracker + think() execute on the same reactor thread. Chain
@@ -1843,6 +1902,7 @@ void NodeImpl::clean_tracker()
 
             if (!result.best.IsNull()) {
                 m_best_share_hash = result.best;
+                apply_min_protocol_ratchet();  // oracle main.py:216 (per best-share advance)
             }
 
             flush_verified_to_leveldb();
@@ -1925,7 +1985,7 @@ void NodeImpl::clean_tracker()
     }
 
     // Step 3: Drop tails — remove ALL children of qualifying tails.
-    // Exact translation of p2pool node.py:382-398.
+    // C++ implementation of the p2pool tail-dropping step.
     // p2pool has NO best-chain protection — the 2*CHAIN_LENGTH+10 threshold
     // ensures only shares far beyond the PPLNS window are removed.
     {
@@ -2014,6 +2074,7 @@ void NodeImpl::clean_tracker()
         if (!result.best.IsNull()) {
             clean_best_changed = (m_best_share_hash != result.best);
             m_best_share_hash = result.best;
+            apply_min_protocol_ratchet();  // oracle main.py:216 (per best-share advance)
         }
         publish_snapshot();
         flush_verified_to_leveldb();
@@ -2092,155 +2153,18 @@ void NodeImpl::clean_tracker()
     }); // end of m_think_pool lambda
 }
 
-bool NodeImpl::is_whitelisted(const NetService& addr) const
-{
-    const std::string ip = addr.address();
-    if (m_whitelist_ips.contains(ip)) return true;
-    if (m_whitelist_hosts.contains(addr)) return true;
-    return false;
-}
 
-bool NodeImpl::is_banned(const NetService& addr) const
-{
-    // Whitelist bypass: permanent dial targets are immune to bans.
-    if (is_whitelisted(addr)) return false;
-
-    auto now = std::chrono::steady_clock::now();
-    auto it = m_ban_list.find(addr);
-    if (it != m_ban_list.end() && it->second > now) return true;
-
-    auto ip_it = m_ip_ban_list.find(addr.address());
-    if (ip_it != m_ip_ban_list.end() && ip_it->second > now) return true;
-
-    return false;
-}
 
 // ── Admin API implementation ──────────────────────────────────────────
 
-void NodeImpl::set_whitelist_path(const std::string& path)
-{
-    m_whitelist_path = path;
-    if (!path.empty()) load_whitelist_from_disk();
-}
 
-void NodeImpl::load_whitelist_from_disk()
-{
-    if (m_whitelist_path.empty()) return;
-    std::ifstream f(m_whitelist_path);
-    if (!f) return;
-    try {
-        nlohmann::json j;
-        f >> j;
-        if (!j.contains("entries") || !j["entries"].is_array()) return;
-        for (const auto& e : j["entries"]) {
-            if (!e.contains("host") || !e.contains("port")) continue;
-            std::string host = e["host"].get<std::string>();
-            uint16_t port = e["port"].get<uint16_t>();
-            m_whitelist_ips.insert(host);
-            m_whitelist_hosts.insert(NetService(host, port));
-        }
-        LOG_INFO << "[Pool] Loaded " << m_whitelist_hosts.size()
-                 << " whitelist entries from " << m_whitelist_path;
-    } catch (const std::exception& e) {
-        LOG_WARNING << "[Pool] Failed to parse whitelist " << m_whitelist_path
-                    << ": " << e.what();
-    }
-}
 
-void NodeImpl::save_whitelist_to_disk() const
-{
-    if (m_whitelist_path.empty()) return;
-    try {
-        nlohmann::json j;
-        j["version"] = 1;
-        auto arr = nlohmann::json::array();
-        auto now_unix = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        for (const auto& host : m_whitelist_hosts) {
-            arr.push_back({
-                {"host", host.address()},
-                {"port", host.port()},
-                {"added_unix", now_unix}
-            });
-        }
-        j["entries"] = arr;
-        std::string tmp = m_whitelist_path + ".new";
-        {
-            std::ofstream f(tmp);
-            f << j.dump(2);
-        }
-        std::filesystem::rename(tmp, m_whitelist_path);
-    } catch (const std::exception& e) {
-        LOG_WARNING << "[Pool] Failed to persist whitelist: " << e.what();
-    }
-}
 
-static nlohmann::json build_bans_json(
-    const std::map<NetService, std::chrono::steady_clock::time_point>& peer_bans,
-    const std::map<std::string, std::chrono::steady_clock::time_point>& ip_bans)
-{
-    auto now = std::chrono::steady_clock::now();
-    auto arr = nlohmann::json::array();
-    for (const auto& [addr, expiry] : peer_bans) {
-        if (expiry <= now) continue;
-        auto secs = std::chrono::duration_cast<std::chrono::seconds>(expiry - now).count();
-        arr.push_back({{"host", addr.address()}, {"port", addr.port()},
-                       {"expires_in_sec", secs}, {"source", "auto"}});
-    }
-    for (const auto& [ip, expiry] : ip_bans) {
-        if (expiry <= now) continue;
-        auto secs = std::chrono::duration_cast<std::chrono::seconds>(expiry - now).count();
-        arr.push_back({{"host", ip}, {"port", 0},
-                       {"expires_in_sec", secs}, {"source", "admin"}});
-    }
-    return arr;
-}
 
-static nlohmann::json build_whitelist_json(const std::set<NetService>& hosts)
-{
-    auto arr = nlohmann::json::array();
-    for (const auto& h : hosts)
-        arr.push_back({{"host", h.address()}, {"port", h.port()}});
-    return arr;
-}
 
-nlohmann::json NodeImpl::admin_list_bans() const
-{
-    return {{"ok", true}, {"bans", build_bans_json(m_ban_list, m_ip_ban_list)}};
-}
 
-nlohmann::json NodeImpl::admin_ban_ip(const std::string& ip, int duration_sec)
-{
-    if (ip.empty())
-        return {{"ok", false}, {"error", "ip required"}};
-    int dur = duration_sec > 0 ? duration_sec : static_cast<int>(m_ban_duration.count());
-    auto expiry = std::chrono::steady_clock::now() + std::chrono::seconds(dur);
-    m_ip_ban_list[ip] = expiry;
-    LOG_INFO << "[Pool] Admin ban: " << ip << " for " << dur << "s";
-    return {{"ok", true}, {"action", "ban"}, {"target", ip},
-            {"duration_sec", dur},
-            {"bans", build_bans_json(m_ban_list, m_ip_ban_list)}};
-}
 
-nlohmann::json NodeImpl::admin_unban_ip(const std::string& ip)
-{
-    if (ip.empty())
-        return {{"ok", false}, {"error", "ip required"}};
-    size_t removed = m_ip_ban_list.erase(ip);
-    for (auto it = m_ban_list.begin(); it != m_ban_list.end(); ) {
-        if (it->first.address() == ip) { it = m_ban_list.erase(it); ++removed; }
-        else ++it;
-    }
-    LOG_INFO << "[Pool] Admin unban: " << ip << " (" << removed << " entries removed)";
-    return {{"ok", true}, {"action", "unban"}, {"target", ip},
-            {"removed", removed},
-            {"bans", build_bans_json(m_ban_list, m_ip_ban_list)}};
-}
 
-nlohmann::json NodeImpl::admin_list_whitelist() const
-{
-    return {{"ok", true}, {"whitelist", build_whitelist_json(m_whitelist_hosts)}};
-}
 
 nlohmann::json NodeImpl::admin_whitelist_add(const std::string& host, uint16_t port)
 {
@@ -2269,23 +2193,6 @@ nlohmann::json NodeImpl::admin_whitelist_add(const std::string& host, uint16_t p
             {"whitelist", build_whitelist_json(m_whitelist_hosts)}};
 }
 
-nlohmann::json NodeImpl::admin_whitelist_remove(const std::string& host, uint16_t port)
-{
-    if (host.empty() || port == 0)
-        return {{"ok", false}, {"error", "host and port required"}};
-    NetService addr(host, port);
-    size_t removed_h = m_whitelist_hosts.erase(addr);
-    // Only remove the IP from whitelist if no other host:port remains for it.
-    bool other_on_same_ip = std::any_of(
-        m_whitelist_hosts.begin(), m_whitelist_hosts.end(),
-        [&](const NetService& n) { return n.address() == host; });
-    if (!other_on_same_ip) m_whitelist_ips.erase(host);
-    if (removed_h) save_whitelist_to_disk();
-    LOG_INFO << "[Pool] De-whitelisted " << addr.to_string();
-    return {{"ok", true}, {"action", "whitelist_remove"},
-            {"target", addr.to_string()}, {"removed", removed_h},
-            {"whitelist", build_whitelist_json(m_whitelist_hosts)}};
-}
 
 nlohmann::json NodeImpl::admin_list_peers() const
 {

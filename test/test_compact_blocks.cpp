@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// BIP 152 Compact Block unit tests
 ///
 /// Tests:

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /* $Id: sph_shavite.h 208 2010-06-02 20:33:00Z tp $ */
 /**
  * SHAvite-3 interface. This code implements SHAvite-3 with the

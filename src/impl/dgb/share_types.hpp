@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 #include <core/uint256.hpp>
@@ -8,7 +9,7 @@
 namespace dgb
 {
 
-// SSOT delegation (oracle = 17). Serialization/consensus gate sources from
+// SSOT delegation (oracle digibyte.py:26 = 35). Serialization/consensus gate sources from
 // PoolConfig; no local literal. Symbol kept for share_check.hpp consumers.
 inline constexpr uint32_t SEGWIT_ACTIVATION_VERSION = PoolConfig::SEGWIT_ACTIVATION_VERSION;
 

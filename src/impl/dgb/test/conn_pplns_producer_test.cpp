@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DGB Phase B — per-connection PPLNS-inputs producer-assembly KAT.
 //
 // Locks dgb::make_conn_pplns_inputs() (conn_pplns_producer.hpp): the seam that

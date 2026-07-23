@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // btc::coin::broadcast_block_for_connect CONNECT-AUTHORITATIVE KATs.
 //
@@ -79,4 +80,45 @@ TEST(BtcBlockBroadcastConnect, NullP2pRpcConnects) {
 
     EXPECT_TRUE(btc::coin::broadcast_block_for_connect(no_p2p, submit));
     EXPECT_EQ(rpc_calls, 1);
+}
+// ── #744/#787 M1: a THROWING RPC leg must never destroy an ARM A relay win ──
+// Once ARM B (m_rpc) is armed, a daemon unreachable at submit time raises a
+// JsonRpcException out of submit_block_hex. Both legs of
+// broadcast_block_for_connect are now guarded so that throw cannot unwind out
+// and turn an already-succeeded P2P relay into a false "reached NEITHER -- lost
+// subsidy" alarm.
+
+// 5) RPC leg THROWS but P2P relayed -> block still counts as reaching the
+//    network (true), and no exception escapes.
+TEST(BtcBlockBroadcastConnect, RpcThrowsButP2pRelayed) {
+    auto relay  = [] { return true; };
+    auto submit = []() -> bool { throw std::runtime_error("daemon unreachable"); };
+
+    bool result = false;
+    EXPECT_NO_THROW({ result = btc::coin::broadcast_block_for_connect(relay, submit); });
+    EXPECT_TRUE(result);   // ARM A's relay win stands despite the throwing RPC leg
+}
+
+// 6) RPC leg THROWS and P2P did NOT relay -> reaches neither -> false (scream),
+//    but still no exception escapes the won-block path.
+TEST(BtcBlockBroadcastConnect, RpcThrowsAndP2pFailedReachesNeither) {
+    auto relay  = [] { return false; };
+    auto submit = []() -> bool { throw std::runtime_error("daemon unreachable"); };
+
+    bool result = true;
+    EXPECT_NO_THROW({ result = btc::coin::broadcast_block_for_connect(relay, submit); });
+    EXPECT_FALSE(result);
+}
+
+// 7) A THROWING P2P relay leg must not skip the connect-authoritative RPC leg
+//    (the RPC still delivers the block).
+TEST(BtcBlockBroadcastConnect, P2pThrowsRpcStillConnects) {
+    auto relay  = []() -> bool { throw std::runtime_error("relay sink threw"); };
+    int rpc_calls = 0;
+    auto submit = [&] { ++rpc_calls; return true; };
+
+    bool result = false;
+    EXPECT_NO_THROW({ result = btc::coin::broadcast_block_for_connect(relay, submit); });
+    EXPECT_TRUE(result);
+    EXPECT_EQ(rpc_calls, 1);   // RPC leg reached despite the throwing relay
 }

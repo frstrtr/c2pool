@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DGB Phase B — per-connection Stratum coinbase assembler + split KAT.
 //
 // Locks dgb::coin::build_connection_coinbase_parts() (coin/connection_coinbase.hpp)

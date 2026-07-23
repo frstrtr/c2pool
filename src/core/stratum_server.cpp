@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #include "stratum_server.hpp"
 #include "web_server.hpp"       // MiningInterface
 #include "address_utils.hpp"    // address utilities
@@ -14,6 +15,28 @@
 #include <cmath>
 #include <cstring>
 #include <boost/algorithm/string.hpp>
+#ifdef __linux__
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#endif
+
+namespace {
+// Sample kernel-measured TCP round-trip time for a connected socket, in ms.
+// Same value `ss -ti` prints (tcpi_rtt, microseconds). Linux-only; 0 elsewhere
+// or on any error (socket closed, not yet established).
+inline double sample_tcp_rtt_ms(int fd) {
+#ifdef __linux__
+    struct tcp_info ti;
+    socklen_t len = sizeof(ti);
+    if (fd >= 0 && ::getsockopt(fd, IPPROTO_TCP, TCP_INFO, &ti, &len) == 0)
+        return static_cast<double>(ti.tcpi_rtt) / 1000.0;
+#else
+    (void)fd;
+#endif
+    return 0.0;
+}
+}  // namespace
 
 namespace core {
 
@@ -69,6 +92,7 @@ StratumServer::StratumServer(net::io_context& ioc, const std::string& address, u
     , bind_address_(address)
     , port_(port)
     , running_(false)
+    , idle_reap_timer_(ioc)
 {
 }
 
@@ -90,7 +114,8 @@ bool StratumServer::start()
         
         running_ = true;
         accept_connections();
-        
+        start_idle_reaper();   // no-op unless session_idle_timeout_sec > 0
+
         LOG_INFO << "StratumServer started on " << bind_address_ << ":" << port_;
         return true;
         
@@ -110,6 +135,7 @@ void StratumServer::stop()
         boost::system::error_code ec;
         acceptor_.cancel(ec);
         acceptor_.close(ec);
+        idle_reap_timer_.cancel();     // stop the zombie-session reaper
         running_ = false;
 
         // Snapshot + clear the live-sessions set under the mutex, then close
@@ -152,10 +178,46 @@ void StratumServer::accept_connections()
 void StratumServer::handle_accept(boost::system::error_code ec, tcp::socket socket)
 {
     if (!ec) {
-        // Create, register, and start Stratum session
-        auto session = std::make_shared<StratumSession>(std::move(socket), mining_interface_, this);
-        register_session(session);
-        session->start();
+        // ── STRICT per-node miner cap (hotel interim fix #5) ──
+        // Admission control BEFORE register_session: if the node already holds
+        // max_stratum_connections live sessions, close the new socket cleanly,
+        // WARN, bump the refused counter, and keep accepting. 0 = unlimited.
+        // Dead sessions are normally pruned lazily in notify_all(); prune here
+        // too when at cap so lingering closed sockets never starve real miners.
+        const size_t cap = mining_interface_
+            ? mining_interface_->get_stratum_config().max_stratum_connections
+            : 0;
+        size_t live = 0;
+        if (cap > 0) {
+            std::lock_guard<std::mutex> lock(sessions_mutex_);
+            if (sessions_.size() >= cap) {
+                for (auto it = sessions_.begin(); it != sessions_.end(); ) {
+                    if (!(*it)->is_connected())
+                        it = sessions_.erase(it);
+                    else
+                        ++it;
+                }
+            }
+            live = sessions_.size();
+        }
+        if (cap > 0 && live >= cap) {
+            refused_connections_.fetch_add(1);
+            boost::system::error_code ep_ec;
+            const auto ep = socket.remote_endpoint(ep_ec);
+            LOG_WARNING << "Stratum connection refused: node at miner cap "
+                        << live << "/" << cap << " (max_stratum_connections)"
+                        << (ep_ec ? std::string{} : " peer=" + ep.address().to_string()
+                                        + ":" + std::to_string(ep.port()))
+                        << " refused_total=" << refused_connections_.load();
+            boost::system::error_code ignore;
+            socket.shutdown(tcp::socket::shutdown_both, ignore);
+            socket.close(ignore);
+        } else {
+            // Create, register, and start Stratum session
+            auto session = std::make_shared<StratumSession>(std::move(socket), mining_interface_, this);
+            register_session(session);
+            session->start();
+        }
     } else {
         LOG_ERROR << "Stratum accept error: " << ec.message();
     }
@@ -176,6 +238,29 @@ void StratumServer::unregister_session(std::shared_ptr<StratumSession> s)
 {
     std::lock_guard<std::mutex> lock(sessions_mutex_);
     sessions_.erase(s);
+}
+
+size_t StratumServer::get_session_count() const
+{
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    return sessions_.size();
+}
+
+std::pair<size_t, size_t> StratumServer::get_job_payload_stats() const
+{
+    // Snapshot sessions under the mutex, count outside it (session job maps
+    // are io-thread state — see header comment: call quiesced).
+    std::vector<std::shared_ptr<StratumSession>> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        snapshot.assign(sessions_.begin(), sessions_.end());
+    }
+    size_t distinct = 0, total = 0;
+    for (const auto& s : snapshot) {
+        distinct += s->distinct_job_payloads();
+        total    += s->active_job_count();
+    }
+    return {distinct, total};
 }
 
 double StratumServer::get_total_hashrate() const
@@ -301,6 +386,58 @@ void StratumServer::notify_all()
     }
 }
 
+void StratumServer::start_idle_reaper()
+{
+    // Zombie-session reaper (belt-and-suspenders alongside OS TCP keepalive):
+    // periodically close sessions that have sent no inbound line past the idle
+    // timeout. A live miner submits shares far inside the window; a half-open
+    // NAT-dead peer sends nothing. No-op (never re-armed) unless the DASH-set
+    // StratumConfig::session_idle_timeout_sec > 0 -> other coins unchanged.
+    const auto& cfg0 = mining_interface_ ? mining_interface_->get_stratum_config()
+                                         : core::stratum::StratumConfig{};
+    const uint32_t timeout = cfg0.session_idle_timeout_sec;
+    const bool keepalive_on = cfg0.tcp_keepalive_enabled;
+    if (timeout == 0 || !running_) return;
+
+    // Sweep at half the timeout, bounded to [15 s, 60 s], so a dead session is
+    // reclaimed within ~1.5x the timeout.
+    const uint32_t period = std::max<uint32_t>(15, std::min<uint32_t>(60, timeout / 2));
+    idle_reap_timer_.expires_after(std::chrono::seconds(period));
+    idle_reap_timer_.async_wait([this, timeout, keepalive_on](const boost::system::error_code& ec) {
+        if (ec) return;        // cancelled at shutdown
+        if (!running_) return;
+        std::vector<std::shared_ptr<StratumSession>> snapshot;
+        {
+            std::lock_guard<std::mutex> lk(sessions_mutex_);
+            snapshot.assign(sessions_.begin(), sessions_.end());
+        }
+        size_t reaped = 0;
+        for (auto& s : snapshot) {
+            if (!s->is_connected())
+                continue;   // socket already dead -> notify_all prunes it
+            if (s->seconds_since_activity() <= timeout)
+                continue;   // recently active
+            // KEEPALIVE-AWARE: when OS TCP keepalive is enabled it is the
+            // liveness authority -- a still-open socket means keepalive has NOT
+            // declared the peer dead (it force-closes dead NAT paths, which the
+            // is_connected() guard above then catches). Do NOT reap an idle-but-
+            // keepalive-validated AUTHORIZED rig: a high fixed-diff suffix
+            // (ADDR+N) can legitimately exceed the idle window between submits,
+            // and reaping it would drop a LIVE, paying miner. Idle-time reaping
+            // is the FALLBACK only where keepalive is unavailable; unauthorized
+            // sessions (never completed handshake) are always fair game.
+            if (keepalive_on && s->is_authorized())
+                continue;
+            s->drop_stale("idle timeout (no inbound share/line)");
+            ++reaped;
+        }
+        if (reaped)
+            LOG_INFO << "[Stratum] idle-reaper closed " << reaped
+                     << " stale session(s) (> " << timeout << "s idle)";
+        start_idle_reaper();   // re-arm
+    });
+}
+
 /// StratumSession Implementation
 StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<IWorkSource> mining_interface,
                                StratumServer* server)
@@ -308,7 +445,10 @@ StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<IWorkSource> 
     , mining_interface_(mining_interface)
     , server_(server)
     , connected_at_(std::chrono::steady_clock::now())
+    , last_activity_(connected_at_)
+    , last_notify_at_(connected_at_)
     , work_push_timer_(socket_.get_executor())
+    , handshake_timer_(socket_.get_executor())
 {
     subscription_id_ = generate_subscription_id();
     extranonce1_ = generate_extranonce1();
@@ -318,6 +458,7 @@ StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<IWorkSource> 
     const auto& cfg = mining_interface_->get_stratum_config();
     hashrate_tracker_.set_difficulty_bounds(cfg.min_difficulty, cfg.max_difficulty);
     hashrate_tracker_.set_target_time_per_mining_share(cfg.target_time);
+    hashrate_tracker_.set_hashrate_vardiff(cfg.use_hashrate_vardiff);
     if (cfg.vardiff_enabled)
         hashrate_tracker_.enable_vardiff();
 }
@@ -328,6 +469,8 @@ void StratumSession::start()
     auto ep = socket_.remote_endpoint(ec);
     if (ec) return; // socket closed before start() was dispatched
     LOG_INFO << "StratumSession started for client: " << ep;
+    apply_socket_keepalive();   // OS keepalive (no-op unless enabled) -- reaps NAT-dead peers
+    arm_handshake_timer();      // authorize deadline (no-op unless configured)
     read_message();
 }
 
@@ -362,10 +505,13 @@ void StratumSession::read_message()
 void StratumSession::process_message(std::size_t bytes_read)
 {
     try {
+        // Zombie-session reaper: a received line is proof of a live peer.
+        last_activity_ = std::chrono::steady_clock::now();
+
         std::istream is(&buffer_);
         std::string line;
         std::getline(is, line);
-        
+
         if (!line.empty() && line.back() == '\r') {
             line.pop_back();  // Remove \r if present
         }
@@ -410,6 +556,16 @@ void StratumSession::process_message(std::size_t bytes_read)
                 : hashrate_tracker_.get_current_difficulty();
             send_set_difficulty(initial_diff);
             send_notify_work();
+            // Idle keepalive only: arm the periodic work-push / keepalive timer
+            // as soon as the session is subscribed -- a backup pool connection
+            // commonly subscribes and then sits idle without ever submitting, and
+            // it must still be fed keepalive notifies (D9 60 s watchdog).
+            // Idempotent: the authorize path re-calls start_periodic_work_push()
+            // and it no-ops. Gated on keepalive being enabled so coins with it
+            // OFF (LTC/BTC/DGB) keep the legacy authorize-only arming.
+            if (mining_interface_
+                && mining_interface_->get_stratum_config().keepalive_notify_sec > 0)
+                start_periodic_work_push();
         }
         
     } catch (const std::exception& e) {
@@ -448,6 +604,8 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
     if (params.size() >= 1 && params[0].is_string()) {
         username_ = params[0];
         authorized_ = true;
+        // Handshake completed -> disarm the authorize deadline (zombie-session fix).
+        handshake_timer_.cancel();
 
         // ─── Step 1: Strip fixed difficulty suffix (+N) before any parsing ───
         // Format: "ADDRESS+1024" or "ADDR,ADDR+512"  →  suggested_difficulty_=N
@@ -625,11 +783,26 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
             }
         }
 
-        // If merged addresses were parsed (or auto-generated), resend work notification so the
-        // coinbase ref_hash includes them.  The initial job sent right after
-        // subscribe had empty merged_addresses because authorize hadn't run yet.
-        if (!merged_addresses_.empty() && mining_interface_) {
-            send_notify_work(true);  // force clean_jobs so miner drops old job without merged_addrs
+        // Resend work after a successful authorize. The job sent right after
+        // subscribe was built before authorize ran, so it carried neither the
+        // miner's primary payout address (username_ was empty -> empty
+        // payout_script -> degenerate value-0 OP_RETURN coinbase) nor any merged
+        // addresses. Two distinct primary classes need this resend, and NEITHER
+        // populates merged_addresses_:
+        //   (1) Standalone parent coins (BCH/BTC, no merged chains) never
+        //       populate merged_addresses_ at all.
+        //   (2) A P2WSH/P2TR primary (Cases 7-9) carries a 32-byte witness
+        //       program that cannot reduce to a 20-byte hash160, so the
+        //       auto-derive above is skipped and merged_addresses_ stays empty
+        //       even for a merged coin (LTC/DOGE) whose username_ IS set.
+        // Gating the resend on merged_addresses_ alone left BOTH classes mining
+        // the payout-less coinbase -> BCHN bad-txns/BIP30 on a won block. Resend
+        // whenever the now-known username_ or merged addrs can change the
+        // coinbase: address_to_script(username_) yields the real witness/script
+        // payout for (2) exactly as it yields the P2PKH payout for (1).
+        // force_clean so the miner drops the stale job.
+        if (mining_interface_ && (!username_.empty() || !merged_addresses_.empty())) {
+            send_notify_work(true);
         }
         
         // Start periodic work push (every SHARE_PERIOD) to keep miner on fresh work
@@ -646,6 +819,7 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
                 wi.remote_endpoint = socket_.remote_endpoint().address().to_string()
                     + ":" + std::to_string(socket_.remote_endpoint().port());
             } catch (...) {}
+            wi.rtt_ms = sample_tcp_rtt_ms(socket_.native_handle());
             mining_interface_->register_stratum_worker(session_id_, wi);
         }
         
@@ -873,6 +1047,17 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     if (params.size() < 5 || !params[1].is_string() || !params[2].is_string()
         || !params[3].is_string() || !params[4].is_string()) {
         ++rejected_shares_;
+        // Rate-limited (≤ once / REJECT_LOG_INTERVAL / session) malformed-params
+        // reject diagnostic — a misbehaving client sending garbage submits is
+        // otherwise silent. INFO + throttled so it cannot flood.
+        {
+            auto now_lg = std::chrono::steady_clock::now();
+            if (now_lg - last_badparams_log_ >= REJECT_LOG_INTERVAL) {
+                last_badparams_log_ = now_lg;
+                LOG_INFO << "[Stratum] REJECT bad-params user=" << username_
+                         << " nparams=" << params.size();
+            }
+        }
         nlohmann::json response;
         response["id"] = request_id;
         response["result"] = false;
@@ -920,6 +1105,7 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
                      << ": block template changed (job=" << job_id
                      << " job_prev=" << job_it->second.gbt_prevhash.substr(0, 16)
                      << " current_prev=" << current_prevhash.substr(0, 16) << ")";
+            ++doa_shares_;
             // DON'T set job.stale_info here — it would break ref_hash.
             // The share is still created and broadcast (matches p2pool behavior).
             // DOA tracking is for statistics/dashboard only.
@@ -930,6 +1116,9 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     // CRITICAL: copy the job snapshot — do NOT hold a reference.
     // handle_submit() may trigger notify_all() → send_notify_work() → new job
     // added to active_jobs_ → map rebalance → reference invalidated → SIGSEGV.
+    // (The heavyweight template data is behind job.payload, a shared_ptr, so
+    // this copy is cheap and the payload stays alive even if the entry is
+    // evicted mid-processing.)
     const auto job = job_it->second;
 
     // ASICBoost: apply version rolling bits to the job version
@@ -976,9 +1165,9 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     // every BTC stratum submission gets a garbage scrypt-based diff and
     // rejects at the vardiff gate.
     double share_difficulty = mining_interface_->compute_share_difficulty(
-        job.coinb1, job.coinb2,
+        job.payload->coinb1, job.payload->coinb2,
         extranonce1_, extranonce2, ntime, nonce,
-        effective_version, job.gbt_prevhash, job.nbits, job.merkle_branches);
+        effective_version, job.gbt_prevhash, job.nbits, job.payload->merkle_branches);
     // VARDIFF: acceptance threshold is the per-connection adaptive difficulty.
     // p2pool accepts ALL pseudoshares meeting effective_target (VARDIFF level),
     // not just those meeting pool share_bits. This gives smooth hashrate data.
@@ -990,8 +1179,21 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     if (sb != 0)
         pool_difficulty = chain::target_to_difficulty(chain::bits_to_target(sb));
 
-    // Use VARDIFF as stratum acceptance threshold
+    // Use VARDIFF as stratum acceptance threshold — but validate the share
+    // against the difficulty THIS job was issued at (the target the miner
+    // actually received), not the live vardiff. A vardiff UP-retarget between
+    // job-issue and submit must not reject the miner's in-flight shares — that
+    // was the sole source of the DASH hotel's ~28% "Low difficulty share"
+    // rejects (X11 hashrate swings oscillate vardiff; every up-retarget
+    // rejected in-flight work). Faithful port of p2pool-dash work.py:477
+    // ("within 3 work events" grace): p2pool judges each share by its OWN job's
+    // target. Take the lenient lower of {live vardiff, this job's issued diff}.
+    // issued_difficulty==0 (unset) ⇒ old behavior. REWARD-NEUTRAL: the pool
+    // target + block-target checks below are independent and unchanged, so a
+    // real block (which far exceeds any vardiff) is unaffected on all coins.
     double required_difficulty = vardiff_difficulty;
+    if (job.issued_difficulty > 0.0 && job.issued_difficulty < required_difficulty)
+        required_difficulty = job.issued_difficulty;
 
     // Build JobSnapshot BEFORE the rejection gate — needed for block-level
     // checking which must run on ALL submissions, not just accepted ones.
@@ -1010,13 +1212,13 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     }
 
     MiningInterface::JobSnapshot snapshot;
-    snapshot.coinb1          = job.coinb1;
-    snapshot.coinb2          = job.coinb2;
+    snapshot.coinb1          = job.payload->coinb1;
+    snapshot.coinb2          = job.payload->coinb2;
     snapshot.gbt_prevhash    = job.gbt_prevhash;
     snapshot.nbits           = job.nbits;           // share target bits (for header construction)
     snapshot.block_nbits     = job.gbt_block_nbits; // original GBT block bits (for block target check)
     snapshot.version         = effective_version;  // use rolled version for block construction
-    snapshot.merkle_branches = job.merkle_branches;
+    snapshot.merkle_branches = job.payload->merkle_branches;
     snapshot.tx_data         = job.tx_data;
     snapshot.mweb            = job.mweb;
     snapshot.segwit_active   = job.segwit_active;
@@ -1034,9 +1236,9 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     snapshot.frozen_ref.bits = job.frozen_bits;
     snapshot.frozen_ref.timestamp = job.frozen_timestamp;
     snapshot.frozen_ref.merged_payout_hash = job.frozen_merged_payout_hash;
-    snapshot.frozen_ref.frozen_merkle_branches = job.frozen_merkle_branches;
+    snapshot.frozen_ref.frozen_merkle_branches = job.payload->frozen_merkle_branches;
     snapshot.frozen_ref.frozen_witness_root = job.frozen_witness_root;
-    snapshot.frozen_ref.frozen_merged_coinbase_info = job.frozen_merged_coinbase_info;
+    snapshot.frozen_ref.frozen_merged_coinbase_info = job.payload->frozen_merged_coinbase_info;
     snapshot.frozen_ref.share_version = job.share_version;
     snapshot.frozen_ref.desired_version = job.desired_version;
     // NOTE: stale_info is NOT propagated here. It must match what ref_hash_fn
@@ -1050,6 +1252,18 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     // Above pool target → also a P2P share (broadcast to network).
     if (share_difficulty < required_difficulty) {
         ++rejected_shares_;
+        // Rate-limited (≤ once / REJECT_LOG_INTERVAL / session) low-diff reject
+        // diagnostic: surfaces the exact diff triplet so a firmware-grid gap
+        // between advertised/issued and required is visible in the field.
+        {
+            auto now_lg = std::chrono::steady_clock::now();
+            if (now_lg - last_lowdiff_log_ >= REJECT_LOG_INTERVAL) {
+                last_lowdiff_log_ = now_lg;
+                LOG_INFO << "[Stratum] REJECT low-diff user=" << username_ << " job=" << job_id
+                         << " hash_diff=" << share_difficulty << " required=" << required_difficulty
+                         << " issued=" << job.issued_difficulty << " vardiff=" << vardiff_difficulty;
+            }
+        }
         // Record rejection for VARDIFF timing (p2pool only records accepted,
         // but we need the timing signal to avoid stalling VARDIFF).
         hashrate_tracker_.record_mining_share_submission(vardiff_difficulty, false);
@@ -1062,10 +1276,18 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
 
     // ── Pseudoshare accepted — record in RateMonitor ──
     // p2pool: work = target_to_average_attempts(effective_target)
-    // For us: work = vardiff_difficulty × 2^32 (equivalent unit conversion)
+    // For us: work = credited_difficulty × 2^32 (equivalent unit conversion)
     ++accepted_shares_;
     static constexpr double TWO_32 = 4294967296.0;
-    double work = vardiff_difficulty * TWO_32;
+    // #766/#762: credit the hashrate estimate at the difficulty THIS job was
+    // actually issued/mined at, not the live vardiff. A vardiff retarget
+    // between job-issue and submit must not skew the EWMA/RateMonitor input —
+    // the share represents work at its own job's target. Falls back to the live
+    // vardiff when issued_difficulty is unset (0). Estimate/stats only; the
+    // acceptance gate above is unchanged.
+    double credited_difficulty =
+        (job.issued_difficulty > 0.0) ? job.issued_difficulty : vardiff_difficulty;
+    double work = credited_difficulty * TWO_32;
     bool is_dead = (job.stale_info != 0);
 
     // Record in global RateMonitor (for get_local_addr_rates)
@@ -1073,7 +1295,21 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
         server_->record_pseudoshare(work, pubkey_hash_, username_, is_dead);
 
     // Record in per-connection tracker (for VARDIFF adjustment + per-session stats)
-    hashrate_tracker_.record_mining_share_submission(vardiff_difficulty, true);
+    hashrate_tracker_.record_mining_share_submission(credited_difficulty, true);
+
+    // Best-share dashboard feed: every ACCEPTED pseudoshare's real (X11/scrypt)
+    // difficulty is a candidate for the "Best Share" card (highest-difficulty
+    // share seen — how close a miner got to a block). Default no-op; a work
+    // source whose dashboard is a separate object (c2pool-dash) overrides this
+    // to forward into the dashboard's best-share tracker. share_difficulty is
+    // the true per-hash difficulty computed above; pass the raw submit fields so
+    // the implementor can recover the exact pow-hash. Display only.
+    mining_interface_->record_best_pseudoshare(
+        share_difficulty, username_,
+        job.payload->coinb1, job.payload->coinb2,
+        extranonce1_, extranonce2, ntime, nonce,
+        effective_version, job.gbt_prevhash, job.nbits,
+        job.payload->merkle_branches);
 
     // Check if VARDIFF changed → send new difficulty AND new work to miner.
     // p2pool (stratum.py:594-595): after adjusting target, calls _send_work()
@@ -1127,6 +1363,8 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
             0.0,
             hashrate_tracker_.get_current_difficulty(),
             accepted_shares_, rejected_shares_, stale_shares_);
+        mining_interface_->update_stratum_worker_rtt(session_id_,
+            sample_tcp_rtt_ms(socket_.native_handle()));
     }
 
     nlohmann::json response;
@@ -1140,6 +1378,20 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
 void StratumSession::send_response(const nlohmann::json& response)
 {
     try {
+        // Write-queue backlog cap (zombie-session fix): a dead peer whose kernel
+        // send buffer has filled never drains the async_write, so the queue
+        // grows unbounded. Past the configured depth, drop the session rather
+        // than accumulate. 0 = unlimited (legacy; other coins unchanged).
+        const size_t cap = mining_interface_
+            ? mining_interface_->get_stratum_config().max_write_queue_depth
+            : 0;
+        if (cap > 0 && write_queue_.size() >= cap) {
+            LOG_WARNING << "[Stratum] session " << session_id_
+                        << " write backlog " << write_queue_.size()
+                        << " >= cap " << cap << " -- dropping stuck session";
+            drop_stale("write-queue backlog exceeded");
+            return;
+        }
         std::string message = response.dump() + "\n";
         write_queue_.push_back(std::move(message));
         if (!writing_)
@@ -1243,8 +1495,16 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         auto now = std::chrono::steady_clock::now().time_since_epoch().count();
         auto prev = s_last_warn.load();
         if (now - prev > 30'000'000'000LL) { // 30 seconds
-            if (s_last_warn.compare_exchange_strong(prev, now))
-                LOG_WARNING << "[LTC] Waiting for block template (header sync in progress)...";
+            if (s_last_warn.compare_exchange_strong(prev, now)) {
+                // Runtime coin tag from the work-source config — this core is
+                // coin-agnostic and must never hardcode a coin (issue #732:
+                // a DASH binary logging "[LTC]" sent the operator diagnosing
+                // the wrong coin). Neutral fallback when unset.
+                const std::string& sym =
+                    mining_interface_->get_stratum_config().coin_symbol;
+                LOG_WARNING << "[" << (sym.empty() ? "Stratum" : sym)
+                            << "] Waiting for block template (header sync in progress)...";
+            }
         }
         auto timer = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
         timer->expires_after(std::chrono::seconds(1));
@@ -1364,13 +1624,82 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         }
     }
 
+    // ── ATOMIC SNAPSHOT: header fields (stale-payee fix) ──
+    // When the work source froze the header fields WITH the coinbase
+    // (snapshot.has_header — DASH does; the masternode payee rotates every
+    // block), they OVERRIDE the tmpl values fetched separately at the top of
+    // this function. tmpl and the coinbase are otherwise two independent
+    // fetches that can straddle a template refresh (TTL expiry / tip move /
+    // RPC-reconnect churn): the issued job would then carry the NEW tip's
+    // prevhash with a coinbase built for the OLD height's masternode payee —
+    // hex-confirmed on DASH testnet as a submit-time bad-cb-payee reject of a
+    // byte-correct-at-build coinbase (a lost block reward). With the override,
+    // header + coinbase + branches + tx set are ONE frozen template unit.
+    // Work sources that leave has_header false are byte-unchanged.
+    if (cbr.snapshot.has_header) {
+        gbt_prevhash = cbr.snapshot.gbt_prevhash;
+        prevhash     = gbt_to_stratum_prevhash(gbt_prevhash);
+        version_u32  = cbr.snapshot.header_version;
+        {
+            std::ostringstream ss;
+            ss << std::hex << std::setw(8) << std::setfill('0') << version_u32;
+            version = ss.str();
+        }
+        if (!cbr.snapshot.block_nbits_hex.empty()) {
+            gbt_block_nbits = cbr.snapshot.block_nbits_hex;
+            nbits           = gbt_block_nbits;
+        }
+        if (cbr.snapshot.curtime) {
+            curtime = cbr.snapshot.curtime;
+            std::ostringstream ts;
+            ts << std::hex << std::setw(8) << std::setfill('0') << curtime;
+            ntime = ts.str();
+        }
+    }
+
+    // ── Unmineable-job gate (stale-payee fix, defect 2) ──
+    // Refuse to register/serve a job that is not real mineable work:
+    //   (a) require_job_snapshot set (DASH) but the per-connection builder did
+    //       NOT return an atomic snapshot — assembling a job from the separate
+    //       tmpl fetch + the stub/global coinbase would be exactly the MIXED
+    //       template unit the atomic binding above exists to prevent;
+    //   (b) an empty / all-zero prevhash (the observed pre-auth zero-hash
+    //       job_0 defect): a zeroed prev is not work on any chain.
+    // Same retry posture as the no-template path at the top: skip + 1 s timer.
+    if (mining_interface_->get_stratum_config().require_job_snapshot) {
+        const bool snapshot_missing = !cbr.snapshot.has_header;
+        const bool zero_prev = gbt_prevhash.empty()
+            || gbt_prevhash.find_first_not_of('0') == std::string::npos;
+        if (snapshot_missing || zero_prev) {
+            const std::string& sym =
+                mining_interface_->get_stratum_config().coin_symbol;
+            LOG_WARNING << "[" << (sym.empty() ? "Stratum" : sym)
+                        << "] job suppressed ("
+                        << (snapshot_missing ? "no atomic header+coinbase snapshot"
+                                             : "empty/zero prevhash")
+                        << ") — not serving unmineable/mixed work; retrying in 1s";
+            auto timer = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
+            timer->expires_after(std::chrono::seconds(1));
+            timer->async_wait([weak_self = weak_from_this(), timer](boost::system::error_code ec) {
+                if (ec) return;
+                auto self = weak_self.lock();
+                if (!self || !self->is_connected()) return;
+                self->send_notify_work();
+            });
+            return;
+        }
+    }
+
     // ── ATOMIC SNAPSHOT: merkle branches ──
     // Override merkle branches with snapshot captured atomically with coinbase.
     // This ensures the merkle tree matches the witness commitment in coinb1.
-    // NOTE: Header fields (prevhash, version, bits, ntime) are NOT overridden —
-    // they come from the current daemon state and are independent of the
-    // coinbase/tx_data consistency. Overriding them caused GENTX validation
-    // failures on p2pool nodes (absheight, bits mismatch).
+    // NOTE: For work sources without has_header, the header fields (prevhash,
+    // version, bits, ntime) are NOT overridden — they come from the current
+    // daemon state and are independent of the coinbase/tx_data consistency.
+    // Overriding them from a DIFFERENT fetch caused GENTX validation failures
+    // on p2pool nodes (absheight, bits mismatch); the has_header override
+    // above is safe because its fields come from the SAME snapshot as the
+    // coinbase itself.
     if (!cbr.snapshot.merkle_branches.empty()) {
         merkle_branches_vec = std::move(cbr.snapshot.merkle_branches);
         merkle_branches = nlohmann::json::array();
@@ -1382,9 +1711,61 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
     bool clean_jobs = force_clean || (prevhash != last_prevhash_);
     last_prevhash_ = prevhash;
 
-    // Track this job — evict oldest if at capacity (keep MAX_ACTIVE_JOBS for late shares)
-    while (active_jobs_.size() >= MAX_ACTIVE_JOBS) {
-        active_jobs_.erase(active_jobs_.begin());
+    // ── Shared per-generation payload (hotel interim fix #2) ──
+    // coinb1/coinb2 (coinb2 carries the PPLNS outputs) + the merkle branch
+    // vectors are the dominant per-job allocations. Within one work generation
+    // a session rebuilds byte-identical copies on every notify (VARDIFF pushes,
+    // safety timer, best-share-unchanged refreshes) — fold them into ONE
+    // refcounted block shared by all jobs of that generation. Reuse is gated
+    // on a full byte-compare, so any change (new template, new tip, rolled
+    // extranonce, changed payout set) allocates a fresh payload: the bytes a
+    // miner receives are IDENTICAL to the pre-fix per-job copies.
+    const uint64_t work_generation = mining_interface_->get_work_generation();
+    std::shared_ptr<const JobEntry::SharedJobPayload> payload;
+    if (payload_cache_ && payload_cache_generation_ == work_generation
+        && payload_cache_->coinb1 == coinb1
+        && payload_cache_->coinb2 == coinb2
+        && payload_cache_->merkle_branches == merkle_branches_vec
+        && payload_cache_->frozen_merkle_branches == cbr.snapshot.frozen_ref.frozen_merkle_branches
+        && payload_cache_->frozen_merged_coinbase_info == cbr.snapshot.frozen_ref.frozen_merged_coinbase_info) {
+        payload = payload_cache_;  // byte-identical → share the block
+    } else {
+        auto p = std::make_shared<JobEntry::SharedJobPayload>();
+        p->coinb1 = coinb1;
+        p->coinb2 = coinb2;
+        p->merkle_branches = std::move(merkle_branches_vec);
+        p->frozen_merkle_branches = cbr.snapshot.frozen_ref.frozen_merkle_branches;
+        p->frozen_merged_coinbase_info = cbr.snapshot.frozen_ref.frozen_merged_coinbase_info;
+        payload = std::move(p);
+        payload_cache_ = payload;
+        payload_cache_generation_ = work_generation;
+    }
+
+    // ── Job tracking: FIFO + 300 s TTL eviction (hotel interim fix #1) ──
+    // active_jobs_ is an unordered_map: erase(begin()) removed an ARBITRARY
+    // entry — possibly the job the miner is hashing right now — producing
+    // nondeterministic stale-rejects under notify storms. job_order_ records
+    // insertion order so we evict the genuinely-OLDEST job first, and a TTL
+    // sweep expires entries older than JOB_TTL (300 s), mirroring p2pool's
+    // ExpiringDict semantics. The most recently issued job (deque back) is
+    // never evicted — it is the job the miner is currently on.
+    const auto now_steady = std::chrono::steady_clock::now();
+    // TTL sweep (oldest-first; stop at the first young entry).
+    while (job_order_.size() > 1) {
+        auto oldest = active_jobs_.find(job_order_.front());
+        if (oldest == active_jobs_.end()) {  // defensive: desynced id
+            job_order_.pop_front();
+            continue;
+        }
+        if (now_steady - oldest->second.created_at < JOB_TTL)
+            break;
+        active_jobs_.erase(oldest);
+        job_order_.pop_front();
+    }
+    // FIFO capacity eviction (keep MAX_ACTIVE_JOBS for late shares).
+    while (active_jobs_.size() >= MAX_ACTIVE_JOBS && job_order_.size() > 1) {
+        active_jobs_.erase(job_order_.front());
+        job_order_.pop_front();
     }
     {
         JobEntry je;
@@ -1392,12 +1773,16 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         je.gbt_prevhash = gbt_prevhash;
         je.nbits = nbits;
         je.ntime = curtime;
-        je.coinb1 = coinb1;
-        je.coinb2 = coinb2;
+        je.payload = payload;
         je.version = version_u32;
-        je.merkle_branches = std::move(merkle_branches_vec);
         je.gbt_block_nbits = gbt_block_nbits;
+        je.created_at = now_steady;
+        // Freeze the vardiff advertised with this job so the submit gate can
+        // validate a share against the target the miner actually received
+        // (p2pool-dash work.py:477 grace), immune to later vardiff retargets.
+        je.issued_difficulty = hashrate_tracker_.get_current_difficulty();
         active_jobs_[job_id] = std::move(je);
+        job_order_.push_back(job_id);
     }
 
     // Store the SAME frozen prev_share_hash that was used for ref_hash computation
@@ -1424,9 +1809,9 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         je.frozen_bits = cbr.snapshot.frozen_ref.bits;
         je.frozen_timestamp = cbr.snapshot.frozen_ref.timestamp;
         je.frozen_merged_payout_hash = cbr.snapshot.frozen_ref.merged_payout_hash;
-        je.frozen_merkle_branches = cbr.snapshot.frozen_ref.frozen_merkle_branches;
+        // frozen_merkle_branches + frozen_merged_coinbase_info live in the
+        // shared payload (je.payload) — see fix #2 above.
         je.frozen_witness_root = cbr.snapshot.frozen_ref.frozen_witness_root;
-        je.frozen_merged_coinbase_info = cbr.snapshot.frozen_ref.frozen_merged_coinbase_info;
         je.share_version = cbr.snapshot.frozen_ref.share_version;
         je.desired_version = cbr.snapshot.frozen_ref.desired_version;
         je.has_frozen = true;
@@ -1454,6 +1839,13 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
     // Track generation so safety timer doesn't re-push unchanged work
     last_pushed_generation_ = mining_interface_->get_work_generation();
 
+    // Idle keepalive-notify bookkeeping: record when we last put a mining.notify
+    // on the wire so the periodic push can tell an idle session (no notify for
+    // keepalive_notify_sec) from a recently-fed one. Covers EVERY notify path
+    // (event-driven, VARDIFF, safety, keepalive) so a real notify resets the
+    // idle clock and the keepalive never piggybacks right after one.
+    last_notify_at_ = std::chrono::steady_clock::now();
+
     send_response(notification);
 }
 
@@ -1461,9 +1853,19 @@ void StratumSession::start_periodic_work_push()
 {
     // Safety-net timer: push work only if the template changed since last push.
     // p2pool has no periodic push — work is pushed purely by events (new block,
-    // new best_share, VARDIFF). This 30-second fallback catches edge cases where
-    // an event-driven notify_all() might miss a session.
-    work_push_timer_.expires_after(std::chrono::seconds(5));
+    // new best_share, VARDIFF). This fallback catches edge cases where an
+    // event-driven notify_all() might miss a session. When idle keepalive-notify
+    // is enabled (StratumConfig::keepalive_notify_sec) the SAME timer also feeds
+    // an idle-but-live session a non-clean refresh so a client-side no-notify
+    // watchdog never drops it (see schedule_work_push_timer). First tick soon;
+    // never later than the keepalive interval so an idle session is fed promptly.
+    if (periodic_push_started_) return;   // arm exactly once (subscribe/authorize)
+    periodic_push_started_ = true;
+    const auto& cfg = mining_interface_->get_stratum_config();
+    uint32_t first = 5;
+    if (cfg.keepalive_notify_sec > 0)
+        first = std::min<uint32_t>(first, cfg.keepalive_notify_sec);
+    work_push_timer_.expires_after(std::chrono::seconds(first));
     schedule_work_push_timer();
 }
 
@@ -1475,13 +1877,34 @@ void StratumSession::schedule_work_push_timer()
     // Matches p2pool Twisted: transport owns timers, connectionLost is teardown.
     work_push_timer_.async_wait([self = shared_from_this()](boost::system::error_code ec) {
         if (ec || !self->is_connected()) return;
-        self->work_push_timer_.expires_after(std::chrono::seconds(30));
+        const auto& cfg = self->mining_interface_->get_stratum_config();
+        // Re-arm at the keepalive interval when enabled (so the idle check runs
+        // often enough to stay under the client watchdog), else the legacy 30 s
+        // safety cadence -- LTC/BTC/DGB (keepalive_notify_sec == 0) unchanged.
+        const uint32_t interval =
+            cfg.keepalive_notify_sec > 0 ? cfg.keepalive_notify_sec : 30;
+        self->work_push_timer_.expires_after(std::chrono::seconds(interval));
         self->schedule_work_push_timer();
         try {
             auto current_gen = self->mining_interface_->get_work_generation();
             if (current_gen != self->last_pushed_generation_) {
+                // Work actually changed -> event-style push (may be clean_jobs).
                 self->send_notify_work();
                 self->last_pushed_generation_ = current_gen;
+            } else if (cfg.keepalive_notify_sec > 0
+                       && self->is_subscribed()
+                       && self->seconds_since_last_notify() * 2
+                              >= static_cast<double>(cfg.keepalive_notify_sec)) {
+                // Idle keepalive: nothing changed and this session has had no
+                // notify for >= half the interval. Re-send the CURRENT job as a
+                // non-clean (force_clean=false) mining.notify to feed a client-
+                // side no-notify watchdog (measured D9: 60 s) so an otherwise-
+                // idle BACKUP connection never flaps. clean_jobs stays false, so
+                // the ASIC keeps its current work -- this is a liveness ping, not
+                // a work reset. The half-interval guard bounds the worst-case gap
+                // between notifies to ~1.5x the interval (well under the watchdog)
+                // while never piggybacking right after an event notify.
+                self->send_notify_work(false);
             }
         } catch (const std::exception& e) {
             LOG_WARNING << "[STRATUM] Work push error: " << e.what();
@@ -1489,15 +1912,99 @@ void StratumSession::schedule_work_push_timer()
     });
 }
 
+size_t StratumSession::distinct_job_payloads() const
+{
+    // Pointer-identity census of the shared per-generation payloads (fix #2).
+    // Bounded-memory evidence for the flat-RSS KAT: with N active jobs of one
+    // work generation this returns 1, not N.
+    std::set<const void*> ptrs;
+    for (const auto& [id, je] : active_jobs_) {
+        (void)id;
+        if (je.payload)
+            ptrs.insert(static_cast<const void*>(je.payload.get()));
+    }
+    return ptrs.size();
+}
+
 void StratumSession::cancel_timers()
 {
     // Cancel pending timer — callback fires with ec=operation_aborted → returns.
     // Timer is a member, so it outlives all its callbacks (no use-after-free).
     work_push_timer_.cancel();
+    handshake_timer_.cancel();
     // Close socket so is_connected() returns false for any already-dequeued
     // callbacks that fire with ec=success after cancel().
     boost::system::error_code ec;
     socket_.close(ec);
+}
+
+// ── Zombie-session fixes (transport/liveness only; consensus-neutral) ────────
+
+void StratumSession::apply_socket_keepalive()
+{
+    // Enable OS TCP keepalive so the kernel actively probes an idle peer and
+    // errors the pending async_read when a NAT path has gone dead (the peer
+    // never sent FIN/RST). This is THE root fix for immortal subscribed
+    // sessions -- socket_.is_open() alone never falsifies for a half-open NAT
+    // drop. No-op unless the (DASH-set) StratumConfig knob is enabled, so
+    // LTC/BTC/DGB behaviour is unchanged.
+    const auto& cfg = mining_interface_->get_stratum_config();
+    if (!cfg.tcp_keepalive_enabled) return;
+
+    boost::system::error_code ec;
+    socket_.set_option(boost::asio::socket_base::keep_alive(true), ec);   // portable (asio)
+    if (ec) {
+        LOG_WARNING << "[Stratum] SO_KEEPALIVE set failed: " << ec.message();
+        return;
+    }
+    // Per-probe tuning (idle/interval/count) is Linux-specific -- Windows tunes
+    // keepalive via WSAIoctl(SIO_KEEPALIVE_VALS) and macOS via TCP_KEEPALIVE, so
+    // guard exactly like sample_tcp_rtt_ms() above (#ifdef __linux__). Off-Linux
+    // the portable keep_alive(true) above still arms keepalive with OS defaults;
+    // the DASH deploy target is Linux, where the 60/10/3 tuning (~90 s detect)
+    // applies. This keeps core building on the Windows/macOS CI lanes.
+#ifdef __linux__
+    const int fd = socket_.native_handle();
+    int idle  = static_cast<int>(cfg.tcp_keepalive_idle_sec);
+    int intvl = static_cast<int>(cfg.tcp_keepalive_interval_sec);
+    int cnt   = static_cast<int>(cfg.tcp_keepalive_count);
+    ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
+    ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
+    LOG_TRACE << "[Stratum] TCP keepalive armed (idle=" << idle
+              << "s interval=" << intvl << "s count=" << cnt << ")";
+#else
+    LOG_TRACE << "[Stratum] TCP keepalive armed (OS-default probe timing; "
+                 "per-probe tuning is Linux-only)";
+#endif
+}
+
+void StratumSession::arm_handshake_timer()
+{
+    // Drop a session that never completes mining.authorize within the deadline
+    // (a live rig authorizes in << 1 s; a half-open probe never does). Disarmed
+    // in handle_authorize(). No-op unless configured. Member timer + weak self
+    // keepalive so a fired-after-close callback is a safe no-op.
+    const auto& cfg = mining_interface_->get_stratum_config();
+    if (cfg.handshake_timeout_sec == 0) return;
+    handshake_timer_.expires_after(std::chrono::seconds(cfg.handshake_timeout_sec));
+    std::weak_ptr<StratumSession> weak = shared_from_this();
+    handshake_timer_.async_wait([weak](const boost::system::error_code& ec) {
+        if (ec) return;  // cancelled (authorized, or shutdown)
+        auto self = weak.lock();
+        if (!self) return;
+        if (!self->authorized_ && self->is_connected())
+            self->drop_stale("handshake (authorize) deadline");
+    });
+}
+
+void StratumSession::drop_stale(const char* reason)
+{
+    LOG_INFO << "[Stratum] dropping stale session " << session_id_
+             << " (" << reason << ")";
+    // cancel_timers() closes the socket; the pending async_read then fails and
+    // runs the standard disconnect path (unregister worker, log). Idempotent.
+    cancel_timers();
 }
 
 // Parse multi-chain addresses from username string.
@@ -1561,4 +2068,3 @@ std::string StratumSession::generate_extranonce1()
 }
 
 } // namespace core
-

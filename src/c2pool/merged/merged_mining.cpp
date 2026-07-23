@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #include "merged_mining.hpp"
 
 #include <core/log.hpp>
@@ -442,9 +443,31 @@ AuxWork AuxChainRPC::create_aux_block(const std::string& address)
 bool AuxChainRPC::submit_block(const std::string& block_hex)
 {
     try {
-        call("submitblock", nlohmann::json::array({block_hex}));
-        LOG_INFO << "[MM:" << m_config.symbol << "] Block submitted successfully!";
-        return true;
+        auto result = call("submitblock", nlohmann::json::array({block_hex}));
+        // BIP22: submitblock returns a NULL result on ACCEPT; a REJECTION is
+        // delivered as a non-null string RESULT ("rejected", "high-hash",
+        // "bad-txnmrklroot", ...), NOT a JSON-RPC error -- so a
+        // template-divergence reject does NOT throw. Interpreting throw-or-not as
+        // accept-or-not (the previous behaviour) mis-records a rejected block as
+        // WON. Treat any non-null result as a rejection, except the
+        // duplicate/inconclusive verdicts which mean the daemon already has (or
+        // may still accept) the block -> a win.
+        if (result.is_null()) {
+            LOG_INFO << "[MM:" << m_config.symbol << "] submitblock ACCEPTED";
+            return true;
+        }
+        const std::string reason =
+            result.is_string() ? result.get<std::string>() : result.dump();
+        if (reason == "duplicate" || reason == "duplicate-invalid" ||
+            reason == "duplicate-inconclusive" || reason == "inconclusive") {
+            LOG_INFO << "[MM:" << m_config.symbol
+                     << "] submitblock duplicate/inconclusive (" << reason
+                     << ") -- treated as accepted";
+            return true;
+        }
+        LOG_ERROR << "[MM:" << m_config.symbol
+                  << "] submitblock REJECTED by daemon: " << reason;
+        return false;
     } catch (const std::exception& e) {
         LOG_WARNING << "[MM:" << m_config.symbol << "] submitblock failed: " << e.what();
         return false;
@@ -454,9 +477,22 @@ bool AuxChainRPC::submit_block(const std::string& block_hex)
 bool AuxChainRPC::submit_aux_block(const uint256& block_hash, const std::string& auxpow_hex)
 {
     try {
-        call("submitauxblock", nlohmann::json::array({block_hash.GetHex(), auxpow_hex}));
-        LOG_INFO << "[MM:" << m_config.symbol << "] Aux block ACCEPTED by daemon!";
-        return true;
+        auto result = call("submitauxblock",
+                           nlohmann::json::array({block_hash.GetHex(), auxpow_hex}));
+        // submitauxblock returns a BOOLEAN result: true = accepted, false =
+        // rejected (e.g. "block hash unknown" for a hash the daemon never minted
+        // via createauxblock). Honor it -- the previous code discarded the result
+        // and returned true unless call() threw, so a false-result rejection was
+        // mis-recorded as a won block. (No run-path caller today: the DOGE
+        // PPLNS-committed hash is structurally not createauxblock-minted, so this
+        // path is not wired as a fallback -- corrected here for latent safety.)
+        const bool accepted = result.is_boolean() ? result.get<bool>() : false;
+        if (accepted)
+            LOG_INFO << "[MM:" << m_config.symbol << "] submitauxblock ACCEPTED by daemon";
+        else
+            LOG_ERROR << "[MM:" << m_config.symbol
+                      << "] submitauxblock REJECTED by daemon: " << result.dump();
+        return accepted;
     } catch (const std::exception& e) {
         LOG_WARNING << "[MM:" << m_config.symbol << "] submitauxblock failed: " << e.what();
         return false;
@@ -571,6 +607,16 @@ IAuxChainBackend* MergedMiningManager::get_chain_rpc(uint32_t chain_id)
             return chain.rpc.get();
     }
     return nullptr;
+}
+
+bool MergedMiningManager::has_chain(uint32_t chain_id) const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    for (const auto& chain : m_chains) {
+        if (chain.config.chain_id == chain_id)
+            return true;
+    }
+    return false;
 }
 
 void MergedMiningManager::start()
@@ -1012,10 +1058,31 @@ void MergedMiningManager::try_submit_merged_blocks(
                          << "] Merged block submitted (" << block_hex.size()/2 << " bytes"
                          << ", snapshot hash=" << committed_block_hash.GetHex().substr(0, 16) << ")";
                 {
+                    // Transient manual-submit artifact kept at a fixed /tmp
+                    // path (NOT re-rooted under --data-dir): routing an
+                    // env/CLI-derived path into a file sink trips CodeQL
+                    // cpp/path-injection, and the state that matters for
+                    // co-located isolation (LevelDB, addrs, logs) is already
+                    // re-rooted via config_path(). See #722.
                     std::string path = "/tmp/c2pool_doge_block_" + std::to_string(chain.current_work.height) + ".hex";
                     std::ofstream f(path);
                     if (f.is_open()) { f << block_hex; f.close(); }
                 }
+                // DOGE dual-path broadcast (the viable pair for a PPLNS merged
+                // block): ARM B = full-block submitblock to a local daemon; ARM A =
+                // the INDEPENDENT embedded P2P relay (m_block_relay_fn, bound in
+                // main_ltc). The P2P relay fires UNCONDITIONALLY -- including when
+                // the local submitblock is REJECTED for a transient/local reason --
+                // because it is an independent arm that can still land the block on
+                // the network; gating it on `ok` would drop a working reward-safety
+                // arm. #744 note: submitauxblock is NOT a viable fallback here.
+                // DOGE ships multiaddress=true and rebuild_cached_blocks commits
+                // current_work.block_hash to c2pool's self-built PPLNS block hash,
+                // which the daemon's AuxpowMiner never minted via createauxblock, so
+                // submitauxblock of it is always rejected ("block hash unknown") --
+                // and the daemon's own template would pay its aux address, violating
+                // the trustless merged-payout invariant. So the canonical aux path
+                // is deliberately NOT wired as a fallback.
                 bool ok = chain.rpc->submit_block(block_hex);
                 record_discovered_block(chain, ok, parent_hash.GetHex());
                 if (m_block_relay_fn) {

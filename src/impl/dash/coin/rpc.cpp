@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #include "rpc.hpp"
 
 #include <impl/dash/coin/rpc_request.hpp>
@@ -7,6 +8,11 @@
 #include <core/core_util.hpp>    // core::timestamp() (getwork latency)
 
 #include <util/strencodings.h>   // ParseHex / HexStr
+
+#ifndef _WIN32
+#include <sys/socket.h>          // setsockopt SO_SND/RCVTIMEO (Send() deadline)
+#include <sys/time.h>            // struct timeval
+#endif
 
 namespace dash
 {
@@ -74,6 +80,10 @@ void NodeRPC::connect(NetService address, std::string userpass)
                     {
                         try
                         {
+                            // Bound the synchronous Send() I/O BEFORE check()
+                            // runs its first RPC, so a wedged dashd cannot hang
+                            // the caller (io thread or background rpc_pool).
+                            apply_socket_timeouts();
                             if (check())
                             {
                                 m_connected = true;
@@ -114,12 +124,23 @@ void NodeRPC::reconnect()
     m_connected = false;
     LOG_WARNING << "RPC connection lost — reconnecting in 15 seconds...";
     m_stream.close();
+    // Stale-payee fix: the connection churned — anything cached from before
+    // this point (template / masternode payee) must not be served or
+    // submitted. Notify the observer (DASHWorkSource cache invalidation).
+    if (m_on_reconnect)
+        m_on_reconnect();
     m_reconnect_timer = std::make_unique<core::Timer>(m_context, false);
     m_reconnect_timer->start(15, [this]() { connect(m_address, m_userpass); });
 }
 
 void NodeRPC::sync_reconnect()
 {
+    // Stale-payee fix: fire the churn observer FIRST — the caller (Send) is
+    // about to retry against a fresh connection; any template cached from the
+    // dead connection's era is suspect and must be invalidated.
+    if (m_on_reconnect)
+        m_on_reconnect();
+
     beast::error_code ec;
     m_stream.socket().shutdown(io::ip::tcp::socket::shutdown_both, ec);
     m_stream.close();
@@ -135,11 +156,59 @@ void NodeRPC::sync_reconnect()
         LOG_WARNING << "CoindRPC sync_reconnect connect failed: " << ec.message();
         return;
     }
+    apply_socket_timeouts();   // re-arm the Send() deadline on the fresh socket
     LOG_INFO << "CoindRPC reconnected (sync)";
+}
+
+void NodeRPC::close_stream()
+{
+    // Same teardown idiom as sync_reconnect()/the destructor. m_connected is
+    // cleared so the next Send() write-fails into a clean sync_reconnect().
+    beast::error_code ec;
+    m_stream.socket().shutdown(io::ip::tcp::socket::shutdown_both, ec);
+    m_stream.close();
+    m_connected = false;
+}
+
+void NodeRPC::apply_socket_timeouts()
+{
+    // Force the socket back to BLOCKING mode, then set kernel send/receive
+    // timeouts. async_connect (connect()) leaves asio's non_blocking flag set;
+    // under it a synchronous recv returns EAGAIN immediately and SO_RCVTIMEO is
+    // a no-op. In blocking mode the sync http::write/http::read inside Send()
+    // do true blocking send()/recv() which the kernel bounds by SO_SND/RCVTIMEO,
+    // returning an error after RPC_IO_TIMEOUT_SECONDS instead of hanging on a
+    // wedged dashd. (beast tcp_stream::expires_after cannot be used: it only
+    // governs ASYNC ops -- the sync path calls socket.read_some() directly.)
+    // Per-operation inactivity timeout: a large-but-steadily-arriving GBT does
+    // NOT trip it; only a genuine stall does. POSIX (SO_*TIMEO takes a timeval);
+    // guarded off Windows (no <sys/time.h>/timeval, and Winsock SO_RCVTIMEO takes
+    // a DWORD) -- the DASH deploy target is Linux, and macOS keeps the real
+    // deadline. On Windows this is a no-op (pre-PR behaviour: no deadline).
+#ifndef _WIN32
+    if (!m_stream.socket().is_open())
+        return;
+    boost::system::error_code ec;
+    m_stream.socket().non_blocking(false, ec);   // guarantee SO_*TIMEO applies
+    if (ec)
+        LOG_WARNING << "CoindRPC: could not set blocking mode: " << ec.message();
+    struct timeval tv;
+    tv.tv_sec  = RPC_IO_TIMEOUT_SECONDS;
+    tv.tv_usec = 0;
+    const int fd = m_stream.socket().native_handle();
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
 }
 
 std::string NodeRPC::Send(const std::string &request)
 {
+    // io-thread-decouple / LTC parity (impl/ltc/coin/rpc.cpp:136): serialize the
+    // whole write+read+reconnect. getwork()/submit_block_hex (io thread) and the
+    // tip-poll's getbestblockhash (background rpc_pool thread) both drive this
+    // single shared beast client; m_http_request/m_stream are not thread-safe.
+    // The socket deadline (apply_socket_timeouts) bounds how long the lock is held.
+    std::lock_guard<std::mutex> _rpc_lock(m_rpc_mutex);
     // Retry once after synchronous reconnect on write/read failure
     for (int attempt = 0; attempt < 2; ++attempt)
     {
@@ -157,6 +226,10 @@ std::string NodeRPC::Send(const std::string &request)
                 sync_reconnect();
                 continue;
             }
+            // Deadline-desync guard (see the read-fail path below): tear the
+            // socket down before giving up so a partially-written request can
+            // never be answered into a LATER Send() on a reused connection.
+            close_stream();
             return {};
         }
 
@@ -175,6 +248,17 @@ std::string NodeRPC::Send(const std::string &request)
                 sync_reconnect();
                 continue;
             }
+            // Deadline-desync guard (SO_RCVTIMEO deadline hazard): this final
+            // attempt has already WRITTEN the request into dashd but its response
+            // is unread (read timed out). jsonrpccxx reuses the constant id
+            // "curltest" and never validates response ids, so reusing this open
+            // connection would make the NEXT Send() read THIS request's late
+            // response -> permanent off-by-one desync (a GBT would parse a
+            // getbestblockhash string -> zeroed work -> a stuck "honest set-gap"
+            // outage until the connection churns). Tear the socket down so the
+            // next Send() write-fails into a clean sync_reconnect(). Already
+            // under m_rpc_mutex.
+            close_stream();
             return {};
         }
 
@@ -337,16 +421,9 @@ DashWorkData NodeRPC::getwork()
     // We accept both shapes. Platform credit-pool OP_RETURN burns surface as a
     // payee with an empty/"6a" script -> normalized to "!6a".
     auto push_payment = [&w](const nlohmann::json& entry) {
-        PackedPayment pp;
-        if (entry.is_object())
-        {
-            if (entry.contains("payee") && entry["payee"].is_string())
-                pp.payee = entry["payee"].get<std::string>();
-            else if (entry.contains("script") && entry["script"].is_string())
-                pp.payee = "!" + entry["script"].get<std::string>();
-            if (entry.contains("amount"))
-                pp.amount = entry["amount"].get<uint64_t>();
-        }
+        // bad-cb-payee fix: empty payee strings normalize to the raw "!"+script
+        // form (see rpc_data.hpp::normalize_payment) instead of being dropped.
+        PackedPayment pp = normalize_payment(entry);
         if (pp.amount == 0)
             return;
         w.m_packed_payments.push_back(std::move(pp));
@@ -407,11 +484,16 @@ void NodeRPC::submit_block(BlockType& block, bool ignore_failure)
 bool NodeRPC::submit_block_hex(const std::string& block_hex, bool ignore_failure)
 {
     auto result = m_client.CallMethod<nlohmann::json>(ID, "submitblock", {block_hex});
-    bool success = result.is_null();
+    // Dual-path contract (M1): a "duplicate"/"inconclusive"/already-have result
+    // means the OTHER broadcast arm already landed this block on the network —
+    // that is SUCCESS, not failure. See submitblock_result_accepted().
+    const bool success = dash::coin::submitblock_result_accepted(result);
     if (!success && !ignore_failure)
         LOG_ERROR << "submit_block_hex result: " << result.dump();
     else if (success)
-        LOG_INFO << "submit_block_hex accepted";
+        LOG_INFO << "submit_block_hex accepted"
+                 << (result.is_null() ? std::string{}
+                                      : " (already on network: " + result.dump() + ")");
     return success;
 }
 
@@ -439,6 +521,18 @@ nlohmann::json NodeRPC::getmininginfo()
     return CallAPIMethod("getmininginfo");
 }
 
+// Trivial tip probe -- `getbestblockhash` returns the best-block hash as a bare
+// JSON string. Returns "" if the daemon result is null/absent (never throws on
+// a well-formed-but-empty result; transport errors still propagate to the
+// caller, which swallows them). No dashd config change is required.
+std::string NodeRPC::getbestblockhash()
+{
+    auto result = CallAPIMethod("getbestblockhash");
+    if (result.is_string())
+        return result.get<std::string>();
+    return {};
+}
+
 // verbose: true -- json result, false -- hex-encode result;
 nlohmann::json NodeRPC::getblockheader(uint256 header, bool verbose)
 {
@@ -449,6 +543,18 @@ nlohmann::json NodeRPC::getblockheader(uint256 header, bool verbose)
 nlohmann::json NodeRPC::getblock(uint256 blockhash, int verbosity)
 {
     return CallAPIMethod("getblock", {blockhash, verbosity});
+}
+
+// E2c (#738): the MN-set seed fetch. `protx list valid true` returns every
+// registered, non-PoSe-banned masternode at the current tip with the detailed
+// per-MN state (payoutAddress, lastPaidHeight, registeredHeight, PoSe
+// heights, pubKeyOperator, ...). Chosen over `protx diff`: the diff (even
+// extended) carries payoutAddress but NOT lastPaidHeight/registeredHeight, so
+// a diff-seeded set would rank every MN equal in GetMNPayee ordering and
+// project the WRONG payee (the bad-cb-payee class #746 fixed).
+nlohmann::json NodeRPC::protx_list_valid_detailed()
+{
+    return CallAPIMethod("protx", {"list", "valid", true});
 }
 
 } // namespace coin

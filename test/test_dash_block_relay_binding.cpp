@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase S8 — WonBlockRelay <-> DashBroadcaster binding KATs.
 ///
 /// Exercises src/impl/dash/block_relay_binding.hpp — the adapter that pulls the

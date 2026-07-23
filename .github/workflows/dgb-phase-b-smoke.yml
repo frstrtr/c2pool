@@ -1,0 +1,105 @@
+name: DGB Phase-B smoke — per-coin pillar gtests
+
+# ci-steward 2026-07-06. Per-coin smoke for the DGB (DigiByte) lane: assert the
+# DGB Phase-B pillars (block assembly, witness commitment, mempool ingest,
+# won-block reconstruction, header ingest/sample-build, share) build and their
+# gtest suites run green. CI plumbing only — NO consensus knowledge here; the
+# dgb lane owns the targets and the gate script (tests/gates/dgb_phase_b_smoke.sh).
+#
+# Network-free CI arm only: ctest -R the pillar suites BY NAME with an empty-suite
+# guard demanding a positive test count (false-green trap caught in the script).
+#
+# Neutral-skip: on branches/coins without the DGB Phase-B sources the job is a
+# green no-op. Register as a required check only after a confirmed non-hollow
+# green rollup on the runner.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  dgb-phase-b-smoke:
+    name: DGB Phase-B smoke — per-coin pillar gtests
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set per-job Conan home
+        run: |
+          # github-hosted: ephemeral per-job home, warmed by actions/cache below.
+          # self-hosted:   PERSISTENT home keyed on the runner instance. A runner
+          # executes one job at a time, so this home is never contended (no
+          # sqlite "failed to acquire database lock in 20s") while still keeping
+          # the per-job isolation of #704/#710 -- no two concurrent jobs share it.
+          # Being persistent, it also takes the GH cache-service restore off the
+          # hot path: that restore times out on VM905 ("Failed to restore: The
+          # operation cannot be completed in timeout") and its miss cascaded into
+          # a cold from-source Boost rebuild on all 8 runners at once.
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+          else
+            echo "CONAN_HOME=$HOME/.conan2-ci/$RUNNER_NAME" >> "$GITHUB_ENV"
+          fi
+
+      - name: Check DGB Phase-B source presence
+        id: presence
+        run: |
+          if [ -f "src/impl/dgb/test/block_assembly_test.cpp" ] && [ -f "tests/gates/dgb_phase_b_smoke.sh" ]; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+            echo "::notice::DGB Phase-B sources present — running per-coin smoke."
+          else
+            echo "exists=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::DGB Phase-B sources absent on this branch — neutral skip."
+          fi
+
+      - name: Install system dependencies
+        if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends g++ cmake make libleveldb-dev libsecp256k1-dev
+
+      - uses: actions/setup-python@v6
+        if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'
+        with: { python-version: '3.12' }
+
+      - name: Install Conan 2
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
+
+      - name: Show committed Conan profile
+        if: steps.presence.outputs.exists == '1'
+        run: conan profile show -pr:a=ci/conan/linux-gcc13.profile
+
+      - name: Restore Conan cache (github-hosted only)
+        if: runner.environment == 'github-hosted' && steps.presence.outputs.exists == '1'
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/conan2
+          key: conan2-ubuntu24-gcc13-dgb-smoke-${{ hashFiles('conanfile.txt', 'ci/conan/linux-gcc13.profile', 'conan.lock') }}
+          restore-keys: |
+            conan2-ubuntu24-gcc13-dgb-smoke-
+            conan2-ubuntu24-gcc13-
+
+      - name: Clean stale build dir (self-hosted workspace is reused)
+        if: steps.presence.outputs.exists == '1' && runner.environment != 'github-hosted'
+        run: rm -rf build_dgb_smoke
+
+      - name: Run DGB Phase-B smoke (dgb-lane entrypoint)
+        if: steps.presence.outputs.exists == '1'
+        env:
+          BUILD_DIR: ${{ github.workspace }}/build_dgb_smoke
+        run: bash tests/gates/dgb_phase_b_smoke.sh
+
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace

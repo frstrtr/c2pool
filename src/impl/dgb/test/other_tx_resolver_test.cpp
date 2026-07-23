@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // dgb_other_tx_resolver_test -- pins coin/other_tx_resolver.hpp, the won-block
 // reconstructor's (#82) transaction_hash_refs -> ordered other_tx hash walk.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // G1 greenlight-gate KAT — DGB net/consensus byte-parity vs the oracle.
 //
 // FENCED conformance test (no production code touched). This is the test-form
@@ -47,7 +48,7 @@ constexpr uint32_t ORACLE_SHARE_PERIOD        = 15;     // s
 constexpr uint32_t ORACLE_CHAIN_LENGTH        = 2880;   // 12h / 15s
 constexpr uint32_t ORACLE_SPREAD              = 24;
 constexpr uint32_t ORACLE_TARGET_LOOKBEHIND   = 100;
-constexpr uint32_t ORACLE_MIN_PROTO_VERSION   = 1700;   // digibyte.py NEW_MIN (accept-floor)
+constexpr uint32_t ORACLE_MIN_PROTO_VERSION   = 1400;   // oracle cold floor: p2p.py:153 getattr fallback (digibyte.py sets no MINIMUM_PROTOCOL_VERSION)
 constexpr uint32_t ORACLE_ADV_PROTO_VERSION   = 3501;   // p2p.py:28 Protocol.VERSION
 constexpr uint32_t ORACLE_SEGWIT_ACT_VERSION  = 35;     // digibyte.py:27
 constexpr uint64_t ORACLE_DUST_THRESHOLD      = 100000; // 0.001 DGB

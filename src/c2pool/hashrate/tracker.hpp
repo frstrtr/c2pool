@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 #include <chrono>
@@ -51,6 +52,21 @@ private:
     // Whether vardiff auto-adjustment is active (only for stratum per-connection trackers)
     bool vardiff_enabled_ = false;
 
+    // --- Hashrate-based vardiff (stable-by-construction; opt-in per tracker) ---
+    // Sets difficulty directly from a smoothed hashrate estimate
+    // (D = H_est * target_time / 2^32) instead of the ratio feedback loop, which
+    // oscillates because new_diff = current_diff / ratio(current_diff). Off by
+    // default; DASH opts in via set_hashrate_vardiff(true). Port of p2pool-dash
+    // work.py:369-376 target modulation. The legacy ratio path stays byte-identical.
+    bool     use_hashrate_vardiff_   = false;
+    double   vardiff_ewma_tau_       = 90.0;  // s; hashrate estimator time constant (60-120)
+    double   vardiff_deadband_       = 0.10;  // only move diff when change > 10%
+    int      vardiff_warmup_shares_  = 4;     // keep seed/initial diff until warm
+    double   ewma_work_              = 0.0;   // exp-decayed sum of accepted-share difficulty
+    double   ewma_last_decay_time_   = 0.0;   // epoch s
+    double   ewma_first_share_time_  = 0.0;   // epoch s
+    uint64_t ewma_share_count_       = 0;
+
     // Statistics
     uint64_t total_mining_shares_submitted_ = 0;
     uint64_t total_mining_shares_accepted_ = 0;
@@ -70,6 +86,8 @@ public:
     void set_difficulty_bounds(double min_difficulty, double max_difficulty);
     void set_target_time_per_mining_share(double target_seconds);
     void enable_vardiff(bool enabled = true);
+    // Enable the stable-by-construction hashrate-based vardiff (DASH). Off = legacy ratio feedback.
+    void set_hashrate_vardiff(bool on) { use_hashrate_vardiff_ = on; }
 
     // Backward compatibility
     void record_share_submission(double difficulty, bool accepted) {
@@ -92,6 +110,10 @@ public:
 
 private:
     void adjust_difficulty();
+    // Hashrate-based vardiff helpers (all take epoch-seconds 'now'; caller holds shares_mutex_).
+    void   record_share_for_hashrate(double issued_difficulty, double now);
+    double get_recent_hashrate(double now) const;   // EWMA H/s (600s get_current_hashrate() untouched)
+    void   set_difficulty_from_hashrate(double now);
 };
 
 } // namespace hashrate

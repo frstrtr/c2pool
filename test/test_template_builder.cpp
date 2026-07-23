@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase 3 — TemplateBuilder unit tests
 ///
 /// Tests the LTC TemplateBuilder, subsidy schedule, Merkle tree, and

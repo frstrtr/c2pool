@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 #include <core/config.hpp>
@@ -34,7 +35,16 @@ public:
     static constexpr uint16_t P2P_PORT                  = 5024;
     static constexpr uint32_t SPREAD                    = 24;
     static constexpr uint32_t TARGET_LOOKBEHIND         = 100;
-    static constexpr uint32_t MINIMUM_PROTOCOL_VERSION    = 1700;  // floor (p2pool-dgb-scrypt digibyte.py NEW_MIN)
+    // Inbound P2P accept-floor. Oracle p2pool-dgb-scrypt networks/digibyte.py sets NO
+    // MINIMUM_PROTOCOL_VERSION, so the cold handshake floor is the p2p.py:153 getattr
+    // fallback = 1400. (Prior 1700 + "NEW_MIN" sourcing was fabricated -- digibyte.py
+    // has no such field, and 1700 bound neither oracle anchor.)
+    static constexpr uint32_t MINIMUM_PROTOCOL_VERSION    = 1400;  // oracle p2p.py:153 getattr fallback (cold)
+    // Ratchet TARGET (oracle data.py:81 BaseShare.MINIMUM_PROTOCOL_VERSION): the runtime
+    // floor lifts 1400->3500 once counts[share.VERSION] >= 95% of the window
+    // (update_min_protocol_version, data.py:857). The runtime 95%-ratchet wiring is the
+    // step-2 follow-up PR; this constant documents the target value.
+    static constexpr uint32_t SHARE_MINIMUM_PROTOCOL_VERSION = 3500;
     static constexpr uint32_t ADVERTISED_PROTOCOL_VERSION = 3501;  // advertised P2P protocol capability == oracle frstrtr/p2pool-dgb-scrypt p2p.py:28 Protocol.VERSION
     static constexpr uint32_t SEGWIT_ACTIVATION_VERSION = 35;     // canonical oracle p2pool-dgb-scrypt digibyte.py:27 (merged-v36 farsider350=17 WAIVED for DGB per operator 2026-06-17)
     static constexpr uint32_t BLOCK_MAX_SIZE            = 32000000;

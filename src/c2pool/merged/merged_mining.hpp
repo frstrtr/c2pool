@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 #include <string>
@@ -240,6 +241,11 @@ public:
 
     // Number of registered chains
     size_t chain_count() const { return m_chains.size(); }
+
+    // True if a chain with this chain_id is registered (embedded OR rpc).
+    // NOTE: distinct from get_chain_rpc(), which returns only the RPC
+    // fallback backend (null for embedded-primary chains with no fallback).
+    bool has_chain(uint32_t chain_id) const;
 
     // Get RPC client for a chain (for wiring broadcaster getpeerinfo)
     IAuxChainBackend* get_chain_rpc(uint32_t chain_id);

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // c2pool::dgb::make_header_sample / compact_to_target test (embedded-ingest
 // HeaderSample builder).

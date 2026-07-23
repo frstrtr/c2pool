@@ -1,5 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 #include <boost/asio.hpp>
+#include <optional>
 
 #include <core/log.hpp>
 #include <core/socket.hpp>
@@ -19,7 +21,7 @@ class Server
 {
 private:
 	INetwork* m_node;
-	io::ip::tcp::acceptor m_acceptor;
+	std::optional<io::ip::tcp::acceptor> m_acceptor;
 
 protected:
 	void accept()
@@ -30,7 +32,7 @@ protected:
         // fall back to raw m_node (preserves prior behavior).
         auto weak_node = m_node->weak_from_this();
         bool was_managed = weak_node.lock() != nullptr;
-        m_acceptor.async_accept(
+        m_acceptor->async_accept(
 			[this, weak_node, was_managed](boost::system::error_code ec, io::ip::tcp::socket io_socket)
 			{
 				if (ec)
@@ -57,24 +59,35 @@ protected:
 
 public:
 	Server(io::io_context* context, INetwork* node, const std::string& /*label*/ = "")
-		: m_acceptor(*context), m_node(node)
+		: m_node(node)
 	{
+		// Rig-free / test construction (context == nullptr, e.g. a default-
+		// constructed BaseNode used for share-admit unit tests) leaves the
+		// acceptor unengaged so no null io_context is dereferenced. listen()
+		// is only valid once a real io_context has been wired in.
+		if (context)
+			m_acceptor.emplace(*context);
 	}
 
 	void listen(auto listen_port)
     {
+        if (!m_acceptor)
+        {
+            LOG_ERROR << "listen() called on a context-less Server";
+            return;
+        }
         io::ip::tcp::endpoint listen_ep(io::ip::tcp::v4(), listen_port);
 
-        m_acceptor.open(listen_ep.protocol());
-		m_acceptor.set_option(io::socket_base::reuse_address(true));
-		m_acceptor.bind(listen_ep);
-		m_acceptor.listen();
+        m_acceptor->open(listen_ep.protocol());
+		m_acceptor->set_option(io::socket_base::reuse_address(true));
+		m_acceptor->bind(listen_ep);
+		m_acceptor->listen();
 		accept();
 
 		LOG_INFO << "Factory started for port: " << listen_ep.port();
     }
 
-	uint16_t listen_port() const { return m_acceptor.local_endpoint().port(); }
+	uint16_t listen_port() const { return m_acceptor->local_endpoint().port(); }
 };
 
 class Client
@@ -82,7 +95,7 @@ class Client
 private:
 	INetwork* m_node;
 	io::io_context* m_context;
-    io::ip::tcp::resolver m_resolver;
+    std::optional<io::ip::tcp::resolver> m_resolver;
     std::string m_label = "Net";  // chain/protocol label for log messages
 
 	void connect_socket(boost::asio::ip::tcp::resolver::results_type endpoints)
@@ -136,7 +149,12 @@ private:
 		// only enforce the alive check when there WAS a shared owner to
 		// begin with.
 		bool was_managed = weak_node.lock() != nullptr;
-		m_resolver.async_resolve(addr.address(), addr.port_str(),
+		if (!m_resolver)
+		{
+			LOG_ERROR << "resolve() called on a context-less Client";
+			return;
+		}
+		m_resolver->async_resolve(addr.address(), addr.port_str(),
 			[this, weak_node, was_managed, addr = addr](const auto& ec, auto endpoints)
 			{
 				if (ec)
@@ -160,8 +178,13 @@ private:
 
 public:
 	Client(io::io_context* context, INetwork* node, const std::string& label = "Net")
-		: m_context(context), m_resolver(*context), m_node(node), m_label(label)
+		: m_node(node), m_context(context), m_label(label)
 	{
+		// Rig-free / test construction (context == nullptr) defers the resolver
+		// so no null io_context is dereferenced; resolve()/connect() are only
+		// valid once a real io_context has been wired in.
+		if (context)
+			m_resolver.emplace(*context);
 	}
 
 	void connect(NetService addr)

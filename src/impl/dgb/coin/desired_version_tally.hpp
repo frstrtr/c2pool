@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // SSOT for the DGB DESIRED-VERSION TALLY -- the pure accumulation core of
@@ -78,6 +79,83 @@ accumulate_version_counts(const std::vector<uint64_t>& window)
     for (uint64_t dv : window)
         counts[dv]++;
     return counts;
+}
+
+// Runtime P2P accept-floor RATCHET -- SSOT for the oracle update_min_protocol_version
+// (p2pool-dgb-scrypt data.py:857-863), the runtime sibling of the 60% version-switch
+// gate (share_check.hpp step 2). Both read the SAME work-weighted desired-version map
+// over the SAME window [CHAIN_LENGTH*9//10, CHAIN_LENGTH//10] behind the best share's
+// parent (main.py:216 / data.py:562 call-site); this one lifts the inbound handshake
+// floor instead of rejecting a share.
+//
+// Oracle (data.py:857):
+//     def update_min_protocol_version(counts, share):
+//         minpver    = getattr(share.net, 'MINIMUM_PROTOCOL_VERSION', 1400)
+//         newminpver = share.MINIMUM_PROTOCOL_VERSION
+//         if (counts is not None) and (minpver < newminpver):
+//             if counts.get(share.VERSION, 0) >= sum(counts.itervalues())*95//100:
+//                 share.net.MINIMUM_PROTOCOL_VERSION = newminpver
+//
+// `counts` here is get_desired_version_counts -- WORK-WEIGHTED by
+// target_to_average_attempts(share.target), keyed by desired_version, looked up by the
+// best share's VERSION. c2pool's get_desired_version_weights is the byte-faithful
+// match (see accumulate_version_weights above), so this function consumes that map
+// directly. Pure: no I/O, inputs unmutated; returns the (possibly lifted) floor.
+//
+// Integer math is the oracle's exactly: ratchet iff
+//     best_weight >= floor(total_weight * 95 / 100).
+// We floor-divide (total*95)/100 and NOT the cross-multiplied best*100 >= total*95
+// idiom -- the two differ at the boundary when (total*95) % 100 != 0 (then floor-div
+// accepts best == floor(...), cross-mult rejects it), and the oracle floor-divides.
+inline uint32_t ratchet_min_protocol_version(
+    const std::map<uint64_t, uint288>& version_weights,
+    int64_t  best_version,
+    uint32_t current_floor,
+    uint32_t target_floor)
+{
+    if (current_floor >= target_floor)          // oracle: minpver < newminpver guard
+        return current_floor;
+
+    uint288 best_weight;
+    uint288 total_weight;
+    for (const auto& [ver, w] : version_weights) {
+        total_weight = total_weight + w;
+        if (static_cast<int64_t>(ver) == best_version)
+            best_weight = best_weight + w;
+    }
+    // oracle: counts.get(share.VERSION, 0) >= sum(counts.itervalues())*95//100
+    if (best_weight >= (total_weight * uint32_t(95)) / uint32_t(100))
+        return target_floor;
+    return current_floor;
+}
+
+// Runtime WIRING decision -- the call-site guard the pure ratchet above deliberately
+// omits. ratchet_min_protocol_version mirrors ONLY the oracle dict-branch
+// (data.py:861): over an empty/partial window it ratchets (0 >= 0), because the
+// oracle's None / full-window guard lives at the CALL SITE (main.py:212):
+//     if len(shares) > CHAIN_LENGTH:
+//         counts = get_desired_version_counts(tracker,
+//             get_nth_parent_hash(previous_share.hash, CHAIN_LENGTH*9//10), CHAIN_LENGTH//10)
+//         update_min_protocol_version(counts, best_share)
+// Without this guard a fresh node (parent_height < CHAIN_LENGTH -> empty window) would
+// spuriously lift the floor to 3500 and reject every legitimate peer. This function is
+// that guard: no lift until a FULL window exists behind the best share's parent, then
+// delegate to the pure ratchet over the [CHAIN_LENGTH*9/10, CHAIN_LENGTH] window the
+// caller sampled (the SAME window as the 60% version-switch gate, share_check step 2).
+inline uint32_t apply_min_protocol_ratchet_decision(
+    int32_t  parent_height,
+    int32_t  chain_length,
+    const std::map<uint64_t, uint288>& window_weights,
+    int64_t  best_version,
+    uint32_t current_floor,
+    uint32_t target_floor)
+{
+    if (current_floor >= target_floor)      // oracle guard: minpver < newminpver
+        return current_floor;
+    if (parent_height < chain_length)       // oracle main.py:212: len(shares) > CHAIN_LENGTH
+        return current_floor;               // no full window yet -> never lift
+    return ratchet_min_protocol_version(
+        window_weights, best_version, current_floor, target_floor);
 }
 
 }  // namespace dgb

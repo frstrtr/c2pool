@@ -10,6 +10,12 @@ endif()
 if(MSVC)
     # Suppress common MSVC warnings for POSIX names and unsafe CRT functions
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS _WINSOCK_DEPRECATED_NO_WARNINGS)
+    # Enable C++ unwind semantics (/EHsc). Boost headers (asio, log, signals2)
+    # reference the inline boost::throw_exception, which links as an unresolved
+    # external (LNK2019) unless exceptions are enabled. The pinned Conan MSVC
+    # toolchain does not guarantee CMake's default /EHsc, so set it explicitly
+    # for every MSVC target — the coin binaries and the CI boost_sentinel alike.
+    add_compile_options(/EHsc)
 endif()
 
 # Handle CMake 3.30+ policy for FindBoost removal
@@ -27,6 +33,35 @@ find_package(Boost QUIET OPTIONAL_COMPONENTS system)
 
 find_package(nlohmann_json REQUIRED)
 find_package(yaml-cpp REQUIRED)  # hoisted to root so yaml-cpp::yaml-cpp is visible to src/c2pool OBJECT libs (sibling of src/core)
+
+# Optional dashd ZMQ `hashblock` INSTANT tip-notify (DASH fallback-arm hardening
+# on top of the #770 3 s poll). libzmq is an OPTIONAL dependency: when present
+# the c2pool-dash --coin-zmq-hashblock path is compiled (C2POOL_ZMQ define);
+# when absent c2pool-dash builds + runs exactly as the poll-only path. The conan
+# recipe (zeromq/4.3.5) exposes the CMake target `libzmq` via package `ZeroMQ`.
+option(C2POOL_WITH_ZMQ "Build dashd ZMQ hashblock instant tip-notify (optional; needs libzmq)" ON)
+set(C2POOL_ZMQ_AVAILABLE OFF)
+set(C2POOL_ZMQ_TARGET "")
+if(C2POOL_WITH_ZMQ)
+    find_package(ZeroMQ QUIET)
+    if(TARGET libzmq)
+        set(C2POOL_ZMQ_AVAILABLE ON)
+        set(C2POOL_ZMQ_TARGET libzmq)
+    elseif(TARGET libzmq-static)
+        set(C2POOL_ZMQ_AVAILABLE ON)
+        set(C2POOL_ZMQ_TARGET libzmq-static)
+    elseif(TARGET zmq)
+        set(C2POOL_ZMQ_AVAILABLE ON)
+        set(C2POOL_ZMQ_TARGET zmq)
+    endif()
+    if(C2POOL_ZMQ_AVAILABLE)
+        message(STATUS "dashd ZMQ hashblock tip-notify: ENABLED (libzmq via ${C2POOL_ZMQ_TARGET})")
+    else()
+        message(STATUS "dashd ZMQ hashblock tip-notify: DISABLED (libzmq not found; c2pool-dash builds poll-only)")
+    endif()
+else()
+    message(STATUS "dashd ZMQ hashblock tip-notify: DISABLED (C2POOL_WITH_ZMQ=OFF)")
+endif()
 
 # Threading (needed by LevelDB on some platforms)
 find_package(Threads REQUIRED)
@@ -81,6 +116,17 @@ endif()
 include_directories(include)
 include_directories(src)
 
+# Boost.Asio build compat (build-only, no behaviour change): force-include the
+# handler_invoke_helpers shim ahead of every C++ TU so a legacy system Boost
+# leaking boost/asio/impl/system_executor.hpp cannot break the conan-pinned
+# build on any coin, regardless of ccache eviction. See core/boost_asio_compat.hpp.
+# MSVC/Windows carries no legacy *system* Boost under /usr/include, so it has
+# nothing to leak and does not need (or resolve) this force-include. Gating to
+# non-MSVC avoids C1083 on the MSVC path while keeping the Linux/macOS fix.
+if(NOT MSVC)
+  add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-include;core/boost_asio_compat.hpp>")
+endif()
+
 # Make secp256k1 headers available globally (needed by btclibs, impl/)
 if(SECP256K1_INCLUDE_DIRS)
     include_directories(${SECP256K1_INCLUDE_DIRS})
@@ -88,5 +134,9 @@ endif()
 
 add_subdirectory(src)
 add_subdirectory(test)
+# Boost header-integrity + version sentinel (CI compile-gate; testing-only).
+if(GTest_FOUND OR GTEST_FOUND)
+    add_subdirectory(ci/sentinel)
+endif()
 # add_subdirectory(benchmark)
 # add_subdirectory(temp)

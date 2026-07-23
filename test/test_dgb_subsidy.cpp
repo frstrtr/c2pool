@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Regression test: DGB block subsidy vs the coin's OWN canonical oracle,
 // p2pool-dgb-scrypt (bitcoin/networks/digibyte.py :: get_subsidy).
 //

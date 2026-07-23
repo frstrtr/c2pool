@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // Dash v36 activation LATCH — the persisted VOTING -> ACTIVATED -> CONFIRMED
@@ -31,7 +32,7 @@
 // live share_check caller yet (the caller feeds it the already-computed
 // v36_active boolean), so it is socket-free testable and zero consensus risk.
 
-#include "config_pool.hpp"   // dash::PoolConfig::CHAIN_LENGTH
+#include "config_pool.hpp"   // dash::SharechainConfig::CHAIN_LENGTH
 
 #include <nlohmann/json.hpp>
 
@@ -72,7 +73,7 @@ struct ActivationLatch
     LatchState state          = LatchState::Voting;
     uint64_t   version        = 36;     // the version this latch tracks activation of
     uint64_t   activated_height = 0;    // height at which v36_active first held (valid iff != Voting)
-    uint64_t   confirm_span   = 2ull * PoolConfig::CHAIN_LENGTH;  // 2*CHAIN_LENGTH ancestors
+    uint64_t   confirm_span   = 2ull * SharechainConfig::CHAIN_LENGTH;  // 2*CHAIN_LENGTH ancestors
 
     bool is_confirmed() const { return state == LatchState::Confirmed; }
 

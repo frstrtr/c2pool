@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 /// Phase C-PAY step 4: per-block DMN state machine.
@@ -29,16 +30,32 @@
 ///     block can have its collateral spent in a later tx of the same
 ///     block (rare but consensus-correct). We mirror.
 ///
-///   Pass 3 — payee resolution (coinbase outputs):
-///     dashcore computes expected payee from PREV-block list before
-///     applying any tx; we OBSERVE actual coinbase outputs and find
-///     matches in our current list. Functionally equivalent for nodes
-///     processing accepted blocks (every accepted coinbase pays the
-///     dashcore-expected MN by definition).
-///     For each output that matches an MN's scriptPayout: set
-///     nLastPaidHeight = height; for Evo MNs, increment
-///     nConsecutivePayments if last payment was at height-1, else reset
-///     to 1.
+///   Pass 3 — payee resolution (PROJECTION attribution, dashd-exact):
+///     Mirrors dashcore evo/deterministicmns.cpp BuildNewListFromBlock:
+///     the payee is COMPUTED from the pre-block list (GetMNPayee on
+///     pindexPrev == find_expected_payee() before pass 1) and — if still
+///     present after passes 1/2 (newList.HasMN) — marked
+///     nLastPaidHeight = height. The coinbase is only used as a
+///     CROSS-CHECK: if it does not pay the projected MN's scriptPayout,
+///     this state has desynced from the network's payment schedule and
+///     the apply reports payee_desync (caller fails closed + re-seeds)
+///     instead of guessing an attribution.
+///
+///     HISTORY (soak-found 2026-07-22, e4-e1e2b, 13x bad-cb-payee):
+///     the previous OBSERVATION attribution (scan coinbase outputs,
+///     pick_paid_mn per matching output) was not idempotent: any
+///     duplicated/replayed attribution of one block re-picked within a
+///     shared-payoutAddress group (53 testnet MNs share one address) and
+///     marked the NEXT MN of the group, silently shifting the group's
+///     payment cursor one slot ahead FOREVER. The embedded arm then
+///     emitted the wrong coinbase payee at every height where the
+///     one-ahead group cursor changed the projected address (~10% of
+///     serves; dashd rejected each with bad-cb-payee). Projection
+///     attribution + the whole-apply monotonic-height guard remove the
+///     divergence class structurally; the desync flag turns any residual
+///     mismatch into an immediate fail-closed instead of silent wrongness.
+///     For Evo MNs, nConsecutivePayments increments if last payment was
+///     at height-1, else resets to 1 (unchanged).
 ///
 /// Things we DELIBERATELY don't model (with consequence notes):
 ///   - Confirmation pass (dashcore: nMasternodeMinimumConfirmations →
@@ -110,19 +127,65 @@ public:
         size_t updated{0};
         size_t revoked{0};
         size_t spent{0};       // collateral spent → MN removed
-        size_t paid{0};        // matched a coinbase output
+        size_t paid{0};        // projected payee marked paid this block
         size_t total_after{0};
+        // Duplicate / out-of-order delivery: height <= last applied height.
+        // The WHOLE apply was skipped (no state mutation). A re-run of the
+        // old observation-attribution over an already-applied block marked
+        // the NEXT MN of a shared-payoutAddress group — the soak-found
+        // bad-cb-payee corruption this guard closes.
+        bool skipped_out_of_order{false};
+        // NON-CONTIGUOUS delivery: height > cursor + 1 — one or more blocks
+        // between the cursor (seed as-of height or last applied block) and
+        // this one were NEVER folded. dashd advanced its DIP-3 payment
+        // cursor at each skipped block; ours did not, so from here on the
+        // projected payee is some earlier queue slot than dashd's. Within a
+        // shared-payoutAddress group that divergence is INVISIBLE to the
+        // pass-3 coinbase cross-check (the script still matches) and only
+        // surfaces — as a served bad-cb-payee — when the lagged cursor
+        // crosses an address-group boundary. The WHOLE apply is refused (no
+        // state mutation); the caller must fail closed + re-seed, exactly
+        // like payee_desync.
+        //
+        // SOAK EVIDENCE (E4 re-soak 2026-07-23, binary 7daa4d61): seed
+        // as-of 1519820; blocks 1519821+1519822 mined during header sync
+        // were never folded; folds 1519823..1519826 each marked the wrong
+        // (2-slots-behind) yeRZB-group MN silently; at 1519827 dashd's head
+        // rotated to the yVXDA group while ours was still yeRZB-member
+        // 05b68797... -> bad-cb-payee served for the whole window.
+        bool gap_detected{false};
+        // The coinbase does NOT pay the MN this machine projects as the
+        // deterministic payee: this state desynced from the network's DMN
+        // payment schedule (missed block / corrupted seed / replay). The
+        // payment was NOT attributed — never guess. Caller must fail
+        // closed (stop backing templates with this payee set) + re-seed.
+        bool payee_desync{false};
     };
 
-    void load(std::vector<std::pair<uint256, MNState>> entries)
+    /// as_of_height: the chain height this snapshot is CURRENT AT (0 =
+    /// unknown / cold). It seeds the forward-contiguous apply cursor: the
+    /// snapshot's lastPaidHeight set IS the DIP-3 payment queue as dashd
+    /// held it AFTER connecting block as_of_height, so the ONLY block
+    /// apply_block may fold next is as_of_height + 1. Folding a later block
+    /// on top of the seed (the E4 soak's 1519823-on-a-1519820-seed) means
+    /// the skipped blocks' payments were never attributed and the queue
+    /// cursor is stale — apply_block reports gap_detected instead.
+    void load(std::vector<std::pair<uint256, MNState>> entries,
+              uint32_t as_of_height = 0)
     {
         m_entries.clear();
         m_collateral_index.clear();
+        m_last_applied_height = as_of_height;
         for (auto& [h, st] : entries) {
             m_collateral_index[st.collateralOutpoint] = h;
             m_entries.emplace(h, std::move(st));
         }
     }
+
+    // Height of the last block folded by apply_block (0 = none since load).
+    // apply_block is FORWARD-ONLY: any call at height <= this is skipped
+    // whole (see ApplyResult::skipped_out_of_order).
+    uint32_t last_applied_height() const { return m_last_applied_height; }
 
     size_t size() const { return m_entries.size(); }
 
@@ -460,6 +523,49 @@ public:
     {
         ApplyResult r;
 
+        // ── Pass 0: forward-only guard + payee projection ──────────
+        // dashcore connects blocks strictly forward; mirror that here so a
+        // duplicated or out-of-order delivery can NEVER mutate this state.
+        // (Soak-found 2026-07-22: one extra attribution pass over an
+        // already-applied block shifted a shared-payoutAddress group's
+        // payment cursor one slot ahead permanently -> intermittent
+        // bad-cb-payee on the embedded serve arm.)
+        if (m_last_applied_height != 0 && height <= m_last_applied_height) {
+            r.skipped_out_of_order = true;
+            r.total_after = m_entries.size();
+            return r;
+        }
+
+        // Forward-CONTIGUITY guard (E4 re-soak fix, shared-address cursor
+        // lag): dashcore's BuildNewListFromBlock folds every block in
+        // sequence — the payee mark at height N is computed on the list
+        // that folded N-1. A gap (height > cursor + 1) means dashd
+        // advanced the payment queue at blocks we never saw; folding this
+        // block on the stale queue would attribute its payment to an
+        // earlier queue slot than dashd did. With shared payout addresses
+        // that wrong-specific-MN advance passes the pass-3 script
+        // cross-check (same address) and stays silently wrong until an
+        // address-group boundary — where the arm serves bad-cb-payee.
+        // Refuse the whole apply; the caller fails closed + re-seeds an
+        // authoritative snapshot (never guess across a gap).
+        if (m_last_applied_height != 0
+            && height > m_last_applied_height + 1) {
+            r.gap_detected = true;
+            r.total_after = m_entries.size();
+            LOG_WARNING << "[MNS-SM] PAYEE APPLY GAP: block h=" << height
+                        << " on cursor h=" << m_last_applied_height
+                        << " (" << (height - m_last_applied_height - 1)
+                        << " block(s) never folded) — apply refused"
+                           " (fail closed, re-seed required)";
+            return r;
+        }
+
+        // dashcore BuildNewListFromBlock computes the payee from the
+        // PRE-block list (oldList.GetMNPayee(pindexPrev)) BEFORE folding
+        // this block's special txs; the mark lands after passes 1/2 (and
+        // only if the MN survived them — newList.HasMN). Mirror exactly.
+        const std::optional<uint256> projected = find_expected_payee();
+
         // ── Pass 1: special-tx records ─────────────────────────────
         // Walk all non-coinbase txs (i=1+). The order of types within
         // a block is whatever the miner included; dashcore handles
@@ -597,48 +703,59 @@ public:
             }
         }
 
-        // ── Pass 3: payee resolution ──────────────────────────────
-        // BUG FIX 2026-04-25: multiple MNs can share the same payoutAddress
-        // (operators running multiple MNs to one wallet). The original
-        // find_by_payout_script returned the FIRST map-iteration match,
-        // which deterministically attributed ALL payments to whichever
-        // MN had the lowest proRegTxHash bytes. Net effect: for each
-        // shared-script payment dashd correctly attributed to one MN,
-        // we'd attribute it to the OTHER one — leaving the actual paid
-        // MN's nLastPaidHeight stale forever. Live-observed: MN
-        // 7173b6a9... and 06a9ee24... both pay address
-        // XjbaGWaGnvEtuQAUoBgDxJWe8ZNv45upG2; we kept giving 06a9ee24
-        // every payment, so 7173b6a9 stayed at lastPaid=2458528 → kept
-        // winning find_expected_payee → 100% [PAY] MISMATCH against
-        // dashd which correctly rotated the two.
-        //
-        // Fix: when multiple MNs share a script, use pick_paid_mn (defined
-        // above) which mirrors dashd's CompareByLastPaid_GetHeight ordering.
-        if (!block.m_txs.empty()) {
-            const auto& cb = block.m_txs[0];
-            for (const auto& vout : cb.vout) {
-                auto matched = pick_paid_mn(vout.scriptPubKey.m_data);
-                if (!matched) continue;
-                auto it = m_entries.find(*matched);
-                if (it == m_entries.end()) continue;
-                // Idempotency safety net: never roll lastPaidHeight backwards.
-                // Defense-in-depth against any future caller bypassing the
-                // outer OOO guard (main_dash.cpp's `already_in_state` check).
-                // Without this, an out-of-order h<current re-apply would have
-                // bumped lastPaid backwards — the original 03fa0aa1 bug class.
-                if (height <= it->second.nLastPaidHeight) continue;
-                bool was_consecutive = (it->second.nLastPaidHeight == height - 1);
-                it->second.nLastPaidHeight = height;
-                if (it->second.nType == vendor::MnType::EVO) {
-                    it->second.nConsecutivePayments =
-                        was_consecutive ? it->second.nConsecutivePayments + 1 : 1;
-                } else {
-                    it->second.nConsecutivePayments = 0;
+        // ── Pass 3: payee resolution (PROJECTION, dashd-exact) ─────
+        // dashcore evo/deterministicmns.cpp BuildNewListFromBlock: mark the
+        // PROJECTED payee (computed pass 0 from the pre-block list), not an
+        // MN inferred from scanning coinbase outputs. Observation-based
+        // attribution (the pre-2026-07 code) re-derived the paid MN with
+        // pick_paid_mn per matching output; that inference is not
+        // idempotent under duplicated/replayed applies within a
+        // shared-payoutAddress group and once wrong stayed wrong forever
+        // (self-perpetuating one-slot-ahead group cursor; soak-found
+        // bad-cb-payee at ~10% of embedded serves). The coinbase is now
+        // only the CROSS-CHECK: an accepted block by definition pays
+        // dashd's projected MN, so if it does not pay OURS, our queue has
+        // desynced — report payee_desync, attribute nothing, and let the
+        // caller fail closed + re-seed (never guess).
+        if (projected && !block.m_txs.empty()) {
+            auto it = m_entries.find(*projected);
+            // Mirrors dashcore's newList.HasMN(payee->proRegTxHash): a
+            // payee whose MN was removed by THIS block's passes 1/2 is
+            // silently skipped (no mark, no desync).
+            if (it != m_entries.end()) {
+                const auto& script = it->second.scriptPayout.m_data;
+                bool paid_in_cb = false;
+                if (!script.empty()) {
+                    for (const auto& vout : block.m_txs[0].vout) {
+                        if (vout.scriptPubKey.m_data == script) {
+                            paid_in_cb = true;
+                            break;
+                        }
+                    }
                 }
-                ++r.paid;
+                if (paid_in_cb) {
+                    bool was_consecutive =
+                        (it->second.nLastPaidHeight == height - 1);
+                    it->second.nLastPaidHeight = height;
+                    if (it->second.nType == vendor::MnType::EVO) {
+                        it->second.nConsecutivePayments =
+                            was_consecutive
+                                ? it->second.nConsecutivePayments + 1 : 1;
+                    } else {
+                        it->second.nConsecutivePayments = 0;
+                    }
+                    ++r.paid;
+                } else {
+                    r.payee_desync = true;
+                    LOG_WARNING << "[MNS-SM] PAYEE DESYNC h=" << height
+                                << ": coinbase does not pay projected MN "
+                                << projected->GetHex().substr(0, 16)
+                                << " — attribution withheld (fail closed)";
+                }
             }
         }
 
+        m_last_applied_height = height;
         r.total_after = m_entries.size();
         return r;
     }
@@ -646,6 +763,10 @@ public:
 private:
     std::map<uint256, MNState>                                          m_entries;
     std::map<bitcoin_family::coin::TxPrevOut, uint256, TxPrevOutLess>   m_collateral_index;
+
+    // Forward-only apply cursor: height of the last block folded by
+    // apply_block (0 = none since load). See ApplyResult::skipped_out_of_order.
+    uint32_t m_last_applied_height{0};
 
     // Compute a tx's identifying hash. Mirrors dashcore's
     // CTransaction::GetHash() which is SHA256d(serialized_tx).

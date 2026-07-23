@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // dgb::ShareTracker::compute_share_target — genesis/unknown-prev branch KAT.
 //
 // FENCED conformance test (no production code touched). Pins the share-target

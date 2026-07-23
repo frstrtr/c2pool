@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #include <gtest/gtest.h>
 #include <core/coin/utxo.hpp>
 #include <core/coin/utxo_view_cache.hpp>

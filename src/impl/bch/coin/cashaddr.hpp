@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ---------------------------------------------------------------------------
 // bch::coin::cashaddr -- BCH CashAddr address codec (M4 TODO from config_coin.hpp).
@@ -33,9 +34,12 @@
 // ---------------------------------------------------------------------------
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <core/address_utils.hpp>   // register_address_decoder (payout hook)
 
 namespace bch {
 namespace coin {
@@ -267,6 +271,74 @@ inline CashAddrContent DecodeCashAddrContent(const std::string& addr,
 
     out.erase(out.begin()); // pop version
     return {type, std::move(out)};
+}
+
+// -- {type,hash} -> BCH scriptPubKey (locking script) -------------------------
+// P2PKH (20B): OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+// P2SH  (20B): OP_HASH160 <20> OP_EQUAL
+// P2SH32(32B): OP_HASH256 <32> OP_EQUAL   (CHIP-2022-02, May 2023)
+// Token-aware variants lock identically -- token-awareness is a wallet display
+// capability, not a script-level distinction. Returns {} on unsupported size.
+inline std::vector<unsigned char> content_to_script(const CashAddrContent& c) {
+    const auto& h = c.hash;
+    std::vector<unsigned char> s;
+    switch (c.type) {
+        case PUBKEY_TYPE:
+        case TOKEN_PUBKEY_TYPE:
+            if (h.size() != 20) return {};
+            s = {0x76, 0xa9, 0x14};
+            s.insert(s.end(), h.begin(), h.end());
+            s.push_back(0x88); s.push_back(0xac);
+            return s;
+        case SCRIPT_TYPE:
+        case TOKEN_SCRIPT_TYPE:
+            if (h.size() == 20) {            // P2SH20
+                s = {0xa9, 0x14};
+                s.insert(s.end(), h.begin(), h.end());
+                s.push_back(0x87);
+                return s;
+            }
+            if (h.size() == 32) {            // P2SH32 (OP_HASH256)
+                s = {0xaa, 0x20};
+                s.insert(s.end(), h.begin(), h.end());
+                s.push_back(0x87);
+                return s;
+            }
+            return {};
+    }
+    return {};
+}
+
+// Decode a CashAddr string to its scriptPubKey under a specific network prefix.
+// Returns {} if the string is not a valid CashAddr for that prefix.
+inline std::vector<unsigned char> cashaddr_to_script(const std::string& addr,
+                                                     const std::string& prefix) {
+    auto content = DecodeCashAddrContent(addr, prefix);
+    if (content.IsNull()) return {};
+    return content_to_script(content);
+}
+
+// Convenience: resolve under the active network prefix (mainnet/testnet/regtest).
+inline std::vector<unsigned char> cashaddr_to_script_for_net(const std::string& addr,
+                                                             bool testnet, bool regtest) {
+    const std::string prefix = regtest ? std::string(REGTEST_PREFIX)
+                                        : prefix_for(testnet);
+    return cashaddr_to_script(addr, prefix);
+}
+
+// Register the BCH CashAddr decoder into the generic core address hook so
+// core::address_to_script (the stratum payout path) resolves a miner CashAddr
+// username to a real payout scriptPubKey. Without this the BCH payout script is
+// empty -> degenerate value-0 OP_RETURN coinbase -> BCHN bad-txns/BIP30 reject.
+// Idempotent (once per process). Core stays CashAddr-agnostic.
+inline void register_cashaddr_decoder(bool testnet, bool regtest) {
+    static std::once_flag once;
+    std::call_once(once, [testnet, regtest]() {
+        core::register_address_decoder(
+            [testnet, regtest](const std::string& a) -> std::vector<unsigned char> {
+                return cashaddr_to_script_for_net(a, testnet, regtest);
+            });
+    });
 }
 
 } // namespace cashaddr

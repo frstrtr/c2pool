@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // Phase 1c: Whale departure recovery — non-consensus local heuristic.
@@ -14,7 +15,7 @@
 // This is non-consensus: only affects what OUR node mines.
 // Structured log lines: [WHALE-DEPARTURE] and [WHALE-RECOVERY].
 //
-// Port of p2pool-v36 work.py Phase 1c + 1c.1 (commits 77d3c7d0 + 546c5382).
+// C++ implementation of the p2pool-v36 work.py Phase 1c + 1c.1 design (ref commits 77d3c7d0 + 546c5382).
 
 #include "config_pool.hpp"
 #include "share_tracker.hpp"

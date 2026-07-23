@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase S8 — WonBlockRelay (embedded-P2P won-block relay framer) KATs.
 ///
 /// Exercises src/impl/dash/block_relay.hpp — the framing half of the

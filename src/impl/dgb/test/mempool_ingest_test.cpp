@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // dgb_mempool_ingest_test -- pins c2pool::dgb::wire_mempool_ingest, the
 // connector that routes the embedded P2P `tx` relay (dgb::interfaces::Node::

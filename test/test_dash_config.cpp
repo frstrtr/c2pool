@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase S8 — Dash coin/pool config types KATs
 ///
 /// Exercises src/impl/dash/config.hpp — the dash::PoolConfig / dash::CoinConfig

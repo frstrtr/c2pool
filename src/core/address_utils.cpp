@@ -1,8 +1,11 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #include "address_utils.hpp"
 
 #include <cstring>
 #include <sstream>
 #include <iomanip>
+#include <functional>
+#include <mutex>
 
 #include <btclibs/crypto/sha256.h>
 #include <btclibs/crypto/ripemd160.h>
@@ -11,6 +14,18 @@
 #include <btclibs/span.h>
 
 namespace core {
+
+namespace {
+std::mutex& address_decoder_mutex() { static std::mutex m; return m; }
+std::vector<AddressDecoderFn>& address_decoders() {
+    static std::vector<AddressDecoderFn> d; return d;
+}
+} // namespace
+
+void register_address_decoder(AddressDecoderFn fn) {
+    std::lock_guard<std::mutex> lk(address_decoder_mutex());
+    address_decoders().push_back(std::move(fn));
+}
 
 std::string base58check_to_hash160(const std::string& address)
 {
@@ -269,6 +284,16 @@ std::vector<unsigned char> address_to_script(const std::string& address)
     auto h160 = address_to_hash160(address, addr_type);
     if (h160.size() == 40) {
         return hash160_to_merged_script(h160, addr_type);
+    }
+
+    // Coin-registered fallback decoders (e.g. BCH CashAddr). Core stays
+    // format-agnostic: first decoder to return a non-empty script wins.
+    {
+        std::lock_guard<std::mutex> lk(address_decoder_mutex());
+        for (auto& fn : address_decoders()) {
+            auto script = fn(address);
+            if (!script.empty()) return script;
+        }
     }
 
     return {};

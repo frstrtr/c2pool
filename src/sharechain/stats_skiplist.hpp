@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // stats_skiplist.hpp — O(log n) sharechain statistics via probabilistic skip list
 //
 // Same pattern as weights_skiplist.hpp but aggregates dashboard stats

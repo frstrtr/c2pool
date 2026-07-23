@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #include <algorithm>
 #include <iostream>
 #include <fstream>
@@ -21,6 +22,7 @@
 // Core includes
 #include <core/settings.hpp>
 #include <core/fileconfig.hpp>
+#include <core/core_util.hpp>
 #include <core/coinbase_builder.hpp>
 #include <c2pool/storage/the_checkpoint.hpp>
 #include <core/pack.hpp>
@@ -262,6 +264,10 @@ static void segfault_handler(int sig) {
 #include <impl/doge/coin/auxpow_header.hpp>
 // 2b-ii: embedded NMC merged-mining backend (host activation)
 #include <impl/nmc/coin/aux_chain_embedded.hpp>
+// DGB's own embedded merged-mining backend (DC seam, -DAUX_DOGE=ON).
+// Header is fully wrapped in #ifdef AUX_DOGE -> compiles to nothing when off.
+#include <impl/dgb/coin/aux_chain_embedded.hpp>
+#include <impl/dgb/params.hpp>  // dgb::make_coin_params (SubsidyFunc), dgb::AUXPOW_CHAIN_ID
 
 // V36-compatible operational features
 #include <impl/ltc/pool_monitor.hpp>
@@ -362,6 +368,8 @@ void print_help() {
     std::cout << "COMMAND LINE OPTIONS:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
     std::cout << "  --help, -h                Show this help message and exit\n";
+    std::cout << "  --data-dir PATH           Root all per-instance state here (default: ~/.c2pool)\n";
+    std::cout << "                            (isolates co-located instances)\n";
     std::cout << "  --testnet                 Use testnet instead of mainnet\n";
     std::cout << "  --integrated              Full P2P pool with sharechain (DEFAULT)\n";
     std::cout << "  --solo                    Solo pool mode (no P2P sharechain, local payouts)\n";
@@ -422,7 +430,8 @@ void print_help() {
     std::cout << "  --stratum-max-diff N      Maximum per-connection difficulty (default: 65536)\n";
     std::cout << "  --stratum-target-time N   Target seconds per pseudoshare (default: 3)\n";
     std::cout << "  --no-vardiff              Disable automatic difficulty adjustment\n";
-    std::cout << "  --max-coinbase-outputs N  Max coinbase outputs per block (default: 4000, matches p2pool)\n\n";
+    std::cout << "  --max-coinbase-outputs N  Max coinbase outputs per block (default: 4000, matches p2pool)\n";
+    std::cout << "  --max-stratum-connections N  Max concurrent miners on this node (default: 100, 0 = unlimited)\n\n";
 
     std::cout << "EMBEDDED NODE OPTIONS:\n";
     std::cout << "  --embedded-ltc            Use embedded LTC SPV node (no daemon needed)\n";
@@ -469,7 +478,8 @@ void print_help() {
     std::cout << "  --cors-origin ORIGIN      CORS Access-Control-Allow-Origin (default: disabled)\n";
     std::cout << "  --payout-window N         PPLNS payout window in seconds (default: 86400)\n";
     std::cout << "  --storage-save-interval N Periodic sharechain save interval in seconds (default: 300)\n";
-    std::cout << "  --dashboard-dir PATH      Dashboard static files directory (default: web-static)\n\n";
+    std::cout << "  --dashboard-dir PATH      Dashboard static files directory (default: web-static)\n";
+    std::cout << "  --analytics-id ID         Google Analytics measurement ID (e.g. G-XXXXXXXXXX)\n\n";
 
     std::cout << "BLOCKCHAIN SUPPORT:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
@@ -515,6 +525,20 @@ void print_help() {
 }
 
 int main(int argc, char* argv[]) {
+    // Pre-scan for --data-dir BEFORE anything reads config_path() — the
+    // Settings ctor (Fileconfig captures its path at construction) and the
+    // file-log sink both resolve through it. Redirecting the chokepoint here
+    // guarantees the override wins everywhere. See #722.
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--data-dir") {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0' || argv[i + 1][0] == '-') {
+                std::cerr << "error: --data-dir requires a PATH argument\n";
+                return 1;
+            }
+            core::filesystem::set_data_dir(argv[i + 1]);
+        }
+    }
+
     // Install crash handlers
     std::set_terminate(c2pool_terminate_handler);
     std::signal(SIGINT, signal_handler);
@@ -530,7 +554,29 @@ int main(int argc, char* argv[]) {
 
     // Initialize logging
     core::log::Logger::init();
-    
+
+    // Mining-hotel interim fix #4: raise RLIMIT_NOFILE to 65536 at startup.
+    // One fd per stratum session + HTTP + RPC + P2P + LevelDB — distro-default
+    // 1024 starves the accept loop under miner churn. Log the effective limit.
+    {
+        const uint64_t nofile = core::raise_nofile_limit(65536);
+        if (nofile == 0)
+#ifdef _WIN32
+            // Windows has no RLIMIT_NOFILE; emit on stdout so the --help smoke
+            // (pwsh `2>&1 | Select-Object -First N`) never surfaces a stderr
+            // NativeCommandError from this benign startup notice.
+            std::cout << "[init] RLIMIT_NOFILE: not applicable on this platform\n";
+#else
+            LOG_WARNING << "RLIMIT_NOFILE: unsupported on this platform (or query failed)";
+#endif
+        else if (nofile < 65536)
+            LOG_WARNING << "RLIMIT_NOFILE soft limit is " << nofile
+                        << " (< 65536; hard limit too low — raise with ulimit -Hn / limits.conf)";
+        else
+            LOG_INFO << "RLIMIT_NOFILE soft limit: " << nofile;
+    }
+
+
     // Banner intentionally deferred — only the bordered log-file banner is
     // emitted (see post-parse section below). Printing an unbordered copy
     // here too cluttered journalctl output with duplicate headers.
@@ -608,7 +654,16 @@ int main(int argc, char* argv[]) {
     std::string redistribute_mode_str = "pplns";
 
     // Stratum tuning (configurable via CLI or YAML)
-    core::StratumConfig stratum_config;  // defaults: min=0.001, max=65536, target=10s, vardiff=true
+    core::StratumConfig stratum_config;  // defaults: min=0.0005, max=65536, target=3.0s, vardiff=true
+    stratum_config.coin_symbol = "LTC";  // runtime coin tag for coin-agnostic core log lines
+    // Idle keepalive-notify (cross-coin reuse of DASH's D9 mitigation): many
+    // ASIC/proxy clients drop a pool connection that receives no mining.notify
+    // within ~60 s (LTC/DOGE ~2.5 min block cadence gives long idle gaps at high
+    // fixed diff). 25 s is safely under any reasonable client watchdog and kept
+    // identical to the other coins for consistency. Re-notify the CURRENT job
+    // (non-clean, so no ASIC work reset and NO work-generation bump); this is
+    // transport/liveness only -- ZERO wire-byte and consensus change.
+    stratum_config.keepalive_notify_sec = 25;
 
     // Operational tuning (configurable via CLI or YAML)
     std::string log_file;                        // empty = default "debug.log"
@@ -751,6 +806,13 @@ int main(int argc, char* argv[]) {
         if (arg == "--help" || arg == "-h") {
             print_help();
             return 0;
+        }
+        else if (arg == "--data-dir" && i + 1 < argc) {
+            // Root ALL per-instance on-disk state (sharechain LevelDB, addr
+            // store, whitelist, logs, ratchet, found-blocks db, ...) under
+            // this path so co-located instances never contend the LevelDB
+            // LOCK. Default (unset) keeps ~/.c2pool — see issue #722.
+            core::filesystem::set_data_dir(argv[++i]);
         }
         else if (arg == "--testnet") {
             settings->m_testnet = true;
@@ -1036,6 +1098,10 @@ int main(int argc, char* argv[]) {
             stratum_config.max_coinbase_outputs = static_cast<size_t>(std::stoul(argv[++i]));
             cli_explicit.insert("max_coinbase_outputs");
         }
+        else if (arg == "--max-stratum-connections" && i + 1 < argc) {
+            stratum_config.max_stratum_connections = static_cast<size_t>(std::stoul(argv[++i]));
+            cli_explicit.insert("max_stratum_connections");
+        }
         // Operational tuning
         else if (arg == "--log-file" && i + 1 < argc) {
             log_file = argv[++i];
@@ -1080,6 +1146,10 @@ int main(int argc, char* argv[]) {
         else if (arg == "--dashboard-dir" && i + 1 < argc) {
             dashboard_dir = argv[++i];
             cli_explicit.insert("dashboard_dir");
+        }
+        else if (arg == "--analytics-id" && i + 1 < argc) {
+            analytics_id = argv[++i];
+            cli_explicit.insert("analytics_id");
         }
         // Seed node: -n HOST:PORT (p2pool compat)
         else if (arg == "-n" && i + 1 < argc) {
@@ -1223,6 +1293,14 @@ int main(int argc, char* argv[]) {
             if (!cli_explicit.count("message_blob_hex") && cfg["message_blob_hex"])
                 operator_message_blob_hex = cfg["message_blob_hex"].as<std::string>();
 
+            // Custom coinbase scriptSig text (CLI --coinbase-text takes precedence)
+            if (!cli_explicit.count("coinbase_text") && cfg["coinbase_text"])
+                coinbase_text = cfg["coinbase_text"].as<std::string>();
+
+            // Private sharechain identifier, hex (CLI --network-id/--chain-id takes precedence)
+            if (!cli_explicit.count("network_id") && cfg["network_id"])
+                network_id = std::stoull(cfg["network_id"].as<std::string>(), nullptr, 16);
+
             // Stratum tuning
             if (!cli_explicit.count("stratum_min_diff") && cfg["min_difficulty"])
                 stratum_config.min_difficulty = cfg["min_difficulty"].as<double>();
@@ -1234,6 +1312,8 @@ int main(int argc, char* argv[]) {
                 stratum_config.vardiff_enabled = cfg["vardiff_enabled"].as<bool>();
             if (!cli_explicit.count("max_coinbase_outputs") && cfg["max_coinbase_outputs"])
                 stratum_config.max_coinbase_outputs = cfg["max_coinbase_outputs"].as<size_t>();
+            if (!cli_explicit.count("max_stratum_connections") && cfg["max_stratum_connections"])
+                stratum_config.max_stratum_connections = cfg["max_stratum_connections"].as<size_t>();
 
             // Operational tuning
             if (!cli_explicit.count("log_file") && cfg["log_file"])
@@ -1258,7 +1338,7 @@ int main(int argc, char* argv[]) {
                 storage_save_interval = cfg["storage_save_interval"].as<int>();
             if (!cli_explicit.count("dashboard_dir") && cfg["dashboard_dir"])
                 dashboard_dir = cfg["dashboard_dir"].as<std::string>();
-            if (cfg["analytics_id"])
+            if (!cli_explicit.count("analytics_id") && cfg["analytics_id"])
                 analytics_id = cfg["analytics_id"].as<std::string>();
             if (cfg["explorer"])
                 explorer_enabled = cfg["explorer"].as<bool>();
@@ -1355,8 +1435,12 @@ int main(int argc, char* argv[]) {
             "THIS IS EXPERIMENTAL SOFTWARE -- USE AT YOUR OWN RISK",
             "THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY",
             "OF ANY KIND, EXPRESS OR IMPLIED.",
-            "Distributed under the MIT/X11 software license",
-            "See http://www.opensource.org/licenses/mit-license.php",
+            "Distributed under the GNU AGPL-3.0-or-later license.",
+            "This is free software; see the source for copying terms.",
+            "AGPL section 13: if you run a modified version and let",
+            "users interact with it over a network, you must offer",
+            "them the corresponding source code.",
+            "Source: https://github.com/frstrtr/c2pool",
         }, rows);
         for (const auto& r : rows) LOG_WARNING << r;
     }
@@ -1868,7 +1952,8 @@ int main(int argc, char* argv[]) {
                      << " max_diff=" << stratum_config.max_difficulty
                      << " target_time=" << stratum_config.target_time << "s"
                      << " vardiff=" << (stratum_config.vardiff_enabled ? "on" : "off")
-                     << " max_cb_outputs=" << stratum_config.max_coinbase_outputs;
+                     << " max_cb_outputs=" << stratum_config.max_coinbase_outputs
+                     << " max_stratum_connections=" << stratum_config.max_stratum_connections;
             LOG_INFO << "Operational config: p2p_max_peers=" << p2p_max_peers
                      << " ban_duration=" << p2p_ban_duration << "s"
                      << " rss_limit=" << rss_limit_mb << "MB"
@@ -5040,6 +5125,13 @@ int main(int argc, char* argv[]) {
             std::unique_ptr<nmc::coin::HeaderChain>     nmc_chain;
             std::unique_ptr<nmc::coin::Mempool>         nmc_pool;
             std::unique_ptr<nmc::coin::NMCChainParams>  nmc_params_ptr;
+#ifdef AUX_DOGE
+            // DGB's own embedded aux chain objects (DC seam; mirror DOGE/NMC).
+            // Guarded: the DGB HeaderChain/Mempool types are only visible via
+            // the self-guarded aux_chain_embedded.hpp include under AUX_DOGE.
+            std::unique_ptr<c2pool::dgb::HeaderChain>   dgb_aux_chain;
+            std::unique_ptr<dgb::coin::Mempool>         dgb_aux_pool;
+#endif // AUX_DOGE
             // DOGE UTXO set for fee computation (no segwit/MWEB — simplified)
             std::unique_ptr<core::coin::UTXOViewDB>    doge_utxo_db;
             std::unique_ptr<core::coin::UTXOViewCache> doge_utxo_cache;
@@ -5310,6 +5402,45 @@ int main(int argc, char* argv[]) {
                                          << cfg.rpc_host << ":" << cfg.rpc_port;
                             }
                         }
+                    } else if (cfg.symbol == "DGB") {
+#ifdef AUX_DOGE
+                        // DGB's OWN embedded merged-mining backend (DC seam).
+                        // Mirrors the NMC embedded block: lazily build a DGB
+                        // HeaderChain + Mempool, register AuxChainEmbedded as
+                        // primary, wire the embedded P2P relay, and keep an
+                        // AuxChainRPC (digibyted) fallback.
+                        if (!dgb_aux_chain)
+                            dgb_aux_chain = std::make_unique<c2pool::dgb::HeaderChain>();
+                        if (!dgb_aux_pool)
+                            dgb_aux_pool = std::make_unique<dgb::coin::Mempool>();
+                        {
+                            // DGB subsidy schedule (config_coin.hpp SSOT) feeds
+                            // the embedded coinbasevalue via the #207 resolver.
+                            auto dgb_cp = dgb::make_coin_params(settings->m_testnet);
+                            auto backend = std::make_unique<dgb::coin::AuxChainEmbedded>(
+                                *dgb_aux_chain, *dgb_aux_pool, dgb_cp.subsidy_func, cfg);
+                            // Embedded P2P relay for DGB flows through the
+                            // manager-level set_block_relay_fn wired below
+                            // (same route the DOGE embedded backend uses);
+                            // submit_block() is log+cache, the network write
+                            // is that relay via the CoinBroadcaster.
+                            mm_manager->add_chain(cfg, std::move(backend));
+                            LOG_INFO << "Merged mining: DGB embedded (primary) chain_id=" << cfg.chain_id;
+                            // digibyted RPC fallback (embedded primary persists).
+                            if (cfg.rpc_port > 0 && !cfg.rpc_userpass.empty()) {
+                                auto rpc_fallback = std::make_unique<c2pool::merged::AuxChainRPC>(ioc, cfg);
+                                mm_manager->set_fallback_backend(cfg.chain_id, std::move(rpc_fallback));
+                                LOG_INFO << "Merged mining: DGB RPC fallback at "
+                                         << cfg.rpc_host << ":" << cfg.rpc_port;
+                            }
+                        }
+#else
+                        // Without -DAUX_DOGE the DGB embedded backend is absent;
+                        // fall through to the standard RPC path so the seam is a
+                        // no-op rather than a broken reference.
+                        mm_manager->add_chain(cfg);
+                        LOG_INFO << "Merged mining: added DGB via RPC (AUX_DOGE off) chain_id=" << cfg.chain_id;
+#endif // AUX_DOGE
                     } else {
                         // Non-DOGE chain or no P2P — standard RPC path
                         mm_manager->add_chain(cfg);

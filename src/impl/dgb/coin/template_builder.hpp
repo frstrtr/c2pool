@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // DGB block-template builder. Mirrors src/impl/btc/coin/template_builder.hpp.
 // Must emit p2pool-merged-v36-compatible templates (V36 master compat).
@@ -32,6 +33,44 @@ namespace dgb
 
 namespace coin
 {
+
+// ── Underfill guard (v36 cutover deploy path) ───────────────────────────────
+// Port of the LTC/DOGE template-builder guard (src/impl/ltc/coin/
+// template_builder.hpp, src/impl/doge/coin/template_builder.hpp) to the DGB
+// embedded template path, in the DASH free-predicate form
+// (src/impl/dash/coin/embedded_gbt.hpp). Detects the "near-empty template on a
+// non-empty mempool" regression: the tx selector returns almost no
+// transactions even though the local mempool holds a substantial fee-paying
+// backlog. c2pool-side template-fill safety net — NOT the byte-parity KAT
+// axis; thresholds are the v36-native shared structure (standardize
+// cross-coin) pinned to the legacy p2pool near-empty floor (~50 kB),
+// identical to LTC/DOGE/DASH.
+//
+// DGB placement note: build_work_template() below is a pure SHAPING function
+// with no mempool access (transactions[] is a caller-supplied pass-through),
+// so the guard cannot evaluate here. It evaluates in the ONE place with
+// mempool visibility that feeds BOTH build_work_template callers (the stratum
+// DGBWorkSource and the embedded CoinNodeInterface path):
+// make_mempool_tx_source() in embedded_tx_select.cpp. Only the predicate +
+// thresholds live in this header (guard-weight TU safe: <cstdint> only).
+inline constexpr uint64_t UNDERFILL_MIN_FILL_BYTES = 50'000ull; // < this = near-empty block
+inline constexpr uint64_t UNDERFILL_BACKLOG_SLACK  = 50'000ull; // unselected fee-paying material that should have filled it
+
+/// Pure trip predicate — the exact boolean the LTC/DOGE guards evaluate.
+/// Factored out so the KAT can pin it without a log scraper:
+///   near_empty  : template packed fewer bytes than the near-empty floor
+///   has_backlog : the mempool holds fee-paying material (known fees > 0)
+///                 well beyond what was selected (> selected + slack)
+/// Genuinely empty (or fee-unknown-only) mempools never trip.
+inline bool underfill_guard_trips(uint64_t selected_bytes,
+                                  uint64_t mempool_bytes,
+                                  uint64_t mempool_known_fees)
+{
+    const bool near_empty  = selected_bytes < UNDERFILL_MIN_FILL_BYTES;
+    const bool has_backlog = mempool_known_fees > 0
+                          && mempool_bytes > selected_bytes + UNDERFILL_BACKLOG_SLACK;
+    return near_empty && has_backlog;
+}
 
 // --- CoinNodeInterface ------------------------------------------------------
 // Abstract interface for obtaining work and submitting blocks; lets the
@@ -77,11 +116,14 @@ public:
 // absence, never a fabricated tx; the fee total is folded into coinbasevalue
 // UPSTREAM via resolve_coinbase_value, not here), previousblockhash
 // is emitted ONLY when the caller supplies a real tip hash (truthful absence,
-// never a fabricated id), and `bits` is held back entirely -- DGB Core's live
-// next-target is MultiShield V4 (a global 5-algo window == V37), so a
-// Scrypt-only walk would emit a known-wrong difficulty (the same fabrication
-// the empty transactions[] deliberately avoids). bits becomes a GBT
-// pass-through once the external-daemon path is plumbed in.
+// never a fabricated id), and `bits` is likewise a caller-supplied conditional
+// pass-through: emitted ONLY when the caller hands in the authoritative
+// external-daemon GBT bits. The embedded Scrypt-only path supplies none -- DGB
+// Core's live next-target is MultiShield V4 (a global 5-algo window == V37), so
+// a Scrypt-only walk would emit a known-wrong difficulty (the same fabrication
+// the empty transactions[] deliberately avoids); it leaves bits unset and the
+// field is held back for that caller, never fabricated. The G1 replay harness
+// and any future daemon-GBT caller set in.bits from the oracle value.
 struct WorkTemplateInputs {
     // Absolute height of the NEXT block (#209 next_block_height()).
     uint32_t next_height = 0;
@@ -108,6 +150,13 @@ struct WorkTemplateInputs {
     // coinbasevalue UPSTREAM via resolve_coinbase_value(total_fees) (#207 SSOT);
     // the builder never derives the reward, so this field is display-only shape.
     nlohmann::json transactions = nlohmann::json::array();
+    // GBT nBits (compact difficulty) as the daemon emits it -- the authoritative
+    // external-daemon GBT value, supplied by the caller. nullopt -> bits omitted
+    // from the template (truthful absence: the embedded Scrypt-only path can only
+    // reconstruct MultiShield V4 with a full 5-algo window (== V37), so it never
+    // fabricates a Scrypt-only value and leaves this unset). The identical
+    // conditional-emit discipline as previousblockhash.
+    std::optional<std::string> bits;
 };
 
 inline nlohmann::json build_work_template(const WorkTemplateInputs& in)
@@ -139,6 +188,11 @@ inline nlohmann::json build_work_template(const WorkTemplateInputs& in)
     // previousblockhash: truthful conditional emit (see struct notes).
     if (in.previousblockhash)
         tmpl["previousblockhash"] = *in.previousblockhash;
+
+    // bits: truthful conditional emit -- present only when the caller supplies
+    // the authoritative external-daemon GBT value (see struct notes).
+    if (in.bits)
+        tmpl["bits"] = *in.bits;
 
     return tmpl;
 }

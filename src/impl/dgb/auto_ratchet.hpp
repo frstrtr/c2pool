@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // AutoRatchet: autonomous share version transition state machine (DGB port).
@@ -21,7 +22,7 @@
 //                       (permanent on restart)               |
 //                       CONFIRMED <--------------------------+
 //
-// Port of p2pool-v36 data.py AutoRatchet (lines 2109-2344), mirroring
+// C++ implementation of the p2pool-v36 AutoRatchet design, mirroring
 // src/impl/ltc/auto_ratchet.hpp.
 //
 // DGB DIVERGENCE FROM LTC (per operator 2026-06-17 re-scope): DGB's

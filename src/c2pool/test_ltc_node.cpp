@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Test program specifically for the LTC-based c2pool node
 #include <iostream>
 #include <memory>

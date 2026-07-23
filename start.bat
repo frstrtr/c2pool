@@ -1,16 +1,41 @@
 @echo off
-setlocal
+setlocal enabledelayedexpansion
 set DIR=%~dp0
 set CONFIG=%1
 if "%CONFIG%"=="" set CONFIG=%DIR%config\c2pool_mainnet.yaml
 
-echo === c2pool ===
+:: Locate the packaged coin binary. release.yml packages it per-coin as
+:: c2pool-<coin>.exe, so resolve by glob rather than a hard-coded name;
+:: fall back to a plain c2pool.exe for source builds.
+set BIN=
+for %%f in ("%DIR%c2pool-*.exe") do set BIN=%%f
+if "!BIN!"=="" if exist "%DIR%c2pool.exe" set BIN=%DIR%c2pool.exe
+if "!BIN!"=="" (
+    echo ERROR: no c2pool binary found in %DIR%
+    exit /b 1
+)
+for %%f in ("!BIN!") do set BINNAME=%%~nxf
+
+:: Coin-guard: refuse a binary/config coin mismatch (see start.sh).
+for /f "tokens=2 delims=-." %%c in ("!BINNAME!") do set BINCOIN=%%c
+if exist "%CONFIG%" (
+    set /p CFGHDR=<"%CONFIG%"
+    echo !CFGHDR! | findstr /I "!BINCOIN!" >nul
+    if errorlevel 1 (
+        echo ERROR: config/coin mismatch - binary is c2pool-!BINCOIN! but config header reads:
+        echo          !CFGHDR!
+        echo Launch with the coin-correct config, e.g.: %~nx0 config\c2pool_mainnet.yaml
+        exit /b 1
+    )
+)
+
+echo === !BINNAME! ===
 echo Config:   %CONFIG%
 echo Web:      http://0.0.0.0:8080
 echo Explorer: http://0.0.0.0:9090
 
 :: Start c2pool
-start /B "" "%DIR%c2pool.exe" --config "%CONFIG%" --dashboard-dir "%DIR%web-static"
+start /B "" "!BIN!" --config "%CONFIG%" --dashboard-dir "%DIR%web-static"
 
 :: Wait for API
 :wait_loop

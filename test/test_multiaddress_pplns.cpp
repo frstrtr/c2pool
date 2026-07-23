@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // test_multiaddress_pplns.cpp — Tests for multiaddress coinbase building
 // and PPLNS consensus validation across parent and merged chains.
 //

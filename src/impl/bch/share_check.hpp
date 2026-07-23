@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // P2: Share verification — check_hash_link, check_merkle_link, share init/check
@@ -170,6 +171,19 @@ inline HashLinkType prefix_to_hash_link_v35(
     const std::vector<unsigned char>& const_ending)
 {
     auto v36_link = prefix_to_hash_link(prefix, const_ending);
+    // FAIL-LOUD (v36 verify-preimage): a V35 HashLinkType (FixedStrType(0)) has
+    // NO extra_data field, so any coinbase whose trailing partial SHA-256 block
+    // exceeds the const_ending tail (bufsize > len(const_ending)) leaves residual
+    // bytes a V35 hash_link cannot carry. Silently dropping them makes
+    // check_hash_link recompute a DIFFERENT coinbase txid than the author
+    // committed, so the share fails verify against a v36 peer. This is exactly
+    // the case the oracle's V36 hash_link (variable-length extra_data) exists
+    // for: such a coinbase MUST be authored at V36. Refuse to forge an
+    // unrepresentable V35 hash_link rather than emit a mismatching preimage.
+    if (!v36_link.m_extra_data.m_data.empty())
+        throw std::runtime_error(
+            "prefix_to_hash_link_v35: coinbase requires V36 hash_link "
+            "(extra_data non-empty; V35 FixedStrType(0) cannot represent it)");
     HashLinkType result;
     result.m_state = v36_link.m_state;
     result.m_length = v36_link.m_length;
@@ -710,6 +724,26 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
         reinterpret_cast<const unsigned char*>(header_stream.data()), header_stream.size());
     uint256 share_hash = Hash(hdr_span);
 
+    // [verify-preimage-diag] Non-fatal author-vs-verify divergence localiser.
+    // When a locally-stored identity is present and the recomputed hash differs,
+    // dump the preimage components. The header scalars are carried verbatim, so a
+    // mismatch here isolates to gentx_hash / merkle_root (coinbase+PPLNS author
+    // path). The chain keys off share.m_hash, so this is diagnostic only.
+    if (!share.m_hash.IsNull() && share_hash != share.m_hash) {
+        static int preimage_diag = 0;
+        if (preimage_diag++ < 10) {
+            LOG_WARNING << "[verify-preimage] recomputed=" << share_hash.GetHex().substr(0, 16)
+                        << " stored=" << share.m_hash.GetHex().substr(0, 16);
+            LOG_WARNING << "[verify-preimage] gentx_hash=" << gentx_hash.GetHex()
+                        << " merkle_root=" << merkle_root.GetHex();
+            LOG_WARNING << "[verify-preimage] hdr ver=" << share.m_min_header.m_version
+                        << " prev=" << share.m_min_header.m_previous_block.GetHex().substr(0, 16)
+                        << " time=" << share.m_min_header.m_timestamp
+                        << " bits=0x" << std::hex << share.m_min_header.m_bits << std::dec
+                        << " nonce=" << share.m_min_header.m_nonce;
+        }
+    }
+
     // --- PoW check (SHA256d) ---
     // For Bitcoin POW_FUNC is SHA256d, identical to the block identity hash.
     // (LTC was scrypt(1024,1,1,256); BTC's pow_hash == share_hash via Hash(hdr_span).)
@@ -916,7 +950,7 @@ inline std::vector<unsigned char> get_share_script(const auto* obj)
 // the PPLNS weights computed from the share chain.  Returns the expected
 // gentx txid (double-SHA256 of the non-witness serialised transaction).
 //
-// This is the C++ port of p2pool v36's generate_transaction() / check().
+// C++ implementation of the p2pool v36 generate_transaction() / check() design.
 //
 // The coinbase structure is:
 //   tx_ins:  [ { prev_output: 0...0:ffffffff, script: coinbase } ]
@@ -2202,6 +2236,18 @@ uint256 create_local_share_v35(
         prev_share, share.m_timestamp, desired_target);
     share.m_max_bits   = share_max_bits;
     share.m_bits       = share_bits;
+
+    // -- Share-target pin (independent of has_frozen) --
+    // Pin m_bits/m_max_bits to the target the miner was actually ISSUED and
+    // hashed against (caller passes job.share_bits/share_max_bits) BEFORE
+    // abswork is derived from m_bits below. Without this, create_local_share
+    // re-derives the target via compute_share_target, which on cold-start /
+    // isolated-net (and under the BCH_DEMO_SHARE_BITS floor) differs from the
+    // target the stratum gate accepted -- so the internal PoW recheck rejects
+    // an otherwise-valid local share and Stored stays 0. The has_frozen block
+    // below re-applies the same values, so this is a no-op on that path.
+    if (override_max_bits) share.m_max_bits = override_max_bits;
+    if (override_bits)     share.m_bits     = override_bits;
     share.m_nonce      = 0;
 
     // V35: address as string (VarStr), convert from payout_script
@@ -2635,6 +2681,18 @@ uint256 create_local_share(
     share.m_max_bits   = share_max_bits;
     share.m_bits       = share_bits;
 
+    // -- Share-target pin (independent of has_frozen) --
+    // Pin m_bits/m_max_bits to the target the miner was actually ISSUED and
+    // hashed against (caller passes job.share_bits/share_max_bits) BEFORE
+    // abswork is derived from m_bits below. Without this, create_local_share
+    // re-derives the target via compute_share_target, which on cold-start /
+    // isolated-net (and under the BCH_DEMO_SHARE_BITS floor) differs from the
+    // target the stratum gate accepted -- so the internal PoW recheck rejects
+    // an otherwise-valid local share and Stored stays 0. The has_frozen block
+    // below re-applies the same values, so this is a no-op on that path.
+    if (override_max_bits) share.m_max_bits = override_max_bits;
+    if (override_bits)     share.m_bits     = override_bits;
+
     share.m_nonce      = 0; // share commitment nonce (not block nonce)
     share.m_merged_addresses = merged_addrs;
 
@@ -2720,7 +2778,14 @@ uint256 create_local_share(
             // Chain is complete and shorter than 99 → None (zero)
             share.m_far_share_hash = uint256();
         } else {
-            share.m_far_share_hash = tracker.chain.get_nth_parent_key(prev_share, 99);
+            try {
+                share.m_far_share_hash = tracker.chain.get_nth_parent_key(prev_share, 99);
+            } catch (const std::exception&) {
+                // Bootstrap: chain shorter than the 99-deep lookback even though
+                // get_height_and_last reported a non-null last → far=None, mirroring
+                // the guarded _v35 author and p2pool's get_nth_parent_hash(prev,99).
+                share.m_far_share_hash = uint256();
+            }
         }
     } else {
         // Genesis: p2pool always does (prev_absheight + 1), (prev_abswork + aps)

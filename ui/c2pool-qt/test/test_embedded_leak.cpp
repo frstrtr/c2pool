@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // test_embedded_leak — Qt step 14 leak-regression harness.
 //
 // Asserts that mount→destroy × 100 of PageEmbedded does not leave

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // FALLBACK broadcast orchestration for a WON block.
@@ -51,8 +52,19 @@ inline bool broadcast_block_for_connect(
     const std::function<bool()>& relay_p2p,
     const std::function<bool()>& submit_rpc)
 {
-    bool relayed   = relay_p2p  ? relay_p2p()  : false;  // best-effort fast propagation
-    bool connected = submit_rpc ? submit_rpc() : false;  // ALWAYS - connect-authoritative
+    // BOTH legs guarded (mirrors core::broadcast_block_with_fallback): a throwing
+    // sink must NEVER unwind out of the won-block path and destroy the OTHER
+    // leg's result. In particular a throwing submit_rpc -- e.g. a daemon
+    // unreachable at submit time raises JsonRpcException out of submit_block_hex
+    // -- must NOT erase an already-succeeded P2P relay, else the caller falsely
+    // reports "reached NEITHER -- lost subsidy" for a block that WAS relayed to
+    // peers. This hole was newly reachable once ARM B (m_rpc) was armed (#744 M1).
+    bool relayed = false;
+    try { relayed = relay_p2p ? relay_p2p() : false; }      // best-effort fast propagation
+    catch (...) { relayed = false; }
+    bool connected = false;
+    try { connected = submit_rpc ? submit_rpc() : false; }  // ALWAYS - connect-authoritative
+    catch (...) { connected = false; }
     return relayed || connected;
 }
 

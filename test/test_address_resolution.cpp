@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /**
  * Tests for merged mining address resolution:
  *   - Cases 2a-2c: Auto-derivation (LTC P2PKH/P2WPKH/P2SH → merged chain script)
@@ -400,4 +401,148 @@ TEST(AddressResolution, ConvertibleCheckP2TR)
     EXPECT_EQ(atype, "p2tr");
     bool convertible = (atype == "p2pkh" || atype == "p2wpkh" || atype == "p2sh");
     EXPECT_FALSE(convertible);
+}
+
+// ============================================================================
+// Suite 8: post-authorize work-resend single-fire gate (PR #585 seam b)
+//
+// Deterministic mirror of the decision in
+// core::StratumSession::handle_authorize (src/core/stratum_server.cpp): the
+// auto-derive predicate that populates merged_addresses_, the NEW (widened)
+// resend gate that fires the single send_notify_work(true), and the OLD
+// merged-only gate kept as a regression witness.
+//
+// Pins the *actually-changed path* across the full username matrix INCLUDING
+// P2WSH/P2TR LTC primaries. Such primaries carry a 32-byte witness program
+// that cannot reduce to a 20-byte hash160, so merged_addresses_ is never
+// auto-derived even though username_ is set. Under the OLD merged-only gate
+// they got no resend and kept mining the degenerate value-0 coinbase; the
+// widened gate now resends once so the coinbase carries the real payout.
+// ============================================================================
+
+namespace {
+// VERBATIM mirror of the auto-derive predicate (stratum_server.cpp): merged
+// addresses are derived from the primary ONLY for convertible 20-byte types.
+bool auto_derives_merged(const std::string& atype, size_t h160_len)
+{
+    return h160_len == 40u &&
+        (atype == "p2pkh" || atype == "p2wpkh" || atype == "p2sh");
+}
+
+// NEW (PR #585) resend gate: fires when the now-known username_ OR any merged
+// addr can change the coinbase.
+bool resend_fires_new(const std::string& username, bool merged_nonempty)
+{
+    return !username.empty() || merged_nonempty;
+}
+
+// OLD (pre-#585) gate, retained as the regression witness: merged-only.
+bool resend_fires_old(bool merged_nonempty)
+{
+    return merged_nonempty;
+}
+
+// Models has_merged_chain(): true for a merged-mining pool (LTC w/ DOGE aux),
+// false for a standalone parent (BCH/BTC).
+struct GateOutcome {
+    bool merged_nonempty;
+    int  new_fires;   // # of send_notify_work(true) the new gate would issue
+    bool old_would_fire;
+    std::vector<unsigned char> payout_script;
+};
+
+GateOutcome simulate_authorize(const std::string& username, bool has_merged_chain)
+{
+    std::string atype;
+    auto h160 = address_to_hash160(username, atype);
+    bool merged_nonempty = has_merged_chain && auto_derives_merged(atype, h160.size());
+    GateOutcome o;
+    o.merged_nonempty = merged_nonempty;
+    // single guard around a single send_notify_work(true) -> count is 0 or 1
+    o.new_fires = resend_fires_new(username, merged_nonempty) ? 1 : 0;
+    o.old_would_fire = resend_fires_old(merged_nonempty);
+    o.payout_script = address_to_script(username);
+    return o;
+}
+} // namespace
+
+// --- Unchanged classes (P2PKH / P2WPKH / P2SH merged primary): derive + fire,
+//     identical to the OLD gate. ---
+
+TEST(ResendGate, P2PKH_MergedPrimary_FiresOnce_Unchanged)
+{
+    auto o = simulate_authorize(LTC_P2PKH, /*has_merged_chain=*/true);
+    EXPECT_TRUE(o.merged_nonempty);
+    EXPECT_EQ(o.new_fires, 1);          // single-fire
+    EXPECT_TRUE(o.old_would_fire);      // old gate also fired -> behavior unchanged
+    EXPECT_FALSE(o.payout_script.empty());
+}
+
+TEST(ResendGate, P2WPKH_MergedPrimary_FiresOnce_Unchanged)
+{
+    auto o = simulate_authorize(LTC_BECH32, true);
+    EXPECT_TRUE(o.merged_nonempty);
+    EXPECT_EQ(o.new_fires, 1);
+    EXPECT_TRUE(o.old_would_fire);
+    EXPECT_FALSE(o.payout_script.empty());
+}
+
+TEST(ResendGate, P2SH_MergedPrimary_FiresOnce_Unchanged)
+{
+    auto o = simulate_authorize(LTC_P2SH, true);
+    EXPECT_TRUE(o.merged_nonempty);
+    EXPECT_EQ(o.new_fires, 1);
+    EXPECT_TRUE(o.old_would_fire);
+    EXPECT_FALSE(o.payout_script.empty());
+}
+
+// --- New-firing class 1: standalone parent (no merged chains). ---
+
+TEST(ResendGate, StandaloneParent_FiresOnce_WasSilentBefore)
+{
+    // Any valid primary on a pool with NO merged chains (BCH/BTC).
+    auto o = simulate_authorize(LTC_P2PKH, /*has_merged_chain=*/false);
+    EXPECT_FALSE(o.merged_nonempty);
+    EXPECT_EQ(o.new_fires, 1);          // widened gate fires
+    EXPECT_FALSE(o.old_would_fire);     // OLD merged-only gate stayed silent (the bug)
+    EXPECT_FALSE(o.payout_script.empty());
+}
+
+// --- New-firing class 2: P2WSH/P2TR LTC primary on a MERGED coin. The
+//     actually-changed path the integrator flagged: merged stays empty
+//     (non-convertible 32-byte program) yet the resend must now fire once with
+//     a real payout script. ---
+
+TEST(ResendGate, P2WSH_LtcPrimary_FiresOnce_MergedEmpty_RealPayout)
+{
+    auto o = simulate_authorize(LTC_P2WSH, /*has_merged_chain=*/true);
+    EXPECT_FALSE(o.merged_nonempty);    // 32-byte program -> no auto-derive
+    EXPECT_EQ(o.new_fires, 1);          // widened gate fires (latent-bug fix)
+    EXPECT_FALSE(o.old_would_fire);     // OLD gate would have stayed silent
+    // carries the REAL payout: P2WSH = OP_0 <32-byte program>
+    ASSERT_EQ(o.payout_script.size(), 34u);
+    EXPECT_EQ(o.payout_script[0], 0x00);
+    EXPECT_EQ(o.payout_script[1], 0x20);
+}
+
+TEST(ResendGate, P2TR_LtcPrimary_FiresOnce_MergedEmpty_RealPayout)
+{
+    auto o = simulate_authorize(LTC_P2TR, /*has_merged_chain=*/true);
+    EXPECT_FALSE(o.merged_nonempty);    // 32-byte program -> no auto-derive
+    EXPECT_EQ(o.new_fires, 1);          // widened gate fires (latent-bug fix)
+    EXPECT_FALSE(o.old_would_fire);     // OLD gate would have stayed silent
+    // carries the REAL payout: P2TR = OP_1 <32-byte program>
+    ASSERT_EQ(o.payout_script.size(), 34u);
+    EXPECT_EQ(o.payout_script[0], 0x51);
+    EXPECT_EQ(o.payout_script[1], 0x20);
+}
+
+// Empty username (pre-authorize job) must NOT fire under either gate — the
+// degenerate-coinbase precondition that motivated the resend in the first place.
+TEST(ResendGate, EmptyUsername_NeverFires)
+{
+    auto o = simulate_authorize("", /*has_merged_chain=*/false);
+    EXPECT_FALSE(o.merged_nonempty);
+    EXPECT_EQ(o.new_fires, 0);
+    EXPECT_FALSE(o.old_would_fire);
 }

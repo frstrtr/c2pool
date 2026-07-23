@@ -56,10 +56,17 @@ async function capture(mode, outfile) {
     // Suppress console errors from unused endpoints (Mock returns {} for
     // a handful of dashboards we don't care about.)
     page.on('pageerror', (err) => console.error(`[${mode}] pageerror`, err.message));
-    // `load` rather than `networkidle0` — bundled mode opens a
-    // persistent SSE connection that keeps "network" non-idle.
-    await page.goto(url, { waitUntil: 'load', timeout: 15000 });
-    await page.waitForSelector('#defrag-canvas', { timeout: 5000 });
+    // `domcontentloaded` rather than `load`/`networkidle0`. The four
+    // dashboard scripts (d3, multipool, highcharts*) are synchronous
+    // <head> classic scripts, so they have downloaded + executed by
+    // DOMContentLoaded and #defrag-canvas already exists — the explicit
+    // waitForSelector below gates render deterministically. `load` is
+    // fragile: a fresh Chrome-for-Testing build (self-hosted runner)
+    // leaves a non-essential subresource (favicon/image) pending and
+    // never fires the load event within the timeout; `networkidle0`
+    // never settles because bundled mode opens a persistent SSE conn.
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForSelector('#defrag-canvas', { timeout: 20000 });
     // Generous fixed delay lets both paths complete their initial
     // fetch + render. Deterministic against the mock server (no live
     // data, no SSE pushes).

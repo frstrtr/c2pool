@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 /// Phase 5.3: DOGE Template Builder
@@ -51,6 +52,17 @@ public:
     static constexpr uint32_t MAX_BLOCK_WEIGHT  = 4'000'000u;
     static constexpr uint32_t COINBASE_RESERVE  = 2'000u;
 
+    // ── Underfill guard (v36 cutover deploy path) ──────────────────────
+    // Mirror of the LTC parent guard. DOGE runs its OWN embedded GBT path and
+    // selects its OWN transactions, so it can go near-empty on a non-empty DOGE
+    // mempool independently: merged-mining makes the aux inherit the parent PoW,
+    // NOT the tx-fill. The guard therefore lives here directly rather than being
+    // inherited from LTC. Thresholds are a v36-native shared structure (bucket-2,
+    // standardize cross-coin) pinned to the legacy p2pool near-empty floor
+    // (~50 kB); reviewable by btc-heap-opt.
+    static constexpr uint64_t UNDERFILL_MIN_FILL_BYTES = 50'000ull; // < this = near-empty block
+    static constexpr uint64_t UNDERFILL_BACKLOG_SLACK  = 50'000ull; // unselected fee-paying material that should have filled it
+
     static std::optional<ltc::coin::rpc::WorkData> build_template(
         const HeaderChain& chain,
         const Mempool&     pool,
@@ -97,9 +109,11 @@ public:
         std::vector<Transaction> tx_objects;
         std::vector<uint256>     tx_hashes;
 
+        uint64_t selected_bytes = 0;  // wire bytes packed into this template (underfill guard)
         for (const auto& stx : selected_txs) {
             uint256     txid     = compute_txid(stx.tx);
             auto        packed   = pack(TX_WITH_WITNESS(stx.tx));
+            selected_bytes += packed.get_span().size();
             std::string hex_data = HexStr(packed.get_span());
 
             nlohmann::json entry;
@@ -113,6 +127,27 @@ public:
 
             tx_objects.push_back(Transaction(stx.tx));
             tx_hashes.push_back(txid);
+        }
+
+        // ── Underfill guard ───────────────────────────────────────
+        // Do not silently treat a near-empty DOGE template as healthy when the
+        // DOGE mempool held fee-paying backlog that should have filled it. We
+        // cannot fabricate transactions, so surface loudly (WARNING) for
+        // contabo-prod-watch / the operator. Genuinely empty mempools never trip.
+        {
+            const uint64_t mempool_bytes = static_cast<uint64_t>(pool.byte_size());
+            const uint64_t mempool_fees  = pool.total_fees();
+            const bool near_empty  = selected_bytes < UNDERFILL_MIN_FILL_BYTES;
+            const bool has_backlog = mempool_fees > 0
+                                  && mempool_bytes > selected_bytes + UNDERFILL_BACKLOG_SLACK;
+            if (near_empty && has_backlog) {
+                LOG_WARNING << "[EMB-DOGE] TemplateBuilder UNDERFILL: selected "
+                            << selected_txs.size() << " tx / " << selected_bytes
+                            << "B into template while mempool holds " << pool.size()
+                            << " tx / " << mempool_bytes << "B (" << mempool_fees
+                            << " sat fees) — near-empty block on a non-empty "
+                            << "mempool; template-fill regression, gates cutover.";
+            }
         }
 
         // ── Build GBT-compatible JSON ────────────────────────────────────

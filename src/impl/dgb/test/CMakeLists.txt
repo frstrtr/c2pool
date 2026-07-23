@@ -177,6 +177,19 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_connection_coinbase_test "" AUTO)
 
+    # --- G3b: won-block wire framing KAT -----------------------------------
+    # Pins coin/won_block_serialize.hpp: the body emitted for a won block is
+    # exactly the tx set the FROZEN stratum merkle root commits to (no branches
+    # => coinbase-only, else bad-txnmrklroot), and BIP144 witness form is
+    # emitted IFF the coinbase carries the BIP141 aa21a9ed commitment (else
+    # unexpected-witness). Header-only + byte-level: no chain/tx-codec deps.
+    # MUST appear in BOTH this registration AND the build.yml --target
+    # allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_won_block_serialize_test won_block_serialize_test.cpp)
+    target_link_libraries(dgb_won_block_serialize_test PRIVATE
+        GTest::gtest_main GTest::gtest)
+    gtest_add_tests(dgb_won_block_serialize_test "" AUTO)
+
     # --- Phase B: PPLNS weights -> consensus-sorted payout outputs KAT ------
     # Pins coin/pplns_payout_split.hpp: compute_pplns_payout_split reproduces
     # steps 2-3 of share_check.hpp generate_share_transaction (the verification
@@ -357,6 +370,20 @@ if (BUILD_TESTING AND GTest_FOUND)
             GTest::gtest_main GTest::gtest nlohmann_json::nlohmann_json)
         gtest_add_tests(${dgb_guard} "" AUTO)
     endforeach()
+
+    # dgb_arith256_muldiv_kat_test: FENCED, additive KAT for #690 -- PROVES the
+    # DigiShield 256-bit retarget primitives (detail mul_add_u128 / div_u128 /
+    # add_u128, and u256 mul_u64 / div_u64 / operator+=) are BIT-IDENTICAL on the
+    # native __int128 path vs the portable-forced software path
+    # (detail::*_portable / u256_portable) that certifies the MSVC
+    # _umul128/_udiv128 branch we cannot compile or run on Linux. Special
+    # coverage of the _udiv128 hi<d running-remainder boundary. Pure header math
+    # (<cstdint> only) -> links only GTest, like the foreach guards above. MUST
+    # also be in BOTH build.yml --target allowlists (#143 NOT_BUILT trap).
+    add_executable(dgb_arith256_muldiv_kat_test arith256_muldiv_kat_test.cpp)
+    target_link_libraries(dgb_arith256_muldiv_kat_test PRIVATE
+        GTest::gtest_main GTest::gtest)
+    gtest_add_tests(dgb_arith256_muldiv_kat_test "" AUTO)
     # --- #82 broadcaster-gate: CoinNode submit/seam contract -----------------
     # Links the dgb OBJECT lib (coin_node.cpp) like dgb_share_test so the live
     # CoinNode::submit_block_hex !m_rpc guard + embedded WorkView slice are
@@ -651,6 +678,59 @@ if (BUILD_TESTING AND GTest_FOUND)
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_aux_broadcast_path_election_test "" AUTO)
+    # --- DGB+DOGE (phase DC) -- SUBMIT-half KAT ((b) ruling, UID:3130) ---------
+    # Companion to dgb_aux_doge_dc_proof_test: pins that a won DOGE-aux block is
+    # submitted FROM DGBS OWN dispatch, RPC-only, through a DGB-owned dogecoind
+    # seam DISTINCT from the digibyted parent seam, consuming the shared doge
+    # module read-side-only. Header-only under test (aux_doge_submit.hpp), so it
+    # needs no doge/merged link -- only core (ICoinNode/WorkView) + dgb. The header
+    # is #ifdef AUX_DOGE-gated (parity with coin/node.hpp), so this TU defines
+    # AUX_DOGE locally to stay build-verifiable in the normal test leg. MUST appear
+    # in BOTH this registration AND the build.yml --target allowlist (#143 trap).
+    add_executable(dgb_aux_doge_submit_test aux_doge_submit_test.cpp)
+    target_compile_definitions(dgb_aux_doge_submit_test PRIVATE AUX_DOGE)
+    target_link_libraries(dgb_aux_doge_submit_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb ltc_coin
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_aux_doge_submit_test "" AUTO)
+
+    # --- DGB+DOGE (phase DC) -- EMBED LIVE-WIRE KAT ((b) ruling, UID:3134) ------
+    # Closes the embed<->submit seam: pins that the auxpow_hex the submit half
+    # frames is the PARENT-SIDE build_auxpow_proof derivation over the MINTED,
+    # DOGE-commitment-carrying coinbase (the runtime getauxblock-seam image), not
+    # a hand-fixtured parallel. Includes the AUX_DOGE-gated submit header, so it
+    # defines AUX_DOGE locally and links the merged producer + ltc_coin like the
+    # dc_proof sibling. MUST appear in BOTH this registration AND the build.yml
+    # --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_aux_doge_embed_livewire_test aux_doge_embed_livewire_test.cpp)
+    target_compile_definitions(dgb_aux_doge_embed_livewire_test PRIVATE AUX_DOGE)
+    target_link_libraries(dgb_aux_doge_embed_livewire_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb ltc_coin
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_aux_doge_embed_livewire_test "" AUTO)
+
+    # --- DGB+DOGE (phase DC) -- ASSEMBLED-BLOCK LAYOUT VERIFIER KAT ------------
+    # ltc-doge un-fence contract (2026-07-02): pins the DC verifier to the
+    # AUTHORITATIVE assembled DOGE-submit-block layout (header80||auxpow||varint
+    # ||coinbase||tmpl_txs), the auxpow field order vs the build_auxpow_proof
+    # SSOT, AUXPOW_CHAIN_ID 0x0062, and the UNCONDITIONAL primary-path relay
+    # semantic -- so the deferred /tmp/c2pool_doge_block_<h>.hex capture matches
+    # by construction. Consume-only: neutral producer + shared chain param, no
+    # merged_mining.*/doge edits. Defines AUX_DOGE locally + links the merged
+    # producer & ltc_coin like the dc_proof sibling. MUST appear in BOTH this
+    # registration AND the build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_aux_doge_dc_layout_verifier_test aux_doge_dc_layout_verifier_test.cpp)
+    target_compile_definitions(dgb_aux_doge_dc_layout_verifier_test PRIVATE AUX_DOGE)
+    target_link_libraries(dgb_aux_doge_dc_layout_verifier_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb ltc_coin
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_aux_doge_dc_layout_verifier_test "" AUTO)
 
     # dgb_share_target_genesis_test: FENCED KAT pinning ShareTracker::compute_
     # share_target genesis/unknown-prev clamp to [MAX_TARGET/30, MAX_TARGET] vs
@@ -664,6 +744,34 @@ if (BUILD_TESTING AND GTest_FOUND)
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_share_target_genesis_test "" AUTO)
+
+    # dgb_share_bits_oracle_pin_test: FENCED Phase-B KAT. Pins the sharechain
+    # `bits` (compact FloatingInteger) encoding against LITERAL goldens from the
+    # oracle reference encoder (data.py from_target_upper_bound), removing the
+    # SUT-vs-SUT circularity in dgb_share_target_genesis_test. MUST also be in
+    # the build.yml --target allowlist (#143).
+    add_executable(dgb_share_bits_oracle_pin_test share_bits_oracle_pin_test.cpp)
+    target_link_libraries(dgb_share_bits_oracle_pin_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_share_bits_oracle_pin_test "" AUTO)
+
+    # dgb_share_target_retarget_test: FENCED non-circular KAT pinning the
+    # NON-genesis (deep-chain, acc_height >= TARGET_LOOKBEHIND) branch of
+    # ShareTracker::compute_share_target -- Step-3 emergency time-based decay +
+    # Step-4 +/-10% clamp -- to goldens derived from an INDEPENDENT Python
+    # reference of the oracle formula (not from the SUT). Companion to
+    # dgb_share_target_genesis_test (which covers the genesis branch); links the
+    # same proven set. MUST also be in the build.yml --target allowlist (#143).
+    add_executable(dgb_share_target_retarget_test share_target_retarget_test.cpp)
+    target_link_libraries(dgb_share_target_retarget_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_share_target_retarget_test "" AUTO)
 
     # dgb_g1_oracle_byte_parity_test: FENCED greenlight-gate G1 KAT. Pins the
     # assembled make_coin_params() net/consensus constants AND bucket-1
@@ -813,6 +921,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(dgb_share_weight_decay_test PRIVATE
         GTest::gtest_main GTest::gtest)
     gtest_add_tests(dgb_share_weight_decay_test "" AUTO)
+    # dgb_emergency_decay_saturation_test: FENCED, additive KAT pinning the
+    # share_tracker.hpp Step-3 emergency time-based decay (death-spiral
+    # prevention) eased target == min(prev_max_target * 2^halvings, MAX_TARGET)
+    # against an arbitrary-precision oracle (right-shift threshold form, no wrap
+    # at 2^256 OR 2^288). Proves (a) the load-bearing h=21/57.5min fails-now/
+    # passes-after boundary vector and (b) full-sweep NEW==ORACLE identity. Uses
+    # core uint256/uint288 -> links core only (no OBJECT lib). MUST also be in
+    # the build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_emergency_decay_saturation_test emergency_decay_saturation_test.cpp)
+    target_link_libraries(dgb_emergency_decay_saturation_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_emergency_decay_saturation_test "" AUTO)
     # dgb_binomial_conf_interval_test: FENCED, additive KAT pinning the pure
     # Wilson-score confidence-interval arithmetic of p2pool util/math.py:133
     # binomial_conf_interval (+ ierf/erf A&S-7.1.26 helpers) lifted into
@@ -858,6 +981,20 @@ if (BUILD_TESTING AND GTest_FOUND)
         core
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
     gtest_add_tests(dgb_desired_version_tally_test "" AUTO)
+    # dgb_min_protocol_ratchet_test: FENCED, additive KAT pinning the runtime
+    # P2P accept-floor ratchet dgb::ratchet_min_protocol_version (coin/
+    # desired_version_tally.hpp) vs the p2pool-dgb-scrypt update_min_protocol_version
+    # oracle (data.py:857-863): best-VERSION work-weight >= floor(total*95/100) lifts
+    # MINIMUM_PROTOCOL_VERSION 1400->3500. Same work-weighted map / window as the 60%
+    # switch gate; floor-div boundary case pins the oracle math (not cross-multiply).
+    # Pure header -> links core only. MUST also be in the build.yml --target allowlist
+    # (#143 NOT_BUILT trap).
+    add_executable(dgb_min_protocol_ratchet_test min_protocol_ratchet_test.cpp)
+    target_link_libraries(dgb_min_protocol_ratchet_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
+    gtest_add_tests(dgb_min_protocol_ratchet_test "" AUTO)
     # dgb_naughty_propagation_test: FENCED, additive KAT pinning the
     # NAUGHTY-PROPAGATION ancestor-punishment generation arithmetic in
     # coin/naughty_propagation.hpp vs the p2pool-dgb-scrypt data.py:543-549
@@ -926,6 +1063,23 @@ if (BUILD_TESTING AND GTest_FOUND)
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_auto_ratchet_tail_guard_test "" AUTO)
+
+    # dgb_auto_ratchet_sim_test: FENCED, additive rig-free SIM KAT arming the
+    # G2 staged-migration harness C2/C3/C4 rows WITHOUT a Scrypt rig or a live
+    # digibyted parent -- the C++ counterpart of the harness --sim-votes path.
+    # Exercises the AutoRatchet staged-gate LOGIC (auto_ratchet.hpp) over
+    # hand-derived oracle votes, pinned to DGB's OWN oracle baseline (v35,
+    # SUCCESSOR=None). Drives get_share_version + a verbatim replica of the live
+    # inline 60%-by-WORK tail guard. Links the dgb OBJECT lib like
+    # dgb_auto_ratchet_tail_guard_test (uint288 + share_tracker.hpp). MUST also
+    # be in the build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_auto_ratchet_sim_test auto_ratchet_sim_test.cpp)
+    target_link_libraries(dgb_auto_ratchet_sim_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_auto_ratchet_sim_test "" AUTO)
     # dgb_chain_walk_window_test: FENCED, additive KAT pinning the LOOKBEHIND
     # chain-walk WINDOW clamp in coin/chain_walk_window.hpp vs the
     # p2pool-dgb-scrypt oracle idiom actual = min(lookbehind, height) with the

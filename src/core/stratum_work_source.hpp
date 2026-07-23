@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // IWorkSource — abstract interface that decouples `core::StratumServer`
@@ -89,6 +90,12 @@ public:
                                        uint64_t accepted, uint64_t rejected,
                                        uint64_t stale) = 0;
 
+    // Optional: record per-session TCP round-trip latency (ms), sampled from the
+    // kernel socket by the stratum session. Default no-op so per-coin work sources
+    // need no override; MiningInterface stores it for dashboard display.
+    virtual void update_stratum_worker_rtt(const std::string& /*session_id*/,
+                                           double /*rtt_ms*/) {}
+
     // ── Work generation ──────────────────────────────────────────────────
     // Called per-job-issue (when sending mining.notify). Implementors
     // must produce a snapshot consistent with their template state at
@@ -176,6 +183,25 @@ public:
         uint32_t version, const std::string& prevhash_hex,
         const std::string& nbits_hex,
         const std::vector<std::string>& merkle_branches) const = 0;
+
+    /// Record an ACCEPTED pseudoshare for the dashboard "Best Share" card
+    /// (the highest-difficulty share seen — how close a miner got to a block).
+    /// The stratum session invokes this for EVERY accepted pseudoshare (the
+    /// vardiff-gate acceptance path), passing the already-computed X11/scrypt
+    /// share difficulty plus the raw submit fields so an implementor that wants
+    /// the exact pow-hash can recompute it. Default no-op — only work sources
+    /// whose dashboard is a separate object (c2pool-dash: the DASHWorkSource
+    /// drives its own stratum acceptor, distinct from the WebServer's
+    /// MiningInterface) override this to forward to the dashboard's best-share
+    /// tracker. Display only — never affects acceptance, target, or payout.
+    virtual void record_best_pseudoshare(
+        double /*share_difficulty*/, const std::string& /*miner*/,
+        const std::string& /*coinb1*/, const std::string& /*coinb2*/,
+        const std::string& /*extranonce1*/, const std::string& /*extranonce2*/,
+        const std::string& /*ntime*/, const std::string& /*nonce*/,
+        uint32_t /*version*/, const std::string& /*prevhash_hex*/,
+        const std::string& /*nbits_hex*/,
+        const std::vector<std::string>& /*merkle_branches*/) {}
 };
 
 }  // namespace core::stratum

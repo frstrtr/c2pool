@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /**
  * Threading architecture regression tests.
  *
@@ -60,8 +61,10 @@
 #include <chrono>
 #include <cstring>
 #include <future>
+#include <map>
 #include <memory>
 #include <set>
+#include <shared_mutex>
 #include <thread>
 
 namespace io = boost::asio;
@@ -494,4 +497,96 @@ TEST(VerifyShareThreading, Phase2SkipsNullHashShares)
         EXPECT_FALSE(share.hash.IsNull())
             << "Phase 2 emitted a share with null hash (index=" << share.index << ")";
     }
+}
+
+// ─── 8. Phase2HoldsLockAgainstComputePrune ───────────────────────────────────
+// Regression guard for the kr1z1s use-after-free / SIGSEGV race (issue #759).
+//
+// Models the exact hazard in NodeImpl: think()/clean_tracker() run on a SEPARATE
+// compute thread and take m_tracker_mutex EXCLUSIVELY to prune (drop_tails) —
+// FREEING chain nodes — while the IO thread runs processing_shares_phase2() /
+// notify_local_share() which mutate/read the same chain nodes.
+//
+// The FIXED discipline (btc/bch, back-ported to ltc): the IO-thread body must
+// hold the shared_mutex (try_to_lock; on !owns_lock defer) across every access
+// to the shared node container, and guard chain.contains() UNDER the lock.
+// The old ltc pattern released the lock early / read contains() bare, letting
+// the prune free a node mid-access -> UAF. Here the nodes are heap-allocated so
+// a discipline break is a genuine use-after-free (fails under ASan/TSan; may
+// also SIGSEGV in a plain build). With the correct discipline the run is clean.
+TEST(VerifyShareThreading, Phase2HoldsLockAgainstComputePrune)
+{
+    // A stand-in "chain": heap nodes keyed by id, guarded by a shared_mutex —
+    // the same primitive (std::shared_mutex m_tracker_mutex) the node uses.
+    struct Node {
+        int id;
+        std::atomic<uint64_t> touched{0};
+        explicit Node(int i) : id(i) {}   // atomic member => non-copyable/movable
+    };
+    std::map<int, std::unique_ptr<Node>> chain;
+    std::shared_mutex chain_mutex;
+
+    constexpr int MAX_ID = 512;
+    for (int i = 0; i < MAX_ID; ++i)
+        chain.emplace(i, std::make_unique<Node>(i));
+
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> io_ops{0};
+    std::atomic<uint64_t> defers{0};
+
+    // COMPUTE thread: clean_tracker() analog. Exclusive lock -> free ~half the
+    // nodes (drop_tails), then repopulate. This is the writer that invalidates
+    // pointers the IO thread must never hold across the lock boundary.
+    std::thread compute([&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            {
+                std::unique_lock<std::shared_mutex> lock(chain_mutex);
+                for (int i = 0; i < MAX_ID; i += 2)
+                    chain.erase(i);          // free nodes (drop_tails)
+                for (int i = 0; i < MAX_ID; i += 2)
+                    chain.emplace(i, std::make_unique<Node>(i));
+            }
+            std::this_thread::yield();
+        }
+    });
+
+    // IO thread: processing_shares_phase2() + notify_local_share() analog.
+    // try_to_lock; ONLY touch the freed-able nodes while owns_lock() holds, and
+    // HOLD the lock across the whole mutation body (never cache a Node* past the
+    // unlock). notify's contains()+access are guarded under the same lock.
+    auto io_body = [&] {
+        for (int iter = 0; iter < 20000 && !stop.load(std::memory_order_relaxed); ++iter) {
+            // processing_shares_phase2: hold lock across the mutation body.
+            {
+                std::unique_lock<std::shared_mutex> lock(chain_mutex, std::try_to_lock);
+                if (!lock.owns_lock()) { defers.fetch_add(1); continue; }
+                for (auto& [id, node] : chain) {
+                    node->touched.fetch_add(1, std::memory_order_relaxed); // deref UNDER lock
+                    io_ops.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            // notify_local_share: guarded contains() + access UNDER the lock.
+            {
+                int probe = iter % MAX_ID;
+                std::unique_lock<std::shared_mutex> lock(chain_mutex, std::try_to_lock);
+                if (lock.owns_lock()) {
+                    auto it = chain.find(probe);               // contains()
+                    if (it != chain.end())
+                        it->second->touched.fetch_add(1);      // deref UNDER lock
+                }
+            }
+        }
+    };
+
+    std::thread io1(io_body), io2(io_body);
+    io1.join(); io2.join();
+    stop.store(true);
+    compute.join();
+
+    // If we got here without a crash/ASan/TSan fault, the discipline held under
+    // concurrent prune. io_ops > 0 proves the IO body actually ran (didn't just
+    // defer forever), so the invariant was genuinely exercised.
+    EXPECT_GT(io_ops.load(), 0u)
+        << "IO body never acquired the lock — invariant not exercised";
+    SUCCEED() << "io_ops=" << io_ops.load() << " defers=" << defers.load();
 }

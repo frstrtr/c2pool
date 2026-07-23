@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // the_checkpoint.hpp — THE checkpoint verification and fast-sync support
 //

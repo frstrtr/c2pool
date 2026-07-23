@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #include "node.hpp"
 
 #include <core/common.hpp>
@@ -394,21 +395,38 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
     // Non-blocking mutex: if think() holds the exclusive lock on the compute
     // thread, queue this batch for processing after think() releases. The IO
     // thread never blocks — keepalive timers and network I/O continue.
-    {
-        std::unique_lock lock(m_tracker_mutex, std::try_to_lock);
-        if (!lock.owns_lock()) {
-            LOG_INFO << "[ASYNC-DEFER] processing_shares_phase2: mutex busy, queuing "
-                     << data.m_items.size() << " shares from " << addr.to_string()
-                     << " (pending=" << m_pending_adds.size() + 1 << ")";
-            m_pending_adds.push_back(PendingShareBatch{
-                std::make_unique<HandleSharesData>(std::move(data)), addr});
+    //
+    // HOLD this lock across the entire mutation body below (mirrors LTC f445db8e).
+    // try_to_lock keeps the IO thread non-blocking — busy => queue + return. Once
+    // acquired we must NOT release until all m_tracker.chain mutations are done:
+    // the prior code released here and ran the body lock-free, letting the
+    // compute-thread clean_tracker() exclusive prune (drop_tails) free chain nodes
+    // mid-mutation -> SIGSEGV (kr1z1s LTC/DGB). Released just before run_think().
+    std::unique_lock lock(m_tracker_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        // ── Backpressure (V36 livelock defense-in-depth) ──────────────
+        // If think() is wedged/slow the deferred queue could grow without
+        // bound and blow memory. Cap it: over MAX_PENDING_ADDS we DROP the
+        // new batch (peers re-advertise their best share, so dropped shares
+        // are re-requested later) and warn instead of growing unbounded.
+        if (m_pending_adds.size() >= MAX_PENDING_ADDS) {
+            LOG_WARNING << "[ASYNC-DEFER] BACKPRESSURE: pending_adds at cap ("
+                        << m_pending_adds.size() << "/" << MAX_PENDING_ADDS
+                        << "), dropping batch of " << data.m_items.size()
+                        << " shares from " << addr.to_string()
+                        << " — think() may be wedged";
             return;
         }
+        LOG_INFO << "[ASYNC-DEFER] processing_shares_phase2: mutex busy, queuing "
+                 << data.m_items.size() << " shares from " << addr.to_string()
+                 << " (pending=" << m_pending_adds.size() + 1 << ")";
+        m_pending_adds.push_back(PendingShareBatch{
+            std::make_unique<HandleSharesData>(std::move(data)), addr});
+        return;
     }
-    // Lock released — proceed with normal processing.
-    // No lock needed for the rest: we only enter here when think() is NOT
-    // running (m_tracker_mutex was available), and ASIO single-thread
-    // guarantees no other IO handler overlaps.
+    // Lock acquired and HELD across the mutation body below; released just before
+    // the async run_think() trigger so the compute thread can take the exclusive
+    // lock. ASIO single-thread still guarantees no overlapping IO handler.
 
     // Step 1: collect verified shares (skip any that failed verification, hash still null)
     std::vector<ShareType> valid_shares;
@@ -568,6 +586,11 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
                  << source << "... (dup=" << dup_count
                  << " chain=" << m_tracker.chain.size() << ")";
     }
+
+    // Release the tracker lock before triggering think(): run_think() posts the
+    // think+prune job to the compute thread, which needs the exclusive lock. All
+    // chain mutations above are complete at this point.
+    lock.unlock();
 
     // Trigger think() after every share batch (p2pool: set_best_share after handle_shares).
     // p2pool calls set_best_share() after EVERY batch with new_count > 0 — no size gate.
@@ -792,15 +815,19 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
 void NodeImpl::notify_local_share(const uint256& share_hash)
 {
     // p2pool: set_best_share() → think() synchronously on the reactor thread.
-    // Use think() for ALL best_share decisions, matching p2pool exactly.
-    if (share_hash.IsNull() || !m_tracker.chain.contains(share_hash))
+    // Use think() for ALL best_share decisions, as p2pool does.
+    if (share_hash.IsNull())
         return;
 
-    // Try inline verify — if think() holds the mutex, defer to next think() cycle.
-    // The share is already in the chain; think() will verify + score it.
+    // Both the chain.contains() read AND attempt_verify() run UNDER the tracker
+    // lock (mirrors LTC f445db8e). A bare m_tracker.chain.contains() here (the
+    // prior code) raced the compute-thread clean_tracker() exclusive prune freeing
+    // chain nodes -> SIGSEGV (kr1z1s LTC/DGB). try_to_lock keeps the IO thread
+    // non-blocking; if think()/clean holds the lock we skip the inline verify —
+    // the share is already in-chain and run_think() below will score it next cycle.
     {
         std::unique_lock lock(m_tracker_mutex, std::try_to_lock);
-        if (lock.owns_lock())
+        if (lock.owns_lock() && m_tracker.chain.contains(share_hash))
             m_tracker.attempt_verify(share_hash);
     }
 
@@ -966,7 +993,7 @@ void NodeImpl::readvertise_best_share()
 
 void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_hash)
 {
-    // p2pool node.py:108-141 download_shares() — exact translation.
+    // download_shares(): C++ implementation of the p2pool share-download loop.
     //
     // Key differences from old c2pool implementation:
     // 1. RANDOM peer selection (not the reporting peer)
@@ -1327,7 +1354,7 @@ void NodeImpl::start_outbound_connections()
 
 void NodeImpl::prune_shares(const uint256& /*best_share*/)
 {
-    // Matches p2pool node.py:381-398 tail-dropping exactly:
+    // Tail-dropping (as in p2pool's clean_tracker):
     // - Check each tail: if min(height(head) for heads) < 2*CL+10 → skip
     // - Remove ONE child of qualifying tail per iteration
     // - Loop up to 1000 times (gradual, not bulk)
@@ -1855,7 +1882,7 @@ void NodeImpl::heartbeat_log()
 }
 
 // Periodic maintenance: eat stale heads, drop tails.
-// Direct translation of p2pool node.py:355-402 clean_tracker().
+// C++ implementation of the p2pool clean_tracker() design (stale-head eating + tail dropping).
 //
 // Runs on the compute thread under exclusive lock — matching p2pool where
 // clean_tracker + think() execute on the same reactor thread. Chain
@@ -1993,7 +2020,7 @@ void NodeImpl::clean_tracker()
     }
 
     // Step 3: Drop tails — remove ALL children of qualifying tails.
-    // Exact translation of p2pool node.py:382-398.
+    // C++ implementation of the p2pool tail-dropping step.
     // p2pool has NO best-chain protection — the 2*CHAIN_LENGTH+10 threshold
     // ensures only shares far beyond the PPLNS window are removed.
     {
@@ -2161,155 +2188,18 @@ void NodeImpl::clean_tracker()
     }); // end of m_think_pool lambda
 }
 
-bool NodeImpl::is_whitelisted(const NetService& addr) const
-{
-    const std::string ip = addr.address();
-    if (m_whitelist_ips.contains(ip)) return true;
-    if (m_whitelist_hosts.contains(addr)) return true;
-    return false;
-}
 
-bool NodeImpl::is_banned(const NetService& addr) const
-{
-    // Whitelist bypass: permanent dial targets are immune to bans.
-    if (is_whitelisted(addr)) return false;
-
-    auto now = std::chrono::steady_clock::now();
-    auto it = m_ban_list.find(addr);
-    if (it != m_ban_list.end() && it->second > now) return true;
-
-    auto ip_it = m_ip_ban_list.find(addr.address());
-    if (ip_it != m_ip_ban_list.end() && ip_it->second > now) return true;
-
-    return false;
-}
 
 // ── Admin API implementation ──────────────────────────────────────────
 
-void NodeImpl::set_whitelist_path(const std::string& path)
-{
-    m_whitelist_path = path;
-    if (!path.empty()) load_whitelist_from_disk();
-}
 
-void NodeImpl::load_whitelist_from_disk()
-{
-    if (m_whitelist_path.empty()) return;
-    std::ifstream f(m_whitelist_path);
-    if (!f) return;
-    try {
-        nlohmann::json j;
-        f >> j;
-        if (!j.contains("entries") || !j["entries"].is_array()) return;
-        for (const auto& e : j["entries"]) {
-            if (!e.contains("host") || !e.contains("port")) continue;
-            std::string host = e["host"].get<std::string>();
-            uint16_t port = e["port"].get<uint16_t>();
-            m_whitelist_ips.insert(host);
-            m_whitelist_hosts.insert(NetService(host, port));
-        }
-        LOG_INFO << "[Pool] Loaded " << m_whitelist_hosts.size()
-                 << " whitelist entries from " << m_whitelist_path;
-    } catch (const std::exception& e) {
-        LOG_WARNING << "[Pool] Failed to parse whitelist " << m_whitelist_path
-                    << ": " << e.what();
-    }
-}
 
-void NodeImpl::save_whitelist_to_disk() const
-{
-    if (m_whitelist_path.empty()) return;
-    try {
-        nlohmann::json j;
-        j["version"] = 1;
-        auto arr = nlohmann::json::array();
-        auto now_unix = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        for (const auto& host : m_whitelist_hosts) {
-            arr.push_back({
-                {"host", host.address()},
-                {"port", host.port()},
-                {"added_unix", now_unix}
-            });
-        }
-        j["entries"] = arr;
-        std::string tmp = m_whitelist_path + ".new";
-        {
-            std::ofstream f(tmp);
-            f << j.dump(2);
-        }
-        std::filesystem::rename(tmp, m_whitelist_path);
-    } catch (const std::exception& e) {
-        LOG_WARNING << "[Pool] Failed to persist whitelist: " << e.what();
-    }
-}
 
-static nlohmann::json build_bans_json(
-    const std::map<NetService, std::chrono::steady_clock::time_point>& peer_bans,
-    const std::map<std::string, std::chrono::steady_clock::time_point>& ip_bans)
-{
-    auto now = std::chrono::steady_clock::now();
-    auto arr = nlohmann::json::array();
-    for (const auto& [addr, expiry] : peer_bans) {
-        if (expiry <= now) continue;
-        auto secs = std::chrono::duration_cast<std::chrono::seconds>(expiry - now).count();
-        arr.push_back({{"host", addr.address()}, {"port", addr.port()},
-                       {"expires_in_sec", secs}, {"source", "auto"}});
-    }
-    for (const auto& [ip, expiry] : ip_bans) {
-        if (expiry <= now) continue;
-        auto secs = std::chrono::duration_cast<std::chrono::seconds>(expiry - now).count();
-        arr.push_back({{"host", ip}, {"port", 0},
-                       {"expires_in_sec", secs}, {"source", "admin"}});
-    }
-    return arr;
-}
 
-static nlohmann::json build_whitelist_json(const std::set<NetService>& hosts)
-{
-    auto arr = nlohmann::json::array();
-    for (const auto& h : hosts)
-        arr.push_back({{"host", h.address()}, {"port", h.port()}});
-    return arr;
-}
 
-nlohmann::json NodeImpl::admin_list_bans() const
-{
-    return {{"ok", true}, {"bans", build_bans_json(m_ban_list, m_ip_ban_list)}};
-}
 
-nlohmann::json NodeImpl::admin_ban_ip(const std::string& ip, int duration_sec)
-{
-    if (ip.empty())
-        return {{"ok", false}, {"error", "ip required"}};
-    int dur = duration_sec > 0 ? duration_sec : static_cast<int>(m_ban_duration.count());
-    auto expiry = std::chrono::steady_clock::now() + std::chrono::seconds(dur);
-    m_ip_ban_list[ip] = expiry;
-    LOG_INFO << "[Pool] Admin ban: " << ip << " for " << dur << "s";
-    return {{"ok", true}, {"action", "ban"}, {"target", ip},
-            {"duration_sec", dur},
-            {"bans", build_bans_json(m_ban_list, m_ip_ban_list)}};
-}
 
-nlohmann::json NodeImpl::admin_unban_ip(const std::string& ip)
-{
-    if (ip.empty())
-        return {{"ok", false}, {"error", "ip required"}};
-    size_t removed = m_ip_ban_list.erase(ip);
-    for (auto it = m_ban_list.begin(); it != m_ban_list.end(); ) {
-        if (it->first.address() == ip) { it = m_ban_list.erase(it); ++removed; }
-        else ++it;
-    }
-    LOG_INFO << "[Pool] Admin unban: " << ip << " (" << removed << " entries removed)";
-    return {{"ok", true}, {"action", "unban"}, {"target", ip},
-            {"removed", removed},
-            {"bans", build_bans_json(m_ban_list, m_ip_ban_list)}};
-}
 
-nlohmann::json NodeImpl::admin_list_whitelist() const
-{
-    return {{"ok", true}, {"whitelist", build_whitelist_json(m_whitelist_hosts)}};
-}
 
 nlohmann::json NodeImpl::admin_whitelist_add(const std::string& host, uint16_t port)
 {
@@ -2338,23 +2228,6 @@ nlohmann::json NodeImpl::admin_whitelist_add(const std::string& host, uint16_t p
             {"whitelist", build_whitelist_json(m_whitelist_hosts)}};
 }
 
-nlohmann::json NodeImpl::admin_whitelist_remove(const std::string& host, uint16_t port)
-{
-    if (host.empty() || port == 0)
-        return {{"ok", false}, {"error", "host and port required"}};
-    NetService addr(host, port);
-    size_t removed_h = m_whitelist_hosts.erase(addr);
-    // Only remove the IP from whitelist if no other host:port remains for it.
-    bool other_on_same_ip = std::any_of(
-        m_whitelist_hosts.begin(), m_whitelist_hosts.end(),
-        [&](const NetService& n) { return n.address() == host; });
-    if (!other_on_same_ip) m_whitelist_ips.erase(host);
-    if (removed_h) save_whitelist_to_disk();
-    LOG_INFO << "[Pool] De-whitelisted " << addr.to_string();
-    return {{"ok", true}, {"action", "whitelist_remove"},
-            {"target", addr.to_string()}, {"removed", removed_h},
-            {"whitelist", build_whitelist_json(m_whitelist_hosts)}};
-}
 
 nlohmann::json NodeImpl::admin_list_peers() const
 {

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ---------------------------------------------------------------------------
 // DGB-Scrypt proof-of-work digest CALL  (M3 §7b / Stage 4b-4c work-gen).

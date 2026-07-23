@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // SharechainBridge — QtWebChannel transport for the embedded JS
 // Explorer bundle. Mirrors the 9-operation Transport interface from
 // web-static/sharechain-explorer/src/transport/types.ts so the JS

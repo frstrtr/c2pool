@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // template_capture.hpp -- the per-job template-retention seam (#271): the
 // PRODUCTION captured_template_txs_fn provider that feeds the won-block

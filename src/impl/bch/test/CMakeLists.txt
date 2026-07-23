@@ -20,6 +20,12 @@ if(BUILD_TESTING)
         abla_growth_soak_test     # M5: dynamic ABLA budget-GROWTH proof above 32 MB floor (pure)
         coinbase_kat_segwit_predicate_test # KAT: DGB<->BCH coinbase pairing -- gated-segwit-OFF predicate pin (pure)
         asert_kat_test            # M5: ASERT DAA known-answer vs BCHN @89a591f gold properties + mainnet anchor (pure)
+        muldiv_kat_test           # ABLA: 128-bit muldiv native(__int128)==portable(boost uint128) equivalence -- MSVC-portability guard (pure)
+        g1_oracle_byte_parity_test # G1: oracle byte-parity vs p2pool-merged-v36 bitcoincash[_testnet].py (pure)
+        g1_share_serialization_parity_test # G1: share-serialization byte-parity vs jtoomim oracle wire (pure)
+        g0_canonical_pin_test      # G0: canonical-pin vs p2poolBCH @6603b79 baseline + v35->v36 transition rule (pure)
+        g2_ratchet_gate_kat_test   # G2: 60%-by-WORK version-switch accept gate + mint-cannot-outrun-accept (pure)
+        coinbase_author_kat_test  # KAT G2: v36 coinbase output-assembly byte-parity vs p2pool-merged-v36 oracle (pure)
     )
     foreach(t IN LISTS BCH_ABLA_TESTS)
         add_executable(bch_${t} ${t}.cpp)
@@ -198,4 +204,20 @@ if(BUILD_TESTING)
             btclibs)
         add_test(NAME bch_${t} COMMAND bch_${t})
     endforeach()
+
+    # g2_block_assembly_roundtrip_test: the won-block assembly + pre-broadcast
+    # self-check gate that closes the G2 zero-blocks failure (155-byte body,
+    # zero-output generation transaction, bad-txnmrklroot on ~774k solutions).
+    # Needs coin/transaction.cpp for the MutableTransaction ctors, same as
+    # block_connector_test; link set and header-only-over-coin/*.hpp posture are
+    # otherwise identical, so per-coin isolation stays clean.
+    add_executable(bch_g2_block_assembly_roundtrip_test
+        g2_block_assembly_roundtrip_test.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/transaction.cpp)
+    target_include_directories(bch_g2_block_assembly_roundtrip_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(bch_g2_block_assembly_roundtrip_test PRIVATE
+        core pool sharechain
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
+        btclibs)
+    add_test(NAME bch_g2_block_assembly_roundtrip_test COMMAND bch_g2_block_assembly_roundtrip_test)
 endif()

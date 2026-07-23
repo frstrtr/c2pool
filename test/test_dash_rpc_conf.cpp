@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DASH external-dashd RPC creds-resolution KAT (launcher slice 4).
 //
 // Exercises the dash.conf credential parser + endpoint-override + arm-gating

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // bch::coin::header_sync::classify_headers_batch -- M5 full-block body.
 // Pins the headers-first IBD continuation policy that NodeP2P's `headers`

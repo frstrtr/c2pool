@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // dgb::compute_stale_prop / compute_real_pool_hashrate — pool efficiency KAT.
 //
 // FENCED conformance test (no production code touched). Pins the pool

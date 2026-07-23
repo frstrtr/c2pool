@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // SettingsBridge — exposes a subset of SettingsStore to JS over
 // QtWebChannel so the embedded Explorer / PPLNS View bundles (and
 // their plugins) can persist view state into the same native

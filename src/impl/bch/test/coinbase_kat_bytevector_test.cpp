@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // bch coinbase KAT -- full-coinbase byte-vector vs oracle ground-truth
 // (DGB<->BCH pairing, slice 2; the byte-vector half promised by slice 1s
@@ -12,7 +13,7 @@
 //
 // >>> ORACLE GROUND-TRUTH PROVENANCE <<<
 // The expected hex below was emitted by p2pool/util/pack.py`s tx_id_type --
-// reconstructed VERBATIM from p2pool/bitcoin/data.py:133-138 (version IntType(32)
+// reconstructed to match the p2pool/bitcoin data.py serialization (version IntType(32)
 // | ListType(tx_in) | ListType(tx_out) | lock_time IntType(32)) -- run over this
 // fixed coinbase:
 //   version   = 1

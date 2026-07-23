@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /* $Id: sph_groestl.h 216 2010-06-08 09:46:57Z tp $ */
 /**
  * Groestl interface. This code implements Groestl with the recommended

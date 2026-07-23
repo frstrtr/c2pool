@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 #include <map>
@@ -169,4 +170,3 @@ typename ShareVariants<Formatter, Args...>::load_map ShareVariants<Formatter, Ar
     static void Read(StreamType &stream, ShareT* obj) { FormatAction<ShareT::version>(stream, obj, UnserializeFormatter{}); }\
     template<int64_t version, typename StreamType, typename ShareT, typename StreamFormatter>\
     static void FormatAction(StreamType &stream, ShareT* obj, StreamFormatter formatter)
-

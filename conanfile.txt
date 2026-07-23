@@ -4,10 +4,14 @@ nlohmann_json/3.12.0
 yaml-cpp/0.8.0
 gtest/1.14.0
 leveldb/1.23
+zeromq/4.3.5
 
 [options]
 boost/*:without_exception=False
 boost/*:without_cobalt=True
+# dashd `hashblock` is a plain unauthenticated SUB socket: no CURVE/encryption
+# needed, so drop the libsodium transitive dep and keep the build lean.
+zeromq/*:encryption=False
 
 [generators]
 CMakeDeps

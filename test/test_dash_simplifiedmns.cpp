@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase C-SML step 1 — Dash SimplifiedMNList (DIP-0004) unit tests
 ///
 /// Exercises the vendored CSimplifiedMNListEntry / CSimplifiedMNList

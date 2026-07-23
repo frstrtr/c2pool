@@ -1,0 +1,27 @@
+# C2Pool Bitcoin [BTC] Testnet Configuration
+#
+# Zero-config startup: run ./start.sh (Linux/macOS) or start.bat (Windows).
+# Miners set their payout address as the stratum username (p2pool-style).
+# CLI arguments always override values set here.
+
+# --- Network -----------------------------------------------------------------
+# port:                        # BTC testnet sharechain port — binary default applies; set to override
+# stratum_port:                # Stratum is opt-in for this coin: enable with --stratum [HOST:]PORT
+web_port: 8080                 # Web dashboard / JSON-RPC API port
+http_host: "0.0.0.0"           # HTTP bind address
+# external_ip: ""              # Public IP/domain for stratum URL display
+
+# --- Operating mode ----------------------------------------------------------
+# Deployment: EXTERNAL bitcoind RPC for block templates (getblocktemplate).
+# Run a full bitcoind and set the btc_rpc_* fields below.
+
+# --- Bootstrap header checkpoint (optional) ----------------------------------
+# Skip old headers on first sync.  Format: HEIGHT:BLOCK_HASH
+# header_checkpoint: "HEIGHT:BLOCK_HASH"   # set for faster first sync
+
+# --- Coin daemon RPC (for non-embedded / daemon mode) ------------------------
+# btc_rpc_host: 127.0.0.1
+# btc_rpc_port:                # your BTC daemon's RPC port
+# btc_rpc_user: user
+# btc_rpc_password: pass
+

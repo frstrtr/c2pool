@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 #include "config_pool.hpp"
@@ -14,6 +15,7 @@
 
 #include <core/coin_params.hpp>
 #include <pool/node.hpp>
+#include <pool/sharechain_node.hpp>
 #include <pool/protocol.hpp>
 #include <core/message.hpp>
 #include <core/reply_matcher.hpp>
@@ -42,8 +44,10 @@ struct ShareReplyData
     std::vector<chain::RawShare> m_raw_items;
 };
 
-class NodeImpl : public pool::BaseNode<dgb::Config, dgb::ShareChain, dgb::Peer>
+class NodeImpl : public pool::SharechainNode<dgb::Config, dgb::ShareChain, dgb::Peer>
 {
+
+    using base_t = pool::SharechainNode<dgb::Config, dgb::ShareChain, dgb::Peer>;
     // Async share downloader:
     // ID = uint256 (matches sharereq id to sharereply id)
     // RESPONSE = parsed shares plus their original raw payloads
@@ -63,6 +67,21 @@ protected:
     WhaleDepartureDetector m_whale_departure;
     // Lock-free publication of the detector verdict (see local_desired_target).
     std::atomic<bool> m_whale_departure_active{false};
+
+    // Runtime P2P accept-floor, ratcheted 1400 -> 3500 by the desired-version
+    // tally (oracle net.MINIMUM_PROTOCOL_VERSION, mutated at main.py:216). Seeded
+    // from the cold config floor (PoolConfig::MINIMUM_PROTOCOL_VERSION) and lifted
+    // by apply_min_protocol_ratchet() on the compute thread under m_tracker_mutex;
+    // read lock-free by handle_version() on the IO thread. Latching (never lowers).
+    std::atomic<uint32_t> m_runtime_min_protocol_version{
+        PoolConfig::MINIMUM_PROTOCOL_VERSION};
+
+    // Runtime sibling of the 60% version-switch gate (share_check step 2): on each
+    // best-share advance, lift m_runtime_min_protocol_version once >=95% of the
+    // window work behind the best share's parent desires the best share's VERSION.
+    // Mirrors oracle main.py:213-216 + data.py:857. MUST be called under the
+    // exclusive m_tracker_mutex (reads tracker chain + desired-version weights).
+    void apply_min_protocol_ratchet();
     // Phase 3L non-consensus log-based pool monitor (attack/anomaly detection).
     // Driven from run_think() under the exclusive tracker lock on a ~30s cadence;
     // emits [MONITOR-*] log lines only — no consensus / sharechain effect.
@@ -391,7 +410,6 @@ public:
     void set_max_peers(size_t count) { m_max_peers = count; }
 
     /// Set P2P ban duration (seconds).
-    void set_ban_duration(int seconds) { m_ban_duration = std::chrono::seconds(seconds); }
 
     /// Set cache size limits for memory control.
     void set_cache_limits(size_t max_shared, size_t max_known_txs, size_t max_raw) {
@@ -480,7 +498,6 @@ public:
     }
 
     /// Check whether a peer address is currently banned.
-    bool is_banned(const NetService& addr) const;
 
     /// ── Runtime admin API (pool peer bans + whitelist) ─────────────────
     /// All methods assumed to run on the io_context thread — callers
@@ -488,22 +505,15 @@ public:
     ///
     /// Returned JSON uses the shape:
     ///   {"ok": true|false, "error"?: "...", "bans": [...], "whitelist": [...]}
-    nlohmann::json admin_list_bans() const;
-    nlohmann::json admin_ban_ip(const std::string& ip, int duration_sec);
-    nlohmann::json admin_unban_ip(const std::string& ip);
-    nlohmann::json admin_list_whitelist() const;
     nlohmann::json admin_whitelist_add(const std::string& host, uint16_t port);
-    nlohmann::json admin_whitelist_remove(const std::string& host, uint16_t port);
     nlohmann::json admin_list_peers() const;
     nlohmann::json admin_drop_peer(const std::string& ip);
     nlohmann::json admin_dial_peer(const std::string& host, uint16_t port);
 
     /// Path to persisted whitelist file (~/.c2pool/pool_whitelist.json).
     /// Set by c2pool_refactored.cpp before start(); empty = no persistence.
-    void set_whitelist_path(const std::string& path);
 
     /// True if addr's IP matches a whitelist entry (IP or host:port).
-    bool is_whitelisted(const NetService& addr) const;
 
 protected:
     std::string m_software_version = "/c2pool:0.1/";  // overridden by set_software_version()
@@ -549,21 +559,13 @@ protected:
     std::set<NetService> m_outbound_addrs;     // successfully connected outbound peers
 
     // Peer banning: maps address → ban expiry time
-    std::map<NetService, std::chrono::steady_clock::time_point> m_ban_list;
-    std::chrono::seconds m_ban_duration{300}; // 5 minutes (configurable)
 
     // IP-only manual bans (admin endpoint). Keyed by IP string so the
     // operator can ban/unban without knowing the peer's source port.
-    std::map<std::string, std::chrono::steady_clock::time_point> m_ip_ban_list;
 
     // Whitelist: IPs that bypass is_banned() and host:port entries kept as
     // permanent dial targets. Persists across restart via m_whitelist_path.
-    std::set<std::string> m_whitelist_ips;
-    std::set<NetService> m_whitelist_hosts;
-    std::string m_whitelist_path;
 
-    void load_whitelist_from_disk();
-    void save_whitelist_to_disk() const;
 
     // Rate-limiting no longer needed: think() runs on a dedicated compute
     // thread (m_think_pool), serialized by m_think_running atomic flag.

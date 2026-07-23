@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 /// Dash UTXO adapter layer — Phase U step 1.
@@ -5,9 +6,10 @@
 /// Plumbs `dash::coin::BlockType` and `dash::coin::MutableTransaction` into
 /// the chain-agnostic `core::coin::UTXOViewCache` / `UTXOViewDB` machinery
 /// (already used by LTC and DOGE). This file is the **type-compatibility
-/// shim only** — no live UTXOViewCache instance is constructed yet; that
-/// wiring lands in later Phase U steps (connect_block on new-tip arrival,
-/// LevelDB persistence, block-bootstrapper cold-start).
+/// shim**; the live UTXOViewCache wiring (connect_block on block-connect
+/// arrival, LevelDB persistence, block-bootstrapper cold-start) lives in
+/// utxo_lane.hpp (Phase U capstone, E2b/#738) and is constructed by the
+/// opt-in embedded path in main_dash.cpp.
 ///
 /// Why adapter-only first: lets us ship the Dash-side types + constants +
 /// txid helper in a standalone commit so the larger Phase U integration

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // H5 acceptance gate: deterministic pointer-identity + O(1) proof for the
 // tx_data memo (the work_source.cpp:634 churn/leak fix). Standalone harness
 // in the style of template_parity_test.cpp -- no btc/test CMake plumbing

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // Coin-agnostic data types crossing the stratum API boundary.
@@ -38,11 +39,77 @@ struct StratumConfig {
     double max_difficulty       = 65536.0;  // ceiling for per-connection vardiff
     double target_time          = 3.0;      // seconds between pseudoshares (p2pool default: 3)
     bool   vardiff_enabled      = true;     // auto-adjust per-connection difficulty
+    bool   use_hashrate_vardiff = false;    // stable-by-construction hashrate-based vardiff (DASH); off = legacy ratio feedback
     size_t max_coinbase_outputs = 4000;     // Python p2pool's [-4000:] cap; no consensus limit
     // Per-network mining.set_difficulty multiplier (p2pool net.DUMB_SCRYPT_DIFF):
     // 2^16 (65536) for scrypt nets (LTC/DOGE), 1 for SHA256d nets (bitcoin).
     // Default preserves the scrypt convention; SHA256d work sources override to 1.0.
     double set_difficulty_multiplier = 65536.0;
+    // STRICT per-node miner cap (mining-hotel interim fix): maximum number of
+    // concurrent stratum TCP sessions this node accepts. When the cap is hit
+    // the excess socket is closed cleanly, a WARN is logged, the
+    // refused_connections counter increments, and the accept loop keeps
+    // running. 0 = unlimited (legacy behavior). Wire-through:
+    // max_stratum_connections (YAML) / --max-stratum-connections (CLI).
+    // Admission control only — zero wire-byte change for admitted sessions.
+    size_t max_stratum_connections = 100;
+    // Runtime coin tag for coin-agnostic core log lines (e.g. the "waiting
+    // for block template" warning). Set by each coin's work source / main so
+    // a DASH binary never logs "[LTC]" (issue #732 secondary defect). Empty
+    // -> the core falls back to the neutral "[Stratum]" tag.
+    std::string coin_symbol;
+    // Coins whose coinbase validity is bound to the template height (DASH:
+    // the masternode payee rotates EVERY block -> a coinbase built from one
+    // template combined with the header of another is rejected bad-cb-payee)
+    // set this true. The session then refuses to assemble a job unless
+    // build_connection_coinbase() returned an atomic header+coinbase snapshot
+    // (WorkSnapshot::has_header): no job is ever served from MIXED template
+    // fetches, and the legacy stub-coinbase fallback is unreachable.
+    // Default false: LTC/BTC/DGB behavior is byte-unchanged.
+    bool require_job_snapshot{false};
+
+    // ── Live-session hygiene (mining-hotel ZOMBIE-SESSION LEAK fix) ──────────
+    // A NAT-dropped miner's TCP connection is frequently never FIN/RST'd, so
+    // StratumSession::is_connected() (socket_.is_open()) stays true FOREVER and
+    // the session is never reaped -- every failed rig retry then mints an
+    // immortal subscribed session that keeps drawing full per-notify job builds
+    // (observed: 66 sockets for ~23 rigs). At the default cap these zombies also
+    // lock real rigs out (admission control). These knobs bound that leak. ALL
+    // default OFF/neutral so LTC/BTC/DGB behaviour is BYTE-UNCHANGED; DASH opts
+    // in (impl/dash/stratum/work_source.cpp ctor). Transport/liveness only --
+    // zero wire-byte change and consensus-neutral.
+    //
+    // (a) OS TCP keepalive: the kernel probes an idle peer and errors the
+    //     pending async_read on a dead NAT path, which runs the normal
+    //     disconnect+prune. THE root fix for the immortal-session class.
+    bool     tcp_keepalive_enabled      = false;
+    uint32_t tcp_keepalive_idle_sec     = 60;   // begin probing after 60 s idle
+    uint32_t tcp_keepalive_interval_sec = 10;   // 10 s between probes
+    uint32_t tcp_keepalive_count        = 3;    // drop after 3 failed probes
+    // (b) Handshake deadline: drop a session that has not completed
+    //     mining.authorize within N s (a live rig authorizes in << 1 s). 0=off.
+    uint32_t handshake_timeout_sec      = 0;
+    // (c) Application idle reaper (belt-and-suspenders for keepalive): reap a
+    //     session that has sent NO inbound line for N s. A live miner submits
+    //     shares far inside this window; a half-open zombie sends nothing. 0=off.
+    uint32_t session_idle_timeout_sec   = 0;
+    // (d) Write-queue backlog cap: drop a session whose un-acked write backlog
+    //     exceeds this many frames (a dead peer whose kernel send buffer filled
+    //     accumulates unbounded). 0=unlimited (legacy).
+    size_t   max_write_queue_depth      = 0;
+    // (e) Idle keepalive-notify: re-send a mining.notify (a normal, non-
+    //     clean_jobs refresh of the CURRENT job) to a connected+subscribed
+    //     session that has received NO notify for ~this many seconds, driven by
+    //     the per-session periodic work-push timer -- regardless of tip/work
+    //     changes and regardless of whether the session is submitting. This
+    //     feeds a CLIENT-SIDE no-notify watchdog (measured Antminer D9: drops a
+    //     pool after 60.0 s without a notify) so an otherwise-idle BACKUP pool
+    //     connection stays alive independent of slot/path/RPC-timeout settings.
+    //     Set comfortably under the client watchdog (DASH: 25 s vs the 60 s D9
+    //     watchdog). clean_jobs is NEVER forced on this refresh, so ASIC work is
+    //     not reset. 0 = off (LTC/BTC/DGB unchanged: periodic push stays purely
+    //     work-generation-gated).
+    uint32_t keepalive_notify_sec       = 0;
 };
 
 /// Frozen share-construction fields returned by ref_hash_fn. These
@@ -111,6 +178,21 @@ struct WorkSnapshot {
     // prevent merkle root mismatch when refresh_work() updates the template.
     std::shared_ptr<const std::vector<std::string>> tx_data;          // raw tx hex from template (a1: shared/lazy)
     std::vector<std::string> merkle_branches;  // stratum merkle branches
+    // ── Atomic header binding (stale-payee fix) ──────────────────────────
+    // Header fields frozen from the SAME template snapshot the coinbase was
+    // built over. When has_header is true the stratum session OVERRIDES the
+    // header fields it fetched separately via get_current_work_template()
+    // with these, so the issued job (prevhash/version/nbits/ntime + coinbase
+    // + merkle branches + tx set) is ONE frozen unit from ONE template — a
+    // job can never carry the new tip's header with the old height's
+    // masternode payee (dashd bad-cb-payee, a lost block reward). Work
+    // sources that leave has_header false (LTC/BTC/DGB) are byte-unchanged.
+    bool        has_header{false};
+    std::string gbt_prevhash;        // BE display hex (template previousblockhash)
+    uint32_t    header_version{0};   // block header version
+    std::string block_nbits_hex;     // 8-char BE hex GBT block bits
+    uint32_t    curtime{0};          // template curtime (0 = leave session value)
+    uint32_t    height{0};           // template height (diagnostics/logging)
 };
 
 /// Result of build_connection_coinbase(): the two coinbase fragments
@@ -135,6 +217,7 @@ struct WorkerInfo {
     uint64_t stale{0};
     std::chrono::steady_clock::time_point connected_at;
     std::string remote_endpoint;  // "ip:port"
+    double rtt_ms{0.0};           // TCP round-trip latency in ms (Linux tcpi_rtt); 0 = unknown / non-Linux
 };
 
 }  // namespace core::stratum

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // AutoRatchet: autonomous share version transition state machine.
@@ -21,7 +22,7 @@
 //                       (permanent on restart)               |
 //                       CONFIRMED <--------------------------+
 //
-// Port of p2pool-v36 data.py AutoRatchet (lines 2109-2344).
+// C++ implementation of the p2pool-v36 AutoRatchet design.
 
 #include "config_pool.hpp"
 #include "share_tracker.hpp"

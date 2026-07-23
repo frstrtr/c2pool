@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // dgb_template_builder_test — guards the dgb::coin::build_work_template SSOT
 // (Stage 4c extraction). The work-template assembly was lifted out of
 // DGBWorkSource::get_current_work_template() into coin/template_builder.hpp so

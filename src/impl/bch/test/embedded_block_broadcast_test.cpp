@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // bch::coin::EmbeddedDaemon::broadcast_won_block dual-path contract test
 // (M5 -- embedded body; broadcaster-gate A+B).
@@ -41,6 +42,7 @@ int failures = 0;
 
 struct TestConfig {
     bool m_testnet = false;
+    bool m_testnet4 = false;  // mirror config_coin.hpp: BCH testnet4 selector
     struct P2P { std::vector<std::byte> prefix; };
     struct Coin { P2P m_p2p; };
     Coin m_coin;

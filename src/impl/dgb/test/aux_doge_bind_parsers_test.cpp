@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // DGB+DOGE merged-mining (M3) — bind_aux_doge_parsers() PRODUCTION-binding KAT.
 // Fenced / test-only — links the PRODUCTION dgb object lib, consumes the shared

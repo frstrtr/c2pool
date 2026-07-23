@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Block-replay (BIP 152 compact-block) reassembly tests for DASH (S5 slice).
 //
 // Exercises the vendored compact-block encoding ported in

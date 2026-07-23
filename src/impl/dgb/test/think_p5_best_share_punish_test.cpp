@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // dgb think() Phase-5 BEST-SHARE PUNISH WALK conformance KAT.
 //
 // FENCED, additive (no production code touched this slice). Pins

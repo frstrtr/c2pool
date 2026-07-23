@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 /// Phase C-MEMPOOL step 1: in-memory Dash mempool.
@@ -38,6 +39,7 @@
 #include "block.hpp"
 #include "transaction.hpp"
 #include "utxo_adapter.hpp"
+#include "vendor/assetlock.hpp"   // DIP-0027 CAssetUnlockPayload (type-9 fee source)
 
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
@@ -49,6 +51,7 @@
 #include <cstdint>
 #include <ctime>
 #include <map>
+#include <set>
 #include <mutex>
 #include <optional>
 #include <utility>
@@ -69,6 +72,32 @@ struct MempoolEntry {
         return (fee_known && base_size > 0)
             ? static_cast<double>(fee) / base_size
             : 0.0;
+    }
+};
+
+/// Deterministic block-template selection key. Sorts highest-feerate
+/// first; ties broken by txid ascending. Byte-reproducible across
+/// nodes/runs AND bit-for-bit conformant with dashcore BlockAssembler
+/// ordering. dashcore CompareTxMemPoolEntryByAncestorFee compares two
+/// entries by cross-multiplication of (fee, size) as doubles --
+/// f1 = a.fee * b.size vs f2 = b.fee * a.size -- explicitly "avoid
+/// division by rewriting (a/b > c/d) as (a*d > c*b)". A pre-divided
+/// fee/base_size double rounds where the cross-multiply does not, so the
+/// two representations can order a tie-pair differently. We therefore
+/// carry (fee, base_size) and reproduce the exact double cross-multiply;
+/// equal feerate is broken by GetHash()/txid ascending, as the oracle
+/// does. (No ancestor packages in this simplified mempool, so
+/// GetModFeeAndSize reduces to the entry's own (fee, base_size).)
+struct FeeKey {
+    uint64_t fee;        // satoshi
+    uint32_t base_size;  // serialized bytes (>0 for every indexed entry)
+    uint256  txid;
+    bool operator<(const FeeKey& o) const {
+        // dashcore CompareTxMemPoolEntryByAncestorFee, division-free form.
+        const double f1 = static_cast<double>(fee)   * o.base_size;
+        const double f2 = static_cast<double>(o.fee) * base_size;
+        if (f1 != f2) return f1 > f2;   // higher feerate first
+        return txid < o.txid;           // txid asc tiebreak (oracle-conformant)
     }
 };
 
@@ -139,7 +168,7 @@ public:
         // recompute_unknown_fees() resolves them after a UTXO update.
         // Uses negative feerate as the multimap key so begin() = best.
         if (stored.fee_known) {
-            m_feerate_index.emplace(stored.feerate_satvb(), txid);
+            m_feerate_index.insert(FeeKey{stored.fee, stored.base_size, txid});
         }
 
         // Periodic stats — every 100 entries + first 5 + every eviction.
@@ -243,7 +272,7 @@ public:
         for (auto& [txid, entry] : m_pool) {
             if (entry.fee_known) continue;
             if (compute_fee_locked(entry, utxo)) {
-                m_feerate_index.emplace(entry.feerate_satvb(), txid);
+                m_feerate_index.insert(FeeKey{entry.fee, entry.base_size, txid});
                 resolved_fees += entry.fee;
                 ++resolved;
             } else {
@@ -337,8 +366,17 @@ public:
         uint32_t           base_size{0};
     };
 
+    // exclude_special (C-3): when true, drop every Dash special tx (tx.type != 0
+    // — ProRegTx/ProUpServTx/asset-lock/asset-unlock) from the selection. dashd
+    // recomputes the coinbase CbTx roots (merkleRootMNList/Quorums) and the
+    // DIP-0027 creditPoolBalance by APPLYING the block's own special txs, so
+    // including one in the embedded template WITHOUT folding its effect into the
+    // CbTx yields bad-cbtx and a rejected block. build_embedded_workdata passes
+    // true (safe-minimal: the creditPool accrual then reduces to the platform-
+    // reward term only). Default false preserves the mempool's general pricing +
+    // selection capability (including the asset-unlock fee path) unchanged.
     std::pair<std::vector<SelectedTx>, uint64_t>
-    get_sorted_txs_with_fees(uint32_t max_bytes) const
+    get_sorted_txs_with_fees(uint32_t max_bytes, bool exclude_special = false) const
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         std::vector<SelectedTx> result;
@@ -346,12 +384,13 @@ public:
         uint32_t total_bytes = 0;
         auto* utxo = m_utxo.load();
 
-        for (const auto& [feerate, txid] : m_feerate_index) {
-            (void)feerate;
+        for (const auto& fk : m_feerate_index) {
+            const uint256& txid = fk.txid;
             auto pit = m_pool.find(txid);
             if (pit == m_pool.end()) continue;
             const auto& entry = pit->second;
             if (!entry.fee_known) continue;
+            if (exclude_special && entry.tx.type != 0) continue;
             if (total_bytes + entry.base_size > max_bytes) continue;
 
             // Stale-input guard.
@@ -388,7 +427,7 @@ private:
     std::map<std::pair<uint256, uint32_t>, uint256>    m_spent_outputs;
     // Step 2: feerate-sorted index. greater<double> means begin() =
     // highest feerate, so iteration is best-first.
-    std::multimap<double, uint256, std::greater<double>> m_feerate_index;
+    std::set<FeeKey>                                   m_feerate_index;
     size_t                                             m_total_bytes{0};
     size_t                                             m_max_bytes;
     time_t                                             m_expiry_sec;
@@ -415,13 +454,7 @@ private:
 
         // Drop from feerate index (only present if fee was known).
         if (it->second.fee_known) {
-            auto frng = m_feerate_index.equal_range(it->second.feerate_satvb());
-            for (auto rit = frng.first; rit != frng.second; ++rit) {
-                if (rit->second == txid) {
-                    m_feerate_index.erase(rit);
-                    break;
-                }
-            }
+            m_feerate_index.erase(FeeKey{it->second.fee, it->second.base_size, txid});
         }
 
         // Drop from spent-outputs index.
@@ -444,6 +477,34 @@ private:
     bool compute_fee_locked(MempoolEntry& entry,
                             ::core::coin::UTXOViewCache* utxo)
     {
+        // DIP-0027 asset-UNLOCK special case (type 9, E2b/#738). An
+        // asset-unlock tx mints UTXO from the credit pool and carries NO
+        // regular inputs, so the generic in-minus-out path below yields
+        // in_sum(0) < out_sum -> permanently fee_known=false, and the
+        // conservative selection guard would exclude it forever. Its miner
+        // fee is EXPLICIT in the payload (CAssetUnlockPayload.fee — the
+        // amount deducted from the unlock total for the miner's coinbase;
+        // vendor/assetlock.hpp), exactly what dashd's GBT reports for it.
+        // Pricing from the payload needs no UTXO view, so this branch sits
+        // ahead of the null-utxo bail-out. TARGETED: only an input-free
+        // type-9 body with a well-formed payload qualifies; anything else
+        // (including a malformed type-9) falls through to / stays on the
+        // conservative unknown-fee path. The general unknown-fee exclusion
+        // for every other tx class is untouched.
+        if (entry.tx.type == vendor::CAssetUnlockPayload::SPECIALTX_TYPE
+            && entry.tx.vin.empty()) {
+            vendor::CAssetUnlockPayload payload;
+            if (vendor::parse_assetunlock_payload(entry.tx.extra_payload,
+                                                  payload)) {
+                entry.fee = payload.fee;
+                entry.fee_known = true;
+                return true;
+            }
+            entry.fee_known = false;
+            entry.fee = 0;
+            return false;
+        }
+
         if (!utxo) {
             entry.fee_known = false;
             return false;

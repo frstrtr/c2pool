@@ -1,5 +1,5 @@
 if (BUILD_TESTING AND GTest_FOUND)
-    add_executable(share_test share_test.cpp f11_donation_invariance_test.cpp)
+    add_executable(share_test share_test.cpp f11_donation_invariance_test.cpp emergency_decay_overflow_test.cpp wirecompat_runtime_test.cpp desired_version_tally_test.cpp auto_ratchet_sim_test.cpp auto_ratchet_tail_guard_test.cpp chain_walk_window_test.cpp)
     target_link_libraries(share_test PRIVATE
         GTest::gtest_main GTest::gtest
         core ltc

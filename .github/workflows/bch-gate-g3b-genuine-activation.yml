@@ -1,0 +1,114 @@
+name: BCH gate G3b — genuine Upgrade9 activation
+
+# ci-steward 2026-07-07. CI plumbing only — NO consensus knowledge here. The BCH
+# lane owns the harness, the CHECK-companions, and the gate script; this workflow
+# just runs the canonical entrypoint tests/gates/bch_g3b_genuine_activation.sh,
+# which self-configures (conan + cmake -DCOIN_BCH=ON, override via BUILD_DIR) and
+# runs two arms:
+#   * CI arm (network-free, always on): the pool-side activation semantics via the
+#     bch_g2_ratchet_gate_kat / bch_cashtokens_transparency / bch_coinbase_author_kat
+#     targets, with a false-green guard demanding the full expected test count ran.
+#   * Live regtest arm (opt-in): runs only when BCH_UPGRADE9_HEIGHT points at an
+#     isolated regtest BCHN started with -upgrade9activationheight=<N>. Left unset
+#     here — the network-free CI arm carries the gate until the BCH lane wires a
+#     regtest BCHN + secrets into the runner.
+#
+# Mirrors dash-gate-g3a-regtest-block-production.yml. Neutral-skip: on branches
+# predating the G3b entrypoint the job is a green no-op. Register as a required
+# check only after a confirmed non-hollow green rollup (operator-side ruleset).
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  g3b-genuine-activation:
+    name: BCH gate G3b — genuine Upgrade9 activation
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set per-job Conan home
+        run: |
+          # github-hosted: ephemeral per-job home, warmed by actions/cache below.
+          # self-hosted:   PERSISTENT home keyed on the runner instance. A runner
+          # executes one job at a time, so this home is never contended (no
+          # sqlite "failed to acquire database lock in 20s") while still keeping
+          # the per-job isolation of #704/#710 -- no two concurrent jobs share it.
+          # Being persistent, it also takes the GH cache-service restore off the
+          # hot path: that restore times out on VM905 ("Failed to restore: The
+          # operation cannot be completed in timeout") and its miss cascaded into
+          # a cold from-source Boost rebuild on all 8 runners at once.
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+          else
+            echo "CONAN_HOME=$HOME/.conan2-ci/$RUNNER_NAME" >> "$GITHUB_ENV"
+          fi
+
+      - name: Check gate entrypoint presence
+        id: presence
+        run: |
+          if [ -f "tests/gates/bch_g3b_genuine_activation.sh" ]; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+            echo "::notice::G3b entrypoint present — running genuine Upgrade9 activation gate."
+          else
+            echo "exists=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::tests/gates/bch_g3b_genuine_activation.sh not on this branch — neutral skip."
+          fi
+
+      - name: Install system dependencies
+        if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            g++ cmake make libleveldb-dev libsecp256k1-dev
+
+      - uses: actions/setup-python@v6
+        if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'
+        with: { python-version: '3.12' }
+
+      - name: Install Conan 2
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
+
+      - name: Show committed Conan profile
+        if: steps.presence.outputs.exists == '1'
+        run: conan profile show -pr:a=ci/conan/linux-gcc13.profile
+
+      - name: Restore Conan cache (github-hosted only)
+        if: runner.environment == 'github-hosted' && steps.presence.outputs.exists == '1'
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/conan2
+          key: conan2-ubuntu24-gcc13-bch-g3b-${{ hashFiles('conanfile.txt', 'ci/conan/linux-gcc13.profile', 'conan.lock') }}
+          restore-keys: |
+            conan2-ubuntu24-gcc13-bch-g3b-
+            conan2-ubuntu24-gcc13-
+
+      - name: Clean stale build dir (self-hosted workspace is reused)
+        if: steps.presence.outputs.exists == '1' && runner.environment != 'github-hosted'
+        run: rm -rf build_bch_g3b
+
+      - name: Run G3b genuine-activation gate (bch-lane TEST_ENTRYPOINT)
+        if: steps.presence.outputs.exists == '1'
+        env:
+          BUILD_DIR: ${{ github.workspace }}/build_bch_g3b
+          # Live regtest arm stays opt-in: the script runs it only when this points
+          # at an isolated BCHN started with -upgrade9activationheight=<N>. Left
+          # unset — the network-free CI arm carries the gate.
+          BCH_UPGRADE9_HEIGHT: ${{ secrets.BCH_UPGRADE9_HEIGHT }}
+        run: bash tests/gates/bch_g3b_genuine_activation.sh
+
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace

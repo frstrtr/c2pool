@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // btc::stratum::BTCWorkSource — Stage 4a skeleton.
 //
 // All IWorkSource methods are stubbed to safe defaults. Subsequent
@@ -12,12 +13,14 @@
 
 #include <impl/btc/stratum/work_source.hpp>
 #include <impl/btc/stratum/tx_data_memo.hpp>   // H5 tx_data memo seam (work_source.cpp:634 churn fix)
+#include <impl/btc/stratum/finder_fee.hpp>  // D2 v35_finder_fee_split integer-exact SSOT
 #include <memory>
 
 #include <impl/btc/coin/header_chain.hpp>
 #include <impl/btc/coin/mempool.hpp>
 #include <impl/btc/coin/template_builder.hpp>  // build_template + merkle_hash_pair
 #include <impl/btc/coin/transaction.hpp>
+#include <c2pool/merged/merged_mining.hpp>   // MergedMiningManager::has_chain (PR-2a)
 
 #include <core/address_utils.hpp>               // address_to_script (for share write path)
 #include <core/hash.hpp>
@@ -125,6 +128,41 @@ BTCWorkSource::BTCWorkSource(btc::coin::HeaderChain&       chain,
     // 65536x-inflated wire diff that starves low-rate SHA256d miners of
     // acceptable shares. Wire-only; does not touch the share-accept target.
     config_.set_difficulty_multiplier = 1.0;
+    // Runtime coin tag for coin-agnostic core log lines (#732).
+    if (config_.coin_symbol.empty())
+        config_.coin_symbol = "BTC";
+
+    // ── Zombie-session leak fix: OPT BTC IN to the live-session hygiene knobs
+    // (default-off in StratumConfig so other coins stay byte-unchanged; the
+    // machinery lives in core::StratumServer). The live c2pool-btc node serves
+    // ~23 public/NAT rigs, and a NAT-dropped rig's TCP session is frequently
+    // never FIN/RST'd, so socket_.is_open() stays true forever and the session
+    // is never reaped -- every failed retry mints an immortal subscribed session
+    // that keeps drawing full per-notify job builds (the 66-sockets-for-~23-rigs
+    // class), multiplying the per-notify JSON churn. Transport/liveness only;
+    // ZERO wire-byte change and consensus-neutral.
+    config_.tcp_keepalive_enabled      = true;   // kernel probes dead NAT paths (root fix)
+    config_.tcp_keepalive_idle_sec     = 60;
+    config_.tcp_keepalive_interval_sec = 10;
+    config_.tcp_keepalive_count        = 3;      // ~90 s to detect a dead peer
+    config_.handshake_timeout_sec      = 30;     // drop never-authorize probes
+    // Idle reaper is a BACKSTOP to TCP keepalive (the real liveness authority),
+    // NOT the primary zombie killer. 1800 s (NOT the 600 s that would clip a
+    // live rig) + the keepalive-aware skip in core::StratumServer::
+    // start_idle_reaper() means an AUTHORIZED rig on a high fixed-diff suffix
+    // (e.g. ADDR+65536 at modest SHA256d hashrate -> multi-minute share
+    // intervals) is NEVER reaped for idleness while its socket is keepalive-
+    // validated; only genuinely dead / never-authorized sessions are reclaimed.
+    config_.session_idle_timeout_sec   = 1800;
+    config_.max_write_queue_depth      = 256;    // drop a stuck-write dead peer
+    // Idle keepalive-notify (cross-coin reuse of DASH's D9 mitigation): rigs on
+    // a high fixed-diff suffix can go multiple minutes between shares, and many
+    // ASIC/proxy clients drop a pool connection that receives no mining.notify
+    // within ~60 s (then retry). Re-notify the CURRENT job (non-clean, so no
+    // ASIC work reset and NO work-generation bump) every 25 s -- comfortably
+    // under any reasonable client watchdog -- so idle BTC sessions stay stable
+    // backups. Transport/liveness only; ZERO wire-byte and consensus change.
+    config_.keepalive_notify_sec       = 25;
 
     LOG_INFO << "[BTC-STRATUM] BTCWorkSource constructed"
              << " (testnet=" << is_testnet_
@@ -169,10 +207,11 @@ uint64_t BTCWorkSource::get_work_generation() const
     return work_generation_.load(std::memory_order_relaxed);
 }
 
-bool BTCWorkSource::has_merged_chain(uint32_t /*chain_id*/) const
+bool BTCWorkSource::has_merged_chain(uint32_t chain_id) const
 {
-    // BTC MVP: no merged mining (the LTC MM rig is DOGE — none for BTC currently).
-    return false;
+    // Wired in PR-2a: consult the merged-mining manager if main_btc set one
+    // (--merged NMC:...). No manager or unknown chain_id => false.
+    return mm_manager_ != nullptr && mm_manager_->has_chain(chain_id);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -275,12 +314,22 @@ std::vector<std::string> BTCWorkSource::get_stratum_merkle_branches() const
     auto wd = cached_template();
     if (!wd || wd->m_hashes.empty()) return {};
 
-    // wd->m_hashes[0] is the coinbase placeholder — the actual coinbase
-    // hash doesn't matter for branch computation since the miner provides
-    // their own coinbase. We only need the structure.
-    std::vector<uint256> level = wd->m_hashes;
+    // PRODUCER/CONSUMER CONTRACT: wd->m_hashes is the pure tx-hash list
+    // [tx1..txN] with NO coinbase slot (filled by rpc.cpp / template_builder.hpp
+    // straight from GBT transactions[]). The stratum merkle tree, however, has
+    // the coinbase as leaf 0. Prepend a placeholder leaf for it before folding
+    // — the actual coinbase hash doesn't matter for branch computation since
+    // the miner provides their own coinbase; we only need the leaf STRUCTURE.
+    // Without this prepend, level[1] below would be tx2 (not tx1), tx1 would be
+    // dropped, and the header merkle root would diverge from the serialized
+    // body → bad-txnmrklroot rejection on any populated (>=1 tx) won block.
+    // SSOT: branch sibling structure lives in btc::coin::stratum_merkle_siblings
+    // (template_builder.hpp) so the merkle self-check in mining_submit and any
+    // KAT exercise the SAME fold as the wire path. We only hex-encode here.
+    std::vector<uint256> level = btc::coin::stratum_merkle_siblings(wd->m_hashes);
     std::vector<std::string> branches;
-    while (level.size() > 1) {
+    branches.reserve(level.size());
+    for (const auto& sib : level) {
         // Right-sibling of the left-most node = level[1].
         // Wire encoding: hex of LE-internal bytes (NOT GetHex() which is
         // BE display). Matches cgminer convention + LTC's working
@@ -289,19 +338,7 @@ std::vector<std::string> BTCWorkSource::get_stratum_merkle_branches() const
         // the bytes on the wire MUST be the same LE-internal bytes the
         // pool used to build the merkle tree. GetHex() reverses them and
         // produces a totally different merkle root in the miner's view.
-        branches.push_back(HexStr(std::span<const unsigned char>(level[1].data(), 32)));
-
-        // Ascend: place a placeholder for the next-level coinbase combo,
-        // then hash subsequent pairs (duplicate last on odd count).
-        std::vector<uint256> next;
-        next.reserve((level.size() + 2) / 2);
-        next.push_back(uint256::ZERO);  // placeholder for combo of (cb, level[1])
-        for (size_t i = 2; i < level.size(); i += 2) {
-            const uint256& l = level[i];
-            const uint256& r = (i + 1 < level.size()) ? level[i + 1] : level[i];
-            next.push_back(btc::coin::merkle_hash_pair(l, r));
-        }
-        level = std::move(next);
+        branches.push_back(HexStr(std::span<const unsigned char>(sib.data(), 32)));
     }
     return branches;
 }
@@ -442,23 +479,24 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
         }
     }
 
-    // v35 finder fee: 0.5% of subsidy goes to the share-finder (this miner),
-    // deducted from donation. Reference: c2pool_refactored.cpp wiring +
-    // share_tracker.hpp v35 PPLNS docs ("amounts WITHOUT finder fee — caller
-    // adds subsidy/200 to the share creator's script"). Conditional on having
-    // a non-empty payout_script — otherwise we'd reintroduce the empty-output
-    // bug we just filtered. And the deduction-from-donation must succeed
-    // (donation must hold ≥ finder_fee), else we'd inflate total > subsidy.
-    if (!payouts.empty() && coinbasevalue > 0 && !payout_script.empty()) {
-        const double finder_fee = static_cast<double>(coinbasevalue) / 200.0;
-        if (!donation_script.empty()) {
-            auto it = payouts.find(donation_script);
-            if (it != payouts.end() && it->second >= finder_fee) {
-                it->second   -= finder_fee;
-                payouts[payout_script] += finder_fee;
-            }
-            // else: donation can't cover the fee — skip silently. Total stays
-            // at subsidy (per get_v35_expected_payouts post-condition).
+    // v35 finder fee: 0.5% of the coinbase value goes to the share-finder
+    // (this miner), moved from the donation residual to the finder's output.
+    // Integer floor division (subsidy//200) via the v35_finder_fee_split SSOT —
+    // NO float on the money path (see finder_fee.hpp). Matches the p2pool
+    // reference (data.py generate_transaction: amounts[finder] += subsidy//200,
+    // unconditional) and the core/web_server.cpp preview path. The split is
+    // capped at the donation available, so it is applied unconditionally
+    // (never all-or-nothing skipped) while total stays == subsidy and no output
+    // goes negative. The map holds doubles, but the moved value is an exact
+    // integer satoshi count (<= 2^53, exact in double).
+    if (!payouts.empty() && coinbasevalue > 0 && !payout_script.empty()
+        && !donation_script.empty()) {
+        auto it = payouts.find(donation_script);
+        if (it != payouts.end()) {
+            const uint64_t donation_sats = static_cast<uint64_t>(it->second);
+            const uint64_t taken = v35_finder_fee_split(coinbasevalue, donation_sats);
+            it->second             -= static_cast<double>(taken);
+            payouts[payout_script] += static_cast<double>(taken);
         }
     }
 
@@ -527,9 +565,12 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
     std::vector<uint8_t> witness_commitment_script;  // empty if segwit not active
     uint256 witness_root_uint;
     if (segwit_active) {
-        std::vector<uint256> wtxids;
-        wtxids.reserve(1 + (wd->m_txs.size()));
-        wtxids.push_back(uint256::ZERO);  // coinbase wtxid placeholder
+        // Collect the OTHER txs' wtxids (template "hash" field); the coinbase
+        // wtxid placeholder (BIP141 = 32 zero bytes) at leaf 0 is prepended by
+        // the shared witness_merkle_root() SSOT helper, so the leaf-0 contract
+        // lives in ONE place (mirrors the txid-merkle leaf-0 fix, PR #570).
+        std::vector<uint256> other_wtxids;
+        other_wtxids.reserve(wd->m_txs.size());
         if (auto txs_field = wd->m_data.find("transactions");
             txs_field != wd->m_data.end() && txs_field->is_array())
         {
@@ -537,23 +578,11 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
                 if (!t.is_object()) continue;
                 if (auto h = t.find("hash"); h != t.end() && h->is_string()) {
                     uint256 wt; wt.SetHex(h->get<std::string>().c_str());
-                    wtxids.push_back(wt);
+                    other_wtxids.push_back(wt);
                 }
             }
         }
-        // Bitcoin Core merkle: pad odd levels by duplicating last.
-        std::vector<uint256> level = std::move(wtxids);
-        while (level.size() > 1) {
-            std::vector<uint256> next;
-            next.reserve((level.size() + 1) / 2);
-            for (size_t i = 0; i < level.size(); i += 2) {
-                const uint256& l = level[i];
-                const uint256& r = (i + 1 < level.size()) ? level[i + 1] : level[i];
-                next.push_back(btc::coin::merkle_hash_pair(l, r));
-            }
-            level = std::move(next);
-        }
-        witness_root_uint = level.empty() ? uint256::ZERO : level[0];
+        witness_root_uint = btc::coin::witness_merkle_root(other_wtxids);
 
         // commitment_hash = SHA256d(witness_root || witness_reserved_value)
         std::array<uint8_t, 64> commit_in;
@@ -760,6 +789,34 @@ nlohmann::json BTCWorkSource::mining_submit(
     push_u32_le(header, parse_be_hex_u32(nonce));
 
     uint256 pow_hash = Hash(std::span<const uint8_t>(header.data(), header.size()));
+
+    // ── Non-fatal merkle self-check (producer/consumer contract guard) ──
+    // Recompute the body merkle root over the full leaf set
+    // [coinbase_txid, tx1..txN] and compare it to the branch-folded header
+    // root above. If get_stratum_merkle_branches and the serialized body ever
+    // disagree on the leaf structure (the latent bad-txnmrklroot class), this
+    // logs a loud DIVERGENCE BEFORE the block is submitted and rejected. Uses
+    // the current cached template's leaf set; a template roll between job
+    // freeze and submit can produce a benign mismatch, so this is advisory
+    // only and never rejects the share.
+    if (auto wd_chk = cached_template()) {
+        std::vector<uint256> body_leaves;
+        body_leaves.reserve(wd_chk->m_hashes.size() + 1);
+        body_leaves.push_back(coinbase_txid);
+        body_leaves.insert(body_leaves.end(), wd_chk->m_hashes.begin(), wd_chk->m_hashes.end());
+        uint256 body_root = btc::coin::compute_merkle_root(body_leaves);
+        if (body_root == merkle_root) {
+            LOG_DEBUG_OTHER << "[BTC-STRATUM] merkle self-check OK: body root matches header"
+                            << " (" << body_leaves.size() << " leaves)";
+        } else {
+            LOG_WARNING << "[BTC-STRATUM] merkle self-check DIVERGENCE: header root="
+                        << HexStr(std::span<const uint8_t>(merkle_root.data(), 32))
+                        << " body root="
+                        << HexStr(std::span<const uint8_t>(body_root.data(), 32))
+                        << " over " << body_leaves.size() << " leaves"
+                        << " — block would be rejected bad-txnmrklroot (template roll or leaf-set bug)";
+        }
+    }
 
     // Decode share target (separate from block target — pre-this-fix we
     // were comparing pow_hash against block target which is network

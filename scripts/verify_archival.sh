@@ -59,10 +59,10 @@ echo
 
 # Check that refactored version is present and active
 echo "🚀 Checking Active Implementation..."
-if [ -f "src/c2pool/c2pool_refactored.cpp" ]; then
-    echo "✅ c2pool_refactored.cpp - ACTIVE IMPLEMENTATION"
+if [ -f "src/c2pool/main_ltc.cpp" ]; then
+    echo "✅ main_ltc.cpp - ACTIVE IMPLEMENTATION"
 else
-    echo "❌ c2pool_refactored.cpp - MISSING (CRITICAL ERROR)"
+    echo "❌ main_ltc.cpp - MISSING (CRITICAL ERROR)"
 fi
 
 echo
@@ -71,14 +71,14 @@ echo
 echo "🔨 Checking Build Targets..."
 if [ -f "build/src/c2pool/c2pool" ]; then
     echo "✅ c2pool - PRIMARY EXECUTABLE BUILT"
-    echo "   └─ Built from: c2pool_refactored.cpp"
+    echo "   └─ Built from: main_ltc.cpp"
 else
     echo "❌ c2pool - PRIMARY EXECUTABLE NOT FOUND"
 fi
 
 if [ -f "build/src/c2pool/c2pool_enhanced" ]; then
     echo "✅ c2pool_enhanced - ENHANCED EXECUTABLE BUILT"
-    echo "   └─ Built from: c2pool_refactored.cpp"
+    echo "   └─ Built from: main_ltc.cpp"
 else
     echo "❌ c2pool_enhanced - ENHANCED EXECUTABLE NOT FOUND"
 fi
@@ -131,7 +131,7 @@ echo "==================="
 echo
 archive_count=$(ls -1 archive/*.cpp 2>/dev/null | wc -l)
 echo "📁 Archived files: $archive_count"
-echo "🚀 Active implementation: c2pool_refactored.cpp"
+echo "🚀 Active implementation: main_ltc.cpp"
 echo "🎯 Primary executable: c2pool"
 echo "⭐ Enhanced executable: c2pool_enhanced"
 echo
@@ -143,9 +143,9 @@ if [ -f "archive/c2pool_legacy.cpp" ]; then
     echo "   Legacy c2pool.cpp: $legacy_size lines"
 fi
 
-if [ -f "src/c2pool/c2pool_refactored.cpp" ]; then
-    refactored_size=$(wc -l < src/c2pool/c2pool_refactored.cpp)
-    echo "   Refactored c2pool_refactored.cpp: $refactored_size lines"
+if [ -f "src/c2pool/main_ltc.cpp" ]; then
+    refactored_size=$(wc -l < src/c2pool/main_ltc.cpp)
+    echo "   Refactored main_ltc.cpp: $refactored_size lines"
 fi
 
 echo
@@ -165,6 +165,6 @@ echo
 echo "🎉 LEGACY ARCHIVAL COMPLETE!"
 echo
 echo "All future development should use:"
-echo "   Source: src/c2pool/c2pool_refactored.cpp"
+echo "   Source: src/c2pool/main_ltc.cpp"
 echo "   Build:  make c2pool"
 echo "   Run:    ./c2pool --help"

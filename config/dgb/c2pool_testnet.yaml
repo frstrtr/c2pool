@@ -1,0 +1,27 @@
+# C2Pool DigiByte [DGB] Testnet Configuration
+#
+# Zero-config startup: run ./start.sh (Linux/macOS) or start.bat (Windows).
+# Miners set their payout address as the stratum username (p2pool-style).
+# CLI arguments always override values set here.
+
+# --- Network -----------------------------------------------------------------
+# port:                        # DGB testnet sharechain port — binary default applies; set to override
+# stratum_port:                # Stratum is opt-in for this coin: enable with --stratum [HOST:]PORT
+web_port: 8080                 # Web dashboard / JSON-RPC API port
+http_host: "0.0.0.0"           # HTTP bind address
+# external_ip: ""              # Public IP/domain for stratum URL display
+
+# --- Operating mode ----------------------------------------------------------
+# Deployment: DigiByte daemon RPC. Run digibyted and set the dgb_rpc_*
+# fields below. See `./c2pool-dgb --help` for algo/mode options.
+
+# --- Bootstrap header checkpoint (optional) ----------------------------------
+# Skip old headers on first sync.  Format: HEIGHT:BLOCK_HASH
+# header_checkpoint: "HEIGHT:BLOCK_HASH"   # set for faster first sync
+
+# --- Coin daemon RPC (for non-embedded / daemon mode) ------------------------
+# dgb_rpc_host: 127.0.0.1
+# dgb_rpc_port:                # your DGB daemon's RPC port
+# dgb_rpc_user: user
+# dgb_rpc_password: pass
+

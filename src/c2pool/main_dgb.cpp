@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // c2pool-dgb — DigiByte Scrypt-only (V36) p2pool node entry point.
 //
 // Wires the real dgb sharechain/pool TU (pool pillars + score path, ported from
@@ -102,7 +103,9 @@ void print_banner(const char* argv0, const core::CoinParams& p)
         << "       [--coin-daemon H:P] [--coin-magic HEX] [--regtest]\n"
         << "       [--regtest-force-won-share] [--no-p2p-relay]\n"
         << "       [--redistribute SPEC] [--sharechain-port P]\n"
-        << "       [--dev-relax-algo-softforks]\n\n"
+        << "       [--data-dir PATH] [--dev-relax-algo-softforks]\n\n"
+        << "  --data-dir PATH  root all per-instance state here (default ~/.c2pool);\n"
+        << "                   isolates co-located instances\n"
         << "Status: pool/sharechain pillars live (Phase B); run-loop up\n"
         << "        (--run: io_context + sharechain peer + Stratum standup).\n"
         << "        --stratum [HOST:]PORT binds a miner-facing TCP listener\n"
@@ -644,6 +647,58 @@ int run_node(const core::CoinParams& params, bool testnet,
         header_chain, mempool, testnet, std::move(stratum_submit_fn),
         params.subsidy_func);
 
+    // -- External-daemon GBT tip fallback bind (the fallback V36 mandates PERSIST)
+    // While the embedded HeaderChain is unfed (tip_hash()==nullopt -- the live
+    // state of a freshly-stood-up :5025 node) the Scrypt-only walk supplies
+    // NEITHER previousblockhash NOR the MultiShield-V4 bits. Bind the RPC arm so
+    // get_current_work_template() + get_current_gbt_prevhash() (the mining.notify
+    // prevhash source) draw both from digibyted getblocktemplate. The RPC
+    // transport stays in main (mirrors the #82 submit arm + dash's #726
+    // dashd_fallback); stratum/ holds only the std::function seam. UNARMED (no
+    // digibyte.conf creds) -> seam left unbound -> truthful absence, byte-identical
+    // to the daemon-less default build. A real embedded tip always wins over this.
+    if (rpc) {
+        auto* rpc_ptr = rpc.get();
+        work_source->set_gbt_tip_fn(
+            [rpc_ptr]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
+                try {
+                    // DGB GBT: "segwit" BIP9 rule; NodeRPC::getblocktemplate injects
+                    // the mandatory separate Scrypt "algo" param (V36 Scrypt-only).
+                    nlohmann::json tmpl = rpc_ptr->getblocktemplate({"segwit"});
+                    if (!tmpl.is_object())
+                        return std::nullopt;
+                    auto ph = tmpl.find("previousblockhash");
+                    auto bt = tmpl.find("bits");
+                    if (ph == tmpl.end() || !ph->is_string() ||
+                        bt == tmpl.end() || !bt->is_string())
+                        return std::nullopt;
+                    dgb::stratum::DGBWorkSource::GbtTip tip;
+                    tip.previousblockhash = ph->get<std::string>();
+                    tip.bits              = bt->get<std::string>();
+                    // GBT previousblockhash is 64-hex big-endian display -- the
+                    // exact u256_be_display_hex convention the embedded path emits,
+                    // so it flows verbatim (parity by the daemon's own GBT contract).
+                    // Width-guard so a malformed reply is a truthful absence, never a
+                    // fabricated short id.
+                    if (tip.previousblockhash.size() != 64)
+                        return std::nullopt;
+                    return tip;
+                } catch (const std::exception& e) {
+                    std::cerr << "[DGB-STRATUM] GBT tip fallback RPC failed: "
+                              << e.what() << " -- prevhash/bits held absent"
+                              << std::endl;
+                    return std::nullopt;
+                }
+            });
+        std::cout << "[DGB] stratum GBT tip fallback ARMED: previousblockhash+bits "
+                     "<- digibyted getblocktemplate (embedded-empty-chain path)"
+                  << std::endl;
+    } else {
+        std::cout << "[DGB] stratum GBT tip fallback UNARMED (no digibyted creds) "
+                     "-- prevhash/bits truthful-absent until embedded chain feeds"
+                  << std::endl;
+    }
+
     // -- Phase-B producer bind: per-connection coinbase PPLNS inputs ----------
     // Bind DGBWorkSource::set_pplns_inputs_fn -- the SOLE empty-jobs seam. While
     // unbound, build_connection_coinbase() returns an empty job (pre-wire stub);
@@ -1143,6 +1198,16 @@ int main(int argc, char** argv)
             return 0;
         }
         if (std::strcmp(argv[i], "--help") == 0)     want_help = true;
+        if (std::strcmp(argv[i], "--data-dir") == 0) {
+            // Root all per-instance state (LevelDB sharechain, addr store,
+            // logs, ...) under PATH so co-located instances don't contend the
+            // LevelDB LOCK. Default keeps ~/.c2pool. See #722.
+            if (i + 1 >= argc || argv[i + 1][0] == '\0' || argv[i + 1][0] == '-') {
+                std::cerr << "error: --data-dir requires a PATH argument\n";
+                return 1;
+            }
+            core::filesystem::set_data_dir(argv[++i]);
+        }
         if (std::strcmp(argv[i], "--selftest") == 0) want_selftest = true;
         if (std::strcmp(argv[i], "--run") == 0)      want_run = true;
         if (std::strcmp(argv[i], "--stratum") == 0 && i + 1 < argc) {

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // Parsed getblocktemplate response with Dash-specific fields.
@@ -24,6 +25,54 @@ struct PackedPayment {
     std::string payee;
     uint64_t    amount{0};
 };
+
+// Normalize ONE masternode / superblock / platform payment entry from a dashd
+// getblocktemplate/getwork response into a PackedPayment.
+//
+// bad-cb-payee TRAP: dashd surfaces the platform credit-pool OP_RETURN burn as
+// a masternode[] entry shaped {"payee":"", "script":"6a", "amount":N} -- the
+// payee field is PRESENT but an EMPTY string. The empty string must NOT win the
+// address branch: a "" payee flows into the base58 decode path downstream, fails
+// to decode, and the whole burn output is silently dropped -> missing-payee /
+// bad-cb-payee on submit. Require a NON-EMPTY payee before treating it as a
+// base58 address; otherwise fall through to the raw "!"+script form so the burn
+// output is preserved byte-for-byte.
+inline PackedPayment normalize_payment(const nlohmann::json& entry)
+{
+    PackedPayment pp;
+    if (entry.is_object())
+    {
+        if (entry.contains("payee") && entry["payee"].is_string()
+            && !entry["payee"].get<std::string>().empty())
+            pp.payee = entry["payee"].get<std::string>();
+        else if (entry.contains("script") && entry["script"].is_string())
+            pp.payee = "!" + entry["script"].get<std::string>();
+        if (entry.contains("amount"))
+            pp.amount = entry["amount"].get<uint64_t>();
+    }
+    return pp;
+}
+
+// Classify a dashd `submitblock` RPC result under the dual-path won-block
+// contract (M1). submitblock returns null on accept; a non-null string is a
+// reject reason. A "duplicate" / "inconclusive" / "already-have" result means
+// the block is ALREADY on the network — the OTHER broadcast arm (embedded P2P
+// relay, or a peer) landed it first — which is SUCCESS (the block reached the
+// network), NOT a failure. "duplicate-invalid" is the one exception: the block
+// was rejected as invalid, a genuine failure. Pure over the JSON so the KAT can
+// pin it without a live RPC client.
+inline bool submitblock_result_accepted(const nlohmann::json& result)
+{
+    if (result.is_null()) return true;
+    if (!result.is_string()) return false;
+    std::string code = result.get<std::string>();
+    for (char& c : code)
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    const bool already_have = code == "duplicate"
+                           || code.find("inconclusive") != std::string::npos
+                           || code.find("already") != std::string::npos;
+    return already_have && code.find("invalid") == std::string::npos;
+}
 
 struct DashWorkData {
     // Raw getblocktemplate JSON response (kept for fallback access to fields

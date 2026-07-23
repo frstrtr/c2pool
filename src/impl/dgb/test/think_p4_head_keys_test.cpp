@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // KAT pinning the think() Phase-4 head-score key construction
 // (think_p4_head_keys.hpp) against the p2pool data.py think() Phase-4 oracle:
 // selection key (adjusted_work, -reason, -time_seen) with a one-share punishment

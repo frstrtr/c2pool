@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase 4 — Live daemon-less integration tests
 ///
 /// Verifies the full embedded-node pipeline end-to-end against a live LTC

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DGB-Scrypt PoW digest CALL guard (coin/scrypt_pow.hpp) -- Stage 4b/4c.
 //
 // Pins (1) the scrypt_1024_1_1_256 digest bytes over a fixed 80-byte header and

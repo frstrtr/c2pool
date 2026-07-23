@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Value-invariance gate for the BTC stratum work-template cache (heap opt).
 //
 // work_source.cpp build_connection_coinbase / get_current_work_template /

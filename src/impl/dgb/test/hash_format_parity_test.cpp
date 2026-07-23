@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // dgb_hash_format_parity_test -- FENCED, additive KAT pinning the pure GBT
 // block-hash display formatter dgb::coin::u256_be_display_hex lifted into

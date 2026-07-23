@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // BCH ABLA (Adaptive Blocksize-Limit Algorithm, CHIP-2023-01) -- net-new
 // BCH-specific code. Activated at the May 2024 upgrade; it replaces the static
@@ -26,6 +27,10 @@
 #include <cstdint>
 #include <limits>
 
+// Portable 128-bit intermediate for muldiv on compilers without __int128 (MSVC).
+// Header-only; boost is already a c2pool dependency (conan + system libboost).
+#include <boost/multiprecision/cpp_int.hpp>
+
 namespace bch {
 namespace coin {
 namespace abla {
@@ -38,9 +43,31 @@ inline constexpr uint64_t MAX_CONSENSUS_BLOCK_SIZE     = uint64_t(2000) * ONE_ME
 // 2^7 fixed precision for the "asymmetry factor" (zeta). BCHN abla.h B7.
 inline constexpr uint64_t B7 = 1u << 7u;
 
-// muldiv(x,y,z) = x*y/z in 128-bit intermediate (BCHN abla.cpp). The platform
-// is gcc/clang C++20 on linux -> use the native __int128 path BCHN selects.
-inline uint64_t muldiv(uint64_t x, uint64_t y, uint64_t z) {
+// muldiv(x,y,z) = x*y/z evaluated in a 128-bit intermediate (BCHN abla.cpp).
+// Consensus-critical: the product x*y can reach ~2^128, so the intermediate MUST
+// be a true 128-bit type; the ABLA control function guarantees the final
+// quotient fits uint64_t (asserted below).
+//
+// GCC/Clang provide the native unsigned __int128 that BCHN selects -- that path
+// is kept BYTE-EXACT for the shipping Linux/macOS builds. MSVC has no __int128
+// (error C4235), which broke the c2pool-bch Windows package; on any compiler
+// without __int128 we fall back to boost::multiprecision::uint128_t, a fixed
+// 128-bit unsigned type that yields BIT-IDENTICAL results. The two paths are
+// pinned equal on Linux by muldiv_kat_test (native == portable across the full
+// ABLA operand space) -- the KAT guard required for this consensus math.
+inline uint64_t muldiv_portable(uint64_t x, uint64_t y, uint64_t z) {
+    assert(z != 0);
+    using u128 = boost::multiprecision::uint128_t;
+    const u128 res = (u128(x) * u128(y)) / u128(z);
+    assert(res <= u128(std::numeric_limits<uint64_t>::max()));
+    return static_cast<uint64_t>(res);
+}
+
+#if defined(__SIZEOF_INT128__)
+// Native path (GCC/Clang) -- unchanged; this is what the merged Linux/macOS
+// packages have always shipped. Exposed by name so the KAT can diff it against
+// muldiv_portable on the trusted platform.
+inline uint64_t muldiv_native(uint64_t x, uint64_t y, uint64_t z) {
     assert(z != 0);
     const unsigned __int128 res =
         (static_cast<unsigned __int128>(x) * static_cast<unsigned __int128>(y))
@@ -48,6 +75,10 @@ inline uint64_t muldiv(uint64_t x, uint64_t y, uint64_t z) {
     assert(res <= static_cast<unsigned __int128>(std::numeric_limits<uint64_t>::max()));
     return static_cast<uint64_t>(res);
 }
+inline uint64_t muldiv(uint64_t x, uint64_t y, uint64_t z) { return muldiv_native(x, y, z); }
+#else
+inline uint64_t muldiv(uint64_t x, uint64_t y, uint64_t z) { return muldiv_portable(x, y, z); }
+#endif
 
 // Algorithm configuration -- part of a chain's consensus params (BCHN abla.h).
 struct Config {

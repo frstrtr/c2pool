@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 #include <core/config.hpp>
@@ -67,6 +68,17 @@ public:
     static constexpr uint32_t MINIMUM_PROTOCOL_VERSION  = 3301;
     // Our capability: V36 shares (matches LTC/DOGE advertised version).
     static constexpr uint32_t ADVERTISED_PROTOCOL_VERSION = 3600;
+    // -----------------------------------------------------------------------
+    // CROSSING-FLOOR SHARE VERSION (v36 HYBRID accept-both floor, SSOT).
+    // The exact share version the LIVE jtoomim-BCH sharechain currently mints.
+    // BCH is a CROSSING coin (not greenfield): shares author at the ratchet-
+    // current tip version, whose cold-start / empty-chain floor is THIS value.
+    // author, ref_hash, donation and the gentx-rebuild ALL feed from here so
+    // the miner-hashed template and the verify-side rebuild read ONE version
+    // -- never a scattered 35/36 literal (that inconsistency was the recompute/
+    // GENTX byte-offset-104 root). The 60%-by-work auto-ratchet (#326/#577)
+    // advances the tip past this floor to 36; bumping this to 36 forks the net.
+    static constexpr int64_t  CROSSING_FLOOR_VERSION    = 35;
     // NOTE: NO SEGWIT_ACTIVATION_VERSION on BCH -- SegWit was rejected at the
     // Aug-2017 fork. (BTC carries one; intentionally absent here.)
     static constexpr uint32_t BLOCK_MAX_SIZE            = 32000000;   // 32 MB (BCH)

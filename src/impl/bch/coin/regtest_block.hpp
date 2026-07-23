@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // regtest_block.hpp -- valid-block construction for the leg-C broadcaster-gate

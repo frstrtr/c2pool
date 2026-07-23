@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // c2pool-btc — Bitcoin embedded SPV p2pool node.
 //
 // PR-B2-net (focused header-sync entry point).
@@ -30,6 +31,7 @@
 #include <impl/btc/coin/transaction.hpp>
 #include <impl/btc/config.hpp>
 #include <impl/btc/config_pool.hpp>
+#include <impl/btc/coin/rpc_conf.hpp>   // bitcoin.conf creds for the submitblock RPC backup (ARM B, #82/#744)
 #include <impl/btc/node.hpp>
 #include <impl/btc/auto_ratchet.hpp>     // AutoRatchet V35->V36 forward-version-voting
 #include <impl/btc/share_check.hpp>      // RefHashParams + compute_ref_hash_for_work
@@ -77,6 +79,9 @@ static void print_usage()
         "  --testnet4      BTC testnet4 chain (genesis 00000000da84f2ba...)\n"
         "  --regtest       BTC regtest chain (genesis 0f9188f13cb7b2c7...)\n"
         "                  default: mainnet\n"
+        "  --data-dir PATH root all per-instance state here (default ~/.c2pool).\n"
+        "                  Isolates co-located instances so they don't contend\n"
+        "                  the LevelDB LOCK.\n"
         "  --bitcoind H:P  bitcoind P2P endpoint host:port\n"
         "                  e.g. 127.0.0.1:8333  (mainnet)\n"
         "                       127.0.0.1:18333 (testnet3)\n"
@@ -98,7 +103,13 @@ static void print_usage()
         "  --prefix HEX    c2pool sharechain PREFIX (hex, <=8 bytes), an\n"
         "                  INDEPENDENT per-network constant (no algebraic tie to\n"
         "                  IDENTIFIER). Supply with --network-id to join a custom\n"
-        "                  p2pool chain; omit to use the compiled default prefix.\n";
+        "                  p2pool chain; omit to use the compiled default prefix.\n"
+        "  --coin-rpc H:P  submitblock RPC backup (ARM B) endpoint override.\n"
+        "                  Endpoint only (no secret); creds come from bitcoin.conf.\n"
+        "  --coin-rpc-auth PATH  bitcoin.conf-style file with rpcuser/rpcpassword\n"
+        "                  for the submitblock backup (default ~/.bitcoin/\n"
+        "                  bitcoin.conf; keeps rpcpassword off the process table).\n"
+        "                  Omit both to run daemonless (embedded P2P relay only).\n";
 }
 
 /// BTC wire-protocol magic bytes per network (pchMessageStart).
@@ -129,6 +140,8 @@ int main(int argc, char* argv[])
     uint16_t    sharechain_port = 0;        // 0 = default P2P_PORT (9333); --sharechain-port overrides (opt-in isolation)
     std::string network_id_hex;             // --network-id: c2pool IDENTIFIER override (empty = public net)
     std::string prefix_hex;                 // --prefix: c2pool PREFIX override (empty = compiled default)
+    std::string rpc_endpoint;               // --coin-rpc HOST:PORT: submitblock backup endpoint override (no secret)
+    std::string rpc_conf_path;              // --coin-rpc-auth PATH: bitcoin.conf creds (default ~/.bitcoin/bitcoin.conf)
 
     for (int i = 1; i < argc; ++i)
     {
@@ -137,6 +150,16 @@ int main(int argc, char* argv[])
         {
             print_usage();
             return 0;
+        }
+        else if (arg == "--data-dir")
+        {
+            // Isolate per-instance on-disk state (LevelDB sharechain, addr
+            // store, logs, ...) under PATH. Default keeps ~/.c2pool. See #722.
+            if (i + 1 >= argc || argv[i + 1][0] == '\0' || argv[i + 1][0] == '-') {
+                std::cerr << "error: --data-dir requires a PATH argument\n";
+                return 1;
+            }
+            core::filesystem::set_data_dir(argv[++i]);
         }
         else if (arg == "--testnet")
         {
@@ -206,6 +229,20 @@ int main(int argc, char* argv[])
         else if (arg == "--prefix" && i + 1 < argc)
         {
             prefix_hex = argv[++i];
+        }
+        else if (arg == "--coin-rpc" && i + 1 < argc)
+        {
+            // --coin-rpc HOST:PORT — endpoint override for the submitblock RPC
+            // backup (ARM B). Endpoint ONLY (no secret) so it is safe on argv;
+            // rpcuser/rpcpassword come from bitcoin.conf (--coin-rpc-auth).
+            rpc_endpoint = argv[++i];
+        }
+        else if (arg == "--coin-rpc-auth" && i + 1 < argc)
+        {
+            // --coin-rpc-auth PATH — bitcoin.conf-style file carrying
+            // rpcuser/rpcpassword for the submitblock RPC backup. Keeps the
+            // rpcpassword OFF the process table (default ~/.bitcoin/bitcoin.conf).
+            rpc_conf_path = argv[++i];
         }
         else
         {
@@ -364,6 +401,47 @@ int main(int argc, char* argv[])
     config.coin()->m_symbol      = "BTC";
 
     btc::coin::Node<btc::Config> coin_node(&ioc, &config);
+
+    // ── #82/#744 submitblock RPC BACKUP arm (ARM B of the dual-path
+    // broadcaster) ── The embedded coin-net P2P relay (submit_block_for_connect
+    // -> submit_block_p2p_raw) is the always-primary daemonless path; this arms
+    // the OPT-IN submitblock backup so a won block ALSO reaches a locally-run
+    // bitcoind if the operator provisions one. Creds come from bitcoin.conf
+    // (default ~/.bitcoin/bitcoin.conf, overridable with --coin-rpc-auth PATH)
+    // so the rpcpassword NEVER touches argv; --coin-rpc HOST:PORT overrides only
+    // the endpoint. No creds => arm stays UNARMED (has_rpc()==false) and
+    // submit_block_hex returns false LOUDLY -- byte-identical to the daemonless
+    // default. Mirrors main_dgb's NodeRPC arming (the #82 reference).
+    {
+        btc::coin::RpcConf rpc_conf;
+        std::string conf_path = rpc_conf_path;
+        if (conf_path.empty()) {
+            const char* home = std::getenv("HOME");
+            conf_path = std::string(home ? home : ".") + "/.bitcoin/bitcoin.conf";
+        }
+        if (btc::coin::load_rpc_conf(conf_path, rpc_conf)) {
+            if (rpc_conf.port == 0) {
+                // Bitcoin Core RPC defaults: mainnet 8332, testnet3 18332,
+                // testnet4 48332, regtest 18443.
+                rpc_conf.port = regtest ? 18443
+                              : (testnet4 ? 48332
+                                          : (testnet ? 18332 : 8332));
+            }
+            btc::coin::apply_endpoint_override(rpc_endpoint, rpc_conf);
+        } else {
+            // No conf creds; --coin-rpc alone still lets an operator point the
+            // endpoint, but without user/pass the arm cannot fire.
+            btc::coin::apply_endpoint_override(rpc_endpoint, rpc_conf);
+        }
+        if (rpc_conf.armed()) {
+            coin_node.arm_submit_rpc(NetService(rpc_conf.host, rpc_conf.port),
+                                     rpc_conf.userpass());
+        } else {
+            LOG_INFO << "[BTC] submitblock RPC backup UNARMED "
+                        "(no bitcoin.conf creds; embedded P2P relay is the only "
+                        "broadcast arm)";
+        }
+    }
 
     // Constants for getheaders driver: protocol version sent in the message
     // (matches what we advertised in version handshake — see B1 coin/p2p_node.hpp).
@@ -532,6 +610,15 @@ int main(int argc, char* argv[])
 
     LOG_INFO << "[BTC] Connecting to bitcoind...";
     coin_node.start_p2p(NetService(bitcoind_host, bitcoind_port));
+
+    // Phase 10c: pull the peer mempool on connect (BIP 35) so TemplateBuilder
+    // produces POPULATED blocks. Without this the new_tx subscription above only
+    // sees txs announced via inv AFTER connect; txs already resident in the
+    // bitcoind mempool at connect time (e.g. a seeded regtest mempool) are never
+    // requested, leaving coinbase-only templates. Mirrors main_dgb. Peer must
+    // advertise NODE_BLOOM (regtest: -peerbloomfilters=1) or the request is
+    // skipped (logged) to avoid a disconnect; normal inv relay still applies.
+    coin_node.enable_mempool_request();
 
     // Drive initial header sync. Per BTC protocol, NodeP2P's verack handler
     // sends sendheaders/sendcmpct/feefilter but NOT getheaders — header sync

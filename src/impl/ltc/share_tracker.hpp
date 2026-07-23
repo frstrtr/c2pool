@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // Portable 128-bit multiply-shift: (a * b) >> shift
@@ -673,7 +674,7 @@ public:
         std::set<NetService> bad_peer_addresses;
 
         // Phase 1: Verify unverified heads, remove bad shares.
-        // Exact translation of p2pool data.py:2077-2108.
+        // C++ implementation of the p2pool think() unverified-head walk.
         // For each unverified head: walk backward, try to verify.
         // If verification fails: remove the share (it's bad).
         // If no verification possible and chain unrooted: request parents.
@@ -934,10 +935,9 @@ public:
 
             auto [last_height, last_last_hash] = chain.get_height_and_last(last_hash);
 
-            // p2pool data.py:2098-2103 EXACTLY:
-            //   want = max(self.net.CHAIN_LENGTH - head_height, 0)
-            //   can = max(last_height - 1 - self.net.CHAIN_LENGTH, 0) if last_last_hash is not None else last_height
-            //   get = min(want, can)
+            // Bounded backfill window: request as many shares as the chain is
+            // short of CHAIN_LENGTH (want), capped by how many the rooted peer
+            // can actually supply (can); to_get = min(want, can).
             auto CL = static_cast<int32_t>(PoolConfig::chain_length());
             auto want = std::max(CL - head_height, 0);
             auto can = last_last_hash.IsNull()
@@ -1283,9 +1283,8 @@ public:
             timestamp_cutoff = static_cast<uint32_t>(now_seconds()) - 24 * 60 * 60;
         }
 
-        // Filter desired by timestamp cutoff — p2pool data.py:2374 EXACTLY:
-        //   return best, [(peer_addr, hash) for peer_addr, hash, ts, targ in desired
-        //                  if ts >= timestamp_cutoff]
+        // Filter the desired list by timestamp cutoff: keep only entries whose
+        // timestamp is at or after the cutoff.
         // This prevents requesting shares from stale/pruned chain tails that
         // peers no longer have. Without this, we hammer peers with unanswerable
         // requests and they eventually drop us.
@@ -1365,6 +1364,27 @@ public:
         if (time_span <= 0) time_span = 1;
 
         return attempts / uint288(time_span);
+    }
+
+    // Saturating left-shift of a share target, used by the death-spiral
+    // emergency decay (Step 3 of compute_share_target).
+    //
+    // BUG GUARDED: a bare `prev << shift` overflows the 256-bit target and
+    // WRAPS to a tiny value (= HARDER difficulty), which accelerates the very
+    // death spiral the emergency decay exists to arrest. The old `halvings <
+    // 256` guard only bounded the shift width, not whether the shifted value
+    // stayed <= max_target (MAX_TARGET is 2^236-1 on mainnet, so even modest
+    // halvings overflow). We saturate to max_target whenever the shift would
+    // exceed it; otherwise the result is provably <= max_target < 2^256.
+    static uint256 emergency_decay_shl(const uint256& prev, unsigned int shift,
+                                       const uint256& max_target)
+    {
+        // prev << shift > max_target  <=>  prev > (max_target >> shift)
+        if (shift >= 256 || prev > (max_target >> shift))
+            return max_target;
+        uint256 r = prev;
+        r <<= shift;            // result <= max_target < 2^256: no overflow
+        return r;
     }
 
     // -- Share target computation --
@@ -1539,11 +1559,10 @@ public:
                 auto halvings = excess / half_life;
                 auto remainder = excess % half_life;
                 // 2^halvings with linear interpolation for fractional part
-                uint256 eased = prev_max_target;
-                if (halvings < 256)
-                    eased <<= halvings;
-                else
-                    eased = MAX_TARGET;
+                // Saturating shift: guards against uint256 overflow that
+                // would otherwise wrap the eased target to a tiny value.
+                uint256 eased = emergency_decay_shl(
+                    prev_max_target, static_cast<unsigned int>(halvings), MAX_TARGET);
                 // Linear interpolation: eased = eased * (half_life + remainder) / half_life
                 uint288 eased_288;
                 eased_288.SetHex(eased.GetHex());
@@ -2595,7 +2614,7 @@ public:
         if (total_weight.IsNull() || subsidy == 0)
             return result;
 
-        // Integer division matching p2pool exactly (using uint288 throughout
+        // Integer division matching p2pool's payout arithmetic (using uint288 throughout
         // to avoid uint64 truncation — total_weight routinely exceeds 2^64):
         // donation_amount = subsidy * donation_weight // total_weight
         uint288 subsidy288(subsidy);

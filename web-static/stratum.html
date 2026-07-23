@@ -628,6 +628,7 @@
                     <tr>
                         <th>Worker</th>
                         <th>Hash Rate</th>
+                        <th title="Kernel TCP round-trip latency (ss -ti tcpi_rtt)">Latency (ms)</th>
                         <th>Shares</th>
                         <th>Accepted</th>
                         <th>Rejected</th>
@@ -985,6 +986,11 @@
                         .text(w.name.length > 25 ? w.name.substr(0, 12) + '...' + w.name.substr(-8) : w.name)
                         .attr('title', w.name);
                     tr.append('td').attr('class', 'hash-rate').text(format_hashrate(s.hash_rate || 0));
+                    var rtt = s.rtt_ms || 0;
+                    var rttClass = rtt <= 0 ? '' : (rtt < 20 ? 'good' : (rtt > 100 ? 'bad' : ''));
+                    tr.append('td').attr('class', rttClass)
+                        .attr('title', rtt <= 0 ? 'unknown (non-Linux node or socket closed)' : '')
+                        .text(rtt > 0 ? d3.format('.1f')(rtt) : '-');
                     tr.append('td').text(d3.format(',')(s.shares || 0));
                     tr.append('td').attr('class', 'good').text(d3.format(',')(s.accepted || 0));
                     tr.append('td').attr('class', wRejectPct > 5 ? 'bad' : '')
@@ -995,7 +1001,7 @@
                 
                 if (workerList.length === 0) {
                     tbody.append('tr')
-                        .append('td').attr('colspan', '7')
+                        .append('td').attr('colspan', '8')
                         .style('text-align', 'center')
                         .style('color', 'var(--text-muted)')
                         .text('No workers connected');

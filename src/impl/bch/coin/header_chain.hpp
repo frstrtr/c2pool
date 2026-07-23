@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 /// BCH Header Chain
@@ -150,6 +151,7 @@ struct BCHChainParams {
     uint256     pow_limit;                   // == asert.pow_limit (mirror for check_pow)
     uint256     genesis_hash;                // SHA256d genesis block hash (identification)
     bool        allow_min_difficulty{false}; // == asert.allow_min_difficulty (testnet)
+    bool        no_retargeting{false};       // == BCHN fPowNoRetargeting (regtest)
 
     // Fast-start checkpoint: skip syncing from genesis, start from a recent height.
     // The header chain seeds this checkpoint as if it were the genesis block.
@@ -193,6 +195,25 @@ struct BCHChainParams {
         p.pow_limit            = p.asert.pow_limit;
         p.allow_min_difficulty = p.asert.allow_min_difficulty;
         p.genesis_hash.SetHex("000000001dd410c49a788668ce26751718cc797474d3152a5fc073dd44fd9f7b");
+        p.fast_start_checkpoint = Checkpoint{0, p.genesis_hash};
+        return p;
+    }
+
+    /// BCH regtest params (P2P port 18444). BCHN CRegTestParams:
+    /// fPowNoRetargeting + fPowAllowMinDifficultyBlocks -- difficulty is fixed at
+    /// the genesis nBits 0x207fffff (powLimit), so a single CPU can mine it.
+    /// Genesis is the shared Satoshi regtest genesis. Seeds the cold-start tip so
+    /// served work nbits == 0x207fffff BEFORE the first P2P regtest block arrives
+    /// (FINDING3: --pool --regtest previously collapsed to testnet params and
+    /// served unwinnable testnet difficulty). GBT-from-local-regtest-BCHN
+    /// (regtest_block::build_from_gbt) is a deferred follow-on slice.
+    static BCHChainParams regtest() {
+        BCHChainParams p;
+        p.asert                = asert_regtest();
+        p.pow_limit            = p.asert.pow_limit;
+        p.allow_min_difficulty = p.asert.allow_min_difficulty;
+        p.no_retargeting       = true;
+        p.genesis_hash.SetHex("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206");
         p.fast_start_checkpoint = Checkpoint{0, p.genesis_hash};
         return p;
     }
@@ -704,6 +725,14 @@ private:
     /// only the immediate predecessor, not an ancestor walk.
     bool validate_difficulty(const BlockHeaderType& header, uint32_t new_height) {
         if (new_height < 2) return true; // genesis + first block
+
+        // Regtest (BCHN fPowNoRetargeting): difficulty never adjusts -- every
+        // block carries the powLimit nBits (0x207fffff). ASERT is bypassed here:
+        // CalculateASERT would assert on the regtest powLimit (top byte 0x7f
+        // violates its 32-leading-zero-bits invariant). The bits/target are
+        // already gated against pow_limit by check_pow at the accept site, so
+        // accept. (FINDING3.)
+        if (m_params.no_retargeting) return true;
 
         // Get tip (the block we're building on).
         auto prev_opt = lookup_header_internal(header.m_previous_block);

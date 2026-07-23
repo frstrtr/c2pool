@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #include "web_server.hpp"
 #include "stratum_server.hpp"
 #include <memory>
@@ -42,870 +43,6 @@ namespace core {
 static std::string to_hex(const std::vector<unsigned char>& data)
 {
     return HexStr(std::span<const unsigned char>(data.data(), data.size()));
-}
-
-// ── Security helpers ───────────────────────────────────────────────────
-// URL-decode percent-encoded strings (%20 → space, etc.)
-static std::string url_decode(const std::string& str)
-{
-    std::string result;
-    result.reserve(str.size());
-    for (size_t i = 0; i < str.size(); ++i) {
-        if (str[i] == '%' && i + 2 < str.size()) {
-            int hi = 0, lo = 0;
-            auto hexval = [](char c) -> int {
-                if (c >= '0' && c <= '9') return c - '0';
-                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-                return -1;
-            };
-            hi = hexval(str[i + 1]);
-            lo = hexval(str[i + 2]);
-            if (hi >= 0 && lo >= 0) {
-                result += static_cast<char>((hi << 4) | lo);
-                i += 2;
-                continue;
-            }
-        } else if (str[i] == '+') {
-            result += ' ';
-            continue;
-        }
-        result += str[i];
-    }
-    return result;
-}
-
-// Validate that a string is a hex hash (exactly 64 hex chars)
-static bool is_valid_hex_hash(const std::string& s)
-{
-    if (s.size() != 64) return false;
-    for (char c : s) {
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
-            return false;
-    }
-    return true;
-}
-
-// Validate that a string looks like a cryptocurrency address (base58/bech32 charset, reasonable length)
-static bool is_valid_address_chars(const std::string& s)
-{
-    if (s.empty() || s.size() > 128) return false;
-    for (char c : s) {
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')))
-            return false;
-    }
-    return true;
-}
-
-// Validate graph source/view against allowed charset (alphanumeric + underscore, max 64 chars)
-static bool is_valid_graph_param(const std::string& s)
-{
-    if (s.empty() || s.size() > 64) return false;
-    for (char c : s) {
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'))
-            return false;
-    }
-    return true;
-}
-
-/// HttpSession Implementation
-HttpSession::HttpSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface)
-    : socket_(std::move(socket))
-    , mining_interface_(mining_interface)
-{
-}
-
-void HttpSession::run()
-{
-    read_request();
-}
-
-void HttpSession::read_request()
-{
-    auto self = shared_from_this();
-    
-    http::async_read(socket_, buffer_, request_,
-        [self](beast::error_code ec, std::size_t bytes_transferred)
-        {
-            boost::ignore_unused(bytes_transferred);
-            
-            if(ec == http::error::end_of_stream)
-                return self->handle_error(ec, "read_request");
-                
-            if(ec)
-                return self->handle_error(ec, "read_request");
-                
-            self->process_request();
-        });
-}
-
-void HttpSession::process_request()
-{
-    // Create HTTP response
-    http::response<http::string_body> response{http::status::ok, request_.version()};
-    response.set(http::field::server, mining_interface_->get_pool_version());
-    response.set(http::field::content_type, "application/json");
-
-    // CORS — only set if operator configured an origin
-    const auto& cors_origin = mining_interface_->get_cors_origin();
-    if (!cors_origin.empty()) {
-        response.set(http::field::access_control_allow_origin, cors_origin);
-        response.set(http::field::access_control_allow_methods, "GET, POST, OPTIONS");
-        response.set(http::field::access_control_allow_headers, "Content-Type");
-    }
-
-    // Security headers
-    response.set("X-Content-Type-Options", "nosniff");
-    response.set("X-Frame-Options", "DENY");
-    response.set("Referrer-Policy", "no-referrer");
-
-    // Admin endpoints accept both GET and POST so CLI tools can POST
-    // mutations without falling through to the JSON-RPC handler.
-    // Covers /api/admin/pool/* AND /api/admin/coin/*.
-    bool is_admin_path = std::string(request_.target()).substr(0, 11) == "/api/admin/";
-
-    try {
-        std::string response_body;
-
-        if (request_.method() == http::verb::options) {
-            // Handle CORS preflight
-            response_body = "";
-        }
-        else if (request_.method() == http::verb::get
-                 || (is_admin_path && request_.method() == http::verb::post)) {
-            // Path-based REST routing for p2pool-compatible endpoints
-            std::string raw_target(request_.target());
-            std::string target(raw_target);
-            // Strip query string
-            auto qpos = target.find('?');
-            if (qpos != std::string::npos) target = target.substr(0, qpos);
-
-            auto getQueryParam = [&raw_target](const std::string& key) -> std::string {
-                const auto qp = raw_target.find('?');
-                if (qp == std::string::npos) {
-                    return {};
-                }
-                const std::string query = raw_target.substr(qp + 1);
-                const std::string prefix = key + "=";
-                auto pos = query.find(prefix);
-                if (pos == std::string::npos) {
-                    return {};
-                }
-                pos += prefix.size();
-                auto end = query.find('&', pos);
-                if (end == std::string::npos) {
-                    end = query.size();
-                }
-                return url_decode(query.substr(pos, end - pos));
-            };
-
-            // ── Auth gate for sensitive endpoints ──────────────────────
-            if (mining_interface_->auth_required()) {
-                bool needs_auth = (target.substr(0, 9) == "/control/"
-                                || target == "/web/log"
-                                || target == "/logs/export");
-                if (needs_auth) {
-                    const std::string token = getQueryParam("token");
-                    if (!mining_interface_->verify_auth_token(token)) {
-                        response.result(http::status::unauthorized);
-                        response.body() = R"({"error":"Unauthorized – supply ?token=<auth_token>"})";
-                        response.prepare_payload();
-                        send_response(std::move(response));
-                        return;
-                    }
-                }
-            }
-
-            nlohmann::json rest_result;
-            if (target == "/local_rate")
-                rest_result = mining_interface_->rest_local_rate();
-            else if (target == "/global_rate")
-                rest_result = mining_interface_->rest_global_rate();
-            else if (target == "/current_payouts")
-                rest_result = mining_interface_->rest_current_payouts();
-            else if (target == "/users")
-                rest_result = mining_interface_->rest_users();
-            else if (target == "/fee")
-                rest_result = mining_interface_->rest_fee();
-            else if (target == "/recent_blocks")
-                rest_result = mining_interface_->rest_recent_blocks();
-            else if (target == "/checkpoint")
-                rest_result = mining_interface_->rest_checkpoint();
-            else if (target == "/checkpoints")
-                rest_result = mining_interface_->rest_checkpoints();
-            else if (target == "/uptime")
-                rest_result = mining_interface_->rest_uptime();
-            else if (target == "/connected_miners")
-                rest_result = mining_interface_->rest_connected_miners();
-            else if (target == "/stratum_stats")
-                rest_result = mining_interface_->rest_stratum_stats();
-            else if (target == "/global_stats")
-                rest_result = mining_interface_->rest_global_stats();
-            else if (target == "/sharechain/stats")
-                rest_result = mining_interface_->rest_sharechain_stats();
-            else if (target == "/sharechain/window") {
-                // Layer 1+2: cached response + ETag/304
-                auto client_ip = socket_.remote_endpoint().address().to_string();
-                if (!mining_interface_->rate_check(client_ip, 4)) {  // max 4/min
-                    response.result(http::status::too_many_requests);
-                    response_body = R"({"error":"Rate limited"})";
-                } else {
-                    auto [body, etag] = mining_interface_->get_cached_window_response();
-                    std::string client_etag;
-                    auto it = request_.find(http::field::if_none_match);
-                    if (it != request_.end()) client_etag = std::string(it->value());
-                    if (!etag.empty() && client_etag == "\"" + etag + "\"") {
-                        response.result(http::status::not_modified);
-                        response_body = "";
-                    } else {
-                        response.set(http::field::etag, "\"" + etag + "\"");
-                        response.set(http::field::cache_control, "no-cache");
-                        response_body = body;
-                    }
-                }
-            }
-            else if (target == "/sharechain/tip")
-                rest_result = mining_interface_->rest_sharechain_tip();
-            else if (target == "/sharechain/delta") {
-                auto client_ip = socket_.remote_endpoint().address().to_string();
-                if (!mining_interface_->rate_check(client_ip, 30)) {  // max 30/min
-                    response.result(http::status::too_many_requests);
-                    response_body = R"({"error":"Rate limited"})";
-                } else {
-                    rest_result = mining_interface_->rest_sharechain_delta(getQueryParam("since"));
-                }
-            }
-            else if (target == "/sharechain/stream") {
-                // Layer 4: SSE — send headers and keep connection open
-                auto client_ip = socket_.remote_endpoint().address().to_string();
-                if (!mining_interface_->rate_check(client_ip, 2)) {  // max 2 SSE connections/min per IP
-                    response.result(http::status::too_many_requests);
-                    response_body = R"({"error":"Rate limited"})";
-                } else {
-                    // Send SSE headers manually, then register for push
-                    std::string sse_headers =
-                        "HTTP/1.1 200 OK\r\n"
-                        "Content-Type: text/event-stream\r\n"
-                        "Cache-Control: no-cache\r\n"
-                        "Connection: keep-alive\r\n"
-                        "X-Accel-Buffering: no\r\n"
-                        "\r\n"
-                        "data: {\"connected\":true}\n\n";
-                    auto buf = std::make_shared<std::string>(sse_headers);
-                    auto self = shared_from_this();
-                    auto sock_ptr = std::make_shared<tcp::socket>(std::move(socket_));
-                    boost::asio::async_write(*sock_ptr, boost::asio::buffer(*buf),
-                        [buf, sock_ptr, mi = mining_interface_](beast::error_code ec, std::size_t) {
-                            if (!ec) mi->sse_register(sock_ptr);
-                        });
-                    return;  // Don't close connection
-                }
-            }
-            else if (target == "/control/mining/start")
-                rest_result = mining_interface_->rest_control_mining_start();
-            else if (target == "/control/mining/stop")
-                rest_result = mining_interface_->rest_control_mining_stop();
-            else if (target == "/control/mining/restart")
-                rest_result = mining_interface_->rest_control_mining_restart();
-            else if (target == "/control/mining/ban")
-                rest_result = mining_interface_->rest_control_mining_ban(getQueryParam("target"));
-            else if (target == "/control/mining/unban")
-                rest_result = mining_interface_->rest_control_mining_unban(getQueryParam("target"));
-            else if (target == "/web/log") {
-                // Return plain text log (not JSON)
-                response.set(http::field::content_type, "text/plain; charset=utf-8");
-                response.body() = mining_interface_->rest_web_log();
-                response.prepare_payload();
-                send_response(std::move(response));
-                return;
-            }
-            else if (target == "/logs/export") {
-                const std::string scope = getQueryParam("scope");
-                int64_t from_ts = 0, to_ts = 0;
-                try { from_ts = std::stoll(getQueryParam("from")); } catch (...) {}
-                try { to_ts = std::stoll(getQueryParam("to")); } catch (...) {}
-                const std::string fmt = getQueryParam("format");
-                response.set(http::field::content_type,
-                    (fmt == "csv") ? "text/csv; charset=utf-8" :
-                    (fmt == "jsonl") ? "application/x-ndjson; charset=utf-8" :
-                    "text/plain; charset=utf-8");
-                response.body() = mining_interface_->rest_logs_export(scope, from_ts, to_ts, fmt);
-                response.prepare_payload();
-                send_response(std::move(response));
-                return;
-            }
-            // ── p2pool legacy compatibility endpoints ──────────────────────
-            else if (target == "/local_stats")
-                rest_result = mining_interface_->rest_local_stats();
-            else if (target == "/miner_thresholds")
-                rest_result = mining_interface_->rest_miner_thresholds();
-            else if (target == "/web/version")
-                rest_result = mining_interface_->rest_web_version();
-            else if (target == "/web/currency_info")
-                rest_result = mining_interface_->rest_web_currency_info();
-            else if (target == "/payout_addr")
-                rest_result = mining_interface_->rest_payout_addr();
-            else if (target == "/payout_addrs")
-                rest_result = mining_interface_->rest_payout_addrs();
-            else if (target == "/web/best_share_hash")
-                rest_result = mining_interface_->rest_web_best_share_hash();
-            else if (target == "/web/sync_status")
-                rest_result = mining_interface_->rest_sync_status();
-            else if (target == "/p2pool_global_stats")
-                rest_result = mining_interface_->rest_p2pool_global_stats();
-
-            // ── Additional p2pool-compatible REST endpoints ────────────────
-            else if (target == "/rate")
-                rest_result = mining_interface_->rest_rate();
-            else if (target == "/difficulty")
-                rest_result = mining_interface_->rest_difficulty();
-            else if (target == "/user_stales")
-                rest_result = mining_interface_->rest_user_stales();
-            else if (target == "/peer_addresses") {
-                response.set(http::field::content_type, "text/plain; charset=utf-8");
-                response.body() = mining_interface_->rest_peer_addresses();
-                response.prepare_payload();
-                send_response(std::move(response));
-                return;
-            }
-            else if (target == "/peer_versions")
-                rest_result = mining_interface_->rest_peer_versions();
-            else if (target == "/peer_txpool_sizes")
-                rest_result = mining_interface_->rest_peer_txpool_sizes();
-            else if (target == "/peer_list")
-                rest_result = mining_interface_->rest_peer_list();
-            else if (target == "/pings")
-                rest_result = mining_interface_->rest_pings();
-            else if (target == "/stale_rates")
-                rest_result = mining_interface_->rest_stale_rates();
-            else if (target == "/node_info")
-                rest_result = mining_interface_->rest_node_info();
-            else if (target == "/api/node_topology")
-                rest_result = mining_interface_->rest_node_topology();
-            else if (target == "/luck_stats")
-                rest_result = mining_interface_->rest_luck_stats();
-            else if (target == "/ban_stats")
-                rest_result = mining_interface_->rest_ban_stats();
-            else if (target == "/stratum_security")
-                rest_result = mining_interface_->rest_stratum_security();
-            else if (target == "/best_share")
-                rest_result = mining_interface_->rest_best_share();
-            else if (target == "/version_signaling")
-                rest_result = mining_interface_->rest_version_signaling();
-            else if (target == "/v36_status")
-                rest_result = mining_interface_->rest_v36_status();
-            else if (target == "/tracker_debug")
-                rest_result = mining_interface_->rest_tracker_debug();
-
-            // Merged mining endpoints
-            else if (target == "/merged_stats")
-                rest_result = mining_interface_->rest_merged_stats();
-            else if (target == "/current_merged_payouts")
-                rest_result = mining_interface_->rest_current_merged_payouts();
-            else if (target == "/pplns/current")
-                rest_result = mining_interface_->rest_pplns_current();
-            else if (target.rfind("/pplns/miner/", 0) == 0) {
-                // /pplns/miner/<address> — extract address from path.
-                std::string addr = target.substr(std::string("/pplns/miner/").size());
-                // URL-decode (spec §5.2 "MUST be URL-encoded by the client").
-                std::string decoded;
-                decoded.reserve(addr.size());
-                for (size_t i = 0; i < addr.size(); ++i) {
-                    if (addr[i] == '%' && i + 2 < addr.size()) {
-                        auto hex = addr.substr(i + 1, 2);
-                        try {
-                            decoded.push_back(static_cast<char>(
-                                std::stoi(hex, nullptr, 16)));
-                            i += 2;
-                        } catch (...) {
-                            decoded.push_back(addr[i]);
-                        }
-                    } else if (addr[i] == '+') {
-                        decoded.push_back(' ');
-                    } else {
-                        decoded.push_back(addr[i]);
-                    }
-                }
-                rest_result = mining_interface_->rest_pplns_miner(decoded);
-            }
-            else if (target == "/recent_merged_blocks")
-                rest_result = mining_interface_->rest_recent_merged_blocks();
-            else if (target == "/all_merged_blocks")
-                rest_result = mining_interface_->rest_all_merged_blocks();
-            else if (target == "/discovered_merged_blocks")
-                rest_result = mining_interface_->rest_discovered_merged_blocks();
-            else if (target == "/broadcaster_status")
-                rest_result = mining_interface_->rest_broadcaster_status();
-            else if (target == "/merged_broadcaster_status")
-                rest_result = mining_interface_->rest_merged_broadcaster_status();
-            else if (target == "/network_difficulty")
-                rest_result = mining_interface_->rest_network_difficulty();
-
-            // /web/ sub-endpoints (share chain inspection)
-            else if (target == "/web/heads")
-                rest_result = mining_interface_->rest_web_heads();
-            else if (target == "/web/verified_heads")
-                rest_result = mining_interface_->rest_web_verified_heads();
-            else if (target == "/web/tails")
-                rest_result = mining_interface_->rest_web_tails();
-            else if (target == "/web/verified_tails")
-                rest_result = mining_interface_->rest_web_verified_tails();
-            else if (target == "/web/my_share_hashes")
-                rest_result = mining_interface_->rest_web_my_share_hashes();
-            else if (target == "/web/my_share_hashes50")
-                rest_result = mining_interface_->rest_web_my_share_hashes50();
-            else if (target == "/web/log_json")
-                rest_result = mining_interface_->rest_web_log_json();
-
-            // Path-parameterised endpoints (starts_with matching)
-            // Each path parameter is URL-decoded and validated before use.
-            else if (target.substr(0, 13) == "/miner_stats/") {
-                std::string addr = url_decode(target.substr(13));
-                if (!is_valid_address_chars(addr)) {
-                    response.result(http::status::bad_request);
-                    response.body() = R"({"error":"Invalid address parameter"})";
-                    response.prepare_payload();
-                    send_response(std::move(response));
-                    return;
-                }
-                rest_result = mining_interface_->rest_miner_stats(addr);
-            }
-            else if (target.substr(0, 15) == "/miner_payouts/") {
-                std::string addr = url_decode(target.substr(15));
-                if (!is_valid_address_chars(addr)) {
-                    response.result(http::status::bad_request);
-                    response.body() = R"({"error":"Invalid address parameter"})";
-                    response.prepare_payload();
-                    send_response(std::move(response));
-                    return;
-                }
-                rest_result = mining_interface_->rest_miner_payouts(addr);
-            }
-            else if (target.substr(0, 18) == "/patron_sendmany/") {
-                std::string total = url_decode(target.substr(18));
-                if (!is_valid_address_chars(total)) {
-                    response.result(http::status::bad_request);
-                    response.body() = R"({"error":"Invalid parameter"})";
-                    response.prepare_payload();
-                    send_response(std::move(response));
-                    return;
-                }
-                response.set(http::field::content_type, "text/plain; charset=utf-8");
-                response.body() = mining_interface_->rest_patron_sendmany(total).dump();
-                response.prepare_payload();
-                send_response(std::move(response));
-                return;
-            }
-            else if (target.substr(0, 11) == "/web/share/") {
-                std::string hash = url_decode(target.substr(11));
-                if (!is_valid_hex_hash(hash)) {
-                    response.result(http::status::bad_request);
-                    response.body() = R"({"error":"Invalid hash – expected 64 hex characters"})";
-                    response.prepare_payload();
-                    send_response(std::move(response));
-                    return;
-                }
-                rest_result = mining_interface_->rest_web_share(hash);
-            }
-            else if (target.substr(0, 20) == "/web/payout_address/") {
-                std::string hash = url_decode(target.substr(20));
-                if (!is_valid_hex_hash(hash)) {
-                    response.result(http::status::bad_request);
-                    response.body() = R"({"error":"Invalid hash – expected 64 hex characters"})";
-                    response.prepare_payload();
-                    send_response(std::move(response));
-                    return;
-                }
-                rest_result = mining_interface_->rest_web_payout_address(hash);
-            }
-            else if (target.substr(0, 16) == "/web/graph_data/") {
-                // /web/graph_data/<source>/<view>
-                std::string rest_path = url_decode(target.substr(16));
-                auto slash_pos = rest_path.find('/');
-                std::string source = (slash_pos != std::string::npos) ? rest_path.substr(0, slash_pos) : rest_path;
-                std::string view   = (slash_pos != std::string::npos) ? rest_path.substr(slash_pos + 1) : "";
-                if (!is_valid_graph_param(source) || (!view.empty() && !is_valid_graph_param(view))) {
-                    response.result(http::status::bad_request);
-                    response.body() = R"({"error":"Invalid graph source/view parameter"})";
-                    response.prepare_payload();
-                    send_response(std::move(response));
-                    return;
-                }
-                rest_result = mining_interface_->rest_web_graph_data(source, view);
-            }
-
-            // ── Coin peer sharing (public, rate-limited) ──────────────
-            else if (target == "/api/coin_peers") {
-                auto remote_ip = socket_.remote_endpoint().address().to_string();
-                auto result = mining_interface_->rest_coin_peers(remote_ip);
-                if (result.contains("error")) {
-                    response.result(http::status::too_many_requests);
-                    response.set(http::field::retry_after, "10");
-                }
-                response.body() = result.dump();
-                response.prepare_payload();
-                send_response(std::move(response));
-                return;
-            }
-
-            else {
-                // ── Admin API endpoints (loopback-only) ───────────────────
-                if (target.substr(0, 16) == "/api/admin/pool/") {
-                    auto remote_addr = socket_.remote_endpoint().address();
-                    if (!remote_addr.is_loopback()) {
-                        response.result(http::status::forbidden);
-                        response.body() = R"({"error":"Admin API is local-only"})";
-                        response.prepare_payload();
-                        send_response(std::move(response));
-                        return;
-                    }
-                    if (!mining_interface_->has_admin_fns()) {
-                        response.result(http::status::not_found);
-                        response.body() = R"({"error":"Admin API not enabled"})";
-                        response.prepare_payload();
-                        send_response(std::move(response));
-                        return;
-                    }
-
-                    std::string ep = target.substr(16); // after "/api/admin/pool/"
-                    // strip query string
-                    auto qpos = ep.find('?');
-                    if (qpos != std::string::npos) ep = ep.substr(0, qpos);
-
-                    auto parse_host_port = [&](uint16_t& port_out) -> std::string {
-                        std::string host = getQueryParam("host");
-                        std::string ip_q = getQueryParam("ip");
-                        port_out = 0;
-                        if (!host.empty()) {
-                            auto colon = host.rfind(':');
-                            if (colon != std::string::npos) {
-                                try { port_out = static_cast<uint16_t>(std::stoul(host.substr(colon + 1))); } catch (...) {}
-                                host = host.substr(0, colon);
-                            }
-                        } else {
-                            host = ip_q;
-                        }
-                        std::string port_q = getQueryParam("port");
-                        if (!port_q.empty()) {
-                            try { port_out = static_cast<uint16_t>(std::stoul(port_q)); } catch (...) {}
-                        }
-                        return host;
-                    };
-
-                    if (ep == "bans/list") {
-                        rest_result = mining_interface_->call_admin_list_bans();
-                    } else if (ep == "bans/add") {
-                        std::string ip = getQueryParam("ip");
-                        int dur = 0;
-                        try { auto d = getQueryParam("duration"); if (!d.empty()) dur = std::stoi(d); } catch (...) {}
-                        rest_result = mining_interface_->call_admin_ban_ip(ip, dur);
-                    } else if (ep == "bans/remove") {
-                        std::string ip = getQueryParam("ip");
-                        rest_result = mining_interface_->call_admin_unban_ip(ip);
-                    } else if (ep == "whitelist/list") {
-                        rest_result = mining_interface_->call_admin_list_whitelist();
-                    } else if (ep == "whitelist/add") {
-                        uint16_t p = 0;
-                        std::string h = parse_host_port(p);
-                        rest_result = mining_interface_->call_admin_whitelist_add(h, p);
-                    } else if (ep == "whitelist/remove") {
-                        uint16_t p = 0;
-                        std::string h = parse_host_port(p);
-                        rest_result = mining_interface_->call_admin_whitelist_remove(h, p);
-                    } else if (ep == "peers/list") {
-                        rest_result = mining_interface_->call_admin_list_peers();
-                    } else if (ep == "peers/drop") {
-                        std::string ip = getQueryParam("ip");
-                        rest_result = mining_interface_->call_admin_drop_peer(ip);
-                    } else if (ep == "peers/dial") {
-                        uint16_t p = 0;
-                        std::string h = parse_host_port(p);
-                        rest_result = mining_interface_->call_admin_dial_peer(h, p);
-                    } else {
-                        rest_result = nlohmann::json{{"ok", false}, {"error", "Unknown admin endpoint"}};
-                    }
-                }
-                // ── Admin API: embedded-coin peer management ──────────────
-                else if (target.substr(0, 16) == "/api/admin/coin/") {
-                    auto remote_addr = socket_.remote_endpoint().address();
-                    if (!remote_addr.is_loopback()) {
-                        response.result(http::status::forbidden);
-                        response.body() = R"({"error":"Admin API is local-only"})";
-                        response.prepare_payload();
-                        send_response(std::move(response));
-                        return;
-                    }
-                    if (!mining_interface_->has_admin_coin_fns()) {
-                        response.result(http::status::not_found);
-                        response.body() = R"({"error":"Coin admin API not enabled"})";
-                        response.prepare_payload();
-                        send_response(std::move(response));
-                        return;
-                    }
-
-                    std::string ep = target.substr(16); // after "/api/admin/coin/"
-                    auto qpos = ep.find('?');
-                    if (qpos != std::string::npos) ep = ep.substr(0, qpos);
-
-                    std::string chain = getQueryParam("chain");
-                    if (chain.empty()) chain = mining_interface_->primary_chain_key();
-
-                    if (ep == "peers/list") {
-                        rest_result = mining_interface_->call_admin_coin_list_peers(chain);
-                    } else if (ep == "peer/add") {
-                        std::string host = getQueryParam("host");
-                        uint16_t port = 0;
-                        // Host may be "A.B.C.D:PORT" (combined) OR "A.B.C.D" with separate ?port=
-                        if (!host.empty()) {
-                            auto colon = host.rfind(':');
-                            if (colon != std::string::npos) {
-                                try { port = static_cast<uint16_t>(std::stoul(host.substr(colon + 1))); } catch (...) {}
-                                host = host.substr(0, colon);
-                            }
-                        }
-                        std::string port_q = getQueryParam("port");
-                        if (!port_q.empty()) {
-                            try { port = static_cast<uint16_t>(std::stoul(port_q)); } catch (...) {}
-                        }
-                        rest_result = mining_interface_->call_admin_coin_add_peer(chain, host, port);
-                    } else {
-                        rest_result = nlohmann::json{{"ok", false}, {"error", "Unknown coin admin endpoint"}};
-                    }
-                }
-                else
-                // ── Explorer API endpoints (loopback-only) ────────────────
-                if (target.substr(0, 14) == "/api/explorer/") {
-                    // Loopback guard: only accept requests from 127.0.0.1 / ::1
-                    auto remote_addr = socket_.remote_endpoint().address();
-                    if (!remote_addr.is_loopback()) {
-                        response.result(http::status::forbidden);
-                        response.body() = R"({"error":"Explorer API is local-only"})";
-                        response.prepare_payload();
-                        send_response(std::move(response));
-                        return;
-                    }
-
-                    if (!mining_interface_->is_explorer_enabled()) {
-                        response.result(http::status::not_found);
-                        response.body() = R"({"error":"Explorer not enabled"})";
-                        response.prepare_payload();
-                        send_response(std::move(response));
-                        return;
-                    }
-
-                    std::string chain = getQueryParam("chain");
-                    if (chain.empty()) chain = mining_interface_->primary_chain_key();
-
-                    std::string ep = target.substr(14);
-
-                    if (ep == "getblockchaininfo" && mining_interface_->has_explorer_chaininfo_fn()) {
-                        rest_result = mining_interface_->call_explorer_chaininfo(chain);
-                    } else if (ep == "getblockhash" && mining_interface_->has_explorer_blockhash_fn()) {
-                        std::string height_str = getQueryParam("height");
-                        uint32_t h = 0;
-                        try { h = static_cast<uint32_t>(std::stoul(height_str)); } catch (...) {}
-                        auto hash = mining_interface_->call_explorer_blockhash(h, chain);
-                        if (hash.empty()) {
-                            rest_result = nlohmann::json{{"error", "Block not found"}};
-                        } else {
-                            rest_result = nlohmann::json{{"result", hash}};
-                        }
-                    } else if (ep == "getblock" && mining_interface_->has_explorer_getblock_fn()) {
-                        std::string hash = getQueryParam("hash");
-                        // Also support height lookup
-                        if (hash.empty()) {
-                            std::string h_str = getQueryParam("height");
-                            if (!h_str.empty() && mining_interface_->has_explorer_blockhash_fn()) {
-                                uint32_t h = 0;
-                                try { h = static_cast<uint32_t>(std::stoul(h_str)); } catch (...) {}
-                                hash = mining_interface_->call_explorer_blockhash(h, chain);
-                            }
-                        }
-                        if (hash.empty()) {
-                            rest_result = nlohmann::json{{"error", "Missing hash or height parameter"}};
-                        } else {
-                            rest_result = mining_interface_->call_explorer_getblock(hash, chain);
-                        }
-                    } else if (ep == "getmempoolinfo" && mining_interface_->has_explorer_mempoolinfo_fn()) {
-                        rest_result = mining_interface_->call_explorer_mempoolinfo(chain);
-                    } else if (ep == "getrawmempool" && mining_interface_->has_explorer_rawmempool_fn()) {
-                        bool verbose = getQueryParam("verbose") == "true";
-                        uint32_t limit = 500;
-                        try { auto ls = getQueryParam("limit"); if (!ls.empty()) limit = std::min(5000u, static_cast<uint32_t>(std::stoul(ls))); } catch (...) {}
-                        rest_result = mining_interface_->call_explorer_rawmempool(chain, verbose, limit);
-                    } else if (ep == "getmempoolentry" && mining_interface_->has_explorer_mempoolentry_fn()) {
-                        std::string txid_param = getQueryParam("txid");
-                        if (txid_param.empty()) {
-                            rest_result = nlohmann::json{{"error", "Missing txid parameter"}};
-                        } else {
-                            rest_result = mining_interface_->call_explorer_mempoolentry(txid_param, chain);
-                        }
-                    } else {
-                        rest_result = nlohmann::json{{"error", "Unknown explorer endpoint"}};
-                    }
-                }
-                else {
-                // ── Static file serving (dashboard gate) ───────────────────
-                const auto& dashboard_dir = mining_interface_->get_dashboard_dir();
-                if (!dashboard_dir.empty()) {
-                    std::string file_path = target;
-                    if (file_path == "/" || file_path.empty())
-                        file_path = mining_interface_->is_node_ready()
-                            ? "/dashboard.html" : "/loading.html";
-
-                    // During startup, redirect all HTML pages to loading.html
-                    // (except loading.html itself). Only loading.html + sync_status
-                    // + currency_info work during early startup.
-                    if (file_path != "/loading.html" && file_path.find(".html") != std::string::npos) {
-                        bool node_ready = mining_interface_->is_node_ready();
-                        if (!node_ready) {
-                            response.result(http::status::temporary_redirect);
-                            response.set(http::field::location, "/loading.html");
-                            response.body() = "";
-                            response.prepare_payload();
-                            send_response(std::move(response));
-                            return;
-                        }
-                    }
-
-                    std::error_code fec;
-                    std::filesystem::path base = std::filesystem::weakly_canonical(dashboard_dir);
-                    std::filesystem::path requested = base / file_path.substr(1);
-                    auto resolved = std::filesystem::canonical(requested, fec);
-
-                    if (!fec && resolved.string().substr(0, base.string().size()) == base.string()
-                             && std::filesystem::is_regular_file(resolved))
-                    {
-                        // MIME type detection
-                        std::string ext = resolved.extension().string();
-                        std::string mime = "application/octet-stream";
-                        if (ext == ".html" || ext == ".htm") mime = "text/html; charset=utf-8";
-                        else if (ext == ".js" || ext == ".mjs") mime = "application/javascript; charset=utf-8";
-                        else if (ext == ".css")  mime = "text/css; charset=utf-8";
-                        else if (ext == ".json") mime = "application/json; charset=utf-8";
-                        else if (ext == ".ico")  mime = "image/x-icon";
-                        else if (ext == ".png")  mime = "image/png";
-                        else if (ext == ".svg")  mime = "image/svg+xml";
-                        else if (ext == ".txt")  mime = "text/plain; charset=utf-8";
-                        else if (ext == ".woff2") mime = "font/woff2";
-                        else if (ext == ".woff") mime = "font/woff";
-                        else if (ext == ".map")  mime = "application/json";
-
-                        std::ifstream file(resolved, std::ios::binary);
-                        std::string contents((std::istreambuf_iterator<char>(file)),
-                                             std::istreambuf_iterator<char>());
-
-                        // Inject analytics tag into HTML pages if configured
-                        const auto& analytics_id = mining_interface_->get_analytics_id();
-                        if (!analytics_id.empty() && (ext == ".html" || ext == ".htm")) {
-                            auto pos = contents.find("</head>");
-                            if (pos == std::string::npos) pos = contents.find("</HEAD>");
-                            if (pos != std::string::npos) {
-                                std::string tag =
-                                    "<!-- analytics -->\n"
-                                    "<script async src=\"https://www.googletagmanager.com/gtag/js?id=" + analytics_id + "\"></script>\n"
-                                    "<script>\n"
-                                    "window.dataLayer=window.dataLayer||[];\n"
-                                    "function gtag(){dataLayer.push(arguments);}\n"
-                                    "gtag('js',new Date());\n"
-                                    "gtag('config','" + analytics_id + "');\n"
-                                    "</script>\n";
-                                contents.insert(pos, tag);
-                            }
-                        }
-
-                        // Explorer nav link injection removed — each HTML page has
-                        // client-side JS that checks currency_info.explorer_enabled
-                        // and injects the link dynamically. Server-side injection was
-                        // fragile (depended on exact ">Classic</a>" text) and caused
-                        // duplicate buttons on pages that had both mechanisms.
-
-                        response.set(http::field::content_type, mime);
-                        response.set(http::field::cache_control, "public, max-age=3600");
-                        response.body() = std::move(contents);
-                        response.prepare_payload();
-                        send_response(std::move(response));
-                        return;
-                    }
-
-                    // Dashboard IS configured, the request matched no REST
-                    // endpoint above, and no such on-disk asset exists -> a real
-                    // 404. Previously this fell through to getinfo() below, so
-                    // unknown paths (explorer.html, blocks.html, typos, scanner
-                    // probes) leaked the node-info JSON instead of Not Found.
-                    response.result(http::status::not_found);
-                    response.set(http::field::content_type, "text/plain; charset=utf-8");
-                    response.body() = "404 Not Found";
-                    response.prepare_payload();
-                    send_response(std::move(response));
-                    return;
-                }
-                // Fallback to getinfo JSON (API-only mode: no --dashboard-dir set)
-                rest_result = mining_interface_->getinfo();
-                }  // end static file serving else
-            }  // end explorer/static dispatch
-
-            if (!rest_result.is_null())
-                response_body = rest_result.dump();
-        }
-        else if (request_.method() == http::verb::post) {
-            // Handle JSON-RPC POST request.
-            // Accept both 1.0 and 2.0 — upgrade 1.0 to 2.0 for the library.
-            std::string request_body = request_.body();
-            {
-                auto pos = request_body.find("\"1.0\"");
-                if (pos != std::string::npos) {
-                    auto ctx = request_body.rfind("jsonrpc", pos);
-                    if (ctx != std::string::npos && pos - ctx < 15)
-                        request_body.replace(pos, 5, "\"2.0\"");
-                }
-            }
-
-            response_body = mining_interface_->HandleRequest(request_body);
-        }
-        else {
-            response.result(http::status::method_not_allowed);
-            response_body = R"({"error":"Method not allowed"})";
-        }
-        
-        response.body() = response_body;
-        response.prepare_payload();
-        
-    } catch (const std::exception& e) {
-        LOG_ERROR << "Error processing request: " << e.what();
-        response.result(http::status::internal_server_error);
-        response.body() = R"({"error":"Internal server error"})";
-        response.prepare_payload();
-    }
-    
-    send_response(std::move(response));
-}
-
-void HttpSession::send_response(http::response<http::string_body> response)
-{
-    auto self = shared_from_this();
-    
-    auto response_ptr = std::make_shared<http::response<http::string_body>>(std::move(response));
-    
-    http::async_write(socket_, *response_ptr,
-        [self, response_ptr](beast::error_code ec, std::size_t bytes_transferred)
-        {
-            boost::ignore_unused(bytes_transferred);
-            
-            if(ec)
-                return self->handle_error(ec, "send_response");
-                
-            // Gracefully close the connection
-            beast::error_code close_ec;
-            self->socket_.shutdown(tcp::socket::shutdown_send, close_ec);
-        });
-}
-
-void HttpSession::handle_error(beast::error_code ec, char const* what)
-{
-    if (ec != beast::errc::operation_canceled && ec != beast::errc::broken_pipe) {
-        LOG_WARNING << "HTTP Session error in " << what << ": " << ec.message();
-    }
 }
 
 /// MiningInterface Implementation
@@ -2776,7 +1913,12 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
             }
         }
 
-        // Save block hex to file for manual submitblock testing
+        // Save block hex to file for manual submitblock testing. Kept at a
+        // fixed /tmp path (NOT re-rooted under --data-dir): it is a transient
+        // manual-test artifact, and routing an env/CLI-derived path into a
+        // file sink trips CodeQL cpp/path-injection with no isolation benefit
+        // (per-instance state that matters — LevelDB, addrs, logs — is already
+        // isolated via config_path()). See #722.
         {
             std::string path = "/tmp/c2pool_block_" + std::to_string(std::time(nullptr)) + ".hex";
             std::ofstream f(path);
@@ -3313,7 +2455,7 @@ nlohmann::json MiningInterface::rest_uptime()
 nlohmann::json MiningInterface::rest_connected_miners()
 {
     // p2pool returns a simple array of unique miner addresses
-    auto workers = get_stratum_workers();
+    auto workers = effective_stratum_workers();
     std::set<std::string> unique_addrs;
     for (const auto& [sid, w] : workers) {
         // Strip worker suffix: "addr.worker" → "addr"
@@ -3333,7 +2475,7 @@ nlohmann::json MiningInterface::rest_stratum_stats()
     // p2pool format: { pool: {...}, workers: {...} }
     // stratum.html reads data.pool.* and data.workers.*
     nlohmann::json result = nlohmann::json::object();
-    auto workers = get_stratum_workers();
+    auto workers = effective_stratum_workers();
     auto now = std::time(nullptr);
     auto now_steady = std::chrono::steady_clock::now();
 
@@ -3377,6 +2519,8 @@ nlohmann::json MiningInterface::rest_stratum_stats()
             workers_json[worker_key]["accepted"] = workers_json[worker_key]["accepted"].get<uint64_t>() + w.accepted;
             workers_json[worker_key]["rejected"] = workers_json[worker_key]["rejected"].get<uint64_t>() + w.rejected;
             workers_json[worker_key]["stale"] = workers_json[worker_key]["stale"].get<uint64_t>() + w.stale;
+            if (w.rtt_ms > workers_json[worker_key].value("rtt_ms", 0.0))
+                workers_json[worker_key]["rtt_ms"] = w.rtt_ms;
             workers_json[worker_key]["shares"] = workers_json[worker_key]["shares"].get<uint64_t>() + w.accepted + w.stale;
             // Keep earliest first_seen
             if (first_seen_ts < workers_json[worker_key]["first_seen"].get<uint64_t>())
@@ -3395,7 +2539,8 @@ nlohmann::json MiningInterface::rest_stratum_stats()
                 {"stale", w.stale},
                 {"shares", w.accepted + w.stale},
                 {"connected_seconds", elapsed},
-                {"remote_endpoint", w.remote_endpoint}
+                {"remote_endpoint", w.remote_endpoint},
+                {"rtt_ms", w.rtt_ms}
             };
         }
     }
@@ -4404,7 +3549,7 @@ nlohmann::json MiningInterface::rest_local_stats()
     nlohmann::json miner_rates = nlohmann::json::object();
     nlohmann::json miner_dead  = nlohmann::json::object();
     {
-        auto workers = get_stratum_workers();
+        auto workers = effective_stratum_workers();
         for (const auto& [sid, w] : workers) {
             // Key by the FULL stratum username (ADDRESS.worker) so each D9/worker
             // gets its own bucket; fall back to the bare address when no worker
@@ -4450,6 +3595,16 @@ nlohmann::json MiningInterface::rest_local_stats()
 
     result["uptime"] = rest_uptime();
 
+    // Live coin-template summary for coin targets (c2pool-dash) that drive
+    // their own work pipeline and leave WebServer's m_cached_template empty.
+    // Display only; NEVER drives coinbase or consensus. Also refreshes the
+    // network-difficulty cache so /global_stats + attempts_to_block read the
+    // real value on the DASH path (where refresh_work() never runs).
+    CoinWorkInfo coin_work;
+    if (m_coin_work_fn) coin_work = m_coin_work_fn();
+    if (coin_work.valid && coin_work.network_difficulty > 0.0)
+        m_network_difficulty.store(coin_work.network_difficulty, std::memory_order_relaxed);
+
     // block_value in coins (not satoshis)
     double block_value = 0.0;
     double payment_amount = 0.0;
@@ -4461,6 +3616,11 @@ nlohmann::json MiningInterface::rest_local_stats()
             // These are deducted from miner payout before PPLNS distribution
             payment_amount = m_cached_template.value("payment_amount", uint64_t(0)) / 1e8;
         }
+    }
+    // Fall back to the coin target's live template when WebServer has none.
+    if (block_value == 0.0 && coin_work.valid) {
+        block_value    = static_cast<double>(coin_work.coinbase_value_sat) / 1e8;
+        payment_amount = static_cast<double>(coin_work.payment_amount_sat) / 1e8;
     }
     result["block_value"] = block_value;
     // Miner portion: subsidy minus protocol payments (masternode/superblock) minus node fee
@@ -4554,7 +3714,7 @@ nlohmann::json MiningInterface::rest_local_stats()
         }
 
         // 5. No miners connected
-        if (get_stratum_workers().empty() && !m_solo_mode)
+        if (effective_stratum_workers().empty() && !m_solo_mode)
             warnings.push_back("No miners connected — pool is idle");
 
         // 6. Version signaling: majority voting for unsupported version
@@ -4601,7 +3761,7 @@ nlohmann::json MiningInterface::rest_local_stats()
     // p2pool-compat: my_hash_rates_in_last_hour — aggregate from all local workers
     double total_hr = 0, total_dead = 0;
     {
-        auto workers = get_stratum_workers();
+        auto workers = effective_stratum_workers();
         for (const auto& [sid, w] : workers) {
             total_hr += w.hashrate;
             total_dead += w.dead_hashrate;
@@ -4640,13 +3800,36 @@ nlohmann::json MiningInterface::rest_local_stats()
     // p2pool-compat: miner_last_difficulties — from stratum workers
     nlohmann::json miner_diffs = nlohmann::json::object();
     {
-        auto workers = get_stratum_workers();
+        auto workers = effective_stratum_workers();
         for (const auto& [sid, w] : workers) {
             std::string key = w.username;
             miner_diffs[key] = w.difficulty;
         }
     }
     result["miner_last_difficulties"] = miner_diffs;
+
+    // Best-share summary (highest-difficulty pseudoshare seen). Mirrors the
+    // dedicated /best_share endpoint so /local_stats consumers get the "how
+    // close did the best share get to a block" metric inline. Display only.
+    {
+        std::lock_guard<std::mutex> lock(m_best_diff_mutex);
+        auto pct = [&](double d) { return net_diff > 0 ? d / net_diff * 100.0 : 0.0; };
+        auto bs_entry = [&](double diff, const std::string& miner,
+                            const std::string& hash, uint64_t ts) {
+            return nlohmann::json{
+                {"difficulty", diff}, {"pct_of_block", pct(diff)},
+                {"miner", miner}, {"hash", hash}, {"timestamp", ts}};
+        };
+        result["best_share"] = {
+            {"network_difficulty", net_diff},
+            {"round", bs_entry(m_best_difficulty.round, m_best_difficulty.miner,
+                               m_best_difficulty.hash, m_best_difficulty.timestamp)},
+            {"session", bs_entry(m_best_difficulty.session, m_best_difficulty.session_miner,
+                                 m_best_difficulty.session_hash, m_best_difficulty.session_ts)},
+            {"all_time", bs_entry(m_best_difficulty.all_time, m_best_difficulty.all_time_miner,
+                                  m_best_difficulty.all_time_hash, m_best_difficulty.all_time_ts)}
+        };
+    }
 
     // p2pool-compat: version and protocol_version
     result["version"] = m_pool_version;
@@ -4807,9 +3990,12 @@ nlohmann::json MiningInterface::rest_web_currency_info()
     if (m_explorer_enabled && !m_explorer_url.empty())
         result["explorer_url"] = m_explorer_url;
 
-    // Mode indicators for conditional UI
+    // Mode indicators for conditional UI. Coin targets whose daemon RPC is an
+    // external NodeRPC arm (c2pool-dash dashd) rather than an ICoinNode set the
+    // m_coin_rpc_available flag so has_rpc is truthful.
     result["embedded"] = (m_coin_node && m_coin_node->is_embedded());
-    result["has_rpc"]  = (m_coin_node && m_coin_node->has_rpc());
+    result["has_rpc"]  = (m_coin_node && m_coin_node->has_rpc())
+                         || m_coin_rpc_available.load(std::memory_order_relaxed);
 
     // p2pool share version for the current coin — consumed by the
     // bundled @c2pool/sharechain-explorer to classify share cells.
@@ -5287,6 +4473,12 @@ nlohmann::json MiningInterface::rest_node_topology()
         if (!m_cached_template.is_null() && m_cached_template.contains("height"))
             primary_height = m_cached_template["height"].get<uint64_t>();
     }
+    // Coin targets (c2pool-dash) leave m_cached_template empty; use the live
+    // template summary's height instead.
+    if (primary_height == 0 && m_coin_work_fn) {
+        auto cw = m_coin_work_fn();
+        if (cw.valid) primary_height = cw.height;
+    }
 
     nlohmann::json coins = nlohmann::json::array();
     auto has_coin = [&](const std::string& sym) {
@@ -5301,9 +4493,11 @@ nlohmann::json MiningInterface::rest_node_topology()
         entry["primary"] = is_primary;
         entry["peers"]   = peers;
         if (is_primary) {
-            // Real embedded/RPC flags for this node's own daemon.
+            // Real embedded/RPC flags for this node's own daemon. Coin targets
+            // with an external NodeRPC arm (c2pool-dash) set m_coin_rpc_available.
             entry["embedded"] = (m_coin_node && m_coin_node->is_embedded());
-            entry["has_rpc"]  = (m_coin_node && m_coin_node->has_rpc());
+            entry["has_rpc"]  = (m_coin_node && m_coin_node->has_rpc())
+                                || m_coin_rpc_available.load(std::memory_order_relaxed);
             // Truthful tip from the embedded daemon's cached template (front-end
             // renders it only when > 0, so omit a meaningless 0).
             if (primary_height > 0)
@@ -5456,7 +4650,7 @@ nlohmann::json MiningInterface::rest_miner_stats(const std::string& address)
     uint64_t accepted = 0, rejected = 0, stale = 0;
     bool found = false;
     {
-        auto workers = get_stratum_workers();
+        auto workers = effective_stratum_workers();
         for (const auto& [sid, w] : workers) {
             // Match base address (strip worker suffix)
             std::string base = w.username;
@@ -5580,23 +4774,28 @@ nlohmann::json MiningInterface::rest_best_share()
             best_round = avg;
         }
 
-        auto make_entry = [&](double diff, const std::string& miner, uint64_t ts) {
+        auto make_entry = [&](double diff, const std::string& miner, uint64_t ts,
+                              const std::string& hash) {
             nlohmann::json e;
             e["difficulty"] = diff;
             e["pct_of_block"] = (net_diff > 0) ? (diff / net_diff * 100.0) : 0.0;
             e["miner"] = miner;
             e["timestamp"] = ts;
+            e["hash"] = hash;   // pow-hash of the record share (empty until wired)
             return e;
         };
 
         result["all_time"] = make_entry(best_all,
-            m_best_difficulty.all_time_miner, m_best_difficulty.all_time_ts);
+            m_best_difficulty.all_time_miner, m_best_difficulty.all_time_ts,
+            m_best_difficulty.all_time_hash);
         auto session = make_entry(best_sess,
-            m_best_difficulty.session_miner, m_best_difficulty.session_ts);
+            m_best_difficulty.session_miner, m_best_difficulty.session_ts,
+            m_best_difficulty.session_hash);
         session["started"] = m_start_time.time_since_epoch().count() / 1000000000ULL;
         result["session"] = session;
         auto round = make_entry(best_round,
-            m_best_difficulty.miner, m_best_difficulty.timestamp);
+            m_best_difficulty.miner, m_best_difficulty.timestamp,
+            m_best_difficulty.hash);
         round["started"] = m_best_difficulty.round_start;
         result["round"] = round;
     }
@@ -6158,9 +5357,22 @@ nlohmann::json MiningInterface::rest_v36_status()
     };
 
     int sample_size = vs.value("overall_total", 0);
-    int v36_shares  = vs.value("overall_v36_shares", 0);
+    // Crossing counter must reflect the DESIRED-version tally the AutoRatchet
+    // keys on (get_desired_version_weights), NOT the per-share FORMAT flag.
+    // p2p-received shares relayed from the V35 seed carry format V35 even while
+    // their miners are voting V36, so overall_v36_shares (a format-flag count)
+    // stays 0 straight through a real crossing -- the founding-charter class of
+    // lie, here in the very fields the operator curls to watch the ratchet.
+    // Re-source from the desired-version data (the same swap #288 made for the
+    // ratchet mint gate): the headline percentage is the work-weighted sampling
+    // signal -- the exact "N% old version" figure the journal logs and the
+    // integrator reads to fire the crossing-event ping -- and the counts are the
+    // flat desired-version vote counts over the chain. Both climb with the cross;
+    // neither is the format-flag stub. (overall_v36_shares stays available on the
+    // parent version_signaling object for anyone who wants the format breakdown.)
+    int v36_shares  = vs.value("overall_v36_votes", 0);
     int v35_shares  = std::max(0, sample_size - v36_shares);
-    double v36_pct  = vs.value("overall_v36_share_pct", 0.0);
+    double v36_pct  = vs.value("sampling_signaling", 0.0);
 
     int height = 0;
     if (m_sharechain_stats_fn) {
@@ -6981,10 +6193,32 @@ void MiningInterface::update_stratum_worker(const std::string& session_id,
     }
 }
 
+void MiningInterface::update_stratum_worker_rtt(const std::string& session_id, double rtt_ms)
+{
+    std::lock_guard<std::mutex> lock(m_stratum_workers_mutex);
+    auto it = m_stratum_workers.find(session_id);
+    if (it != m_stratum_workers.end())
+        it->second.rtt_ms = rtt_ms;
+}
+
 std::map<std::string, MiningInterface::WorkerInfo> MiningInterface::get_stratum_workers() const
 {
     std::lock_guard<std::mutex> lock(m_stratum_workers_mutex);
     return m_stratum_workers;
+}
+
+std::map<std::string, MiningInterface::WorkerInfo> MiningInterface::effective_stratum_workers() const
+{
+    {
+        std::lock_guard<std::mutex> lock(m_stratum_workers_mutex);
+        if (!m_stratum_workers.empty())
+            return m_stratum_workers;   // LTC path: dashboard-owned acceptor
+    }
+    // Coin targets (c2pool-dash) run their stratum acceptor against a separate
+    // IWorkSource; its per-connection registry is the ground truth.
+    if (m_stratum_workers_fn)
+        return m_stratum_workers_fn();
+    return {};
 }
 
 // ──────────── /web/ sub-endpoints (share chain inspection) ───────────────
@@ -7201,7 +6435,8 @@ nlohmann::json MiningInterface::rest_web_graph_data(const std::string& source, c
 
 // ──────────── Difficulty tracking and stat log helpers ────────────────────
 
-void MiningInterface::record_share_difficulty(double difficulty, const std::string& miner)
+void MiningInterface::record_share_difficulty(double difficulty, const std::string& miner,
+                                              const std::string& share_hash)
 {
     // Feed the rolling-hashrate ring. Independent of the best-diff
     // tracking below; the ring has its own internal lock.
@@ -7213,16 +6448,19 @@ void MiningInterface::record_share_difficulty(double difficulty, const std::stri
     if (difficulty > m_best_difficulty.all_time) {
         m_best_difficulty.all_time = difficulty;
         m_best_difficulty.all_time_miner = miner;
+        m_best_difficulty.all_time_hash = share_hash;
         m_best_difficulty.all_time_ts = now_ts;
     }
     if (difficulty > m_best_difficulty.session) {
         m_best_difficulty.session = difficulty;
         m_best_difficulty.session_miner = miner;
+        m_best_difficulty.session_hash = share_hash;
         m_best_difficulty.session_ts = now_ts;
     }
     if (difficulty > m_best_difficulty.round) {
         m_best_difficulty.round = difficulty;
         m_best_difficulty.miner = miner;
+        m_best_difficulty.hash = share_hash;
         m_best_difficulty.timestamp = now_ts;
     }
 }
@@ -7275,7 +6513,7 @@ void MiningInterface::update_stat_log()
     entry.local_hash_rates = nlohmann::json::object();
     entry.local_dead_hash_rates = nlohmann::json::object();
     {
-        auto workers = get_stratum_workers();
+        auto workers = effective_stratum_workers();
         entry.connected_count = static_cast<int>(workers.size());  // raw TCP connections
         std::set<std::string> worker_combos;
         for (const auto& [sid, w] : workers) {
@@ -8411,6 +7649,43 @@ bool WebServer::start()
             });
         }
 
+        // ── No-embedded RPC mode: recurring getblocktemplate poll ─────────────
+        // The one-shot fetch above is the ONLY template refresh in --no-embedded
+        // mode: there is no embedded header-sync on_new_headers callback and no
+        // ZMQ/longpoll subscription to fire "bestblock" events (embedded mode drives
+        // refresh via on_new_headers → trigger_work_refresh). If the daemon was still
+        // in IBD at the 500ms one-shot, m_work_valid stayed false and never recovered
+        // because nothing polls again. Add a recurring poll that (a) bootstraps the
+        // cache once the daemon leaves IBD and (b) re-notifies miners when the network
+        // tip advances — replacing the event source embedded mode gets for free.
+        if (m_coin_node_ && m_coin_node_->has_rpc() && !m_coin_node_->is_embedded()) {
+            auto poll = std::make_shared<net::steady_timer>(ioc_);
+            auto prev_hash = std::make_shared<std::string>();
+            auto poll_fn = std::make_shared<std::function<void(beast::error_code)>>();
+            *poll_fn = [this, poll, prev_hash, poll_fn](beast::error_code ec) {
+                if (ec || !running_) return;
+                poll->expires_after(std::chrono::seconds(2));
+                poll->async_wait(*poll_fn);
+                try {
+                    mining_interface_->refresh_work();
+                    std::string tip = mining_interface_->get_current_gbt_prevhash();
+                    if (!tip.empty() && tip != *prev_hash) {
+                        bool first = prev_hash->empty();
+                        *prev_hash = tip;
+                        if (stratum_server_) stratum_server_->notify_all();
+                        LOG_INFO << "[LTC] no-embed GBT poll: "
+                                 << (first ? "first template " : "new tip ")
+                                 << tip.substr(0, 16) << "... — miners notified";
+                    }
+                } catch (const std::exception& e) {
+                    LOG_WARNING << "[LTC] no-embed GBT poll failed: " << e.what();
+                }
+            };
+            poll->expires_after(std::chrono::seconds(2));
+            poll->async_wait(*poll_fn);
+            LOG_INFO << "[LTC] no-embedded RPC mode: recurring GBT poll scheduled (2s)";
+        }
+
         // Schedule stat_log timer (every 60 seconds for graph data)
         {
             auto stat_timer = std::make_shared<net::steady_timer>(ioc_);
@@ -8474,7 +7749,7 @@ void WebServer::trigger_work_refresh()
         stratum_server_->notify_all();
 }
 
-void WebServer::trigger_work_refresh_debounced()
+void WebServer::execute_debounced_work_refresh()
 {
     // Capture previous tip hash BEFORE refresh updates it — needed for delta precompute.
     // Absent tip (fresh bootstrap, no shares yet) → empty prev_tip_hash, precompute_delta
@@ -8487,7 +7762,6 @@ void WebServer::trigger_work_refresh_debounced()
     if (auto* mm = mining_interface_->get_mm_manager())
         mm->mark_pplns_dirty();
 
-    // No debounce — call refresh immediately.
     trigger_work_refresh();
 
     // Invalidate sharechain window cache (new share changed the tip)
@@ -8505,6 +7779,61 @@ void WebServer::trigger_work_refresh_debounced()
     if (mining_interface_->sse_subscriber_count() > 0) {
         mining_interface_->sse_push(to_json(mining_interface_->get_sharechain_tip()).dump());
     }
+
+    // Record execution for the debounce window + trailing-edge event gate.
+    m_last_work_refresh = std::chrono::steady_clock::now();
+    auto refreshed_tip = mining_interface_->get_sharechain_tip();
+    m_last_refresh_tip_hash = refreshed_tip ? refreshed_tip->hash : std::string{};
+}
+
+void WebServer::trigger_work_refresh_debounced()
+{
+    // ── Notify debounce (hotel interim fix #3) ──
+    // Share-arrival storms used to fan out into one full refresh_work() +
+    // notify_all() per share (the old body here was a no-op stub that called
+    // refresh immediately). Semantics now:
+    //   * Leading edge: a call outside the debounce window refreshes
+    //     IMMEDIATELY (first share after quiet keeps p2pool-grade latency).
+    //   * Trailing coalesce: calls inside the window collapse into ONE
+    //     deferred refresh ~300 ms after the leading edge, event-gated on a
+    //     REAL work change (sharechain tip differs from the last executed
+    //     refresh) so a redundant burst costs nothing.
+    // The new-block path is untouched: trigger_work_refresh() stays immediate.
+    // Timing/coalescing only — the bytes of any notify that IS sent are
+    // unchanged. Single-threaded: callers + timer run on the main ioc_.
+    using namespace std::chrono;
+    static constexpr auto DEBOUNCE_WINDOW = milliseconds(300);
+
+    const auto now = steady_clock::now();
+    const bool in_window = (m_last_work_refresh.time_since_epoch().count() != 0)
+                           && (now - m_last_work_refresh < DEBOUNCE_WINDOW);
+
+    if (!in_window && !m_work_refresh_pending) {
+        execute_debounced_work_refresh();  // leading edge — immediate
+        return;
+    }
+
+    if (m_work_refresh_pending)
+        return;  // trailing refresh already scheduled — this call coalesces
+
+    m_work_refresh_pending = true;
+    if (!m_work_refresh_timer)
+        m_work_refresh_timer = std::make_shared<net::steady_timer>(ioc_);
+    // Fire at the end of the window that opened with the leading-edge refresh.
+    const auto remaining = DEBOUNCE_WINDOW - duration_cast<milliseconds>(now - m_last_work_refresh);
+    m_work_refresh_timer->expires_after(remaining > milliseconds(1) ? remaining : milliseconds(1));
+    m_work_refresh_timer->async_wait([this](beast::error_code ec) {
+        m_work_refresh_pending = false;
+        if (ec || !running_) return;
+        // Event gate: only refresh on a real work change. If the sharechain
+        // tip is still what the last executed refresh saw, the coalesced
+        // calls were redundant (already covered by the leading edge).
+        auto tip = mining_interface_->get_sharechain_tip();
+        std::string tip_hash = tip ? tip->hash : std::string{};
+        if (tip_hash == m_last_refresh_tip_hash)
+            return;
+        execute_debounced_work_refresh();
+    });
 }
 
 void WebServer::set_coin_node(core::coin::ICoinNode* node)

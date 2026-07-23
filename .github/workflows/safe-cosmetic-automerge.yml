@@ -51,7 +51,7 @@ concurrency:
 
 jobs:
   evaluate:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     steps:
       - name: Evaluate gate and merge if green and authorized
         env:
@@ -147,3 +147,9 @@ jobs:
             gh pr merge "$PR" --repo "$REPO" --merge --delete-branch=false
             echo "::endgroup::"
           done
+
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace

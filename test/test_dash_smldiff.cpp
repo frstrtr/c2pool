@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase C-SML step 3 (S8.1) — Dash CSimplifiedMNListDiff wire KATs
 ///
 /// Exercises the vendored CSimplifiedMNListDiff + apply_diff()

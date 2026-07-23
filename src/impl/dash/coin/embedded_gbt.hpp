@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 /// Phase C-TEMPLATE step 5: embedded GBT skeleton (S7 capstone).
@@ -51,9 +52,48 @@
 namespace dash {
 namespace coin {
 
+// ── Underfill guard (v36 cutover deploy path) ───────────────────────────────
+// Port of the LTC/DOGE template-builder guard (src/impl/ltc/coin/
+// template_builder.hpp, src/impl/doge/coin/template_builder.hpp) to the DASH
+// embedded GBT path. Detects the "near-empty template on a non-empty mempool"
+// regression: the tx selector returns almost no transactions even though the
+// local mempool holds a substantial fee-paying backlog. c2pool-side
+// template-fill safety net — NOT the byte-parity KAT axis; thresholds are the
+// v36-native shared structure (bucket-2, standardize cross-coin) pinned to
+// the legacy p2pool near-empty floor (~50 kB), identical to LTC/DOGE.
+// DASH counts base_size bytes (no segwit), so "bytes" here are the same
+// serialized-tx bytes the mempool byte cap and dashcore's 2 MB limit count.
+inline constexpr uint64_t UNDERFILL_MIN_FILL_BYTES = 50'000ull; // < this = near-empty block
+inline constexpr uint64_t UNDERFILL_BACKLOG_SLACK  = 50'000ull; // unselected fee-paying material that should have filled it
+
+/// Pure trip predicate — the exact boolean the LTC/DOGE guards evaluate.
+/// Factored out so the KAT can pin it without a log scraper:
+///   near_empty  : template packed fewer bytes than the near-empty floor
+///   has_backlog : the mempool holds fee-paying material (known fees > 0)
+///                 well beyond what was selected (> selected + slack)
+/// Genuinely empty (or fee-unknown-only) mempools never trip.
+inline bool underfill_guard_trips(uint64_t selected_bytes,
+                                  uint64_t mempool_bytes,
+                                  uint64_t mempool_known_fees)
+{
+    const bool near_empty  = selected_bytes < UNDERFILL_MIN_FILL_BYTES;
+    const bool has_backlog = mempool_known_fees > 0
+                          && mempool_bytes > selected_bytes + UNDERFILL_BACKLOG_SLACK;
+    return near_empty && has_backlog;
+}
+
 /// Build the GBT-equivalent fields we currently know how to compute
 /// for a block at height (prev_height+1). Returns a partially-filled
 /// DashWorkData; missing fields documented above.
+// Forward decls (definitions below) -- E2d folds the DIP-0004 type-5
+// CCbTx extra_payload into the embedded template via these.
+inline vendor::CCbTx build_embedded_cbtx(
+    uint32_t, const vendor::CSimplifiedMNList&, const QuorumManager&,
+    int32_t, const std::array<uint8_t, 96>&, int64_t);
+inline std::vector<unsigned char> encode_cbtx(const vendor::CCbTx&);
+// Zero CLSIG default for the E2d best_cl_sig seam (no temporary-bound ref).
+inline const std::array<uint8_t, 96> k_zero_cl_sig{};
+
 inline DashWorkData build_embedded_workdata(
     uint32_t prev_height,
     const uint256& prev_hash,
@@ -62,27 +102,65 @@ inline DashWorkData build_embedded_workdata(
     uint32_t bits_for_next,
     uint32_t mtp_at_tip,
     uint8_t  address_version,
-    uint8_t  address_p2sh_version)
+    uint8_t  address_p2sh_version,
+    // Step 8 seam: injectable block time. Defaults to std::time(nullptr) so
+    // every existing caller is byte-for-byte unchanged (SAFE-ADDITIVE); the
+    // G1 golden KAT pins it for a deterministic template+coinbase vector.
+    uint32_t curtime = static_cast<uint32_t>(std::time(nullptr)),
+    // Seam: injectable block version. Defaults to 0x20000000 (BIP9 "no
+    // signaling" baseline) so every existing caller is byte-for-byte
+    // unchanged (SAFE-ADDITIVE); the G1 golden KAT pins it, and a real
+    // BIP9-deployment-aware value can later be threaded in without touching
+    // the default header projection.
+    uint32_t version = 0x20000000u,
+    // Seam: optional underfill-guard observation point. Defaults to nullptr so
+    // every existing caller is byte-for-byte unchanged (SAFE-ADDITIVE); the
+    // guard KAT passes a bool to pin the wiring without a log scraper. The
+    // guard itself is log-only (WARNING), exactly like LTC/DOGE — it never
+    // alters the template.
+    bool* underfill_tripped = nullptr,
+    // E2d seams: optional SML/quorum inputs for the DIP-0004 type-5
+    // CCbTx extra_payload. Default nullptr so every existing caller is
+    // byte-for-byte unchanged (SAFE-ADDITIVE) and still gets an empty
+    // payload; when supplied, the template becomes block-valid.
+    const vendor::CSimplifiedMNList* sml = nullptr,
+    const QuorumManager* qmgr = nullptr,
+    int32_t best_cl_height = 0,
+    const std::array<uint8_t, 96>& best_cl_sig = k_zero_cl_sig,
+    int64_t last_observed_credit_pool = 0,
+    // Network seam: the MN_RR activation height gating the DIP-0027
+    // platform-share accrual (dashcore Params().GetConsensus().MN_RRHeight).
+    // Defaults to MAINNET (existing callers byte-unchanged); testnet callers
+    // MUST pass DASH_MN_RR_HEIGHT_TESTNET or the platform reward evaluates to
+    // 0 and the committed creditPoolBalance sits one block-reward low (the E4
+    // re-soak constant −66,966,830-duff bias).
+    int mn_rr_height = DASH_MN_RR_HEIGHT_MAINNET)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
     w.m_previous_block  = prev_hash;
     w.m_bits            = bits_for_next;
-    w.m_curtime         = static_cast<uint32_t>(std::time(nullptr));
+    w.m_curtime         = curtime;
     // Step 8: real median-time-past from header_chain. dashcore
     // requires curtime > MTP for the candidate block to be valid;
     // GBT returns MTP+1 as mintime so miners don't accidentally
     // produce stale-time blocks.
     w.m_mintime         = mtp_at_tip + 1;
-    w.m_version         = 0x20000000;           // TODO: real BIP9 bits
+    w.m_version         = version;              // seam: default 0x20000000 (BIP9 baseline)
 
     // Subsidy + tx selection.
     int64_t reward = compute_dash_block_reward_post_v20(w.m_height);
     constexpr uint32_t MAX_BLOCK_BYTES = 1'990'000;  // leave headroom for cb
+    // C-3: exclude Dash special txs (tx.type != 0) from the embedded template.
+    // dashd recomputes the CbTx roots + creditPool by applying the block's own
+    // special txs; including one without accounting for it yields bad-cbtx. The
+    // safe-minimal cut keeps the embedded block special-tx-free so the creditPool
+    // accrual below is exactly the platform-reward term.
     auto [selected, total_fees] =
-        mempool.get_sorted_txs_with_fees(MAX_BLOCK_BYTES);
+        mempool.get_sorted_txs_with_fees(MAX_BLOCK_BYTES, /*exclude_special=*/true);
     int64_t block_value      = reward + static_cast<int64_t>(total_fees);
-    int64_t platform_reward  = compute_dash_platform_reward_post_v20_mn_rr(w.m_height);
+    int64_t platform_reward  = compute_dash_platform_reward_post_v20_mn_rr(
+        w.m_height, mn_rr_height);
     int64_t mn_payment       = compute_dash_mn_payment_post_v20(block_value) - platform_reward;
 
     w.m_coinbase_value  = static_cast<uint64_t>(block_value);
@@ -93,10 +171,37 @@ inline DashWorkData build_embedded_workdata(
     w.m_txs.reserve(selected.size());
     w.m_tx_hashes.reserve(selected.size());
     w.m_tx_fees.reserve(selected.size());
+    uint64_t selected_bytes = 0;  // wire bytes packed into this template (underfill guard)
     for (auto& s : selected) {
+        selected_bytes += s.base_size;
         w.m_txs.emplace_back(s.tx);
         w.m_tx_hashes.push_back(dash::coin::dash_txid(s.tx));
         w.m_tx_fees.push_back(s.fee);
+    }
+
+    // ── Underfill guard ─────────────────────────────────────────────
+    // Do not silently treat a near-empty DASH template as healthy when the
+    // DASH mempool held fee-paying backlog that should have filled it. We
+    // cannot fabricate transactions, so surface loudly (WARNING) for
+    // contabo-prod-watch / the operator rather than shipping a false-empty
+    // block as normal. Genuinely empty mempools never trip. Mirrors the
+    // LTC/DOGE TemplateBuilder guard; additive only — masternode payment /
+    // CbTx / superblock projection below is untouched either way.
+    {
+        const uint64_t mempool_bytes = static_cast<uint64_t>(mempool.byte_size());
+        const uint64_t mempool_fees  = mempool.total_known_fees();
+        const bool tripped = underfill_guard_trips(selected_bytes,
+                                                   mempool_bytes,
+                                                   mempool_fees);
+        if (underfill_tripped) *underfill_tripped = tripped;
+        if (tripped) {
+            LOG_WARNING << "[GBT-EMB] UNDERFILL: selected "
+                        << selected.size() << " tx / " << selected_bytes
+                        << "B into template while mempool holds " << mempool.size()
+                        << " tx / " << mempool_bytes << "B (" << mempool_fees
+                        << " sat fees) — near-empty block on a non-empty "
+                        << "mempool; template-fill regression, gates cutover.";
+        }
     }
 
     // Platform Credit Pool burn (DIP-0027): emit OP_RETURN payment
@@ -144,9 +249,36 @@ inline DashWorkData build_embedded_workdata(
         }
     }
 
-    // CCbTx extra_payload not yet built (needs ChainLock cycle +
-    // asset-lock state machine for the full v3+ payload).
-    w.m_coinbase_payload.clear();
+    // E2d: fold the DIP-0004 type-5 CCbTx extra_payload so the block is
+    // consensus-valid. Minimal cut -- version/height/merkleRootMNList/
+    // merkleRootQuorums (+ bestCL when known); the v3+ asset-lock/DIP-0027
+    // credit-pool state machine is still deferred and seeded from
+    // last_observed_credit_pool. When the SML/quorum inputs are not
+    // supplied (legacy callers) fall back to an empty payload.
+    if (sml != nullptr && qmgr != nullptr) {
+        // H-4 creditPool accrual. dashd commits, for block N, the credit-pool
+        // balance AFTER block N's activity (evo/creditpool.cpp DiffFromBlock):
+        //   creditPoolBalance(N) = creditPoolBalance(N-1)
+        //                          + platformReward(N)              (locked this block)
+        //                          + Σ assetLocks(N) − Σ assetUnlocks(N)
+        // last_observed_credit_pool is creditPoolBalance(N-1) (the freshness gate
+        // guarantees the SML/CCbTx seed is current at the tip we build on). The
+        // embedded template excludes special txs (C-3 mempool filter), so the
+        // asset-lock/unlock terms are exactly zero and the accrual reduces to the
+        // platform-reward burn locked this block. Verified byte-exact against a
+        // real testnet dashd getblocktemplate: creditPoolBalance stepped by
+        // exactly the platform reward (66966830 duff) each block — see
+        // test_dash_embedded_cbtx_byte_parity.cpp. When platform_reward is 0
+        // (pre-MN_RR) the balance carries forward unchanged, also correct.
+        const int64_t accrued_credit_pool =
+            last_observed_credit_pool + platform_reward;
+        vendor::CCbTx cb = build_embedded_cbtx(
+            prev_height, *sml, *qmgr, best_cl_height, best_cl_sig,
+            accrued_credit_pool);
+        w.m_coinbase_payload = encode_cbtx(cb);
+    } else {
+        w.m_coinbase_payload.clear();
+    }
 
     return w;
 }
@@ -275,11 +407,11 @@ inline vendor::CCbTx build_embedded_cbtx(
         c.bestCLSignature  = {};
     }
 
-    // Step 11: seed creditPoolBalance from the most recently
-    // observed CCbTx. Until the asset-lock state machine (DIP-0027)
-    // ships, this is the best we can do — and it's correct for any
-    // block where no asset-lock OR asset-unlock activity occurred
-    // since we last observed (the common case on mainnet).
+    // creditPoolBalance: the caller (build_embedded_workdata) supplies the
+    // ALREADY-ACCRUED balance for THIS block — i.e. creditPoolBalance(N-1) +
+    // platformReward(N) (+ asset lock/unlock, which are zero because the
+    // embedded template excludes special txs). We commit it verbatim. See the
+    // H-4 accrual note in build_embedded_workdata and the byte-parity KAT.
     c.creditPoolBalance  = last_observed_credit_pool;
     return c;
 }

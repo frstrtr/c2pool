@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DASH share hash_link / gentx_hash byte-parity vs oracle (frstrtr/p2pool-dash).
 //
 // Pins the coinbase_payload encoding inside the gentx hash_link_data assembly.
@@ -16,12 +17,17 @@
 //      CPython hashlib over a fully-known byte vector (ref || nonce || 0 ||
 //      VarStr(payload)). Also asserts the buggy raw-append form yields a
 //      DIFFERENT, separately-pinned digest, proving the prefix is load-bearing.
-//   2. ShareInitVerifyAppendsVarStrPayload — exercises the production
+//   2. ShareInitVerifyAppendsOuterValueVerbatim — exercises the production
 //      share_init_verify() end-to-end on a DashShare with a non-empty outer
 //      payload. With empty merkle/ref links the block merkle_root equals the
 //      gentx_hash, so X11(reconstructed header) is a faithful proxy for the
-//      gentx_hash. The expected value is rebuilt with the oracle VarStr form;
-//      the raw-append form is asserted to differ, so the test is discriminating.
+//      gentx_hash. Oracle framing (data.py:277-289, 346-348): the outer field
+//      VALUE m_data is the VarStr-PACKED payload ([compactsize][raw]) and is
+//      appended VERBATIM — so the check data carries exactly ONE compactsize
+//      prefix. The double-prefix form (re-VarStr'ing m_data, the pre-producer
+//      -slice defect) and the bare-raw form (no prefix at all, the pre-#412
+//      defect) are both asserted to differ, so the test is discriminating in
+//      both directions.
 
 #include <gtest/gtest.h>
 
@@ -169,12 +175,18 @@ TEST(DashShareHashLink, RealTestnet3SpecialTxVarStrParity) {
 }
 
 // (2) End-to-end through the production share_init_verify().
-TEST(DashShareHashLink, ShareInitVerifyAppendsVarStrPayload) {
+TEST(DashShareHashLink, ShareInitVerifyAppendsOuterValueVerbatim) {
     const core::CoinParams params = dash::make_coin_params(/*testnet=*/false);
+
+    // Oracle field value: VarStr-packed payload ([compactsize][raw]) — what
+    // DashFormatter's single strip leaves in m_data for a live oracle share.
+    std::vector<unsigned char> outer_value;
+    outer_value.push_back(static_cast<unsigned char>(kPayload.size()));
+    outer_value.insert(outer_value.end(), kPayload.begin(), kPayload.end());
 
     dash::DashShare share;
     share.m_coinbase = BaseScript(std::vector<unsigned char>{0x00, 0x00});  // 2 bytes (valid 2..100)
-    share.m_coinbase_payload_outer.m_data = kPayload;                       // NON-empty (under test)
+    share.m_coinbase_payload_outer.m_data = outer_value;                    // NON-empty (under test)
     share.m_desired_version = 16;
     share.m_bits = 0x1d00ffffu;       // bits_to_target == mainnet max_target (passes validity guard)
     share.m_max_bits = 0x1d00ffffu;
@@ -217,12 +229,15 @@ TEST(DashShareHashLink, ShareInitVerifyAppendsVarStrPayload) {
         reinterpret_cast<const unsigned char*>(ref_stream.data()), ref_stream.size());
     uint256 ref_hash = dash::check_merkle_link(Hash(ref_span), share.m_ref_merkle_link);
 
-    // expected gentx with the ORACLE (VarStr) payload form
-    auto build_gentx = [&](bool varstr) {
+    // expected gentx: 0 = ORACLE (append field value verbatim = ONE prefix);
+    // 1 = double-prefix defect (re-VarStr the value); 2 = bare-raw defect.
+    auto build_gentx = [&](int form) {
         std::vector<unsigned char> hd(ref_hash.data(), ref_hash.data() + 32);
         put_le(hd, share.m_last_txout_nonce, 8);
         put_le(hd, 0, 4);
-        if (varstr) {
+        if (form == 0) {
+            hd.insert(hd.end(), outer_value.begin(), outer_value.end());
+        } else if (form == 1) {
             PackStream ps; ps << share.m_coinbase_payload_outer;
             auto* cp = reinterpret_cast<const unsigned char*>(ps.data());
             hd.insert(hd.end(), cp, cp + ps.size());
@@ -246,12 +261,16 @@ TEST(DashShareHashLink, ShareInitVerifyAppendsVarStrPayload) {
         return params.pow_func(hsp);
     };
 
-    uint256 expected = share_hash_for(build_gentx(/*varstr=*/true));
-    uint256 buggy    = share_hash_for(build_gentx(/*varstr=*/false));
-    ASSERT_NE(hex_of(expected), hex_of(buggy)) << "test must discriminate the two encodings";
+    uint256 expected      = share_hash_for(build_gentx(0));
+    uint256 double_prefix = share_hash_for(build_gentx(1));
+    uint256 bare_raw      = share_hash_for(build_gentx(2));
+    ASSERT_NE(hex_of(expected), hex_of(double_prefix)) << "test must discriminate";
+    ASSERT_NE(hex_of(expected), hex_of(bare_raw)) << "test must discriminate";
 
     uint256 actual = dash::share_init_verify(share, params, /*check_pow=*/false);
     EXPECT_EQ(hex_of(actual), hex_of(expected))
-        << "share_init_verify must append VarStr(coinbase_payload), not raw bytes";
-    EXPECT_NE(hex_of(actual), hex_of(buggy));
+        << "share_init_verify must append the outer field value verbatim "
+           "(it already carries the oracle's single compactsize prefix)";
+    EXPECT_NE(hex_of(actual), hex_of(double_prefix));
+    EXPECT_NE(hex_of(actual), hex_of(bare_raw));
 }

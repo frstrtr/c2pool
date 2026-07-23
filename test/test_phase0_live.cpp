@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase 0 — Live daemon integration tests
 ///
 /// Connects to a real Litecoin testnet daemon P2P port and verifies

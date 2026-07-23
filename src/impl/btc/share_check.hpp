@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // P2: Share verification — check_hash_link, check_merkle_link, share init/check
@@ -916,7 +917,7 @@ inline std::vector<unsigned char> get_share_script(const auto* obj)
 // the PPLNS weights computed from the share chain.  Returns the expected
 // gentx txid (double-SHA256 of the non-witness serialised transaction).
 //
-// This is the C++ port of p2pool v36's generate_transaction() / check().
+// C++ implementation of the p2pool v36 generate_transaction() / check() design.
 //
 // The coinbase structure is:
 //   tx_ins:  [ { prev_output: 0...0:ffffffff, script: coinbase } ]
@@ -1765,49 +1766,30 @@ bool share_check(const ShareT& share,
             int64_t share_ver = share.version;
 
             auto prev_height = tracker.chain.get_height(share.m_prev_hash);
-            if (prev_height >= chain_length)
-            {
-                if (share_ver == parent_version)
-                {
-                    // same version — always valid (correct when created)
-                }
-                else if (share_ver == parent_version + 1)
-                {
-                    // Upgrade by one version: requires >= 60% weighted support in
-                    // window [CHAIN_LENGTH*9/10, CHAIN_LENGTH] behind the parent.
-                    uint32_t window_start = (static_cast<uint32_t>(chain_length) * 9) / 10;
-                    uint32_t window_size  = static_cast<uint32_t>(chain_length) / 10;
-                    auto ancestor = tracker.chain.get_nth_parent_key(share.m_prev_hash, window_start);
-                    auto weights = tracker.get_desired_version_weights(
-                        ancestor, static_cast<int32_t>(window_size));
+            const bool have_history = (prev_height >= chain_length);
 
-                    uint288 new_ver_weight;   // weight of shares desiring exactly share_ver
-                    uint288 total_weight;
-                    for (auto& [ver, w] : weights)
-                    {
-                        total_weight = total_weight + w;
-                        if (static_cast<int64_t>(ver) == share_ver)
-                            new_ver_weight = new_ver_weight + w;
-                    }
-                    // Canonical: counts.get(self.VERSION,0) < sum(counts)*60//100
-                    if (new_ver_weight * uint32_t(100) < total_weight * uint32_t(60))
-                        throw std::invalid_argument("switch without enough hash power upgraded");
-                }
-                else if (parent_version == share_ver + 1)
-                {
-                    // Downgrade by one (AutoRatchet deactivation: V35 may follow V36)
-                }
-                else
-                {
-                    throw std::invalid_argument("invalid version jump from "
-                        + std::to_string(parent_version) + " to " + std::to_string(share_ver));
-                }
-            }
-            else if (share_ver == parent_version + 1)
+            // Only a +1 upgrade boundary WITH history consults the PPLNS-weighted
+            // desired-version window; compute it lazily there (preserving the prior
+            // fetch behavior — no get_desired_version_weights call on other shapes)
+            // and pass empty otherwise. The SSOT reads window_weights only in that
+            // branch, so accept/reject is byte-for-byte identical to the prior inline.
+            std::map<uint64_t, uint288> window_weights;
+            if (have_history && share_ver == parent_version + 1)
             {
-                // Not enough history for an upgrade boundary
-                throw std::invalid_argument("switch without enough history");
+                uint32_t window_start = (static_cast<uint32_t>(chain_length) * 9) / 10;
+                uint32_t window_size  = static_cast<uint32_t>(chain_length) / 10;
+                auto ancestor = tracker.chain.get_nth_parent_key(share.m_prev_hash, window_start);
+                window_weights = tracker.get_desired_version_weights(
+                    ancestor, static_cast<int32_t>(window_size));
             }
+
+            // SSOT (PR #597): core::version_gate::verify_version_transition holds the
+            // canonical p2pool data.py check() boundary rule (same-version ok; +1 needs
+            // >=60% weighted support AND history; -1 AutoRatchet deactivation ok; other
+            // jumps throw; insufficient-history rejects only +1). floor defaults to
+            // V36_ACTIVATION_VERSION — BTC threads the default (no obsolescence branch).
+            core::version_gate::verify_version_transition<uint288>(
+                parent_version, share_ver, window_weights, have_history);
         }
     }
 

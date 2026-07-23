@@ -15,7 +15,7 @@ permissions:
 jobs:
   attribution-gate:
     name: attribution-gate
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-latest' }}
     steps:
       - name: Checkout full history
         uses: actions/checkout@v4
@@ -62,3 +62,9 @@ jobs:
             exit 1
           fi
           echo "attribution-gate: clean"
+
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // bch::coin::header_sync SYNC-TO-PEER-TIP sequence soak (M5 full-block body).
 //

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ---------------------------------------------------------------------------
 // dgb::coin::make_reconstruct_closure -- the run-loop's faithful
@@ -9,7 +10,7 @@
 // real won share.
 //
 // It composes the already-landed, individually-KAT'd slices into one faithful
-// port of p2pool data.py Share.as_block(tracker, known_txs):
+// C++ implementation of the p2pool Share.as_block(tracker, known_txs) design:
 //   gentx     = unpack_gentx_coinbase(generate_share_transaction(share).bytes)
 //   other_txs = [known_txs[h] for h in get_other_tx_hashes(tracker)]
 //   block     = reconstruct_won_block(header, link, gentx, ..., refs, ...)

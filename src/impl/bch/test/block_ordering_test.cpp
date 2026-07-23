@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // bch::coin BlockConnector — BIP130 ORDERING edge cases (M5 full-block body,
 // slice 2). The slice-1 test (block_connector_test.cpp) pinned the three

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 #include <memory>
@@ -576,6 +577,40 @@ public:
     void set_stratum_rate_stats_fn(std::function<RateStats()> fn) { m_stratum_rate_stats_fn = thread_safe_wrap(std::move(fn)); }
     RateStats get_stratum_rate_stats() const { return m_stratum_rate_stats_fn ? m_stratum_rate_stats_fn() : RateStats{}; }
 
+    // Per-worker stratum registry provider (display only). On the LTC path the
+    // dashboard's OWN core::StratumServer registers workers straight into
+    // m_stratum_workers (register_stratum_worker). Coin targets that run their
+    // own stratum acceptor bound to a separate IWorkSource (c2pool-dash ->
+    // DASHWorkSource) leave m_stratum_workers empty; they wire THIS provider so
+    // /local_stats + /stratum_stats read the live per-connection registry from
+    // that acceptor. effective_stratum_workers() prefers the local registry and
+    // falls back to this provider, so LTC behavior is byte-unchanged.
+    void set_stratum_workers_fn(std::function<std::map<std::string, core::stratum::WorkerInfo>()> fn) {
+        m_stratum_workers_fn = thread_safe_wrap(std::move(fn));
+    }
+
+    // Live coin-template summary provider (display only; NEVER drives coinbase
+    // or consensus). Coin targets that drive their own work pipeline
+    // (c2pool-dash -> DASHWorkSource) leave WebServer's internal
+    // refresh_work()/m_cached_template unpopulated, so block_value / masternode
+    // payment split / network difficulty read 0 on /local_stats. They wire this
+    // to expose the last-sourced template's coinbase value, payment split,
+    // height and network difficulty. Unset on the LTC path (m_cached_template
+    // is populated there), so LTC behavior is byte-unchanged.
+    struct CoinWorkInfo {
+        bool     valid = false;
+        double   network_difficulty = 0.0;   // from template nbits
+        uint64_t coinbase_value_sat = 0;      // "coinbasevalue"
+        uint64_t payment_amount_sat = 0;      // masternode+treasury share
+        uint64_t height = 0;                  // template height
+    };
+    void set_coin_work_fn(std::function<CoinWorkInfo()> fn) { m_coin_work_fn = thread_safe_wrap(std::move(fn)); }
+
+    // Truthful RPC availability for coin targets whose daemon RPC is not
+    // exposed through m_coin_node (c2pool-dash uses an external dashd NodeRPC
+    // arm, not an ICoinNode). OR'd into the /api/node_topology has_rpc flag.
+    void set_coin_rpc_available(bool v) { m_coin_rpc_available.store(v, std::memory_order_relaxed); }
+
     // Current PPLNS outputs for payout display
     // Coin targets (c2pool-dash) that compute PPLNS outside the
     // refresh_work() path can push the current distribution here so
@@ -905,11 +940,13 @@ private:
         const std::string& ref_hash_hex = {},
         const uint256& the_state_root = uint256(),
         const std::string& coinbase_text = {});
+    public:  // pure, stateless stratum-merkle utilities (contract-pinned in core_merkle_branches_test)
     // Compute Stratum merkle branches from a list of tx hashes (excl. coinbase)
     static std::vector<std::string> compute_merkle_branches(std::vector<std::string> tx_hashes);
     // Reconstruct merkle root from coinbase hex + Stratum merkle branches
     static uint256 reconstruct_merkle_root(const std::string& coinbase_hex,
                                            const std::vector<std::string>& merkle_branches);
+    private:
     // Build full block hex from Stratum submit parameters.
     // When job is provided, uses its frozen template data instead of the live m_cached_template.
     std::string build_block_from_stratum(const std::string& extranonce1,
@@ -1327,7 +1364,11 @@ public:
     void auto_detect_external_info();
 
     // Best share difficulty tracking (for /best_share, /miner_stats)
-    void record_share_difficulty(double difficulty, const std::string& miner);
+    // share_hash: optional pow-hash of the record-setting share (display only;
+    // DASH stratum submit path supplies it so the Best Share card can show the
+    // exact hash that got closest to net difficulty).
+    void record_share_difficulty(double difficulty, const std::string& miner,
+                                 const std::string& share_hash = "");
     void record_merged_share_difficulty(double difficulty, const std::string& miner);
 
     // Stat log entry (appended every 5 minutes, rolling 24h window for /web/log JSON)
@@ -1380,7 +1421,7 @@ private:
     peer_info_fn_t m_peer_info_fn;
 
     // Port configuration
-    uint16_t m_p2p_port{9338};
+    uint16_t m_p2p_port{9326};
     uint16_t m_worker_port{9327};
     std::string m_external_ip;
     std::string m_pool_version{"c2pool/0.1.0-alpha"};
@@ -1389,12 +1430,15 @@ private:
     struct BestDifficulty {
         double all_time{0.0};
         std::string all_time_miner;
+        std::string all_time_hash;   // pow-hash of the record share (display only)
         uint64_t all_time_ts{0};
         double session{0.0};
         std::string session_miner;
+        std::string session_hash;
         uint64_t session_ts{0};
         double round{0.0};
         std::string miner;       // round-level miner (backward compat)
+        std::string hash;        // round-level pow-hash (display only)
         uint64_t timestamp{0};   // round-level timestamp (backward compat)
         uint64_t round_start{0};
         // Merged chain (DOGE) best share tracking
@@ -1466,11 +1510,20 @@ public:
     void update_stratum_worker(const std::string& session_id,
                                double hashrate, double dead_hashrate, double difficulty,
                                uint64_t accepted, uint64_t rejected, uint64_t stale) override;
+    void update_stratum_worker_rtt(const std::string& session_id, double rtt_ms) override;
     std::map<std::string, WorkerInfo> get_stratum_workers() const;
 
 private:
+    // Effective per-worker registry for the stats/display path: the locally
+    // registered workers (LTC dashboard-owned acceptor) when present, else the
+    // external provider (coin-target acceptor bound to its own IWorkSource).
+    std::map<std::string, WorkerInfo> effective_stratum_workers() const;
+
     std::map<std::string, WorkerInfo> m_stratum_workers;
     mutable std::mutex m_stratum_workers_mutex;
+    std::function<std::map<std::string, WorkerInfo>()> m_stratum_workers_fn;  // external provider (coin targets)
+    std::function<CoinWorkInfo()> m_coin_work_fn;                             // live template summary (coin targets)
+    std::atomic<bool> m_coin_rpc_available{false};                           // external daemon RPC present
     std::chrono::steady_clock::time_point m_stratum_start_time{std::chrono::steady_clock::now()};
 };
 
@@ -1495,9 +1548,15 @@ class WebServer
     bool solo_mode_;
     std::string solo_address_;
 
-    // Debounce timer for trigger_work_refresh_debounced()
+    // Debounce state for trigger_work_refresh_debounced() (hotel interim fix
+    // #3). Leading-edge-immediate + ~300 ms trailing-coalesce; the trailing
+    // refresh is event-gated on a REAL work change (sharechain tip moved since
+    // the last executed refresh). All state is touched only from the main
+    // ioc_ thread (callers + timer handler run there) — no extra locking.
     std::shared_ptr<net::steady_timer> m_work_refresh_timer;
     bool m_work_refresh_pending = false;
+    std::chrono::steady_clock::time_point m_last_work_refresh{};  // last executed refresh
+    std::string m_last_refresh_tip_hash;  // sharechain tip at last executed refresh
 
     // Payout system integration
     c2pool::payout::PayoutManager* payout_manager_ptr_ = nullptr;
@@ -1571,6 +1630,9 @@ public:
 private:
     void accept_connections();
     void handle_accept(beast::error_code ec, tcp::socket socket);
+    // Body of a debounced work refresh (capture prev tip → refresh → caches →
+    // SSE). Runs on the leading edge and on the trailing coalesced timer.
+    void execute_debounced_work_refresh();
 };
 
 // StratumSession and StratumServer — see stratum_server.hpp

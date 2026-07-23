@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // bch::coin CashTokens transparency KAT (CHIP-2022-02, May 2023).
 //

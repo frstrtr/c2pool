@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase S8 — Dash coin-daemon P2P wire-message KATs
 ///
 /// Exercises the Dash-specific messages in
@@ -73,14 +74,55 @@ TEST(DashP2PMessages, Message_Block_RoundTrip) {
     auto blk = make_header(3);
     auto rmsg = message_block::make_raw(blk);
     EXPECT_EQ(rmsg->m_command, "block");
-    // Dash header is the canonical fixed 80 bytes (no witness/MWEB).
-    EXPECT_EQ(bytes_of(rmsg->m_data).size(), 80u);
+    // E2a: BlockType now serializes the standard Bitcoin block body — the
+    // 80-byte header PLUS a CompactSize tx-count. An empty-body block is
+    // 80 + 1 = 81 bytes (CompactSize(0) == 0x00), matching what a real dashd
+    // `block` message with no transactions would carry. (Pre-E2a this was a
+    // header-only 80 bytes — the deferred-parser regression E2a closes.)
+    EXPECT_EQ(bytes_of(rmsg->m_data).size(), 81u);
 
     auto parsed = message_block::make(rmsg->m_data);
     EXPECT_EQ(parsed->m_block.m_previous_block, blk.m_previous_block);
     EXPECT_EQ(parsed->m_block.m_merkle_root,    blk.m_merkle_root);
     EXPECT_EQ(parsed->m_block.m_bits,           blk.m_bits);
     EXPECT_EQ(parsed->m_block.m_nonce,          blk.m_nonce);
+    EXPECT_TRUE(parsed->m_block.m_txs.empty());
+}
+
+// E2a: a full `block` message body with transactions must deserialize into the
+// exact tx set the ingest legs (MnStateMachine::apply_block, UTXO connect_block)
+// consume. Pre-E2a the body was dropped (header-only) and m_txs stayed empty.
+TEST(DashP2PMessages, Message_Block_Body_TxSet_RoundTrip) {
+    using dash::coin::MutableTransaction;
+    using bitcoin_family::coin::TxIn;
+    using bitcoin_family::coin::TxOut;
+
+    auto blk = make_header(7);
+    // Coinbase-like tx0 (type 0) + a special tx (type 5 with extra_payload) to
+    // exercise the Dash version|type<<16 + extra_payload codec through the body.
+    MutableTransaction cb;
+    cb.version = 1; cb.type = 0;
+    cb.vin.push_back(TxIn{}); cb.vout.push_back(TxOut{});
+    cb.vout.back().value = 500000000;
+    MutableTransaction special;
+    special.version = 3; special.type = 5;
+    special.vin.push_back(TxIn{}); special.vout.push_back(TxOut{});
+    special.extra_payload = {0xde, 0xad, 0xbe, 0xef, 0x01, 0x02};
+    blk.m_txs = {cb, special};
+
+    auto rmsg = message_block::make_raw(blk);
+    auto parsed = message_block::make(rmsg->m_data);
+    ASSERT_EQ(parsed->m_block.m_txs.size(), 2u);
+    EXPECT_EQ(parsed->m_block.m_txs[0].type, 0);
+    EXPECT_EQ(parsed->m_block.m_txs[0].vout.size(), 1u);
+    EXPECT_EQ(parsed->m_block.m_txs[0].vout[0].value, 500000000);
+    EXPECT_EQ(parsed->m_block.m_txs[1].version, 3);
+    EXPECT_EQ(parsed->m_block.m_txs[1].type, 5);
+    EXPECT_EQ(parsed->m_block.m_txs[1].extra_payload,
+              (std::vector<unsigned char>{0xde, 0xad, 0xbe, 0xef, 0x01, 0x02}));
+    // Header still intact after the body.
+    EXPECT_EQ(parsed->m_block.m_nonce, blk.m_nonce);
+    EXPECT_EQ(parsed->m_block.m_merkle_root, blk.m_merkle_root);
 }
 
 TEST(DashP2PMessages, Message_Headers_RoundTrip) {

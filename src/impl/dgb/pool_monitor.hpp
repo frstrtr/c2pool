@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // Phase 3L (DGB port): Log-based pool monitoring for attack detection.
@@ -12,7 +13,7 @@
 //   [MONITOR-DIFF]        — difficulty anomaly detection
 //   [MONITOR-SUMMARY]     — one-line health summary
 //
-// Port of p2pool-v36 p2pool/monitor.py (commit d831a045), mirroring
+// C++ implementation of the p2pool-v36 monitor.py design (ref commit d831a045), mirroring
 // src/impl/ltc/pool_monitor.hpp. Consensus-NEUTRAL: pure observability,
 // no sharechain/consensus effect. DGB divergence vs the LTC source is the
 // address encoder only — DGB Base58/bech32 version bytes from CoinParams.

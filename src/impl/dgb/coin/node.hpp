@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // ---------------------------------------------------------------------------
@@ -39,11 +40,13 @@
 // (parse_aux_header<dgb::coin::MutableTransaction> / CAuxPow<dgb::coin::Mutable-
 // Transaction>) inside the PRODUCTION dgb object library, not merely in fixtures.
 #include <functional>
+#include <type_traits>
 
 #include <core/pack.hpp>                            // PackStream (the byte stream the parser reads)
 #include <impl/doge/coin/auxpow.hpp>                // shared SSOT: CAuxPow<>, parse_aux_header<>, CPureBlockHeader
 #include <impl/dgb/coin/transaction.hpp>            // dgb::coin::MutableTransaction (the DGB parent coinbase type)
 #include <impl/dgb/coin/aux_doge_parent_traits.hpp> // doge::coin::parent_coinbase_no_witness<dgb::coin::MutableTransaction>
+#include <impl/dgb/coin/aux_doge_isolation_guard.hpp> // D0.5 per-coin consensus-isolation guard (compile-time half)
 #endif
 
 namespace dgb
@@ -75,6 +78,16 @@ struct AuxDogeParse
 // DGB-parent parse. std::function so bind_aux_doge_parsers() can ASSIGN it (real,
 // callable binding -- never a no-op), forcing ODR-use of the templated parser.
 using AuxDogeParserFn = std::function<AuxDogeParse(PackStream&)>;
+
+// D0.5 isolation (live-path half): the seam's structured proof MUST be pinned to
+// the DGB parent coinbase type. If a regression let the shared module's default
+// (ltc::coin::MutableTransaction) bind here, the DGB live dispatch would parse the
+// aux proof through the LTC parent type -- caught at compile time, in production.
+static_assert(
+    std::is_same_v<decltype(AuxDogeParse::m_aux),
+                   ::doge::coin::CAuxPow<dgb::coin::MutableTransaction>>,
+    "AUX_DOGE isolation: AuxDogeParse must carry CAuxPow<dgb::coin::MutableTransaction> "
+    "(DGB-parent-pinned), never the shared module's ltc default.");
 #endif
 
 template <typename ConfigType>

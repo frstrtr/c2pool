@@ -103,7 +103,7 @@ endif()
 string(REGEX REPLACE "^v" "" C2POOL_GIT_VERSION "${C2POOL_GIT_VERSION}")
 
 # Main C2Pool Enhanced Application (refactored with mining_shares/p2p_shares separation)
-add_executable(c2pool c2pool_refactored.cpp)
+add_executable(c2pool main_ltc.cpp)
 target_compile_definitions(c2pool PRIVATE C2POOL_VERSION="${C2POOL_GIT_VERSION}")
 target_link_libraries(c2pool
     c2pool_node_enhanced
@@ -122,7 +122,7 @@ target_link_libraries(c2pool
 target_link_libraries(c2pool c2pool_hashrate pool)  # OBJECT-lib SCC direct-naming (#22/#39)
 
 # Enhanced version with explicit name (for backward compatibility)
-add_executable(c2pool_enhanced c2pool_refactored.cpp)
+add_executable(c2pool_enhanced main_ltc.cpp)
 target_link_libraries(c2pool_enhanced
     c2pool_node_enhanced
     c2pool_payout
@@ -136,6 +136,28 @@ target_link_libraries(c2pool_enhanced
     ${Boost_LIBRARIES}
 )
 target_link_libraries(c2pool_enhanced c2pool_hashrate pool)  # OBJECT-lib SCC direct-naming (#22/#39)
+
+# c2pool-ltc: LTC (+ embedded DOGE aux merged-mining) reference entrypoint.
+# The coin-matrix / release presence gate keys on src/c2pool/main_ltc.cpp
+# (see PR #66); this target packages the LTC binary as c2pool-ltc. LTC is the
+# reference coin, so this mirrors the c2pool_enhanced link set exactly (c2pool
+# and c2pool_enhanced already build the same LTC-native main). DOGE aux rides
+# via c2pool_merged_mining -- always compiled in, NO -DAUX_DOGE flag.
+add_executable(c2pool-ltc main_ltc.cpp)
+target_compile_definitions(c2pool-ltc PRIVATE C2POOL_VERSION="${C2POOL_GIT_VERSION}")
+target_link_libraries(c2pool-ltc
+    c2pool_node_enhanced
+    c2pool_payout
+    c2pool_merged_mining
+    core
+    ltc
+    c2pool_storage
+    ltc_coin
+    nmc_coin   # NMC coin-layer: out-of-line Transaction/MutableTransaction ctors for embedded merged-mining (2b-ii)
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+)
+target_link_libraries(c2pool-ltc c2pool_hashrate pool)  # OBJECT-lib SCC direct-naming (#22/#39)
 
 # c2pool-btc: BTC SPV embedded p2pool — Phase B0 scaffold (stub entry).
 # Library `btc` is a clone of `ltc` with namespace renamed and CMake targets
@@ -153,6 +175,7 @@ target_link_libraries(c2pool-btc
     ltc_coin  # ltc OBJECT lib pulls in protocol handlers needing ltc::coin::{Mutable,}Transaction ctors
     btc
     btc_stratum
+    nmc_coin   # NMC coin-layer: embedded merged-mining (2b-ii) — supplies nmc::coin Transaction/MutableTransaction ctors for the aux commitment path wired into main_btc
     nlohmann_json::nlohmann_json
     ${Boost_LIBRARIES}
 )
@@ -238,6 +261,15 @@ add_executable(c2pool-bch
     ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/p2p_node.cpp
     ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/coin_node.cpp
     ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/rpc.cpp
+    # M5 pool-node body TUs: NodeImpl out-of-line methods (node.cpp) + the two
+    # p2pool p2p protocol dispatchers (Legacy/Actual handle_message_* family) +
+    # the stratum work source. These define the previously-undefined NodeImpl::
+    # and protocol symbols so the --pool path LINKS. Per-coin isolation holds
+    # (src/impl/bch only); compiled directly into the target like the coin TUs.
+    ${CMAKE_SOURCE_DIR}/src/impl/bch/node.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bch/protocol_actual.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bch/protocol_legacy.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bch/stratum/work_source.cpp
 )
 target_compile_definitions(c2pool-bch PRIVATE C2POOL_VERSION="${C2POOL_GIT_VERSION}")
 # --ibd RUN-LOOP slice (integrator 2026-06-18): the read-only headers-first IBD
@@ -279,9 +311,17 @@ add_executable(c2pool-dash main_dash.cpp)
 target_compile_definitions(c2pool-dash PRIVATE C2POOL_VERSION="${C2POOL_GIT_VERSION}")
 target_link_libraries(c2pool-dash
     core pool sharechain
+    c2pool_node_enhanced  # dash-dashboard: header-only EnhancedC2PoolNodeT (impl/dash/enhanced_node.hpp)
+                          # -> the core::IMiningNode core::WebServer takes. INTERFACE lib; its deps
+                          # (core / c2pool_hashrate / c2pool_difficulty / c2pool_storage) are already listed.
+    dash       # S8-p2p: sharechain pool-node OBJECT lib (NodeImpl + Legacy/Actual dispatch, node.cpp)
     c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
     dash_x11   # DASH X11 PoW sph reference (BLAKE->...->ECHO), additive static lib
     dash_rpc   # launcher slice-3: external-dashd-RPC client (submitblock fallback)
+    dash_stratum  # S8: DASHWorkSource IWorkSource bodies (stratum accept-loop caller)
+    dash_block_replay  # E1: coin/vendor/blockencodings.cpp — the coin-network P2P Handler
+                       # (cmpctblock codec) the opt-in CoinClient instantiates ODR-uses
+                       # CBlockHeaderAndShortTxIDs::FillShortTxIDSelector()
     btclibs
     yaml-cpp::yaml-cpp
     nlohmann_json::nlohmann_json
@@ -292,13 +332,16 @@ target_link_libraries(c2pool-dash
 if(WIN32)
     target_link_libraries(c2pool ws2_32 mswsock bcrypt dbghelp)
     target_link_libraries(c2pool_enhanced ws2_32 mswsock bcrypt dbghelp)
+    target_link_libraries(c2pool-ltc ws2_32 mswsock bcrypt dbghelp)
 endif()
 if(MSVC)
     target_compile_options(c2pool PRIVATE /bigobj)
     target_compile_options(c2pool_enhanced PRIVATE /bigobj)
+    target_compile_options(c2pool-ltc PRIVATE /bigobj)
     # Match Linux 8MB stack (MSVC default is 1MB — deep share validation can overflow)
     target_link_options(c2pool PRIVATE /STACK:8388608)
     target_link_options(c2pool_enhanced PRIVATE /STACK:8388608)
+    target_link_options(c2pool-ltc PRIVATE /STACK:8388608)
 endif()
 
 # Test applications

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // c2pool-bch — Bitcoin Cash (BCH, SHA256d standalone parent, V36) p2pool node
 // entry point.
 //
@@ -34,8 +35,11 @@
 #include <impl/bch/coin/regtest_block.hpp>
 #include <impl/bch/coin/rpc.hpp>
 #include <impl/bch/coin/node.hpp>
+#include <impl/bch/pool_entrypoint.hpp>
+#include <btclibs/util/strencodings.h>   // ParseHexBytes (sharechain prefix)
 
 #include <core/core_util.hpp>
+#include <core/filesystem.hpp>   // core::filesystem::set_data_dir (--data-dir, #722)
 
 #include <cstdlib>
 #include <fstream>
@@ -71,7 +75,10 @@ void print_banner(const char* argv0)
         << "       " << argv0 << " --ibd [--testnet] [--near-tip] [--auto-kick] [--peer HOST:PORT] [--max-seconds N]\n"
         << "       " << argv0 << " --with-peer-verify [--testnet] [--peer HOST:PORT] [--max-seconds N]\n"
         << "       " << argv0 << " --leg-c-capture [--rpc-conf PATH]\n"
-        << "       " << argv0 << " --leg-c-capture-p2p [--rpc-conf PATH] [--p2p-port N]\n\n"
+        << "       " << argv0 << " --leg-c-capture-p2p [--rpc-conf PATH] [--p2p-port N]\n"
+        << "       " << argv0 << " --pool [--testnet|--testnet4|--regtest] [--stratum [HOST:]PORT] [--peer HOST:PORT] [--anchor N] [--rpc-conf PATH]\n"
+        << "  --data-dir PATH  root all per-instance state here (default ~/.c2pool);\n"
+        << "                   isolates co-located instances\n\n"
         << "Status: M5 pool/sharechain + embedded-daemon assembly live.\n"
         << "        The embedded daemon (coin/embedded_daemon.hpp) is the primary\n"
         << "        work source; external BCHN-RPC stays as the fallback.\n"
@@ -583,6 +590,100 @@ int run_leg_c_capture_p2p(const std::string& conf_path, uint16_t p2p_port)
     return confirmed ? 0 : 1;
 }
 
+
+// --pool: PRODUCTION pool run-loop -- the first non-harness c2pool-bch
+// entrypoint. Stands up the BCH pool node + embedded coin daemon on one shared
+// io_context via bch::standup_pool_run, with the won-block sink bound (dual
+// path: embedded P2P primary + BCHN submitblock fallback) and, when --stratum
+// is given, the miner-facing BCHWorkSource + core::StratumServer listening so a
+// genuine share-author coinbase is what gets assembled and broadcast. The
+// --ibd path is a read-only evidence harness; THIS path is the real node.
+//
+// Config is built WITHOUT a YAML load (matches run_ibd): no pool.yaml/coin.yaml
+// is required for the slice. The two embedded-daemon wire fields (P2P magic +
+// BCHN peer) and the sharechain PREFIX (bucket-1 isolation primitive, never
+// standardized) are set by hand from BCH chainparams. The external BCHN-RPC
+// fallback inside EmbeddedDaemon::run() is retained (external_fallback law).
+//
+// p2pool-merged-v36 surface: NONE -- run-loop bring-up + block dispatch, not
+// share/PPLNS/coinbase/PoW bytes. PER-COIN ISOLATION: src/impl/bch only.
+// BCH wire-protocol magic bytes per network (pchMessageStart).
+// Source: BCHN chainparams.cpp, verified vs staged bchn29 bitcoind rodata:
+// mainnet e3e1f3e8, testnet3 f4e5f3f4, testnet4 e2b7daaf, regtest dab5bffa.
+static std::vector<std::byte> bch_magic_bytes(bool testnet, bool testnet4, bool regtest)
+{
+    std::string hex;
+    if      (regtest)  hex = "dab5bffa";   // CRegTestParams
+    else if (testnet4) hex = "e2b7daaf";   // CTestNet4Params
+    else if (testnet)  hex = "f4e5f3f4";   // CTestNetParams (testnet3)
+    else               hex = "e3e1f3e8";   // CMainParams
+    return ParseHexBytes(hex);
+}
+
+int run_pool(const std::string& peer_host, uint16_t peer_port, bool testnet,
+             bool testnet4, bool regtest, uint32_t anchor_height,
+             const std::string& stratum_addr, uint16_t stratum_port,
+             const std::string& rpc_conf)
+{
+    boost::asio::io_context ioc;
+
+    bch::PoolConfig::is_testnet = testnet;
+
+    bch::Config config("bch");
+    // Skip Config::init() (no on-disk pool.yaml/coin.yaml); set only the fields
+    // the run-loop touches, from BCH chainparams.
+    config.coin()->m_testnet = testnet || testnet4 || regtest;
+    config.coin()->m_testnet4 = testnet4;            // -> BCHChainParams::testnet4() (own genesis 000000001dd4.., magic e2b7daaf)
+    config.coin()->m_symbol  = "BCH";
+    config.coin()->m_p2p.address = NetService(peer_host, peer_port);
+    // BCH P2P network magic (pchMessageStart, BCHN chainparams.cpp): mainnet
+    // e3e1f3e8, testnet3 f4e5f3f4, regtest dab5bffa. Wrong magic == BCHN drops
+    // the peer with EOF right after connect.
+    config.coin()->m_p2p.prefix = bch_magic_bytes(testnet, testnet4, regtest);
+    // Sharechain identity: BCH p2pool PREFIX namespaces the sharechain P2P
+    // framing. standup_pool_run's Node reads pool()->m_prefix.
+    config.pool()->m_prefix = ParseHexBytes(bch::PoolConfig::prefix_hex());
+
+    // External BCHN-RPC fallback endpoint (v36 external_fallback invariant): the
+    // embedded daemon is the PRIMARY work source, but coin::Node::init_rpc still
+    // binds the external RPC as the fallback sink + eager getwork prime. run_pool
+    // builds config by hand (no YAML load), so m_rpc stays unset -- and an unset
+    // endpoint yields "Connection refused", leaving only the embedded leg. Load
+    // host:port + creds from --rpc-conf (operator node, e.g. testnet4 :28332).
+    if (!rpc_conf.empty()) {
+        RegtestRpcConf rc;
+        if (load_rpc_conf(rpc_conf, rc)) {
+            config.coin()->m_rpc.address  = NetService(std::string("127.0.0.1"), rc.port);
+            config.coin()->m_rpc.userpass = rc.user + ":" + rc.pass;
+            std::cout << "[pool] external BCHN-RPC fallback -> 127.0.0.1:" << rc.port
+                      << " (from " << rpc_conf << ")\n";
+        } else {
+            std::cout << "[pool] WARN: --rpc-conf " << rpc_conf
+                      << " has no rpcuser/rpcpassword; RPC fallback endpoint unset\n";
+        }
+    }
+
+    std::cout
+        << "[pool] c2pool-bch pool run-loop"
+        << (regtest ? " (regtest)" : (testnet4 ? " (testnet4)" : (testnet ? " (testnet)" : " (mainnet)")))
+        << " -- BCHN peer " << peer_host << ":" << peer_port
+        << ", cold-start anchor=" << anchor_height;
+    if (stratum_port)
+        std::cout << ", stratum " << stratum_addr << ":" << stratum_port;
+    else
+        std::cout << ", stratum DISABLED (no --stratum)";
+    std::cout << "\n";
+
+    try {
+        bch::standup_pool_run(ioc, config, anchor_height,
+                              stratum_addr, stratum_port, testnet || testnet4 || regtest, regtest);
+    } catch (const std::exception& e) {
+        std::cout << "[pool] FATAL: " << e.what() << "\n";
+        return 1;
+    }
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -592,9 +693,15 @@ int main(int argc, char** argv)
     bool want_leg_c = false;
     bool want_leg_c_p2p = false;
     bool want_with_peer_verify = false;
+    bool want_pool = false;
+    bool regtest = false;
+    std::string stratum_addr = "0.0.0.0";
+    uint16_t stratum_port = 0;        // 0 disables stratum; --stratum sets it
+    uint32_t anchor_height = 0;       // cold-start ABLA floor anchor
     uint16_t leg_c_p2p_port = 18444;  // BCHN regtest P2P default
     std::string rpc_conf;
     bool testnet = false;
+    bool testnet4 = false;
     bool near_tip = false;
     bool auto_kick = false;
     std::string host = "192.168.86.110";   // VM300 bchn-bch
@@ -607,14 +714,39 @@ int main(int argc, char** argv)
             return 0;
         }
         if (std::strcmp(argv[i], "--help") == 0)     want_help = true;
+        if (std::strcmp(argv[i], "--data-dir") == 0) {
+            // Root all per-instance state (LevelDB sharechain, addr store,
+            // logs, ...) under PATH so co-located instances don't contend the
+            // LevelDB LOCK. Default keeps ~/.c2pool. See #722.
+            if (i + 1 >= argc || argv[i + 1][0] == '\0' || argv[i + 1][0] == '-') {
+                std::cerr << "error: --data-dir requires a PATH argument\n";
+                return 1;
+            }
+            core::filesystem::set_data_dir(argv[++i]);
+        }
         if (std::strcmp(argv[i], "--ibd") == 0)      want_ibd = true;
         if (std::strcmp(argv[i], "--with-peer-verify") == 0) want_with_peer_verify = true;
+        if (std::strcmp(argv[i], "--pool") == 0)     want_pool = true;
+        if (std::strcmp(argv[i], "--regtest") == 0)  { regtest = true; testnet = true; port = 18444; }
+        if (std::strcmp(argv[i], "--anchor") == 0 && i + 1 < argc)
+            anchor_height = static_cast<uint32_t>(std::stoul(argv[++i]));
+        if (std::strcmp(argv[i], "--stratum") == 0 && i + 1 < argc) {
+            std::string sp = argv[++i];
+            const auto c = sp.rfind(char(58));  // ASCII colon
+            if (c != std::string::npos) {
+                stratum_addr = sp.substr(0, c);
+                stratum_port = static_cast<uint16_t>(std::stoul(sp.substr(c + 1)));
+            } else {
+                stratum_port = static_cast<uint16_t>(std::stoul(sp));
+            }
+        }
         if (std::strcmp(argv[i], "--leg-c-capture") == 0) want_leg_c = true;
         if (std::strcmp(argv[i], "--leg-c-capture-p2p") == 0) want_leg_c_p2p = true;
         if (std::strcmp(argv[i], "--p2p-port") == 0 && i + 1 < argc)
             leg_c_p2p_port = static_cast<uint16_t>(std::stoul(argv[++i]));
         if (std::strcmp(argv[i], "--rpc-conf") == 0 && i + 1 < argc) rpc_conf = argv[++i];
         if (std::strcmp(argv[i], "--testnet") == 0) { testnet = true; port = 18333; }
+        if (std::strcmp(argv[i], "--testnet4") == 0) { testnet4 = true; port = 28333; }
         if (std::strcmp(argv[i], "--near-tip") == 0) near_tip = true;
         if (std::strcmp(argv[i], "--auto-kick") == 0) auto_kick = true;
         if (std::strcmp(argv[i], "--peer") == 0 && i + 1 < argc) {
@@ -650,6 +782,9 @@ int main(int argc, char** argv)
         }
         return run_leg_c_capture(rpc_conf);
     }
+
+    if (want_pool)
+        return run_pool(host, port, testnet, testnet4, regtest, anchor_height, stratum_addr, stratum_port, rpc_conf);
 
     if (want_with_peer_verify)
         return run_with_peer_verify(host, port, testnet, max_seconds);

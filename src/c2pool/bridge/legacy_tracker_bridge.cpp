@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #include "legacy_tracker_bridge.hpp"
 #include <nlohmann/json.hpp>
 #include <core/log.hpp>

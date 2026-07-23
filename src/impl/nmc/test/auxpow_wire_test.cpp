@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // nmc::coin::AuxPow wire-vector KAT (P1 / card 237 — real mainnet round-trip).
 //

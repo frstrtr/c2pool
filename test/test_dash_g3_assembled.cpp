@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase G3 ASSEMBLED — DASH per-coin block-production gate (integrator 2026-06-26).
 ///
 /// The other dash KATs pin each block-production PRIMITIVE in isolation:

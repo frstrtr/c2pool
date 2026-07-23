@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // H5 leak-fix seam (acceptance-gate testable unit).
 //

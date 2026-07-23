@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DGB #82 — gentx-bytes -> MutableTransaction unpack round-trip KAT.
 //
 // Locks dgb::coin::unpack_gentx_coinbase() (coin/gentx_unpack.hpp) — the

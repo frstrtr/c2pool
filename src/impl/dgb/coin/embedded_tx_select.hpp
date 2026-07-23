@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ===========================================================================
 // embedded_tx_select.hpp -- production EmbeddedTxSource factory.
@@ -35,6 +36,16 @@ namespace dgb::coin
 //
 // `pool` is captured by reference -- it MUST outlive the returned source (the
 // embedded node and its mempool share a lifetime).
-EmbeddedTxSource make_mempool_tx_source(Mempool& pool, uint32_t max_weight);
+//
+// underfill_tripped: optional underfill-guard observation seam (see
+// template_builder.hpp underfill_guard_trips). Each invocation of the returned
+// source evaluates the LTC/DOGE "near-empty template on a non-empty mempool"
+// guard over the REAL pool queries (byte_size / total_fees) and, when the
+// pointer is non-null, writes the trip boolean through it so the KAT can pin
+// the wiring without a log scraper. Defaults to nullptr so every existing
+// caller is byte-for-byte unchanged (SAFE-ADDITIVE); the guard itself is
+// log-only (WARNING) and never alters the selection.
+EmbeddedTxSource make_mempool_tx_source(Mempool& pool, uint32_t max_weight,
+                                        bool* underfill_tripped = nullptr);
 
 } // namespace dgb::coin

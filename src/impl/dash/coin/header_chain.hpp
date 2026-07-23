@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 /// Dash Header Chain — SPV header-only chain with X11 PoW validation.
@@ -14,6 +15,7 @@
 #include <core/pack.hpp>
 #include <core/hash.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -316,6 +318,31 @@ public:
         return m_headers.size();
     }
 
+    // Median-time-past of the tip: median of the last 11 block timestamps
+    // (dashcore GetMedianTimePast / BIP113). build_embedded_workdata() uses
+    // mtp_at_tip+1 as the template mintime, so the embedded arm needs a real
+    // MTP off the header chain to match dashd's GBT. Falls back to the tip
+    // timestamp when fewer than 11 headers are indexed (cold start).
+    uint32_t median_time_past() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_tip.IsNull()) return 0;
+        static constexpr int MEDIAN_SPAN = 11;
+        std::vector<uint32_t> times;
+        times.reserve(MEDIAN_SPAN);
+        int64_t h = static_cast<int64_t>(m_tip_height);
+        for (int i = 0; i < MEDIAN_SPAN && h >= 0; ++i, --h) {
+            auto e = get_header_by_height_internal(static_cast<uint32_t>(h));
+            if (!e) break;
+            times.push_back(e->header.m_timestamp);
+        }
+        if (times.empty()) {
+            auto it = m_headers.find(m_tip);
+            return it != m_headers.end() ? it->second.header.m_timestamp : 0;
+        }
+        std::sort(times.begin(), times.end());
+        return times[times.size() / 2];
+    }
+
     bool has_header(const uint256& hash) const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_headers.count(hash) > 0;
@@ -342,7 +369,7 @@ public:
             m_pending_tip_change.fired = false;
         }
         if (ptc.fired && m_on_tip_changed)
-            m_on_tip_changed(ptc.old_tip, ptc.old_height, ptc.new_tip, ptc.new_height);
+            m_on_tip_changed(ptc.old_tip, ptc.old_height, ptc.new_tip, ptc.new_height, ptc.was_reorg);
         return true;
     }
 
@@ -381,7 +408,7 @@ public:
             }
         }
         if (last_ptc.fired && m_on_tip_changed)
-            m_on_tip_changed(last_ptc.old_tip, last_ptc.old_height, last_ptc.new_tip, last_ptc.new_height);
+            m_on_tip_changed(last_ptc.old_tip, last_ptc.old_height, last_ptc.new_tip, last_ptc.new_height, last_ptc.was_reorg);
         return accepted;
     }
 
@@ -424,7 +451,9 @@ public:
 
     const DashChainParams& params() const { return m_params; }
 
-    using TipChangedCallback = std::function<void(const uint256&, uint32_t, const uint256&, uint32_t)>;
+    // (old_tip, old_height, new_tip, new_height, was_reorg). was_reorg lets the
+    // SML axis wipe + cold-resync when the tip jumped branches (see PendingTipChange).
+    using TipChangedCallback = std::function<void(const uint256&, uint32_t, const uint256&, uint32_t, bool)>;
     void set_on_tip_changed(TipChangedCallback cb) { m_on_tip_changed = std::move(cb); }
 
 private:
@@ -502,7 +531,10 @@ private:
             m_best_work = entry.chain_work;
             m_tip = bhash;
             m_tip_height = new_height;
-            if (new_height == old_height + 1 && entry.prev_hash == m_height_index[old_height]) {
+            bool linear_extension =
+                new_height == old_height + 1
+                && entry.prev_hash == m_height_index[old_height];
+            if (linear_extension) {
                 m_height_index[new_height] = bhash;
             } else {
                 rebuild_height_index(bhash);
@@ -527,6 +559,10 @@ private:
                 }
             }
             m_pending_tip_change.fired = true;
+            // A rebuilt height index with a pre-existing chain (old_height>0)
+            // means the new tip did not linearly extend the old one — a reorg
+            // the SML axis must react to.
+            m_pending_tip_change.was_reorg = !linear_extension && old_height > 0;
             m_pending_tip_change.old_tip = old_tip;
             m_pending_tip_change.old_height = old_height;
             m_pending_tip_change.new_tip = bhash;
@@ -707,6 +743,11 @@ private:
 
     struct PendingTipChange {
         bool fired{false};
+        // was_reorg: the tip advanced onto a branch that does NOT directly
+        // extend the previous tip (the height index had to be rebuilt). The
+        // SML axis consumes this to wipe + cold-resync the incremental SML,
+        // whose applied diffs were relative to the now-orphaned branch.
+        bool was_reorg{false};
         uint256 old_tip, new_tip;
         uint32_t old_height{0}, new_height{0};
     };

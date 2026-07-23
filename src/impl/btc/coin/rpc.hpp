@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 #include "block.hpp"
@@ -48,6 +49,15 @@ private:
     bool m_connected = false;
     std::unique_ptr<core::Timer> m_reconnect_timer;
 
+    // #744/#787 M2: a hung bitcoind (accepts TCP, never responds) must not freeze
+    // the whole single-threaded ioc (stratum + sharechain P2P + header sync all
+    // run on it) mid-won-block. apply_socket_timeouts() forces the socket to
+    // blocking mode and sets kernel SO_SND/RCVTIMEO so Send()'s sync write/read
+    // return an error after RPC_IO_TIMEOUT_SECONDS instead of hanging forever.
+    // Mirrors the DASH #781 pattern. Called after each (re)connect.
+    static constexpr int RPC_IO_TIMEOUT_SECONDS = 30;
+    void apply_socket_timeouts();
+
     std::string Send(const std::string &request) override;
     nlohmann::json CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params = {});
 
@@ -87,5 +97,3 @@ struct RPCAuthData
 } // namespace coin
 
 } // namespace btc
-
-

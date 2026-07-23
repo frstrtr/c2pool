@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // nmc::coin::broadcast_won_aux_block dual-path dispatcher test (PE item 3,
 // broadcaster-gate dispatcher half).

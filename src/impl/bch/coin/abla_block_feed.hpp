@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ---------------------------------------------------------------------------
 // bch::coin::AblaBlockFeed -- M5: drives the ABLA size feed from the REAL

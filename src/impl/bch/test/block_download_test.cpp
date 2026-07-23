@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // bch::coin::block_download::BlockDownloadWindow -- M5 full-block body.
 // Pins the windowed headers-first block-download policy that NodeP2P drives

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 /// Multi-peer manager for coin daemon P2P connections.
@@ -16,6 +17,7 @@
 #include <cmath>
 #include <random>
 #include <algorithm>
+#include <cctype>
 #include <array>
 #include <sstream>
 
@@ -697,7 +699,20 @@ private:
         else
             dir = m_data_dir;
         std::filesystem::create_directories(dir);
-        return (dir / ("peers_" + m_symbol + ".json")).string();
+        // Defense-in-depth (CodeQL cpp/path-injection): m_symbol is a hardcoded
+        // ticker literal at every production ctor site, but never let it become a
+        // path component. Reject anything non-alphanumeric so no '/','\\','.' or
+        // NUL can survive into the filename.
+        std::string sym = m_symbol;
+        const bool clean = !sym.empty() && sym.size() <= 16 &&
+            std::all_of(sym.begin(), sym.end(),
+                        [](unsigned char c) { return std::isalnum(c) != 0; });
+        if (!clean) {
+            LOG_WARNING << "[PeerManager] non-alphanumeric coin symbol '"
+                        << m_symbol << "' -> using peers_unknown.json";
+            sym = "unknown";
+        }
+        return (dir / ("peers_" + sym + ".json")).string();
     }
 
     void save_peers()

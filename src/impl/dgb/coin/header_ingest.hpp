@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ===========================================================================
 // c2pool::dgb::wire_header_ingest -- connect the embedded P2P header-download

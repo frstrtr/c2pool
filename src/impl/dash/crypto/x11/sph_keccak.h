@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /* $Id: sph_keccak.h 216 2010-06-08 09:46:57Z tp $ */
 /**
  * Keccak interface. This is the interface for Keccak with the

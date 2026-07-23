@@ -1,4 +1,13 @@
 if (BUILD_TESTING AND GTest_FOUND)
+    # include(GoogleTest) MUST precede any gtest_discover_tests() call below:
+    # it sets _GOOGLETEST_DISCOVER_TESTS_SCRIPT (path to GoogleTestAddTests.cmake).
+    # In PRE_TEST mode the generated <tgt>[1]_include.cmake includes that script
+    # to define gtest_discover_tests_impl; if the var is unset the include path is
+    # empty and ctest dies "Unknown CMake command gtest_discover_tests_impl" (exit
+    # 8). The clean-build-dir step (8d05ef2b) removed the cached _tests.cmake that
+    # had masked this, surfacing it on test_dgb_subsidy (the first PRE_TEST call).
+    include(GoogleTest)
+
     # DGB block subsidy oracle-conformance (card #156). config_coin.hpp
     # subsidy() is header-only/static; no dgb runtime link required.
     add_executable(test_dgb_subsidy test_dgb_subsidy.cpp)
@@ -254,10 +263,146 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_conformance PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
     gtest_add_tests(test_dash_conformance "" AUTO)
 
+    # DASH min-protocol-version ratchet gate KAT (#643, option a): pure, header-only
+    # policy object; no socket/ltc/pool dependency. Mirrors the test_dash_conformance link set.
+    add_executable(test_dash_min_protocol_gate test_dash_min_protocol_gate.cpp)
+    target_link_libraries(test_dash_min_protocol_gate PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_min_protocol_gate PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
+    gtest_add_tests(test_dash_min_protocol_gate "" AUTO)
+
+    # DASH S8 pool-node leaf 4 — share_tracker.hpp KAT: DensePPLNSWindow decayed
+    # weight ring buffer (compute_v36_weights), decay table, donation split,
+    # window slides. PoW-independent consensus core; socket-free, chain-free.
+    # Mirrors the test_dash_conformance link set.
+    add_executable(test_dash_share_tracker test_dash_share_tracker.cpp)
+    target_link_libraries(test_dash_share_tracker PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_share_tracker PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
+    gtest_add_tests(test_dash_share_tracker "" AUTO)
+
+    # DASH S8 pool-node leaf 5 (FINAL) slice A — node.hpp skeleton KAT: NodeImpl
+    # default-constructible/concrete, empty fresh tracker, lock-free snapshot
+    # publish/getters, tracker()/read_tracker()/tracker_shared_lock() accessors.
+    # Rig-free (no io_context/sockets). Needs pool (BaseNode) + c2pool_storage
+    # (SharechainStorage) on top of the dash_x11 + core link set.
+    add_executable(test_dash_node test_dash_node.cpp)
+    target_link_libraries(test_dash_node PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_node PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining c2pool_storage pool)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_node "" AUTO)
+
+    # DASH S8 per-miner work-target MODULATION KAT (work.py:308-326 oracle pin):
+    # pool-share cap (1.67%) + dust-threshold ease + average_attempts_to_target.
+    # Header-only (stratum/work_target.hpp over core/target_utils + config_pool);
+    # pure, socket-free. Mirrors the test_dash_conformance link set.
+    add_executable(test_dash_work_target test_dash_work_target.cpp)
+    target_link_libraries(test_dash_work_target PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_work_target PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
+    gtest_add_tests(test_dash_work_target "" AUTO)
+
+    # Header-only (stratum/work_job_targets.hpp over work_target.hpp + config_pool);
+    # pure, socket-free. get_work() job-target assembly KAT.
+    add_executable(test_dash_work_job_targets test_dash_work_job_targets.cpp)
+    target_link_libraries(test_dash_work_job_targets PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_work_job_targets PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
+    gtest_add_tests(test_dash_work_job_targets "" AUTO)
+    add_executable(test_dash_job_notify_roundtrip test_dash_job_notify_roundtrip.cpp)
+    target_link_libraries(test_dash_job_notify_roundtrip PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_job_notify_roundtrip PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_job_notify_roundtrip "" AUTO)
+
+    add_executable(test_dash_share_messages test_dash_share_messages.cpp)
+    target_link_libraries(test_dash_share_messages PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_share_messages PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_share_messages "" AUTO)
+
+    add_executable(test_dash_stratum_binding test_dash_stratum_binding.cpp)
+    target_link_libraries(test_dash_stratum_binding PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_stratum_binding PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_stratum_binding "" AUTO)
+
+    # DASH G1 difficulty / vardiff PARITY KAT: share-diff floor byte-exactness +
+    # per-share min_work (target_to_average_attempts) oracle pin. Header-only over
+    # core/target_utils + config_pool; pure, socket-free. Mirrors the work_target
+    # link set.
+    add_executable(test_dash_difficulty_parity test_dash_difficulty_parity.cpp)
+    target_link_libraries(test_dash_difficulty_parity PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_difficulty_parity PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_difficulty_parity "" AUTO)
+
     # share_init_verify gentx hash_link byte-parity vs oracle (coinbase_payload
     # VarStr prefix). Header-only over the dash_x11 + core link set; mirrors the
     # test_dash_conformance link set.
-    add_executable(test_dash_share_hash_link test_dash_share_hash_link.cpp)
+    # test_dash_share_producer.cpp (mint campaign slice 1): producer-side
+    # prospective share_info assembly, ref_hash/hash_link producers, oracle
+    # retarget + gentx byte goldens. Compiled into this EXISTING allowlisted
+    # target so the CI build.yml allowlist stays untouched (proven pattern).
+    # test_dash_mint_runloop.cpp (mint campaign slice 3): the run-loop mint
+    # pipeline -- producer job -> coinb1/coinb2 split -> real X11 solve ->
+    # mint_from_inputs -> tracker insert -> wire round-trip -> best-share
+    # election -> PPLNS oracle-window pin. Same allowlisted target (proven
+    # pattern), no build.yml change.
+    # test_dash_share_download.cpp (#754 share-download leg): sharereq wire
+    # byte-parity vs the python oracle layout, DownloadGate de-dup/retry/
+    # cycle-reset, build_stops, and the download-gate proof -- a mocked
+    # sharereply's shares (RawShare round-trip, child->parent order) insert +
+    # verify and ROOT a previously-unrooted live-pushed tip. Same allowlisted
+    # target (proven pattern), no build.yml change.
+    # test_dash_v36_share.cpp (Phase A DASH v36 share-type): byte-parity of the
+    # standardized cross-coin v36 prefix vs the non-segwit (BCH) v36 shape,
+    # round-trip through the version-36 ShareVariants dispatch, merged-fields-
+    # inert convention, and v16 backward-compat. Same allowlisted target (proven
+    # pattern), no build.yml change (avoids the #769 new-target/allowlist trap).
+    add_executable(test_dash_share_hash_link
+        test_dash_share_hash_link.cpp
+        test_dash_share_producer.cpp
+        test_dash_share_producer_bind.cpp
+        test_dash_mint_runloop.cpp
+        test_dash_share_download.cpp
+        test_dash_v36_share.cpp)
     target_link_libraries(test_dash_share_hash_link PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -375,7 +520,22 @@ if (BUILD_TESTING AND GTest_FOUND)
     # frstrtr/p2pool-dash getwork (pre-v35). Header-only over the dash leaves +
     # core (links core for script_to_address in address_utils.cpp). Last S7
     # capstone; node-backed end-to-end parity deferred to a live-harness leaf.
-    add_executable(test_dash_embedded_gbt test_dash_embedded_gbt.cpp)
+    #
+    # CI-fold (build.yml "Build tests" allowlists this target but not the two
+    # byte-parity executables): the real-dashd CbTx byte-parity + from-wire
+    # merkle-root parity proofs are COMPILED INTO this already-built+CI-run
+    # executable (their TEST() suites are distinct: DashEmbeddedCbtxByteParity,
+    # DashMnlistdiffRootParity), so they actually run in CI. Do NOT re-add
+    # standalone add_executable/gtest_add_tests for them — CTest would register
+    # unbuilt executables (ctest "Not Run" exit 8, the Linux x86_64 red).
+    # DASH_FIXTURE_DIR is needed by the from-wire fixture loader (mnlistdiff).
+    add_executable(test_dash_embedded_gbt
+        test_dash_embedded_gbt.cpp
+        test_dash_embedded_cbtx_byte_parity.cpp
+        test_dash_mnlistdiff_root_parity.cpp
+        test_dash_sml_quorum_db.cpp)
+    target_compile_definitions(test_dash_embedded_gbt PRIVATE
+        DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_embedded_gbt PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -384,6 +544,192 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_dash_embedded_gbt PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_embedded_gbt "" AUTO)
+
+    # DASH underfill guard: port of the LTC/DOGE "near-empty template on a
+    # non-empty mempool" template-builder guard to the DASH embedded GBT path
+    # (embedded_gbt.hpp), for the mining-hotel deployment. Predicate KATs at
+    # the pinned 50 kB floor/slack + build_embedded_workdata wiring via the
+    # SAFE-ADDITIVE underfill_tripped seam (log-only guard; masternode
+    # burn/payee projection asserted unchanged). Same link set as the
+    # embedded_gbt capstone.
+    add_executable(test_dash_underfill_guard test_dash_underfill_guard.cpp)
+    target_link_libraries(test_dash_underfill_guard PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_underfill_guard PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_underfill_guard "" AUTO)
+
+    # BTC underfill guard: port of the LTC/DOGE "near-empty template on a
+    # non-empty mempool" template-builder guard to the BTC embedded template
+    # path (src/impl/btc/coin/template_builder.hpp). Predicate KATs at the
+    # pinned 50 kB floor/slack + build_template wiring via the SAFE-ADDITIVE
+    # underfill_tripped seam (log-only guard; GBT projection asserted
+    # unchanged). Chain fixture = in-memory fast-start checkpoint (the BCH
+    # embedded_getwork_test shape). Link set mirrors test_template_builder
+    # (the LTC twin) with the btc OBJECT libs. MUST also be in the build.yml
+    # --target allowlist or CTest reports a NOT_BUILT sentinel.
+    add_executable(test_btc_underfill_guard test_btc_underfill_guard.cpp)
+    target_link_libraries(test_btc_underfill_guard PRIVATE
+        GTest::gtest_main GTest::gtest
+        core btc
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_btc_underfill_guard PRIVATE btc_stratum c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage btc_coin btclibs pool sharechain ${SECP256K1_LIBRARIES})  # OBJECT-lib SCC direct-naming (#22/#39), btc twin; btc_stratum owns BTCWorkSource (zombie-reap opt-in KAT)
+    gtest_add_tests(test_btc_underfill_guard "" AUTO)
+
+    # DGB underfill guard: same LTC/DOGE guard ported to the DGB embedded
+    # template path. DGB's build_work_template() is a pure shaper with no
+    # mempool access, so the guard evaluates in make_mempool_tx_source()
+    # (coin/embedded_tx_select.cpp) — the one mempool-visible point feeding
+    # BOTH template callers (stratum work source + EmbeddedCoinNode);
+    # predicate/thresholds pinned in coin/template_builder.hpp. Compiles the
+    # tx serialization codec, so it links the same proven SCC set as
+    # dgb_embedded_tx_select_test. MUST also be in the build.yml --target
+    # allowlist or CTest reports a NOT_BUILT sentinel.
+    add_executable(test_dgb_underfill_guard test_dgb_underfill_guard.cpp)
+    target_link_libraries(test_dgb_underfill_guard PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb dgb_stratum
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    gtest_add_tests(test_dgb_underfill_guard "" AUTO)
+
+    # BCH underfill guard: same LTC/DOGE guard ported to the BCH embedded
+    # template path (src/impl/bch/coin/template_builder.hpp; ABLA floor
+    # sizelimit + CTOR body asserted unchanged when the guard trips). Gated on
+    # COIN_BCH exactly like the bch_coin library it links (src/impl/bch is a
+    # -DCOIN_BCH=ON leg; the target cannot exist outside it). MUST also be in
+    # the build.yml BCH-leg --target allowlist or CTest reports a NOT_BUILT
+    # sentinel.
+    if(COIN_BCH)
+        add_executable(test_bch_underfill_guard test_bch_underfill_guard.cpp)
+        target_link_libraries(test_bch_underfill_guard PRIVATE
+            GTest::gtest_main GTest::gtest
+            core bch_coin
+            nlohmann_json::nlohmann_json
+            ${Boost_LIBRARIES}
+        )
+        target_link_libraries(test_bch_underfill_guard PRIVATE c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage btclibs pool sharechain)  # OBJECT-lib SCC direct-naming (#22/#39)
+        gtest_add_tests(test_bch_underfill_guard "" AUTO)
+    endif()
+
+    # DASH embedded-vs-dashd work-source selector (S8 embedded_gbt live-wire
+    # capstone): select_dash_work() prefers the locally-assembled embedded
+    # template (build_embedded_workdata) and falls back to dashd
+    # getblocktemplate when the coin-state bundle is not viable. Routing +
+    # retained-fallback KAT; harness-free (embedded builder injected as a stub,
+    # oracle-parity already pinned by test_dash_embedded_gbt). Same link set as
+    # the embedded_gbt capstone (work_source.hpp includes embedded_gbt.hpp).
+    add_executable(test_dash_work_source test_dash_work_source.cpp)
+    target_link_libraries(test_dash_work_source PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_work_source PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_work_source "" AUTO)
+
+    # NodeCoinState: node-held embedded coin-state holder over the
+    # work_source selector link set (mn_state_machine + mempool header-only);
+    # no ltc/pool SCC dependency. Mirrors the test_dash_work_source link set.
+    add_executable(test_dash_node_coin_state test_dash_node_coin_state.cpp)
+    target_link_libraries(test_dash_node_coin_state PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_node_coin_state PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_node_coin_state "" AUTO)
+
+    # DASHWorkSource (dash::stratum): concrete core::stratum::IWorkSource for
+    # DASH X11 -- 4b construction + contract KAT. Links the dash_stratum OBJECT
+    # lib (work_source.cpp) on top of the header-only coin selector link set.
+    # Includes coin/zmq_tip_notify.cpp directly (NOT the C2POOL_ZMQ-guarded
+    # subscriber — only the pure TipHashDedup / frame-decode helpers) so the
+    # ZMQ hashblock instant-tip-notify KAT links without libzmq.
+    add_executable(test_dash_stratum_work_source
+        test_dash_stratum_work_source.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/dash/coin/zmq_tip_notify.cpp)
+    target_link_libraries(test_dash_stratum_work_source PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_stratum dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_stratum_work_source PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_stratum_work_source "" AUTO)
+
+    # CoinStateMaintainer: drives NodeCoinState off async tip/MN/mempool update
+    # events (readiness gate: MN+tip required before publish). Same link set as
+    # test_dash_node_coin_state -- header-only over the work_source selector set.
+    add_executable(test_dash_coin_state_maintainer test_dash_coin_state_maintainer.cpp)
+    target_link_libraries(test_dash_coin_state_maintainer PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_coin_state_maintainer PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_coin_state_maintainer "" AUTO)
+
+    # NodeImpl embedded coin-state HOLD KAT -- constructs a real NodeImpl, so
+    # it links the full node object set (pool + storage), NOT just the
+    # header-only coin-state libs the two suites above use.
+    add_executable(test_dash_node_embedded_wire test_dash_node_embedded_wire.cpp)
+    target_link_libraries(test_dash_node_embedded_wire PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_node_embedded_wire PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining c2pool_storage pool)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_node_embedded_wire "" AUTO)
+    # get_work() consumer capstone: fuses NodeCoinState::select_work() (embedded
+    # template source) with assemble_work_job_targets(); same OBJECT-lib SCC.
+    add_executable(test_dash_get_work test_dash_get_work.cpp)
+    target_link_libraries(test_dash_get_work PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_get_work PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining c2pool_storage pool)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_get_work "" AUTO)
+
+    # Reception wire (legs 1-3): interfaces::Node reception Events ->
+    # CoinStateMaintainer. Proves the wire_*_ingest() subscriptions fold off the
+    # real Events (no direct poke), honour dispose(), and reach the embedded
+    # template. Same header-only link set as the maintainer suite (no NodeImpl
+    # -> no pool/storage dep).
+    # Second TU (E2a): test_dash_live_feed_bridge.cpp — the live-feed bridge
+    # (live_feed.hpp) translating raw coin-P2P wire events into the derived
+    # ingest events (new_headers->HeaderChain, full_block->block_connected) + the
+    # pure tip_advance_from_chain gate. Same target/link set; no new allowlist.
+    # Third TU (E2c): test_dash_mn_seed.cpp — the RPC protx-list MN-set seed
+    # (mn_seed.hpp): payoutAddress->scriptPayout byte-exact round trip,
+    # fail-closed abort on undecodable payees, and the seed->leg-4-event->
+    # populated()-flips->embedded-template-pays-the-correct-MN capstone. Same
+    # target/link set (core already carries address_utils); no new allowlist.
+    add_executable(test_dash_node_reception_wire test_dash_node_reception_wire.cpp
+                   test_dash_live_feed_bridge.cpp
+                   test_dash_mn_seed.cpp)
+    target_link_libraries(test_dash_node_reception_wire PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_node_reception_wire PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_node_reception_wire "" AUTO)
 
     # DASH CSimplifiedMNListDiff (mnlistdiff wire, S8.1 leaf): vendored diff
     # round-trip + dashcore field-layout pin + apply_diff semantics. Header-only
@@ -411,6 +757,15 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_dash_p2p_messages PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_p2p_messages "" AUTO)
+    add_executable(test_dash_poolnode_messages test_dash_poolnode_messages.cpp)
+    target_link_libraries(test_dash_poolnode_messages PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_poolnode_messages PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_poolnode_messages "" AUTO)
 
     add_executable(test_dash_p2p_connection test_dash_p2p_connection.cpp)
     target_link_libraries(test_dash_p2p_connection PRIVATE
@@ -426,9 +781,16 @@ if (BUILD_TESTING AND GTest_FOUND)
     # lifecycle (attach/teardown), the outbound-request->inbound-reply exchange
     # through Connection, and the real-timer idle-timeout path. Header-only over
     # the dash_x11 + core link set; same set as the p2p_connection leaf.
-    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp)
+    # Second TU (E1): test_dash_coin_p2p_client.cpp — the OPT-IN outbound-dial
+    # client (p2p_client.hpp): handshake state machine, dial-plan rotation, and
+    # the byte-exact version/verack handshake drive. Same target, no new
+    # allowlist entry needed.
+    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp)
     target_link_libraries(test_dash_p2p_node PRIVATE
         GTest::gtest_main GTest::gtest
+        dash_block_replay   # E1: coin/vendor/blockencodings.cpp — the full p2p Handler
+                            # (cmpctblock codec) the CoinClient instantiates ODR-uses
+                            # CBlockHeaderAndShortTxIDs::FillShortTxIDSelector().
         dash_x11 core
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}
@@ -455,6 +817,31 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_dash_config PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_config "" AUTO)
+
+    # DASH v36-native MINT-side accept-floor auto-ratchet (#357 gap-closer, FENCED/
+    # UNWIRED). Pins the pure dash::ratchet_min_protocol_version + the full-window
+    # apply_min_protocol_ratchet_decision guard, and the weighted-vs-plain-count
+    # divergence assert. Header-only over core (uint288); mirrors the test_dash_config
+    # link set.
+    add_executable(test_dash_auto_ratchet test_dash_auto_ratchet.cpp)
+    target_link_libraries(test_dash_auto_ratchet PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_auto_ratchet PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_auto_ratchet "" AUTO)
+
+    add_executable(test_dash_peer test_dash_peer.cpp)
+    target_link_libraries(test_dash_peer PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_peer PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_peer "" AUTO)
 
     # additive: pure persisted activation-latch (header-only version_activation_latch.hpp);
     # mirrors the test_dash_config link set (nlohmann_json + core), no ltc/pool SCC dependency.
@@ -500,7 +887,12 @@ if (BUILD_TESTING AND GTest_FOUND)
         nlohmann_json::nlohmann_json)
     gtest_add_tests(test_dash_rpc_request "" AUTO)
 
-    add_executable(test_dash_broadcaster_full test_dash_broadcaster_full.cpp)
+    # test_dash_won_block_dualpath.cpp is FOLDED into this already-allowlisted
+    # target (was a standalone test_dash_won_block_dualpath executable that CI's
+    # build.yml --target allowlist never built -> NOT_BUILT/CTest "Could not find
+    # executable" red). Separate TU, own anon namespace + distinct
+    # DashWonBlockDualPath suite, gtest_main-provided main() -> no symbol clash.
+    add_executable(test_dash_broadcaster_full test_dash_broadcaster_full.cpp test_dash_won_block_dualpath.cpp)
     target_link_libraries(test_dash_broadcaster_full PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -583,6 +975,15 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_block_relay_dual_arm PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_block_relay_dual_arm "" AUTO)
 
+    # S8 broadcaster dual-path GATE KAT: one forced won block fans out down BOTH
+    # arms (embedded P2P primary + submitblock RPC backup) byte-identically, and
+    # a no-arm block reaches NEITHER sink (fail-loud). Mirrors
+    # dgb_forced_won_share_dualpath_test. Its source (test_dash_won_block_dualpath.cpp)
+    # is FOLDED into the test_dash_broadcaster_full target above (which IS in the
+    # build.yml --target allowlist) so CI actually builds+runs it -- a standalone
+    # target here was never allowlisted and tripped the NOT_BUILT/CTest
+    # "Could not find executable" red.
+
     add_executable(test_dash_coinbase_parity test_dash_coinbase_parity.cpp)
     target_link_libraries(test_dash_coinbase_parity PRIVATE
         GTest::gtest_main GTest::gtest
@@ -592,6 +993,62 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_dash_coinbase_parity PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_coinbase_parity "" AUTO)
+
+    # PPLNS coinbase payout muldiv: native(__int128) == portable(boost uint128)
+    # byte-parity -- MSVC-portability guard for coinbase_builder.hpp step 3-4
+    # (fixes c2pool-dash Windows v0.2.1 build). Pure header math; consensus.
+    add_executable(test_dash_coinbase_muldiv test_dash_coinbase_muldiv.cpp)
+    target_link_libraries(test_dash_coinbase_muldiv PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_coinbase_muldiv PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_coinbase_muldiv "" AUTO)
+
+    add_executable(test_dash_cb_payee test_dash_cb_payee.cpp)
+    target_link_libraries(test_dash_cb_payee PRIVATE
+        GTest::gtest_main GTest::gtest
+        core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_cb_payee PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_cb_payee "" AUTO)
+
+    # S8 stratum job-notify round-trip: the mining.notify merkle_branch folds an
+    # extranonce2-substituted coinbase (index 0) to the header merkle_root. Same
+    # link set as the other dash_x11 header-only KATs. Fenced/non-consensus;
+    # binds real merkle_branches_raw(); oracle work.py:474/493, dash_data.py:189/216.
+    add_executable(test_dash_stratum_notify_roundtrip test_dash_stratum_notify_roundtrip.cpp)
+    target_link_libraries(test_dash_stratum_notify_roundtrip PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_stratum_notify_roundtrip PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_stratum_notify_roundtrip "" AUTO)
+
+    add_executable(test_dash_stratum_extranonce_split test_dash_stratum_extranonce_split.cpp)
+    target_link_libraries(test_dash_stratum_extranonce_split PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_stratum_extranonce_split PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_stratum_extranonce_split "" AUTO)
+    add_executable(test_dash_stratum_submit_reassembly test_dash_stratum_submit_reassembly.cpp)
+    target_link_libraries(test_dash_stratum_submit_reassembly PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_stratum_submit_reassembly PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_stratum_submit_reassembly "" AUTO)
 
     add_executable(test_compact_blocks test_compact_blocks.cpp)
     target_link_libraries(test_compact_blocks PRIVATE
@@ -633,6 +1090,24 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_stratum_extensions PRIVATE c2pool_payout ltc_coin c2pool_storage c2pool_merged_mining pool)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_stratum_extensions "" AUTO)
+
+    # Mining-hotel interim fix KATs: strict per-node miner cap (refused
+    # connections + counter), FIFO+TTL job eviction under a 600-notify stale
+    # storm, and the flat-RSS shared-payload pointer-identity scaffold.
+    # Loopback-only (synthetic IWorkSource, ephemeral test port) — no daemon /
+    # RPC / sharechain. DASH byte-parity note: the notify/coinbase/share BYTE
+    # checks live in the dash lane against the frstrtr/p2pool-dash oracle
+    # (share version 16→36), not here.
+    add_executable(test_stratum_hotel_interim test_stratum_hotel_interim.cpp)
+    target_link_libraries(test_stratum_hotel_interim PRIVATE
+        GTest::gtest_main GTest::gtest
+        c2pool_hashrate
+        core ltc
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_stratum_hotel_interim PRIVATE c2pool_payout ltc_coin c2pool_storage c2pool_merged_mining pool)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_stratum_hotel_interim "" AUTO)
 
     add_executable(test_multiaddress_pplns test_multiaddress_pplns.cpp)
     target_link_libraries(test_multiaddress_pplns PRIVATE

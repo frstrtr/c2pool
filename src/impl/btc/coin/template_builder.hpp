@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 /// Phase 3: LTC Template Builder
@@ -88,6 +89,67 @@ inline uint256 compute_merkle_root(std::vector<uint256> hashes) {
     return hashes[0];
 }
 
+/// Stratum coinbase merkle branch siblings for a populated template.
+///
+/// PRODUCER/CONSUMER CONTRACT: `tx_hashes` is the pure tx-hash list
+/// [tx1..txN] with NO coinbase slot (template_builder / GBT transactions[]).
+/// The stratum merkle tree has the coinbase as leaf 0, so we prepend a
+/// placeholder leaf before folding. At each level we emit the SIBLING of the
+/// left-most (coinbase-descended) node -- exactly the branch list a miner
+/// folds against its own coinbase txid to rebuild the header merkle root:
+///     acc = coinbase_txid
+///     for b in siblings: acc = merkle_hash_pair(acc, b)
+///     acc == compute_merkle_root([coinbase_txid, tx1..txN])
+///
+/// SSOT for both BTCWorkSource::get_stratum_merkle_branches() (which hex-
+/// encodes these for the wire) and the merkle self-check in mining_submit.
+/// Without the leaf-0 prepend, tx1 is dropped and the folded root diverges
+/// from the serialized body -> bad-txnmrklroot on any populated won block.
+/// Returns {} for an empty (coinbase-only) template.
+inline std::vector<uint256> stratum_merkle_siblings(const std::vector<uint256>& tx_hashes) {
+    if (tx_hashes.empty()) return {};
+
+    std::vector<uint256> level;
+    level.reserve(tx_hashes.size() + 1);
+    level.push_back(uint256::ZERO);  // coinbase placeholder leaf (leaf 0)
+    level.insert(level.end(), tx_hashes.begin(), tx_hashes.end());
+
+    std::vector<uint256> siblings;
+    while (level.size() > 1) {
+        siblings.push_back(level[1]);  // right-sibling of the coinbase node
+
+        std::vector<uint256> next;
+        next.reserve((level.size() + 2) / 2);
+        next.push_back(uint256::ZERO);  // placeholder for combo of (cb, level[1])
+        for (size_t i = 2; i < level.size(); i += 2) {
+            const uint256& l = level[i];
+            const uint256& r = (i + 1 < level.size()) ? level[i + 1] : level[i];
+            next.push_back(merkle_hash_pair(l, r));
+        }
+        level = std::move(next);
+    }
+    return siblings;
+}
+
+/// Compute the BIP141 segwit witness-commitment merkle root.
+///
+/// The coinbase transaction's own wtxid is DEFINED as 32 zero bytes and MUST
+/// occupy leaf 0 of the witness merkle tree; the remaining leaves are the
+/// other transactions' wtxids IN BLOCK ORDER. This helper is the single source
+/// of truth for that leaf-0 placeholder contract -- the witness-tree analogue
+/// of the txid-merkle coinbase leaf-0 fix (PR #570). Keeping it in one place
+/// means a populated segwit block cannot silently drop the first tx's wtxid
+/// (which bitcoind rejects as bad-witness-merkle-match).
+///
+/// other_wtxids: wtxids of every tx EXCEPT the coinbase, in block order.
+inline uint256 witness_merkle_root(const std::vector<uint256>& other_wtxids) {
+    std::vector<uint256> leaves;
+    leaves.reserve(1 + other_wtxids.size());
+    leaves.push_back(uint256::ZERO);  // coinbase wtxid placeholder (BIP141)
+    leaves.insert(leaves.end(), other_wtxids.begin(), other_wtxids.end());
+    return compute_merkle_root(std::move(leaves));
+}
+
 // ─── CoinNodeInterface ────────────────────────────────────────────────────────
 
 /// Abstract interface for obtaining work and submitting blocks.
@@ -120,6 +182,36 @@ inline std::string bits_to_hex(uint32_t bits) {
     char buf[9];
     std::snprintf(buf, sizeof(buf), "%08x", bits);
     return std::string(buf);
+}
+
+// ── Underfill guard (v36 cutover deploy path) ───────────────────────────────
+// Port of the LTC/DOGE template-builder guard (src/impl/ltc/coin/
+// template_builder.hpp, src/impl/doge/coin/template_builder.hpp) to the BTC
+// embedded template path, in the DASH free-predicate form
+// (src/impl/dash/coin/embedded_gbt.hpp). Detects the "near-empty template on a
+// non-empty mempool" regression: the tx selector returns almost no
+// transactions even though the local mempool holds a substantial fee-paying
+// backlog. c2pool-side template-fill safety net — NOT the byte-parity KAT
+// axis; thresholds are the v36-native shared structure (standardize
+// cross-coin) pinned to the legacy p2pool near-empty floor (~50 kB),
+// identical to LTC/DOGE/DASH.
+inline constexpr uint64_t UNDERFILL_MIN_FILL_BYTES = 50'000ull; // < this = near-empty block
+inline constexpr uint64_t UNDERFILL_BACKLOG_SLACK  = 50'000ull; // unselected fee-paying material that should have filled it
+
+/// Pure trip predicate — the exact boolean the LTC/DOGE guards evaluate.
+/// Factored out so the KAT can pin it without a log scraper:
+///   near_empty  : template packed fewer bytes than the near-empty floor
+///   has_backlog : the mempool holds fee-paying material (known fees > 0)
+///                 well beyond what was selected (> selected + slack)
+/// Genuinely empty (or fee-unknown-only) mempools never trip.
+inline bool underfill_guard_trips(uint64_t selected_bytes,
+                                  uint64_t mempool_bytes,
+                                  uint64_t mempool_known_fees)
+{
+    const bool near_empty  = selected_bytes < UNDERFILL_MIN_FILL_BYTES;
+    const bool has_backlog = mempool_known_fees > 0
+                          && mempool_bytes > selected_bytes + UNDERFILL_BACKLOG_SLACK;
+    return near_empty && has_backlog;
 }
 
 // ─── TemplateBuilder ─────────────────────────────────────────────────────────
@@ -156,10 +248,16 @@ public:
 
     /// Build a WorkData template from the current chain tip + mempool.
     /// Returns std::nullopt if the chain has no tip yet (not synced to genesis).
+    /// underfill_tripped: optional underfill-guard observation seam. Defaults
+    /// to nullptr so every existing caller is byte-for-byte unchanged
+    /// (SAFE-ADDITIVE); the guard KAT passes a bool to pin the wiring without
+    /// a log scraper. The guard itself is log-only (WARNING), exactly like
+    /// LTC/DOGE — it never alters the template.
     static std::optional<rpc::WorkData> build_template(
         const HeaderChain& chain,
         const Mempool&     pool,
-        bool               is_testnet = false)
+        bool               is_testnet = false,
+        bool*              underfill_tripped = nullptr)
     {
         (void)is_testnet;  // reserved for future per-network rules
         auto t0 = std::chrono::steady_clock::now();
@@ -216,9 +314,11 @@ public:
         std::vector<Transaction> tx_objects;
         std::vector<uint256>     tx_hashes;
 
+        uint64_t selected_bytes = 0;  // wire bytes packed into this template (underfill guard)
         for (const auto& stx : selected_txs) {
             uint256     txid     = compute_txid(stx.tx);
             auto        packed   = pack(TX_WITH_WITNESS(stx.tx));
+            selected_bytes += packed.get_span().size();
             std::string hex_data = HexStr(packed.get_span());
             // wtxid = SHA256d of witness serialization (for witness merkle tree)
             uint256     wtxid    = Hash(packed.get_span());
@@ -238,6 +338,31 @@ public:
 
             tx_objects.push_back(Transaction(stx.tx));
             tx_hashes.push_back(txid);
+        }
+
+        // ── Underfill guard ────────────────────────────────────────────────
+        // Do not silently treat a near-empty template as healthy when the
+        // mempool held fee-paying backlog that should have filled it. We cannot
+        // fabricate transactions, so we surface loudly (WARNING) for
+        // contabo-prod-watch / the operator rather than shipping a false-empty
+        // block as normal. Genuinely empty mempools never trip this. Mirrors
+        // the LTC/DOGE TemplateBuilder guard; additive only — the GBT JSON
+        // below is untouched either way.
+        {
+            const uint64_t mempool_bytes = static_cast<uint64_t>(pool.byte_size());
+            const uint64_t mempool_fees  = pool.total_fees();
+            const bool tripped = underfill_guard_trips(selected_bytes,
+                                                       mempool_bytes,
+                                                       mempool_fees);
+            if (underfill_tripped) *underfill_tripped = tripped;
+            if (tripped) {
+                LOG_WARNING << "[EMB-BTC] TemplateBuilder UNDERFILL: selected "
+                            << selected_txs.size() << " tx / " << selected_bytes
+                            << "B into template while mempool holds " << pool.size()
+                            << " tx / " << mempool_bytes << "B (" << mempool_fees
+                            << " sat fees) — near-empty block on a non-empty "
+                            << "mempool; template-fill regression, gates cutover.";
+            }
         }
 
         // ── Build GBT-compatible JSON ──────────────────────────────────────

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 #include "coin/block.hpp"
@@ -314,4 +315,3 @@ struct ShareChain : chain::ShareChain<ShareIndex>
 };
 
 } // namespace bch
-

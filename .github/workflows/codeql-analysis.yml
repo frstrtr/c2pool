@@ -8,10 +8,19 @@ on:
   schedule:
     - cron: '30 1 * * 1'   # Weekly on Monday 01:30 UTC
 
+# Concurrency: a newer run on the same ref cancels the stale in-progress
+# one, cutting concurrent load on the shared self-hosted pool (the OOM/
+# oversubscription root cause, not just queue depth). Per-ref group so
+# distinct PRs/branches never cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     permissions:
       security-events: write
       packages: read
@@ -38,8 +47,26 @@ jobs:
           build-mode: ${{ matrix.build-mode }}
           queries: security-and-quality
 
-      # ── C++ build (manual mode only) ─────────────────────────────────────
       - if: matrix.build-mode == 'manual'
+        name: Set Conan home
+        run: |
+          # github-hosted: ephemeral per-job home, warmed by actions/cache below.
+          # self-hosted:   PERSISTENT home dedicated to this workflow. Restoring a
+          # multi-hundred-MB conan2 tree from the GH cache service onto VM905 is
+          # the flake ("Failed to restore: The operation cannot be completed in
+          # timeout"), and on a miss it forced a from-source boost rebuild too.
+          # A local persistent home takes the network off the hot path.
+          # Keyed on the runner instance (NOT the shared ~/.conan2): a runner runs
+          # one job at a time, so this home is never contended even across refs,
+          # preserving the torn-cache isolation of #704/#710.
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+          else
+            echo "CONAN_HOME=$HOME/.conan2-ci/$RUNNER_NAME" >> "$GITHUB_ENV"
+          fi
+
+      # ── C++ build (manual mode only) ─────────────────────────────────────
+      - if: matrix.build-mode == 'manual' && runner.environment == 'github-hosted'
         name: Install system dependencies
         run: |
           sudo apt-get update -qq
@@ -57,27 +84,47 @@ jobs:
       - if: matrix.build-mode == 'manual'
         name: Install Conan 2
         run: |
-          pip install "conan>=2.0,<3.0"
-          conan profile detect --force
-          sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' \
-            "$(conan profile path default)"
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            export PATH="$HOME/.local/bin:$PATH"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
 
-      - if: matrix.build-mode == 'manual'
-        name: Restore Conan package cache
+      - if: matrix.build-mode == 'manual' && runner.environment == 'github-hosted'
+        name: Restore Conan package cache (github-hosted only)
         uses: actions/cache@v5
         with:
-          path: ~/.conan2
-          # Share cache with build.yml (same Release profile)
-          key: conan2-ubuntu24-gcc13-${{ hashFiles('conanfile.txt') }}
+          path: ${{ runner.temp }}/conan2
+          # Isolated per-job Conan home; keyed by profile + lockfile.
+          key: conan2-ubuntu24-gcc13-${{ hashFiles('conanfile.txt', 'ci/conan/linux-gcc13.profile', 'conan.lock') }}
           restore-keys: conan2-ubuntu24-gcc13-
+
+      - if: matrix.build-mode == 'manual' && runner.environment != 'github-hosted'
+        name: Clean stale build dir (self-hosted workspace is reused)
+        run: rm -rf build_codeql
 
       - if: matrix.build-mode == 'manual'
         name: Install Conan dependencies
+        # Bounded retry: remote package downloads are the only network step left
+        # here, and a transient remote/CDN hiccup should not red a verified-good
+        # release PR.
         run: |
-          conan install . \
-            --build=missing \
-            --output-folder=build_codeql \
-            --settings=build_type=Release
+          for attempt in 1 2 3; do
+            if conan install . \
+                 -pr:a=ci/conan/linux-gcc13.profile \
+                 --lockfile=conan.lock \
+                 --build=missing \
+                 --output-folder=build_codeql \
+                 --settings=build_type=Release; then
+              exit 0
+            fi
+            echo "conan install failed (attempt $attempt/3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          echo "conan install failed after 3 attempts" >&2
+          exit 1
 
       - if: matrix.build-mode == 'manual'
         name: Build for CodeQL analysis
@@ -85,10 +132,30 @@ jobs:
           cmake -S . -B build_codeql \
             -DCMAKE_TOOLCHAIN_FILE=build_codeql/conan_toolchain.cmake \
             -DCMAKE_BUILD_TYPE=Release
-          cmake --build build_codeql --target c2pool -j$(nproc)
+          # Cap build parallelism on the shared self-hosted 905 box so the
+          # CodeQL build does not co-OOM with a concurrent ASan job.
+          # github-hosted (fork) runs keep full parallelism.
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            JOBS=$(nproc)
+          else
+            JOBS=8
+          fi
+          cmake --build build_codeql --target c2pool -j"$JOBS"
 
       # ── Analysis ──────────────────────────────────────────────────────────
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4
         with:
           category: "/language:${{ matrix.language }}"
+          # Cap the run-queries footprint on the shared self-hosted 905 box so
+          # CodeQL does not co-OOM with a concurrent ASan job (was auto-sizing
+          # to --ram=60466 --threads=32, nearly the whole box). 0 = action
+          # auto-default, kept for github-hosted (fork) runs.
+          threads: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '12' || '0' }}
+          ram: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '20000' || '0' }}
+
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // nmc::coin::Mempool — Namecoin name-operation relay KATs (P1 PB).
 //

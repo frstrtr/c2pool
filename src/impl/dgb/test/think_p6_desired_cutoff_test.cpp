@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // dgb think() Phase-6 desired-shares TIMESTAMP CUTOFF conformance KAT.
 //
 // FENCED, additive (no production code touched this slice). Pins

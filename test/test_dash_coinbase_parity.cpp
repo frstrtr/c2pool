@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase G1 byte-parity — DASH coinbase/payee serialization conformance vs the
 /// canonical oracle frstrtr/p2pool-dash (older-than-v35).
 ///
@@ -165,4 +166,81 @@ TEST(DashCoinbaseParity, TxOutOrderingWorkerPaymentsDonation) {
     // sum(outs) == subsidy (data.py worker_payout invariant).
     uint64_t sum = 0; for (auto& o : outs) sum += o.amount;
     EXPECT_EQ(sum, subsidy);
+}
+
+// (9) v36 ARM: full-weight split, NO 2% block-finder fee, donation = remainder.
+//     Gated on params.current_share_version >= 36 (core::version_gate SSOT).
+//     Mirrors DGB share_tracker::get_expected_payouts; total_weight is the
+//     GRAND total (incl. donation_weight) so the donation absorbs its slice
+//     via the step-5 remainder.
+TEST(DashCoinbaseParity, V36FullWeightNoFinder) {
+    auto params = dash::make_coin_params(true);
+    params.current_share_version = 36;  // activate v36 arm
+
+    // Two distinct weighted miners. total_weight=50 > sum(miner weights)=40,
+    // i.e. donation_weight=10 -> donation gets 10/50 of worker_payout.
+    std::vector<unsigned char> hA(20, 0x11), hB(20, 0x22);
+    auto scriptA = dash::pubkey_hash_to_script2(uint160(hA));
+    auto scriptB = dash::pubkey_hash_to_script2(uint160(hB));
+    std::map<std::vector<unsigned char>, uint64_t> weights;
+    weights[scriptA] = 30;
+    weights[scriptB] = 10;
+
+    // Finder hash NOT in the weight set -> in v36 it must produce NO output.
+    std::vector<unsigned char> finder_h(20, 0x07);
+    uint160 finder(finder_h);
+
+    const uint64_t subsidy = 5000000000ull;  // no payments -> worker_payout=subsidy
+    auto outs = dash::coinbase::compute_dash_payouts(
+        subsidy, /*payments=*/{}, finder, weights, /*total_weight=*/50, params);
+
+    std::map<std::vector<unsigned char>, uint64_t> got;
+    for (auto& o : outs) got[o.script] += o.amount;
+
+    EXPECT_EQ(got[scriptA], 3000000000ull);           // 5e9 * 30/50  (FULL weight)
+    EXPECT_EQ(got[scriptB], 1000000000ull);           // 5e9 * 10/50
+    EXPECT_EQ(got[std::vector<unsigned char>(
+                  dash::DONATION_SCRIPT.begin(), dash::DONATION_SCRIPT.end())],
+              1000000000ull);                          // remainder = 5e9 - 4e9
+    // finder dropped entirely in v36 (no 2% fee).
+    EXPECT_EQ(got.count(dash::pubkey_hash_to_script2(finder)), 0u);
+
+    uint64_t sum = 0; for (auto& o : outs) sum += o.amount;
+    EXPECT_EQ(sum, subsidy);
+}
+
+// (10) v36 a60f7f7f floor: when the donation remainder rounds to 0, exactly
+//      1 satoshi is deducted from the largest miner (tiebreak: (amount,script)).
+TEST(DashCoinbaseParity, V36DonationFloorOneSat) {
+    auto params = dash::make_coin_params(true);
+    params.current_share_version = 36;
+
+    std::vector<unsigned char> hA(20, 0x11), hB(20, 0x22);
+    auto scriptA = dash::pubkey_hash_to_script2(uint160(hA));
+    auto scriptB = dash::pubkey_hash_to_script2(uint160(hB));
+    std::map<std::vector<unsigned char>, uint64_t> weights;
+    weights[scriptA] = 1;
+    weights[scriptB] = 1;  // total_weight=2 -> donation_weight=0, remainder rounds to 0
+
+    std::vector<unsigned char> finder_h(20, 0x07);
+    uint160 finder(finder_h);
+
+    const uint64_t subsidy = 1000ull;  // worker_payout=1000 -> A=500,B=500, donation 0
+    auto outs = dash::coinbase::compute_dash_payouts(
+        subsidy, /*payments=*/{}, finder, weights, /*total_weight=*/2, params);
+
+    std::map<std::vector<unsigned char>, uint64_t> got;
+    for (auto& o : outs) got[o.script] += o.amount;
+
+    auto don = std::vector<unsigned char>(
+        dash::DONATION_SCRIPT.begin(), dash::DONATION_SCRIPT.end());
+    EXPECT_EQ(got[don], 1u);                           // floor forced donation >= 1
+    // Tiebreak (amount,script): equal 500/500 -> larger script bytes loses 1 sat.
+    auto& loser  = (scriptA < scriptB) ? scriptB : scriptA;
+    auto& other  = (scriptA < scriptB) ? scriptA : scriptB;
+    EXPECT_EQ(got[loser], 499u);
+    EXPECT_EQ(got[other], 500u);
+
+    uint64_t sum = 0; for (auto& o : outs) sum += o.amount;
+    EXPECT_EQ(sum, subsidy);                            // invariant preserved
 }

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase S8 — WonBlock dual-arm delivery plan + reached-network verdict KATs.
 ///
 /// Exercises src/impl/dash/block_relay_dual_arm.hpp — the pure planner that

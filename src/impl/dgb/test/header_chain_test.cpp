@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // dgb M3 §7b HeaderChain Scrypt-only validate() + retarget-body guard.
 //
@@ -784,4 +785,3 @@ TEST(HeaderChainTipHash, ContinuityHeaderHashIsTip)
     ASSERT_EQ(hc.validate_and_append(c1), IngestResult::ACCEPTED_CONTINUITY);
     EXPECT_TRUE(hc.tip_hash().value() == dgb::coin::u256::from_u64(0xbbbbull));
 }
-

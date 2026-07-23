@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.14.0-v36] - 2026-07-10
+
+### Licensing
+- **Relicensed MIT → AGPL-3.0-or-later** — the c2pool daemon (RPC/Stratum, merged-mining coordination, node management) is now AGPL-3.0-or-later. The extracted primitive layer ships separately as **c2pool-core-engine** under Apache-2.0. Bundled `src/btclibs/` and third-party crypto retain their original MIT notices. (#658)
+
+### Release
+- **c2pool v36 — LTC + DOGE** — first v36 release: LTC parent with DOGE merged-mining (AuxPoW) in one unified binary; AutoRatchet v35→v36 crossing (95% / 60-block / 2× work), work-weighted PPLNS accept gate, and trustless merged-payout coinbase commitment. Multiplatform packages (Linux / macOS / Windows).
+
 ## [0.1.1-alpha] - 2026-04-13
 
 ### Stability (Critical)
@@ -287,8 +295,8 @@
   eliminates silent payout truncation on busy pools
 - `MINIMUM_PAYOUT_SATOSHIS` fixed from 100 000 to 1 — coinbase outputs are
   exempt from the dust limit
-- P2P default ports corrected: mainnet 9326 → 9338
-- YAML testnet ports corrected: p2p 9333 → 19338, stratum 8084 → 19327
+- P2P default port: mainnet 9326 (matches p2pool-merged-v36 sharechain)
+- YAML testnet ports corrected: p2p 9333 → 19326, stratum 8084 → 19327
 - Ghost share tracker silenced via `vardiff_enabled_` flag
 - Stale sharechain view crash on missing shares
 

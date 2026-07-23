@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 /// Phase C-TEMPLATE step 13: DIP-0027 credit-pool state machine.
@@ -44,12 +45,23 @@ public:
     /// Apply a block to the pool. Returns the per-block delta on
     /// success, or std::nullopt if the pool is uninitialized (no seed
     /// observed yet — caller should seed from CCbTx.creditPoolBalance).
+    ///
+    /// reward_accrual is the platform-reward term dashcore adds to the credit
+    /// pool for this block (evo/creditpool.cpp folds the DIP-0027 platform
+    /// share locked at block N on top of the asset-lock/unlock deltas):
+    ///   creditPoolBalance(N) = creditPoolBalance(N-1)
+    ///                          + reward_accrual (platform share locked at N)
+    ///                          + Σ assetLocks(N) − Σ assetUnlocks(N)
+    /// The asset terms are walked from block.m_txs here; the caller supplies
+    /// reward_accrual (compute_dash_platform_reward_post_v20_mn_rr(N)) since
+    /// this state machine deliberately holds no subsidy schedule. Defaults to
+    /// 0 (pure DiffFromBlock accrual) so existing callers are unchanged.
     std::optional<int64_t> apply_block(
-        const BlockType& block, uint32_t height)
+        const BlockType& block, uint32_t height, int64_t reward_accrual = 0)
     {
         if (!m_initialized) return std::nullopt;
 
-        int64_t delta = 0;
+        int64_t delta = reward_accrual;
         size_t locks = 0, unlocks = 0;
 
         // Skip cb (index 0) — it's the special-tx-5 CCbTx itself,
@@ -88,6 +100,7 @@ public:
         if (delta != 0 || locks != 0 || unlocks != 0) {
             LOG_INFO << "[CREDITPOOL] h=" << height
                      << " delta=" << delta
+                     << " reward=" << reward_accrual
                      << " locks=" << locks
                      << " unlocks=" << unlocks
                      << " balance=" << m_balance;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // dgb GetShares walk — share-exchange (SHAREREQ -> SHAREREPLY) conformance KAT.
 //
 // FENCED, additive (no production code touched this slice). Pins

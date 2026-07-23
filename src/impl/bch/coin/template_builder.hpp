@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // BCH block-template builder. Mirrors src/impl/btc/coin/template_builder.hpp,
 // diverging where BCH consensus requires (M1 §4):
@@ -114,6 +115,38 @@ inline std::string bits_to_hex(uint32_t bits) {
     return std::string(buf);
 }
 
+// ── Underfill guard (v36 cutover deploy path) ───────────────────────────────
+// Port of the LTC/DOGE template-builder guard (src/impl/ltc/coin/
+// template_builder.hpp, src/impl/doge/coin/template_builder.hpp) to the BCH
+// embedded template path, in the DASH free-predicate form
+// (src/impl/dash/coin/embedded_gbt.hpp). Detects the "near-empty template on a
+// non-empty mempool" regression: the tx selector returns almost no
+// transactions even though the local mempool holds a substantial fee-paying
+// backlog. c2pool-side template-fill safety net — NOT the byte-parity KAT
+// axis; thresholds are the v36-native shared structure (standardize
+// cross-coin) pinned to the legacy p2pool near-empty floor (~50 kB),
+// identical to LTC/DOGE/DASH. BCH serializes txs in a single canonical form
+// (no segwit), so "bytes" here are the same serialized-tx bytes the mempool
+// byte cap and the ABLA byte budget count.
+inline constexpr uint64_t UNDERFILL_MIN_FILL_BYTES = 50'000ull; // < this = near-empty block
+inline constexpr uint64_t UNDERFILL_BACKLOG_SLACK  = 50'000ull; // unselected fee-paying material that should have filled it
+
+/// Pure trip predicate — the exact boolean the LTC/DOGE guards evaluate.
+/// Factored out so the KAT can pin it without a log scraper:
+///   near_empty  : template packed fewer bytes than the near-empty floor
+///   has_backlog : the mempool holds fee-paying material (known fees > 0)
+///                 well beyond what was selected (> selected + slack)
+/// Genuinely empty (or fee-unknown-only) mempools never trip.
+inline bool underfill_guard_trips(uint64_t selected_bytes,
+                                  uint64_t mempool_bytes,
+                                  uint64_t mempool_known_fees)
+{
+    const bool near_empty  = selected_bytes < UNDERFILL_MIN_FILL_BYTES;
+    const bool has_backlog = mempool_known_fees > 0
+                          && mempool_bytes > selected_bytes + UNDERFILL_BACKLOG_SLACK;
+    return near_empty && has_backlog;
+}
+
 // ─── TemplateBuilder ─────────────────────────────────────────────────────────
 
 /// Builds a BCH block template (WorkData) from a validated HeaderChain and
@@ -125,11 +158,17 @@ public:
     // sourced per-network from abla.hpp (see build_template / file head).
     static constexpr uint32_t COINBASE_RESERVE = 1'000u;  // bytes for coinbase
 
+    /// underfill_tripped: optional underfill-guard observation seam. Defaults
+    /// to nullptr so every existing caller is byte-for-byte unchanged
+    /// (SAFE-ADDITIVE); the guard KAT passes a bool to pin the wiring without
+    /// a log scraper. The guard itself is log-only (WARNING), exactly like
+    /// LTC/DOGE — it never alters the template.
     static std::optional<rpc::WorkData> build_template(
         const HeaderChain& chain,
         const Mempool&     pool,
         bool               is_testnet = false,
-        const abla::State* tip_state  = nullptr)
+        const abla::State* tip_state  = nullptr,
+        bool*              underfill_tripped = nullptr)
     {
         auto t0 = std::chrono::steady_clock::now();
 
@@ -201,9 +240,11 @@ public:
         std::vector<Transaction> tx_objects;
         std::vector<uint256>     tx_hashes;
 
+        uint64_t selected_bytes = 0;  // wire bytes packed into this template (underfill guard)
         for (const auto& stx : selected_txs) {
             uint256     txid     = compute_txid(stx.tx);
             auto        packed   = pack(stx.tx);          // single canonical form
+            selected_bytes += packed.get_span().size();
             std::string hex_data = HexStr(packed.get_span());
 
             nlohmann::json entry;
@@ -220,6 +261,31 @@ public:
 
             tx_objects.push_back(Transaction(stx.tx));
             tx_hashes.push_back(txid);
+        }
+
+        // ── Underfill guard ────────────────────────────────────────────────
+        // Do not silently treat a near-empty template as healthy when the
+        // mempool held fee-paying backlog that should have filled it. We cannot
+        // fabricate transactions, so we surface loudly (WARNING) for
+        // contabo-prod-watch / the operator rather than shipping a false-empty
+        // block as normal. Genuinely empty mempools never trip this. Mirrors
+        // the LTC/DOGE TemplateBuilder guard; additive only — CTOR ordering
+        // above and the GBT JSON below are untouched either way.
+        {
+            const uint64_t mempool_bytes = static_cast<uint64_t>(pool.byte_size());
+            const uint64_t mempool_fees  = pool.total_fees();
+            const bool tripped = underfill_guard_trips(selected_bytes,
+                                                       mempool_bytes,
+                                                       mempool_fees);
+            if (underfill_tripped) *underfill_tripped = tripped;
+            if (tripped) {
+                LOG_WARNING << "[EMB-BCH] TemplateBuilder UNDERFILL: selected "
+                            << selected_txs.size() << " tx / " << selected_bytes
+                            << "B into template while mempool holds " << pool.size()
+                            << " tx / " << mempool_bytes << "B (" << mempool_fees
+                            << " sat fees) — near-empty block on a non-empty "
+                            << "mempool; template-fill regression, gates cutover.";
+            }
         }
 
         // ── GBT-compatible JSON ────────────────────────────────────────────
