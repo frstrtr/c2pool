@@ -322,6 +322,9 @@ target_link_libraries(c2pool-dash
     dash_block_replay  # E1: coin/vendor/blockencodings.cpp — the coin-network P2P Handler
                        # (cmpctblock codec) the opt-in CoinClient instantiates ODR-uses
                        # CBlockHeaderAndShortTxIDs::FillShortTxIDSelector()
+    dash_bls_verify    # R3: coin/vendor/bls_verify.cpp — verify_govvote_operator_sig
+                       # (governance-vote BLS operator-key verify). Fail-closed stub
+                       # unless C2POOL_DASH_BLS, in which case it PUBLIC-links dashbls.
     btclibs
     yaml-cpp::yaml-cpp
     nlohmann_json::nlohmann_json

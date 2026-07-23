@@ -444,6 +444,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_superblock PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
     gtest_add_tests(test_dash_superblock "" AUTO)
 
+    # R3 — governance-vote BLS operator-key verify KAT. Links dash_bls_verify
+    # (the ONLY test that does): the real from-wire DELETE-signal vote verifies
+    # against the real MN operator key; tamper/wrong-key/wrong-digest/wrong-size
+    # reject; the synthetic end-to-end pins the fail-closed threshold ladder.
+    add_executable(test_dash_govvote_bls test_dash_govvote_bls.cpp)
+    target_link_libraries(test_dash_govvote_bls PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_bls_verify
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_govvote_bls PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)
+    gtest_add_tests(test_dash_govvote_bls "" AUTO)
+
     # DASH external-dashd RPC creds-resolution KAT (launcher slice 4): dash.conf
     # rpcuser/rpcpassword/rpcport parse + --coin-rpc endpoint override + armed()
     # gating that main_dash --run consults before ARMing the submitblock fallback.
