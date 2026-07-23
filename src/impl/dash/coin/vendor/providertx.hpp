@@ -188,8 +188,12 @@ struct CProRegTx
         if (obj.nType == MnType::EVO) {
             READWRITE(obj.platformNodeID);
             if (obj.nVersion < ProTxVersion::EXT_ADDR) {
-                READWRITE(Using<BigEndianFormat<2>>(obj.platformP2PPort),
-                          Using<BigEndianFormat<2>>(obj.platformHTTPPort));
+                // Plain uint16 members upstream => LE on the wire (they are
+                // NOT CService ports). Was BigEndianFormat — symmetric, so
+                // wire round-trips were unaffected, but the numeric values
+                // were byte-swapped (same fix as simplifiedmns.hpp
+                // platformHTTPPort, verified against real testnet entries).
+                READWRITE(obj.platformP2PPort, obj.platformHTTPPort);
             }
         }
         READWRITE(obj.vchSig);
@@ -250,8 +254,12 @@ struct CProUpServTx
         if (obj.nType == MnType::EVO) {
             READWRITE(obj.platformNodeID);
             if (obj.nVersion < ProTxVersion::EXT_ADDR) {
-                READWRITE(Using<BigEndianFormat<2>>(obj.platformP2PPort),
-                          Using<BigEndianFormat<2>>(obj.platformHTTPPort));
+                // Plain uint16 members upstream => LE on the wire (they are
+                // NOT CService ports). Was BigEndianFormat — symmetric, so
+                // wire round-trips were unaffected, but the numeric values
+                // were byte-swapped (same fix as simplifiedmns.hpp
+                // platformHTTPPort, verified against real testnet entries).
+                READWRITE(obj.platformP2PPort, obj.platformHTTPPort);
             }
         }
         READWRITE(Using<RawBytesFormat<BLS_SIG_SIZE>>(obj.sig));

@@ -1575,16 +1575,21 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // MEMBER-SET SOURCING (E1 Phase-L, the piece that ENABLES real-
             // commitment serving): the deterministic quorum member selection
             // (dashcore llmq/utils.cpp ComputeQuorumMembers: score = hash over
-            // proRegTxHash/confirmedHash with the per-quorum V20 modifier, taken
-            // over the SML AS OF the quorum base block) needs the HISTORICAL SML
-            // at the quorum base block + the coinbase ChainLock of block base-8.
-            // QuorumMemberSource sources both over the SAME coin-P2P client
-            // (getmnlistd(ZERO, quorumHash) + getmnlistd(ZERO, workBlock)),
-            // computes the ordered member operator-key set (with the per-MN SML
-            // nVersion populating MemberOperatorKey::legacy_scheme — a mixed
-            // quorum needs the scheme flag), and caches it. The provider is a
-            // pure cache lookup (never blocks the template path). NON-ROTATED
-            // types only (llmq_50_60 etc.); rotated (DIP-24) returns nullopt ->
+            // proRegTxHash/confirmedHash with the per-quorum V20 modifier,
+            // taken over the SML AS OF the WORK block = base - 8, per v23.1.7
+            // GetAllQuorumMembers — #814 review R2) needs the HISTORICAL SML +
+            // the work block's own cbTx ChainLock. QuorumMemberSource sources
+            // BOTH via ONE getmnlistd(ZERO, workBlock) full snapshot over the
+            // SAME coin-P2P client, deduped by block hash across quorum types
+            // sharing a cycle base (#814 R1), authenticates the snapshot with
+            // DIP-4 client verification against the PoW-verified header chain
+            // (#814 R3 — a lying peer must not supply the member-set root of
+            // trust), computes the ordered member operator-key set (with the
+            // per-MN SML nVersion populating MemberOperatorKey::legacy_scheme
+            // — a mixed quorum needs the scheme flag; Evo-only for the
+            // platform type, #814 R4), and caches it. The provider is a pure
+            // cache lookup (never blocks the template path). NON-ROTATED types
+            // only (llmq_50_60 etc.); rotated (DIP-24) returns nullopt ->
             // null-serve (qrinfo-based rotated sourcing is a documented
             // follow-up). Anything uncertain -> nullopt -> fail-closed.
             auto qc_member_source =
@@ -1598,6 +1603,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     [hc = header_chain.get()](const uint256& qh)
                         -> std::optional<uint32_t> {
                         if (auto e = hc->get_header(qh)) return e->height;
+                        return std::nullopt;
+                    },
+                    // DIP-4 trust anchor (R3): the PoW-verified header's
+                    // hashMerkleRoot for the awaited work block.
+                    [hc = header_chain.get()](const uint256& bh)
+                        -> std::optional<uint256> {
+                        if (auto e = hc->get_header(bh))
+                            return e->header.m_merkle_root;
                         return std::nullopt;
                     },
                     [cp = coin_p2p.get()](const uint256& base, const uint256& tgt) {

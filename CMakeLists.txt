@@ -134,9 +134,16 @@ if(C2POOL_DASH_BLS)
     find_library(DASHBLS_MIMALLOC_LIB NAMES mimalloc-secure mimalloc
         HINTS ${DASHBLS_ROOT} ENV DASHBLS_ROOT PATH_SUFFIXES lib lib/mimalloc-2.0 lib/mimalloc-2.1)
     find_library(DASHBLS_GMP_LIB NAMES gmp)
-    if(DASHBLS_INCLUDE_DIR AND DASHBLS_LIB AND DASHBLS_RELIC_LIB AND DASHBLS_GMP_LIB)
+    # NOTE: the autotools install (scripts/build_dashbls.sh, the only build
+    # path dash's v23.1.7 src/dashbls subtree supports) folds relic + mimalloc
+    # INTO libdashbls.a — so the separate relic/mimalloc libs are OPTIONAL and
+    # only linked when present (the legacy standalone-CMake layout).
+    if(DASHBLS_INCLUDE_DIR AND DASHBLS_LIB AND DASHBLS_GMP_LIB)
         set(C2POOL_DASH_BLS_AVAILABLE ON)
-        set(DASHBLS_LIBRARIES ${DASHBLS_LIB} ${DASHBLS_RELIC_LIB})
+        set(DASHBLS_LIBRARIES ${DASHBLS_LIB})
+        if(DASHBLS_RELIC_LIB)
+            list(APPEND DASHBLS_LIBRARIES ${DASHBLS_RELIC_LIB})
+        endif()
         if(DASHBLS_MIMALLOC_LIB)
             list(APPEND DASHBLS_LIBRARIES ${DASHBLS_MIMALLOC_LIB})
         endif()

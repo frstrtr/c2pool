@@ -514,3 +514,73 @@ TEST(DashCoinStateMaintainer, SmlApplyAndReorgFireStateDirty) {
     EXPECT_EQ(st.sml_current_hash(), uint256::ZERO);
     EXPECT_EQ(dirty, 2) << "reorg wipe must re-issue work (drop orphaned-branch template)";
 }
+
+// ── #814 review R1 hardening: stale ZERO-base snapshots must not corrupt the
+// tip SML ─────────────────────────────────────────────────────────────────────
+//
+// A ZERO-base diff REPLACES the whole SML/quorum/credit-pool state. While the
+// maintainer HOLDS state, only a genuine FORWARD tip-resync may do that: a
+// stale historical full snapshot (a duplicate Phase-L member-sourcing reply
+// leaking past the demux, or an unsolicited push from a malicious peer) whose
+// cbTx height is at/below the current height — or whose freshness cannot be
+// proven at all (no parseable cbTx) — is REJECTED. Cold / post-reorg states
+// stay permissive (that IS the resync). This is the second fence behind the
+// QuorumMemberSource send-once dedup; either alone stops the 07-xx class of
+// tip-SML corruption, together they are defense in depth.
+TEST(DashCoinStateMaintainer, StaleZeroBaseSnapshotDoesNotCorruptTipSml) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+
+    // Tip-current state via a cold snapshot at height 1518700.
+    m.on_mnlistdiff(diff_with_seed(uint256::ZERO, raw256(0x54), 1518700,
+                                   111'000'000LL, sml_entry(0x40)));
+    ASSERT_TRUE(st.have_sml());
+    ASSERT_EQ(st.sml_current_hash(), raw256(0x54));
+    ASSERT_EQ(st.sml().size(), 1u);
+
+    // THE R1 KAT: a STALE ZERO-base snapshot (height 1518680 < 1518700 — the
+    // shape of a historical member-sourcing reply for a quorum work block)
+    // arrives while the tip state is ahead. It must NOT replace the tip SML.
+    m.on_mnlistdiff(diff_with_seed(uint256::ZERO, raw256(0x99), 1518680,
+                                   55'000'000LL, sml_entry(0x77)));
+    EXPECT_EQ(st.sml_current_hash(), raw256(0x54))
+        << "stale ZERO-base snapshot REPLACED tip state (block-losing R1)";
+    ASSERT_EQ(st.sml().size(), 1u);
+    EXPECT_EQ(st.sml().mnList[0].proRegTxHash, raw256(0x40))
+        << "tip SML content corrupted by the stale snapshot";
+    EXPECT_EQ(st.credit_pool_height(), 1518700)
+        << "credit-pool seed rolled back by the stale snapshot";
+
+    // Same height (== current) is equally stale — rejected.
+    m.on_mnlistdiff(diff_with_seed(uint256::ZERO, raw256(0x9A), 1518700,
+                                   66'000'000LL, sml_entry(0x78)));
+    EXPECT_EQ(st.sml_current_hash(), raw256(0x54));
+
+    // A ZERO-base snapshot whose freshness CANNOT be proven (no parseable
+    // type-5 cbTx) while we hold state: fail closed, reject.
+    {
+        CSimplifiedMNListDiff unproven;
+        unproven.baseBlockHash = uint256::ZERO;
+        unproven.blockHash     = raw256(0x9B);
+        unproven.mnList = {sml_entry(0x79)};
+        m.on_mnlistdiff(unproven);
+        EXPECT_EQ(st.sml_current_hash(), raw256(0x54))
+            << "unproven ZERO-base snapshot must not replace held state";
+    }
+
+    // A genuine FORWARD tip-resync (height 1518701 > 1518700) IS accepted.
+    m.on_mnlistdiff(diff_with_seed(uint256::ZERO, raw256(0x55), 1518701,
+                                   112'000'000LL, sml_entry(0x41)));
+    EXPECT_EQ(st.sml_current_hash(), raw256(0x55))
+        << "forward full resync must still be accepted";
+    EXPECT_EQ(st.sml().mnList[0].proRegTxHash, raw256(0x41));
+
+    // Post-reorg wipe: the guard resets — a cold resync at ANY height (the new
+    // branch may be shorter) is accepted again.
+    m.on_sml_reorg();
+    ASSERT_EQ(st.sml_current_hash(), uint256::ZERO);
+    m.on_mnlistdiff(diff_with_seed(uint256::ZERO, raw256(0x60), 1518650,
+                                   90'000'000LL, sml_entry(0x50)));
+    EXPECT_EQ(st.sml_current_hash(), raw256(0x60))
+        << "post-reorg cold resync must not be blocked by the stale-guard";
+}
