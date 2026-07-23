@@ -27,6 +27,7 @@
 #include <impl/dgb/coin/scrypt_pow.hpp>        // scrypt_pow_hash (DGB-Scrypt PoW SSOT)
 #include <impl/dgb/coin/submit_classify.hpp>   // classify_submission (Stage-4d decision SSOT)
 #include <impl/dgb/coin/connection_coinbase.hpp>  // build_connection_coinbase_from_pplns SSOT
+#include <impl/dgb/coin/won_block_serialize.hpp>   // serialize_won_block SSOT (won-block framing)
 #include <impl/dgb/coin/header_sample_build.hpp>// compact_to_target (compact bits -> u256)
 
 #include <core/log.hpp>
@@ -34,7 +35,8 @@
 #include <core/target_utils.hpp>            // chain::target_to_difficulty (vardiff/pool unit parity)
 #include <core/address_utils.hpp>              // address_to_script (share payout from username)
 
-#include <btclibs/util/strencodings.h>          // ParseHex
+#include <btclibs/util/strencodings.h>          // ParseHex, HexStr
+#include <btclibs/span.h>                       // Span (HexStr arg)
 
 #include <array>
 #include <cstdio>
@@ -524,37 +526,61 @@ nlohmann::json DGBWorkSource::mining_submit(
         LOG_WARNING << "[DGB-STRATUM-BLOCK] *** BLOCK FOUND *** user=" << username
                     << " height~=" << height << " job=" << job_id;
 
-        // Serialize the block: header || tx_count || coinbase[+witness] || txs.
-        // A segwit-active coinbase is reserialized in BIP144 form with the
-        // 32-byte witness reserved value (digibyted validates the aa21a9ed
-        // commitment by hashing witness_root||reserved; a missing witness ->
-        // bad-witness-merkle-match -> block rejected).
-        std::vector<uint8_t> coinbase_serialized = coinbase;
-        if (job->segwit_active) {
-            const std::array<uint8_t, 2> marker_flag = {0x00, 0x01};
-            coinbase_serialized.insert(coinbase_serialized.begin() + 4,
-                marker_flag.begin(), marker_flag.end());
-            std::array<uint8_t, 34> witness_bytes{};
-            witness_bytes[0] = 0x01;  // stack_count = 1
-            witness_bytes[1] = 0x20;  // item_len    = 32 (reserved value, all zero)
-            coinbase_serialized.insert(coinbase_serialized.end() - 4,
-                witness_bytes.begin(), witness_bytes.end());
-        }
-
+        // Serialize the block through the dgb::coin::serialize_won_block SSOT
+        // (coin/won_block_serialize.hpp).  It enforces the two invariants the
+        // ALREADY-HASHED header pins and the old hand-rolled framing violated:
+        //
+        //   1. the body must be exactly the tx set the frozen merkle root
+        //      commits to -- with NO merkle branches in the job the committed
+        //      root is the bare coinbase txid, so the block is coinbase-only;
+        //      appending job->tx_data anyway is a guaranteed bad-txnmrklroot;
+        //   2. BIP144 witness form is emitted IFF the coinbase carries the
+        //      BIP141 aa21a9ed commitment -- a witness-bearing coinbase
+        //      without one is rejected (unexpected-witness), and the
+        //      commitment cannot be injected here (it would change the
+        //      coinbase txid and invalidate the header the miner hashed).
+        //
+        // Both conditions are LOGGED when they fire: they mean an upstream
+        // job-build seam (branch cache / segwit_commitment_script producer)
+        // is still unpopulated, and the block ships degraded-but-valid rather
+        // than complete-but-rejected.
         static const std::vector<std::string> kEmptyTxData;
         const std::vector<std::string>& txs =
             job->tx_data ? *job->tx_data : kEmptyTxData;
 
-        std::vector<uint8_t> block_bytes;
-        block_bytes.reserve(80 + 9 + coinbase_serialized.size() + txs.size() * 256);
-        block_bytes.insert(block_bytes.end(), header.begin(), header.end());
-        push_varint(block_bytes, 1 + txs.size());   // total tx count (coinbase + others)
-        block_bytes.insert(block_bytes.end(),
-            coinbase_serialized.begin(), coinbase_serialized.end());
-        for (const auto& tx_hex : txs) {
-            auto tx_bytes = ParseHex(tx_hex);
-            block_bytes.insert(block_bytes.end(), tx_bytes.begin(), tx_bytes.end());
+        std::vector<std::vector<uint8_t>> other_txs;
+        other_txs.reserve(txs.size());
+        for (const auto& tx_hex : txs)
+            other_txs.push_back(ParseHex(tx_hex));
+
+        const dgb::coin::WonBlockAssembly asm_out = dgb::coin::serialize_won_block(
+            header, coinbase, other_txs, job->segwit_active,
+            /*committed_coinbase_only=*/job->merkle_branches.empty());
+        const std::vector<uint8_t>& block_bytes = asm_out.bytes;
+
+        if (asm_out.dropped_txs) {
+            LOG_ERROR << "[DGB-STRATUM-BLOCK] job carried " << asm_out.dropped_txs
+                      << " body tx(s) but NO merkle branches -- the frozen header"
+                      << " commits to a COINBASE-ONLY block; shipping committed"
+                      << " form (their fees are forfeit). Populate the branch"
+                      << " cache (get_stratum_merkle_branches) to claim them.";
         }
+        if (asm_out.witness_form_suppressed) {
+            LOG_WARNING << "[DGB-STRATUM-BLOCK] segwit-active job but the coinbase"
+                        << " carries no BIP141 commitment output -- emitting LEGACY"
+                        << " (witness-form would be rejected unexpected-witness)."
+                        << " Populate segwit_commitment_script at job build.";
+        }
+
+        // Won blocks are rare: dump the wire bytes so any daemon-side reject is
+        // decodable offline without a second live repro.
+        LOG_WARNING << "[DGB-STRATUM-BLOCK] wire: txs=" << asm_out.tx_count
+                    << " witness_form=" << (asm_out.witness_form ? 1 : 0)
+                    << " merkle_root=" << merkle_root.GetHex()
+                    << " coinbase_txid=" << coinbase_txid.GetHex()
+                    << " branches=" << job->merkle_branches.size()
+                    << " block=" << HexStr(Span<const uint8_t>(block_bytes.data(),
+                                                               block_bytes.size()));
 
         // Dual-path broadcaster (#82): submit_block_fn_ relays via P2P (primary)
         // and falls back to the submitblock RPC; true iff it reached >=1 sink. A

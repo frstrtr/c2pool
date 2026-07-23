@@ -177,6 +177,19 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_connection_coinbase_test "" AUTO)
 
+    # --- G3b: won-block wire framing KAT -----------------------------------
+    # Pins coin/won_block_serialize.hpp: the body emitted for a won block is
+    # exactly the tx set the FROZEN stratum merkle root commits to (no branches
+    # => coinbase-only, else bad-txnmrklroot), and BIP144 witness form is
+    # emitted IFF the coinbase carries the BIP141 aa21a9ed commitment (else
+    # unexpected-witness). Header-only + byte-level: no chain/tx-codec deps.
+    # MUST appear in BOTH this registration AND the build.yml --target
+    # allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_won_block_serialize_test won_block_serialize_test.cpp)
+    target_link_libraries(dgb_won_block_serialize_test PRIVATE
+        GTest::gtest_main GTest::gtest)
+    gtest_add_tests(dgb_won_block_serialize_test "" AUTO)
+
     # --- Phase B: PPLNS weights -> consensus-sorted payout outputs KAT ------
     # Pins coin/pplns_payout_split.hpp: compute_pplns_payout_split reproduces
     # steps 2-3 of share_check.hpp generate_share_transaction (the verification
