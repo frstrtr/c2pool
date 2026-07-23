@@ -61,6 +61,7 @@
 #include <impl/dash/coin/dkg_window.hpp>       // dash::coin::is_dkg_commitment_window (BLOCKER-1 guard)
 #include <impl/dash/coin/dkg_commitments.hpp>  // E1: build_daemonless_qc_plan (serve DKG windows daemonlessly)
 #include <impl/dash/coin/vendor/bls_verify.hpp>  // E1 Phase-L: make_commitment_bls_verifier (real qc verify seam)
+#include <impl/dash/coin/quorum_member_source.hpp>  // E1 Phase-L: daemonless member-set sourcing (the provider)
 #include <impl/dash/coin/utxo_lane.hpp>    // dash::coin::UtxoLane — embedded UTXO/fee lane (E2b, #738)
 #include <impl/dash/coin/header_chain.hpp>       // dash::coin::HeaderChain — SPV header/tip authority (E2a)
 #include <impl/dash/coin/coin_state_maintainer.hpp>  // dash::coin::CoinStateMaintainer — populate ordering gate (E2a)
@@ -1571,33 +1572,65 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // (verified_for -> nullopt -> the slot mines the consensus-valid
             // null commitment, exactly the pre-Phase-L posture — reward-safe).
             //
-            // MEMBER-SET RESIDUAL: the deterministic quorum member selection
+            // MEMBER-SET SOURCING (E1 Phase-L, the piece that ENABLES real-
+            // commitment serving): the deterministic quorum member selection
             // (dashcore llmq/utils.cpp ComputeQuorumMembers: score = hash over
-            // proRegTxHash/confirmedHash with the per-quorum modifier, taken
-            // over the SML AS OF the quorum base block) needs the HISTORICAL
-            // SML at cycleStart+quorumIndex — sourced over coin-P2P qrinfo
-            // (getqrinfo), not yet wired. Until that lands the provider returns
-            // nullopt and Phase-L stays fail-closed to null-serve; the BLS
-            // crypto path is complete + KAT-locked and needs no further change
-            // when the member set arrives. The SML nVersion (VER_LEGACY_BLS/
-            // VER_BASIC_BLS) MUST populate MemberOperatorKey::legacy_scheme so a
-            // mixed-scheme quorum verifies (a bare key hex is scheme-ambiguous).
+            // proRegTxHash/confirmedHash with the per-quorum V20 modifier, taken
+            // over the SML AS OF the quorum base block) needs the HISTORICAL SML
+            // at the quorum base block + the coinbase ChainLock of block base-8.
+            // QuorumMemberSource sources both over the SAME coin-P2P client
+            // (getmnlistd(ZERO, quorumHash) + getmnlistd(ZERO, workBlock)),
+            // computes the ordered member operator-key set (with the per-MN SML
+            // nVersion populating MemberOperatorKey::legacy_scheme — a mixed
+            // quorum needs the scheme flag), and caches it. The provider is a
+            // pure cache lookup (never blocks the template path). NON-ROTATED
+            // types only (llmq_50_60 etc.); rotated (DIP-24) returns nullopt ->
+            // null-serve (qrinfo-based rotated sourcing is a documented
+            // follow-up). Anything uncertain -> nullopt -> fail-closed.
+            auto qc_member_source =
+                std::make_shared<dash::coin::QuorumMemberSource>(
+                    qc_net,
+                    [hc = header_chain.get()](uint32_t h)
+                        -> std::optional<uint256> {
+                        if (auto e = hc->get_header_by_height(h)) return e->hash;
+                        return std::nullopt;
+                    },
+                    [hc = header_chain.get()](const uint256& qh)
+                        -> std::optional<uint32_t> {
+                        if (auto e = hc->get_header(qh)) return e->height;
+                        return std::nullopt;
+                    },
+                    [cp = coin_p2p.get()](const uint256& base, const uint256& tgt) {
+                        if (cp) cp->send_getmnlistd(base, tgt);
+                    });
+
             dash::coin::vendor::MemberKeysProvider qc_member_keys =
-                [](uint8_t /*llmqType*/, const uint256& /*quorumHash*/)
+                [qc_member_source](uint8_t llmq_type, const uint256& quorum_hash)
                     -> std::optional<std::vector<dash::coin::vendor::MemberOperatorKey>> {
-                    return std::nullopt;   // historical-SML member selection: qrinfo TODO
+                    return qc_member_source->lookup(llmq_type, quorum_hash);
                 };
             qc_cache->set_bls_verify_fn(
                 dash::coin::vendor::make_commitment_bls_verifier(
                     std::move(qc_member_keys)));
             if (dash::coin::vendor::bls_backend_available()) {
-                LOG_INFO << "[QC-PHASE-L] dashbls verifier installed "
-                            "(real qc inclusion gated on member-set sourcing)";
+                LOG_INFO << "[QC-PHASE-L] dashbls verifier + member-set sourcing "
+                            "installed (real qc inclusion when the member set is "
+                            "sourced; fail-closed to null-serve otherwise)";
+            }
+
+            // DEMUX: route the source's HISTORICAL getmnlistd replies away from
+            // the tip-SML maintainer (a base=ZERO snapshot would overwrite it).
+            if (coin_p2p) {
+                coin_p2p->set_historical_mnlistdiff_filter(
+                    [qc_member_source]
+                    (const dash::coin::vendor::CSimplifiedMNListDiff& d) {
+                        return qc_member_source->on_mnlistdiff(d);
+                    });
             }
 
             coin_feed_subs.push_back(
                 coin_state.new_qfcommit.subscribe(
-                    [qc_cache, qc_net]
+                    [qc_cache, qc_net, qc_member_source]
                     (const dash::coin::vendor::CFinalCommitment& c) {
                         if (qc_cache->ingest(qc_net, c)) {
                             LOG_INFO << "[QC-MINEABLE] cached commitment type="
@@ -1605,8 +1638,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                      << " quorum="
                                      << c.quorumHash.GetHex().substr(0, 16)
                                      << "... signers=" << c.CountSigners()
-                                     << " cache=" << qc_cache->size()
-                                     << " (inclusion pending Phase-L BLS)";
+                                     << " cache=" << qc_cache->size();
+                            // Proactively source the member set so it is READY by
+                            // the DKG-window height that must serve it.
+                            qc_member_source->request(c.llmqType, c.quorumHash);
                         }
                     }));
             node_coin_state.set_qc_plan_fn(

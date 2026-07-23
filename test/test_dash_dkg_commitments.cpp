@@ -424,8 +424,22 @@ TEST(DashDkgCommitments, MineableCacheStructuralAdmissionAndBlsGate)
     {
         auto bad = good;
         bad.signers.assign(50, false);
-        for (int i = 0; i < 29; ++i) bad.signers[static_cast<size_t>(i)] = true;  // threshold is 30
+        for (int i = 0; i < 29; ++i) bad.signers[static_cast<size_t>(i)] = true;  // below threshold (30)
         EXPECT_FALSE(cache.ingest(LlmqNetwork::Mainnet, bad));
+    }
+    {
+        // must-fix: >= threshold (30) but < minSize (40) — cryptographically
+        // valid yet bad-qc-invalid to every dashd. MUST reject (else, once
+        // member sourcing serves it, the block is lost).
+        auto bad = good;
+        bad.signers.assign(50, false);
+        for (int i = 0; i < 35; ++i) bad.signers[static_cast<size_t>(i)] = true;
+        EXPECT_FALSE(cache.ingest(LlmqNetwork::Mainnet, bad))
+            << "admitted a >=threshold but <minSize commitment (block-losing)";
+        auto bad2 = good;
+        bad2.validMembers.assign(50, false);
+        for (int i = 0; i < 35; ++i) bad2.validMembers[static_cast<size_t>(i)] = true;
+        EXPECT_FALSE(cache.ingest(LlmqNetwork::Mainnet, bad2));
     }
     {
         auto bad = good; bad.quorumSig.fill(0);

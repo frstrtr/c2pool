@@ -210,6 +210,16 @@ private:
     using HandshakeCallback = std::function<void()>;
     HandshakeCallback m_on_handshake_complete;
 
+    // E1 Phase-L member-set sourcing DEMUX: a filter that consumes HISTORICAL
+    // mnlistdiff replies (full base=ZERO snapshots at old quorum-base / work
+    // blocks, requested by QuorumMemberSource) BEFORE they reach the tip-SML
+    // maintainer — which treats any ZERO-base diff as a full snapshot and would
+    // overwrite the tip SML to that historical block. Returns true iff it
+    // consumed the diff; then new_mnlistdiff is NOT fired. Unset => no demux.
+    using MnListDiffFilter =
+        std::function<bool(const vendor::CSimplifiedMNListDiff&)>;
+    MnListDiffFilter m_historical_mnlistdiff_filter;
+
 public:
     CoinClient(io::io_context* context, dash::interfaces::Node* coin, config_t* config,
                const std::string& chain_label = "COIN-P2P")
@@ -311,6 +321,8 @@ public:
     /// Fired once per session when the version/verack handshake completes —
     /// the hook E2 uses to kick the initial getheaders/mnlistdiff sync.
     void set_on_handshake_complete(HandshakeCallback cb) { m_on_handshake_complete = std::move(cb); }
+    /// Install the Phase-L historical-mnlistdiff demux (QuorumMemberSource).
+    void set_historical_mnlistdiff_filter(MnListDiffFilter f) { m_historical_mnlistdiff_filter = std::move(f); }
 
     /// Send a getheaders request (E2 sync driver seam; unused by E1 run_node).
     void send_getheaders(uint32_t version, const std::vector<uint256>& locator, const uint256& stop)
@@ -685,6 +697,15 @@ private:
                  << " +" << msg->m_diff.mnList.size() << "mn -"
                  << msg->m_diff.deletedMNs.size() << "del qtail="
                  << msg->m_diff.quorum_tail.size() << "B";
+        // Phase-L DEMUX: a HISTORICAL member-sourcing reply is consumed here and
+        // must NOT reach the tip-SML maintainer (base=ZERO would overwrite the
+        // tip SML to the old block). Only tip-sync diffs fall through.
+        if (m_historical_mnlistdiff_filter
+            && m_historical_mnlistdiff_filter(msg->m_diff)) {
+            LOG_INFO << "[" << m_chain_label << "] mnlistdiff consumed by "
+                        "member-set sourcing (historical; tip SML untouched)";
+            return;
+        }
         m_coin->new_mnlistdiff.happened(msg->m_diff);
     }
 

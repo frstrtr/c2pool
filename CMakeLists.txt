@@ -116,8 +116,9 @@ endif()
 # fail-closed stub and the DKG-window serve path keeps the pre-Phase-L
 # null-commitment posture exactly — no dashbls dependency enters any build.
 #
-# Build the library once for the CI factory with scripts/build_dashbls.sh (pins
-# the exact upstream commit); point cmake at it with -DDASHBLS_ROOT=<prefix>.
+# Build the library once for the CI factory with scripts/build_dashbls.sh (builds
+# dash's OWN src/dashbls subtree at the v23.1.7 tag — byte-identical to dashd);
+# point cmake at it with -DDASHBLS_ROOT=<prefix>.
 option(C2POOL_DASH_BLS "Link dashbls (BLS12-381) for E1 Phase-L real quorum-commitment verify" OFF)
 set(C2POOL_DASH_BLS_AVAILABLE OFF)
 if(C2POOL_DASH_BLS)

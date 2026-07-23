@@ -12,26 +12,39 @@
 #
 # Requires: cmake, a C++17 compiler, and libgmp-dev (relic ARITH=gmp backend).
 #
-# Pinned to the exact upstream commit dash v23.1.x vendors as src/dashbls
-# (libdashbls 2.0 / relic 0.5.0). RE-PIN in lockstep with the vendored-dashcore
-# bump that moves vendor/llmq_commitment.hpp (same discipline as dkg_window.hpp).
+# SOURCE = dash's OWN vendored src/dashbls subtree at the v23.1.7 release tag,
+# NOT the standalone dashpay/bls-signatures repo. The standalone 1.3.6 tag
+# (dd683653) is functionally equivalent but NOT byte-identical to what dashd
+# links: dash's subtree carries fixes applied on top (e.g. a relic bn_free leak)
+# that never got a standalone tag. Pinning to the dash tag guarantees the BLS
+# code is byte-identical to the daemon whose commitments we verify — the whole
+# point of reuse-first. RE-PIN in lockstep with the vendored-dashcore bump that
+# moves vendor/llmq_commitment.hpp (same discipline as dkg_window.hpp).
 set -euo pipefail
 
-DASHBLS_REPO="${DASHBLS_REPO:-https://github.com/dashpay/bls-signatures.git}"
-# libdashbls 2.0 (dash v23.1.x src/dashbls subtree; relic backend, basic+legacy
-# BLS schemes). Pin by commit for a reproducible, offline-cacheable build.
-DASHBLS_COMMIT="${DASHBLS_COMMIT:-dd683653c6eaba7235bc9c600f46bafbb8210291}"
+# dash release tag whose src/dashbls subtree we build (byte-identical to dashd).
+DASH_REPO="${DASH_REPO:-https://github.com/dashpay/dash.git}"
+DASH_REF="${DASH_REF:-v23.1.7}"
 PREFIX="${1:-${DASHBLS_ROOT:-/opt/dashbls}}"
 BUILD_DIR="${BUILD_DIR:-/tmp/dashbls-build}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 
-echo "[build_dashbls] repo=$DASHBLS_REPO commit=$DASHBLS_COMMIT prefix=$PREFIX"
+echo "[build_dashbls] dash=$DASH_REPO ref=$DASH_REF (src/dashbls subtree) prefix=$PREFIX"
 
 rm -rf "$BUILD_DIR"
-git clone "$DASHBLS_REPO" "$BUILD_DIR/src"
-git -C "$BUILD_DIR/src" checkout --quiet "$DASHBLS_COMMIT"
+# Sparse, shallow checkout of only src/dashbls at the tag (avoids cloning all of
+# dash). Falls back to a full checkout if sparse is unavailable.
+git clone --depth 1 --branch "$DASH_REF" --filter=blob:none --sparse \
+    "$DASH_REPO" "$BUILD_DIR/dash"
+git -C "$BUILD_DIR/dash" sparse-checkout set src/dashbls
+DASHBLS_SRC="$BUILD_DIR/dash/src/dashbls"
+if [ ! -f "$DASHBLS_SRC/CMakeLists.txt" ]; then
+    echo "[build_dashbls] ERROR: src/dashbls not found at $DASH_REF" >&2
+    exit 1
+fi
+echo "[build_dashbls] building dash $DASH_REF src/dashbls (dashd-byte-identical)"
 
-cmake -S "$BUILD_DIR/src" -B "$BUILD_DIR/build" \
+cmake -S "$DASHBLS_SRC" -B "$BUILD_DIR/build" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$PREFIX" \
     -DBUILD_BLS_TESTS=0 \

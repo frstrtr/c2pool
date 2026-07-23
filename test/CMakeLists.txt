@@ -510,6 +510,24 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_bls_verify PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_bls_verify "" AUTO)
 
+    # E1 Phase-L member-set sourcing: deterministic ComputeQuorumMembers over the
+    # SML AS OF the quorum base block (quorum_members.hpp) reproduces dashd's exact
+    # ordered member set + operator keys + legacy/basic scheme flag, and the
+    # computed set makes #812's verify_final_commitment ACCEPT the REAL from-wire
+    # commitment (the whole point — real-commitment serving instead of null-serve).
+    # Real testnet vectors in test/data/dash_quorum_members_kat.hpp. The member
+    # selection + fail-closed KATs run in EVERY build; the verify-accept + partial-
+    # bitset KATs are #ifdef C2POOL_DASH_BLS-gated (same posture as bls_verify).
+    add_executable(test_dash_quorum_members test_dash_quorum_members.cpp)
+    target_link_libraries(test_dash_quorum_members PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_bls_verify core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_quorum_members PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_quorum_members "" AUTO)
+
     # DASH masternode state-machine (S7 leaf): vendored ProTx wire
     # (providertx.hpp) + MNState persistence (mn_state_db.hpp) +
     # apply_block RebuildListFromBlock + find_expected_payee / pick_paid_mn

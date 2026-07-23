@@ -145,14 +145,15 @@ bool verify_final_commitment(const CFinalCommitment& c,
         }
         if (signer_pubkeys.empty()) return false;
 
-        if (signer_pubkeys.size() == 1) {
-            // dashcore is_single_member() path: plain VerifyInsecure.
-            if (!scheme.Verify(signer_pubkeys[0], msg, members_sig))
-                return false;
-        } else {
-            if (!scheme.VerifySecure(signer_pubkeys, members_sig, msg))
-                return false;
-        }
+        // dashcore CFinalCommitment::Verify secure-aggregates the members' sig
+        // for EVERY enabled LLMQ type. The plain-Verify shortcut is keyed
+        // upstream on is_single_member() (llmq_params.size == 1), which NO
+        // enabled type is — NOT on the signer COUNT (a count-based shortcut
+        // diverges from dashbls VerifySecure, which has no n==1 special case).
+        // So always VerifySecure; the minSize floor keeps signer_pubkeys well
+        // above 1 for any admitted commitment.
+        if (!scheme.VerifySecure(signer_pubkeys, members_sig, msg))
+            return false;
 
         // ── quorumSig: threshold sig against quorumPublicKey ────────────────
         bls::G1Element quorum_pubkey =

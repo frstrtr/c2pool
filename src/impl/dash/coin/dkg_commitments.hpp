@@ -139,6 +139,7 @@ enum class LlmqNetwork : uint8_t { Mainnet, Testnet };
 struct LlmqParamsView {
     uint8_t  type;
     uint16_t size;
+    uint16_t min_size;              // dashcore .minSize — the FLOOR Verify enforces
     uint16_t threshold;
     uint32_t dkg_interval;
     uint32_t mining_window_start;   // offset from cycle start
@@ -149,12 +150,16 @@ struct LlmqParamsView {
 
 // llmq/params.h rows for the production types (LLMQ_25_67 is
 // .useRotation=false at this pin — do NOT confuse with the DIP-24 types).
-inline constexpr LlmqParamsView kLlmq50_60  {1, 50,  30,  24,  10, 18, 24, false};
-inline constexpr LlmqParamsView kLlmq60_75  {5, 60,  45,  288, 42, 50, 32, true };
-inline constexpr LlmqParamsView kLlmq400_60 {2, 400, 240, 288, 20, 28, 4,  false};
-inline constexpr LlmqParamsView kLlmq400_85 {3, 400, 340, 576, 20, 48, 4,  false};
-inline constexpr LlmqParamsView kLlmq100_67 {4, 100, 67,  24,  10, 18, 24, false};
-inline constexpr LlmqParamsView kLlmq25_67  {6, 25,  17,  24,  10, 18, 24, false};
+// min_size is dashcore .minSize (the CFinalCommitment::Verify floor: signers/
+// validMembers must be >= minSize, NOT merely >= threshold — a
+// >=threshold-but-<minSize commitment verifies cryptographically yet is invalid
+// to every dashd, so admitting it and serving it loses the block).
+inline constexpr LlmqParamsView kLlmq50_60  {1, 50,  40,  30,  24,  10, 18, 24, false};
+inline constexpr LlmqParamsView kLlmq60_75  {5, 60,  50,  45,  288, 42, 50, 32, true };
+inline constexpr LlmqParamsView kLlmq400_60 {2, 400, 300, 240, 288, 20, 28, 4,  false};
+inline constexpr LlmqParamsView kLlmq400_85 {3, 400, 350, 340, 576, 20, 48, 4,  false};
+inline constexpr LlmqParamsView kLlmq100_67 {4, 100, 80,  67,  24,  10, 18, 24, false};
+inline constexpr LlmqParamsView kLlmq25_67  {6, 25,  22,  17,  24,  10, 18, 24, false};
 
 /// Enabled LLMQ types per network, IN dashd's AddLLMQ ORDER (chainparams.cpp:
 /// mainnet 269-273, testnet 459-464). The order matters for byte parity: the
@@ -314,11 +319,14 @@ public:
         // VerifySizes.
         if (c.signers.size() != p->size || c.validMembers.size() != p->size)
             return false;
-        // A REAL commitment: thresholds met, crypto fields non-null
-        // (dashcore Verify's CountValidMembers/CountSigners >= threshold and
-        // non-null key/sig checks — everything except the BLS math).
-        if (c.CountValidMembers() < p->threshold) return false;
-        if (c.CountSigners() < p->threshold) return false;
+        // A REAL commitment: dashcore CFinalCommitment::Verify enforces the
+        // count FLOOR at minSize, NOT threshold (VerifySizes/quorum count check:
+        // CountValidMembers() >= minSize and CountSigners() >= minSize). A
+        // colluding >=threshold-but-<minSize commitment passes the BLS math yet
+        // is bad-qc-invalid to every dashd — admitting it (and, once member
+        // sourcing lands, serving it) loses the block. Enforce minSize.
+        if (c.CountValidMembers() < p->min_size) return false;
+        if (c.CountSigners() < p->min_size) return false;
         auto all_zero = [](const auto& arr) {
             for (auto b : arr) if (b != 0) return false;
             return true;
@@ -386,8 +394,20 @@ daemonless_qc_commitments(
     for (const auto& s : *slots) {
         if (cache != nullptr) {
             if (auto real = cache->verified_for(s.params.type, s.quorum_hash)) {
-                out.push_back(std::move(*real));
-                continue;
+                // quorumIndex is OUTSIDE BuildCommitmentHash (confirmed vs
+                // dashcore v23.1.x) — neither BLS leg binds it, so a relay peer
+                // can flip it on an otherwise-valid qfcommit. dashd enforces
+                // base_height % dkgInterval == quorumIndex; the slot's
+                // quorum_index IS that value by construction (base = cycleStart
+                // + quorum_index). Serving a commitment whose quorumIndex does
+                // not match this slot => bad-qc-invalid = lost block, so refuse
+                // it and mine the consensus-valid null commitment instead
+                // (reward-safe; the honest-copy DoS via keep-best dedup is the
+                // flagged availability-only follow-up).
+                if (real->quorumIndex == s.quorum_index) {
+                    out.push_back(std::move(*real));
+                    continue;
+                }
             }
         }
         out.push_back(build_null_commitment(s.params, s.quorum_hash,
