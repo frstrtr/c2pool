@@ -204,4 +204,20 @@ if(BUILD_TESTING)
             btclibs)
         add_test(NAME bch_${t} COMMAND bch_${t})
     endforeach()
+
+    # g2_block_assembly_roundtrip_test: the won-block assembly + pre-broadcast
+    # self-check gate that closes the G2 zero-blocks failure (155-byte body,
+    # zero-output generation transaction, bad-txnmrklroot on ~774k solutions).
+    # Needs coin/transaction.cpp for the MutableTransaction ctors, same as
+    # block_connector_test; link set and header-only-over-coin/*.hpp posture are
+    # otherwise identical, so per-coin isolation stays clean.
+    add_executable(bch_g2_block_assembly_roundtrip_test
+        g2_block_assembly_roundtrip_test.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/transaction.cpp)
+    target_include_directories(bch_g2_block_assembly_roundtrip_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(bch_g2_block_assembly_roundtrip_test PRIVATE
+        core pool sharechain
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
+        btclibs)
+    add_test(NAME bch_g2_block_assembly_roundtrip_test COMMAND bch_g2_block_assembly_roundtrip_test)
 endif()

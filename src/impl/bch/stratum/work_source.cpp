@@ -27,6 +27,7 @@
 #include <impl/bch/stratum/work_source.hpp>
 
 #include <impl/bch/stratum/coinbase_outputs.hpp>  // assemble_v36_coinbase_outputs
+#include <impl/bch/stratum/coinbase_slot_guard.hpp> // coinb1_ends_in_commitment_slot
 
 #include <impl/bch/coin/header_chain.hpp>
 #include <impl/bch/coin/mempool.hpp>
@@ -506,11 +507,41 @@ core::stratum::CoinbaseResult BCHWorkSource::build_connection_coinbase(
     }
     const uint256&  ref_hash       = rh_result.ref_hash;
     const uint64_t  ref_nonce      = rh_result.last_txout_nonce;
-    const bool      emit_op_return = ref_hash_fn && !ref_hash.IsNull();
+
+    // ── G2 HARDENING (2026-07-23): the commitment output is STRUCTURAL ──────
+    // The extranonce (en1||en2, 8 bytes) is spliced at the coinb1/coinb2 seam.
+    // That seam is only well-defined when it falls INSIDE a real output's
+    // script; if the commitment output is suppressed, the seam degenerates to
+    // "end of the output vector" and the miner's 8 extranonce bytes land
+    // between the output vector and the locktime. The published job then hashes
+    // a byte string that does not deserialize as the transaction anyone
+    // reconstructs, and every solved block is rejected `bad-txnmrklroot`.
+    //
+    // That is exactly what happened on the live pool: coinb1 terminated at an
+    // output count of 0x00 after 62 bytes, and ~774k accepted solutions yielded
+    // ZERO blocks. So the OP_RETURN commitment output is now emitted
+    // UNCONDITIONALLY -- it is the extranonce's container, not an optional
+    // decoration -- which also makes a zero-output generation transaction
+    // structurally unreachable (output_count >= 1 always).
+    //
+    // A null reference hash is still a real problem (the resulting share cannot
+    // link to the sharechain), but it is a LOUD, LOCAL one: it is logged here
+    // and caught at share verification, instead of silently producing
+    // merkle-invalid blocks for the rest of the pool's life.
+    if (!ref_hash_fn) {
+        LOG_ERROR << "[BCH-STRATUM] no ref_hash callback wired -- emitting the "
+                     "commitment output with a null reference hash so the "
+                     "extranonce still sits inside a real output; shares from "
+                     "this job will NOT link to the sharechain";
+    } else if (ref_hash.IsNull()) {
+        LOG_WARNING << "[BCH-STRATUM] reference hash is null -- commitment "
+                       "output still emitted (extranonce container); the share "
+                       "authored from this job will not link";
+    }
 
     // Assemble coinb1: full tx up to (and including) ref_hash. NO SegWit
-    // output -> output_count is PPLNS outputs + optional OP_RETURN only.
-    const size_t output_count = outputs.size() + (emit_op_return ? 1 : 0);
+    // output -> output_count is PPLNS outputs + the always-present commitment.
+    const size_t output_count = outputs.size() + 1;
 
     std::vector<uint8_t> coinb1;
     push_u32_le(coinb1, 1);                  // tx version
@@ -527,13 +558,27 @@ core::stratum::CoinbaseResult BCHWorkSource::build_connection_coinbase(
         push_varint(coinb1, script.size());
         coinb1.insert(coinb1.end(), script.begin(), script.end());
     }
-    if (emit_op_return) {
+    {
+        // Commitment output -- ALWAYS emitted; carries the 8-byte extranonce
+        // slot at its tail, which is where coinb1 ends and en1||en2 is spliced.
         push_u64_le(coinb1, 0);   // 0 sats
         coinb1.push_back(0x2a);   // script_len = 42
         coinb1.push_back(0x6a);   // OP_RETURN
         coinb1.push_back(0x28);   // PUSH_40
         coinb1.insert(coinb1.end(), ref_hash.data(), ref_hash.data() + 32);
         // [8B nonce slot -- coinb1 ends here; en1+en2 fills it]
+    }
+
+    // Fail-closed post-condition. The invariants above make both branches
+    // unreachable; if a future edit breaks one, REFUSE to publish the job
+    // rather than hand miners a template whose solutions can never be relayed.
+    // (Caller treats an empty coinb1 as "no per-connection coinbase".)
+    if (output_count == 0 || !bch::stratum::coinb1_ends_in_commitment_slot(coinb1)) {
+        LOG_ERROR << "[BCH-STRATUM] REFUSING to publish generation transaction: "
+                     "output_count=" << output_count
+                  << " and the extranonce slot is not inside a commitment "
+                     "output -- this is the G2 bad-txnmrklroot shape";
+        return core::stratum::CoinbaseResult{};
     }
 
     std::vector<uint8_t> coinb2;
