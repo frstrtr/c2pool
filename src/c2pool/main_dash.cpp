@@ -70,6 +70,8 @@
 #include <impl/dash/coin/tip_ingest.hpp>         // wire_tip_ingest (leg 2)
 #include <impl/dash/coin/block_connect_ingest.hpp>   // wire_block_connect_ingest (leg 3)
 #include <impl/dash/coin/mn_list_ingest.hpp>     // wire_mn_list_ingest (leg 4)
+#include <impl/dash/coin/govsync_ingest.hpp>     // wire_govobject_ingest / wire_govvote_ingest (E-SUPERBLOCK)
+#include <impl/dash/coin/superblock.hpp>         // get_superblock_payments / superblock_budget (E-SUPERBLOCK)
 #include <impl/dash/coin/mn_seed.hpp>            // E2c: RPC protx-list MN-set seed (parse_protx_list_seed)
 #include <impl/dash/node.hpp>          // dash::Node — sharechain pool-node (NodeBridge<NodeImpl,Legacy,Actual>)
 #include <impl/dash/config.hpp>        // dash::Config (PoolConfig/CoinConfig)
@@ -409,7 +411,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              const std::string& coin_zmq_hashblock,
              const std::string& external_ip,
              const std::string& coin_p2p_magic_hex,
-             bool force_won_block)
+             bool force_won_block,
+             bool embedded_superblock)
 {
     namespace io = boost::asio;
 
@@ -1572,6 +1575,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         coin_feed_subs.push_back(
             c2pool::dash::wire_mnlistdiff_ingest(coin_state, *maintainer));
 
+        // Legs 6-7 (E-SUPERBLOCK — DAEMONLESS SUPERBLOCK PAYEE SOURCING): the
+        // governance-object + vote feed off the coin-P2P govsync leg. govobj
+        // triggers advance the GovernanceStore (winning-trigger schedule);
+        // govobjvote funding votes feed the tally (counted only when verified —
+        // see the vote-verifier seam below). This is what lets the embedded arm
+        // serve a SUPERBLOCK height daemonlessly instead of falling back.
+        coin_feed_subs.push_back(
+            c2pool::dash::wire_govobject_ingest(coin_state, *maintainer));
+        coin_feed_subs.push_back(
+            c2pool::dash::wire_govvote_ingest(coin_state, *maintainer));
+
         // getmnlistd base tracker: the block hash the local SML is current at.
         // Cold start = ZERO (full snapshot). Each accepted mnlistdiff advances
         // it to diff.blockHash so the NEXT request is an incremental diff off
@@ -1726,6 +1740,54 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 [sb_cycle](uint32_t next_height) {
                     return dash::coin::is_superblock_height(next_height, sb_cycle);
                 });
+
+            // E-SUPERBLOCK: daemonless superblock payee provider. At a superblock
+            // height the provider resolves the winning governance trigger's
+            // budget-valid (script, amount) schedule from the GovernanceStore the
+            // govsync legs (6-7) feed, so the embedded arm can serve the correct
+            // superblock coinbase WITHOUT dashd. get_superblock_payments returns
+            // nullopt when there is no trigger-confident winner (unfunded OR
+            // under-synced OR over-budget) — the NodeCoinState guard then FAILS
+            // CLOSED to the reward-safe dashd fallback (never guesses payees).
+            //
+            // Enabled ONLY under --embedded-superblock (opt-in, default OFF). With
+            // it OFF, set_require_superblock_provider(false) preserves the prior
+            // reward-safe behaviour EXACTLY (every superblock height falls back).
+            //
+            // FAIL-CLOSED BY CONSTRUCTION until vote-verify lands: the funding
+            // tally only counts votes the maintainer's vote-verifier accepts, and
+            // that verifier is UNSET here (the vote-ECDSA-verify against keyIDVoting
+            // is the documented follow-up), so no trigger ever reaches threshold =>
+            // the provider returns nullopt => superblock heights fall back even
+            // with the flag on. The parse/selection/template-emit logic is proven
+            // by the KATs; flipping this fully live is gated on vote-verify + soak.
+            {
+                const int64_t budget_cycle = sb_cycle;
+                node_coin_state.set_superblock_provider(
+                    [maint = maintainer.get(), budget_cycle](uint32_t next_height)
+                        -> std::optional<std::vector<dash::coin::SuperblockPayment>> {
+                        const int64_t budget =
+                            dash::coin::superblock_budget(next_height,
+                                                          static_cast<int>(budget_cycle));
+                        return dash::coin::get_superblock_payments(
+                            maint->gov_store(),
+                            static_cast<int32_t>(next_height), budget);
+                    });
+                // Seed the funding threshold from the current SML size (dashcore
+                // ~10% of the weighted MN count). 0 => unknown => fail closed;
+                // a live node re-seeds as the SML grows. Cross-checkable against
+                // dashd getgovernanceinfo.fundingthreshold.
+                const size_t mn_count = node_coin_state.sml().size();
+                maintainer->gov_store().set_funding_threshold(
+                    mn_count > 0 ? static_cast<int>(mn_count / 10 + 1) : 0);
+                node_coin_state.set_require_superblock_provider(embedded_superblock);
+                if (embedded_superblock)
+                    LOG_INFO << "[E-SUPERBLOCK] daemonless superblock arm ENABLED "
+                                "(--embedded-superblock); superblock heights served "
+                                "from govsync triggers when trigger-confident, else "
+                                "fail closed to dashd. Vote-verify pending => "
+                                "currently fails closed until pinned.";
+            }
         }
 
         // E4 re-soak fix (constant −66,966,830-duff creditPool bias): the
@@ -1943,6 +2005,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 auto tip_entry = hc->tip();
                 const uint256 tip = tip_entry ? tip_entry->hash : uint256::ZERO;
                 cp->send_getmnlistd(*sml_base, tip);
+                // E-SUPERBLOCK: pull the governance object/vote store (triggers +
+                // funding votes) so a superblock height can be served daemonlessly.
+                // Zero nProp + empty filter => request all. Cheap; a handful of
+                // objects. Re-primed on tip changes below for freshness.
+                cp->send_govsync();
             });
 
         std::cout << "[run] E2a live-feed wired: header-chain(" << hdr_db
@@ -2516,6 +2583,7 @@ int main(int argc, char** argv)
     bool embedded_mainnet = false;             // --embedded-mainnet: gate-lift, allow the daemonless embedded template arm on MAINNET (byte-parity proven; default OFF = dashd fallback)
     std::string coin_p2p_magic = "";           // --coin-p2p-magic HEX: override the embedded CoinClient wire magic (e.g. regtest fcc1b7dc); default mainnet/testnet
     bool force_won_block = false;              // --regtest-force-won-block: fail-closed regtest E5 harness (drive one real won block through the run-path dual-path)
+    bool embedded_superblock = false;          // --embedded-superblock: OPT-IN daemonless superblock payee sourcing via govsync (E-SUPERBLOCK); default OFF = superblock heights fall back to dashd (reward-safe)
     std::string stratum_host = "0.0.0.0";      // --stratum [HOST:]PORT bind interface (default all)
     uint16_t    stratum_port = 0;              // 0 disables the Stratum accept-loop; --stratum sets it
     bool embedded_utxo = false;                // --embedded-utxo: arm the E2b UTXO/fee lane (opt-in)
@@ -2581,6 +2649,8 @@ int main(int argc, char** argv)
             coin_p2p_magic = argv[++i];
         else if (std::strcmp(argv[i], "--regtest-force-won-block") == 0)
             force_won_block = true;
+        else if (std::strcmp(argv[i], "--embedded-superblock") == 0)
+            embedded_superblock = true;
         else if (std::strcmp(argv[i], "--embedded-utxo") == 0)
             embedded_utxo = true;
         else if ((std::strcmp(argv[i], "--give-author") == 0 ||
@@ -2697,7 +2767,7 @@ int main(int argc, char** argv)
                         embedded_mainnet,
                         coin_zmq_hashblock,
                         external_ip,
-                        coin_p2p_magic, force_won_block);
+                        coin_p2p_magic, force_won_block, embedded_superblock);
     }
     return run_selftest();
 }

@@ -28,6 +28,8 @@
 /// safety path and the [GBT-XCHECK] cross-check whenever the bundle is not live.
 
 #include <impl/dash/coin/node_coin_state.hpp>    // NodeCoinState
+#include <impl/dash/coin/governance_store.hpp>   // GovernanceStore (daemonless superblock)
+#include <impl/dash/coin/governance_object.hpp>  // parse_superblock_trigger, govdata_hex_to_plain
 #include <impl/dash/coin/mn_state_machine.hpp>   // MNState
 #include <impl/dash/coin/block.hpp>            // BlockType
 #include <impl/dash/coin/transaction.hpp>        // MutableTransaction
@@ -62,6 +64,70 @@ public:
     explicit CoinStateMaintainer(NodeCoinState& state) : m_state(state) {}
     CoinStateMaintainer(const CoinStateMaintainer&) = delete;
     CoinStateMaintainer& operator=(const CoinStateMaintainer&) = delete;
+
+    // ── E-SUPERBLOCK: daemonless governance object/vote ingestion ─────────
+
+    /// The node-owned governance object/vote store (daemonless superblock payee
+    /// sourcing). main_dash builds the NodeCoinState superblock provider closure
+    /// over this — get_superblock_payments(gov_store(), height, budget).
+    GovernanceStore&       gov_store()       { return m_gov_store; }
+    const GovernanceStore& gov_store() const { return m_gov_store; }
+
+    /// Vote verification seam. on_govvote counts a funding vote ONLY when this
+    /// verifier returns true (it must ECDSA-verify the vote signature against
+    /// the voting MN's keyIDVoting from the SML and confirm MN membership).
+    /// UNSET (default) => NO vote is counted => the funding tally stays 0 =>
+    /// no trigger ever reaches threshold => the superblock arm FAILS CLOSED to
+    /// dashd. This is the reward-safe default until vote-ECDSA-verify is pinned.
+    struct GovVoteContext {
+        uint256              parent_hash;
+        uint256              mn_outpoint_hash;
+        uint32_t             mn_outpoint_index{0};
+        int32_t              outcome{0};
+        int32_t              signal{0};
+        int64_t              time{0};
+        std::vector<uint8_t> vch_sig;
+        uint256              vote_hash;
+    };
+    void set_vote_verifier(std::function<bool(const GovVoteContext&)> fn) {
+        m_vote_verifier = std::move(fn);
+    }
+
+    /// Reception path (govobj): ingest a governance object. Only TRIGGER objects
+    /// (type 2) whose vchData parses as a valid superblock payment schedule are
+    /// added to the store; everything else (proposals, malformed triggers) is
+    /// dropped. The trigger's payee vector is re-derived from its OWN vchData
+    /// (parse_superblock_trigger), never guessed — a parse failure fails closed.
+    void on_govobject(const uint256& object_hash, int32_t object_type,
+                      const std::vector<uint8_t>& vch_data) {
+        if (object_type != GOVERNANCE_OBJECT_TRIGGER) return;   // only superblock triggers
+        // vchData is hex-encoded plaintext JSON (dashcore GetDataAsPlainString).
+        std::string hex(vch_data.begin(), vch_data.end());
+        auto plain = govdata_hex_to_plain(hex);
+        if (!plain) return;                                     // not hex → drop
+        auto trig = parse_superblock_trigger(*plain, object_hash);
+        if (!trig) return;                                      // malformed → fail closed
+        m_gov_store.add_trigger(*trig);
+        LOG_INFO << "[GOVSYNC] trigger " << object_hash.GetHex().substr(0, 16)
+                 << " for superblock h=" << trig->event_block_height << " with "
+                 << trig->payments.size() << " payee(s), total="
+                 << trig->total_amount() << " duffs";
+    }
+
+    /// Reception path (govobjvote): ingest a governance vote. Only FUNDING-signal
+    /// votes on a KNOWN trigger are relevant; the vote is counted ONLY if the
+    /// verifier confirms its ECDSA signature (see set_vote_verifier — default
+    /// UNSET => never counted => fail closed).
+    void on_govvote(const GovVoteContext& v, const std::string& mn_outpoint_key) {
+        if (v.signal != VOTE_SIGNAL_FUNDING) return;            // only the superblock tally axis
+        if (!m_gov_store.has_trigger(v.parent_hash)) return;    // vote for a non-trigger → ignore
+        if (!m_vote_verifier || !m_vote_verifier(v)) {
+            // Unverified (default) or failed verify: DO NOT count. Fail closed.
+            return;
+        }
+        m_gov_store.add_verified_funding_vote(
+            v.parent_hash, mn_outpoint_key, v.outcome, v.time);
+    }
 
     /// Reception path (mnlistdiff): replace the masternode set the embedded
     /// coinbase pays. An EMPTY list is treated as a gap -- it cannot back a
@@ -602,6 +668,8 @@ private:
     }
 
     NodeCoinState& m_state;
+    GovernanceStore m_gov_store;             // E-SUPERBLOCK: govsync object/vote store
+    std::function<bool(const GovVoteContext&)> m_vote_verifier;  // vote-ECDSA seam (unset=fail closed)
     std::function<void()> m_on_state_dirty;  // SML/bestCL/reorg -> re-issue work
     std::function<void()> m_on_mn_reseed;    // payee desync -> authoritative protx re-seed
     std::function<void()> m_on_full_resync;  // H-1 heal -> reset sml_base + full re-sync

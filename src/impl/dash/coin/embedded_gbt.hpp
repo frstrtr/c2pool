@@ -31,6 +31,7 @@
 #include <impl/dash/coin/mn_state_machine.hpp>
 #include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/subsidy.hpp>
+#include <impl/dash/coin/governance_object.hpp>   // SuperblockPayment (daemonless superblock outputs)
 #include <impl/dash/coin/utxo_adapter.hpp>
 #include <impl/dash/coin/rpc_data.hpp>
 #include <impl/dash/coin/quorum_root.hpp>
@@ -134,7 +135,19 @@ inline DashWorkData build_embedded_workdata(
     // MUST pass DASH_MN_RR_HEIGHT_TESTNET or the platform reward evaluates to
     // 0 and the committed creditPoolBalance sits one block-reward low (the E4
     // re-soak constant −66,966,830-duff bias).
-    int mn_rr_height = DASH_MN_RR_HEIGHT_MAINNET)
+    int mn_rr_height = DASH_MN_RR_HEIGHT_MAINNET,
+    // E-SUPERBLOCK seam: daemonless superblock (governance treasury) outputs.
+    // Default nullptr => every existing caller byte-unchanged (no superblock
+    // outputs — the normal-block path). At a FUNDED superblock height the
+    // governance provider resolves the winning trigger's (script, amount)
+    // vector (superblock.hpp::get_superblock_payments) and threads it here;
+    // build appends those outputs AND adds their total to the coinbase value,
+    // exactly as dashd's getblocktemplate augments coinbasevalue with the
+    // superblock array. An empty/nullptr vector is a normal block (a
+    // confidently-UNFUNDED superblock height serves normally). The MN payment /
+    // platform burn / mempool selection above are untouched — superblock
+    // outputs are purely additive, matching dashcore GetBlockTxOuts ordering.
+    const std::vector<SuperblockPayment>* superblock_payments = nullptr)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
@@ -247,6 +260,43 @@ inline DashWorkData build_embedded_workdata(
             pp.amount = static_cast<uint64_t>(mn_payment);
             w.m_packed_payments.push_back(std::move(pp));
         }
+    }
+
+    // ── Daemonless superblock (governance treasury) outputs (E-SUPERBLOCK) ──
+    // At a FUNDED superblock height dashd's coinbase pays the governance-
+    // determined treasury payees IN ADDITION to the masternode payment +
+    // platform burn, and augments coinbasevalue by their total. We mirror that:
+    // append each (script, amount) as a packed payment (via script_to_address
+    // for standard scripts, "!hex" fallback for non-standard — same convention
+    // as the MN payee above) and add the total to m_coinbase_value. The payee
+    // vector is the winning trigger's schedule, already budget-validated by
+    // superblock.hpp::get_superblock_payments. When nullptr/empty this is a
+    // normal block (unfunded superblock or non-superblock height) — no-op.
+    if (superblock_payments != nullptr && !superblock_payments->empty()) {
+        int64_t superblock_total = 0;
+        for (const auto& sp : *superblock_payments) {
+            std::string addr = ::core::script_to_address(
+                sp.script, /*bech32_hrp=*/"", address_version, address_p2sh_version);
+            PackedPayment pp;
+            if (!addr.empty()) {
+                pp.payee = std::move(addr);
+            } else {
+                std::string hex_script;
+                hex_script.reserve(sp.script.size() * 2);
+                static const char* digits = "0123456789abcdef";
+                for (uint8_t b : sp.script) {
+                    hex_script.push_back(digits[(b >> 4) & 0xF]);
+                    hex_script.push_back(digits[b & 0xF]);
+                }
+                pp.payee = "!" + hex_script;
+            }
+            pp.amount = static_cast<uint64_t>(sp.amount);
+            w.m_packed_payments.push_back(std::move(pp));
+            superblock_total += sp.amount;
+        }
+        // dashd augments coinbasevalue by the superblock total (the accrued
+        // treasury slice released this block).
+        w.m_coinbase_value += static_cast<uint64_t>(superblock_total);
     }
 
     // E2d: fold the DIP-0004 type-5 CCbTx extra_payload so the block is

@@ -44,6 +44,7 @@
 #include "transaction.hpp"
 
 #include <impl/dash/crypto/hash_x11.hpp>   // block identity on Dash = X11(header)
+#include <core/hash.hpp>                    // ::Hash (double-SHA256) for govobj/govvote hashing
 
 #include <algorithm>
 #include <memory>
@@ -358,6 +359,20 @@ public:
         m_peer->write(msg);
     }
 
+    /// Send a govsync (MNGOVERNANCESYNC) — E-SUPERBLOCK governance-object sync
+    /// seam. A zero nProp with an EMPTY bloom filter requests ALL governance
+    /// objects + votes; the peer streams them back as govobj / govobjvote
+    /// messages, which the handlers above forward into the GovernanceStore.
+    void send_govsync()
+    {
+        if (!m_peer) return;
+        auto msg = message_govsync::make_raw(
+            uint256::ZERO,               // nProp = 0 => request all
+            std::vector<uint8_t>{},      // empty filter vData
+            /*nHashFuncs=*/0u, /*nTweak=*/0u, /*nFlags=*/uint8_t{0});
+        m_peer->write(msg);
+    }
+
     /// Relay a pre-serialized won block as a `block` P2P message (the embedded
     /// P2P-relay arm of the dual-path broadcaster — dispatch wiring is a later
     /// slice; the method is here so the relay leg binds without a client edit).
@@ -661,6 +676,58 @@ private:
                  << msg->m_diff.quorum_tail.size() << "B";
         m_coin->new_mnlistdiff.happened(msg->m_diff);
     }
+
+    // ── E-SUPERBLOCK: governance objects + votes (daemonless superblock) ──
+
+    ADD_P2P_HANDLER(govobj)
+    {
+        // MNGOVERNANCEOBJECT. Compute the dashcore object hash (double-SHA256 of
+        // the full serialization — same field order the message writes, incl.
+        // vchSig, matching CGovernanceObject::GetHash) and forward the record.
+        // The maintainer parses a TRIGGER's vchData into the GovernanceStore.
+        auto stream = ::pack(*msg);
+        auto sp = stream.get_span();
+        std::span<const unsigned char> bytes(
+            reinterpret_cast<const unsigned char*>(sp.data()), sp.size());
+        ::dash::interfaces::Node::GovObjectRecord rec;
+        rec.object_hash = ::Hash(bytes);
+        rec.object_type = msg->m_object_type;
+        rec.vch_data    = msg->m_vch_data;
+        LOG_INFO << "[" << m_chain_label << "] govobj: hash="
+                 << rec.object_hash.GetHex().substr(0, 16) << " type="
+                 << rec.object_type << " data=" << rec.vch_data.size() << "B";
+        m_coin->new_govobject.happened(rec);
+    }
+
+    ADD_P2P_HANDLER(govobjvote)
+    {
+        // MNGOVERNANCEOBJECTVOTE. Forward the vote for the maintainer to VERIFY
+        // (ECDSA over the vote hash against the voting MN's keyIDVoting) + TALLY.
+        // vote_hash here is a placeholder digest of the full message — the exact
+        // dashcore GetSignatureHash preimage (outpoint|parent|outcome|signal|
+        // time, sig excluded) MUST be pinned before vote-verify is enabled.
+        auto stream = ::pack(*msg);
+        auto sp = stream.get_span();
+        std::span<const unsigned char> bytes(
+            reinterpret_cast<const unsigned char*>(sp.data()), sp.size());
+        ::dash::interfaces::Node::GovVoteRecord rec;
+        rec.parent_hash      = msg->m_parent_hash;
+        rec.mn_outpoint_hash = msg->m_masternode_outpoint.hash;
+        rec.mn_outpoint_index= msg->m_masternode_outpoint.index;
+        rec.mn_outpoint_key  = msg->m_masternode_outpoint.to_key();
+        rec.outcome          = msg->m_vote_outcome;
+        rec.signal           = msg->m_vote_signal;
+        rec.time             = msg->m_time;
+        rec.vch_sig          = msg->m_vch_sig;
+        rec.vote_hash        = ::Hash(bytes);   // placeholder (see above)
+        LOG_INFO << "[" << m_chain_label << "] govobjvote: parent="
+                 << rec.parent_hash.GetHex().substr(0, 16) << " mn="
+                 << rec.mn_outpoint_key.substr(0, 20) << " outcome="
+                 << rec.outcome << " signal=" << rec.signal;
+        m_coin->new_govvote.happened(rec);
+    }
+
+    ADD_P2P_HANDLER(govsync)   { /* inbound sync request — we don't serve governance */ }
 
     // ── tolerated / ignored peer traffic ─────────────────────────────────
 

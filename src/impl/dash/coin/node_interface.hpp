@@ -144,6 +144,41 @@ struct Node
     };
     Event<ChainLockSigEvent> new_chainlock_sig;
 
+    // ── E-SUPERBLOCK: daemonless governance feed (govsync) ────────────────
+    // Reception path: fires when the coin-P2P client parses a `govobj`
+    // (MNGOVERNANCEOBJECT) message. Carries the object hash (computed by the
+    // handler), its type (2 == superblock trigger), and the raw vchData payload
+    // (hex-encoded plaintext JSON schedule). CoinStateMaintainer::on_govobject
+    // subscribes: for a trigger it parses the payment schedule into the
+    // GovernanceStore. Distinct from the SML axis (mnlistdiff) — this is the
+    // governance-object axis feeding daemonless superblock payee sourcing.
+    struct GovObjectRecord {
+        uint256              object_hash;
+        int32_t              object_type{0};
+        std::vector<uint8_t> vch_data;      // hex-encoded plaintext (trigger schedule)
+    };
+    Event<GovObjectRecord> new_govobject;
+
+    // Reception path: fires when the coin-P2P client parses a `govobjvote`
+    // (MNGOVERNANCEOBJECTVOTE) message. Carries everything the maintainer needs
+    // to VERIFY (ECDSA over the vote hash against the voting MN's keyIDVoting
+    // from the SML) and, once verified, TALLY the funding-signal vote in the
+    // GovernanceStore. Until vote-ECDSA-verify is pinned the maintainer leaves
+    // the vote UNCOUNTED (fail closed). CoinStateMaintainer::on_govvote
+    // subscribes.
+    struct GovVoteRecord {
+        uint256              parent_hash;        // the object being voted on
+        uint256              mn_outpoint_hash;   // voting masternode collateral txid
+        uint32_t             mn_outpoint_index{0};
+        std::string          mn_outpoint_key;    // "<txid>-<index>" (store key)
+        int32_t              outcome{0};         // 1=yes 2=no 3=abstain
+        int32_t              signal{0};          // 1=funding
+        int64_t              time{0};
+        std::vector<uint8_t> vch_sig;            // ECDSA sig (verify seam)
+        uint256              vote_hash;          // signature-hash preimage digest
+    };
+    Event<GovVoteRecord> new_govvote;
+
     std::map<uint256, coin::Transaction> known_txs;
 };
 
