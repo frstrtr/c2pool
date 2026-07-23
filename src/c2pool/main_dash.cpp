@@ -60,6 +60,7 @@
 #include <impl/dash/coin/node_coin_state.hpp>  // dash::coin::NodeCoinState (embedded work bundle)
 #include <impl/dash/coin/dkg_window.hpp>       // dash::coin::is_dkg_commitment_window (BLOCKER-1 guard)
 #include <impl/dash/coin/dkg_commitments.hpp>  // E1: build_daemonless_qc_plan (serve DKG windows daemonlessly)
+#include <impl/dash/coin/vendor/bls_verify.hpp>  // E1 Phase-L: make_commitment_bls_verifier (real qc verify seam)
 #include <impl/dash/coin/utxo_lane.hpp>    // dash::coin::UtxoLane — embedded UTXO/fee lane (E2b, #738)
 #include <impl/dash/coin/header_chain.hpp>       // dash::coin::HeaderChain — SPV header/tip authority (E2a)
 #include <impl/dash/coin/coin_state_maintainer.hpp>  // dash::coin::CoinStateMaintainer — populate ordering gate (E2a)
@@ -1559,6 +1560,41 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // the sourcing leg is live.
             auto qc_cache =
                 std::make_shared<dash::coin::MineableCommitmentCache>();
+
+            // Phase-L VERIFY leg: install the dashbls-backed verifier on the
+            // cache. verified_for() will only yield a REAL commitment once this
+            // passes dashcore's CFinalCommitment::Verify (membersSig aggregate
+            // over the signers' operator keys + quorumSig against
+            // quorumPublicKey, both over BuildCommitmentHash). The verifier
+            // sources the ordered member operator key set via the provider
+            // below; anything it cannot establish with certainty fails CLOSED
+            // (verified_for -> nullopt -> the slot mines the consensus-valid
+            // null commitment, exactly the pre-Phase-L posture — reward-safe).
+            //
+            // MEMBER-SET RESIDUAL: the deterministic quorum member selection
+            // (dashcore llmq/utils.cpp ComputeQuorumMembers: score = hash over
+            // proRegTxHash/confirmedHash with the per-quorum modifier, taken
+            // over the SML AS OF the quorum base block) needs the HISTORICAL
+            // SML at cycleStart+quorumIndex — sourced over coin-P2P qrinfo
+            // (getqrinfo), not yet wired. Until that lands the provider returns
+            // nullopt and Phase-L stays fail-closed to null-serve; the BLS
+            // crypto path is complete + KAT-locked and needs no further change
+            // when the member set arrives. The SML nVersion (VER_LEGACY_BLS/
+            // VER_BASIC_BLS) MUST populate MemberOperatorKey::legacy_scheme so a
+            // mixed-scheme quorum verifies (a bare key hex is scheme-ambiguous).
+            dash::coin::vendor::MemberKeysProvider qc_member_keys =
+                [](uint8_t /*llmqType*/, const uint256& /*quorumHash*/)
+                    -> std::optional<std::vector<dash::coin::vendor::MemberOperatorKey>> {
+                    return std::nullopt;   // historical-SML member selection: qrinfo TODO
+                };
+            qc_cache->set_bls_verify_fn(
+                dash::coin::vendor::make_commitment_bls_verifier(
+                    std::move(qc_member_keys)));
+            if (dash::coin::vendor::bls_backend_available()) {
+                LOG_INFO << "[QC-PHASE-L] dashbls verifier installed "
+                            "(real qc inclusion gated on member-set sourcing)";
+            }
+
             coin_feed_subs.push_back(
                 coin_state.new_qfcommit.subscribe(
                     [qc_cache, qc_net]
