@@ -322,6 +322,95 @@ TEST(DashCoinStateMaintainer, PayeeDesyncWipesDemotesAndFiresReseed) {
     EXPECT_TRUE(fb) << "after a payee desync, get_work must serve the dashd fallback";
 }
 
+
+// ════════════════════════════════════════════════════════════════════════
+// Soak-found 2026-07-23 (E4 re-soak, bad-cb-payee at 1519827): a NON-
+// CONTIGUOUS fold — the connected block is more than one past the payee
+// queue's cursor (seed as-of height or last applied block) — means dashd
+// advanced its DIP-3 payment queue at blocks we never folded. Within a
+// shared-payoutAddress group the resulting cursor lag is invisible to the
+// coinbase cross-check (same script) and surfaces as a served bad-cb-payee
+// at the next address-group boundary. The maintainer must treat a gap
+// exactly like a desync: fail CLOSED (wipe + demote + authoritative
+// re-seed), never fold on a stale cursor. PRE-FIX this folded silently and
+// stayed live serving the lagged projection.
+// ════════════════════════════════════════════════════════════════════════
+TEST(DashCoinStateMaintainer, SeedGapFailsClosedWipesDemotesAndReseeds) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    bool reseed_fired = false;
+    m.set_on_mn_reseed([&]() { reseed_fired = true; });
+    // Seed current as-of H-3: blocks H-2 and H-1 are never folded (the E4
+    // incident's 1519821/1519822, mined during header sync).
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)), H - 3);
+    m.on_new_tip(H - 1, PREV_HASH, BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER, CURTIME, VERSION);
+    ASSERT_TRUE(m.live());
+
+    // The connected block's coinbase DOES pay the projected MN's script —
+    // exactly the incident shape (same shared address), so pre-fix nothing
+    // looked wrong and the wrong cursor slot was advanced.
+    BlockType blk;
+    blk.m_txs.push_back(make_spend(raw256(0x90), 0, 500000000, 1));
+    blk.m_txs[0].vout[0].scriptPubKey.m_data = p2pkh_script(0x30);
+    bind_block(blk);
+    auto r = m.on_block_connected(blk, H);
+
+    EXPECT_TRUE(r.gap_detected);
+    EXPECT_EQ(r.paid, 0u) << "a gapped fold must not attribute the payment";
+    EXPECT_EQ(st.mnstates().size(), 0u) << "stale-cursor payee set must be wiped";
+    EXPECT_FALSE(m.live()) << "a gap must demote the bundle to the dashd fallback";
+    EXPECT_TRUE(reseed_fired) << "a gap must request an authoritative re-seed";
+
+    bool fb = false;
+    WorkSelection sel = st.select_work([&]() { fb = true; return DashWorkData{}; });
+    EXPECT_EQ(sel.source, WorkSource::DashdFallback);
+    EXPECT_TRUE(fb) << "after a payee-queue gap, get_work must serve the dashd fallback";
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Serve-time MN-payee freshness gate (E4 re-soak fix): under
+// require_fresh_mn_payee the embedded arm must NOT serve while the payee
+// queue has not folded every block through the tip it builds on — the
+// projected payee would be a stale queue slot (the incident served
+// templates for 1519823..1519827 off a queue current at 1519820). Once the
+// queue catches up contiguously, the arm serves again. PRE-FIX no such gate
+// existed: viability ignored the payee queue's currency entirely.
+// ════════════════════════════════════════════════════════════════════════
+TEST(DashCoinStateMaintainer, FreshMnPayeeGateRefusesLaggedQueueThenServes) {
+    NodeCoinState st;
+    st.set_require_fresh_mn_payee(true);
+    CoinStateMaintainer m(st);
+    // Queue current as-of H-2, but the tip we build on is H-1: the queue
+    // has not folded block H-1 yet — its projection is pre-H-1 stale.
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)), H - 2);
+    m.on_new_tip(H - 1, PREV_HASH, BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER, CURTIME, VERSION);
+    ASSERT_TRUE(m.live()) << "bundle is populated; the gate acts at viability";
+
+    bool fb1 = false;
+    WorkSelection s1 = st.select_work([&]() { fb1 = true; return DashWorkData{}; });
+    EXPECT_EQ(s1.source, WorkSource::DashdFallback)
+        << "a payee queue lagging the tip must not back an embedded template";
+    EXPECT_TRUE(fb1);
+
+    // Fold the missing block H-1 (contiguous with the H-2 seed; its
+    // coinbase pays the projected MN). The queue is now current AT the tip.
+    BlockType blk;
+    blk.m_txs.push_back(make_spend(raw256(0x90), 0, 500000000, 1));
+    blk.m_txs[0].vout[0].scriptPubKey.m_data = p2pkh_script(0x30);
+    bind_block(blk);
+    auto r = m.on_block_connected(blk, H - 1);
+    EXPECT_FALSE(r.gap_detected);
+    EXPECT_FALSE(r.payee_desync);
+    EXPECT_EQ(r.paid, 1u);
+    ASSERT_TRUE(m.live());
+
+    bool fb2 = false;
+    WorkSelection s2 = st.select_work([&]() { fb2 = true; return DashWorkData{}; });
+    EXPECT_EQ(s2.source, WorkSource::Embedded)
+        << "queue current at the tip: the embedded arm serves again";
+    EXPECT_FALSE(fb2);
+}
+
 // A block whose non-coinbase tx spends the sole MN's collateral removes it
 // (apply_block pass 2). The now-empty set cannot back a masternode payee, so
 // the maintainer drops the embedded bundle and get_work falls back to dashd.

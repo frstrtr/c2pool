@@ -778,6 +778,217 @@ TEST(DashMnState, CoinbaseNotPayingProjectedMnReportsDesyncNoGuess) {
         << "desync must not attribute the payment to the observed-match MN";
 }
 
+
+// ─── seed-gap contiguity (soak-found bad-cb-payee class #2, 2026-07-23) ────
+//
+// E4 re-soak evidence (run/e4-e1e2c, binary 7daa4d61, testnet dashd
+// @192.168.86.52): the E2c seed was fetched as-of h=1519820; blocks 1519821
+// and 1519822 were mined during header sync and NEVER folded; the first live
+// full-block fold was 1519823. dashd advanced its DIP-3 payment cursor at
+// the two skipped blocks (both paid yeRZB…-group MNs: 6d1b185b…, 8e11eb78…);
+// c2pool's queue did not, so every subsequent fold marked a 2-slots-behind
+// MN of the SAME shared payout address (invisible to the pass-3 script
+// cross-check). At 1519827 dashd's head crossed into the yVXDA… group
+// (617d72f6…) while our lagged head was still yeRZB…-member 05b68797… —
+// bad-cb-payee served for the whole 1519826→1519827 window; the desync net
+// only fired at 1519827-connect, one block too late by construction.
+//
+// Fix under test: load(entries, as_of) seeds the forward-contiguous apply
+// cursor; apply_block REFUSES a non-contiguous fold (gap_detected, no
+// mutation) so the caller fails closed + re-seeds instead of silently
+// advancing a stale queue.
+
+// The seed's as-of height IS the cursor: duplicate/old folds are skipped,
+// a gapped fold is refused, only as_of+1 advances.
+TEST(DashMnState, SeedAsOfHeightSeedsContiguityCursor) {
+    MnStateMachine m;
+    auto shared = script_bytes(0x47, 25);
+    MNState a; a.isValid = true; a.scriptPayout.m_data = shared;
+    a.nRegisteredHeight = 1'000'000; a.nLastPaidHeight = 1'519'100;
+    a.collateralOutpoint.hash = raw256_byte(0, 0xA4);
+    uint256 hA = raw256_byte(0, 0x01);
+    m.load(std::vector<std::pair<uint256, MNState>>{{hA, a}}, 1'519'820);
+    EXPECT_EQ(m.last_applied_height(), 1'519'820u);
+
+    BlockType blk;
+    blk.m_txs.push_back(coinbase_tx(std::vector<std::vector<unsigned char>>{shared}));
+
+    // At/below the seed: duplicate/out-of-order, skipped whole.
+    auto r0 = m.apply_block(blk, 1'519'820);
+    EXPECT_TRUE(r0.skipped_out_of_order);
+
+    // Beyond as_of+1: a gap — blocks 1'519'821..822 would be skipped and the
+    // cursor would go stale. PRE-FIX the machine folded this silently (the
+    // incident); POST-FIX it refuses with gap_detected and no mutation.
+    auto r2 = m.apply_block(blk, 1'519'823);
+    EXPECT_TRUE(r2.gap_detected);
+    EXPECT_EQ(r2.paid, 0u);
+    EXPECT_EQ(m.last_applied_height(), 1'519'820u);
+    EXPECT_EQ(m.entries().at(hA).nLastPaidHeight, 1'519'100u)
+        << "a gapped apply must not attribute anything";
+
+    // Exactly as_of+1: contiguous, folds normally.
+    auto r1 = m.apply_block(blk, 1'519'821);
+    EXPECT_FALSE(r1.gap_detected);
+    EXPECT_EQ(r1.paid, 1u);
+    EXPECT_EQ(m.last_applied_height(), 1'519'821u);
+}
+
+// ─── FROM-WIRE vector: testnet 1519826 → 1519827 (E4 re-soak incident) ─────
+//
+// Real data captured from dashd testnet @192.168.86.52:
+//   - kMnSetAsOf1519825: `protx list valid true 1519825` (85 valid MNs;
+//     payout-address groups: 53x yVXDAM73…, 28x yeRZBWYf…, 4 singles);
+//   - the two coinbase payout scripts from `getblock <hash> 2` at 1519826
+//     (block 0000004c14c66f9f…, MN output 1.11618884 → yeRZBWYf…) and
+//     1519827 (block 0000001cb3001858…, MN output 1.11611384 → yVXDAM73…);
+//   - ground truth specific payees: `protx list valid true <h>` shows
+//     lastPaidHeight==1519826 for ff261d2c… (yeRZB group) and
+//     lastPaidHeight==1519827 for 617d72f6… (yVXDA group).
+
+#include "dash_mn_set_1519825.inc"
+
+static std::vector<unsigned char> hexscript(const char* h) {
+    std::vector<unsigned char> v;
+    auto nib = [](char c) -> unsigned {
+        return (c >= '0' && c <= '9') ? unsigned(c - '0') : unsigned(c - 'a' + 10);
+    };
+    for (const char* p = h; p[0] && p[1]; p += 2)
+        v.push_back(static_cast<unsigned char>((nib(p[0]) << 4) | nib(p[1])));
+    return v;
+}
+
+static std::vector<std::pair<uint256, MNState>> mn_set_as_of_1519825() {
+    std::vector<std::pair<uint256, MNState>> v;
+    for (const auto& e : kMnSetAsOf1519825) {
+        MNState s;
+        s.isValid            = true;
+        s.scriptPayout.m_data = hexscript(e.script);
+        s.nLastPaidHeight    = e.last_paid;
+        s.nRegisteredHeight  = e.registered;
+        s.nPoSeRevivedHeight = e.revived;
+        // distinct collaterals (load() keys a collateral index); the proTx
+        // hash itself is unique per MN so reuse it.
+        s.collateralOutpoint.hash  = uint256S(e.protx);
+        s.collateralOutpoint.index = 0;
+        v.emplace_back(uint256S(e.protx), s);
+    }
+    return v;
+}
+
+// The specific proTxHashes dashd paid (ground truth, see header above).
+static const char* kPaidAt1519826 =
+    "ff261d2c1c76907a2ad8aeb6c5611796f03b5cbd88ae92452a4727e13f4f4ac9";
+static const char* kPaidAt1519827 =
+    "617d72f6941af02ef5f2ceaa2ac0315ed5db0979c45391398f74b0fadc100ca6";
+// The two shared MN payout scripts (P2PKH of yeRZBWYf… / yVXDAM73…).
+static const char* kScriptYeRZB =
+    "76a914c69a0bda7daaae481be8def95e5f347a1d00a4b488ac";
+static const char* kScriptYVXDA =
+    "76a91464f2b2b84f62d68a2cd7f7f5fb2b5aa75ef716d788ac";
+
+// The real coinbase payout scripts (all outputs, in order, from the wire).
+static MutableTransaction coinbase_1519826() {
+    return coinbase_tx(std::vector<std::vector<unsigned char>>{
+        hexscript("76a9142629e1bbb4960da4c86226c876019e55c7c0346288ac"),
+        hexscript("6a"),
+        hexscript(kScriptYeRZB),
+        hexscript("76a91420cb5c22b1e4d5947e5c112c7696b51ad9af3c6188ac"),
+        hexscript("6a28de5d37566ad5bab938ddbe82c123bd051d3ec7c47fbaa641f9"
+                  "0fc9032a5acadf0000000000000000")});
+}
+static MutableTransaction coinbase_1519827() {
+    return coinbase_tx(std::vector<std::vector<unsigned char>>{
+        hexscript("76a914b489115851ca07a26a5ad8bac3cec3c7dbebd83188ac"),
+        hexscript("6a"),
+        hexscript(kScriptYVXDA)});
+}
+
+// (i) After the REAL 1519826 block folds on the REAL 1519825 list, the
+// projection must advance to the SPECIFIC proTxHash dashd pays at 1519827 —
+// 617d72f6… across the shared-address-group boundary into the yVXDA group —
+// exactly mirroring dashd BuildNewListFromBlock + GetMNPayee(pindexPrev).
+TEST(DashMnState, FromWire1519826To1519827AdvancesSpecificProTxAcrossGroupBoundary) {
+    MnStateMachine m;
+    m.load(mn_set_as_of_1519825(), 1'519'825);
+
+    // Projection for 1519826 from the as-of-1519825 list: dashd paid
+    // ff261d2c… (yeRZB group) there.
+    auto p26 = m.find_expected_payee();
+    ASSERT_TRUE(p26.has_value());
+    EXPECT_EQ(p26->GetHex(), kPaidAt1519826);
+
+    BlockType b26;
+    b26.m_txs.push_back(coinbase_1519826());
+    auto r26 = m.apply_block(b26, 1'519'826);
+    EXPECT_FALSE(r26.gap_detected);
+    EXPECT_FALSE(r26.payee_desync);
+    EXPECT_EQ(r26.paid, 1u);
+    EXPECT_EQ(m.entries().at(uint256S(kPaidAt1519826)).nLastPaidHeight,
+              1'519'826u)
+        << "the SPECIFIC projected MN (not just any yeRZB-address MN) must "
+           "carry the payment mark";
+
+    // THE incident assertion: the projection for 1519827 is 617d72f6…
+    // (yVXDA), NOT a yeRZB-group member (the soak binary projected
+    // 05b68797… / yeRZB and served bad-cb-payee).
+    auto p27 = m.find_expected_payee();
+    ASSERT_TRUE(p27.has_value());
+    EXPECT_EQ(p27->GetHex(), kPaidAt1519827);
+    EXPECT_EQ(m.entries().at(*p27).scriptPayout.m_data, hexscript(kScriptYVXDA));
+}
+
+// The incident mechanism itself, from-wire: folding the real 1519826 block
+// over a cursor that missed blocks (the soak missed 1519821+1519822) is
+// REFUSED. PRE-FIX this folded silently — the coinbase pays yeRZB, our
+// (stale) projection is also a yeRZB-group member, so the script cross-check
+// passed and the WRONG specific MN was marked (paid=1, no desync): the
+// silent cursor lag that surfaced as bad-cb-payee at 1519827.
+TEST(DashMnState, FromWireGappedFoldIsRefusedNotSilentlyMisattributed) {
+    MnStateMachine m;
+    m.load(mn_set_as_of_1519825(), 1'519'823);   // cursor claims two blocks behind
+
+    BlockType b26;
+    b26.m_txs.push_back(coinbase_1519826());
+    auto r = m.apply_block(b26, 1'519'826);
+    EXPECT_TRUE(r.gap_detected);
+    EXPECT_FALSE(r.payee_desync);
+    EXPECT_EQ(r.paid, 0u)
+        << "a gapped fold must never attribute the payment (pre-fix it "
+           "marked a wrong same-address MN here)";
+    EXPECT_EQ(m.last_applied_height(), 1'519'823u);
+    EXPECT_EQ(m.entries().at(uint256S(kPaidAt1519826)).nLastPaidHeight,
+              1'519'741u)
+        << "no mutation on a refused apply (1519741 = ff261d2c…'s from-wire "
+           "lastPaidHeight in the 1519825 snapshot)";
+}
+
+// (ii) If the queue is nonetheless wrong (any residual divergence source),
+// the desync net MUST fire the moment the network shows a coinbase that does
+// not pay our projected MN: at 1519827 the projection (617d72f6…/yVXDA after
+// a correct 1519826 fold) vs a coinbase paying yeRZB (what the incident
+// binary emitted) is a DESYNC — nothing attributed, caller fails closed.
+TEST(DashMnState, FromWireWrongGroupCoinbaseFiresDesyncNoAttribution) {
+    MnStateMachine m;
+    m.load(mn_set_as_of_1519825(), 1'519'825);
+    BlockType b26;
+    b26.m_txs.push_back(coinbase_1519826());
+    ASSERT_EQ(m.apply_block(b26, 1'519'826).paid, 1u);
+
+    BlockType bad27;   // the incident binary's wrong-group coinbase
+    bad27.m_txs.push_back(coinbase_tx(std::vector<std::vector<unsigned char>>{
+        hexscript("76a914b489115851ca07a26a5ad8bac3cec3c7dbebd83188ac"),
+        hexscript("6a"),
+        hexscript(kScriptYeRZB)}));
+    auto r = m.apply_block(bad27, 1'519'827);
+    EXPECT_TRUE(r.payee_desync);
+    EXPECT_EQ(r.paid, 0u);
+    EXPECT_EQ(m.entries().at(uint256S(kPaidAt1519827)).nLastPaidHeight,
+              1'519'742u)
+        << "desync must not attribute (1519742 = 617d72f6…'s from-wire "
+           "lastPaidHeight in the 1519825 snapshot)";
+}
+
 // ─── sync_validity_from_sml (Bug 12/14 triple-field reconciliation) ─────────
 
 TEST(DashMnState, SyncValidityFromSmlBansAndRevives) {

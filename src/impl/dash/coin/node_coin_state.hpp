@@ -115,6 +115,19 @@ public:
     const uint256& credit_pool_current_hash() const { return m_credit_pool_current_hash; }
     int32_t credit_pool_height() const { return m_credit_pool_height; }
 
+    /// MN-payee freshness gate (E4 re-soak fix, bad-cb-payee at 1519827).
+    /// The projected masternode payee for height prev+1 is only dashd-exact
+    /// when the payee queue (MnStateMachine) has folded EVERY block through
+    /// the tip we build on: dashd computes GetMNPayee(pindexPrev) on the
+    /// list that connected pindexPrev. When enabled, viability + the
+    /// pre-emit gate require mnstates().last_applied_height() == prev_height
+    /// (the load(as_of) seed counts as "folded through as_of"). A queue
+    /// still catching up — the soak's seed-at-1519820 serving 1519823..27,
+    /// or a tip header that outran its full block — fails closed to the
+    /// reward-safe dashd fallback instead of serving a stale-cursor payee.
+    /// Default OFF preserves prior unit-test posture.
+    void set_require_fresh_mn_payee(bool v) { m_require_fresh_mn_payee = v; }
+
     /// creditPool freshness gate (soak fix). dashcore CheckCreditPoolDiffForBlock
     /// rejects a block whose committed creditPoolBalance is off by a block's
     /// accrual (bad-cbtx-assetlocked-amount). When enabled, viability + the
@@ -255,6 +268,14 @@ public:
         if (m_require_fresh_credit_pool
             && m_credit_pool_height != static_cast<int32_t>(m_prev_height))
             return false;
+        // E4 re-soak fix: the payee queue must have folded every block
+        // through the tip this template builds on, else the projected
+        // masternode payee is a stale queue slot (bad-cb-payee). Re-assert
+        // at emit so a cached template built before the queue lagged (or a
+        // viability bypass) can never reach a miner.
+        if (m_require_fresh_mn_payee
+            && m_mnstates.last_applied_height() != m_prev_height)
+            return false;
         vendor::CCbTx cb;
         if (!vendor::parse_cbtx(w.m_coinbase_payload, cb)) return false;
         if (cb.nHeight != static_cast<int32_t>(next_h)) return false;
@@ -306,6 +327,16 @@ public:
                                  && (!m_require_fresh_credit_pool
                                      || m_credit_pool_height
                                             == static_cast<int32_t>(m_prev_height))
+                                 // E4 re-soak fix (bad-cb-payee at 1519827):
+                                 // refuse a payee queue that has not folded
+                                 // every block through the tip we build on —
+                                 // its projected payee is a stale queue slot
+                                 // (dashd-exact projection requires
+                                 // GetMNPayee on the list that connected
+                                 // pindexPrev).
+                                 && (!m_require_fresh_mn_payee
+                                     || m_mnstates.last_applied_height()
+                                            == m_prev_height)
                                  && (!m_require_sml
                                      || (m_have_sml
                                          && m_quorum_healthy
@@ -363,6 +394,7 @@ private:
     std::function<bool(uint32_t)> m_commitment_window_fn;  // refuse embedded on DKG commitment heights
     bool     m_require_fresh_bestcl{false};  // refuse embedded on a stale/absent bestCL
     bool     m_require_fresh_credit_pool{false}; // refuse embedded on a lagged credit-pool seed
+    bool     m_require_fresh_mn_payee{false};    // refuse embedded on a lagged payee queue (stale cursor)
     int      m_mn_rr_height{DASH_MN_RR_HEIGHT_MAINNET}; // network MN_RR activation height (platform-share gate)
     uint256  m_credit_pool_current_hash;     // block hash the credit-pool seed is current at
     int32_t  m_credit_pool_height{-1};       // seed cbTx's OWN height (-1 = never seeded)
