@@ -116,9 +116,24 @@ std::string address_to_hash160(const std::string& address, std::string& addr_typ
                 carry >>= 8;
             }
         }
+        // P2SH version-byte whitelist. Chain-agnostic: an address whose
+        // version byte is a known P2SH prefix of ANY supported coin yields a
+        // P2SH script; everything else falls through to P2PKH. This is safe
+        // only while no supported coin uses one of these bytes as its P2PKH
+        // version — verified against upstream chainparams:
+        //   0x05 BTC/BCH-legacy mainnet P2SH ('3')
+        //   0x32 LTC mainnet P2SH ('M')          0x3a LTC testnet P2SH ('Q')
+        //   0x16 DOGE mainnet P2SH ('9'/'A')
+        //   0xc4 BTC/LTC/DOGE/DGB testnet P2SH ('2')
+        //   0x10 DASH mainnet P2SH ('7')         0x13 DASH testnet P2SH ('8'/'9')
+        // P2PKH versions in use (must never appear above): 0x00 BTC, 0x30 LTC,
+        // 0x1e DOGE/DGB, 0x4c DASH, 0x8c DASH-testnet, 0x6f BTC/LTC-testnet.
+        // (DASH bytes verified against dashpay/dash chainparams.cpp: mainnet
+        // SCRIPT_ADDRESS=16, testnet/devnet/regtest SCRIPT_ADDRESS=19.)
         uint8_t version = decoded[0];
         if (version == 0x32 || version == 0x05 || version == 0x3a ||
-            version == 0xc4 || version == 0x16) {
+            version == 0xc4 || version == 0x16 || version == 0x10 ||
+            version == 0x13) {
             addr_type = "p2sh";
         } else {
             addr_type = "p2pkh";

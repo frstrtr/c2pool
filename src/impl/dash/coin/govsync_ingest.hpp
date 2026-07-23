@@ -10,7 +10,9 @@
 //     added to the store; everything else is dropped.
 //   * new_govvote   -> CoinStateMaintainer::on_govvote: a governance vote. A
 //     FUNDING-signal vote on a known trigger is counted ONLY if the maintainer's
-//     vote verifier confirms its ECDSA signature (default UNSET => fail closed).
+//     vote verifier confirms its signature — for TRIGGER funding votes that is
+//     BLS by the MN's OPERATOR key, NOT ECDSA/keyIDVoting (see the verifier
+//     contract in coin_state_maintainer.hpp). Default UNSET => fail closed.
 //
 // LIFETIME: the handlers capture maint by reference, so maint (and the
 // NodeCoinState it drives) MUST outlive node. Same EventDisposable teardown
