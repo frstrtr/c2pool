@@ -29,6 +29,7 @@
 
 #include <impl/dash/coin/node_coin_state.hpp>    // NodeCoinState
 #include <impl/dash/coin/governance_store.hpp>   // GovernanceStore (daemonless superblock)
+#include <impl/dash/coin/govsync_status.hpp>     // GovSyncStatus (R5 completeness determination)
 #include <impl/dash/coin/governance_object.hpp>  // parse_superblock_trigger, govvote_signature_hash
 #include <impl/dash/coin/superblock.hpp>         // get_superblock_payments (R6 cross-check + provider)
 #include <impl/dash/coin/mn_state_machine.hpp>   // MNState
@@ -49,8 +50,10 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <ctime>
 #include <functional>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -118,6 +121,42 @@ public:
     /// R6 desync latch state (observability / tests).
     bool gov_desync_latched() const { return m_gov_desync_latched; }
 
+    // ── R5 govsync-completeness determination ────────────────────────────────
+    // Models dashcore CMasternodeSync's governance-phase completion (peer
+    // coverage + time-quiescence) — the "is governance synced" gate the
+    // NodeCoinState superblock guard consults via set_superblock_sync_complete_fn.
+    // Fed from the SAME reception path as the GovernanceStore (on_govobject /
+    // on_govvote re-arm quiescence) plus note_govsync_requested from the govsync
+    // send site. gov_sync_complete() is the production predicate main_dash wires.
+
+    /// Completeness tunables (main_dash sets these from the deployment; a
+    /// single-peer deployment leaves min_peers unmet => permanently INCOMPLETE
+    /// => reward-safe dashd fallback). See govsync_status.hpp for the model.
+    void set_gov_sync_params(size_t min_peers, int64_t settle_secs,
+                             int64_t quiesce_secs) {
+        m_gov_sync_status.set_params(min_peers, settle_secs, quiesce_secs);
+    }
+
+    /// Override the wall-clock source (default std::time). Tests inject a fake
+    /// clock so the settle/quiesce windows are deterministic.
+    void set_now_fn(std::function<int64_t()> fn) { m_now_fn = std::move(fn); }
+
+    /// The govsync send site (main_dash) calls this whenever it issues an
+    /// MNGOVERNANCESYNC to a peer — records peer coverage + (re)arms quiescence.
+    void note_govsync_requested(const std::string& peer_key) {
+        m_gov_sync_status.note_govsync_requested(peer_key, m_now_fn());
+    }
+
+    /// The production completeness predicate: TRUE only when the daemonless
+    /// governance view has provably caught up (peer coverage + settle + quiesce).
+    /// Default (nothing synced) => false => superblock heights fail closed.
+    bool gov_sync_complete() const {
+        return m_gov_sync_status.is_complete(m_now_fn());
+    }
+
+    /// Observability handle (logs / tests).
+    const GovSyncStatus& gov_sync_status() const { return m_gov_sync_status; }
+
     /// Vote verification seam — the contract the follow-up implementer MUST
     /// build to (WRONG-SCHEME WARNING: trigger funding votes are NOT
     /// ECDSA/keyIDVoting-signed; that path applies only to PROPOSAL funding
@@ -164,6 +203,10 @@ public:
     /// bytes). The parse is CHAIN-STRICT per set_gov_params.
     void on_govobject(const uint256& object_hash, int32_t object_type,
                       const std::vector<uint8_t>& vch_data) {
+        // R5: ANY object arrival (trigger, proposal, or malformed) proves the
+        // peer is still streaming its set — re-arm the quiescence window BEFORE
+        // the type filter, so a stream of proposals still keeps us "mid-sync".
+        m_gov_sync_status.note_object_arrival(m_now_fn());
         if (object_type != GOVERNANCE_OBJECT_TRIGGER) return;   // only superblock triggers
         std::string plain(vch_data.begin(), vch_data.end());
         auto trig = parse_superblock_trigger(plain, object_hash, m_gov_testnet);
@@ -187,6 +230,9 @@ public:
     /// by the MN's OPERATOR key (see set_vote_verifier — default UNSET =>
     /// never counted => fail closed).
     void on_govvote(const GovVoteContext& v, const std::string& mn_outpoint_key) {
+        // R5: ANY vote arrival re-arms the quiescence window (mid-sync signal),
+        // BEFORE the signal/outcome/known-trigger filters below.
+        m_gov_sync_status.note_vote_arrival(m_now_fn());
         if (v.signal != VOTE_SIGNAL_FUNDING) return;            // only the superblock tally axis
         if (v.outcome != VOTE_OUTCOME_YES && v.outcome != VOTE_OUTCOME_NO &&
             v.outcome != VOTE_OUTCOME_ABSTAIN)
@@ -799,6 +845,8 @@ private:
                                "(superblock heights fail to dashd until "
                                "restart); re-issuing work.";
                 m_gov_store.clear();
+                m_gov_sync_status.reset();   // R5: a proven-wrong view is no
+                                             // longer "complete"; force re-sync
                 m_gov_desync_latched = true;
                 // Transient invalidate + re-issue so any currently-published
                 // template is rebuilt. The MN axis is a separate axis — if it
@@ -832,6 +880,12 @@ private:
 
     NodeCoinState& m_state;
     GovernanceStore m_gov_store;             // E-SUPERBLOCK: govsync object/vote store
+    GovSyncStatus   m_gov_sync_status;       // R5: govsync-completeness determination
+    // Wall-clock source for the completeness settle/quiesce windows (default
+    // std::time; tests inject a fake clock).
+    std::function<int64_t()> m_now_fn{[]() {
+        return static_cast<int64_t>(std::time(nullptr));
+    }};
     // Vote-verify seam (unset = fail closed). Contract: BLS by the MN's
     // OPERATOR key for trigger funding votes — see set_vote_verifier docs.
     std::function<bool(const GovVoteContext&)> m_vote_verifier;
