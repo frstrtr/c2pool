@@ -661,6 +661,123 @@ TEST(DashMnState, FindExpectedPayeeSkipsInvalid) {
     EXPECT_EQ(*exp, raw256_byte(0, 0x05));
 }
 
+// ─── projection attribution (soak-found bad-cb-payee class, 2026-07-22) ────
+//
+// E4 re-soak evidence (run/e4-e1e2b, binary 0b6cd2bb): 13/124 embedded serves
+// REJECTED by dashd with bad-cb-payee. Root cause: the old OBSERVATION
+// attribution (scan coinbase outputs -> pick_paid_mn per match) is not
+// idempotent — ONE duplicated attribution pass over an already-applied block
+// re-picks inside a shared-payoutAddress group (53 testnet MNs share one
+// address) and marks the NEXT MN of the group. The group's payment cursor
+// then runs one slot ahead of dashd's DIP-3 schedule FOREVER, emitting the
+// wrong coinbase payee at every height where the shifted cursor changes the
+// projected address (~10% of serves). Exhaustive replay of the soak's 129
+// embedded emissions reproduced ALL of them (129/129, incl. all 13 fails)
+// from exactly two such duplicated attributions.
+//
+// Fix under test: dashd-exact PROJECTION attribution
+// (evo/deterministicmns.cpp BuildNewListFromBlock: mark
+// GetMNPayee(pindexPrev), never an output-scan inference) + whole-apply
+// forward-only guard + payee-desync fail-closed.
+
+// THE regression KAT (fails on the pre-fix machine, passes post-fix): a
+// duplicated apply of one block must NOT advance a shared-payoutAddress
+// group's payment cursor. Uses only the pre-fix API surface so it compiles
+// against both implementations.
+TEST(DashMnState, SharedPayoutGroupCursorSurvivesDuplicateApply) {
+    MnStateMachine m;
+    auto shared = script_bytes(0x42, 25);   // A and B share this payout
+    auto other  = script_bytes(0x43, 25);   // C pays elsewhere
+
+    MNState a; a.isValid = true; a.scriptPayout.m_data = shared;
+    a.nRegisteredHeight = 1'000'000; a.nLastPaidHeight = 1'519'100;
+    MNState b = a; b.nLastPaidHeight = 1'519'200;
+    MNState c = a; c.scriptPayout.m_data = other; c.nLastPaidHeight = 1'519'300;
+    // Distinct collaterals (load() keys a collateral index).
+    a.collateralOutpoint.hash = raw256_byte(0, 0xA1);
+    b.collateralOutpoint.hash = raw256_byte(0, 0xB1);
+    c.collateralOutpoint.hash = raw256_byte(0, 0xC1);
+
+    uint256 hA = raw256_byte(0, 0x01);
+    uint256 hB = raw256_byte(0, 0x02);
+    uint256 hC = raw256_byte(0, 0x03);
+    m.load(std::vector<std::pair<uint256, MNState>>{{hA, a}, {hB, b}, {hC, c}});
+
+    // dashd schedule: A (oldest) is the payee at H; the block pays `shared`.
+    BlockType blk;
+    blk.m_txs.push_back(coinbase_tx(std::vector<std::vector<unsigned char>>{shared}));
+    auto r1 = m.apply_block(blk, 1'520'000);
+    EXPECT_EQ(r1.paid, 1u);
+    EXPECT_EQ(m.entries().at(hA).nLastPaidHeight, 1'520'000u);
+
+    // DUPLICATE delivery of the same block. Pre-fix: pick_paid_mn skips the
+    // just-marked A and spuriously marks B (the soak corruption). Post-fix:
+    // the whole apply is skipped (forward-only) — no mutation.
+    m.apply_block(blk, 1'520'000);
+    EXPECT_EQ(m.entries().at(hB).nLastPaidHeight, 1'519'200u)
+        << "duplicate apply must not mark the next MN of the shared group";
+
+    // The projected next payee must still be B (dashd's schedule), not C.
+    auto exp = m.find_expected_payee();
+    ASSERT_TRUE(exp.has_value());
+    EXPECT_EQ(*exp, hB)
+        << "group cursor ran one slot ahead after a duplicate apply";
+}
+
+// Projection attribution marks exactly the projected MN and reports it —
+// and an out-of-order (height <=) delivery is skipped whole.
+TEST(DashMnState, ApplyBlockIsForwardOnlyAndReportsSkip) {
+    MnStateMachine m;
+    auto shared = script_bytes(0x44, 25);
+    MNState a; a.isValid = true; a.scriptPayout.m_data = shared;
+    a.nRegisteredHeight = 1'000'000; a.nLastPaidHeight = 1'519'100;
+    a.collateralOutpoint.hash = raw256_byte(0, 0xA2);
+    uint256 hA = raw256_byte(0, 0x01);
+    m.load(std::vector<std::pair<uint256, MNState>>{{hA, a}});
+    EXPECT_EQ(m.last_applied_height(), 0u);
+
+    BlockType blk;
+    blk.m_txs.push_back(coinbase_tx(std::vector<std::vector<unsigned char>>{shared}));
+    auto r1 = m.apply_block(blk, 1'520'000);
+    EXPECT_FALSE(r1.skipped_out_of_order);
+    EXPECT_EQ(r1.paid, 1u);
+    EXPECT_EQ(m.last_applied_height(), 1'520'000u);
+
+    auto r2 = m.apply_block(blk, 1'520'000);     // duplicate
+    EXPECT_TRUE(r2.skipped_out_of_order);
+    EXPECT_EQ(r2.paid, 0u);
+    auto r3 = m.apply_block(blk, 1'519'999);     // out-of-order
+    EXPECT_TRUE(r3.skipped_out_of_order);
+    EXPECT_EQ(m.last_applied_height(), 1'520'000u);
+}
+
+// A coinbase that does NOT pay the projected MN is a payee DESYNC: nothing is
+// attributed (never guess) and the apply reports payee_desync so the caller
+// fails closed. The old code silently marked whatever MN matched any output.
+TEST(DashMnState, CoinbaseNotPayingProjectedMnReportsDesyncNoGuess) {
+    MnStateMachine m;
+    auto sA = script_bytes(0x45, 25);
+    auto sB = script_bytes(0x46, 25);
+    MNState a; a.isValid = true; a.scriptPayout.m_data = sA;
+    a.nRegisteredHeight = 1'000'000; a.nLastPaidHeight = 1'519'100;  // projected
+    MNState b = a; b.scriptPayout.m_data = sB; b.nLastPaidHeight = 1'519'200;
+    a.collateralOutpoint.hash = raw256_byte(0, 0xA3);
+    b.collateralOutpoint.hash = raw256_byte(0, 0xB3);
+    uint256 hA = raw256_byte(0, 0x01);
+    uint256 hB = raw256_byte(0, 0x02);
+    m.load(std::vector<std::pair<uint256, MNState>>{{hA, a}, {hB, b}});
+
+    // Block pays B's script while the projection says A -> desync, no mark.
+    BlockType blk;
+    blk.m_txs.push_back(coinbase_tx(std::vector<std::vector<unsigned char>>{sB}));
+    auto r = m.apply_block(blk, 1'520'000);
+    EXPECT_TRUE(r.payee_desync);
+    EXPECT_EQ(r.paid, 0u);
+    EXPECT_EQ(m.entries().at(hA).nLastPaidHeight, 1'519'100u);
+    EXPECT_EQ(m.entries().at(hB).nLastPaidHeight, 1'519'200u)
+        << "desync must not attribute the payment to the observed-match MN";
+}
+
 // ─── sync_validity_from_sml (Bug 12/14 triple-field reconciliation) ─────────
 
 TEST(DashMnState, SyncValidityFromSmlBansAndRevives) {

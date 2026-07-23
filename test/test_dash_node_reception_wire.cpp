@@ -353,7 +353,11 @@ TEST(DashReceptionWire, BlockConnectRelayNoSpecialTxPreservesReadiness) {
 
     dash::interfaces::BlockConnected bc;
     bc.height = H;
-    bc.block.m_txs.push_back(make_spend(raw256(0x90), 0, 500'000'000, 1));  // cb (idx 0, skipped)
+    bc.block.m_txs.push_back(make_spend(raw256(0x90), 0, 500'000'000, 1));  // cb (idx 0)
+    // Projection attribution: a readiness-preserving block pays the PROJECTED
+    // payee (every dashd-accepted block does); a non-paying coinbase is a
+    // payee desync and deliberately demotes (maintainer KAT covers it).
+    bc.block.m_txs[0].vout[0].scriptPubKey.m_data = p2pkh_script(0x30);
     bc.block.m_txs.push_back(make_spend(raw256(0x91), 0, 400'000'000, 2));  // plain spend, no collateral
     bind_block(bc.block);
     node.block_connected.happened(bc);
