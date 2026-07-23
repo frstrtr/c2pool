@@ -34,14 +34,16 @@ target_link_libraries(dash_block_replay PRIVATE core nlohmann_json::nlohmann_jso
 # links it is c2pool-dash (this slice), so the ltc/btc/doge/dgb build + ctest
 # surfaces are untouched. Per-coin isolation held: src/impl/dash only, no
 # shared-base/core SOURCE edit, dashd RPC fallback preserved.
-# E1 Phase-L: type-6 quorum-commitment BLS verify (coin/vendor/bls_verify.cpp).
-# Compiled UNCONDITIONALLY so the seam symbols (make_commitment_bls_verifier,
-# verify_final_commitment, build_commitment_hash) always resolve; the dashbls
-# backend is linked + the C2POOL_DASH_BLS define is set (PUBLIC, so the sole
-# consumer c2pool-dash inherits it) ONLY when the library was found. Without it
-# the verify functions are fail-closed stubs and NO dashbls dependency enters
-# the build — keeping the Windows main_ltc launcher (shared core only) clean.
-# SAFE-ADDITIVE: the only executable linking dash_bls_verify is c2pool-dash.
+# E1 Phase-L / E-SUPERBLOCK: BLS verify (coin/vendor/bls_verify.cpp). Provides
+# BOTH the type-6 quorum-commitment aggregate verify (Phase-L) AND the single-
+# signature governance-vote operator-key verify (R3 daemonless superblock
+# serving — verify_govvote_operator_sig). Compiled UNCONDITIONALLY so the seam
+# symbols always resolve; the dashbls backend is linked + the C2POOL_DASH_BLS
+# define is set (PUBLIC, so the sole consumer c2pool-dash inherits it) ONLY when
+# the library was found. Without it the verify functions are fail-closed stubs
+# and NO dashbls dependency enters the build — keeping the Windows main_ltc
+# launcher (shared core only) clean. SAFE-ADDITIVE: the only executable linking
+# dash_bls_verify is c2pool-dash (plus its KAT test_dash_govvote_bls).
 add_library(dash_bls_verify STATIC coin/vendor/bls_verify.cpp)
 target_include_directories(dash_bls_verify PRIVATE
     ${CMAKE_SOURCE_DIR}/src

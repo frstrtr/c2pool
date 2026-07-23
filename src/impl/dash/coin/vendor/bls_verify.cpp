@@ -171,6 +171,69 @@ bool verify_final_commitment(const CFinalCommitment& c,
 #endif // C2POOL_DASH_BLS
 }
 
+// ── R3: governance-vote operator-key single-sig verify ──────────────────────
+
+bool verify_govvote_operator_sig(
+    const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& pubkey_operator,
+    bool key_legacy_scheme, const uint256& digest,
+    const std::vector<uint8_t>& vch_sig)
+{
+#ifndef C2POOL_DASH_BLS
+    (void)pubkey_operator;
+    (void)key_legacy_scheme;
+    (void)digest;
+    (void)vch_sig;
+    return false;   // no BLS backend → fail closed (vote never tallied → dashd)
+#else
+    // dashcore CGovernanceVote::CheckSignature: a BLS signature is 96 bytes.
+    if (vch_sig.size() != CFinalCommitment::BLS_SIG_SIZE) return false;
+
+    const bls::Bytes msg(digest.data(), 32);   // GetSignatureHash() digest bytes
+
+    try {
+        // The SIGNING scheme (signature wire-encoding + verify DST) and the
+        // OPERATOR KEY's wire-encoding are INDEPENDENT, and dashcore treats them
+        // so: a masternode registered under LEGACY_BLS (nVersion 1) keeps a
+        // legacy-encoded pubKeyOperator forever, yet post-V19 it signs its
+        // governance votes under the CURRENT (BASIC) scheme — a basic-encoded
+        // signature verified with the basic DST. (Pinned against the real
+        // from-wire testnet vote: legacy-encoded pubkey + basic-encoded sig +
+        // basic DST verifies; every other combination fails.) So we vary the
+        // two axes independently: the network signing scheme (BASIC first,
+        // post-V19) drives sig-encoding + DST together; the key's declared
+        // scheme drives the pubkey encoding, other as fallback. A forged/
+        // tampered sig or wrong key verifies under NO combination — this only
+        // widens which LEGITIMATE encodings are accepted, never what is
+        // cryptographically valid.
+        for (bool net_legacy : {false, true}) {   // BASIC (post-V19) first
+            bls::G2Element sig;
+            try {
+                sig = bls::G2Element::FromBytes(
+                    bls::Bytes(vch_sig.data(), vch_sig.size()), net_legacy);
+            } catch (...) { continue; }
+
+            for (bool pk_legacy : {key_legacy_scheme, !key_legacy_scheme}) {
+                bls::G1Element pk;
+                try {
+                    pk = bls::G1Element::FromBytes(
+                        bls::Bytes(pubkey_operator.data(), pubkey_operator.size()),
+                        pk_legacy);
+                } catch (...) { continue; }
+                if (!pk.IsValid()) continue;
+
+                const bool ok = net_legacy
+                    ? bls::LegacySchemeMPL().Verify(pk, msg, sig)
+                    : bls::BasicSchemeMPL().Verify(pk, msg, sig);
+                if (ok) return true;
+            }
+        }
+        return false;
+    } catch (...) {
+        return false;   // any relic/dashbls throw → fail closed
+    }
+#endif // C2POOL_DASH_BLS
+}
+
 // ── seam factory ────────────────────────────────────────────────────────────
 
 std::function<bool(const CFinalCommitment&)>
