@@ -31,6 +31,7 @@
 #include <vector>
 
 #include <impl/dash/coin/won_block_dispatch.hpp>
+#include <impl/dash/coin/coin_p2p_magic.hpp>
 
 using dash::coin::broadcast_won_block;
 using dash::coin::P2pRelaySink;
@@ -234,4 +235,24 @@ TEST(DashWonBlockDualPath, DisconnectedP2pWithNoBackupReachesNeither)
     EXPECT_FALSE(r.rpc_ok);
     EXPECT_FALSE(r.any());              // LOUD "block NOT relayed", never a silent win
     EXPECT_STREQ(r.landed_first, "none");
+}
+
+// 8) E5 --coin-p2p-magic override: the embedded coin-P2P wire magic selector.
+//    No override -> the mainnet/testnet defaults are returned BYTE-FOR-BYTE
+//    unchanged (guards the production ARM A dial from regression). An override
+//    (regtest fcc1b7dc) is honoured verbatim so ARM A can dial a regtest dashd
+//    for the live-accept harness. Transport-only; the defaults must never move.
+TEST(DashWonBlockDualPath, CoinP2pMagicSelectorDefaultsUnchanged)
+{
+    // No override: canonical dashd pchMessageStart per net, unchanged.
+    EXPECT_EQ(dash::coin::select_coin_p2p_magic("", /*testnet=*/false), "bf0c6bbd");
+    EXPECT_EQ(dash::coin::select_coin_p2p_magic("", /*testnet=*/true),  "cee2caff");
+}
+
+TEST(DashWonBlockDualPath, CoinP2pMagicSelectorOverrideHonoured)
+{
+    // Explicit override (regtest V1 magic) wins on both net flags -- the E5
+    // harness lever that lets ARM A dial a regtest coin daemon.
+    EXPECT_EQ(dash::coin::select_coin_p2p_magic("fcc1b7dc", /*testnet=*/true),  "fcc1b7dc");
+    EXPECT_EQ(dash::coin::select_coin_p2p_magic("fcc1b7dc", /*testnet=*/false), "fcc1b7dc");
 }
