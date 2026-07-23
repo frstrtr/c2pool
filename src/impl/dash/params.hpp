@@ -105,7 +105,18 @@ inline core::CoinParams make_coin_params(bool testnet, const PoolOverrides& over
 
     p.target_lookbehind        = SharechainConfig::TARGET_LOOKBEHIND;
     p.spread                   = SharechainConfig::SPREAD;
-    p.minimum_protocol_version = SharechainConfig::MINIMUM_PROTOCOL_VERSION;
+    // v16->v36 crossing: the COLD reject-floor stays at MINIMUM_PROTOCOL_VERSION
+    // (1700) so v16 AND v36 peers COEXIST during the window; the runtime accept-
+    // floor AutoRatchet (node.cpp apply_min_protocol_ratchet) lifts the reject
+    // floor to NEW_MINIMUM_PROTOCOL_VERSION (3600) only once >=95% of the window
+    // work desires v36. advertised_protocol_version (3600) is what we ADVERTISE
+    // (v36 capability, mirrors ltc/dgb params) — NOT the accept-floor; handle_version
+    // keeps minimum_protocol_version as the reject floor. Advertising 3600 is
+    // backward-compatible (legacy 1700-floor peers accept any >=1700) and is
+    // REQUIRED for ratchet coherence: once two nodes ratchet their floor to 3600
+    // they must each advertise >=3600 or they would reject each other.
+    p.minimum_protocol_version    = SharechainConfig::MINIMUM_PROTOCOL_VERSION;
+    p.advertised_protocol_version = SharechainConfig::ADVERTISED_PROTOCOL_VERSION;
     p.block_max_size           = 0;  // DASH: no segwit weight accounting
     p.block_max_weight         = 0;
 
