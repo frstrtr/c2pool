@@ -434,19 +434,27 @@ TEST(DashNodeCoinState, QcPlanServesDkgWindowHeightAndEmitGateEnforcesIt) {
         [](uint32_t next_h) { return dash::coin::is_dkg_commitment_window(next_h); });
     // The same closure shape main_dash installs: the daemonless plan over
     // the node's own QuorumManager + a header-chain hash-at-height lookup.
-    st.set_qc_plan_fn([&st](uint32_t next_h) {
-        return dash::coin::build_daemonless_qc_plan(
-            dash::coin::LlmqNetwork::Testnet, next_h, st.qmgr(),
-            [](uint32_t h) -> std::optional<uint256> {
-                uint256 u;
-                std::memset(u.data(), 0xCD, 32);
-                std::memcpy(u.data(), &h, 4);
-                return u;
-            },
-            [](const uint256&) -> std::optional<uint32_t> {
-                return std::nullopt;   // never needed for an all-null plan
-            });
-    });
+    // Attested failed-DKG evidence for every slot keeps the all-null plan
+    // servable under the height-completeness gate (block-1520106 fix); the
+    // no-evidence fail-closed leg is asserted further down.
+    auto make_plan_fn = [&st](dash::coin::DkgNullEvidenceFn evidence) {
+        return [&st, evidence](uint32_t next_h) {
+            return dash::coin::build_daemonless_qc_plan(
+                dash::coin::LlmqNetwork::Testnet, next_h, st.qmgr(),
+                [](uint32_t h) -> std::optional<uint256> {
+                    uint256 u;
+                    std::memset(u.data(), 0xCD, 32);
+                    std::memcpy(u.data(), &h, 4);
+                    return u;
+                },
+                [](const uint256&) -> std::optional<uint32_t> {
+                    return std::nullopt;   // never needed for an all-null plan
+                },
+                /*cache=*/nullptr, evidence);
+        };
+    };
+    st.set_qc_plan_fn(make_plan_fn(
+        [](uint8_t, const uint256&) { return true; }));
 
     // Tip 1518417 => next block 1518418 (phase 10: the exact height the
     // BLOCKER-1 test above proves REFUSED without a plan).
@@ -490,6 +498,14 @@ TEST(DashNodeCoinState, QcPlanServesDkgWindowHeightAndEmitGateEnforcesIt) {
         wrong_root.m_coinbase_payload = dash::coin::encode_cbtx(cb);
     }
     EXPECT_FALSE(st.embedded_template_emit_ok(wrong_root));
+
+    // COMPLETENESS GATE (block-1520106 fix): the SAME closure without
+    // failed-DKG evidence must fail the whole height closed — mandatory
+    // slots with neither a verified real commitment nor attested-null
+    // evidence are unservable (null-where-unsourced is the bad-cbtx).
+    st.set_qc_plan_fn(make_plan_fn(nullptr));
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable())
+        << "unattested mandatory slots must fail closed to the dashd arm";
 
     // And a plan fn that cannot derive the set (header gap) fails closed —
     // the PHASE-1 reward-safe routing, not a wrong block.

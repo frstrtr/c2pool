@@ -35,10 +35,12 @@
 #include <core/uint256.hpp>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
 #include <fstream>
 #include <map>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -274,8 +276,22 @@ TEST(DashDkgCommitments, FromWireWindowHeightPlanMatchesDashdQuorumRoot)
                          "all-null plan";
         return std::nullopt;
     };
+
+    // COMPLETENESS GATE (block-1520106 fix): without positive failed-DKG
+    // evidence for the three mandatory slots, null is not provably canonical
+    // and the WHOLE height must fail closed — never served with unattested
+    // nulls (the old per-slot behaviour is exactly what diverged the root).
+    EXPECT_FALSE(build_daemonless_qc_plan(
+        LlmqNetwork::Testnet, next_h, qmgr, fake_hash_at, height_of)
+            .has_value())
+        << "unattested null slots must fail the whole height closed";
+
+    // With attested failed-DKG evidence for every slot, the plan serves and
+    // the byte-parity claim below holds.
     auto plan = build_daemonless_qc_plan(
-        LlmqNetwork::Testnet, next_h, qmgr, fake_hash_at, height_of);
+        LlmqNetwork::Testnet, next_h, qmgr, fake_hash_at, height_of,
+        /*cache=*/nullptr,
+        /*null_evidence=*/[](uint8_t, const uint256&) { return true; });
     ASSERT_TRUE(plan.has_value());
 
     // The current cycle's quorums cannot be in the (older) fixture set, so
@@ -450,12 +466,20 @@ TEST(DashDkgCommitments, MineableCacheStructuralAdmissionAndBlsGate)
     ASSERT_TRUE(cache.ingest(LlmqNetwork::Mainnet, good));
     EXPECT_EQ(cache.size(), 1u);
 
-    // THE Phase-L line: without a BLS verifier the cache NEVER serves — the
-    // provider must mine the consensus-valid null commitment instead.
+    // THE Phase-L line: without a BLS verifier the cache NEVER serves. Under
+    // the completeness gate an unverified mandatory slot with no failed-DKG
+    // evidence fails the WHOLE height closed (block-1520106 fix)...
     EXPECT_FALSE(cache.has_bls_verifier());
     EXPECT_FALSE(cache.verified_for(1, qh).has_value());
+    EXPECT_FALSE(daemonless_qc_commitments(
+        LlmqNetwork::Mainnet, 1'900'812u, fake_hash_at, never_mined, &cache)
+            .has_value())
+        << "unverifiable mandatory slots must fail the whole height closed";
+    // ...and with attested failed-DKG evidence the consensus-valid nulls are
+    // mined (the only case where null is canonical).
     auto plan_commitments = daemonless_qc_commitments(
-        LlmqNetwork::Mainnet, 1'900'812u, fake_hash_at, never_mined, &cache);
+        LlmqNetwork::Mainnet, 1'900'812u, fake_hash_at, never_mined, &cache,
+        [](uint8_t, const uint256&) { return true; });
     ASSERT_TRUE(plan_commitments.has_value());
     for (const auto& c : *plan_commitments)
         EXPECT_EQ(c.CountSigners(), 0) << "unverified commitment served";
@@ -468,6 +492,203 @@ TEST(DashDkgCommitments, MineableCacheStructuralAdmissionAndBlsGate)
     // And a failing verifier withholds it again.
     cache.set_bls_verify_fn([](const CFinalCommitment&) { return false; });
     EXPECT_FALSE(cache.verified_for(1, qh).has_value());
+}
+
+// ── block 1520106: HEIGHT-COMPLETENESS KATs (real from-wire vectors) ───────
+//
+// The definitive-soak bad-cbtx: 1520106 is the FIRST height of the rotated
+// LLMQ_60_75 (type 5, DIP-24) mining window (phase 42 of the 288-cycle) AND
+// phase 18 of the 24-cycle (types 1/4/6 already mined) AND phase 42 of the
+// 576-cycle (type 3 window). dashd mined 33 mandatory qc txs: 29 REAL
+// rotated type-5 (idx 0..31 minus {2,3,31}), 3 null type-5 (idx 2/3/31,
+// failed DKGs) and 1 null type-3. Pre-fix Phase-L null-served all 33 slots
+// (rotated member sourcing unsupported => BLS verify fail-closed), folded
+// NOTHING, and committed block 1520105's root verbatim — diverging from
+// dashd's with-block root = FAIL_BAD_CBTX.
+
+#include "data/dash_qc_1520106_kat.hpp"
+
+namespace {
+
+CFinalCommitment parse_commitment_hex(const std::string& hex)
+{
+    ::PackStream s;
+    s.from_hex(hex);
+    CFinalCommitment c;
+    s >> c;
+    EXPECT_EQ(s.cursor_size(), 0u) << "trailing bytes in commitment fixture";
+    return c;
+}
+
+uint256 disp_to_u256(const std::string& disp)
+{
+    uint256 u;
+    u.SetHex(disp);
+    return u;
+}
+
+std::string span_hex(std::span<const std::byte> sp)
+{
+    static const char* d = "0123456789abcdef";
+    std::string out;
+    out.reserve(sp.size() * 2);
+    for (auto b : sp) {
+        const auto v = std::to_integer<uint8_t>(b);
+        out.push_back(d[v >> 4]);
+        out.push_back(d[v & 0xf]);
+    }
+    return out;
+}
+
+QuorumManager make_qmgr_1520105()
+{
+    vendor::QuorumTail tail;
+    for (const auto& hex : dash_qc1520106::kActiveCommitmentHex)
+        tail.newQuorums.push_back(parse_commitment_hex(hex));
+    QuorumManager qmgr;
+    qmgr.apply(tail);
+    EXPECT_EQ(qmgr.active_count(), 109u);
+    return qmgr;
+}
+
+std::optional<uint256> hash_at_1520106(uint32_t h)
+{
+    if (h >= dash_qc1520106::kRotatedCycleBase
+        && h < dash_qc1520106::kRotatedCycleBase + 32)
+        return disp_to_u256(dash_qc1520106::kBaseHashDisp
+                                [h - dash_qc1520106::kRotatedCycleBase]);
+    return std::nullopt;   // any other lookup would itself fail closed
+}
+
+// The four genuinely-failed DKG slots dashd mined NULL commitments for.
+bool failed_dkg_1520106(uint8_t type, const uint256& qh)
+{
+    using namespace dash_qc1520106;
+    if (type == 3) return qh == disp_to_u256(kBaseHashDisp[0]);
+    if (type != 5) return false;
+    return qh == disp_to_u256(kBaseHashDisp[2])
+        || qh == disp_to_u256(kBaseHashDisp[3])
+        || qh == disp_to_u256(kBaseHashDisp[31]);
+}
+
+} // namespace
+
+TEST(DashDkgCommitments, Block1520106MandatorySlotSetMatchesDashd)
+{
+    auto qmgr = make_qmgr_1520105();
+    auto has_mined = [&qmgr](uint8_t t, const uint256& qh) {
+        return qmgr.find(t, qh).has_value();
+    };
+    // The interval-24 types (1/4/6, cycle base 1520088 = rotated base idx
+    // 24) were mined at phase 10 and must be IN the active set — that is
+    // what suppresses their slots at phase 18.
+    const uint256 base24 = disp_to_u256(dash_qc1520106::kBaseHashDisp[24]);
+    for (uint8_t t : {1, 4, 6})
+        ASSERT_TRUE(has_mined(t, base24)) << "type " << int(t);
+
+    auto slots = compute_required_qc_slots(
+        LlmqNetwork::Testnet, dash_qc1520106::kHeight,
+        hash_at_1520106, has_mined);
+    ASSERT_TRUE(slots.has_value());
+    // Exactly dashd's mined set: 32 rotated type-5 slots then the type-3
+    // slot (AddLLMQ order == the block's qc tx order).
+    ASSERT_EQ(slots->size(), 33u);
+    for (int i = 0; i < 32; ++i) {
+        EXPECT_EQ((*slots)[static_cast<size_t>(i)].params.type, 5);
+        EXPECT_EQ((*slots)[static_cast<size_t>(i)].quorum_index, i);
+        EXPECT_EQ((*slots)[static_cast<size_t>(i)].quorum_hash,
+                  disp_to_u256(dash_qc1520106::kBaseHashDisp
+                                   [static_cast<size_t>(i)]));
+    }
+    EXPECT_EQ(slots->back().params.type, 3);
+    EXPECT_EQ(slots->back().quorum_index, 0);
+    EXPECT_EQ(slots->back().quorum_hash,
+              disp_to_u256(dash_qc1520106::kBaseHashDisp[0]));
+}
+
+TEST(DashDkgCommitments, Block1520106WithBlockFoldReproducesDashdRoot)
+{
+    auto qmgr = make_qmgr_1520105();
+
+    // The active-set root IS the root the soak build served at 1520106 —
+    // the completeness-gap signature (it folded nothing).
+    EXPECT_EQ(compute_merkle_root_quorums(qmgr).GetHex(),
+              dash_qc1520106::kQuorumRootActive1520105Disp);
+
+    std::vector<CFinalCommitment> block_qcs;
+    for (const auto& hex : dash_qc1520106::kBlockCommitmentHex)
+        block_qcs.push_back(parse_commitment_hex(hex));
+    ASSERT_EQ(block_qcs.size(), 33u);
+
+    auto height_of = [](const uint256&) -> std::optional<uint32_t> {
+        ADD_FAILURE() << "eviction ordering must not be needed (rotated "
+                         "replacement + skipped nulls only)";
+        return std::nullopt;
+    };
+    auto root = compute_merkle_root_quorums_with_block(
+        LlmqNetwork::Testnet, qmgr, block_qcs, height_of);
+    ASSERT_TRUE(root.has_value());
+    // BYTE PARITY with the root dashd mined in block 1520106's cbTx.
+    EXPECT_EQ(root->GetHex(), dash_qc1520106::kQuorumRootMined1520106Disp);
+}
+
+TEST(DashDkgCommitments, Block1520106CompletenessGateFailsClosedThenServes)
+{
+    auto qmgr = make_qmgr_1520105();
+    auto height_of = [](const uint256&) -> std::optional<uint32_t> {
+        return std::nullopt;   // must not be needed on any served path here
+    };
+
+    // (1) THE SOAK REALITY (fail-before/pass-after): rotated member sourcing
+    // unsupported => cache empty/unverifiable => pre-fix the plan null-served
+    // all 33 slots and committed the 1520105 root (bad-cbtx). Post-fix the
+    // WHOLE height must fail closed — no plan, arm=dashd-fallback.
+    RequiredQcSlot gap{};
+    EXPECT_FALSE(build_daemonless_qc_plan(
+        LlmqNetwork::Testnet, dash_qc1520106::kHeight, qmgr,
+        hash_at_1520106, height_of,
+        /*cache=*/nullptr, /*null_evidence=*/nullptr, &gap).has_value())
+        << "unsourceable rotated slots must fail the whole height closed";
+    EXPECT_EQ(gap.params.type, 5);
+    EXPECT_EQ(gap.quorum_index, 0);   // first unsatisfiable mandatory slot
+
+    // (2) PARTIAL sourcing: all 29 real rotated commitments BLS-verified,
+    // but no failed-DKG evidence for the 4 null slots => still the whole
+    // height (null-where-dashd-null cannot be assumed from absence).
+    MineableCommitmentCache cache;
+    std::vector<CFinalCommitment> block_qcs;
+    for (const auto& hex : dash_qc1520106::kBlockCommitmentHex)
+        block_qcs.push_back(parse_commitment_hex(hex));
+    for (const auto& c : block_qcs)
+        if (c.CountSigners() > 0)
+            ASSERT_TRUE(cache.ingest(LlmqNetwork::Testnet, c));
+    EXPECT_EQ(cache.size(), 29u);
+    cache.set_bls_verify_fn([](const CFinalCommitment&) { return true; });
+    EXPECT_FALSE(build_daemonless_qc_plan(
+        LlmqNetwork::Testnet, dash_qc1520106::kHeight, qmgr,
+        hash_at_1520106, height_of, &cache,
+        /*null_evidence=*/nullptr, &gap).has_value())
+        << "an unattested null slot must fail the whole height closed";
+    EXPECT_EQ(gap.params.type, 5);
+    EXPECT_EQ(gap.quorum_index, 2);   // idx 2 = the first failed-DKG slot
+
+    // (3) COMPLETE sourcing: 29 verified reals + positive failed-DKG
+    // evidence for exactly the 4 slots dashd mined null => the height
+    // serves, every commitment byte-matches dashd's mined qc tx (including
+    // the legitimately-null ones), and the committed root is dashd's.
+    auto plan = build_daemonless_qc_plan(
+        LlmqNetwork::Testnet, dash_qc1520106::kHeight, qmgr,
+        hash_at_1520106, height_of, &cache, failed_dkg_1520106);
+    ASSERT_TRUE(plan.has_value());
+    ASSERT_EQ(plan->commitments.size(), 33u);
+    for (size_t i = 0; i < 33; ++i) {
+        auto packed = ::pack(plan->commitments[i]);
+        EXPECT_EQ(span_hex(packed.get_span()),
+                  dash_qc1520106::kBlockCommitmentHex[i])
+            << "commitment " << i << " must byte-match dashd's mined qc";
+    }
+    EXPECT_EQ(plan->merkle_root_quorums.GetHex(),
+              dash_qc1520106::kQuorumRootMined1520106Disp);
 }
 
 // ── template integration ───────────────────────────────────────────────────

@@ -102,9 +102,30 @@
 ///       it only needs to verify-and-include, which (1)+(2) cover.
 ///
 /// Until then an unverified relayed commitment MUST NOT be mined (a
-/// malicious peer could hand us a bad-qc-invalid block), so the provider
-/// falls back to the always-consensus-valid NULL commitment for that
-/// slot — exactly what dashd mines when IT has no verified commitment.
+/// malicious peer could hand us a bad-qc-invalid block).
+///
+/// HEIGHT COMPLETENESS (fail-closed, definitive-soak block 1520106): the
+/// merkleRootQuorums fold is PER-HEIGHT, so the serve decision must be
+/// per-height ALL-OR-NOTHING, never per-slot. A null commitment is
+/// consensus-VALID for any slot (CheckLLMQCommitment VerifyNull), but it
+/// is only CANONICAL — only reproduces the root the network's dashd
+/// miners commit — when that quorum's DKG genuinely failed and dashd's
+/// own commitment is ALSO null. Serving null for a slot whose DKG
+/// SUCCEEDED (rotated-unsupported, member-set-unsourced, relay gap,
+/// verify-fail) skips a leaf every dashd folds in, diverging the whole
+/// merkleRootQuorums = bad-cbtx verdict. At 1520106 (first height of the
+/// rotated LLMQ_60_75 window) all 32 mandatory rotated slots null-served
+/// while dashd mined 29 REAL rotated commitments: the served root was
+/// byte-identical to block 1520105's (folded nothing) vs dashd's
+/// with-block root. THE RULE: a slot with no BLS-verified real
+/// commitment may be served null ONLY on positive evidence that dashd's
+/// commitment for that quorum is also null (DkgNullEvidenceFn); absence
+/// of a relayed qfcommit is NOT that evidence (absence != vote — the
+/// 07-14 ratchet lesson). Otherwise the WHOLE height is underivable:
+/// return nullopt so the embedded arm fails closed to the dashd
+/// fallback. Until rotated (DIP-24) member sourcing lands, any height
+/// whose mandatory set includes a rotated slot therefore falls back
+/// unless every rotated slot has attested-null evidence.
 ///
 /// MAINTENANCE: the params table + enabled sets + V19 floors below are
 /// copied VERBATIM from dashcore llmq/params.h + chainparams.cpp @
@@ -375,16 +396,32 @@ private:
 
 // ── Daemonless provider (the piece main_dash wires in) ─────────────────────
 
+/// Positive attestation that the DKG for (llmq_type, quorum_hash) genuinely
+/// FAILED — i.e. dashd's own miner mines the NULL commitment for that slot,
+/// so serving null is canonical (reproduces the network root). This must be
+/// EVIDENCE of the failure, never inference from the absence of a relayed
+/// qfcommit (a relay gap looks identical and null-serving through it is the
+/// exact 1520106 divergence). No production source is wired yet: until one
+/// exists (e.g. DKG-phase observation), an unsatisfiable slot fails the
+/// whole height closed. Tests/harness inject attested vectors.
+using DkgNullEvidenceFn =
+    std::function<bool(uint8_t llmq_type, const uint256& quorum_hash)>;
+
 /// The full mandatory type-6 set for block `next_height`, sourced without
-/// dashd: real BLS-verified commitments from `cache` when available (Phase
-/// L), the consensus-valid null commitment otherwise. std::nullopt => the
-/// set cannot be derived safely; the embedded arm must fail closed.
+/// dashd — per-height ALL-OR-NOTHING (see HEIGHT COMPLETENESS above). Every
+/// slot must carry either a BLS-verified REAL commitment from `cache` or an
+/// attested-null (null_evidence): std::nullopt => at least one mandatory
+/// slot is unsatisfiable (or the slot set itself cannot be derived) and the
+/// embedded arm must fail closed for the WHOLE height. `first_gap`, when
+/// non-null, receives the first unsatisfiable slot (observability only).
 inline std::optional<std::vector<vendor::CFinalCommitment>>
 daemonless_qc_commitments(
     LlmqNetwork net, uint32_t next_height,
     const std::function<std::optional<uint256>(uint32_t)>& hash_at_height,
     const std::function<bool(uint8_t, const uint256&)>& has_mined,
-    const MineableCommitmentCache* cache = nullptr)
+    const MineableCommitmentCache* cache = nullptr,
+    const DkgNullEvidenceFn& null_evidence = nullptr,
+    RequiredQcSlot* first_gap = nullptr)
 {
     auto slots = compute_required_qc_slots(net, next_height,
                                            hash_at_height, has_mined);
@@ -400,18 +437,25 @@ daemonless_qc_commitments(
                 // base_height % dkgInterval == quorumIndex; the slot's
                 // quorum_index IS that value by construction (base = cycleStart
                 // + quorum_index). Serving a commitment whose quorumIndex does
-                // not match this slot => bad-qc-invalid = lost block, so refuse
-                // it and mine the consensus-valid null commitment instead
-                // (reward-safe; the honest-copy DoS via keep-best dedup is the
-                // flagged availability-only follow-up).
+                // not match this slot => bad-qc-invalid = lost block, so treat
+                // the slot as unsatisfiable (the honest-copy DoS via keep-best
+                // dedup is the flagged availability-only follow-up).
                 if (real->quorumIndex == s.quorum_index) {
                     out.push_back(std::move(*real));
                     continue;
                 }
             }
         }
-        out.push_back(build_null_commitment(s.params, s.quorum_hash,
-                                            s.quorum_index));
+        // No verified real commitment for this mandatory slot. Null is
+        // canonical ONLY on positive failed-DKG evidence; otherwise the
+        // whole height is unservable (completeness gate — the 1520106 fix).
+        if (null_evidence && null_evidence(s.params.type, s.quorum_hash)) {
+            out.push_back(build_null_commitment(s.params, s.quorum_hash,
+                                                s.quorum_index));
+            continue;
+        }
+        if (first_gap != nullptr) *first_gap = s;
+        return std::nullopt;
     }
     return out;
 }
@@ -501,30 +545,36 @@ inline std::optional<uint256> compute_merkle_root_quorums_with_block(
 
 /// Everything the embedded template needs at one height: the ordered
 /// mandatory type-6 commitment set (empty off-window / all-mined) plus the
-/// merkleRootQuorums INCLUDING those commitments. While the set is all-null
-/// (the pre-Phase-L posture) the root equals the PROVEN
-/// compute_merkle_root_quorums(qmgr) by construction.
+/// merkleRootQuorums INCLUDING those commitments. Every commitment in the
+/// set is either BLS-verified real or attested-null (the completeness gate
+/// in daemonless_qc_commitments) — a partially-sourced height never
+/// produces a plan.
 struct QcBlockPlan {
     std::vector<vendor::CFinalCommitment> commitments;
     uint256 merkle_root_quorums;
 };
 
 /// Compose the full daemonless plan. std::nullopt => cannot be derived
-/// safely at this height; the embedded arm must fail closed to the dashd
-/// fallback (exactly the PHASE-1 refusal, but now only when genuinely
-/// unable rather than for the whole window).
+/// safely at this height — slot set underivable, root fold underivable, or
+/// ANY mandatory slot lacking a verified real / attested-null commitment
+/// (per-height all-or-nothing) — and the embedded arm must fail closed to
+/// the dashd fallback (exactly the PHASE-1 refusal, but now only when
+/// genuinely unable rather than for the whole window).
 inline std::optional<QcBlockPlan> build_daemonless_qc_plan(
     LlmqNetwork net, uint32_t next_height,
     const QuorumManager& qmgr,
     const std::function<std::optional<uint256>(uint32_t)>& hash_at_height,
     const std::function<std::optional<uint32_t>(const uint256&)>& height_of_hash,
-    const MineableCommitmentCache* cache = nullptr)
+    const MineableCommitmentCache* cache = nullptr,
+    const DkgNullEvidenceFn& null_evidence = nullptr,
+    RequiredQcSlot* first_gap = nullptr)
 {
     auto has_mined = [&qmgr](uint8_t t, const uint256& qh) {
         return qmgr.find(t, qh).has_value();
     };
     auto commitments = daemonless_qc_commitments(
-        net, next_height, hash_at_height, has_mined, cache);
+        net, next_height, hash_at_height, has_mined, cache,
+        null_evidence, first_gap);
     if (!commitments) return std::nullopt;
     auto root = compute_merkle_root_quorums_with_block(
         net, qmgr, *commitments, height_of_hash);

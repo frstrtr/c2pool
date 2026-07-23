@@ -1657,10 +1657,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             qc_member_source->request(c.llmqType, c.quorumHash);
                         }
                     }));
+            // COMPLETENESS GATE (definitive-soak block 1520106): the plan is
+            // per-height all-or-nothing — any mandatory slot without a
+            // BLS-verified real commitment (no attested-null evidence source
+            // is wired in production) fails the WHOLE height closed to the
+            // dashd fallback. Log the first gap once per height so the soak
+            // can attribute the fallback (the hot path re-derives the plan
+            // on every template build — do not log unthrottled).
+            auto qc_gap_logged_h = std::make_shared<uint32_t>(0u);
             node_coin_state.set_qc_plan_fn(
-                [&node_coin_state, hc = header_chain.get(), qc_net, qc_cache]
+                [&node_coin_state, hc = header_chain.get(), qc_net, qc_cache,
+                 qc_gap_logged_h]
                 (uint32_t next_h) -> std::optional<dash::coin::QcBlockPlan> {
-                    return dash::coin::build_daemonless_qc_plan(
+                    dash::coin::RequiredQcSlot gap{};
+                    auto plan = dash::coin::build_daemonless_qc_plan(
                         qc_net, next_h, node_coin_state.qmgr(),
                         [hc](uint32_t h) -> std::optional<uint256> {
                             if (auto e = hc->get_header_by_height(h))
@@ -1671,7 +1681,23 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             if (auto e = hc->get_header(qh)) return e->height;
                             return std::nullopt;
                         },
-                        qc_cache.get());
+                        qc_cache.get(),
+                        /*null_evidence=*/nullptr,
+                        &gap);
+                    if (!plan && !gap.quorum_hash.IsNull()
+                        && *qc_gap_logged_h != next_h) {
+                        *qc_gap_logged_h = next_h;
+                        LOG_INFO << "[QC-COMPLETENESS] h=" << next_h
+                                 << " mandatory slot type="
+                                 << static_cast<int>(gap.params.type)
+                                 << " qi=" << gap.quorum_index
+                                 << " quorum="
+                                 << gap.quorum_hash.GetHex().substr(0, 16)
+                                 << "... has no verified real commitment and no"
+                                    " failed-DKG evidence -> WHOLE height"
+                                    " fails closed (arm=dashd-fallback)";
+                    }
+                    return plan;
                 });
         }
 
