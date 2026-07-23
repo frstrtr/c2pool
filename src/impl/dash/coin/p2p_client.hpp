@@ -210,6 +210,16 @@ private:
     using HandshakeCallback = std::function<void()>;
     HandshakeCallback m_on_handshake_complete;
 
+    // E1 Phase-L member-set sourcing DEMUX: a filter that consumes HISTORICAL
+    // mnlistdiff replies (full base=ZERO snapshots at old quorum-base / work
+    // blocks, requested by QuorumMemberSource) BEFORE they reach the tip-SML
+    // maintainer — which treats any ZERO-base diff as a full snapshot and would
+    // overwrite the tip SML to that historical block. Returns true iff it
+    // consumed the diff; then new_mnlistdiff is NOT fired. Unset => no demux.
+    using MnListDiffFilter =
+        std::function<bool(const vendor::CSimplifiedMNListDiff&)>;
+    MnListDiffFilter m_historical_mnlistdiff_filter;
+
 public:
     CoinClient(io::io_context* context, dash::interfaces::Node* coin, config_t* config,
                const std::string& chain_label = "COIN-P2P")
@@ -311,6 +321,8 @@ public:
     /// Fired once per session when the version/verack handshake completes —
     /// the hook E2 uses to kick the initial getheaders/mnlistdiff sync.
     void set_on_handshake_complete(HandshakeCallback cb) { m_on_handshake_complete = std::move(cb); }
+    /// Install the Phase-L historical-mnlistdiff demux (QuorumMemberSource).
+    void set_historical_mnlistdiff_filter(MnListDiffFilter f) { m_historical_mnlistdiff_filter = std::move(f); }
 
     /// Send a getheaders request (E2 sync driver seam; unused by E1 run_node).
     void send_getheaders(uint32_t version, const std::vector<uint256>& locator, const uint256& stop)
@@ -554,6 +566,18 @@ private:
         // NO getdata pulls yet — the ingest legs are later slices.
         for (auto& inv : msg->m_invs)
         {
+            // E1 Phase-L sourcing leg: pull relayed DKG final commitments
+            // (MSG_QUORUM_FINAL_COMMITMENT = 21, dashcore protocol.h). The
+            // qfcommit handler below feeds the MineableCommitmentCache.
+            if (static_cast<uint32_t>(inv.m_type) == 21u)
+            {
+                auto getdata_msg = message_getdata::make_raw(
+                    {inventory_type(
+                        static_cast<inventory_type::inv_type>(21u),
+                        inv.m_hash)});
+                m_peer->write(getdata_msg);
+                continue;
+            }
             if (inv.base_type() == inventory_type::block)
             {
                 LOG_INFO << "[" << m_chain_label << "] block inv "
@@ -642,6 +666,20 @@ private:
         }
     }
 
+    ADD_P2P_HANDLER(qfcommit)
+    {
+        // E1 Phase-L sourcing leg: a peer-relayed DKG final commitment — the
+        // same stream dashd's own miner mines type-6 txs from. Fire the event
+        // seam; main_dash feeds the MineableCommitmentCache (structural
+        // admission there; BLS verification is the Phase-L gate before any
+        // template inclusion). No subscriber => no-op, zero behavior change.
+        LOG_INFO << "[" << m_chain_label << "] qfcommit: type="
+                 << static_cast<int>(msg->m_commitment.llmqType)
+                 << " quorum=" << msg->m_commitment.quorumHash.GetHex().substr(0, 16)
+                 << "... signers=" << msg->m_commitment.CountSigners();
+        m_coin->new_qfcommit.happened(msg->m_commitment);
+    }
+
     ADD_P2P_HANDLER(mnlistdiff)
     {
         // SML/quorum snapshot. message_mnlistdiff already fully deserialized the
@@ -659,6 +697,15 @@ private:
                  << " +" << msg->m_diff.mnList.size() << "mn -"
                  << msg->m_diff.deletedMNs.size() << "del qtail="
                  << msg->m_diff.quorum_tail.size() << "B";
+        // Phase-L DEMUX: a HISTORICAL member-sourcing reply is consumed here and
+        // must NOT reach the tip-SML maintainer (base=ZERO would overwrite the
+        // tip SML to the old block). Only tip-sync diffs fall through.
+        if (m_historical_mnlistdiff_filter
+            && m_historical_mnlistdiff_filter(msg->m_diff)) {
+            LOG_INFO << "[" << m_chain_label << "] mnlistdiff consumed by "
+                        "member-set sourcing (historical; tip SML untouched)";
+            return;
+        }
         m_coin->new_mnlistdiff.happened(msg->m_diff);
     }
 

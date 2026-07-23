@@ -419,6 +419,100 @@ TEST(DashNodeCoinState, DkgCommitmentHeightRefusesEmbedded) {
     EXPECT_TRUE(st.make_embedded_work_inputs().viable());
 }
 
+// E1 — daemonless DKG-window serving: with a qc plan installed the SAME
+// window height that BLOCKER-1 refused is SERVED, the template carries the
+// mandatory type-6 txs (dkg_commitments.hpp plan, testnet types 1/4/6 at an
+// interval-24 window height), and the pre-emit gate both accepts the honest
+// template and discards a tampered one (missing commitment => the block
+// dashd would reject as bad-qc-missing never leaves the node).
+TEST(DashNodeCoinState, QcPlanServesDkgWindowHeightAndEmitGateEnforcesIt) {
+    NodeCoinState st;
+    seed_single_mn(st, p2pkh_script(0x30));
+    seed_sml(st);
+    st.set_require_sml(true);
+    st.set_commitment_window_fn(
+        [](uint32_t next_h) { return dash::coin::is_dkg_commitment_window(next_h); });
+    // The same closure shape main_dash installs: the daemonless plan over
+    // the node's own QuorumManager + a header-chain hash-at-height lookup.
+    // Attested failed-DKG evidence for every slot keeps the all-null plan
+    // servable under the height-completeness gate (block-1520106 fix); the
+    // no-evidence fail-closed leg is asserted further down.
+    auto make_plan_fn = [&st](dash::coin::DkgNullEvidenceFn evidence) {
+        return [&st, evidence](uint32_t next_h) {
+            return dash::coin::build_daemonless_qc_plan(
+                dash::coin::LlmqNetwork::Testnet, next_h, st.qmgr(),
+                [](uint32_t h) -> std::optional<uint256> {
+                    uint256 u;
+                    std::memset(u.data(), 0xCD, 32);
+                    std::memcpy(u.data(), &h, 4);
+                    return u;
+                },
+                [](const uint256&) -> std::optional<uint32_t> {
+                    return std::nullopt;   // never needed for an all-null plan
+                },
+                /*cache=*/nullptr, evidence);
+        };
+    };
+    st.set_qc_plan_fn(make_plan_fn(
+        [](uint8_t, const uint256&) { return true; }));
+
+    // Tip 1518417 => next block 1518418 (phase 10: the exact height the
+    // BLOCKER-1 test above proves REFUSED without a plan).
+    st.set_sml_current_hash(raw256(0xAB));
+    st.set_tip(1518417, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u);
+
+    auto e = st.make_embedded_work_inputs();
+    ASSERT_TRUE(e.viable())
+        << "E1: a DKG window height must now be SERVED daemonlessly";
+    // Testnet interval-24 types LLMQ_50_60 / LLMQ_100_67 / LLMQ_25_67, all
+    // unmined in the (empty) quorum set => 3 mandatory null commitments.
+    ASSERT_EQ(e.qc_commitments.size(), 3u);
+    ASSERT_TRUE(e.has_quorum_root_override);
+
+    bool fallback_called = false;
+    WorkSelection sel = st.select_work([&]() {
+        fallback_called = true;
+        return DashWorkData{};
+    });
+    EXPECT_EQ(sel.source, WorkSource::Embedded);
+    EXPECT_FALSE(fallback_called);
+    ASSERT_EQ(sel.work.m_txs.size(), 3u);
+    for (size_t i = 0; i < 3; ++i)
+        EXPECT_EQ(sel.work.m_txs[i].type, 6) << "qc txs must lead the tx set";
+    EXPECT_TRUE(st.embedded_template_emit_ok(sel.work))
+        << "the honest daemonless qc template must pass the pre-emit gate";
+
+    // Tampered: drop one mandatory commitment => the emit gate must discard
+    // (that block is dashd bad-qc-missing).
+    DashWorkData tampered = sel.work;
+    tampered.m_txs.pop_back();
+    EXPECT_FALSE(st.embedded_template_emit_ok(tampered));
+
+    // Tampered: wrong committed quorum root => discard (wrong-root block).
+    DashWorkData wrong_root = sel.work;
+    {
+        dash::coin::vendor::CCbTx cb;
+        ASSERT_TRUE(dash::coin::vendor::parse_cbtx(wrong_root.m_coinbase_payload, cb));
+        cb.merkleRootQuorums = raw256(0x5A);
+        wrong_root.m_coinbase_payload = dash::coin::encode_cbtx(cb);
+    }
+    EXPECT_FALSE(st.embedded_template_emit_ok(wrong_root));
+
+    // COMPLETENESS GATE (block-1520106 fix): the SAME closure without
+    // failed-DKG evidence must fail the whole height closed — mandatory
+    // slots with neither a verified real commitment nor attested-null
+    // evidence are unservable (null-where-unsourced is the bad-cbtx).
+    st.set_qc_plan_fn(make_plan_fn(nullptr));
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable())
+        << "unattested mandatory slots must fail closed to the dashd arm";
+
+    // And a plan fn that cannot derive the set (header gap) fails closed —
+    // the PHASE-1 reward-safe routing, not a wrong block.
+    st.set_qc_plan_fn([](uint32_t) { return std::nullopt; });
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable());
+}
+
 // BLOCKER-2 viability: a stale/absent bestCL fails closed; a fresh one serves.
 TEST(DashNodeCoinState, StaleBestClRefusesEmbedded) {
     NodeCoinState st;

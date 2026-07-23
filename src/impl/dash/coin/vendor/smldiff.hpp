@@ -55,19 +55,115 @@ namespace dash {
 namespace coin {
 namespace vendor {
 
-// Minimal CPartialMerkleTree — wire-skip-only. We never reconstruct the
-// tree; the cbTxMerkleTree exists in the diff so a verifying node can
-// confirm the cbTx is in the block, but we already have the full block
-// from Phase U so the proof is redundant for us.
+// CPartialMerkleTree — wire format + ExtractMatches (client verification).
+//
+// The wire codec was originally a skip-only stub ("we have the full block
+// from Phase U so the proof is redundant"). That stopped being true with the
+// E1 Phase-L HISTORICAL member-set sourcing (#814 review R3): a historical
+// getmnlistd snapshot arrives with NO accompanying block, and its SML is the
+// root of trust for the BLS member-set verify — so the DIP-4 client
+// verification (cbTx proven into the verified block header via this proof,
+// then SML root checked against cbTx.merkleRootMNList) is mandatory before
+// the snapshot may be believed. ExtractMatches below is vendored VERBATIM
+// (modulo container shape) from dashcore src/merkleblock.cpp @ v23.1.7
+// CPartialMerkleTree::{ExtractMatches, TraverseAndExtract, CalcTreeWidth}.
+// Wire format: nTransactions LE32 | vHash[] | vBits[] (vBits as
+// CompactSize-prefixed packed bytes, LSB-first — upstream BytesToBits).
 struct CPartialMerkleTreeStub
 {
     uint32_t                   nTransactions{0};
     std::vector<uint256>       vHash;
-    std::vector<unsigned char> vBitsBytes;  // packed bits, opaque
+    std::vector<unsigned char> vBitsBytes;  // packed bits (LSB-first)
 
     C2POOL_SERIALIZE_METHODS(CPartialMerkleTreeStub)
     {
         READWRITE(obj.nTransactions, obj.vHash, obj.vBitsBytes);
+    }
+
+    // upstream consensus/consensus.h MaxBlockSize(fDIP0001Active=true) = 2 MB;
+    // ExtractMatches caps nTransactions at MaxBlockSize()/60.
+    static constexpr uint32_t kMaxBlockSize = 2'000'000u;
+
+    /// dashcore CPartialMerkleTree::ExtractMatches @ v23.1.7: traverse the
+    /// partial tree, collect matched txids (+ their in-block indices) and
+    /// return the reconstructed merkle root — or uint256::ZERO on ANY
+    /// malformation (the caller must treat ZERO as verification failure).
+    uint256 ExtractMatches(std::vector<uint256>& vMatch,
+                           std::vector<unsigned int>& vnIndex) const
+    {
+        vMatch.clear();
+        vnIndex.clear();
+        if (nTransactions == 0) return uint256::ZERO;
+        if (nTransactions > kMaxBlockSize / 60) return uint256::ZERO;
+        if (vHash.size() > nTransactions) return uint256::ZERO;
+        const std::vector<bool> bits = bytes_to_bits(vBitsBytes);
+        if (bits.size() < vHash.size()) return uint256::ZERO;
+        int height = 0;
+        while (calc_tree_width(height) > 1) height++;
+        unsigned int bits_used = 0, hash_used = 0;
+        bool bad = false;
+        uint256 root = traverse_extract(height, 0, bits_used, hash_used,
+                                        bits, vMatch, vnIndex, bad);
+        if (bad) return uint256::ZERO;
+        // all bits consumed (modulo byte-packing padding), all hashes consumed
+        if ((bits_used + 7) / 8 != (bits.size() + 7) / 8) return uint256::ZERO;
+        if (hash_used != vHash.size()) return uint256::ZERO;
+        return root;
+    }
+
+private:
+    static std::vector<bool> bytes_to_bits(const std::vector<unsigned char>& bytes)
+    {
+        std::vector<bool> ret(bytes.size() * 8);
+        for (size_t p = 0; p < ret.size(); ++p)
+            ret[p] = (bytes[p / 8] & (1u << (p % 8))) != 0;
+        return ret;
+    }
+
+    unsigned int calc_tree_width(int height) const
+    {
+        return (nTransactions + (1u << height) - 1) >> height;
+    }
+
+    static uint256 hash_pair(const uint256& a, const uint256& b)
+    {
+        uint256 out;
+        CHash256()
+            .Write(std::span<const unsigned char>(a.data(), 32))
+            .Write(std::span<const unsigned char>(b.data(), 32))
+            .Finalize(std::span<unsigned char>(out.data(), 32));
+        return out;
+    }
+
+    uint256 traverse_extract(int height, unsigned int pos,
+                             unsigned int& bits_used, unsigned int& hash_used,
+                             const std::vector<bool>& bits,
+                             std::vector<uint256>& vMatch,
+                             std::vector<unsigned int>& vnIndex,
+                             bool& bad) const
+    {
+        if (bits_used >= bits.size()) { bad = true; return uint256::ZERO; }
+        const bool parent_of_match = bits[bits_used++];
+        if (height == 0 || !parent_of_match) {
+            if (hash_used >= vHash.size()) { bad = true; return uint256::ZERO; }
+            const uint256& hash = vHash[hash_used++];
+            if (height == 0 && parent_of_match) {
+                vMatch.push_back(hash);
+                vnIndex.push_back(pos);
+            }
+            return hash;
+        }
+        uint256 left = traverse_extract(height - 1, pos * 2, bits_used,
+                                        hash_used, bits, vMatch, vnIndex, bad);
+        uint256 right;
+        if (pos * 2 + 1 < calc_tree_width(height - 1)) {
+            right = traverse_extract(height - 1, pos * 2 + 1, bits_used,
+                                     hash_used, bits, vMatch, vnIndex, bad);
+            if (right == left) bad = true;   // identical branches = mutation
+        } else {
+            right = left;
+        }
+        return hash_pair(left, right);
     }
 };
 

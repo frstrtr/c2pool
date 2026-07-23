@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <functional>
 #include <utility>
+#include <vector>
 
 namespace dash {
 namespace coin {
@@ -67,6 +68,16 @@ struct EmbeddedWorkInputs {
     // (per-chainparams in dashcore). Mainnet default; main_dash sets the
     // testnet value via NodeCoinState::set_mn_rr_height (E4 re-soak fix).
     int                              mn_rr_height{DASH_MN_RR_HEIGHT_MAINNET};
+
+    // E1 daemonless DKG-window seams (dkg_commitments.hpp QcBlockPlan,
+    // populated by NodeCoinState::make_embedded_work_inputs when a qc plan fn
+    // is installed): the mandatory type-6 commitment set for this height
+    // (empty off-window / all-mined) and the with-block merkleRootQuorums the
+    // CbTx must commit. Absent (default) => pre-E1 behavior byte-for-byte
+    // (no qc txs, plain compute_merkle_root_quorums root).
+    std::vector<vendor::CFinalCommitment> qc_commitments;
+    bool                             has_quorum_root_override{false};
+    uint256                          quorum_root_override;
 
     bool viable() const {
         return has_state && mnstates != nullptr && mempool != nullptr;
@@ -117,6 +128,10 @@ inline WorkSelection select_dash_work(
                 /*underfill_tripped=*/nullptr,
                 emb.sml, emb.qmgr,
                 emb.best_cl_height, emb.best_cl_sig, emb.credit_pool,
+                // E1: mandatory type-6 set + with-block quorum root.
+                emb.qc_commitments.empty() ? nullptr : &emb.qc_commitments,
+                emb.has_quorum_root_override ? &emb.quorum_root_override
+                                             : nullptr,
                 emb.mn_rr_height);
         },
         dashd_fallback);

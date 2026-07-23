@@ -98,12 +98,19 @@ struct CSimplifiedMNListEntry
     uint256                               proRegTxHash;
     uint256                               confirmedHash;
     std::array<uint8_t, NETADDR_SIZE>     netAddress{};   // raw IPv6 (v4 = ::ffff:...)
-    uint16_t                              netPort{0};      // BE on the wire
+    uint16_t                              netPort{0};      // BE on the wire (CService)
     std::array<uint8_t, BLS_PUBKEY_SIZE>  pubKeyOperator{};
     uint160                               keyIDVoting;
     bool                                  isValid{false};
     uint16_t                              nType{TYPE_REGULAR};
-    uint16_t                              platformHTTPPort{0};  // BE on the wire
+    // LE on the wire — a PLAIN uint16 member upstream (READWRITE(obj.
+    // platformHTTPPort)), unlike netPort which rides CService's BE port.
+    // (Was mis-annotated/mis-coded BE here: symmetric read+write made every
+    // FROM-WIRE round-trip byte-identical — the proven root parity was
+    // unaffected — but the in-memory value was byte-swapped and any entry
+    // CONSTRUCTED from a numeric port hashed wrong. Verified against real
+    // testnet Evo entries: LE reproduces cbTx.merkleRootMNList.)
+    uint16_t                              platformHTTPPort{0};
     uint160                               platformNodeID;
 
     // c2pool pack.hpp uses explicit Serialize/Unserialize members (the
@@ -126,7 +133,7 @@ struct CSimplifiedMNListEntry
             s << nType;
             if (nType == TYPE_EVO) {
                 if (nVersion < VER_EXT_ADDR) {
-                    s << Using<BigEndianFormat<2>>(platformHTTPPort);
+                    s << platformHTTPPort;   // plain uint16 => LE (upstream)
                 }
                 s << platformNodeID;
             }
@@ -148,7 +155,7 @@ struct CSimplifiedMNListEntry
             s >> nType;
             if (nType == TYPE_EVO) {
                 if (nVersion < VER_EXT_ADDR) {
-                    s >> Using<BigEndianFormat<2>>(platformHTTPPort);
+                    s >> platformHTTPPort;   // plain uint16 => LE (upstream)
                 }
                 s >> platformNodeID;
             }
@@ -177,11 +184,7 @@ struct CSimplifiedMNListEntry
             s << nType;
             if (nType == TYPE_EVO) {
                 if (nVersion < VER_EXT_ADDR) {
-                    uint8_t pport_be[2] = {
-                        static_cast<uint8_t>((platformHTTPPort >> 8) & 0xff),
-                        static_cast<uint8_t>(platformHTTPPort & 0xff)
-                    };
-                    s.write(std::as_bytes(std::span{pport_be}));
+                    s << platformHTTPPort;   // plain uint16 => LE (upstream)
                 }
                 s << platformNodeID;
             }
