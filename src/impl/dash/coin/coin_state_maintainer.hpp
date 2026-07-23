@@ -51,11 +51,64 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
 namespace dash {
 namespace coin {
+
+// ── R3 governance-tally MN resolution (dashcore v23.1.7 parity) ─────────────
+//
+// Both the vote-VERIFY path (CGovernanceVote::IsValid) and the vote-COUNT path
+// (CGovernanceObject::CountMatchingVotes) in dashcore resolve the voting
+// masternode with CDeterministicMNList::GetMNByCollateral — the UNFILTERED
+// lookup (evo/deterministicmns.h keeps GetValidMNByCollateral as a SEPARATE
+// accessor, and governance uses the unfiltered one in both places). So a
+// PoSe-BANNED MN's vote still VERIFIES and still COUNTS at its full voting
+// weight in dashd. Filtering banned MNs out of the tally here would diverge:
+// dropping a banned MN's NO vote inflates (yes − no) in c2pool vs dashd, and
+// natural PoSe-ban churn triggers that with no attacker (wrong trigger wins =>
+// wrong superblock payees => lost block).
+//
+// THE ASYMMETRY TO PRESERVE: dashcore's funding THRESHOLD denominator
+// (UpdateSentinelVariables: nAbsVoteReq = max(nGovernanceMinQuorum,
+// nWeightedMnCount / 10)) uses GetCounts().m_valid_weighted — the VALID set.
+// So: per-vote tally UNFILTERED, threshold denominator valid-only. That is
+// dashcore's own asymmetry; reseed_funding_threshold() below keeps the
+// valid-only denominator and these helpers keep the unfiltered tally.
+
+/// dashcore GetMNByCollateral over the node's live DMN view: UNFILTERED —
+/// resolves PoSe-banned entries too. nullptr only when the collateral outpoint
+/// is not in the DMN list at all (dashcore then rejects the vote / counts 0).
+inline const MNState* gov_mn_by_collateral(
+    const MnStateMachine& mns, const bitcoin_family::coin::TxPrevOut& outpoint)
+{
+    auto pro = mns.find_by_collateral(outpoint);
+    if (!pro) return nullptr;
+    auto it = mns.entries().find(*pro);
+    return it == mns.entries().end() ? nullptr : &it->second;
+}
+
+/// dashcore CountMatchingVotes per-vote weight for a stored vote key
+/// ("<collateral-txid-hex>-<index>", GovOutPoint::to_key()): EvoNode 4x,
+/// Regular 1x, 0 ONLY for an outpoint not in the DMN list (unknown MN). A
+/// PoSe-banned MN still weighs in at full weight — see the parity note above.
+inline int gov_vote_weight_for_key(const MnStateMachine& mns,
+                                   const std::string& key)
+{
+    const auto dashpos = key.rfind('-');
+    if (dashpos == std::string::npos) return 0;
+    bitcoin_family::coin::TxPrevOut op;
+    op.hash.SetHex(key.substr(0, dashpos));
+    try {
+        op.index = static_cast<uint32_t>(std::stoul(key.substr(dashpos + 1)));
+    } catch (...) { return 0; }
+    const MNState* mn = gov_mn_by_collateral(mns, op);
+    if (!mn) return 0;
+    return (mn->nType == vendor::MnType::EVO) ? DASH_VOTE_WEIGHT_EVO
+                                              : DASH_VOTE_WEIGHT_REGULAR;
+}
 
 /// Drives a node-owned NodeCoinState from the async update events the running
 /// node observes. Non-copyable (holds a reference to the node's holder). The
@@ -123,8 +176,10 @@ public:
     /// ECDSA/keyIDVoting-signed; that path applies only to PROPOSAL funding
     /// votes — dashcore governance/object.cpp: onlyVotingKeyAllowed =
     /// (type == PROPOSAL && signal == FUNDING)):
-    ///   1. Look the voting MN up by its COLLATERAL OUTPOINT in the valid
-    ///      deterministic MN set at verify time (unknown MN => reject). Note
+    ///   1. Look the voting MN up by its COLLATERAL OUTPOINT in the
+    ///      deterministic MN list at verify time (unknown MN => reject) —
+    ///      UNFILTERED, dashcore GetMNByCollateral: a PoSe-banned MN's vote
+    ///      still verifies (and counts), see gov_mn_by_collateral above. Note
     ///      the DIP-4 SML does not carry collateral outpoints — this needs the
     ///      full DMN view (protx info), see GovernanceStore::set_vote_weight_fn.
     ///   2. BLS-verify vch_sig with the MN's OPERATOR key (pubKeyOperator from
@@ -188,9 +243,14 @@ public:
     /// never counted => fail closed).
     void on_govvote(const GovVoteContext& v, const std::string& mn_outpoint_key) {
         if (v.signal != VOTE_SIGNAL_FUNDING) return;            // only the superblock tally axis
-        if (v.outcome != VOTE_OUTCOME_YES && v.outcome != VOTE_OUTCOME_NO &&
-            v.outcome != VOTE_OUTCOME_ABSTAIN)
-            return;                                             // dashcore IsValid outcome range
+        // dashcore CGovernanceVote::IsValid outcome range: NONE..ABSTAIN
+        // (nVoteOutcome < VOTE_OUTCOME_NONE || >= VOTE_OUTCOME_UNKNOWN =>
+        // reject). NONE is a VALID, STORED outcome — a newer NONE vote
+        // REPLACES a stored YES in dashd's per-(MN,signal) record, dropping
+        // the yes-count. Dropping NONE here would leave a stale YES tallied
+        // in c2pool after the voter withdrew it (tally inflation vs dashd).
+        if (v.outcome < VOTE_OUTCOME_NONE || v.outcome > VOTE_OUTCOME_ABSTAIN)
+            return;
         if (!m_gov_store.has_trigger(v.parent_hash)) return;    // vote for a non-trigger → ignore
         if (!m_vote_verifier || !m_vote_verifier(v)) {
             // Unverified (default) or failed verify: DO NOT count. Fail closed.
@@ -752,6 +812,12 @@ private:
     // weight (Regular 1, EvoNode 4 — evo/dmn_types.h). Empty list or unset
     // min-quorum (set_gov_params not called) => 0 => fail closed. Called on
     // every accepted mnlistdiff, on SML reorg wipes, and from set_gov_params.
+    //
+    // NOTE the deliberate ASYMMETRY (dashcore's own, DO NOT "fix"): this
+    // DENOMINATOR is computed over the VALID set only (GetCounts()
+    // .m_valid_weighted — the `isValid` filter below stays), while the
+    // per-vote TALLY resolves voters UNFILTERED (GetMNByCollateral — a
+    // PoSe-banned MN's vote still counts; see gov_vote_weight_for_key).
     void reseed_funding_threshold() {
         int weighted = 0;
         for (const auto& e : m_state.sml().mnList) {

@@ -113,6 +113,58 @@ if(GTest_FOUND OR GTEST_FOUND)
 else()
     message(STATUS "GTest not found - testing disabled")
 endif()
+# ── E1 Phase-L: optional dashbls (BLS12-381) backend for type-6 quorum-
+# commitment verification ────────────────────────────────────────────────────
+# dashpay/bls-signatures ("dashbls", relic-backed, Apache-2.0) — the SAME
+# library dashd wraps in src/bls/bls.h. OPT-IN and DASH-ONLY: only the DASH impl
+# (dash_bls_verify) + its KAT consume it, never the shared core the Windows
+# main_ltc launcher builds ([[reference_windows_ci_conan_flake]]: Windows CI
+# builds only the LTC launcher, so DASH-only BLS code cannot break it). When the
+# option is OFF (default) or the library is not found, dash_bls_verify compiles a
+# fail-closed stub and the DKG-window serve path keeps the pre-Phase-L
+# null-commitment posture exactly — no dashbls dependency enters any build.
+#
+# Build the library once for the CI factory with scripts/build_dashbls.sh (builds
+# dash's OWN src/dashbls subtree at the v23.1.7 tag — byte-identical to dashd);
+# point cmake at it with -DDASHBLS_ROOT=<prefix>.
+option(C2POOL_DASH_BLS "Link dashbls (BLS12-381) for E1 Phase-L real quorum-commitment verify" OFF)
+set(C2POOL_DASH_BLS_AVAILABLE OFF)
+if(C2POOL_DASH_BLS)
+    # Honour a DASHBLS_ROOT hint (the build-factory install prefix), else search
+    # the system paths. dashbls installs: include/dashbls/*.hpp,
+    # lib/libdashbls.a, lib/librelic_s.a, lib/mimalloc-2.0/libmimalloc-secure.a.
+    find_path(DASHBLS_INCLUDE_DIR dashbls/bls.hpp
+        HINTS ${DASHBLS_ROOT} ENV DASHBLS_ROOT PATH_SUFFIXES include)
+    find_library(DASHBLS_LIB       NAMES dashbls bls-dash
+        HINTS ${DASHBLS_ROOT} ENV DASHBLS_ROOT PATH_SUFFIXES lib)
+    find_library(DASHBLS_RELIC_LIB NAMES relic_s relic
+        HINTS ${DASHBLS_ROOT} ENV DASHBLS_ROOT PATH_SUFFIXES lib)
+    find_library(DASHBLS_MIMALLOC_LIB NAMES mimalloc-secure mimalloc
+        HINTS ${DASHBLS_ROOT} ENV DASHBLS_ROOT PATH_SUFFIXES lib lib/mimalloc-2.0 lib/mimalloc-2.1)
+    find_library(DASHBLS_GMP_LIB NAMES gmp)
+    # NOTE: the autotools install (scripts/build_dashbls.sh, the only build
+    # path dash's v23.1.7 src/dashbls subtree supports) folds relic + mimalloc
+    # INTO libdashbls.a — so the separate relic/mimalloc libs are OPTIONAL and
+    # only linked when present (the legacy standalone-CMake layout).
+    if(DASHBLS_INCLUDE_DIR AND DASHBLS_LIB AND DASHBLS_GMP_LIB)
+        set(C2POOL_DASH_BLS_AVAILABLE ON)
+        set(DASHBLS_LIBRARIES ${DASHBLS_LIB})
+        if(DASHBLS_RELIC_LIB)
+            list(APPEND DASHBLS_LIBRARIES ${DASHBLS_RELIC_LIB})
+        endif()
+        if(DASHBLS_MIMALLOC_LIB)
+            list(APPEND DASHBLS_LIBRARIES ${DASHBLS_MIMALLOC_LIB})
+        endif()
+        list(APPEND DASHBLS_LIBRARIES ${DASHBLS_GMP_LIB})
+        message(STATUS "dashbls found (E1 Phase-L BLS verify ENABLED): ${DASHBLS_LIB}")
+        message(STATUS "dashbls includes: ${DASHBLS_INCLUDE_DIR}")
+    else()
+        message(WARNING "C2POOL_DASH_BLS=ON but dashbls not found "
+            "(need dashbls + relic + gmp; run scripts/build_dashbls.sh and pass "
+            "-DDASHBLS_ROOT=<prefix>). Falling back to fail-closed null-serve.")
+    endif()
+endif()
+
 include_directories(include)
 include_directories(src)
 
