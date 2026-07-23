@@ -146,26 +146,32 @@ struct Node
 
     // ── E-SUPERBLOCK: daemonless governance feed (govsync) ────────────────
     // Reception path: fires when the coin-P2P client parses a `govobj`
-    // (MNGOVERNANCEOBJECT) message. Carries the object hash (computed by the
-    // handler), its type (2 == superblock trigger), and the raw vchData payload
-    // (hex-encoded plaintext JSON schedule). CoinStateMaintainer::on_govobject
+    // (MNGOVERNANCEOBJECT) message. Carries the object hash (dashcore
+    // Governance::Object::GetHash preimage, computed by the handler via
+    // govobject_hash), its type (2 == superblock trigger), and the raw
+    // vchData payload — the PLAINTEXT JSON schedule bytes (dashcore's vchData
+    // carries the JSON directly; RPC DataHex is hex OF these bytes; there is
+    // no hex layer on the wire). CoinStateMaintainer::on_govobject
     // subscribes: for a trigger it parses the payment schedule into the
     // GovernanceStore. Distinct from the SML axis (mnlistdiff) — this is the
     // governance-object axis feeding daemonless superblock payee sourcing.
     struct GovObjectRecord {
         uint256              object_hash;
         int32_t              object_type{0};
-        std::vector<uint8_t> vch_data;      // hex-encoded plaintext (trigger schedule)
+        std::vector<uint8_t> vch_data;      // plaintext JSON bytes (trigger schedule)
     };
     Event<GovObjectRecord> new_govobject;
 
     // Reception path: fires when the coin-P2P client parses a `govobjvote`
-    // (MNGOVERNANCEOBJECTVOTE) message. Carries everything the maintainer needs
-    // to VERIFY (ECDSA over the vote hash against the voting MN's keyIDVoting
-    // from the SML) and, once verified, TALLY the funding-signal vote in the
-    // GovernanceStore. Until vote-ECDSA-verify is pinned the maintainer leaves
-    // the vote UNCOUNTED (fail closed). CoinStateMaintainer::on_govvote
-    // subscribes.
+    // (MNGOVERNANCEOBJECTVOTE) message. Carries everything the maintainer
+    // needs to VERIFY and, once verified, TALLY the funding-signal vote in
+    // the GovernanceStore. VERIFICATION SCHEME (dashcore CGovernanceVote::
+    // IsValid): TRIGGER funding votes — the only votes the superblock tally
+    // consults — are BLS-signed by the voting MN's OPERATOR key
+    // (pubKeyOperator) over vote_hash; the ECDSA/keyIDVoting path applies
+    // ONLY to PROPOSAL funding votes and must NOT be used here. Until BLS
+    // vote-verify is pinned the maintainer leaves every vote UNCOUNTED (fail
+    // closed). CoinStateMaintainer::on_govvote subscribes.
     struct GovVoteRecord {
         uint256              parent_hash;        // the object being voted on
         uint256              mn_outpoint_hash;   // voting masternode collateral txid
@@ -174,8 +180,8 @@ struct Node
         int32_t              outcome{0};         // 1=yes 2=no 3=abstain
         int32_t              signal{0};          // 1=funding
         int64_t              time{0};
-        std::vector<uint8_t> vch_sig;            // ECDSA sig (verify seam)
-        uint256              vote_hash;          // signature-hash preimage digest
+        std::vector<uint8_t> vch_sig;            // BLS operator-key sig (verify seam)
+        uint256              vote_hash;          // govvote_signature_hash (signed digest)
     };
     Event<GovVoteRecord> new_govvote;
 

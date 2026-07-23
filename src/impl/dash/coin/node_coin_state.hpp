@@ -220,6 +220,25 @@ public:
     /// failing closed on any under-synced / unverified / over-budget view.
     void set_require_superblock_provider(bool v) { m_require_superblock_provider = v; }
 
+    /// GOVSYNC-COMPLETENESS GATE (structural reward-safety invariant, R5).
+    /// The dangerous failure mode of daemonless superblock sourcing is a
+    /// PARTIAL governance view: a store missing the higher-yes competing
+    /// trigger (or its votes) yields a CONFIDENT wrong winner — dashd
+    /// validates against ITS best trigger and rejects our block. A per-trigger
+    /// threshold cannot see what it never received, so trigger-confidence
+    /// alone is NOT sufficient to serve.
+    ///
+    /// This predicate must return true ONLY when the governance sync is
+    /// provably COMPLETE (objects+votes fully streamed and quiesced against
+    /// enough peers, counts cross-checked). It is DEFAULT-ABSENT, and
+    /// resolve_superblock REFUSES the serve path while it is absent or false
+    /// — so landing vote-verification alone can NEVER open the serve path;
+    /// the completeness predicate must be wired deliberately, together with
+    /// its own proof obligations. No production caller sets it yet.
+    void set_superblock_sync_complete_fn(std::function<bool()> fn) {
+        m_superblock_sync_complete_fn = std::move(fn);
+    }
+
     /// DKG mining-phase guard (review PR #780 BLOCKER-1, CRITICAL). On a height
     /// where a quorum commitment (type-6) is required in-block, the embedded arm
     /// cannot produce a valid block: it strips all special txs (so it omits the
@@ -404,6 +423,14 @@ private:
         // refuse (route to the reward-safe dashd fallback) — old behaviour.
         if (!m_require_superblock_provider || !m_superblock_provider)
             return SuperblockDisposition{false, {}};
+        // R5 COMPLETENESS GATE (structural): a trigger-confident answer from a
+        // PARTIAL governance view is the confidently-wrong-winner hazard, so
+        // the serve path additionally requires the govsync-completeness
+        // predicate to be PRESENT and TRUE. Default-absent => refuse => the
+        // reward-safe dashd fallback — landing vote-verify alone can never
+        // open this path.
+        if (!m_superblock_sync_complete_fn || !m_superblock_sync_complete_fn())
+            return SuperblockDisposition{false, {}};
         // Consult the governance provider: nullopt => not trigger-confident =>
         // fail closed; a value (possibly empty = unfunded) => arm may serve.
         auto sched = m_superblock_provider(next_h);
@@ -428,6 +455,9 @@ private:
     // reward-safe behaviour); ON => resolve_superblock consults the provider.
     std::function<std::optional<std::vector<SuperblockPayment>>(uint32_t)> m_superblock_provider;
     bool m_require_superblock_provider{false};
+    // R5 govsync-completeness gate: absent (default) or false => superblock
+    // heights refuse the embedded arm even when the provider is confident.
+    std::function<bool()> m_superblock_sync_complete_fn;
     std::function<bool(uint32_t)> m_commitment_window_fn;  // refuse embedded on DKG commitment heights
     bool     m_require_fresh_bestcl{false};  // refuse embedded on a stale/absent bestCL
     bool     m_require_fresh_credit_pool{false}; // refuse embedded on a lagged credit-pool seed

@@ -12,11 +12,13 @@
 /// This sits on top of GovernanceStore (winning-trigger selection + funding
 /// tally) and returns EXACTLY what the embedded coinbase must pay at a
 /// superblock height, or nullopt to signal "no confident superblock schedule"
-/// (unfunded OR under-synced) — in which case the caller decides:
-///   - unfunded superblock  → serve a NORMAL template (no extra outputs);
-///   - under-synced view     → FAIL CLOSED to the dashd fallback.
-/// The two are distinguished by the govsync-completeness gate the caller holds,
-/// NOT here (this function only knows the store's current view).
+/// (unfunded OR under-synced). NOTE: get_superblock_payments NEVER returns an
+/// empty vector — nullopt covers both cases, and the caller cannot tell them
+/// apart from here alone, so a nullopt superblock height ALWAYS fails closed
+/// to the dashd fallback. Serving a NORMAL template at a confidently-UNFUNDED
+/// superblock height would additionally require the govsync-completeness gate
+/// (NodeCoinState::set_superblock_sync_complete_fn) to prove the store's view
+/// complete; that distinction is a gated follow-up, not implemented here.
 
 #include <impl/dash/coin/governance_store.hpp>
 #include <impl/dash/coin/subsidy.hpp>

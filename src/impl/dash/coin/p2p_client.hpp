@@ -44,7 +44,7 @@
 #include "transaction.hpp"
 
 #include <impl/dash/crypto/hash_x11.hpp>   // block identity on Dash = X11(header)
-#include <core/hash.hpp>                    // ::Hash (double-SHA256) for govobj/govvote hashing
+#include <impl/dash/coin/governance_object.hpp> // govobject_hash / govvote_signature_hash (dashcore-exact digests)
 
 #include <algorithm>
 #include <memory>
@@ -681,16 +681,20 @@ private:
 
     ADD_P2P_HANDLER(govobj)
     {
-        // MNGOVERNANCEOBJECT. Compute the dashcore object hash (double-SHA256 of
-        // the full serialization — same field order the message writes, incl.
-        // vchSig, matching CGovernanceObject::GetHash) and forward the record.
-        // The maintainer parses a TRIGGER's vchData into the GovernanceStore.
-        auto stream = ::pack(*msg);
-        auto sp = stream.get_span();
-        std::span<const unsigned char> bytes(
-            reinterpret_cast<const unsigned char*>(sp.data()), sp.size());
+        // MNGOVERNANCEOBJECT. Compute the dashcore object identity hash via
+        // govobject_hash — the EXACT Governance::Object::GetHash() preimage
+        // (governance/common.cpp), which dashcore itself notes "doesn't match
+        // serialization": it EXCLUDES nCollateralHash and nObjectType,
+        // hex-string-encodes vchData, and inserts legacy dummy bytes after
+        // the outpoint. This hash is what votes carry as nParentHash, so a
+        // wrong preimage silently detaches every vote from its trigger.
+        // Pinned byte-exact against from-wire testnet objects in
+        // test_dash_superblock.
         ::dash::interfaces::Node::GovObjectRecord rec;
-        rec.object_hash = ::Hash(bytes);
+        rec.object_hash = ::dash::coin::govobject_hash(
+            msg->m_hash_parent, msg->m_revision, msg->m_time, msg->m_vch_data,
+            msg->m_masternode_outpoint.hash, msg->m_masternode_outpoint.index,
+            msg->m_vch_sig);
         rec.object_type = msg->m_object_type;
         rec.vch_data    = msg->m_vch_data;
         LOG_INFO << "[" << m_chain_label << "] govobj: hash="
@@ -701,15 +705,15 @@ private:
 
     ADD_P2P_HANDLER(govobjvote)
     {
-        // MNGOVERNANCEOBJECTVOTE. Forward the vote for the maintainer to VERIFY
-        // (ECDSA over the vote hash against the voting MN's keyIDVoting) + TALLY.
-        // vote_hash here is a placeholder digest of the full message — the exact
-        // dashcore GetSignatureHash preimage (outpoint|parent|outcome|signal|
-        // time, sig excluded) MUST be pinned before vote-verify is enabled.
-        auto stream = ::pack(*msg);
-        auto sp = stream.get_span();
-        std::span<const unsigned char> bytes(
-            reinterpret_cast<const unsigned char*>(sp.data()), sp.size());
+        // MNGOVERNANCEOBJECTVOTE. Forward the vote for the maintainer to
+        // VERIFY + TALLY. For TRIGGER funding votes — the only votes the
+        // superblock tally consults — verification is BLS by the voting MN's
+        // OPERATOR key (dashcore CGovernanceVote::IsValid with
+        // useVotingKey=false -> CheckSignature(pubKeyOperator); the
+        // ECDSA/keyIDVoting path applies ONLY to PROPOSAL funding votes).
+        // vote_hash is govvote_signature_hash — the exact dashcore
+        // GetSignatureHash preimage (outpoint, parent, outcome, signal, time;
+        // vchSig excluded), i.e. the digest the operator key signed.
         ::dash::interfaces::Node::GovVoteRecord rec;
         rec.parent_hash      = msg->m_parent_hash;
         rec.mn_outpoint_hash = msg->m_masternode_outpoint.hash;
@@ -719,11 +723,16 @@ private:
         rec.signal           = msg->m_vote_signal;
         rec.time             = msg->m_time;
         rec.vch_sig          = msg->m_vch_sig;
-        rec.vote_hash        = ::Hash(bytes);   // placeholder (see above)
-        LOG_INFO << "[" << m_chain_label << "] govobjvote: parent="
-                 << rec.parent_hash.GetHex().substr(0, 16) << " mn="
-                 << rec.mn_outpoint_key.substr(0, 20) << " outcome="
-                 << rec.outcome << " signal=" << rec.signal;
+        rec.vote_hash        = ::dash::coin::govvote_signature_hash(
+            msg->m_masternode_outpoint.hash, msg->m_masternode_outpoint.index,
+            msg->m_parent_hash, msg->m_vote_outcome, msg->m_vote_signal,
+            msg->m_time);
+        // DEBUG, not INFO: a mainnet governance sync streams tens of
+        // thousands of votes (per-vote INFO would flood the journal).
+        LOG_DEBUG_COIND << "[" << m_chain_label << "] govobjvote: parent="
+                        << rec.parent_hash.GetHex().substr(0, 16) << " mn="
+                        << rec.mn_outpoint_key.substr(0, 20) << " outcome="
+                        << rec.outcome << " signal=" << rec.signal;
         m_coin->new_govvote.happened(rec);
     }
 

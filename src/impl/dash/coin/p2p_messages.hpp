@@ -185,7 +185,7 @@ END_MESSAGE()
 // ⚠ PIN-BEFORE-ENABLE: these layouts must be byte-pinned against a real
 // from-wire govobj/govobjvote capture before the daemonless superblock arm is
 // switched on in production. The arm is opt-in and DEFAULT-OFF; until pinned +
-// vote-ECDSA-verify lands, a superblock height fails closed to dashd. A layout
+// BLS-operator vote-verify lands, a superblock height fails closed to dashd. A layout
 // mismatch only makes ingestion fail (objects/votes rejected) => the store
 // stays empty => the arm keeps failing closed. It can never MISpay: the payee
 // vector is re-derived from the trigger's own vchData and budget-checked.

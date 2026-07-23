@@ -1745,48 +1745,72 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // height the provider resolves the winning governance trigger's
             // budget-valid (script, amount) schedule from the GovernanceStore the
             // govsync legs (6-7) feed, so the embedded arm can serve the correct
-            // superblock coinbase WITHOUT dashd. get_superblock_payments returns
+            // superblock coinbase WITHOUT dashd. superblock_schedule() returns
             // nullopt when there is no trigger-confident winner (unfunded OR
-            // under-synced OR over-budget) — the NodeCoinState guard then FAILS
-            // CLOSED to the reward-safe dashd fallback (never guesses payees).
+            // under-synced OR over-budget OR the R6 desync latch fired) — the
+            // NodeCoinState guard then FAILS CLOSED to the reward-safe dashd
+            // fallback (never guesses payees).
             //
             // Enabled ONLY under --embedded-superblock (opt-in, default OFF). With
             // it OFF, set_require_superblock_provider(false) preserves the prior
             // reward-safe behaviour EXACTLY (every superblock height falls back).
             //
-            // FAIL-CLOSED BY CONSTRUCTION until vote-verify lands: the funding
-            // tally only counts votes the maintainer's vote-verifier accepts, and
-            // that verifier is UNSET here (the vote-ECDSA-verify against keyIDVoting
-            // is the documented follow-up), so no trigger ever reaches threshold =>
-            // the provider returns nullopt => superblock heights fall back even
-            // with the flag on. The parse/selection/template-emit logic is proven
-            // by the KATs; flipping this fully live is gated on vote-verify + soak.
+            // FAIL-CLOSED BY CONSTRUCTION until vote-verify lands, TRIPLY:
+            //   1. the funding tally counts only votes the maintainer's
+            //      vote-verifier accepts — and that verifier is UNSET here.
+            //      (Follow-up contract: BLS by the voting MN's OPERATOR key
+            //      over govvote_signature_hash — dashcore verifies TRIGGER
+            //      funding votes against pubKeyOperator, NOT the
+            //      ECDSA/keyIDVoting path, which is proposal-only. See
+            //      CoinStateMaintainer::set_vote_verifier.)
+            //   2. the weighted tally needs the vote-weight/membership seam
+            //      (GovernanceStore::set_vote_weight_fn) — also UNSET here
+            //      (the DIP-4 SML lacks collateral outpoints; needs the full
+            //      DMN view).
+            //   3. the R5 govsync-completeness gate
+            //      (set_superblock_sync_complete_fn) is NOT wired — the
+            //      NodeCoinState guard refuses the serve path structurally,
+            //      so landing vote-verify alone can never open it.
+            // The parse/selection/template-emit logic is proven by the KATs;
+            // flipping this fully live is gated on vote-verify + completeness
+            // + a funded-superblock soak.
             {
                 const int64_t budget_cycle = sb_cycle;
-                node_coin_state.set_superblock_provider(
-                    [maint = maintainer.get(), budget_cycle](uint32_t next_height)
-                        -> std::optional<std::vector<dash::coin::SuperblockPayment>> {
-                        const int64_t budget =
-                            dash::coin::superblock_budget(next_height,
-                                                          static_cast<int>(budget_cycle));
-                        return dash::coin::get_superblock_payments(
-                            maint->gov_store(),
-                            static_cast<int32_t>(next_height), budget);
+                // Chain-strict trigger parsing + dashcore threshold inputs:
+                // min-quorum is chainparams nGovernanceMinQuorum; the
+                // threshold itself re-derives from the weighted SML count on
+                // every accepted mnlistdiff (maintainer reseed — dashcore
+                // nAbsVoteReq = max(minQuorum, weighted/10)). Cross-checkable
+                // against dashd getgovernanceinfo.fundingthreshold.
+                maintainer->set_gov_params(
+                    testnet, testnet ? dash::coin::DASH_GOV_MIN_QUORUM_TESTNET
+                                     : dash::coin::DASH_GOV_MIN_QUORUM_MAINNET);
+                // Superblock ctx for the R6 coinbase cross-check + executed-
+                // cycle pruning on the block-connect leg.
+                maintainer->set_superblock_ctx(
+                    [sb_cycle](uint32_t h) {
+                        return dash::coin::is_superblock_height(h, sb_cycle);
+                    },
+                    [budget_cycle](uint32_t h) {
+                        return dash::coin::superblock_budget(
+                            h, static_cast<int>(budget_cycle));
                     });
-                // Seed the funding threshold from the current SML size (dashcore
-                // ~10% of the weighted MN count). 0 => unknown => fail closed;
-                // a live node re-seeds as the SML grows. Cross-checkable against
-                // dashd getgovernanceinfo.fundingthreshold.
-                const size_t mn_count = node_coin_state.sml().size();
-                maintainer->gov_store().set_funding_threshold(
-                    mn_count > 0 ? static_cast<int>(mn_count / 10 + 1) : 0);
+                node_coin_state.set_superblock_provider(
+                    [maint = maintainer.get()](uint32_t next_height)
+                        -> std::optional<std::vector<dash::coin::SuperblockPayment>> {
+                        return maint->superblock_schedule(next_height);
+                    });
                 node_coin_state.set_require_superblock_provider(embedded_superblock);
+                // NOTE deliberately NOT set: set_superblock_sync_complete_fn
+                // (R5). Until a govsync-completeness proof exists, superblock
+                // heights refuse the embedded arm even with the flag on.
                 if (embedded_superblock)
                     LOG_INFO << "[E-SUPERBLOCK] daemonless superblock arm ENABLED "
                                 "(--embedded-superblock); superblock heights served "
                                 "from govsync triggers when trigger-confident, else "
-                                "fail closed to dashd. Vote-verify pending => "
-                                "currently fails closed until pinned.";
+                                "fail closed to dashd. Vote-verify (BLS operator) + "
+                                "completeness gate pending => currently fails "
+                                "closed until pinned.";
             }
         }
 
@@ -2005,10 +2029,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 auto tip_entry = hc->tip();
                 const uint256 tip = tip_entry ? tip_entry->hash : uint256::ZERO;
                 cp->send_getmnlistd(*sml_base, tip);
-                // E-SUPERBLOCK: pull the governance object/vote store (triggers +
-                // funding votes) so a superblock height can be served daemonlessly.
-                // Zero nProp + empty filter => request all. Cheap; a handful of
-                // objects. Re-primed on tip changes below for freshness.
+                // E-SUPERBLOCK: prime the governance object/vote sync (triggers
+                // + funding votes) so a superblock height can be served
+                // daemonlessly. Zero nProp + empty filter => request all.
+                // Handshake-only today — there is NO tip-change re-prime yet.
+                // KNOWN GAP (pre-enable requirement): dashcore answers govsync
+                // with INVENTORY (MSG_GOVERNANCE_OBJECT/_VOTE invs), not
+                // direct govobj/govobjvote messages, and our inv handler does
+                // not getdata governance types — so this leg is currently
+                // INERT (an extra fail-closed layer: the store stays empty).
+                // The inv-driven getdata + per-object vote sync + periodic
+                // re-prime co-land with vote-verify before any enable.
                 cp->send_govsync();
             });
 
