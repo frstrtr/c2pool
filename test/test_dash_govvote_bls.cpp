@@ -41,6 +41,15 @@
 #include <impl/dash/coin/coin_state_maintainer.hpp> // on_govvote / set_vote_verifier
 #include <impl/dash/coin/vendor/bls_verify.hpp>     // verify_govvote_operator_sig
 
+#ifdef C2POOL_DASH_BLS
+// Synthetic operator keypair for the legacy-scheme-signed-vote KAT (a
+// legacy-SIGNED vote cannot be captured from the wire — post-V19 dashd
+// rejects and never relays one; that is exactly the parity under test).
+#include <dashbls/bls.hpp>
+#include <dashbls/schemes.hpp>
+#include <dashbls/elements.hpp>
+#endif
+
 #include <core/uint256.hpp>
 
 #include <array>
@@ -52,6 +61,7 @@ namespace {
 
 using dash::coin::vendor::verify_govvote_operator_sig;
 using dash::coin::vendor::bls_backend_available;
+using dash::coin::VOTE_OUTCOME_NONE;
 using dash::coin::VOTE_OUTCOME_YES;
 using dash::coin::VOTE_OUTCOME_NO;
 using dash::coin::VOTE_SIGNAL_FUNDING;
@@ -295,6 +305,229 @@ TEST(DashGovVoteBLS, MaintainerCountsOnlyVerifiedVotes) {
         ASSERT_TRUE(best.has_value());
         EXPECT_EQ(best->object_hash, oh);
     }
+}
+
+// ═══════════ #818 review must-fix KATs — governance-tally dashcore parity ═══
+// All three are the SAME hazard class: c2pool tallying votes dashd does NOT
+// (or not counting ones it does) => tally divergence => wrong trigger wins =>
+// wrong superblock payees => lost block. Parity target: dashcore v23.1.7
+// governance/vote.cpp + governance/object.cpp.
+
+// ── 8. must-fix 1: a LEGACY-SCHEME-SIGNED vote REJECTS ───────────────────────
+// dashcore CGovernanceVote::CheckSignature(const CBLSPublicKey&) does
+// sig.SetBytes(vchSig, false) + sig.VerifyInsecure(pubKey, hash, false) — the
+// SIGNATURE axis is hard-pinned BASIC (SetBytes has no legacy/CheckMalleable
+// retry; that exists only in stream Unserialize). Post-V19 dashd therefore
+// REJECTS a legacy-scheme-signed governance vote. The pre-fix legacy-sig
+// fallback ACCEPTED it — a hostile registered MN could legacy-sign a YES on a
+// near-threshold trigger and feed it only to c2pool (dashd would not relay
+// it), inflating the local tally. FAILS on the pre-fix code / PASSES after.
+#ifdef C2POOL_DASH_BLS
+TEST(DashGovVoteBLS, LegacySchemeSignedVoteRejects) {
+    if (!bls_backend_available()) GTEST_SKIP();
+    std::vector<uint8_t> seed(32, 0x5a);
+    bls::PrivateKey sk = bls::BasicSchemeMPL().KeyGen(seed);
+    const uint256 digest = real_vote_digest();   // real vote structure/preimage
+    const bls::Bytes msg(digest.data(), 32);
+
+    // The hostile MN legacy-SIGNS the (otherwise well-formed) vote digest and
+    // may hand us the sig in either wire encoding, claiming either key
+    // registration — dashd rejects EVERY combination, and so must we.
+    bls::G2Element legacy_sig = bls::LegacySchemeMPL().Sign(sk, msg);
+    for (bool sig_enc_legacy : {true, false}) {
+        const std::vector<uint8_t> sig_bytes = legacy_sig.Serialize(sig_enc_legacy);
+        for (bool key_enc_legacy : {true, false}) {
+            const std::array<uint8_t, 48> pk48 =
+                sk.GetG1Element().SerializeToArray(key_enc_legacy);
+            EXPECT_FALSE(verify_govvote_operator_sig(
+                pk48, /*key_legacy_scheme=*/key_enc_legacy, digest, sig_bytes))
+                << "legacy-SIGNED vote accepted (sig_enc_legacy="
+                << sig_enc_legacy << ", key_enc_legacy=" << key_enc_legacy
+                << ") — dashd rejects it; tally-inflation hazard";
+        }
+    }
+
+    // Positive control: the SAME key BASIC-signs (the post-V19 network
+    // scheme) => ACCEPT — under BOTH pubkey wire-encodings and BOTH declared
+    // registration flags. This pins that must-fix 1 removed ONLY the
+    // signature-axis fallback and KEPT the pubkey-ENCODING fallback (dashcore
+    // CBLSLazyPublicKey ingest decodes the operator key per its registration
+    // version before CheckSignature ever sees it).
+    bls::G2Element basic_sig = bls::BasicSchemeMPL().Sign(sk, msg);
+    const std::vector<uint8_t> basic_sig_bytes = basic_sig.Serialize(false);
+    for (bool key_enc_legacy : {false, true}) {
+        const std::array<uint8_t, 48> pk48 =
+            sk.GetG1Element().SerializeToArray(key_enc_legacy);
+        for (bool declared_legacy : {false, true}) {
+            EXPECT_TRUE(verify_govvote_operator_sig(
+                pk48, declared_legacy, digest, basic_sig_bytes))
+                << "basic-signed vote must verify (key_enc_legacy="
+                << key_enc_legacy << ", declared_legacy=" << declared_legacy
+                << ") — pubkey-encoding fallback must be preserved";
+        }
+    }
+}
+#endif // C2POOL_DASH_BLS
+
+// ── 9. must-fix 2: banned-MN votes COUNT; threshold denominator is VALID-only ─
+// dashcore resolves the voting MN with the UNFILTERED GetMNByCollateral in
+// BOTH CGovernanceVote::IsValid and CGovernanceObject::CountMatchingVotes — a
+// PoSe-BANNED MN's vote verifies and counts at FULL weight. Only the funding
+// THRESHOLD denominator (UpdateSentinelVariables: max(minQuorum,
+// m_valid_weighted/10)) is computed over the VALID set. Pre-fix c2pool
+// filtered banned MNs out of both closures: natural PoSe-ban churn (no
+// attacker needed) then dropped e.g. a banned MN's NO and inflated yes−no vs
+// dashd. FAILS on the pre-fix semantics / PASSES after.
+TEST(DashGovVoteBLS, BannedMnVoteCountsAtWeightThresholdUsesValidSet) {
+    using dash::coin::gov_mn_by_collateral;
+    using dash::coin::gov_vote_weight_for_key;
+
+    dash::coin::NodeCoinState ncs;
+    dash::coin::CoinStateMaintainer m(ncs);
+
+    // SML: 30 valid + 20 PoSe-banned regular MNs. The DENOMINATOR half of the
+    // asymmetry: valid-weighted = 30 => threshold = max(1, 30/10) = 3 — the
+    // banned 20 are EXCLUDED here (dashcore m_valid_weighted), even though
+    // their votes still count below.
+    for (int i = 0; i < 50; ++i) {
+        dash::coin::vendor::CSimplifiedMNListEntry e;
+        e.isValid = (i < 30);
+        e.nType   = dash::coin::vendor::CSimplifiedMNListEntry::TYPE_REGULAR;
+        ncs.sml().mnList.push_back(e);
+    }
+    m.set_gov_params(/*testnet=*/true, /*min_quorum=*/1);   // reseeds threshold
+    EXPECT_EQ(m.gov_store().funding_threshold(), 3)
+        << "threshold denominator must be the VALID-weighted count only";
+
+    // DMN view: one valid regular MN, one PoSe-BANNED EvoNode.
+    dash::coin::MNState valid_mn;
+    valid_mn.collateralOutpoint.hash  = h(0x01);
+    valid_mn.collateralOutpoint.index = 1;
+    valid_mn.isValid = true;
+    valid_mn.nType   = dash::coin::vendor::MnType::REGULAR;
+
+    dash::coin::MNState banned_evo;
+    banned_evo.collateralOutpoint.hash  = h(0x02);
+    banned_evo.collateralOutpoint.index = 2;
+    banned_evo.isValid = false;                             // PoSe-banned
+    banned_evo.nType   = dash::coin::vendor::MnType::EVO;
+
+    ncs.mnstates().load({{h(0x11), valid_mn}, {h(0x12), banned_evo}});
+
+    const std::string valid_key =
+        valid_mn.collateralOutpoint.hash.GetHex() + "-1";
+    const std::string banned_key =
+        banned_evo.collateralOutpoint.hash.GetHex() + "-2";
+
+    // VERIFY path (CGovernanceVote::IsValid): the banned MN still RESOLVES —
+    // its vote reaches the BLS verify (unfiltered GetMNByCollateral).
+    EXPECT_NE(gov_mn_by_collateral(ncs.mnstates(),
+                                   banned_evo.collateralOutpoint),
+              nullptr)
+        << "banned MN must resolve on the verify path (dashd verifies its vote)";
+
+    // TALLY path (CountMatchingVotes): banned EvoNode counts at FULL weight 4;
+    // an unknown collateral is the ONLY membership drop dashcore performs.
+    EXPECT_EQ(gov_vote_weight_for_key(ncs.mnstates(), valid_key), 1);
+    EXPECT_EQ(gov_vote_weight_for_key(ncs.mnstates(), banned_key), 4)
+        << "banned MN's vote must count at full weight (dashcore unfiltered)";
+    EXPECT_EQ(gov_vote_weight_for_key(ncs.mnstates(),
+                                      h(0x03).GetHex() + "-0"), 0);
+
+    // End-to-end through the store with the wired weight fn: the banned
+    // EvoNode's verified YES (weight 4) alone reaches the valid-only
+    // threshold 3; its later NO pulls the tally NEGATIVE — exactly the swing
+    // the pre-fix isValid filter would have hidden.
+    const int32_t H = 1519824;
+    auto oh = h(0xCC);
+    auto& store = m.gov_store();
+    store.add_trigger(mk_trigger(oh, H));
+    store.set_vote_weight_fn([&ncs](const std::string& k) {
+        return dash::coin::gov_vote_weight_for_key(ncs.mnstates(), k);
+    });
+    store.add_verified_funding_vote(oh, banned_key, VOTE_OUTCOME_YES, 100);
+    EXPECT_EQ(store.absolute_yes_count(oh), 4);
+    EXPECT_TRUE(store.is_superblock_triggered(H));
+    store.add_verified_funding_vote(oh, banned_key, VOTE_OUTCOME_NO, 101);
+    EXPECT_EQ(store.absolute_yes_count(oh), -4)
+        << "a banned MN's NO must count (dropping it inflates yes-no vs dashd)";
+    EXPECT_FALSE(store.is_superblock_triggered(H));
+}
+
+// ── 10. must-fix 3: NONE replaces a stored YES; exact replacement tie-break ──
+// dashcore CGovernanceObject::ProcessVote STORES outcome NONE (IsValid's
+// outcome range starts AT VOTE_OUTCOME_NONE) — a newer NONE replaces a stored
+// YES and the yes-count drops. Replacement rule, matched exactly: reject when
+// new nTime < stored ("Obsolete vote"); on EQUAL nTime reject ONLY when the
+// new outcome < the stored outcome (upstream's explicit tie-break); otherwise
+// replace. Pre-fix c2pool dropped NONE (stale YES lingered after the voter
+// withdrew it) and rejected ALL equal-nTime re-votes. FAILS pre-fix / PASSES
+// after.
+TEST(DashGovVoteBLS, NoneVoteReplacesYesAndEqualTimeTieBreakMatchesDashcore) {
+    dash::coin::GovernanceStore store;
+    const int32_t H = 1519824;
+    auto oh = h(0xDD);
+    store.add_trigger(mk_trigger(oh, H));
+    store.set_vote_weight_fn([](const std::string&) { return 1; });
+    store.set_funding_threshold(1);
+
+    store.add_verified_funding_vote(oh, "mn-1", VOTE_OUTCOME_YES, 100);
+    EXPECT_EQ(store.absolute_yes_count(oh), 1);
+    EXPECT_TRUE(store.is_superblock_triggered(H));
+
+    // Newer NONE REPLACES the stored YES → yes-count drops, trigger unfunds.
+    store.add_verified_funding_vote(oh, "mn-1", VOTE_OUTCOME_NONE, 101);
+    EXPECT_EQ(store.absolute_yes_count(oh), 0)
+        << "a newer NONE must remove the stored YES from the tally";
+    EXPECT_FALSE(store.is_superblock_triggered(H));
+
+    // Obsolete (older nTime) => rejected.
+    store.add_verified_funding_vote(oh, "mn-1", VOTE_OUTCOME_YES, 50);
+    EXPECT_EQ(store.absolute_yes_count(oh), 0);
+
+    // Equal-nTime tie-break — reject ONLY new outcome < stored:
+    // stored NONE(0)@101, new YES(1)@101: 1 >= 0 => ACCEPTED (replaces).
+    store.add_verified_funding_vote(oh, "mn-1", VOTE_OUTCOME_YES, 101);
+    EXPECT_EQ(store.absolute_yes_count(oh), 1);
+    // stored YES(1)@101, new NONE(0)@101: 0 < 1 => REJECTED.
+    store.add_verified_funding_vote(oh, "mn-1", VOTE_OUTCOME_NONE, 101);
+    EXPECT_EQ(store.absolute_yes_count(oh), 1);
+    // stored YES(1)@101, new NO(2)@101: 2 >= 1 => ACCEPTED (yes -> no).
+    store.add_verified_funding_vote(oh, "mn-1", VOTE_OUTCOME_NO, 101);
+    EXPECT_EQ(store.absolute_yes_count(oh), -1);
+}
+
+// ── 11. must-fix 3 (ingest leg): on_govvote must NOT drop outcome NONE ───────
+TEST(DashGovVoteBLS, MaintainerIngestsNoneVote) {
+    using Ctx = dash::coin::CoinStateMaintainer::GovVoteContext;
+    const int32_t H = 1519824;
+    auto oh = h(0xEE);
+
+    dash::coin::NodeCoinState ncs;
+    dash::coin::CoinStateMaintainer m(ncs);
+    m.set_gov_params(true, 1);
+    m.gov_store().add_trigger(mk_trigger(oh, H));
+    m.gov_store().set_vote_weight_fn([](const std::string&) { return 1; });
+    m.gov_store().set_funding_threshold(1);
+    m.set_vote_verifier([](const Ctx&) { return true; });
+
+    Ctx yes;
+    yes.parent_hash = oh;
+    yes.outcome = VOTE_OUTCOME_YES;
+    yes.signal  = VOTE_SIGNAL_FUNDING;
+    yes.time    = 100;
+    m.on_govvote(yes, "mn-1");
+    EXPECT_TRUE(m.gov_store().is_superblock_triggered(H));
+
+    // The voter withdraws: a newer NONE vote. Pre-fix on_govvote dropped it
+    // at the outcome filter and the stale YES kept the trigger funded here
+    // while dashd's tally had already dropped it.
+    Ctx none = yes;
+    none.outcome = VOTE_OUTCOME_NONE;
+    none.time    = 101;
+    m.on_govvote(none, "mn-1");
+    EXPECT_FALSE(m.gov_store().is_superblock_triggered(H))
+        << "on_govvote must ingest NONE — the withdrawn YES must leave the tally";
 }
 
 } // namespace

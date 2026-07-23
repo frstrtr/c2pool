@@ -1767,9 +1767,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             //   2. (R3, WIRED below) the weighted tally uses the vote-weight/
             //      membership seam (GovernanceStore::set_vote_weight_fn) —
             //      resolved from the full DMN view (collateral outpoint ->
-            //      operator key + type), EvoNode 4x, 0 for an MN no longer in
-            //      the valid set. The threshold itself reseeds from the weighted
-            //      SML count on every diff (reseed_funding_threshold).
+            //      operator key + type), EvoNode 4x, 0 only for an MN no
+            //      longer in the DMN list at all (dashcore's UNFILTERED
+            //      GetMNByCollateral — PoSe-banned MNs still count). The
+            //      threshold itself reseeds from the weighted VALID SML count
+            //      on every diff (reseed_funding_threshold — dashcore's own
+            //      tally/denominator asymmetry).
             //   3. the R5 govsync-completeness gate
             //      (set_superblock_sync_complete_fn) is STILL NOT wired — the
             //      NodeCoinState guard refuses the serve path structurally,
@@ -1810,14 +1813,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // both closures resolve the voting masternode by its COLLATERAL
                 // OUTPOINT in the node's live DMN view (node_coin_state
                 // .mnstates(), seeded from protx info — the DIP-4 SML alone
-                // carries neither collateral outpoints nor operator keys). Every
-                // step FAILS CLOSED: unknown MN, banned MN, unresolvable key,
-                // wrong sig size, stale/future time, or a failed BLS verify =>
-                // the vote is NOT tallied. The funding THRESHOLD is already
-                // (re)seeded from the weighted SML count on every accepted diff
-                // (reseed_funding_threshold); the R5 completeness gate below is
-                // STILL deliberately unwired, so landing vote-verify here can
-                // never by itself open the serve path.
+                // carries neither collateral outpoints nor operator keys), via
+                // the shared gov_mn_by_collateral / gov_vote_weight_for_key
+                // parity helpers. Every step FAILS CLOSED: unknown MN,
+                // unresolvable key, wrong sig size, stale/future time, or a
+                // failed BLS verify => the vote is NOT tallied. NOTE dashcore
+                // parity (v23.1.7): the resolve is UNFILTERED
+                // (GetMNByCollateral) — a PoSe-BANNED MN's vote still verifies
+                // and still counts at full weight, in BOTH paths; only the
+                // funding THRESHOLD denominator is valid-weighted
+                // (reseed_funding_threshold, reseeded from the weighted SML
+                // count on every accepted diff — dashcore's own asymmetry).
+                // The R5 completeness gate below is STILL deliberately
+                // unwired, so landing vote-verify here can never by itself
+                // open the serve path.
                 {
                     auto* ncs = &node_coin_state;
 
@@ -1830,50 +1839,48 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             -> bool {
                             // dashcore IsValid: reject a vote timestamped more
                             // than an hour into the future (clock-skew bound).
+                            // KNOWN NIT (documented, not fixed): dashcore uses
+                            // GetAdjustedTime() (network-adjusted); c2pool has
+                            // no peer time-offset plumbing here, so this is the
+                            // LOCAL clock. Divergence is bounded by our own
+                            // clock skew and only matters for votes inside that
+                            // skew of the +1h edge; NTP-disciplined hosts make
+                            // it negligible. Revisit if soak shows drift.
                             if (v.time > static_cast<int64_t>(std::time(nullptr)) + 60 * 60)
                                 return false;
-                            // Resolve collateral outpoint -> DMN -> operator key.
+                            // Resolve collateral outpoint -> DMN -> operator
+                            // key. UNFILTERED (no PoSe-ban check) — dashcore
+                            // CGovernanceVote::IsValid resolves via
+                            // GetMNByCollateral, so a banned MN's vote still
+                            // verifies in dashd and must here too (dropping a
+                            // banned MN's NO inflates our yes−no vs dashd).
                             bitcoin_family::coin::TxPrevOut op;
                             op.hash  = v.mn_outpoint_hash;
                             op.index = v.mn_outpoint_index;
-                            auto pro = ncs->mnstates().find_by_collateral(op);
-                            if (!pro) return false;              // MN not in DMN set
-                            const auto& es = ncs->mnstates().entries();
-                            auto it = es.find(*pro);
-                            if (it == es.end()) return false;
-                            if (!it->second.isValid) return false;   // banned/invalid
+                            const dash::coin::MNState* mn =
+                                dash::coin::gov_mn_by_collateral(
+                                    ncs->mnstates(), op);
+                            if (!mn) return false;           // MN not in DMN list
                             const bool legacy =
-                                (it->second.nVersion ==
+                                (mn->nVersion ==
                                  dash::coin::vendor::ProTxVersion::LEGACY_BLS);
                             return dash::coin::vendor::verify_govvote_operator_sig(
-                                it->second.pubKeyOperator, legacy,
+                                mn->pubKeyOperator, legacy,
                                 v.vote_hash, v.vch_sig);
                         });
 
                     // Vote-weight + membership-at-tally — dashcore
-                    // CountMatchingVotes: EvoNode 4x, Regular 1x, and 0
-                    // (vote dropped) when the MN is not in the valid DMN set at
-                    // tally time. Keyed by "<collateral-txid-hex>-<index>"
-                    // (GovOutPoint::to_key()); we reconstruct the outpoint and
-                    // resolve it against the SAME live DMN view.
+                    // CountMatchingVotes: EvoNode 4x, Regular 1x, and 0 (vote
+                    // dropped) ONLY when the outpoint is not in the DMN list
+                    // at tally time (unfiltered GetMNByCollateral — banned MNs
+                    // still count). Keyed by "<collateral-txid-hex>-<index>"
+                    // (GovOutPoint::to_key()); gov_vote_weight_for_key
+                    // reconstructs the outpoint and resolves it against the
+                    // SAME live DMN view.
                     maintainer->gov_store().set_vote_weight_fn(
                         [ncs](const std::string& key) -> int {
-                            const auto dashpos = key.rfind('-');
-                            if (dashpos == std::string::npos) return 0;
-                            bitcoin_family::coin::TxPrevOut op;
-                            op.hash.SetHex(key.substr(0, dashpos));
-                            try {
-                                op.index = static_cast<uint32_t>(
-                                    std::stoul(key.substr(dashpos + 1)));
-                            } catch (...) { return 0; }
-                            auto pro = ncs->mnstates().find_by_collateral(op);
-                            if (!pro) return 0;
-                            const auto& es = ncs->mnstates().entries();
-                            auto it = es.find(*pro);
-                            if (it == es.end() || !it->second.isValid) return 0;
-                            return (it->second.nType == dash::coin::vendor::MnType::EVO)
-                                       ? dash::coin::DASH_VOTE_WEIGHT_EVO
-                                       : dash::coin::DASH_VOTE_WEIGHT_REGULAR;
+                            return dash::coin::gov_vote_weight_for_key(
+                                ncs->mnstates(), key);
                         });
                 }
 
