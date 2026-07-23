@@ -28,6 +28,9 @@
 /// safety path and the [GBT-XCHECK] cross-check whenever the bundle is not live.
 
 #include <impl/dash/coin/node_coin_state.hpp>    // NodeCoinState
+#include <impl/dash/coin/governance_store.hpp>   // GovernanceStore (daemonless superblock)
+#include <impl/dash/coin/governance_object.hpp>  // parse_superblock_trigger, govvote_signature_hash
+#include <impl/dash/coin/superblock.hpp>         // get_superblock_payments (R6 cross-check + provider)
 #include <impl/dash/coin/mn_state_machine.hpp>   // MNState
 #include <impl/dash/coin/block.hpp>            // BlockType
 #include <impl/dash/coin/transaction.hpp>        // MutableTransaction
@@ -43,9 +46,11 @@
 #include <core/pack.hpp>
 #include <core/log.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -62,6 +67,138 @@ public:
     explicit CoinStateMaintainer(NodeCoinState& state) : m_state(state) {}
     CoinStateMaintainer(const CoinStateMaintainer&) = delete;
     CoinStateMaintainer& operator=(const CoinStateMaintainer&) = delete;
+
+    // ── E-SUPERBLOCK: daemonless governance object/vote ingestion ─────────
+
+    /// The node-owned governance object/vote store (daemonless superblock payee
+    /// sourcing). main_dash routes the NodeCoinState superblock provider
+    /// through superblock_schedule() below (which folds the desync latch).
+    GovernanceStore&       gov_store()       { return m_gov_store; }
+    const GovernanceStore& gov_store() const { return m_gov_store; }
+
+    /// Governance chain parameters. `testnet` selects the DASH base58 version
+    /// pair the CHAIN-STRICT trigger address decode accepts (a wrong-chain
+    /// payee fails the trigger closed — dashd "Invalid Dash Address" parity);
+    /// `min_quorum` is chainparams nGovernanceMinQuorum for the funding
+    /// threshold (DASH_GOV_MIN_QUORUM_MAINNET / _TESTNET). Until this is set,
+    /// min_quorum stays 0 => governance_funding_threshold() yields 0 => the
+    /// tally can never trigger (fail closed).
+    void set_gov_params(bool testnet, int min_quorum) {
+        m_gov_testnet = testnet;
+        m_gov_min_quorum = min_quorum;
+        reseed_funding_threshold();
+    }
+
+    /// Superblock context for the R6 desync cross-check + store pruning:
+    /// `is_superblock_fn(height)` — is this height a superblock height (same
+    /// predicate NodeCoinState holds); `budget_fn(height)` — the superblock
+    /// budget cap in duffs (superblock_budget). Unset (default) => the
+    /// cross-check and superblock_schedule() are inert (nullopt => fail
+    /// closed), matching the KAT posture.
+    void set_superblock_ctx(std::function<bool(uint32_t)> is_superblock_fn,
+                            std::function<int64_t(uint32_t)> budget_fn) {
+        m_sb_is_fn     = std::move(is_superblock_fn);
+        m_sb_budget_fn = std::move(budget_fn);
+    }
+
+    /// The daemonless superblock schedule for `height`, folding EVERY local
+    /// gate: the R6 desync latch (a proven-wrong governance view must never
+    /// serve again until re-proven), the superblock ctx being wired, and
+    /// get_superblock_payments' threshold/budget gates. This is what the
+    /// NodeCoinState provider closure calls — never reach around it to the
+    /// raw store. nullopt => NOT trigger-confident => dashd fallback.
+    std::optional<std::vector<SuperblockPayment>>
+    superblock_schedule(uint32_t height) const {
+        if (m_gov_desync_latched) return std::nullopt;   // R6 latch: fail closed
+        if (!m_sb_budget_fn) return std::nullopt;        // ctx not wired
+        return get_superblock_payments(
+            m_gov_store, static_cast<int32_t>(height), m_sb_budget_fn(height));
+    }
+
+    /// R6 desync latch state (observability / tests).
+    bool gov_desync_latched() const { return m_gov_desync_latched; }
+
+    /// Vote verification seam — the contract the follow-up implementer MUST
+    /// build to (WRONG-SCHEME WARNING: trigger funding votes are NOT
+    /// ECDSA/keyIDVoting-signed; that path applies only to PROPOSAL funding
+    /// votes — dashcore governance/object.cpp: onlyVotingKeyAllowed =
+    /// (type == PROPOSAL && signal == FUNDING)):
+    ///   1. Look the voting MN up by its COLLATERAL OUTPOINT in the valid
+    ///      deterministic MN set at verify time (unknown MN => reject). Note
+    ///      the DIP-4 SML does not carry collateral outpoints — this needs the
+    ///      full DMN view (protx info), see GovernanceStore::set_vote_weight_fn.
+    ///   2. BLS-verify vch_sig with the MN's OPERATOR key (pubKeyOperator from
+    ///      the DMN state; basic scheme post-v19) over the digest
+    ///      govvote_signature_hash(outpoint, parent, outcome, signal, time)
+    ///      — dashcore CGovernanceVote::CheckSignature(CBLSPublicKey):
+    ///      sig.SetBytes(vchSig, false); sig.VerifyInsecure(pubKey,
+    ///      GetSignatureHash(), false). Requires the bls-signatures lib and a
+    ///      from-wire vote + operator-key vector pin BEFORE enabling.
+    ///   3. Enforce dashcore CGovernanceVote::IsValid's time bound:
+    ///      nTime <= now + 60*60 (an hour of clock skew, no more).
+    /// UNSET (default) => NO vote is counted => the funding tally stays 0 =>
+    /// no trigger ever reaches threshold => the superblock arm FAILS CLOSED to
+    /// dashd. This default stands until BLS vote-verify is pinned; nothing in
+    /// this file verifies votes today.
+    struct GovVoteContext {
+        uint256              parent_hash;
+        uint256              mn_outpoint_hash;
+        uint32_t             mn_outpoint_index{0};
+        int32_t              outcome{0};
+        int32_t              signal{0};
+        int64_t              time{0};
+        std::vector<uint8_t> vch_sig;
+        uint256              vote_hash;   // govvote_signature_hash (BLS signing digest)
+    };
+    void set_vote_verifier(std::function<bool(const GovVoteContext&)> fn) {
+        m_vote_verifier = std::move(fn);
+    }
+
+    /// Reception path (govobj): ingest a governance object. Only TRIGGER objects
+    /// (type 2) whose vchData parses as a valid superblock payment schedule are
+    /// added to the store; everything else (proposals, malformed triggers) is
+    /// dropped. The trigger's payee vector is re-derived from its OWN vchData
+    /// (parse_superblock_trigger), never guessed — a parse failure fails closed.
+    /// NOTE: wire vchData is the PLAINTEXT JSON bytes (dashcore
+    /// GetDataAsPlainString does no hex layer; RPC DataHex is hex OF these
+    /// bytes). The parse is CHAIN-STRICT per set_gov_params.
+    void on_govobject(const uint256& object_hash, int32_t object_type,
+                      const std::vector<uint8_t>& vch_data) {
+        if (object_type != GOVERNANCE_OBJECT_TRIGGER) return;   // only superblock triggers
+        std::string plain(vch_data.begin(), vch_data.end());
+        auto trig = parse_superblock_trigger(plain, object_hash, m_gov_testnet);
+        if (!trig) return;                                      // malformed → fail closed
+        if (!m_gov_store.add_trigger(*trig)) {
+            LOG_WARNING << "[GOVSYNC] trigger store FULL ("
+                        << m_gov_store.trigger_count()
+                        << ") — dropping trigger "
+                        << object_hash.GetHex().substr(0, 16);
+            return;
+        }
+        LOG_INFO << "[GOVSYNC] trigger " << object_hash.GetHex().substr(0, 16)
+                 << " for superblock h=" << trig->event_block_height << " with "
+                 << trig->payments.size() << " payee(s), total="
+                 << trig->total_amount() << " duffs";
+    }
+
+    /// Reception path (govobjvote): ingest a governance vote. Only FUNDING-signal
+    /// votes on a KNOWN trigger are relevant; the vote is counted ONLY if the
+    /// verifier confirms its signature — for trigger funding votes that is BLS
+    /// by the MN's OPERATOR key (see set_vote_verifier — default UNSET =>
+    /// never counted => fail closed).
+    void on_govvote(const GovVoteContext& v, const std::string& mn_outpoint_key) {
+        if (v.signal != VOTE_SIGNAL_FUNDING) return;            // only the superblock tally axis
+        if (v.outcome != VOTE_OUTCOME_YES && v.outcome != VOTE_OUTCOME_NO &&
+            v.outcome != VOTE_OUTCOME_ABSTAIN)
+            return;                                             // dashcore IsValid outcome range
+        if (!m_gov_store.has_trigger(v.parent_hash)) return;    // vote for a non-trigger → ignore
+        if (!m_vote_verifier || !m_vote_verifier(v)) {
+            // Unverified (default) or failed verify: DO NOT count. Fail closed.
+            return;
+        }
+        m_gov_store.add_verified_funding_vote(
+            v.parent_hash, mn_outpoint_key, v.outcome, v.time);
+    }
 
     /// Reception path (mnlistdiff): replace the masternode set the embedded
     /// coinbase pays. An EMPTY list is treated as a gap -- it cannot back a
@@ -241,6 +378,12 @@ public:
         // diff carried a v3+ cbTx seed.
         if (m_have_mn_sml && cp_seeded && m_on_credit_pool_persist)
             m_on_credit_pool_persist(diff.blockHash, cp_height, cp_balance);
+        // E-SUPERBLOCK (R4): the SML just changed, so the governance funding
+        // threshold changes with it — re-derive max(minQuorum, weighted/10)
+        // from the CURRENT weighted MN count on EVERY accepted diff (dashcore
+        // recomputes nAbsVoteReq per tally; a one-shot seed would freeze a
+        // cold-start 0 forever or drift as the list grows).
+        reseed_funding_threshold();
         if (!m_have_mn_sml)
             demote();
         else
@@ -294,6 +437,10 @@ public:
         // forces a cold full-snapshot re-sync (main_dash points this at
         // SMLDb::clear + QuorumDb::clear; unset in KATs = no-op).
         if (m_on_sml_clear) m_on_sml_clear();
+        // E-SUPERBLOCK (R4): the SML is gone — the funding threshold derived
+        // from it is meaningless. Re-seed (=> 0 with an empty list) so no
+        // trigger can be considered funded until a fresh SML lands.
+        reseed_funding_threshold();
         demote();
         // Re-issue work so miners are moved off any embedded template that was
         // built on the now-orphaned branch onto the dashd fallback immediately.
@@ -365,6 +512,19 @@ public:
         // Runs BEFORE the MN snapshot fence: the credit pool is a distinct axis
         // (asset-lock/unlock + platform-reward), independent of the payee set.
         advance_credit_pool_on_block(block, height);
+
+        // E-SUPERBLOCK (R6): superblock desync cross-check + store pruning —
+        // the superblock analogue of the MN payee-desync latch below (#807,
+        // block 2508008 class). Runs ONLY at superblock heights (the predicate
+        // guard means non-superblock heights can never false-fire) and only
+        // when our governance view was trigger-confident for this height: the
+        // ingested block's actual coinbase is the network's verdict on the
+        // superblock schedule, so every (script, amount) we WOULD have served
+        // must appear among its outputs. A mismatch proves our view wrong —
+        // NEVER serve from it again: clear the store, latch the desync (only a
+        // restart / future re-proof path unlatches), demote to the dashd
+        // fallback, and log loudly.
+        cross_check_superblock_on_block(block, height);
 
         // E2c snapshot fence: blocks the payout-bearing snapshot already
         // reflects (height <= its as-of height) must NOT be re-folded -- the
@@ -604,6 +764,75 @@ private:
                                 static_cast<int32_t>(height));
     }
 
+    // E-SUPERBLOCK (R4): derive the funding threshold from the CURRENT SML —
+    // dashcore UpdateSentinelVariables: nAbsVoteReq = max(nGovernanceMinQuorum,
+    // weighted_valid_MN_count / 10), where each valid MN counts at its voting
+    // weight (Regular 1, EvoNode 4 — evo/dmn_types.h). Empty list or unset
+    // min-quorum (set_gov_params not called) => 0 => fail closed. Called on
+    // every accepted mnlistdiff, on SML reorg wipes, and from set_gov_params.
+    void reseed_funding_threshold() {
+        int weighted = 0;
+        for (const auto& e : m_state.sml().mnList) {
+            if (!e.isValid) continue;
+            weighted += (e.nType == vendor::CSimplifiedMNListEntry::TYPE_EVO)
+                            ? DASH_VOTE_WEIGHT_EVO
+                            : DASH_VOTE_WEIGHT_REGULAR;
+        }
+        m_gov_store.set_funding_threshold(
+            governance_funding_threshold(weighted, m_gov_min_quorum));
+    }
+
+    // E-SUPERBLOCK (R6): superblock desync cross-check (see the call site in
+    // on_block_connected for the rationale). Compares the schedule we WOULD
+    // have served at `height` against the actual coinbase outputs of the
+    // network-accepted block at that height.
+    void cross_check_superblock_on_block(const dash::coin::BlockType& block,
+                                         uint32_t height) {
+        if (!m_sb_is_fn || !m_sb_is_fn(height)) return;   // not a superblock height
+        // Resolve our confident view FIRST (superblock_schedule folds the
+        // latch + threshold/budget gates), THEN prune the executed cycle.
+        auto ours = superblock_schedule(height);
+        if (ours && !ours->empty() && !block.m_txs.empty()) {
+            const auto& cb = block.m_txs[0];
+            bool all_found = true;
+            for (const auto& sp : *ours) {
+                bool found = false;
+                for (const auto& out : cb.vout) {
+                    if (out.value == sp.amount &&
+                        out.scriptPubKey.m_data.size() == sp.script.size() &&
+                        std::equal(sp.script.begin(), sp.script.end(),
+                                   out.scriptPubKey.m_data.begin())) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) { all_found = false; break; }
+            }
+            if (!all_found) {
+                LOG_WARNING << "[GOVSYNC] SUPERBLOCK DESYNC at h=" << height
+                            << " — our trigger-confident schedule ("
+                            << ours->size() << " payee(s)) does NOT match the "
+                               "accepted block's coinbase. Clearing governance "
+                               "store + LATCHING the superblock arm closed "
+                               "(superblock heights fail to dashd until "
+                               "restart); re-issuing work.";
+                m_gov_store.clear();
+                m_gov_desync_latched = true;
+                // Transient invalidate + re-issue so any currently-published
+                // template is rebuilt. The MN axis is a separate axis — if it
+                // is healthy the arm re-publishes for NON-superblock heights;
+                // superblock heights stay closed via the latch above
+                // (superblock_schedule => nullopt => resolve_superblock
+                // refuses => dashd fallback).
+                demote();
+                notify_state_dirty();
+            }
+        }
+        // The cycle at `height` has executed — dashcore erases executed
+        // triggers; prune keeps the store bounded across cycles (F2).
+        m_gov_store.prune_executed(static_cast<int32_t>(height));
+    }
+
     // Publish only when both prerequisites are present; otherwise leave the
     // holder in whatever (un)published state it is in -- callers reach demote()
     // explicitly for the invalidating transitions.
@@ -620,6 +849,15 @@ private:
     }
 
     NodeCoinState& m_state;
+    GovernanceStore m_gov_store;             // E-SUPERBLOCK: govsync object/vote store
+    // Vote-verify seam (unset = fail closed). Contract: BLS by the MN's
+    // OPERATOR key for trigger funding votes — see set_vote_verifier docs.
+    std::function<bool(const GovVoteContext&)> m_vote_verifier;
+    bool m_gov_testnet{false};       // chain-strict trigger address decode
+    int  m_gov_min_quorum{0};        // chainparams nGovernanceMinQuorum (0 = unset => fail closed)
+    bool m_gov_desync_latched{false};// R6: proven-wrong governance view => never serve
+    std::function<bool(uint32_t)>    m_sb_is_fn;      // superblock-height predicate (R6)
+    std::function<int64_t(uint32_t)> m_sb_budget_fn;  // superblock budget cap (duffs)
     std::function<void()> m_on_state_dirty;  // SML/bestCL/reorg -> re-issue work
     std::function<void()> m_on_mn_reseed;    // payee desync -> authoritative protx re-seed
     std::function<void()> m_on_full_resync;  // H-1 heal -> reset sml_base + full re-sync

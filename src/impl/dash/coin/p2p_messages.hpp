@@ -172,6 +172,108 @@ BEGIN_MESSAGE(mnlistdiff)
     }
 END_MESSAGE()
 
+// ── E-SUPERBLOCK: governance sync (daemonless superblock payee sourcing) ──
+// Wire commands (dashcore protocol.cpp):
+//   "govsync"    — MNGOVERNANCESYNC:      request objects+votes (we SEND this)
+//   "govobj"     — MNGOVERNANCEOBJECT:    a governance object (we INGEST this)
+//   "govobjvote" — MNGOVERNANCEOBJECTVOTE: a governance vote  (we INGEST this)
+//
+// Field layouts are ported from dashcore governance/object.h (CGovernanceObject)
+// and governance/vote.h (CGovernanceVote). The masternode outpoint is a
+// COutPoint (32-byte txid + 4-byte LE index), identical to TxPrevOut's wire.
+//
+// ⚠ PIN-BEFORE-ENABLE: these layouts must be byte-pinned against a real
+// from-wire govobj/govobjvote capture before the daemonless superblock arm is
+// switched on in production. The arm is opt-in and DEFAULT-OFF; until pinned +
+// BLS-operator vote-verify lands, a superblock height fails closed to dashd. A layout
+// mismatch only makes ingestion fail (objects/votes rejected) => the store
+// stays empty => the arm keeps failing closed. It can never MISpay: the payee
+// vector is re-derived from the trigger's own vchData and budget-checked.
+
+// COutPoint (masternode outpoint) — mirrors bitcoin_family TxPrevOut wire.
+struct GovOutPoint {
+    uint256  hash;
+    uint32_t index{0xffffffff};
+    C2POOL_SERIALIZE_METHODS(GovOutPoint) { READWRITE(obj.hash, obj.index); }
+
+    // dashcore COutPoint::ToStringShort() == "<txid-hex>-<index>", the store's
+    // per-MN vote key (latest-vote-wins keying).
+    std::string to_key() const { return hash.GetHex() + "-" + std::to_string(index); }
+};
+
+// MNGOVERNANCEOBJECT — CGovernanceObject (governance/object.h SERIALIZE_METHODS).
+// Order: nHashParent, nRevision, nTime, nCollateralHash, vchData, nObjectType,
+// masternodeOutpoint, vchSig. nObjectType: 1=proposal, 2=trigger (superblock).
+BEGIN_MESSAGE(govobj)
+    MESSAGE_FIELDS
+    (
+        (uint256,                    m_hash_parent),
+        (int32_t,                    m_revision),
+        (int64_t,                    m_time),
+        (uint256,                    m_collateral_hash),
+        (std::vector<uint8_t>,       m_vch_data),
+        (int32_t,                    m_object_type),
+        (GovOutPoint,                m_masternode_outpoint),
+        (std::vector<uint8_t>,       m_vch_sig)
+    )
+    {
+        READWRITE(obj.m_hash_parent);
+        READWRITE(obj.m_revision);
+        READWRITE(obj.m_time);
+        READWRITE(obj.m_collateral_hash);
+        READWRITE(obj.m_vch_data);
+        READWRITE(obj.m_object_type);
+        READWRITE(obj.m_masternode_outpoint);
+        READWRITE(obj.m_vch_sig);
+    }
+END_MESSAGE()
+
+// MNGOVERNANCEOBJECTVOTE — CGovernanceVote (governance/vote.h SERIALIZE_METHODS).
+// Order: masternodeOutpoint, nParentHash, nVoteOutcome, nVoteSignal, nTime,
+// vchSig. Outcome: 1=yes 2=no 3=abstain. Signal: 1=funding (superblock tally).
+BEGIN_MESSAGE(govobjvote)
+    MESSAGE_FIELDS
+    (
+        (GovOutPoint,                m_masternode_outpoint),
+        (uint256,                    m_parent_hash),
+        (int32_t,                    m_vote_outcome),
+        (int32_t,                    m_vote_signal),
+        (int64_t,                    m_time),
+        (std::vector<uint8_t>,       m_vch_sig)
+    )
+    {
+        READWRITE(obj.m_masternode_outpoint);
+        READWRITE(obj.m_parent_hash);
+        READWRITE(obj.m_vote_outcome);
+        READWRITE(obj.m_vote_signal);
+        READWRITE(obj.m_time);
+        READWRITE(obj.m_vch_sig);
+    }
+END_MESSAGE()
+
+// MNGOVERNANCESYNC (request) — dashcore sends uint256 nProp + CBloomFilter.
+// We only ever SEND this to pull the store; a zero nProp requests ALL objects.
+// The bloom filter is optional in the protocol; we send an EMPTY filter
+// (vData=empty, nHashFuncs=0, nTweak=0, nFlags=0) — "match nothing extra",
+// which dashcore treats as "send everything" for a zero nProp sync.
+BEGIN_MESSAGE(govsync)
+    MESSAGE_FIELDS
+    (
+        (uint256,                    m_prop),
+        (std::vector<uint8_t>,       m_filter_vdata),
+        (uint32_t,                   m_filter_nhashfuncs),
+        (uint32_t,                   m_filter_ntweak),
+        (uint8_t,                    m_filter_nflags)
+    )
+    {
+        READWRITE(obj.m_prop);
+        READWRITE(obj.m_filter_vdata);
+        READWRITE(obj.m_filter_nhashfuncs);
+        READWRITE(obj.m_filter_ntweak);
+        READWRITE(obj.m_filter_nflags);
+    }
+END_MESSAGE()
+
 using Handler = MessageHandler<
     message_version,
     message_verack,
@@ -200,7 +302,10 @@ using Handler = MessageHandler<
     message_blocktxn,
     message_clsig,
     message_getmnlistd,
-    message_mnlistdiff
+    message_mnlistdiff,
+    message_govobj,
+    message_govobjvote,
+    message_govsync
 >;
 
 } // namespace p2p

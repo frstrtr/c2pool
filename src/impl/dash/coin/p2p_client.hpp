@@ -44,6 +44,7 @@
 #include "transaction.hpp"
 
 #include <impl/dash/crypto/hash_x11.hpp>   // block identity on Dash = X11(header)
+#include <impl/dash/coin/governance_object.hpp> // govobject_hash / govvote_signature_hash (dashcore-exact digests)
 
 #include <algorithm>
 #include <memory>
@@ -358,6 +359,20 @@ public:
         m_peer->write(msg);
     }
 
+    /// Send a govsync (MNGOVERNANCESYNC) — E-SUPERBLOCK governance-object sync
+    /// seam. A zero nProp with an EMPTY bloom filter requests ALL governance
+    /// objects + votes; the peer streams them back as govobj / govobjvote
+    /// messages, which the handlers above forward into the GovernanceStore.
+    void send_govsync()
+    {
+        if (!m_peer) return;
+        auto msg = message_govsync::make_raw(
+            uint256::ZERO,               // nProp = 0 => request all
+            std::vector<uint8_t>{},      // empty filter vData
+            /*nHashFuncs=*/0u, /*nTweak=*/0u, /*nFlags=*/uint8_t{0});
+        m_peer->write(msg);
+    }
+
     /// Relay a pre-serialized won block as a `block` P2P message (the embedded
     /// P2P-relay arm of the dual-path broadcaster — dispatch wiring is a later
     /// slice; the method is here so the relay leg binds without a client edit).
@@ -661,6 +676,67 @@ private:
                  << msg->m_diff.quorum_tail.size() << "B";
         m_coin->new_mnlistdiff.happened(msg->m_diff);
     }
+
+    // ── E-SUPERBLOCK: governance objects + votes (daemonless superblock) ──
+
+    ADD_P2P_HANDLER(govobj)
+    {
+        // MNGOVERNANCEOBJECT. Compute the dashcore object identity hash via
+        // govobject_hash — the EXACT Governance::Object::GetHash() preimage
+        // (governance/common.cpp), which dashcore itself notes "doesn't match
+        // serialization": it EXCLUDES nCollateralHash and nObjectType,
+        // hex-string-encodes vchData, and inserts legacy dummy bytes after
+        // the outpoint. This hash is what votes carry as nParentHash, so a
+        // wrong preimage silently detaches every vote from its trigger.
+        // Pinned byte-exact against from-wire testnet objects in
+        // test_dash_superblock.
+        ::dash::interfaces::Node::GovObjectRecord rec;
+        rec.object_hash = ::dash::coin::govobject_hash(
+            msg->m_hash_parent, msg->m_revision, msg->m_time, msg->m_vch_data,
+            msg->m_masternode_outpoint.hash, msg->m_masternode_outpoint.index,
+            msg->m_vch_sig);
+        rec.object_type = msg->m_object_type;
+        rec.vch_data    = msg->m_vch_data;
+        LOG_INFO << "[" << m_chain_label << "] govobj: hash="
+                 << rec.object_hash.GetHex().substr(0, 16) << " type="
+                 << rec.object_type << " data=" << rec.vch_data.size() << "B";
+        m_coin->new_govobject.happened(rec);
+    }
+
+    ADD_P2P_HANDLER(govobjvote)
+    {
+        // MNGOVERNANCEOBJECTVOTE. Forward the vote for the maintainer to
+        // VERIFY + TALLY. For TRIGGER funding votes — the only votes the
+        // superblock tally consults — verification is BLS by the voting MN's
+        // OPERATOR key (dashcore CGovernanceVote::IsValid with
+        // useVotingKey=false -> CheckSignature(pubKeyOperator); the
+        // ECDSA/keyIDVoting path applies ONLY to PROPOSAL funding votes).
+        // vote_hash is govvote_signature_hash — the exact dashcore
+        // GetSignatureHash preimage (outpoint, parent, outcome, signal, time;
+        // vchSig excluded), i.e. the digest the operator key signed.
+        ::dash::interfaces::Node::GovVoteRecord rec;
+        rec.parent_hash      = msg->m_parent_hash;
+        rec.mn_outpoint_hash = msg->m_masternode_outpoint.hash;
+        rec.mn_outpoint_index= msg->m_masternode_outpoint.index;
+        rec.mn_outpoint_key  = msg->m_masternode_outpoint.to_key();
+        rec.outcome          = msg->m_vote_outcome;
+        rec.signal           = msg->m_vote_signal;
+        rec.time             = msg->m_time;
+        rec.vch_sig          = msg->m_vch_sig;
+        rec.vote_hash        = ::dash::coin::govvote_signature_hash(
+            msg->m_masternode_outpoint.hash, msg->m_masternode_outpoint.index,
+            msg->m_parent_hash, msg->m_vote_outcome, msg->m_vote_signal,
+            msg->m_time);
+        // DEBUG, not INFO: a mainnet governance sync streams tens of
+        // thousands of votes (per-vote INFO would flood the journal).
+        LOG_DEBUG_COIND << "[" << m_chain_label << "] govobjvote: parent="
+                        << rec.parent_hash.GetHex().substr(0, 16) << " mn="
+                        << rec.mn_outpoint_key.substr(0, 20) << " outcome="
+                        << rec.outcome << " signal=" << rec.signal;
+        m_coin->new_govvote.happened(rec);
+    }
+
+    ADD_P2P_HANDLER(govsync)   { /* inbound sync request — we don't serve governance */ }
 
     // ── tolerated / ignored peer traffic ─────────────────────────────────
 

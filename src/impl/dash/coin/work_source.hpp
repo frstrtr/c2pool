@@ -68,6 +68,15 @@ struct EmbeddedWorkInputs {
     // testnet value via NodeCoinState::set_mn_rr_height (E4 re-soak fix).
     int                              mn_rr_height{DASH_MN_RR_HEIGHT_MAINNET};
 
+    // E-SUPERBLOCK seam: the governance-sourced treasury payout schedule for a
+    // FUNDED superblock height (superblock.hpp::get_superblock_payments). Held
+    // by value so it outlives the build closure. Empty => normal block (either
+    // a non-superblock height or a confidently-unfunded superblock). It is only
+    // ever populated when NodeCoinState resolved a trigger-confident, budget-
+    // valid schedule; an under-synced superblock view leaves has_state=false
+    // (viable()==false) so the arm fails closed to dashd instead.
+    std::vector<SuperblockPayment>   superblock_payments;
+
     bool viable() const {
         return has_state && mnstates != nullptr && mempool != nullptr;
     }
@@ -117,7 +126,11 @@ inline WorkSelection select_dash_work(
                 /*underfill_tripped=*/nullptr,
                 emb.sml, emb.qmgr,
                 emb.best_cl_height, emb.best_cl_sig, emb.credit_pool,
-                emb.mn_rr_height);
+                emb.mn_rr_height,
+                // Superblock schedule: pass the vector only when non-empty (a
+                // funded superblock height); empty => nullptr => normal block.
+                emb.superblock_payments.empty() ? nullptr
+                                                : &emb.superblock_payments);
         },
         dashd_fallback);
 }

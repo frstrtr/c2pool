@@ -427,6 +427,23 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_subsidy PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
     gtest_add_tests(test_dash_subsidy "" AUTO)
 
+    # E-SUPERBLOCK: daemonless superblock payee sourcing KATs. Pins the reused
+    # dashcore superblock logic (CSuperblock::ParsePaymentSchedule +
+    # CSuperblockManager::GetSuperblockPayments + CalcSuperblockBudget) against
+    # FROM-WIRE testnet vectors + the store/selection fail-closed discipline +
+    # the build_embedded_workdata superblock-output wiring. Header-only over
+    # impl/dash/coin (governance_object/store, superblock, embedded_gbt) + core
+    # (address_to_script); same link set as test_dash_subsidy.
+    add_executable(test_dash_superblock test_dash_superblock.cpp)
+    target_link_libraries(test_dash_superblock PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_superblock PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
+    gtest_add_tests(test_dash_superblock "" AUTO)
+
     # DASH external-dashd RPC creds-resolution KAT (launcher slice 4): dash.conf
     # rpcuser/rpcpassword/rpcport parse + --coin-rpc endpoint override + armed()
     # gating that main_dash --run consults before ARMing the submitblock fallback.

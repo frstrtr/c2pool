@@ -29,11 +29,15 @@
 #include <impl/dash/coin/vendor/cbtx.hpp>        // vendor::parse_cbtx (pre-emit CbTx self-check)
 #include <impl/dash/coin/subsidy.hpp>            // compute_dash_platform_reward_post_v20_mn_rr (creditPool re-check)
 
+#include <impl/dash/coin/governance_object.hpp>  // SuperblockPayment (daemonless superblock schedule)
+
 #include <core/uint256.hpp>
 
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <optional>
+#include <vector>
 
 namespace dash {
 namespace coin {
@@ -202,6 +206,52 @@ public:
         m_is_superblock_fn = std::move(fn);
     }
 
+    /// Daemonless superblock provider (E-SUPERBLOCK). When enabled (see
+    /// set_require_superblock_provider), the superblock-height guard consults
+    /// this instead of unconditionally refusing. The provider takes the NEXT
+    /// block height and returns:
+    ///   - nullopt              => NOT trigger-confident (govsync incomplete /
+    ///                             stale / votes unverified) => FAIL CLOSED to
+    ///                             the reward-safe dashd fallback;
+    ///   - empty vector         => confidently UNFUNDED superblock => the arm
+    ///                             may serve a NORMAL template (no extra outs);
+    ///   - non-empty vector     => the winning trigger's budget-valid (script,
+    ///                             amount) schedule => the arm serves and emits
+    ///                             exactly those treasury outputs.
+    /// The provider is only ever CALLED at superblock heights (gated by
+    /// m_is_superblock_fn), so a non-superblock height never touches it.
+    void set_superblock_provider(
+        std::function<std::optional<std::vector<SuperblockPayment>>(uint32_t)> fn) {
+        m_superblock_provider = std::move(fn);
+    }
+
+    /// Enable the daemonless superblock arm (--embedded-superblock opt-in).
+    /// Default OFF preserves the prior REWARD-SAFE posture EXACTLY: every
+    /// superblock height refuses the embedded arm and routes to the dashd
+    /// fallback (which builds the correct superblock template). When ON, the
+    /// superblock provider above resolves the schedule daemonlessly, still
+    /// failing closed on any under-synced / unverified / over-budget view.
+    void set_require_superblock_provider(bool v) { m_require_superblock_provider = v; }
+
+    /// GOVSYNC-COMPLETENESS GATE (structural reward-safety invariant, R5).
+    /// The dangerous failure mode of daemonless superblock sourcing is a
+    /// PARTIAL governance view: a store missing the higher-yes competing
+    /// trigger (or its votes) yields a CONFIDENT wrong winner — dashd
+    /// validates against ITS best trigger and rejects our block. A per-trigger
+    /// threshold cannot see what it never received, so trigger-confidence
+    /// alone is NOT sufficient to serve.
+    ///
+    /// This predicate must return true ONLY when the governance sync is
+    /// provably COMPLETE (objects+votes fully streamed and quiesced against
+    /// enough peers, counts cross-checked). It is DEFAULT-ABSENT, and
+    /// resolve_superblock REFUSES the serve path while it is absent or false
+    /// — so landing vote-verification alone can NEVER open the serve path;
+    /// the completeness predicate must be wired deliberately, together with
+    /// its own proof obligations. No production caller sets it yet.
+    void set_superblock_sync_complete_fn(std::function<bool()> fn) {
+        m_superblock_sync_complete_fn = std::move(fn);
+    }
+
     /// DKG mining-phase guard (review PR #780 BLOCKER-1, CRITICAL). On a height
     /// where a quorum commitment (type-6) is required in-block, the embedded arm
     /// cannot produce a valid block: it strips all special txs (so it omits the
@@ -256,7 +306,11 @@ public:
         // have_sml=false, but re-asserting keeps the defence-in-depth uniform.)
         if (!m_quorum_healthy) return false;
         const uint32_t next_h = m_prev_height + 1;
-        if (m_is_superblock_fn && m_is_superblock_fn(next_h)) return false;
+        // Superblock height-class guard (E-SUPERBLOCK). Refuse unless the
+        // daemonless provider is trigger-confident for this height (or the arm
+        // is disabled, in which case any superblock height refuses — old
+        // reward-safe behaviour). resolve_superblock().ok folds all cases.
+        if (!resolve_superblock(next_h).ok) return false;
         if (m_commitment_window_fn && m_commitment_window_fn(next_h)) return false;
         if (m_require_fresh_bestcl
             && m_best_cl_height < static_cast<int32_t>(m_prev_height) - 1)
@@ -308,10 +362,12 @@ public:
     /// semantics work_source.hpp documents.
     EmbeddedWorkInputs make_embedded_work_inputs() const {
         EmbeddedWorkInputs e;
+        // Resolve the superblock disposition ONCE (fail-closed unless the
+        // daemonless provider is trigger-confident) and thread the schedule.
+        SuperblockDisposition sb = resolve_superblock(m_prev_height + 1);
         e.has_state            = m_populated
                                  && (!m_utxo_ready_fn || m_utxo_ready_fn())
-                                 && (!m_is_superblock_fn
-                                     || !m_is_superblock_fn(m_prev_height + 1))
+                                 && sb.ok
                                  // BLOCKER-1: refuse DKG commitment-window heights.
                                  && (!m_commitment_window_fn
                                      || !m_commitment_window_fn(m_prev_height + 1))
@@ -352,6 +408,10 @@ public:
         e.curtime              = m_curtime;
         e.version              = m_version;
         e.mn_rr_height         = m_mn_rr_height;
+        // E-SUPERBLOCK: hand the resolved treasury schedule to the builder.
+        // Empty at non-superblock heights and confidently-unfunded superblocks
+        // (normal block); the winning trigger's payees at a funded superblock.
+        e.superblock_payments  = std::move(sb.payments);
         // CCbTx seams: pass the SML + quorum set ONLY when present, so a
         // legacy/testnet-without-SML bundle still builds the pre-CCbTx template
         // (empty payload) byte-for-byte, while a live daemonless bundle emits
@@ -379,6 +439,36 @@ public:
     }
 
 private:
+    /// Superblock disposition for a candidate next height. ok=false => refuse
+    /// (fail closed). payments empty+ok => normal block; non-empty+ok => emit.
+    struct SuperblockDisposition {
+        bool ok{true};
+        std::vector<SuperblockPayment> payments;
+    };
+
+    SuperblockDisposition resolve_superblock(uint32_t next_h) const {
+        // Not a superblock height => nothing to do, arm serves normally.
+        if (!m_is_superblock_fn || !m_is_superblock_fn(next_h))
+            return SuperblockDisposition{true, {}};
+        // It IS a superblock height. If the daemonless arm is not enabled,
+        // refuse (route to the reward-safe dashd fallback) — old behaviour.
+        if (!m_require_superblock_provider || !m_superblock_provider)
+            return SuperblockDisposition{false, {}};
+        // R5 COMPLETENESS GATE (structural): a trigger-confident answer from a
+        // PARTIAL governance view is the confidently-wrong-winner hazard, so
+        // the serve path additionally requires the govsync-completeness
+        // predicate to be PRESENT and TRUE. Default-absent => refuse => the
+        // reward-safe dashd fallback — landing vote-verify alone can never
+        // open this path.
+        if (!m_superblock_sync_complete_fn || !m_superblock_sync_complete_fn())
+            return SuperblockDisposition{false, {}};
+        // Consult the governance provider: nullopt => not trigger-confident =>
+        // fail closed; a value (possibly empty = unfunded) => arm may serve.
+        auto sched = m_superblock_provider(next_h);
+        if (!sched) return SuperblockDisposition{false, {}};
+        return SuperblockDisposition{true, std::move(*sched)};
+    }
+
     MnStateMachine m_mnstates;
     Mempool        m_mempool;
     vendor::CSimplifiedMNList m_sml;         // merkleRootMNList source (mnlistdiff-fed)
@@ -390,7 +480,15 @@ private:
     uint256  m_sml_current_hash;              // block hash the SML is current at (ZERO = cold/reorg)
     bool     m_require_sml{false};            // gate viability on have_sml (embedded arm)
     std::function<bool()> m_utxo_ready_fn;   // optional UTXO maturity gate (E2b)
-    std::function<bool(uint32_t)> m_is_superblock_fn;  // refuse embedded on superblock heights
+    std::function<bool(uint32_t)> m_is_superblock_fn;  // superblock-height predicate
+    // E-SUPERBLOCK: daemonless governance-sourced superblock schedule provider
+    // + opt-in gate. Default gate OFF => every superblock height refuses (old
+    // reward-safe behaviour); ON => resolve_superblock consults the provider.
+    std::function<std::optional<std::vector<SuperblockPayment>>(uint32_t)> m_superblock_provider;
+    bool m_require_superblock_provider{false};
+    // R5 govsync-completeness gate: absent (default) or false => superblock
+    // heights refuse the embedded arm even when the provider is confident.
+    std::function<bool()> m_superblock_sync_complete_fn;
     std::function<bool(uint32_t)> m_commitment_window_fn;  // refuse embedded on DKG commitment heights
     bool     m_require_fresh_bestcl{false};  // refuse embedded on a stale/absent bestCL
     bool     m_require_fresh_credit_pool{false}; // refuse embedded on a lagged credit-pool seed
