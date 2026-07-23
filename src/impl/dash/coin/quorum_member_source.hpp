@@ -132,7 +132,50 @@ public:
         if (m_ready.count(key) || m_pending.count(key)) return;
 
         const LlmqParamsView* p = params_for(llmq_type);
-        if (p == nullptr || p->use_rotation) return;   // rotated => qrinfo TODO
+        if (p == nullptr) return;                       // unknown type => fail closed
+        if (p->use_rotation) {
+            // ── ROTATED (DIP-24, e.g. llmq_60_75) SOURCING SEAM ─────────────
+            // The non-rotated path above sources ONE full snapshot at the work
+            // block (base-8) and runs ComputeQuorumMembers. A rotated quorum's
+            // member set is NOT derivable from a single snapshot: dashcore
+            // ComputeQuorumMembersByQuarterRotation (llmq/utils.cpp) assembles
+            // it from the QUARTER-ROTATION snapshots + cycle-base mnlistdiffs
+            // that only the qrinfo message carries. That wire + decode +
+            // quarter-rotation port is the ITEM 2 follow-up; UNTIL it lands the
+            // rotated path FAILS CLOSED here (no ready set is produced), so the
+            // #816 completeness gate leaves the mixed-quorum DKG window
+            // unserveable and get_work routes to the reward-safe dashd fallback.
+            //
+            // REMAINING WORK to make this SERVEABLE (each behind a real-vector
+            // KAT against test/data/dash_rotated_quorum_members_kat.hpp — the
+            // captured llmq_60_75 @1520064 ground truth: dashd's exact ordered
+            // 60-member set + operator keys):
+            //   1. getqrinfo P2P request: CGetQuorumRotationInfo
+            //      (baseBlockHashes + blockRequestHash=quorumHash,
+            //       extraShare=false) — a new p2p_messages type + a send seam
+            //      analogous to send_getmnlistd (send_getqrinfo).
+            //   2. CQuorumRotationInfo decode (llmq/snapshot.h /
+            //      quorum_rotation_info): the 3 CQuorumSnapshot skip-lists
+            //      (quorumSnapshotAtHMinusC/2C/3C) + the mnlistdiffs
+            //      (mnListDiffTip/AtH/AtHMinusC/2C/3C[/4C]) — decode + DIP-4
+            //      authenticate each mnlistdiff exactly like authenticate_snapshot.
+            //   3. vendor::compute_quorum_members_by_quarter_rotation port of
+            //      dashcore ComputeQuorumMembersByQuarterRotation +
+            //      BuildNewQuorumQuarterMembers + the snapshot skip-list decode
+            //      (GetQuorumQuarterMembersBySnapshot), producing the ordered
+            //      MemberOperatorKey vector — MUST reproduce the captured order.
+            //   4. feed that set to the SAME m_ready map so lookup() (and #812's
+            //      verify_final_commitment) serves rotated commitments real.
+            // Fail-closed if qrinfo can't be sourced or any snapshot mnlistdiff
+            // fails DIP-4 authentication (same discipline as the non-rotated
+            // authenticate_snapshot).
+            LOG_DEBUG_COIND << "[QC-MEMBERS] rotated type="
+                            << static_cast<int>(llmq_type) << " quorum="
+                            << quorum_hash.GetHex().substr(0, 16)
+                            << " => fail closed (qrinfo quarter-rotation sourcing "
+                               "not yet wired; reward-safe dashd fallback)";
+            return;
+        }
 
         auto base_h = m_height_of_hash(quorum_hash);
         if (!base_h) return;                            // base header not held yet
