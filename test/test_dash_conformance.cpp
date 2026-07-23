@@ -1356,6 +1356,11 @@ TEST(DashConformanceFactory, PoolFieldsSourcedFromSSOT) {
         EXPECT_EQ(p.target_lookbehind,        dash::SharechainConfig::TARGET_LOOKBEHIND);
         EXPECT_EQ(p.spread,                   dash::SharechainConfig::SPREAD);
         EXPECT_EQ(p.minimum_protocol_version, dash::SharechainConfig::MINIMUM_PROTOCOL_VERSION);
+        // v16->v36 crossing: the COLD accept-floor stays at MINIMUM (1700) so v16 and
+        // v36 peers coexist; we ADVERTISE v36 capability (3600) — the AutoRatchet, not
+        // this field, lifts the accept-floor. Mirrors ltc/dgb params advertised wiring.
+        EXPECT_EQ(p.advertised_protocol_version,
+                  dash::SharechainConfig::ADVERTISED_PROTOCOL_VERSION);
         EXPECT_EQ(p.identifier_hex,           dash::SharechainConfig::IDENTIFIER_HEX);
         EXPECT_EQ(p.prefix_hex,               dash::SharechainConfig::PREFIX_HEX);
         EXPECT_EQ(p.testnet_identifier_hex,   dash::SharechainConfig::TESTNET_IDENTIFIER_HEX);
