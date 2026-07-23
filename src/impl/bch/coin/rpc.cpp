@@ -201,6 +201,12 @@ std::string NodeRPC::Send(const std::string &request)
 		}
 		return body;
 	}
+	// Both attempts exhausted: the channel is down and the request was NOT
+	// answered. Returning an empty body here is otherwise indistinguishable
+	// downstream from a legitimately null JSON-RPC result (submitblock's
+	// success shape), so say so loudly rather than let a drop read as an ack.
+	LOG_ERROR << "[BCH-RPC] request DROPPED after reconnect+retry -- no response "
+	             "from the daemon; caller must treat this as a failure, not a null result";
 	return {};
 }
 
@@ -419,13 +425,63 @@ void NodeRPC::submit_block(BlockType& block, bool ignore_failure)
 
 bool NodeRPC::submit_block_hex(const std::string& block_hex, bool ignore_failure)
 {
-	auto result = m_client.CallMethod<nlohmann::json>(ID, "submitblock", {block_hex});
-	bool success = result.is_null();
-	if (!success && !ignore_failure)
-		LOG_ERROR << "submit_block_hex result: " << result.dump();
-	else if (success)
-		LOG_INFO << "submit_block_hex accepted";
-	return success;
+	// The submitblock fallback is the LAST line of defence for a won block, so a
+	// dropped channel here is unrecoverable value loss. Two behaviours the old
+	// body got wrong, both of which contributed to the G2 zero-blocks window:
+	//
+	//   1. A TRANSPORT drop (connection reset / stale keep-alive after the
+	//      daemon restarted) surfaced as a swallowed no-ack and the request was
+	//      never re-issued. It is now LOUD (LOG_ERROR) and RE-ISSUED once after
+	//      a synchronous reconnect. `ignore_failure` suppresses the node's
+	//      CONSENSUS rejection reason only -- it never suppresses a drop.
+	//   2. `duplicate` was reported as failure. A duplicate means the block
+	//      already reached the node, normally via the P2P primary leg, which is
+	//      precisely the dual-path success case the broadcaster documents
+	//      ("rpc_ok = submitblock returned ok OR duplicate"). It is an ACK.
+	for (int attempt = 0; attempt < 2; ++attempt)
+	{
+		try
+		{
+			auto result = m_client.CallMethod<nlohmann::json>(ID, "submitblock", {block_hex});
+			if (result.is_null())
+			{
+				LOG_INFO << "submit_block_hex accepted";
+				return true;
+			}
+
+			const std::string reason = result.dump();
+			if (reason.find("duplicate") != std::string::npos)
+			{
+				LOG_INFO << "submit_block_hex duplicate (" << reason
+				         << ") -- the block already reached the node; counted as ack";
+				return true;
+			}
+
+			// A consensus rejection is a definitive answer; re-issuing the same
+			// bytes cannot change it, so do not retry -- but do say why.
+			if (ignore_failure)
+				LOG_WARNING << "submit_block_hex rejected: " << reason;
+			else
+				LOG_ERROR << "submit_block_hex rejected: " << reason;
+			return false;
+		}
+		catch (const std::exception& e)
+		{
+			LOG_ERROR << "[BCH-RPC] submitblock FALLBACK CHANNEL DROPPED mid-submit ("
+			          << e.what() << ")"
+			          << (attempt == 0
+			                  ? " -- reconnecting and RE-ISSUING the submit"
+			                  : " -- submit LOST after reconnect+retry; the won block did "
+			                    "NOT reach the network down this path");
+			if (attempt == 0)
+			{
+				sync_reconnect();
+				continue;
+			}
+			return false;
+		}
+	}
+	return false;
 }
 
 // RPC Methods

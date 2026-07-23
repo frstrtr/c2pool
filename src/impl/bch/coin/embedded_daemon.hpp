@@ -513,8 +513,17 @@ public:
             (m_coin_node && m_coin_node->has_rpc()),
             [&] {
                 bool ok = m_coin_node->submit_block_hex(block_hex, /*ignore_failure=*/true);
-                LOG_INFO << "[EMB-BCH] won-block submitblock RPC fallback "
-                         << (ok ? "ok/duplicate" : "no-ack") << ".";
+                if (ok) {
+                    LOG_INFO << "[EMB-BCH] won-block submitblock RPC fallback ok/duplicate.";
+                } else {
+                    // A wired fallback channel that does not acknowledge a WON
+                    // BLOCK is a potential lost subsidy, not routine noise. It
+                    // is an error even though the P2P primary may have carried
+                    // the block -- the whole point of the dual path is that we
+                    // never have to assume that.
+                    LOG_ERROR << "[EMB-BCH] won-block submitblock RPC fallback NO-ACK -- the "
+                                 "external daemon did not confirm the block down this path.";
+                }
                 return ok;
             });
 

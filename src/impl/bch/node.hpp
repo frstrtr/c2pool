@@ -26,6 +26,9 @@
 #include "peer.hpp"
 #include "messages.hpp"
 #include <core/version_gate.hpp>   // SSOT: core::version_gate::is_v36_active
+// Won-block assembly SSOT + the pre-broadcast self-check that refuses to relay
+// a body whose recomputed transaction root disagrees with the solved header.
+#include "coin/reconstruct_won_block.hpp"
 
 #include <pool/node.hpp>
 #include <pool/sharechain_node.hpp>
@@ -317,30 +320,48 @@ public:
             return std::nullopt;
         }
 
-        // --- serialize full block (Bitcoin wire) ---
-        // header || CompactSize(1 + other_txs) || coinbase_bytes || other txs.
-        PackStream block_stream;
-        block_stream.write(header_stream.get_span());
-        WriteCompactSize(block_stream,
-                         static_cast<uint64_t>(1 + other_txs.size()));
-        block_stream.write(std::as_bytes(std::span<const unsigned char>(
-            gentx_bytes.data(), gentx_bytes.size())));
-        for (const auto* tx : other_txs)
-            block_stream << *tx;
+        // --- frame + SELF-CHECK, then (only then) hand back for broadcast ---
+        // Framing goes through the coin::reconstruct_won_block_from_parts SSOT
+        // (header || CompactSize(1 + other_txs) || coinbase || other txs), which
+        // re-deserializes its own output and recomputes the transaction root
+        // against the header the miner solved before returning anything.
+        //
+        // This is the gate the G2 zero-blocks failure lacked: every won block
+        // was relayed as a 155-byte body whose generation transaction carried
+        // ZERO outputs (extranonce spliced after the empty output vector), and
+        // the node rejected all ~774k of them with bad-txnmrklroot. Now such a
+        // body is REFUSED here, by name, and never reaches either sink.
+        auto hdr_span = header_stream.get_span();
+        std::vector<unsigned char> header80(
+            reinterpret_cast<const unsigned char*>(hdr_span.data()),
+            reinterpret_cast<const unsigned char*>(hdr_span.data()) + hdr_span.size());
 
-        auto block_span = block_stream.get_span();
-        std::vector<unsigned char> block_bytes(
-            reinterpret_cast<const unsigned char*>(block_span.data()),
-            reinterpret_cast<const unsigned char*>(block_span.data())
-                + block_span.size());
-        std::string block_hex = HexStr(block_span);
+        coin::BlockSelfCheck check;
+        auto assembled = coin::reconstruct_won_block_from_parts(
+            std::span<const unsigned char>(header80.data(), header80.size()),
+            std::span<const unsigned char>(gentx_bytes.data(), gentx_bytes.size()),
+            other_txs, &check);
+
+        if (!assembled) {
+            LOG_ERROR << "[BCH-POOL] reconstruct: share "
+                      << share_hash.GetHex().substr(0, 16)
+                      << " REFUSED pre-broadcast self-check -- " << check.reason
+                      << " (txs=" << check.tx_count
+                      << " gentx_outputs=" << check.gentx_outputs
+                      << " header_root=" << check.header_merkle_root.GetHex().substr(0, 16)
+                      << " computed_root=" << check.computed_merkle_root.GetHex().substr(0, 16)
+                      << ") -- block NOT relayed down either path";
+            return std::nullopt;
+        }
 
         LOG_INFO << "[BCH-POOL] reconstruct: share "
                  << share_hash.GetHex().substr(0, 16)
-                 << " -> full block " << block_bytes.size() << " bytes, "
-                 << (1 + other_txs.size()) << " txs (1 coinbase + "
-                 << other_txs.size() << " other)";
-        return std::make_pair(std::move(block_bytes), std::move(block_hex));
+                 << " -> full block " << assembled->bytes.size() << " bytes, "
+                 << check.tx_count << " txs (1 coinbase with "
+                 << check.gentx_outputs << " outputs + "
+                 << other_txs.size() << " other); self-check PASSED (root "
+                 << check.computed_merkle_root.GetHex().substr(0, 16) << ")";
+        return std::make_pair(std::move(assembled->bytes), std::move(assembled->hex));
     }
 
     NodeImpl(boost::asio::io_context* ctx, config_t* config)

@@ -485,6 +485,7 @@ jobs:
                     bch_asert_kat_test \
                     bch_muldiv_kat_test \
                     bch_g1_oracle_byte_parity_test bch_g1_share_serialization_parity_test bch_g0_canonical_pin_test bch_g2_ratchet_gate_kat_test test_bch_underfill_guard \
+                    bch_g2_block_assembly_roundtrip_test \
             -j8
 
       - name: Run BCH tests
@@ -617,6 +618,7 @@ jobs:
                     bch_asert_kat_test \
                     bch_muldiv_kat_test \
                     bch_g1_oracle_byte_parity_test bch_g1_share_serialization_parity_test bch_g0_canonical_pin_test bch_g2_ratchet_gate_kat_test test_bch_underfill_guard \
+                    bch_g2_block_assembly_roundtrip_test \
             -j8
 
       - name: Run BCH tests under sanitizers
