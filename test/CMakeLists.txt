@@ -495,6 +495,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_quorum_root PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_quorum_root "" AUTO)
 
+    if(C2POOL_DASH_BLS)  # gate the BLS-backend-requiring Phase-L test executables to the BLS-ON build
     # E1 Phase-L: type-6 quorum-commitment BLS verify KAT. Links dash_bls_verify
     # (which carries the C2POOL_DASH_BLS define + dashbls include/libs PUBLIC when
     # the backend was found; a fail-closed stub otherwise). The BuildCommitmentHash
@@ -549,6 +550,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_dash_quorum_member_source PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_quorum_member_source "" AUTO)
+    endif()  # C2POOL_DASH_BLS: the BLS-crypto KATs need the dashbls backend (built in the linux-dash-bls job); skipped in the default OFF build
 
     # DASH masternode state-machine (S7 leaf): vendored ProTx wire
     # (providertx.hpp) + MNState persistence (mn_state_db.hpp) +
