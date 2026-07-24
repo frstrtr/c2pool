@@ -186,6 +186,7 @@ void NodeImpl::error(const message_error_type& err, const NetService& service, c
     // Clean outbound tracking before base removes the peer
     m_pending_outbound.erase(service);
     m_outbound_addrs.erase(service);
+    publish_peer_info_snapshot();   // IO thread: refresh after peer removal
 
     // p2pool p2p.py:595: self.get_shares.respond_all(reason)
     // Cancel pending share requests for this peer — invokes callbacks with
@@ -239,6 +240,7 @@ void NodeImpl::close_connection(const NetService& service)
     }
 
     base_t::close_connection(service);
+    publish_peer_info_snapshot();   // IO thread: refresh after close
 }
 
 NodeImpl::TrackerSnapshot NodeImpl::get_tracker_snapshot() const {
@@ -301,6 +303,7 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
 
         peer->m_nonce = msg->m_nonce;
         m_peers[peer->m_nonce] = peer;
+        publish_peer_info_snapshot();   // IO thread: refresh the display snapshot
 
         // Request peers from the newly established connection
         {
@@ -1667,6 +1670,7 @@ void NodeImpl::run_think()
             LOG_INFO << "[ASYNC-THINK] IO-phase: draining " << m_pending_adds.size()
                      << " pending batches, peers=" << m_peers.size();
             drain_pending_adds();
+            publish_peer_info_snapshot();   // IO thread: keep uptime fresh
 
             // Cycle completed normally — disarm the watchdog first so it
             // cannot fire on this (now-finished) generation.

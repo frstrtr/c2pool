@@ -141,6 +141,19 @@ protected:
     mutable std::mutex m_snapshot_mutex;
     TrackerSnapshot m_snapshot;
 
+    // ── Lock-free peer-info snapshot (display-only) ──────────────────────
+    // m_peers / m_outbound_addrs are IO-thread-owned with NO lock; the
+    // dashboard peer panel (set_peer_info_fn -> /peer_list, /peer_versions, …)
+    // is served from the WebServer. Iterating those std::maps off the IO
+    // thread while handle_version inserts / error()+close_connection erase
+    // rebalances the tree under the reader's iterator -> freed-memory GP-fault
+    // (back-port of the DASH #828 fix). So the JSON is BUILT on the IO thread
+    // (publish_peer_info_snapshot, at every peer add/remove + the think
+    // IO-phase for uptime freshness) and get_peer_info_json returns this copy
+    // lock-free — it NEVER touches the live maps. Guarded by the existing
+    // m_snapshot_mutex (held only for the swap; never nested with the tracker).
+    nlohmann::json m_peer_info_snapshot = nlohmann::json::array();
+
     // Identity of the compute thread (m_think_pool's single thread).
     // Used by TrackerReadGuard to skip shared_lock when the caller is
     // already on the compute thread (which holds exclusive lock).
@@ -542,10 +555,14 @@ public:
             peer->write(message_bestblock::make_raw(header));
     }
 
-    /// Return a JSON array of connected peer info for the /peer_list endpoint.
-    nlohmann::json get_peer_info_json() const {
+    /// Rebuild the lock-free peer-info snapshot. IO-THREAD ONLY (reads the
+    /// IO-owned m_peers / m_outbound_addrs). Called at every peer add/remove
+    /// and on the think IO-phase. Publishes under m_snapshot_mutex so the
+    /// dashboard reader (get_peer_info_json) never touches the live maps.
+    void publish_peer_info_snapshot() {
         nlohmann::json arr = nlohmann::json::array();
         for (const auto& [nonce, peer] : m_peers) {
+            if (!peer) continue;
             auto addr = peer->addr();
             bool incoming = (m_outbound_addrs.find(addr) == m_outbound_addrs.end());
             auto uptime_sec = std::chrono::duration_cast<std::chrono::seconds>(
@@ -559,7 +576,17 @@ public:
                 {"web_port", 0}
             });
         }
-        return arr;
+        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+        m_peer_info_snapshot = std::move(arr);
+    }
+
+    /// Return a JSON array of connected peer info for the /peer_list endpoint.
+    /// Returns the IO-thread-published snapshot lock-free — it must NEVER
+    /// iterate the live m_peers map (that races the IO thread's insert/erase
+    /// -> freed-memory GP-fault; back-port of DASH #828).
+    nlohmann::json get_peer_info_json() const {
+        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+        return m_peer_info_snapshot;
     }
 
     /// Register a callback invoked whenever a bestblock message is received
