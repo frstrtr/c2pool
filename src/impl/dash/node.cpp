@@ -1173,6 +1173,57 @@ void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hash
     if (shares.empty())
         return;
 
+    // ── Tx-completeness gate (canonical p2pool p2p.py:404 parity) ───────────
+    // A v13+ share references its new transactions by hash
+    // (new_transaction_hashes); a canonical peer that cannot resolve those txs
+    // DISCONNECTS us with "referenced unknown transaction" (p2p.py:403-404,
+    // handle_shares / handle_remember_tx). We re-announce the best chain's head
+    // and up to 5 ancestors (ROOT-2 re-announce, broadcast_share), and shares
+    // pulled via sharereply arrive WITHOUT their txs (the reply carries no tx
+    // bytes), so their tx bytes are absent from m_known_txs. Sending such a
+    // share unbacked is exactly what makes the public canonical seeds drop the
+    // connection ~300ms after handshake — the isolation root cause.
+    //
+    // So only broadcast a share when EVERY referenced tx is resolvable for this
+    // peer: either we hold the bytes (m_known_txs, forwarded below via
+    // remember_tx) OR the peer already has it (m_remote_txs advertised via
+    // have_tx / m_remembered_txs we previously sent). Skipping the rest costs no
+    // propagation — a downloaded share is by definition already on the network
+    // we fetched it from; only shares we can fully back need relaying.
+    {
+        std::vector<ShareType> sendable;
+        sendable.reserve(shares.size());
+        size_t skipped_incomplete = 0;
+        for (auto& share : shares) {
+            bool complete = true;
+            share.invoke([&](auto* obj) {
+                for (const auto& th : obj->m_new_transaction_hashes) {
+                    if (m_known_txs.count(th) || peer->m_remote_txs.count(th)
+                            || peer->m_remembered_txs.count(th))
+                        continue;
+                    complete = false;
+                    break;
+                }
+            });
+            if (complete)
+                sendable.push_back(std::move(share));
+            else
+                ++skipped_incomplete;
+        }
+        if (skipped_incomplete > 0) {
+            static int skip_log = 0;
+            if (skip_log++ % 20 == 0)
+                LOG_INFO << "[send_shares] skipped " << skipped_incomplete
+                         << " share(s) with unbacked new-txs (downloaded via "
+                            "sharereply / template-evicted) to "
+                         << peer->addr().to_string()
+                         << " — avoids canonical 'unknown transaction' disconnect";
+        }
+        if (sendable.empty())
+            return;
+        shares.swap(sendable);
+    }
+
     // Forward the txs the peer needs BEFORE the shares (p2pool remember_tx
     // protocol) — a share referencing unknown txs makes the receiving oracle
     // node drop the connection.
@@ -1274,17 +1325,31 @@ void NodeImpl::register_template_txs(const std::vector<coin::Transaction>& txs,
                     << " hashes=" << hashes.size() << " — skipped";
         return;
     }
-    // Drop the PREVIOUS template's leftovers that the new template no longer
-    // carries, then insert the new set — m_known_txs stays bounded by one
-    // template (plus reception-protocol remembered txs, which are peer-scoped).
+    // Insert the new template's txs, then retain a ROLLING WINDOW of the last
+    // RETAINED_TEMPLATE_TX_SETS templates (not just the current one). A tx is
+    // evicted from m_known_txs only once it has fallen out of EVERY retained
+    // template set — so a share minted on any recent job (the miner may solve a
+    // job whose template has since rotated) and a ROOT-2 re-announce a few
+    // rotations later can still forward the referenced tx bytes via remember_tx.
+    // Evicting per-single-template (the previous behaviour) is what left minted
+    // shares unbacked → canonical "referenced unknown transaction" disconnect.
     std::set<uint256> new_set(hashes.begin(), hashes.end());
-    for (const auto& old_hash : m_template_tx_hashes) {
-        if (!new_set.count(old_hash))
-            m_known_txs.erase(old_hash);
-    }
     for (size_t i = 0; i < txs.size(); ++i)
         m_known_txs.insert_or_assign(hashes[i], txs[i]);
-    m_template_tx_hashes = std::move(new_set);
+
+    m_recent_template_tx_sets.push_back(std::move(new_set));
+    while (m_recent_template_tx_sets.size() > RETAINED_TEMPLATE_TX_SETS) {
+        const std::set<uint256> evicted = std::move(m_recent_template_tx_sets.front());
+        m_recent_template_tx_sets.pop_front();
+        for (const auto& old_hash : evicted) {
+            bool still_retained = false;
+            for (const auto& s : m_recent_template_tx_sets) {
+                if (s.count(old_hash)) { still_retained = true; break; }
+            }
+            if (!still_retained)
+                m_known_txs.erase(old_hash);
+        }
+    }
 }
 
 } // namespace dash
