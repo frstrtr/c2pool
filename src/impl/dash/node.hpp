@@ -257,6 +257,14 @@ protected:
     // node.handle_share_hashes join trigger, one hop later.
     std::vector<std::pair<std::weak_ptr<peer_t>, uint256>> m_peer_best_adverts;
 
+    // ── Peer-count mirror ───────────────────────────────────────────────
+    // m_peers (pool/node.hpp base) is IO-thread-owned and has no lock; the
+    // best-share election needs only "any peers?" and is reachable from the
+    // WebServer HTTP thread + the compute thread (via best_share_hash), so
+    // it reads this atomic mirror instead of touching the map. Updated at
+    // the two mutation sites (handle_version insert, error() erase).
+    std::atomic<size_t> m_peer_count{0};
+
     // ── Outbound dialing (btc/ltc start_outbound_connections port) ──────
     static constexpr size_t DEFAULT_TARGET_OUTBOUND_PEERS = 8;
     size_t m_max_peers = 30;
@@ -454,6 +462,7 @@ public:
             else
                 ++it;
         }
+        m_peer_count.store(m_peers.size(), std::memory_order_relaxed);
         m_pending_outbound.erase(service);
         m_outbound_addrs.erase(service);
         base_t::error(err, service, where);
@@ -575,6 +584,7 @@ public:
 
         peer->m_nonce = msg->m_nonce;
         m_peers[peer->m_nonce] = peer;
+        m_peer_count.store(m_peers.size(), std::memory_order_relaxed);
 
         // #754 join trigger (oracle p2p.py handle_version → node.py
         // handle_share_hashes): a peer advertising a best share we don't have

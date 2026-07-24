@@ -1073,13 +1073,17 @@ uint256 NodeImpl::best_share_hash()
     // (m_tracker_mutex contract, node.hpp): shared_lock(try_to_lock), never
     // block; busy ⇒ the last published election (lock-free snapshot) — the
     // stable tip current jobs are already built on.
+    // has_peers via the atomic mirror — m_peers itself is IO-thread-owned
+    // and NOT covered by m_tracker_mutex, so touching the map here (HTTP /
+    // compute thread) would race handle_version's insert (TSAN-captured).
+    const bool has_peers = m_peer_count.load(std::memory_order_relaxed) > 0;
     if (is_compute_thread())    // exclusive lock already held
         return dash::mint::elect_best_share(m_tracker, m_best_share_hash,
-                                            !m_peers.empty());
+                                            has_peers);
     std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::try_to_lock);
     if (!lock.owns_lock())
         return snapshot_best_share();
-    return dash::mint::elect_best_share(m_tracker, m_best_share_hash, !m_peers.empty());
+    return dash::mint::elect_best_share(m_tracker, m_best_share_hash, has_peers);
 }
 
 void NodeImpl::broadcast_share(const uint256& share_hash)
