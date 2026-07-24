@@ -1384,10 +1384,13 @@ public:
         if (far_hash.IsNull() || !chain.contains(far_hash))
             return uint288(0);
 
-        // Verify skip list vs naive walk (periodic — detect stale pointers)
+        // Verify skip list vs naive walk (periodic — detect stale pointers).
+        // Atomic: this method is reachable under the SHARED tracker lock from
+        // two reader threads at once (IO stat-log tick + WebServer HTTP
+        // stats), so a plain static counter is a data race (TSAN-captured).
         {
-            static int skip_verify = 0;
-            if (skip_verify++ % 100 == 0) {
+            static std::atomic<int> skip_verify{0};
+            if (skip_verify.fetch_add(1, std::memory_order_relaxed) % 100 == 0) {
                 try {
                     auto naive_far = chain.get_nth_parent_key(share_hash, dist - 1);
                     if (naive_far != far_hash) {
