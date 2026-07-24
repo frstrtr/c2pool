@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <random>
 #include <unordered_map>
 #include <vector>
@@ -65,6 +66,19 @@ class DistanceSkipList
     /// p2pool: self.skips = {}
     mutable std::unordered_map<hash_t, SkipEntry, hasher_t> m_skips;
 
+    /// Serializes all m_skips access. p2pool's DistanceSkipList is only ever
+    /// touched from the single Twisted reactor thread; in c2pool the same
+    /// lazily-built cache is read AND mutated from multiple threads holding
+    /// only the SHARED tracker lock — e.g. the HTTP stats path
+    /// (get_pool_attempts_per_second) races the IO share-download path
+    /// (build_stops → get_nth_parent). Without serialization, one thread's
+    /// emplace() rehashes the bucket array while another iterates/reads it →
+    /// freed-memory dereference → crash. This mutex is a LEAF: it is taken and
+    /// released around each individual map operation only, and the
+    /// m_previous_fn callback is always invoked OUTSIDE it, so it never nests
+    /// with the tracker lock or re-enters this class.
+    mutable std::mutex m_skips_mutex;
+
     /// Callback: get previous element hash.
     /// p2pool: TrackerSkipList.previous(element) → tracker.items[element].previous_hash
     std::function<hash_t(const hash_t&)> m_previous_fn;
@@ -88,6 +102,7 @@ public:
     /// Called via removed signal when a share is pruned.
     /// p2pool: TrackerSkipList.__init__ watches tracker.removed → forget_item
     void forget_item(const hash_t& hash) {
+        std::lock_guard<std::mutex> lock(m_skips_mutex);
         m_skips.erase(hash);
     }
 
@@ -129,17 +144,43 @@ public:
 
             // p2pool: if pos not in self.skips:
             //   self.skips[pos] = math.geometric(self.p), [(self.previous(pos), self.get_delta(pos))]
-            auto it = m_skips.find(pos);
-            if (it == m_skips.end()) {
-                hash_t prev = m_previous_fn(pos);
-                SkipEntry entry;
-                entry.skip_length = geometric_random();
-                entry.levels.push_back(Delta{pos, 1, prev});  // level 0: single step to parent
-                auto [ins_it, _] = m_skips.emplace(pos, std::move(entry));
-                it = ins_it;
+            //
+            // Copy the entry (skip_length + levels) OUT of the map under the
+            // mutex so no map reference/iterator escapes the lock (the levels
+            // vector is O(log n) small). m_previous_fn is invoked OUTSIDE the
+            // lock — it re-enters the tracker, so holding m_skips_mutex across
+            // it could invert lock order / self-deadlock.
+            int skip_length = 0;
+            std::vector<Delta> levels;
+            bool have_entry = false;
+            {
+                std::lock_guard<std::mutex> lock(m_skips_mutex);
+                auto it = m_skips.find(pos);
+                if (it != m_skips.end()) {
+                    skip_length = it->second.skip_length;
+                    levels = it->second.levels;  // copy-out (no escaping ref)
+                    have_entry = true;
+                }
             }
-
-            auto& entry = it->second;
+            if (!have_entry) {
+                // Build level-0 delta with the previous-hash callback held
+                // OUTSIDE the lock, then insert under the lock. Another thread
+                // may have inserted pos meanwhile — re-check and adopt the
+                // winner's entry so both threads agree on the cache contents.
+                hash_t prev = m_previous_fn(pos);
+                int new_skip_length = geometric_random();
+                Delta level0{pos, 1, prev};  // level 0: single step to parent
+                std::lock_guard<std::mutex> lock(m_skips_mutex);
+                auto it = m_skips.find(pos);
+                if (it == m_skips.end()) {
+                    SkipEntry entry;
+                    entry.skip_length = new_skip_length;
+                    entry.levels.push_back(level0);
+                    it = m_skips.emplace(pos, std::move(entry)).first;
+                }
+                skip_length = it->second.skip_length;
+                levels = it->second.levels;  // copy-out (no escaping ref)
+            }
 
             // p2pool: fill previous updates
             // for i in xrange(skip_length):
@@ -148,14 +189,19 @@ public:
             //         x, y = self.skips[that_hash]
             //         assert len(y) == i
             //         y.append((pos, delta))
-            for (int i = 0; i < entry.skip_length; i++) {
+            for (int i = 0; i < skip_length; i++) {
                 auto upd_it = updates.find(i);
                 if (upd_it != updates.end()) {
                     auto& upd = upd_it->second;
-                    auto skip_it = m_skips.find(upd.node_hash);
-                    if (skip_it != m_skips.end() &&
-                        static_cast<int>(skip_it->second.levels.size()) == i) {
-                        skip_it->second.levels.push_back(upd.delta);
+                    // Guard only the map mutation; upd lives in the local
+                    // `updates` map, not m_skips, so it stays valid.
+                    {
+                        std::lock_guard<std::mutex> lock(m_skips_mutex);
+                        auto skip_it = m_skips.find(upd.node_hash);
+                        if (skip_it != m_skips.end() &&
+                            static_cast<int>(skip_it->second.levels.size()) == i) {
+                            skip_it->second.levels.push_back(upd.delta);
+                        }
                     }
                     updates.erase(upd_it);
                 }
@@ -164,7 +210,7 @@ public:
             // p2pool: put desired skip nodes in updates
             // for i in xrange(len(skip), skip_length):
             //     updates[i] = pos, None
-            for (int i = static_cast<int>(entry.levels.size()); i < entry.skip_length; i++) {
+            for (int i = static_cast<int>(levels.size()); i < skip_length; i++) {
                 updates[i] = UpdateEntry{pos, false, {}};
             }
 
@@ -177,8 +223,8 @@ public:
             Delta taken_delta{};
             bool found = false;
 
-            for (int i = static_cast<int>(entry.levels.size()) - 1; i >= 0; i--) {
-                const auto& delta = entry.levels[i];
+            for (int i = static_cast<int>(levels.size()) - 1; i >= 0; i--) {
+                const auto& delta = levels[i];
                 // apply_delta: (sol_dist + delta.distance, delta.to_hash)
                 int32_t new_dist = sol_dist + delta.distance;
 
@@ -228,9 +274,18 @@ public:
         return sol_hash;
     }
 
-    void clear() { m_skips.clear(); }
-    size_t size() const { return m_skips.size(); }
-    bool contains(const hash_t& hash) const { return m_skips.contains(hash); }
+    void clear() {
+        std::lock_guard<std::mutex> lock(m_skips_mutex);
+        m_skips.clear();
+    }
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(m_skips_mutex);
+        return m_skips.size();
+    }
+    bool contains(const hash_t& hash) const {
+        std::lock_guard<std::mutex> lock(m_skips_mutex);
+        return m_skips.contains(hash);
+    }
 };
 
 } // namespace chain
