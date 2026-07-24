@@ -1,0 +1,34 @@
+=== T8 checkpoint cadence: W=50000 f=10% R=40rounds cadences=[1, 2, 5, 10, 20, 40] ===
+
+[baseline] no-checkpoint PATH-A replay (genesis..head): 450,000 ops  6.552s  ~4.8MB feed  = O(W*(1+f*R)), grows with R
+
+[floor]    T6 snapshot-only rebuild (needs an honest live-set server): 0.163s  1.60MB  = O(W)
+
+[constraint] naive leaf-set rebuild + tail-replay reproduces head: False
+  -> swap-delete forest is HISTORY-DEPENDENT: replaying ops onto a
+     fresh leaf-set rebuild yields a different arrangement than the
+     canonical op-sequence forest. CONSEQUENCE: the checkpoint MUST
+     re-CANONICALISE -- consensus commits roots = canonical rebuild
+     of the sorted live-set, and the validator derives head_live as
+     an ID-SET delta then canonical-rebuilds. Compute is then O(W)
+     flat; the CADENCE bounds the trustless DELTA it must download
+     to derive verified head_live from the nearest committed anchor.
+
+   C delta MB cap   delta ids  rebuild s  egress MB  ckpts/R  head ok
+--------------------------------------------------------------------------
+   1         0.08      10,000      0.333       1.68     40.0     True
+   2         0.16      20,000      0.336       1.76     20.0     True
+   5         0.40      50,000      0.341       2.00      8.0     True
+  10         0.80     100,000      0.352       2.40      4.0     True
+  20         1.60     200,000      0.362       3.20      2.0     True
+  40         3.20     400,000      0.385       4.80      1.0     True
+
+Checkpoint commit cost on-chain: <=8 roots = 256B per checkpoint, O(1) -- independent of W and cadence.
+Snapshot-serving storage stays O(W): only the latest committed live-set
+must be materialised; older checkpoints prune once superseded + final.
+=> Under canonical (re-canonicalising) checkpoints, cold-start COMPUTE is
+   O(W) flat; the CADENCE bounds the trustless DELTA download to O(f*C*W)
+   ids. Pick C <= (k-1)/f for the delta to stay <=(k-1)x the W-leaf floor;
+   at f=10%: C=5 -> +0.5x, C=10 -> +1.0x. Without a checkpoint, the nearest
+   trustless anchor is genesis => O(total-ever) delta, UNBOUNDED in R.
+   This is the lever the superlight open problem turns on.

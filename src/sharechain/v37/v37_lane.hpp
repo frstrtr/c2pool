@@ -13,6 +13,7 @@
 // All folds/evicts/rebuilds happen at positionally defined points; no input
 // to the sequence is node-local.
 
+#include <algorithm>
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -38,6 +39,22 @@ struct LaneParams {
     std::size_t levels() const { return 1 + level_caps.size(); }
 };
 
+// L0 slot flag bits. Annotation-only: flags are NOT digest leaves and never
+// affect weights. Bit 0x08 mirrors V36 share_messages FLAG_PROTOCOL_AUTHORITY
+// for operator familiarity: it marks shares whose message_data carried
+// validated authority messages (V36 share_messages.hpp — envelope under the
+// authority pubkeys, ECDSA-signed, ref_hash/PoW-protected; validation happens
+// in share_check BEFORE push, payloads stay in the share store). Views join
+// message payloads by `pos`; messages age out of visibility at fold, which
+// matches their per-share nature (FLAG_PERSISTENT semantics: operator OQ).
+constexpr std::uint32_t L0F_FEE_SHARE     = 0x01;
+constexpr std::uint32_t L0F_STALE_DOA     = 0x02;
+constexpr std::uint32_t L0F_AUTHORITY_MSG = 0x08;
+constexpr std::uint32_t L0F_MINER_MSG     = 0x10;  // permissionless miner
+// message present (c2pool-v37-miner-messages.md: plaintext envelope, sig
+// bound to the payout identity, TTL funded by decayed_weight() — the lane
+// is the budget ledger; the live-message index is view-layer, not here)
+
 // Level-0 slot (SoA in the production layout; AoS here for clarity — the
 // arrays are contiguous std::vector rings either way).
 struct L0Slot {
@@ -45,7 +62,7 @@ struct L0Slot {
     u64 w_raw = 0;       // work(target), verbatim (F-1; feeds epoch rebuild)
     u128 w_scaled = 0;   // w_raw x InvD[pos - B] at insert, Q62
     MinerId miner = 0;
-    std::uint32_t flags = 0;
+    std::uint32_t flags = 0;   // L0F_* bits above
 };
 
 struct CompEntry {              // (miner, w_scaled, w_raw) triple, F-1
@@ -69,6 +86,17 @@ public:
             throw std::invalid_argument("v37: C0 must be a power of two");
         if (p.rollup == 0 || p.c0 % p.rollup != 0)
             throw std::invalid_argument("v37: R must divide C0");
+        if (p.window < p.c0)
+            throw std::invalid_argument("v37: window must be >= C0 "
+                                        "(eviction needs whole buckets)");
+        if (p.level_caps.empty())
+            throw std::invalid_argument("v37: at least one bucket level");
+        // Inner bucket levels must hold at least one roll-up group; the
+        // outermost level never folds, so its cap is not load-bearing.
+        for (std::size_t k = 0; k + 1 < p.level_caps.size(); ++k)
+            if (p.level_caps[k] < p.rollup)
+                throw std::invalid_argument(
+                    "v37: inner level cap smaller than roll-up factor");
         // decay[] must cover query depths [0,E) and rebuild depths [1,E];
         // epoch_shift[] must cover the max bucket age in epochs.
         u64 max_epochs = (p.window / p.epoch_len()) + 4;
@@ -91,6 +119,10 @@ public:
 
     // ── push: O(1) amortized (§7) ─────────────────────────────────────────
     void push(MinerId miner, u64 w_raw, std::uint32_t flags) {
+        if (w_raw == 0)
+            throw std::invalid_argument("v37: zero-work share");
+            // (a zero-weight acc entry would be committed by the digest but
+            //  erased by undo_push — rewind would not be bit-exact)
         if (m_next_pos - m_B == m_p.epoch_len())
             epoch_rebuild();                              // (1) — clears journal
 
@@ -151,9 +183,18 @@ public:
     // the full lane rebuild from the tracker (the >D path).
     bool rewind(u64 d) {
         u64 pushes = 0;
-        for (const auto& op : m_journal)
+        bool boundary = false;
+        for (const auto& op : m_journal) {
             if (op.type == Op::Type::Push) ++pushes;
+            else if (op.type == Op::Type::RebuildBoundary) boundary = true;
+        }
         if (d > pushes) return false;
+        // The push that TRIGGERED an epoch rebuild cannot be undone without
+        // undoing the rebuild itself (the canonical pre-share state is the
+        // pre-rebuild frame, which the journal cannot restore). When the
+        // boundary sentinel is in the journal, the rebuild-triggering push
+        // is the oldest journaled push — refuse to land on it.
+        if (boundary && d == pushes) return false;
         u64 undone = 0;
         while (undone < d) {
             Op op = m_journal.back();
@@ -163,38 +204,100 @@ public:
             case Op::Type::FoldL0: undo_fold_l0(op); break;
             case Op::Type::FoldLevel: undo_fold_level(op); break;
             case Op::Type::Evict: undo_evict(op); break;
+            case Op::Type::RebuildBoundary:
+                throw std::logic_error("v37: rewind crossed rebuild sentinel"
+                                       " (guarded above — unreachable)");
             }
+        }
+        // One push() call journals [Folds][Push][Evicts]. The loop above
+        // stops at the d-th Push; any folds IMMEDIATELY preceding it were
+        // triggered by that same share's arrival and must be undone too —
+        // the restored state is "before the share arrived", not "after its
+        // folds". Trailing folds are unambiguous: nothing else sits between
+        // a push's folds and its Push record.
+        while (!m_journal.empty() &&
+               (m_journal.back().type == Op::Type::FoldL0 ||
+                m_journal.back().type == Op::Type::FoldLevel)) {
+            Op op = m_journal.back();
+            m_journal.pop_back();
+            if (op.type == Op::Type::FoldL0) undo_fold_l0(op);
+            else undo_fold_level(op);
         }
         return true;
     }
 
-    // ── digest (§8.5, OQ-4) — canonical, consensus-committed ──────────────
-    bytes32 digest() const {
-        std::vector<std::uint8_t> buf;
-        append_bytes(buf, "V37L", 4);
-        append_u64(buf, m_B);
-        append_u64(buf, m_next_pos);
-        append_u64(buf, static_cast<u64>(m_acc.size()));
-        for (const auto& [m, a] : m_acc) {   // std::map: miner-id order
-            append_u32(buf, m);
-            append_u256(buf, a);
-        }
-        // level-ring headers incl. per-ring raw_sum (F-1 leaves)
-        append_u64(buf, static_cast<u64>(m_l0.size()));
-        append_u256(buf, m_l0_scaled_sum);
-        append_u128(buf, m_l0_raw_sum);
-        for (const auto& lvl : m_levels) {
-            append_u64(buf, static_cast<u64>(lvl.size()));
-            for (const auto& b : lvl) {       // per-bucket leaves
-                append_u64(buf, b.pos_lo);
-                append_u64(buf, b.pos_hi);
-                append_u128(buf, b.raw_work);
-                append_u64(buf, b.epoch_tag);
-                auto ch = comp_hash(b);
-                buf.insert(buf.end(), ch.begin(), ch.end());
+    // ── digest (§8.5, OQ-4 + OQ-M5) — Merkle root, consensus-committed ────
+    // CONSENSUS: intern ids are NODE-LOCAL (assigned at first global
+    // sighting, which interleaves differently across lanes on different
+    // nodes). All consensus bytes use the CANONICAL identity key
+    // (PayoutDescriptor identity, 32 bytes) supplied by the resolver, sorted
+    // by those bytes — never raw intern ids.
+    //
+    // OQ-M5 (resolved): the digest is the root of a Merkle tree over the
+    // canonical leaves, so lite clients can verify one accumulator entry
+    // (message-TTL budget) or one bucket's raw work (market settlement band)
+    // with a log-size proof against the on-chain commitment. Tree rule:
+    //   leaf node     = sha256d(0x00 || leaf payload)
+    //   interior node = sha256d(0x01 || left || right)   (domain-separated)
+    //   odd node      = promoted unchanged (no duplication ambiguity)
+    // Leaf order (fixed): [0] header leaf (geometry, B, next_pos, counts,
+    // L0 sums); then acc leaves in canonical-identity order; then bucket
+    // leaves level-by-level, oldest -> newest.
+    template <typename Resolver>  // bytes32 resolver(MinerId)
+    bytes32 digest(Resolver&& id_key) const {
+        return merkle_root(build_leaves(id_key));
+    }
+
+    // Inclusion proof for one miner's accumulator leaf (lite-client TTL
+    // verification). Returns false if the miner has no acc entry.
+    struct MerkleProof {
+        u64 leaf_count = 0;
+        u64 index = 0;
+        std::vector<bytes32> path;  // siblings bottom-up; promote-odd levels
+                                    // contribute no entry (structure is
+                                    // derivable from leaf_count + index)
+    };
+    template <typename Resolver>
+    bool acc_proof(MinerId m, Resolver&& id_key, bytes32& leaf_out,
+                   MerkleProof& proof_out) const {
+        if (!m_acc.count(m)) return false;
+        auto leaves = build_leaves(id_key);
+        // locate the miner's acc leaf: header is leaf 0; acc leaves follow
+        // in canonical order — recompute its leaf hash and find it.
+        bytes32 key = id_key(m);
+        std::vector<std::uint8_t> payload;
+        append_bytes(payload, "V37A", 4);
+        payload.insert(payload.end(), key.begin(), key.end());
+        append_u256(payload, m_acc.at(m));
+        bytes32 target = leaf_hash(payload);
+        u64 idx = 0;
+        for (; idx < leaves.size(); ++idx)
+            if (leaves[idx] == target) break;
+        if (idx == leaves.size()) return false;
+        leaf_out = target;
+        proof_out = make_proof(leaves, idx);
+        return true;
+    }
+
+    // Stateless verifier (what a lite client runs against the committed
+    // root): recomputes the path using only leaf_count/index for structure.
+    static bool verify_proof(const bytes32& root, const bytes32& leaf,
+                             const MerkleProof& p) {
+        bytes32 h = leaf;
+        u64 idx = p.index, size = p.leaf_count;
+        std::size_t used = 0;
+        if (idx >= size || size == 0) return false;
+        while (size > 1) {
+            bool odd_last = (size & 1) && idx == size - 1;
+            if (!odd_last) {
+                if (used >= p.path.size()) return false;
+                const bytes32& sib = p.path[used++];
+                h = (idx & 1) ? interior_hash(sib, h) : interior_hash(h, sib);
             }
+            idx /= 2;
+            size = (size + 1) / 2;
         }
-        return sha256d(buf);
+        return used == p.path.size() && h == root;
     }
 
     // ── OQ-2 exact epoch rebuild, exposed for tests/reference checks ──────
@@ -202,6 +305,9 @@ public:
     // L0; immutable bucket records with the epoch-shift rule). This IS the
     // reference function the fast path re-converges to (§8.4).
     void epoch_rebuild() {
+        if (m_next_pos - m_B != m_p.epoch_len())
+            throw std::logic_error("v37: epoch_rebuild outside the epoch "
+                                   "boundary (positionally defined, §8.3)");
         u64 B_new = m_B + m_p.epoch_len();
         m_acc.clear();
         m_acc_total = U256();
@@ -228,12 +334,14 @@ public:
         }
         m_B = B_new;
         m_journal.clear();   // rewind cannot cross a rebuild (see notes)
+        Op b2; b2.type = Op::Type::RebuildBoundary;
+        m_journal.push_back(std::move(b2));  // sentinel: see rewind()
     }
 
 private:
     // ── journal ───────────────────────────────────────────────────────────
     struct Op {
-        enum class Type { Push, FoldL0, FoldLevel, Evict };
+        enum class Type { Push, FoldL0, FoldLevel, Evict, RebuildBoundary };
         Type type;
         // Push
         L0Slot slot;
@@ -255,7 +363,9 @@ private:
 
     void journal_push(Op op) {
         m_journal.push_back(std::move(op));
-        // Trim: keep ops back to (and including) the D-th most recent push.
+        // Trim: keep ops back to (and including) the D-th most recent push,
+        // PLUS that push's immediately preceding folds — rewind(D) must be
+        // able to undo the full push() call it lands on.
         u64 pushes = 0;
         std::size_t keep_from = 0;
         for (std::size_t i = m_journal.size(); i-- > 0;) {
@@ -263,7 +373,15 @@ private:
                 if (++pushes == m_p.journal_depth) { keep_from = i; break; }
             }
         }
-        if (pushes >= m_p.journal_depth && keep_from > 0)
+        if (pushes < m_p.journal_depth || keep_from == 0) return;
+        while (keep_from > 0 &&
+               (m_journal[keep_from - 1].type == Op::Type::FoldL0 ||
+                m_journal[keep_from - 1].type == Op::Type::FoldLevel ||
+                m_journal[keep_from - 1].type == Op::Type::RebuildBoundary))
+            --keep_from;
+            // the boundary sentinel is kept when adjacent: rewind() must
+            // still see it to refuse landing on the rebuild-triggering push
+        if (keep_from > 0)
             m_journal.erase(m_journal.begin(),
                             m_journal.begin() + static_cast<long>(keep_from));
     }
@@ -405,9 +523,6 @@ private:
     static void append_bytes(std::vector<std::uint8_t>& b, const char* p, std::size_t n) {
         b.insert(b.end(), p, p + n);
     }
-    static void append_u32(std::vector<std::uint8_t>& b, std::uint32_t x) {
-        for (int i = 0; i < 4; ++i) b.push_back(static_cast<std::uint8_t>(x >> (8 * i)));
-    }
     static void append_u64(std::vector<std::uint8_t>& b, u64 x) {
         for (int i = 0; i < 8; ++i) b.push_back(static_cast<std::uint8_t>(x >> (8 * i)));
     }
@@ -418,12 +533,128 @@ private:
     static void append_u256(std::vector<std::uint8_t>& b, const U256& x) {
         for (int i = 0; i < 4; ++i) append_u64(b, x.v[i]);
     }
-    static bytes32 comp_hash(const Bucket& b) {
+    // ── Merkle digest machinery (OQ-M5) ───────────────────────────────────
+    static bytes32 leaf_hash(const std::vector<std::uint8_t>& payload) {
+        std::vector<std::uint8_t> b;
+        b.reserve(payload.size() + 1);
+        b.push_back(0x00);
+        b.insert(b.end(), payload.begin(), payload.end());
+        return sha256d(b);
+    }
+    static bytes32 interior_hash(const bytes32& l, const bytes32& r) {
+        std::uint8_t b[65];
+        b[0] = 0x01;
+        std::copy(l.begin(), l.end(), b + 1);
+        std::copy(r.begin(), r.end(), b + 33);
+        return sha256d(b, 65);
+    }
+    static bytes32 merkle_root(std::vector<bytes32> level) {
+        // never empty: build_leaves always emits the header leaf
+        while (level.size() > 1) {
+            std::vector<bytes32> next;
+            next.reserve((level.size() + 1) / 2);
+            std::size_t i = 0;
+            for (; i + 1 < level.size(); i += 2)
+                next.push_back(interior_hash(level[i], level[i + 1]));
+            if (i < level.size()) next.push_back(level[i]);  // promote odd
+            level = std::move(next);
+        }
+        return level[0];
+    }
+    static MerkleProof make_proof(const std::vector<bytes32>& leaves, u64 idx) {
+        MerkleProof p;
+        p.leaf_count = static_cast<u64>(leaves.size());
+        p.index = idx;
+        std::vector<bytes32> level = leaves;
+        while (level.size() > 1) {
+            bool odd_last = (level.size() & 1) && idx == level.size() - 1;
+            if (!odd_last) p.path.push_back(level[idx ^ 1]);
+            std::vector<bytes32> next;
+            next.reserve((level.size() + 1) / 2);
+            std::size_t i = 0;
+            for (; i + 1 < level.size(); i += 2)
+                next.push_back(interior_hash(level[i], level[i + 1]));
+            if (i < level.size()) next.push_back(level[i]);
+            level = std::move(next);
+            idx /= 2;
+        }
+        return p;
+    }
+
+    // Canonical leaf list — the fixed order every conforming node produces.
+    template <typename Resolver>
+    std::vector<bytes32> build_leaves(Resolver&& id_key) const {
+        std::vector<bytes32> leaves;
+        u64 bucket_total = 0;
+        for (const auto& lvl : m_levels) bucket_total += lvl.size();
+        leaves.reserve(1 + m_acc.size() + bucket_total);
+        {   // [0] header leaf: geometry (consensus parameters — a mismatch
+            // becomes an attributable digest difference), position state,
+            // counts, and the L0 ring sums (F-1 leaves).
+            std::vector<std::uint8_t> h;
+            append_bytes(h, "V37H", 4);
+            append_u64(h, m_p.window);
+            append_u64(h, m_p.c0);
+            append_u64(h, m_p.rollup);
+            append_u64(h, m_p.half_life);
+            append_u64(h, static_cast<u64>(m_p.level_caps.size()));
+            for (u64 c : m_p.level_caps) append_u64(h, c);
+            append_u64(h, m_B);
+            append_u64(h, m_next_pos);
+            append_u64(h, static_cast<u64>(m_acc.size()));
+            append_u64(h, static_cast<u64>(m_l0.size()));
+            append_u256(h, m_l0_scaled_sum);
+            append_u128(h, m_l0_raw_sum);
+            for (const auto& lvl : m_levels)
+                append_u64(h, static_cast<u64>(lvl.size()));
+            leaves.push_back(leaf_hash(h));
+        }
+        {   // acc leaves, canonical-identity order
+            std::vector<std::pair<bytes32, const U256*>> rows;
+            rows.reserve(m_acc.size());
+            for (const auto& [m, a] : m_acc) rows.emplace_back(id_key(m), &a);
+            std::sort(rows.begin(), rows.end(),
+                      [](const auto& a, const auto& b) { return a.first < b.first; });
+            for (const auto& [k, a] : rows) {
+                std::vector<std::uint8_t> b;
+                append_bytes(b, "V37A", 4);
+                b.insert(b.end(), k.begin(), k.end());
+                append_u256(b, *a);
+                leaves.push_back(leaf_hash(b));
+            }
+        }
+        // bucket leaves, level-by-level, oldest -> newest (F-1 settlement
+        // bands provable individually)
+        for (std::size_t k = 0; k < m_levels.size(); ++k) {
+            for (const auto& bkt : m_levels[k]) {
+                std::vector<std::uint8_t> b;
+                append_bytes(b, "V37B", 4);
+                append_u64(b, static_cast<u64>(k));
+                append_u64(b, bkt.pos_lo);
+                append_u64(b, bkt.pos_hi);
+                append_u128(b, bkt.raw_work);
+                append_u64(b, bkt.epoch_tag);
+                auto ch = comp_hash(bkt, id_key);
+                b.insert(b.end(), ch.begin(), ch.end());
+                leaves.push_back(leaf_hash(b));
+            }
+        }
+        return leaves;
+    }
+
+    // Composition hash, also in canonical-identity order (see digest()).
+    template <typename Resolver>
+    static bytes32 comp_hash(const Bucket& b, Resolver&& id_key) {
+        std::vector<std::pair<bytes32, const CompEntry*>> rows;
+        rows.reserve(b.comp.size());
+        for (const auto& e : b.comp) rows.emplace_back(id_key(e.miner), &e);
+        std::sort(rows.begin(), rows.end(),
+                  [](const auto& a, const auto& c) { return a.first < c.first; });
         std::vector<std::uint8_t> buf;
-        for (const auto& e : b.comp) {
-            append_u32(buf, e.miner);
-            append_u256(buf, e.scaled);
-            append_u128(buf, e.raw);
+        for (const auto& [k, e] : rows) {
+            buf.insert(buf.end(), k.begin(), k.end());
+            append_u256(buf, e->scaled);
+            append_u128(buf, e->raw);
         }
         return sha256d(buf);
     }

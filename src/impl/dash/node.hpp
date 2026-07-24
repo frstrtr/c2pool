@@ -306,6 +306,14 @@ protected:
     std::set<NetService> m_whitelist_hosts;
 
 public:
+    // DISPLAY-ONLY read of the live P2P accept-floor (v36 ratchet output). Read
+    // atomically off any thread; the dashboard's /version_signaling surfaces this
+    // as the "min-protocol floor" gauge (1700 pre-crossing -> 3600 post-ratchet).
+    // Consensus-neutral: a plain atomic load, no side effects.
+    uint32_t runtime_min_protocol_version() const {
+        return m_runtime_min_protocol_version.load(std::memory_order_relaxed);
+    }
+
     // Default (rig-free) construction for tests/standalone: no io_context, the
     // share-getter requester is a no-op (there are no peers to write a
     // sharereq to; the ctx ctor below wires the real writer). Routes m_chain
