@@ -84,8 +84,17 @@ public:
     /// the won block reached at least one network sink -- a false return
     /// means it reached NEITHER and the won-block path must log loudly
     /// (no silent drop -- the block-viability gate).
+    ///
+    /// `height_race` is true when the submit-time payee guard classified the
+    /// block as a HeightRace (the job's parent moved since issue): the block
+    /// MIGHT be invalid at its real height, so the broadcaster dispatches it
+    /// RPC-FIRST (local dashd validates before any coin-P2P relay) to avoid
+    /// relaying an unvalidated block to peers and risking a coin-P2P ban.
+    /// Daemonless (no RPC arm) keeps relay-first: the relay is then the ONLY
+    /// path and dropping would forfeit a winnable block.
     using SubmitBlockFn = std::function<bool(const std::vector<unsigned char>& block_bytes,
-                                             uint32_t height)>;
+                                             uint32_t height,
+                                             bool height_race)>;
 
     /// Found-share fields handed to the sharechain mint dispatch when a
     /// stratum submission meets the share target (stage 4d). Mirrors the
