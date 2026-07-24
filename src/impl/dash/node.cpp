@@ -356,6 +356,23 @@ void NodeImpl::load_persisted_shares()
         m_storage->remove_shares_batch(prune);
         LOG_INFO << "[Pool] Pruned " << prune.size() << " old shares from LevelDB";
     }
+
+    // Seed the best-share election + snapshot BEFORE the compute thread starts
+    // (still single-threaded here — called once from the run loop pre-serving).
+    // Without this, m_best_share_hash and TrackerSnapshot.best_share are null
+    // until the FIRST think() finishes, and the first think()'s bootstrap
+    // mass-verify holds the exclusive lock for seconds; over that window
+    // best_share_hash()'s busy-fallback serves null → miners reconnecting at
+    // restart get dead time (fail-closed — no bad payout — but avoidable). One
+    // synchronous election over the just-loaded verified chain gives the tip
+    // immediately. has_peers=false: no peers exist yet at load time, so the
+    // election bootstraps off the verified/raw chain rather than refusing.
+    m_best_share_hash =
+        dash::mint::elect_best_share(m_tracker, m_best_share_hash, /*has_peers=*/false);
+    publish_snapshot();
+    if (!m_best_share_hash.IsNull())
+        LOG_INFO << "[Pool] Seeded best share from persisted chain: "
+                 << m_best_share_hash.GetHex().substr(0, 16);
 }
 
 void NodeImpl::flush_verified_to_leveldb()
@@ -792,6 +809,11 @@ void NodeImpl::drain_peer_best_adverts()
             to_download.emplace_back(weak_peer, best);
         }
     }
+    // TODO(dash-async, follow-up): when drain_peer_best_adverts runs FROM the
+    // think() IO-phase, m_think_running is still true, so this run_think() is a
+    // no-op (skipped). A m_rethink_pending flag checked at the end of the think
+    // cycle would guarantee the re-election happens. Benign today: the 2s
+    // advert timer calls drain again shortly, and by then think() has finished.
     if (rethink)
         run_think();
     for (auto& [weak_peer, best] : to_download)
@@ -811,7 +833,15 @@ void NodeImpl::start_outbound_connections()
     // node.cpp-side consumer that turns the queue into sharereq dispatches.
     // 2s bounds the join latency; the check is O(1) when the queue is empty.
     m_advert_timer = std::make_unique<core::Timer>(m_context, true);
-    m_advert_timer->start(2, [this]() { drain_peer_best_adverts(); });
+    m_advert_timer->start(2, [this]() {
+        drain_peer_best_adverts();
+        // IO thread: keep the display peer-info snapshot's uptimes fresh
+        // (peer add/remove refresh it on membership change; this ticks it so
+        // the dashboard card's uptime advances between events). Cheap — a few
+        // peers — and it is the reader-safe alternative to the HTTP thread
+        // ever touching m_peers directly.
+        publish_peer_info_snapshot();
+    });
 
     if (m_target_outbound_peers == 0)
     {
@@ -866,6 +896,12 @@ void NodeImpl::clean_tracker()
         return;
 
     // Skip if think() is already in flight — the periodic timer will retry.
+    // TODO(dash-async, follow-up): this load()-then-store() is check-then-act;
+    // a run_think() could win the m_think_running flag between the load and the
+    // store below. Benign today because both only ever run on the IO thread
+    // (the timer callbacks are serialized on the single io_context), so there
+    // is no true concurrency — but a compare_exchange on m_think_running would
+    // make the guard symmetric with the exchange() above and future-proof.
     if (m_think_running.load()) {
         m_clean_running.store(false);
         return;

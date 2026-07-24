@@ -178,6 +178,19 @@ protected:
     mutable std::mutex m_snapshot_mutex;
     TrackerSnapshot m_snapshot;
 
+    // ── Lock-free peer-info snapshot (display-only) ──────────────────────
+    // m_peers / m_outbound_addrs are IO-thread-owned and have NO lock; the
+    // dashboard node-status card polls the peer panel from the WebServer HTTP
+    // thread. Iterating those std::maps on the HTTP thread while handle_version
+    // inserts / error()/close_connection erase on the IO thread rebalances the
+    // tree under the reader's iterator → the SAME freed-memory GP-fault this
+    // file's tracker fix closes (TSAN-captured). So the JSON is BUILT on the IO
+    // thread (publish_peer_info_snapshot, at every peer add/remove + the 2s
+    // advert-timer tick for uptime freshness) and the HTTP fn reads this copy
+    // lock-free — mirrors TrackerSnapshot. Guarded by m_snapshot_mutex (a
+    // std::mutex briefly held for the swap, never contended with the tracker).
+    nlohmann::json m_peer_info_snapshot = nlohmann::json::array();
+
     // Identity of the compute thread (m_think_pool's single thread). Used by
     // TrackerReadGuard to skip shared_lock when the caller is already on the
     // compute thread (which holds the exclusive lock).
@@ -255,6 +268,11 @@ protected:
     // start_outbound_connections() (both node.cpp) drain the queue into
     // download_shares — the oracle p2p.py handle_version →
     // node.handle_share_hashes join trigger, one hop later.
+    // TODO(dash-async, follow-up): bound this queue with a drop-oldest cap
+    // (mirror MAX_PENDING_ADDS). Today the busy-download path in
+    // download_shares re-enqueues continuations here when the tracker lock is
+    // held, so a sustained think()-busy window could grow it; a cap keeps it
+    // bounded like m_pending_adds. Not a crash risk (drained every 2s).
     std::vector<std::pair<std::weak_ptr<peer_t>, uint256>> m_peer_best_adverts;
 
     // ── Peer-count mirror ───────────────────────────────────────────────
@@ -465,6 +483,7 @@ public:
         m_peer_count.store(m_peers.size(), std::memory_order_relaxed);
         m_pending_outbound.erase(service);
         m_outbound_addrs.erase(service);
+        publish_peer_info_snapshot();   // IO thread: refresh the display snapshot
         base_t::error(err, service, where);
     }
 
@@ -473,7 +492,10 @@ public:
         cancel_peer_share_requests(service);
         m_pending_outbound.erase(service);
         m_outbound_addrs.erase(service);
+        // base close may drop the peer from m_peers; refresh AFTER so the
+        // snapshot reflects the post-close map (IO thread).
         base_t::close_connection(service);
+        publish_peer_info_snapshot();
     }
 
     void cancel_peer_share_requests(const NetService& service)
@@ -585,6 +607,7 @@ public:
         peer->m_nonce = msg->m_nonce;
         m_peers[peer->m_nonce] = peer;
         m_peer_count.store(m_peers.size(), std::memory_order_relaxed);
+        publish_peer_info_snapshot();   // IO thread: refresh the display snapshot
 
         // #754 join trigger (oracle p2p.py handle_version → node.py
         // handle_share_hashes): a peer advertising a best share we don't have
@@ -689,11 +712,11 @@ public:
     /// above, next to send_version.)
     uint256 best_share_hash();
 
-    /// Pool-peer info for the dashboard node-status card (ltc node.hpp:302
-    /// parity). Display only — MiningInterface::set_peer_info_fn feeds
-    /// /local_stats {peers:{incoming,outgoing}} and the peer table. Read-only
-    /// over the live m_peers map; touches no share/target/payout state.
-    nlohmann::json get_peer_info_json() const {
+    /// Rebuild the lock-free peer-info snapshot. IO-THREAD ONLY (reads the
+    /// IO-owned m_peers / m_outbound_addrs). Called at every peer add/remove
+    /// and on the 2s advert-timer tick. Publishes under m_snapshot_mutex so
+    /// the HTTP reader (get_peer_info_json) never touches the live maps.
+    void publish_peer_info_snapshot() {
         nlohmann::json arr = nlohmann::json::array();
         for (const auto& [nonce, peer] : m_peers) {
             if (!peer) continue;
@@ -710,7 +733,19 @@ public:
                 {"web_port", 0}
             });
         }
-        return arr;
+        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+        m_peer_info_snapshot = std::move(arr);
+    }
+
+    /// Pool-peer info for the dashboard node-status card (ltc node.hpp:302
+    /// parity). Display only — MiningInterface::set_peer_info_fn feeds
+    /// /local_stats {peers:{incoming,outgoing}} and the peer table. Reachable
+    /// from the WebServer HTTP thread, so it returns the IO-thread-published
+    /// snapshot lock-free — it must NEVER iterate the live m_peers map (that
+    /// races the IO thread's insert/erase → freed-memory GP-fault).
+    nlohmann::json get_peer_info_json() const {
+        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+        return m_peer_info_snapshot;
     }
 
     /// Relay a share (and up to 4 un-broadcast ancestors) to all peers via
