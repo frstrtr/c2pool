@@ -42,6 +42,7 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -242,10 +243,18 @@ protected:
 
     // De-dup set for broadcast_share (hashes already relayed to peers).
     std::set<uint256> m_shared_share_hashes;
-    // Hashes of the CURRENT template's txs registered in m_known_txs by
-    // register_template_txs — replaced wholesale each registration so the
-    // known-tx pool stays bounded by one template.
-    std::set<uint256> m_template_tx_hashes;
+    // Rolling history of recent templates' tx-hash sets (register_template_txs).
+    // A locally minted share references its job's template txs; the miner may
+    // solve a job whose template has since rotated (especially at high hashrate),
+    // and ROOT-2 re-announce re-broadcasts a share after several rotations. If we
+    // evict a tx the moment its template rotates (the old single-template bound),
+    // send_shares can no longer forward its bytes via remember_tx, and the
+    // canonical peer drops us with "referenced unknown transaction" (p2p.py:404).
+    // Keep the last RETAINED_TEMPLATE_TX_SETS template tx-sets so a share minted
+    // on any recent job stays fully backable; a tx leaves m_known_txs only once it
+    // has fallen out of EVERY retained set (peer-remembered txs are separate).
+    static constexpr size_t RETAINED_TEMPLATE_TX_SETS = 8;
+    std::deque<std::set<uint256>> m_recent_template_tx_sets;
     // Fired on the IO thread when run_think() elects a new best share
     // (p2pool: new_work_event) — main_dash binds the stratum work refresh.
     std::function<void()> m_on_best_share_changed;
