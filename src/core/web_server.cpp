@@ -1834,9 +1834,20 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
     uint256 submitted_merkle_root;
     std::memcpy(submitted_merkle_root.data(), header_bytes.data() + 36, 32);
 
-    // Validate prev_block_hash matches our cached template
+    // Compare prev_block_hash against our cached template. A MISMATCH is a RACE,
+    // NOT a guaranteed loss: a chain-extended block is a valid same-height
+    // competitor, a 1-block reorg block leads by one, and only a block buried 2+
+    // deep is unwinnable — and forwarding even that is free (the daemon stores a
+    // dead orphan). GUIDING INVARIANT: never REFUSE a block the daemon might
+    // accept — a false refusal is a guaranteed irreversible loss, whereas a
+    // truly-dead block is rejected by the daemon for free. So "stale" is ADVISORY
+    // telemetry only: we log it, mark it in metrics, then FALL THROUGH to the
+    // normal submit path and let the daemon be the authority on validity at the
+    // block's real height. (Previously this path early-returned a synthetic
+    // "stale" error and DROPPED the block, forfeiting winnable race blocks —
+    // this is LTC's + NMC's primary won-block submit path.)
+    bool is_stale = false;
     {
-        bool is_stale = false;
         {
             std::lock_guard<std::mutex> lock(m_work_mutex);
             if (m_work_valid && !m_cached_template.is_null()
@@ -1845,9 +1856,10 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
                 uint256 expected_prev;
                 expected_prev.SetHex(m_cached_template["previousblockhash"].get<std::string>());
                 if (submitted_prev_hash != expected_prev) {
-                    LOG_WARNING << "[LTC] submitblock: stale block — prev_hash mismatch"
+                    LOG_WARNING << "[LTC] submitblock: stale/race block — prev_hash mismatch"
                                 << " submitted=" << submitted_prev_hash.GetHex()
-                                << " expected=" << expected_prev.GetHex();
+                                << " expected=" << expected_prev.GetHex()
+                                << " — forwarding to daemon anyway (daemon is authority)";
                     is_stale = true;
                 }
             }
@@ -1857,33 +1869,49 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
                 LOG_TRACE << "[LTC] submitblock: merkle_root=" << submitted_merkle_root.GetHex();
             }
         }
-        // Fire stale callback OUTSIDE the lock to avoid deadlock
-        if (is_stale) {
-            if (m_on_block_submitted && hex_data.size() >= 160) {
-                m_on_block_submitted(hex_data.substr(0, 160), 253);
-            }
-            return {{"error", "stale block: previous block hash mismatch"}};
+        // Fire the race/stale telemetry OUTSIDE the lock (avoid deadlock) so the
+        // race stays visible in metrics — then continue into the submit path
+        // below. stale_info 253 = ORPHAN (stale prev). NOTE: we fire this ONCE
+        // here for the race marker; the accepted/rejected branches below are
+        // guarded on !is_stale so a stale block is never double-recorded.
+        if (is_stale && m_on_block_submitted && hex_data.size() >= 160) {
+            m_on_block_submitted(hex_data.substr(0, 160), 253);
         }
     }
 
     if (m_coin_node && m_coin_node->has_rpc()) {
         try {
             bool accepted = m_coin_node->submit_block_hex(hex_data, false);
-            LOG_INFO << "Block forwarded to coin daemon";
+            LOG_INFO << "Block forwarded to coin daemon"
+                     << (is_stale ? " (stale/race — daemon is authority on validity)" : "");
             if (accepted) {
-                // Notify P2P layer with stale_info=0 (none — accepted)
-                if (m_on_block_submitted && hex_data.size() >= 160) {
+                // Notify P2P layer with stale_info=0 (none — accepted). Suppressed
+                // for a stale/race block, which already fired 253 above (no
+                // double-record); the block is still relayed below.
+                if (!is_stale && m_on_block_submitted && hex_data.size() >= 160) {
                     m_on_block_submitted(hex_data.substr(0, 160), 0);
                 }
                 // Relay full block via P2P for fast propagation
                 if (m_on_block_relay) {
                     m_on_block_relay(hex_data);
                 }
+            } else {
+                // Daemon REJECTED the block: return its verdict to the caller
+                // (submit_block_hex maps daemon null=accept to true; any non-null
+                // reject/duplicate string to false — the reject reason is logged
+                // by submit_block_hex itself). Do NOT synthesize a "stale" error.
+                // We do NOT fire a found-block callback here (preserving the prior
+                // telemetry, which only recorded on the exception path): a "false"
+                // return can also mean daemon-duplicate (block already accepted via
+                // P2P), and recording that as DOA would mis-count a won block.
+                LOG_WARNING << "submitblock: coin daemon rejected the block (or already had it)";
+                return {{"error", "block rejected by coin daemon"}};
             }
         } catch (const std::exception& e) {
             LOG_ERROR << "submitblock failed: " << e.what();
-            // Fire callback with doa stale info (254)
-            if (m_on_block_submitted && hex_data.size() >= 160) {
+            // Fire callback with doa stale info (254). Suppressed for a stale/race
+            // block (already fired 253 above — no double-record).
+            if (!is_stale && m_on_block_submitted && hex_data.size() >= 160) {
                 m_on_block_submitted(hex_data.substr(0, 160), 254);
             }
             return {{"error", std::string(e.what())}};
@@ -1930,8 +1958,10 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
             }
         }
 
-        // Fire block-found callback immediately (synchronous — updates stats)
-        if (m_on_block_submitted && hex_data.size() >= 160)
+        // Fire block-found callback immediately (synchronous — updates stats).
+        // Suppressed for a stale/race block, which already fired 253 above (no
+        // double-record); the block is still relayed via P2P below regardless.
+        if (!is_stale && m_on_block_submitted && hex_data.size() >= 160)
             m_on_block_submitted(hex_data.substr(0, 160), 0);
 
         // Thread the slow parts (P2P relay + RPC) so stratum isn't blocked.
