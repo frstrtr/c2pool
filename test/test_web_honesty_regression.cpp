@@ -418,21 +418,65 @@ TEST(WebHonestyRegression, VersionSignalingSurfacesOnRatchetingDgb) {
     EXPECT_DOUBLE_EQ(r["overall_v36_vote_pct"].get<double>(), 100.0);
 }
 
-// DASH is non-ratcheting (static v16) -- the ONE coin #496 keeps excluded. Even
-// with full vote data wired, its crossing banner stays hidden: surfacing a
-// V35->V36 transition on a chain that has no such transition would be a lie.
-TEST(WebHonestyRegression, VersionSignalingSuppressedOnNonRatchetingDash) {
+// DASH now runs its OWN v16->v36 crossing: the accept-floor ratchet is armed
+// (apply_min_protocol_ratchet lifts 1700->3600 on >=95% work-weighted v36 desire).
+// The pre-#496 blanket suppression predated that armed ratchet; keeping it would
+// now be the LIE -- hiding a genuinely-armed transition. So DASH version_signaling
+// must surface the TRUTHFUL pre-crossing state: show_transition=true, status
+// "waiting", 0% v36 votes, floor 1700 (target 3600), v36 not yet active. Showing
+// "0% v36, waiting, floor 1700" is honest (a transition is real and armed); the
+// old empty {} is not. Mirrors what main_dash.cpp's stats fn emits pre-crossing.
+TEST(WebHonestyRegression, VersionSignalingTruthfulPreCrossingDash) {
     MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+    // Real DASH pre-crossing shape: wire-format v16 shares, all still DESIRING v16
+    // (0% v36), a mature chain, and the armed accept-floor at its cold 1700 with the
+    // 3600 target advertised -- exactly the fields main_dash.cpp's stats fn emits.
     mi.set_sharechain_stats_fn([] {
         return json{
             {"total_shares", 100},
-            {"shares_by_version", {{"35", 100}}},
-            {"shares_by_desired_version", {{"36", 80}}},
+            {"chain_height", 4320},
+            {"chain_length", 4320},
+            {"shares_by_version", {{"16", 100}}},
+            {"shares_by_desired_version", {{"16", 100}}},
+            {"sampling_desired_version", {{"16", 1.0e15}}},
+            {"deepest_v36_position", 0},
+            {"v36_contiguous_from_tip", 0},
+            {"min_protocol_version", 1700},
+            {"cold_min_protocol_version", 1700},
+            {"new_min_protocol_version", 3600},
+            {"advertised_protocol_version", 3600},
+            {"live_share_version", 16},
         };
     });
-    EXPECT_TRUE(mi.rest_version_signaling().empty())
-        << "Dash is static v16 (non-ratcheting) -- no V35->V36 crossing exists, so "
-           "the banner must stay hidden regardless of wired vote data";
+
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty())
+        << "DASH now ratchets v16->v36 -- the crossing gauge must surface the real "
+           "pre-crossing state, not the pre-armed-ratchet empty suppression";
+
+    // Truthful pre-crossing: a transition is armed but no v36 votes yet.
+    EXPECT_TRUE(r.value("show_transition", false))
+        << "an armed-but-unstarted crossing IS a transition to show (honestly at 0%)";
+    EXPECT_EQ(r.value("status", std::string{}), "waiting")
+        << "0 v36 votes on a ready chain -> waiting-for-upgrade, not a fabricated cross";
+    EXPECT_EQ(r["target_version"].get<int>(), 36);
+    EXPECT_EQ(r["current_share_type"].get<int>(), 16)
+        << "DASH mines wire-format v16 across the whole crossing";
+    EXPECT_DOUBLE_EQ(r["overall_v36_vote_pct"].get<double>(), 0.0)
+        << "no share desires v36 yet -- the gauge must read a truthful 0%";
+    EXPECT_DOUBLE_EQ(r["sampling_signaling"].get<double>(), 0.0);
+
+    // Protocol-floor gauge pass-through (the min-proto floor 1700 -> 3600 target).
+    EXPECT_EQ(r.value("min_protocol_version", 0), 1700);
+    EXPECT_EQ(r.value("new_min_protocol_version", 0), 3600);
+    EXPECT_EQ(r.value("advertised_protocol_version", 0), 3600);
+
+    // The ratchet has NOT latched: this node still mines v16, v36 not active.
+    ASSERT_TRUE(r.contains("auto_ratchet"));
+    EXPECT_EQ(r["auto_ratchet"].value("live_share_version", 0), 16);
+    EXPECT_FALSE(r["auto_ratchet"].value("v36_active", true))
+        << "floor is still 1700 -- v36 must NOT read active pre-crossing";
+    EXPECT_EQ(r["auto_ratchet"].value("state", std::string{}), "voting");
 }
 
 // Honest-empty: a ratcheting coin with too little chain (<10 shares) has no real
