@@ -28,23 +28,33 @@ public:
         MinerId id = static_cast<MinerId>(m_refs.size());
         m_ids.emplace(std::move(key), id);
         m_refs.push_back(d.pay);
+        m_keys.push_back(d.identity_key());
         return id;
     }
     const ScriptRef& pay_ref(MinerId id) const { return m_refs.at(id); }
+    // Canonical identity key (S-3): the consensus-stable name of a miner.
+    // Intern ids are node-local and MUST NOT appear in any consensus bytes.
+    const bytes32& key(MinerId id) const { return m_keys.at(id); }
     std::size_t size() const { return m_refs.size(); }
 
 private:
     std::map<std::vector<std::uint8_t>, MinerId> m_ids;
     std::vector<ScriptRef> m_refs;
+    std::vector<bytes32> m_keys;
 };
 
 class Roundabout {
 public:
     // O(1) directory append; no other lane is touched (§7).
+    // Exception-safe: the Lane is constructed BEFORE the directory entry is
+    // created, so a geometry-validation throw leaves the directory unchanged
+    // (no null entry, the chain id stays usable).
     Lane& add_lane(ChainId chain, const LaneParams& p) {
-        auto [it, fresh] = m_lanes.emplace(chain, nullptr);
-        if (!fresh) throw std::invalid_argument("v37: lane already exists");
-        it->second = std::make_unique<Lane>(p);
+        if (m_lanes.count(chain))
+            throw std::invalid_argument("v37: lane already exists");
+        auto lane = std::make_unique<Lane>(p);
+        auto [it, fresh] = m_lanes.emplace(chain, std::move(lane));
+        (void)fresh;
         return *it->second;
     }
     void remove_lane(ChainId chain) { m_lanes.erase(chain); }
@@ -70,6 +80,15 @@ public:
         MinerId id = m_miners.intern(d);
         l->push(id, w_raw, flags);
         return id;
+    }
+
+    // Lane digest with the canonical identity resolver (the only correct way
+    // to produce the consensus-committed digest; Lane::digest is generic so
+    // tests can inject resolvers, but production goes through here).
+    bytes32 lane_digest(ChainId chain) const {
+        const Lane* l = lane(chain);
+        if (!l) throw std::invalid_argument("v37: unknown chain");
+        return l->digest([this](MinerId m) { return m_miners.key(m); });
     }
 
     // Cross-lane per-miner aggregate of decayed weights: integer-keyed merge

@@ -1,0 +1,18 @@
+=== T7 incremental delta + no-server worst case: W=300000 churn=10%x20rounds gap=5 ===
+bridge: live W=300000 total_ever=900000 deletes=600000 roots=8 build=24925ms  (anchor = 8 root hashes = 256B)
+--- Q1 returning validator (away 5/20 rounds, checkpoint=end-of-round-15) ---
+  c0 baseline roots != c1 roots: True (state really moved)
+  delta path   : ΔW= 300000 ops (adds=150000 dels=150000) build= 6215.0ms bw= 5.722MB roots_match=True
+  cold O(W)    : W = 300000     build=  768.9ms bw= 9.155MB roots_match=True
+  => returning validator pays 1.0000x the cold-snapshot work/bandwidth ( O(ΔW) vs O(W), ΔW/W = 300000/300000 ).
+--- Q2 no-honest-snapshot-server fallback = PATH A replay, O(total-ever) ---
+  total-ever / live inflation = 3.00x at R=20 rounds (replay rebuilds 900000 leaves for a W=300000 live set).
+  closed form: total_ever = W*(1 + f*R), f=10%  ->
+     R=    20 rounds : replay floor =   3.00x O(W)  (~0.90M leaf-rebuilds)
+     R=   100 rounds : replay floor =  11.00x O(W)  (~3.30M leaf-rebuilds)
+     R=   500 rounds : replay floor =  51.00x O(W)  (~15.30M leaf-rebuilds)
+     R=  2000 rounds : replay floor = 201.00x O(W)  (~60.30M leaf-rebuilds)
+  => WITHOUT an honest server the replay-only floor is UNBOUNDED in history length R, not bounded by W. A SINGLE honest snapshot server (or a periodic consensus live-set checkpoint) collapses it to O(W). That checkpoint is the lever the superlight open problem turns on.
+=== VERDICT ===
+  returning-validator delta reproduces the committed c1 roots in O(ΔW), trustless vs the same PoW-committed 8-root anchor as the snapshot; cold-start floor stays O(W); replay-only fallback is O(W*(1+fR)).
+  correctness (delta+cold reproduce committed roots, state moved): PASS

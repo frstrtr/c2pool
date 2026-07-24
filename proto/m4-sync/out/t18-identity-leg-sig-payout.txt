@@ -1,0 +1,38 @@
+=== M5 T18: delta-tail identity leg — payout-descriptor commitment + signature ===
+D_f=12 shares, bits=16
+
+candidate                  chain  pow   S1-commit  S2-sig   COMPOSED   id-only
+honest                     True  True  True      True   ACCEPT    ACCEPT
+forgedA_redirect           True  True  False     False  reject    reject
+forgedB_forgedsig          True  True  True      False  reject    reject
+forgedC_selfconsistent     True  False True      True   reject    ACCEPT
+forgedD_unboundkey         True  True  True      False  reject    reject
+
+--- golden invariants ---
+  [PASS] honest_accepted
+  [PASS] redirect_rejected_commit
+  [PASS] forgedsig_rejected_S2
+  [PASS] selfconsistent_rejected_pow
+  [PASS] unboundkey_rejected_S2
+  [PASS] idonly_accepts_selfconsistent
+  [PASS] composed_rejects_selfconsistent
+
+--- golden vector ---
+{
+  "boundary": "d9a3e15786b275e7f306498cb59bb1075bf6fcb5c23db7de82650f283ac4f540",
+  "honest_tip": "00009b7c4b53e09aa7e2f17e70c65c85d58ca449817ec1e00937f873f1b89b01",
+  "honest_payout_pubkey": "652464a06e9f64f285e901b8f40c32a6952c08014889190d55223567e89f7fdf",
+  "honest_info_digest_0": "1f9d8a969a84fc1e5a059c66d63e2baab127a9b7dd954b0e83375dad296efd0b",
+  "honest_sig_0": "bd1debb6f2a37f3e742d342afe1dea67fe48cce7f160853f6e13e8eb167b40d231a4109beeb986fa03f7cda0ed879874c8555fae3e818b21fcd8e1393071d90e",
+  "sybil_pubkey": "725a6363df0deb4c3dae1da8e99b521644eeba7efee3fb00a86ad48e3f649012",
+  "forgedC_tip": "d79772bab574bf75ef1691cce4237cd24bce89bc84cac2b69cf413d709da55f4",
+  "verdicts": {
+    "honest": "ok",
+    "forgedA_redirect": "descriptor-commitment-mismatch",
+    "forgedB_forgedsig": "bad-signature",
+    "forgedC_selfconsistent": "per-share-PoW-fail",
+    "forgedD_unboundkey": "bad-signature"
+  }
+}
+
+RESULT: ALL PASS — F1 identity leg (payout-descriptor commitment + signature, bound into PoW) TESTED & HOLDS.

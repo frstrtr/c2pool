@@ -1,0 +1,15 @@
+=== T6 sovereign cold-start catch-up: W=300000 churn=10%x20rounds clients=50 ===
+bridge state: live W=300000 total_ever=900000 deletes=600000 roots=8 build=24418ms (commitment the sovereign anchors to = 8 root hashes = 256B)
+  A full-history replay      build= 23.580s ops= 1500000 bw=  32.04MB roots_match=True
+  B root-anchored snapshot   build=  0.737s ops=  300000 bw=   9.16MB roots_match=True
+=== bridge proof-serving topology ===
+  bridge forest mem ~ 18.3MB (O(W), the cost of being a proof-server / snapshot-server)
+  serve 1 sovereign via snapshot : 9.16MB egress
+  serve 1 sovereign via replay   : 32.04MB egress (3.50x snapshot)
+  serve 50 sovereigns via snapshot: 457.8MB total bridge egress
+=== VERDICT ===
+  total-ever / live = 3.00x  -> replay pays 3.00x the bandwidth AND build of the snapshot path for an IDENTICAL end-state.
+  PATH B trustless: rebuilt roots == committed roots (True); a forged snapshot cannot match the PoW-committed 8-root commitment.
+  => sovereign cold-start floor is O(W live) = 0.737s / 9.16MB at W=300000, NOT O(total-ever). Steady-state verification stays O(log W).
+  OPEN: is one-time O(W) bootstrap acceptable at production W, and is there a sovereign with NO honest snapshot-server? (replay is the fallback, 3.00x costlier; both paths are server-trustless.)
+  correctness: both paths reproduce the committed roots: PASS
