@@ -1143,14 +1143,22 @@ TEST(DashSubmitPayeeGuard, OkWhenMandatedAmountDriftsButScriptPresent)
     EXPECT_EQ(r.verdict, dash::stratum::PayeeGuardVerdict::Ok);
 }
 
-TEST(DashSubmitPayeeGuard, WrongHeightWhenPrevDiffers)
+TEST(DashSubmitPayeeGuard, HeightRaceWhenPrevDiffersIsSubmittedNotDropped)
 {
-    // The job's parent is no longer the chain tip: the block is for the wrong
-    // height and dashd would reject it. The guard must refuse the submit.
+    // REWARD-CRITICAL false-refusal fix. The job's parent is no longer the
+    // chain tip -- but "parent moved" is NOT "unwinnable": a chain-extend
+    // leaves us a valid same-height competitor dashd accepts, a 1-block reorg
+    // leaves us one above the tip so the network reorgs to us, and even a deep
+    // bury is free to submit (dashd stores a dead orphan). Per the guard's own
+    // invariant the block must be SUBMITTED (HeightRace), never dropped --
+    // dashd is the authority at the block's real height. The guard also does
+    // NOT run the payee check here (the current template's payees are for the
+    // WRONG height), so it reports HeightRace regardless of payee shape.
     const auto cb = fixture_coinbase_bytes();
     const auto r = dash::stratum::check_submit_payee(
         cb, kPrevHashHex, rotated_work(), dash::make_coin_params(false));
-    EXPECT_EQ(r.verdict, dash::stratum::PayeeGuardVerdict::WrongHeight);
+    EXPECT_EQ(r.verdict, dash::stratum::PayeeGuardVerdict::HeightRace);
+    EXPECT_NE(r.detail.find("height race"), std::string::npos);
 }
 
 TEST(DashSubmitPayeeGuard, UnverifiableOnGarbageCoinbaseNeverBlocks)
@@ -1216,10 +1224,14 @@ TEST(DashStratumWorkSource, WonBlockWithMandatedAmountDriftStillSubmits)
     EXPECT_TRUE(rig.fx.submit_called);        // amount drift is NOT a refusal
 }
 
-// A won block across a MOVED tip is for the wrong height (the job's parent is
-// no longer the chain tip) — dashd would reject it, so the guard refuses and
-// the broadcaster must NOT fire.
-TEST(DashStratumWorkSource, WonBlockAcrossTipMoveIsLocallyRejected)
+// A won block across a MOVED tip is a HEIGHT RACE, not a guaranteed loss: a
+// chain-extend leaves us a valid same-height competitor dashd accepts, a
+// 1-block reorg leaves us one above the tip so the network reorgs to us, and
+// even a deep bury is free to submit (dashd stores a dead orphan). Per the
+// guard's reward invariant the block MUST be submitted (dashd is the authority
+// at its real height) — dropping it would forfeit a winnable reward. The
+// broadcaster MUST fire.
+TEST(DashStratumWorkSource, WonBlockAcrossTipMoveIsSubmittedAsHeightRace)
 {
     SubmitRig rig;
     rig.job.share_bits  = 0x207fffffu;
@@ -1235,7 +1247,7 @@ TEST(DashStratumWorkSource, WonBlockAcrossTipMoveIsLocallyRejected)
     auto result = rig.submit(nonce);
     ASSERT_TRUE(result.is_boolean());
     EXPECT_TRUE(result.get<bool>());          // the miner's work was honest
-    EXPECT_FALSE(rig.fx.submit_called);       // ...but wrong-height: NOT dispatched
+    EXPECT_TRUE(rig.fx.submit_called);        // ...and the race block IS dispatched
 }
 
 // ── Dashboard stats seam (issue: /local_stats hashrate under-reported) ───────

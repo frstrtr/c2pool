@@ -870,13 +870,21 @@ nlohmann::json DASHWorkSource::mining_submit(
                              "job/template pipeline served stale work "
                              "(investigate!)";
                 break;
-            case PayeeGuardVerdict::WrongHeight:
-                payee_guard_reject = true;
-                LOG_ERROR << "[DASH-STRATUM-PAYEE-GUARD] WON BLOCK LOCALLY "
-                             "REJECTED, NOT submitted: " << guard.detail
-                          << " user=" << username << " job=" << job_id
-                          << " -- the job's parent is no longer the chain tip; "
-                             "dashd would reject this wrong-height block";
+            case PayeeGuardVerdict::HeightRace:
+                // Parent moved since the job was issued -- but "parent moved"
+                // is NOT "unwinnable". A chain-extend leaves us a valid
+                // same-height competitor (dashd accepts, we race); a 1-block
+                // reorg leaves us one above the tip (submitting reorgs the
+                // network to us); only a 2+ deep bury is unwinnable, and even
+                // then submitting is free (dashd stores a dead orphan). Per the
+                // reward invariant we SUBMIT and let dashd decide -- dropping
+                // would be a guaranteed, irreversible loss. NOT a reject.
+                LOG_WARNING << "[DASH-STRATUM-PAYEE-GUARD] WON BLOCK is a HEIGHT "
+                               "RACE: " << guard.detail
+                            << " user=" << username << " job=" << job_id
+                            << " -- submitting anyway; dashd is the authority at "
+                               "the block's real height and will accept if valid, "
+                               "reject for free if not";
                 break;
             case PayeeGuardVerdict::Unverifiable:
                 LOG_WARNING << "[DASH-STRATUM-PAYEE-GUARD] guard could not "

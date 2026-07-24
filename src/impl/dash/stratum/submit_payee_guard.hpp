@@ -40,9 +40,21 @@
 // the network. The payee SCRIPT is height-deterministic; the amount is not. So
 // the guard verifies payee SCRIPTS by SET MEMBERSHIP and never compares amounts:
 //
-//   - WrongHeight:  the job's prev != the current chain tip. The job was built
-//                   on a parent that is no longer the tip → the block is for the
-//                   wrong height and dashd would reject it. DO NOT submit.
+//   - HeightRace:   the job's prev != the current chain tip. The tip moved
+//                   AFTER the job was issued, but "parent moved" ≠ "unwinnable"
+//                   and the guard must NOT drop the block (that would forfeit a
+//                   winnable reward, violating the invariant above). If the
+//                   chain merely extended, our block is a valid competing block
+//                   at the same height — dashd ACCEPTS it and we race. If it was
+//                   a 1-block reorg, our block is one above the current tip —
+//                   submitting makes OUR chain longer and the network reorgs to
+//                   us. Only when buried 2+ deep is it unwinnable, and even then
+//                   submitting is free (dashd stores a dead orphan, no harm).
+//                   dashd is the authority on validity at the block's REAL
+//                   height, so we CANNOT run the set-membership payee check here
+//                   (m_packed_payments are for the CURRENT tip's height, not our
+//                   block's) — we SUBMIT and log a race warning. Dropping would
+//                   guarantee the loss; submitting lets the network decide.
 //   - PayeeMissing: prev matches (same height) but a GBT-mandated payee SCRIPT
 //                   (masternode / operator / superblock / platform burn) is
 //                   ABSENT from the coinbase outputs → a genuine bad-cb-payee.
@@ -76,7 +88,7 @@ namespace dash::stratum {
 
 enum class PayeeGuardVerdict {
     Ok,           ///< all mandated payee SCRIPTS present at current height — submit
-    WrongHeight,  ///< job prev != current tip — wrong height, dashd rejects — DO NOT submit
+    HeightRace,   ///< job prev != current tip — parent moved — SUBMIT as a height race (dashd decides)
     PayeeMissing, ///< same height, a mandated payee SCRIPT absent — bad-cb-payee — DO NOT submit
     Unverifiable, ///< coinbase would not parse — submit (never guard-block on parse)
 };
@@ -95,16 +107,25 @@ inline PayeeGuardResult check_submit_payee(
     PayeeGuardResult r;
 
     // Height context: same prev == same height == same expected payee set.
-    // A differing prev means the tip moved after the job was issued: the job
-    // was built on a parent that is no longer the chain tip, so the block is
-    // for the wrong height and dashd would reject it. Refuse — submitting a
-    // wrong-height block cannot win and only muddies the reject log.
+    // A differing prev means the tip moved after the job was issued. That is a
+    // RACE, not a guaranteed loss: if the chain merely extended, our block is a
+    // valid competing block at the same height (dashd accepts, we race); if it
+    // was a 1-block reorg, our block is one above the current tip (submitting
+    // makes our chain longer, the network reorgs to us). Only a 2+ deep bury is
+    // unwinnable — and even then submitting is free (dashd stores a dead orphan,
+    // no harm). Per the reward invariant, when in doubt we SUBMIT and let dashd
+    // (the authority at the block's REAL height) decide. We deliberately SKIP
+    // the set-membership payee check below: m_packed_payments belong to the
+    // CURRENT tip's height, NOT our block's, so comparing against them would be
+    // meaningless — dashd validates the payee at the block's own height.
     if (current.m_previous_block.GetHex() != job_gbt_prevhash) {
-        r.verdict = PayeeGuardVerdict::WrongHeight;
+        r.verdict = PayeeGuardVerdict::HeightRace;
         r.detail  = "job prev=" + job_gbt_prevhash.substr(0, 16)
                   + " current tip=" + current.m_previous_block.GetHex().substr(0, 16)
-                  + " (tip moved since job issue — block is for the wrong height,"
-                    " dashd would reject; DO NOT submit)";
+                  + " (parent moved since job issue — submitting anyway as a"
+                    " height race; dashd will accept if valid at the block's real"
+                    " height, reject for free if not; dropping would guarantee"
+                    " the loss)";
         return r;
     }
 
