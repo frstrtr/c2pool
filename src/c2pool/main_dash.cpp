@@ -92,6 +92,7 @@
 #include <impl/dash/mint_runloop.hpp>          // dash::mint — run-loop share minting (slice 3/3)
 #include <core/web_server.hpp>                 // core::WebServer — the EXISTING c2pool dashboard (same wiring main_ltc.cpp uses)
 #include <impl/dash/enhanced_node.hpp>         // dash::EnhancedDashNode — core::IMiningNode the WebServer ctor takes
+#include <impl/dash/share_messages.hpp>        // dash::unpack_share_messages — signed transitional-blob DISPLAY+VERIFY feed
 #include <core/log.hpp>
 
 #include <chrono>
@@ -654,19 +655,62 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             mi->mark_last_cache_tip_driven();
 
             // ── REAL sharechain stats ─────────────────────────────────────
-            // Straight off the live tracker / published snapshot. Only fields
-            // DASH actually computes are emitted — no LTC-shaped placeholders.
+            // Straight off the live tracker / published snapshot. Emits the same
+            // vote/sampling/propagation fields main_ltc.cpp's stats_fn does, so the
+            // SHARED core::rest_version_signaling() lights the v16→v36 transition
+            // gauges for DASH exactly as it does for LTC's v35→v36 crossing. All
+            // reads are display-only (no consensus mutation): the desired-version
+            // tally + work-weighted sampling mirror what apply_min_protocol_ratchet
+            // keys on (version_negotiation::get_desired_version_weights), so the
+            // dashboard shows the SAME numbers the ratchet decides on.
             mi->set_sharechain_stats_fn([node_ptr]() -> nlohmann::json {
+                // Last-good cache (mirrors main_ltc.cpp's stats_fn): think() holds the
+                // tracker lock frequently during normal operation, and returning a
+                // 4-field snapshot then would make the transition gauge (which reads
+                // shares_by_desired_version / sampling weights) flap to 0 every time.
+                // On a busy tick we return the last FULL result with volatile fields
+                // refreshed from the snapshot, so the crossing gauge stays steady.
+                static std::mutex s_cache_mutex;
+                static nlohmann::json s_last_good;
+
                 auto snap = node_ptr->get_tracker_snapshot();
                 nlohmann::json out;
-                out["chain_length"]   = static_cast<int>(dash::SharechainConfig::chain_length());
+                const int chain_len = static_cast<int>(dash::SharechainConfig::chain_length());
+                out["chain_length"]   = chain_len;
                 out["fork_count"]     = snap.fork_count;
                 out["verified_count"] = snap.verified_count;
                 out["orphan_shares"]  = snap.orphan_shares;
                 out["dead_shares"]    = snap.dead_shares;
+
+                // Protocol-floor gauge inputs (v16→v36 crossing). The live accept-floor
+                // is the ratchet output (1700 pre-crossing → 3600 once ≥95% v36-weighted);
+                // advertised is our v36-capability advert.
+                const int64_t live_floor = static_cast<int64_t>(node_ptr->runtime_min_protocol_version());
+                out["min_protocol_version"]     = live_floor;
+                out["cold_min_protocol_version"] = static_cast<int64_t>(dash::SharechainConfig::MINIMUM_PROTOCOL_VERSION);
+                out["new_min_protocol_version"] = static_cast<int64_t>(dash::SharechainConfig::NEW_MINIMUM_PROTOCOL_VERSION);
+                out["advertised_protocol_version"] = static_cast<int64_t>(dash::SharechainConfig::ADVERTISED_PROTOCOL_VERSION);
+                // DASH shares are wire-format v16 through the whole crossing (only the
+                // desired-version vote moves 16→36; there is no v36 share FORMAT for
+                // DASH), so the node's live share version is 16 until the floor latches.
+                out["live_share_version"] = (live_floor >= static_cast<int64_t>(dash::SharechainConfig::NEW_MINIMUM_PROTOCOL_VERSION)) ? 36 : 16;
+
                 auto guard = node_ptr->read_tracker();
                 if (!guard) {
-                    // Tracker busy — report the snapshot only, and say so.
+                    // Tracker busy — prefer the last FULL result (with the vote/sampling
+                    // fields) over a bare snapshot so the gauge doesn't flap.
+                    std::lock_guard<std::mutex> lock(s_cache_mutex);
+                    if (!s_last_good.is_null()) {
+                        nlohmann::json cached = s_last_good;
+                        // Refresh volatile fields + the live floor from this snapshot.
+                        cached["chain_height"]   = snap.chain_count;
+                        cached["total_shares"]   = snap.chain_count;
+                        cached["verified_count"] = snap.verified_count;
+                        cached["fork_count"]     = snap.fork_count;
+                        cached["min_protocol_version"]  = live_floor;
+                        cached["live_share_version"]    = out["live_share_version"];
+                        return cached;
+                    }
                     out["chain_height"] = snap.chain_count;
                     out["total_shares"] = snap.chain_count;
                     return out;
@@ -678,11 +722,151 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     auto h = chain.get_height(head_hash);
                     if (h > best_height) { best = head_hash; best_height = h; }
                 }
+                const int chain_ht = best.IsNull() ? 0 : chain.get_height(best);
                 out["chain_tip_hash"] = best.IsNull() ? "" : best.GetHex();
-                out["chain_height"]   = best.IsNull() ? 0 : chain.get_height(best);
-                out["total_shares"]   = static_cast<int>(chain.size());
+                out["chain_height"]   = chain_ht;
+                out["stored_shares"]  = static_cast<int>(chain.size());  // all shares in the DB (incl. forks)
+
+                // ── Single backward walk: desired-version votes, share-format
+                //    counts, per-miner tally, and V36 propagation depth ──────────
+                std::map<int, int> desired_counts;   // m_desired_version → count
+                std::map<std::string, int> miner_counts;
+                int format_v16 = 0;
+                int deepest_v36_pos = 0;
+                int v36_contiguous_from_tip = 0;
+                bool contiguous = true;
+                const int skip_count   = std::min(chain_ht, chain_len * 9 / 10);
+                const int sample_count = std::min(chain_ht - skip_count, chain_len / 10);
+                uint256 sampling_start;
+                const int full_walk = std::min(chain_ht, chain_len);
+                if (!best.IsNull() && full_walk > 0) {
+                    int i = 0;
+                    for (auto&& [hash, data] : chain.get_chain(best, static_cast<uint64_t>(full_walk))) {
+                        if (i == skip_count) sampling_start = hash;
+                        data.share.invoke([&](auto* s) {
+                            int dv = static_cast<int>(s->m_desired_version);
+                            desired_counts[dv] += 1;
+                            format_v16 += 1;  // DashShare is wire-format v16
+                            miner_counts[s->m_pubkey_hash.GetHex()] += 1;
+                            if (dv >= 36) {
+                                deepest_v36_pos = i + 1;
+                                if (contiguous) v36_contiguous_from_tip = i + 1;
+                            } else if (contiguous) {
+                                contiguous = false;
+                            }
+                        });
+                        ++i;
+                    }
+                }
+                if (sampling_start.IsNull() && skip_count == 0) sampling_start = best;
+
+                // total_shares == the active-chain window actually tallied (matches
+                // main_ltc.cpp, where total_shares is the windowed skiplist count), so
+                // the gauge's version percentages divide by the same denominator.
+                out["total_shares"] = format_v16;
+
+                nlohmann::json sbv = nlohmann::json::object();
+                if (format_v16 > 0) sbv["16"] = format_v16;
+                out["shares_by_version"] = sbv;
+
+                nlohmann::json sbdv = nlohmann::json::object();
+                for (auto& [ver, cnt] : desired_counts) sbdv[std::to_string(ver)] = cnt;
+                out["shares_by_desired_version"] = sbdv;
+                out["shares_by_miner"]        = miner_counts;
+                out["deepest_v36_position"]   = deepest_v36_pos;
+                out["v36_contiguous_from_tip"] = v36_contiguous_from_tip;
+
+                // ── Work-weighted sampling window: oldest CHAIN_LENGTH/10 shares.
+                //    Same weighting the v36 activation gate consumes, so the
+                //    dashboard's "% of hashpower-by-work on v36" matches the ratchet.
+                nlohmann::json sampling = nlohmann::json::object();
+                if (sample_count > 0 && !sampling_start.IsNull()) {
+                    auto weights = dash::version_negotiation::get_desired_version_weights(
+                        chain, sampling_start, static_cast<uint64_t>(sample_count));
+                    for (auto& [ver, w] : weights)
+                        sampling[std::to_string(ver)] = w.getdouble();
+                }
+                out["sampling_desired_version"] = sampling;
+
+                // Publish as last-good so busy ticks can serve the full gauge fields.
+                {
+                    std::lock_guard<std::mutex> lock(s_cache_mutex);
+                    s_last_good = out;
+                }
                 return out;
             });
+
+            // ── Signed transitional-message feed (DISPLAY + VERIFY) ────────────
+            // Reuses the LTC crossing's exact signed-message component: read the
+            // best share's m_message_data blob, decrypt+verify the ECDSA signature
+            // against the pinned authority pubkeys (dash::unpack_share_messages →
+            // decrypt_message_data checks the 2 DONATION_AUTHORITY_PUBKEYS), and
+            // hand the SHARED core::rest_version_signaling() the same JSON shape
+            // main_ltc.cpp emits so the dashboard renders the signed v16→v36
+            // transition notice + pool announcements with a verified badge + signer.
+            //
+            // Phase A: DASH shares carry an EMPTY m_message_data (share.hpp:142), so
+            // this returns {decrypted:false, messages:[]} and the panel stays hidden
+            // until a signed blob is minted into shares (Phase B — see PR notes:
+            // the operator signs a MSG_TRANSITION_SIGNAL/0x20 payload with the
+            // authority privkey and the mint path embeds it in m_message_data).
+            // The DISPLAY+VERIFY path is fully wired now; only the emit side is Phase B.
+            mi->set_protocol_messages_fn([node_ptr]() -> nlohmann::json {
+                nlohmann::json result = {
+                    {"best_share_hash", ""},
+                    {"message_data_hex", ""},
+                    {"decrypted", false},
+                    {"authority_pubkey_hex", ""},
+                    {"messages", nlohmann::json::array()}
+                };
+
+                auto best = node_ptr->best_share_hash();
+                if (best.IsNull()) return result;
+                auto guard = node_ptr->read_tracker();
+                if (!guard) return result;
+                if (!guard->chain.contains(best)) return result;
+                result["best_share_hash"] = best.GetHex();
+
+                std::vector<unsigned char> blob;
+                guard->chain.get(best).share.invoke([&](auto* s) {
+                    if constexpr (requires { s->m_message_data; })
+                        blob = s->m_message_data.m_data;
+                });
+                if (blob.empty()) return result;
+
+                result["message_data_hex"] = HexStr(blob);
+                auto unpacked = dash::unpack_share_messages(blob.data(), blob.size());
+                result["decrypted"] = unpacked.decrypted;   // true ⇒ signature verified
+                if (!unpacked.decrypted || unpacked.authority_pubkey == nullptr)
+                    return result;
+
+                result["authority_pubkey_hex"] = HexStr(std::vector<unsigned char>(
+                    unpacked.authority_pubkey->begin(), unpacked.authority_pubkey->end()));
+                nlohmann::json msgs = nlohmann::json::array();
+                for (const auto& msg : unpacked.messages) {
+                    msgs.push_back({
+                        {"type", msg.msg_type},
+                        {"flags", msg.flags},
+                        {"timestamp", msg.timestamp},
+                        {"payload_hex", HexStr(msg.payload)},
+                        {"signature_hex", HexStr(msg.signature)},
+                        {"protocol_authority", (msg.wire_flags & dash::FLAG_PROTOCOL_AUTHORITY) != 0},
+                        {"is_transition_signal", msg.msg_type == dash::MSG_TRANSITION_SIGNAL}
+                    });
+                }
+                result["messages"] = msgs;
+                return result;
+            });
+
+            // Seed the cached "live share version" the /v36_status fallback reads
+            // when the chain is too short (<10 shares) for version_signaling to run.
+            // Core defaults this to 36 (LTC-family); DASH mines wire-format v16 until
+            // the accept-floor ratchets 1700→3600, so seed from the live floor to
+            // avoid a spurious "v36 active" on an empty/young DASH chain. Once the
+            // chain matures the stats fn's "live_share_version" drives it. Display-only.
+            mi->set_cached_share_version(
+                node_ptr->runtime_min_protocol_version()
+                    >= dash::SharechainConfig::NEW_MINIMUM_PROTOCOL_VERSION ? 36 : 16);
 
             // ── REAL pool hashrate (ported from main_ltc.cpp:2865) ────────
             // dash::ShareTracker::get_pool_attempts_per_second is the same

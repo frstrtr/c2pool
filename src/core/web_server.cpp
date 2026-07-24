@@ -4945,18 +4945,23 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
 {
     // V35→V36 transition tracking applies to every v36-ratcheting coin
     // (LTC/DOGE/BTC/DGB, plus BCH which reaches this path as its embedded base
-    // coin). Only static-version coins (Dash = v16) have no pending transition,
-    // so for those return an empty object to keep the crossing banner hidden.
-    // A prior hardcoded {LTC,DOGE} allowlist suppressed the crossing banner on
-    // BTC/DGB/BCH nodes mid-cross — a charter #3 blind spot. Coins whose
-    // sharechain stats carry no vote data simply fall through to an empty result
-    // below, so the banner stays hidden until there is real crossing state.
-    if (m_blockchain == Blockchain::DASH)
-        return nlohmann::json::object();
+    // coin). DASH runs its OWN v16→v36 crossing (auto_ratchet.hpp lifts the accept
+    // floor 1700→3600 on ≥95% work-weighted v36 desire): its sharechain-stats fn
+    // (main_dash.cpp) emits the same shares_by_desired_version / sampling weight /
+    // propagation fields, so DASH flows through the identical gauge computation
+    // below — the crossing banner stays hidden until there is real vote data
+    // (overall_total<10 or no shares_by_* → empty result). A prior hardcoded early
+    // return suppressed the DASH crossing banner outright — a charter #3 blind
+    // spot now that DASH ratchets. Coins whose stats carry no vote data simply
+    // fall through to an empty result, so the banner stays hidden.
 
     // Matches p2pool's get_version_signaling() — all fields the dashboard JS expects.
     constexpr int TARGET_VERSION = 36;
+    // ETA cadence for the propagation countdown (display only): DASH mints one
+    // share every 20s, the LTC-family every 10s.
+    const int share_period_sec = (m_blockchain == Blockchain::DASH) ? 20 : 10;
     const std::map<int, std::string> share_type_names = {
+        {16, "DashShare"},
         {17, "Share"}, {32, "PreSegwitShare"}, {33, "NewShare"},
         {34, "SegwitMiningShare"}, {35, "PaddingBugfixShare"}, {36, "MergedMiningShare"}
     };
@@ -5101,7 +5106,7 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
         // V36 votes exist but haven't reached the sampling window yet
         status = "propagating";
         int shares_to = std::max(0, chain_length - deepest_v36_pos);
-        int eta_sec = shares_to * 10;  // SHARE_PERIOD = 10s for LTC
+        int eta_sec = shares_to * share_period_sec;  // per-coin share cadence
         int eta_min = eta_sec / 60;
         int eta_h = eta_min / 60;
         int eta_m = eta_min % 60;
@@ -5167,8 +5172,7 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
     double propagation_pct = propagation_target > 0
         ? std::min(deepest_v36_pos * 100.0 / propagation_target, 100.0) : 0;
     int shares_to_window = std::max(0, propagation_target - deepest_v36_pos);
-    constexpr int SHARE_PERIOD = 10;  // LTC: 10 seconds per share
-    double time_to_window_seconds = shares_to_window * SHARE_PERIOD;
+    double time_to_window_seconds = shares_to_window * share_period_sec;  // per-coin cadence
     result["propagation_pct"] = std::round(propagation_pct * 100) / 100.0;
     result["propagation_target"] = propagation_target;
     result["deepest_v36_position"] = deepest_v36_pos;
@@ -5188,6 +5192,10 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
             auto pm = m_protocol_messages_fn();
             if (pm.value("decrypted", false) && pm.contains("messages") && pm["messages"].is_array()) {
                 auto now = static_cast<uint32_t>(std::time(nullptr));
+                // Signer identity: the authority pubkey whose signature verified the
+                // blob (unpack returns it only on a good ECDSA check). Surfaced so the
+                // dashboard can show "✓ Verified — signed by <pubkey>" on the notice.
+                std::string signer = pm.value("authority_pubkey_hex", "");
                 nlohmann::json announcements = nlohmann::json::array();
                 for (auto& msg : pm["messages"]) {
                     int msg_type = msg.value("type", 0);
@@ -5200,7 +5208,7 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
                     try { payload_json = nlohmann::json::parse(payload_text); } catch (...) {}
 
                     if (msg_type == 0x20 && is_authority && result["transition_message"].is_null()) {
-                        nlohmann::json tmsg = {{"timestamp", ts}, {"verified", true}, {"authority", true}};
+                        nlohmann::json tmsg = {{"timestamp", ts}, {"verified", true}, {"authority", true}, {"signer", signer}};
                         if (payload_json.is_object()) {
                             tmsg["msg"] = payload_json.value("msg", "");
                             tmsg["url"] = payload_json.value("url", "");
@@ -5214,7 +5222,7 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
                             {"type", (msg_type == 0x10) ? "EMERGENCY" : "POOL_ANNOUNCE"},
                             {"type_id", msg_type}, {"timestamp", ts},
                             {"age", (now > ts) ? int(now - ts) : 0},
-                            {"verified", true}, {"authority", is_authority}
+                            {"verified", true}, {"authority", is_authority}, {"signer", signer}
                         };
                         if (payload_json.is_object()) {
                             ann["text"] = payload_json.value("msg", payload_json.value("text", ""));
@@ -5304,11 +5312,13 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
             effective_state = "voting";
         }
         // The chain-derived state above can momentarily disagree with what the
-        // node is ACTUALLY mining: m_cached_share_version is the live ratchet
-        // output (the version stamped on this node's new shares). Surface it as
-        // ground truth so a transient sampling dip cannot make the dashboard
-        // claim "voting" while the node has already latched to V36 (charter #3).
-        int64_t live_share_version = m_cached_share_version;
+        // node is ACTUALLY mining: the live ratchet output (the version stamped on
+        // this node's new shares) is ground truth so a transient sampling dip
+        // cannot make the dashboard claim "voting" while the node has already
+        // latched to V36 (charter #3). LTC-family sources it from m_cached_share_version;
+        // DASH (whose shares stay wire-format v16 across the whole crossing) hands
+        // the ratchet-derived version through the stats fn as "live_share_version".
+        int64_t live_share_version = sc.value("live_share_version", static_cast<int64_t>(m_cached_share_version));
         result["auto_ratchet"] = {
             {"state", effective_state},
             {"persisted_state", effective_state},
@@ -5318,6 +5328,15 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
             {"activated_height", nullptr},
             {"confirmed_at", nullptr}
         };
+
+        // Protocol-floor gauge pass-through (display only). DASH's stats fn emits
+        // the live accept-floor + advert; surface them so the dashboard can show
+        // "min-protocol floor 1700 → 3600" and "advertised vs current share version"
+        // alongside the vote gauge. Harmless for coins that don't emit these keys.
+        for (const char* k : {"min_protocol_version", "cold_min_protocol_version",
+                              "new_min_protocol_version", "advertised_protocol_version"}) {
+            if (sc.contains(k)) result[k] = sc[k];
+        }
     }
 
     return result;

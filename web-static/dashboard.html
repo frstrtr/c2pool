@@ -3141,9 +3141,35 @@
                     }
                     
                     d3.select('#version-signaling').style('display', 'block');
-                    
+
                     // Update title
                     d3.select('.signaling-title').text('V' + vs.current_share_type + ' \u2192 V' + vs.target_version + ' Transition');
+
+                    // Protocol-floor gauge line: accept-floor (ratchet output), advert,
+                    // and the version this node stamps on new shares. Only rendered when
+                    // the node reports the floor (DASH v16\u2192v36 crossing surfaces these).
+                    (function() {
+                        var vsCard = d3.select('#version-signaling');
+                        vsCard.select('.protocol-floor-line').remove();
+                        if (vs.min_protocol_version == null) return;
+                        var floor = vs.min_protocol_version;
+                        var newFloor = vs.new_min_protocol_version;
+                        var adv = vs.advertised_protocol_version;
+                        var liveVer = (vs.auto_ratchet && vs.auto_ratchet.live_share_version) || vs.current_share_type;
+                        var ratcheted = (newFloor != null && floor >= newFloor);
+                        var line = vsCard.append('div')
+                            .attr('class', 'protocol-floor-line')
+                            .style('display', 'flex').style('flex-wrap', 'wrap')
+                            .style('gap', '14px').style('margin', '4px 0 10px 0')
+                            .style('font-size', '0.82em').style('color', '#9fb3c8');
+                        function chip(label, val, hot) {
+                            line.append('span').html(
+                                label + ': <b style="color:' + (hot ? '#22c55e' : '#e2e8f0') + '">' + val + '</b>');
+                        }
+                        chip('Accept-floor', floor + (ratcheted ? ' (ratcheted \u2713)' : ' \u2192 ' + (newFloor||'?')), ratcheted);
+                        chip('Advertised', adv != null ? adv : '\u2014', false);
+                        chip('This node mines', 'V' + liveVer, liveVer >= (vs.target_version||36));
+                    })();
                     
                     // Transition status message
                     var statusMsg = '';
@@ -3340,6 +3366,33 @@
                             d3.select('#transition-msg-url').attr('href', tmsg.url).text(tmsg.url + ' →');
                         } else {
                             d3.select('#transition-msg-url-row').style('display', 'none');
+                        }
+                        // Signature-verified badge + signer + timestamp. The backend sets
+                        // verified=true only after the ECDSA signature checks against a
+                        // pinned authority pubkey, so this is a real cryptographic trust
+                        // indicator — a miner can see the notice is from the legit operator.
+                        var tsec = d3.select('#transition-message-section');
+                        tsec.select('.tx-verified-line').remove();
+                        var vline = tsec.append('div')
+                            .attr('class', 'tx-verified-line')
+                            .style('margin-top', '8px').style('font-size', '0.8em')
+                            .style('display', 'flex').style('flex-wrap', 'wrap').style('gap', '10px');
+                        if (tmsg.verified) {
+                            vline.append('span').style('color', '#22c55e').style('font-weight', '600')
+                                .text('✓ Signature verified (authority-signed)');
+                            if (tmsg.signer) {
+                                var sg = String(tmsg.signer);
+                                vline.append('span').style('color', '#8fa3b8')
+                                    .html('signer: <code style="color:#cbd5e1">' +
+                                          (sg.length > 20 ? sg.slice(0, 10) + '…' + sg.slice(-8) : sg) + '</code>');
+                            }
+                        } else {
+                            vline.append('span').style('color', '#f59e0b').style('font-weight', '600')
+                                .text('⚠ Unverified signature');
+                        }
+                        if (tmsg.timestamp) {
+                            vline.append('span').style('color', '#8fa3b8')
+                                .text('signed: ' + new Date(tmsg.timestamp * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' UTC');
                         }
                     } else {
                         d3.select('#transition-message-section').style('display', 'none');
