@@ -356,6 +356,23 @@ void NodeImpl::load_persisted_shares()
         m_storage->remove_shares_batch(prune);
         LOG_INFO << "[Pool] Pruned " << prune.size() << " old shares from LevelDB";
     }
+
+    // Seed the best-share election + snapshot BEFORE the compute thread starts
+    // (still single-threaded here — called once from the run loop pre-serving).
+    // Without this, m_best_share_hash and TrackerSnapshot.best_share are null
+    // until the FIRST think() finishes, and the first think()'s bootstrap
+    // mass-verify holds the exclusive lock for seconds; over that window
+    // best_share_hash()'s busy-fallback serves null → miners reconnecting at
+    // restart get dead time (fail-closed — no bad payout — but avoidable). One
+    // synchronous election over the just-loaded verified chain gives the tip
+    // immediately. has_peers=false: no peers exist yet at load time, so the
+    // election bootstraps off the verified/raw chain rather than refusing.
+    m_best_share_hash =
+        dash::mint::elect_best_share(m_tracker, m_best_share_hash, /*has_peers=*/false);
+    publish_snapshot();
+    if (!m_best_share_hash.IsNull())
+        LOG_INFO << "[Pool] Seeded best share from persisted chain: "
+                 << m_best_share_hash.GetHex().substr(0, 16);
 }
 
 void NodeImpl::flush_verified_to_leveldb()
@@ -376,6 +393,14 @@ void NodeImpl::flush_verified_to_leveldb()
 
 void NodeImpl::shutdown_persistence()
 {
+    // Teardown runs on the MAIN thread after ioc.run() returns, but a think()
+    // cycle may still be in flight on the compute thread, mutating
+    // m_verified_flush_buf / the chain under the exclusive lock (TSAN-captured
+    // during the join-burst repro: flush_verified_to_leveldb() here racing
+    // attempt_verify's m_on_share_verified push_back). Blocking here is fine —
+    // the IO loop is already stopped, so the IO-never-blocks rule does not
+    // apply; we just wait out the tail end of the last think() cycle.
+    std::unique_lock lock(m_tracker_mutex);
     flush_verified_to_leveldb();
     if (!m_removal_flush_buf.empty() && m_storage && m_storage->is_available()) {
         m_storage->remove_shares_batch(m_removal_flush_buf);
@@ -721,11 +746,32 @@ void NodeImpl::download_shares(peer_ptr peer, const uint256& target_hash)
             // Backfill continuation: oldest received share's parent still
             // unknown → keep pulling (ltc:1093-1102). This drives the full
             // history download without waiting one think() cycle per chunk.
+            //
+            // contains() reads the chain map — reader discipline: shared
+            // lock (try_to_lock, IO thread never blocks). During the join
+            // burst think() holds the exclusive lock most of the time, and
+            // this callback fires on EVERY sharereply — the hottest of the
+            // formerly-unlocked walks. Busy ⇒ queue the continuation on the
+            // advert queue; the 2s advert timer / think()-IO-phase drain
+            // re-checks under its own lock and resumes the backfill.
             const uint256 next = pool::download::oldest_parent(reply.m_items);
-            if (!next.IsNull() && !m_chain->contains(next))
+            if (!next.IsNull())
             {
-                if (auto locked = weak_peer.lock())
-                    download_shares(locked, next);
+                bool known = false;
+                {
+                    std::shared_lock<std::shared_mutex> lk(m_tracker_mutex,
+                                                           std::try_to_lock);
+                    if (!lk.owns_lock()) {
+                        m_peer_best_adverts.emplace_back(weak_peer, next);
+                        return;
+                    }
+                    known = m_chain->contains(next);
+                }
+                if (!known)
+                {
+                    if (auto locked = weak_peer.lock())
+                        download_shares(locked, next);
+                }
             }
         });
 }
@@ -734,22 +780,46 @@ void NodeImpl::drain_peer_best_adverts()
 {
     if (m_peer_best_adverts.empty())
         return;
-    auto adverts = std::move(m_peer_best_adverts);
-    m_peer_best_adverts.clear();
-    for (auto& [weak_peer, best] : adverts)
+    // contains() below reads the chain map — reader discipline: shared lock
+    // (try_to_lock, IO thread never blocks). Busy ⇒ leave the queue intact;
+    // the next 2s advert tick / think()-IO-phase drain retries. The lock is
+    // scoped to the contains() partition only — download_shares()/run_think()
+    // take their own locks.
+    std::vector<std::pair<std::weak_ptr<peer_t>, uint256>> to_download;
+    bool rethink = false;
     {
-        auto peer = weak_peer.lock();
-        if (!peer)
-            continue;
-        if (m_chain->contains(best))
+        std::shared_lock<std::shared_mutex> lk(m_tracker_mutex, std::try_to_lock);
+        if (!lk.owns_lock())
+            return;
+        auto adverts = std::move(m_peer_best_adverts);
+        m_peer_best_adverts.clear();
+        for (auto& [weak_peer, best] : adverts)
         {
-            // Known share: re-run think() to re-evaluate the best chain with
-            // the peer's perspective (ltc node.cpp:328-334 — critical after
-            // restart, when LevelDB-loaded shares carry a stale election).
-            run_think();
-            continue;
+            if (weak_peer.expired())
+                continue;
+            if (m_chain->contains(best))
+            {
+                // Known share: re-run think() to re-evaluate the best chain
+                // with the peer's perspective (ltc node.cpp:328-334 —
+                // critical after restart, when LevelDB-loaded shares carry a
+                // stale election).
+                rethink = true;
+                continue;
+            }
+            to_download.emplace_back(weak_peer, best);
         }
-        download_shares(peer, best);
+    }
+    // TODO(dash-async, follow-up): when drain_peer_best_adverts runs FROM the
+    // think() IO-phase, m_think_running is still true, so this run_think() is a
+    // no-op (skipped). A m_rethink_pending flag checked at the end of the think
+    // cycle would guarantee the re-election happens. Benign today: the 2s
+    // advert timer calls drain again shortly, and by then think() has finished.
+    if (rethink)
+        run_think();
+    for (auto& [weak_peer, best] : to_download)
+    {
+        if (auto peer = weak_peer.lock())
+            download_shares(peer, best);
     }
 }
 
@@ -763,7 +833,15 @@ void NodeImpl::start_outbound_connections()
     // node.cpp-side consumer that turns the queue into sharereq dispatches.
     // 2s bounds the join latency; the check is O(1) when the queue is empty.
     m_advert_timer = std::make_unique<core::Timer>(m_context, true);
-    m_advert_timer->start(2, [this]() { drain_peer_best_adverts(); });
+    m_advert_timer->start(2, [this]() {
+        drain_peer_best_adverts();
+        // IO thread: keep the display peer-info snapshot's uptimes fresh
+        // (peer add/remove refresh it on membership change; this ticks it so
+        // the dashboard card's uptime advances between events). Cheap — a few
+        // peers — and it is the reader-safe alternative to the HTTP thread
+        // ever touching m_peers directly.
+        publish_peer_info_snapshot();
+    });
 
     if (m_target_outbound_peers == 0)
     {
@@ -818,6 +896,12 @@ void NodeImpl::clean_tracker()
         return;
 
     // Skip if think() is already in flight — the periodic timer will retry.
+    // TODO(dash-async, follow-up): this load()-then-store() is check-then-act;
+    // a run_think() could win the m_think_running flag between the load and the
+    // store below. Benign today because both only ever run on the IO thread
+    // (the timer callbacks are serialized on the single io_context), so there
+    // is no true concurrency — but a compare_exchange on m_think_running would
+    // make the guard symmetric with the exchange() above and future-proof.
     if (m_think_running.load()) {
         m_clean_running.store(false);
         return;
@@ -1016,7 +1100,26 @@ void NodeImpl::clean_tracker()
 
 uint256 NodeImpl::best_share_hash()
 {
-    return dash::mint::elect_best_share(m_tracker, m_best_share_hash, !m_peers.empty());
+    // The election walks verified.get_heads()/get_work() — chain-container
+    // reads the compute thread's think() mutates (verified.add during the
+    // bootstrap verify, chain.remove of bads) under the exclusive lock.
+    // Callers here are the IO thread (work refresh, mint) AND the WebServer
+    // HTTP thread (set_best_share_hash_fn / pool-hashrate fn), so an unlocked
+    // walk races the rehash → the join-burst GP fault. Reader discipline
+    // (m_tracker_mutex contract, node.hpp): shared_lock(try_to_lock), never
+    // block; busy ⇒ the last published election (lock-free snapshot) — the
+    // stable tip current jobs are already built on.
+    // has_peers via the atomic mirror — m_peers itself is IO-thread-owned
+    // and NOT covered by m_tracker_mutex, so touching the map here (HTTP /
+    // compute thread) would race handle_version's insert (TSAN-captured).
+    const bool has_peers = m_peer_count.load(std::memory_order_relaxed) > 0;
+    if (is_compute_thread())    // exclusive lock already held
+        return dash::mint::elect_best_share(m_tracker, m_best_share_hash,
+                                            has_peers);
+    std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::try_to_lock);
+    if (!lock.owns_lock())
+        return snapshot_best_share();
+    return dash::mint::elect_best_share(m_tracker, m_best_share_hash, has_peers);
 }
 
 void NodeImpl::broadcast_share(const uint256& share_hash)

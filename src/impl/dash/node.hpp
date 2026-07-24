@@ -159,6 +159,11 @@ protected:
         int dead_shares{0};
         int fork_count{0};
         double pool_hashrate{0};
+        // Last published best-share election (m_best_share_hash at publish
+        // time). The lock-free fallback for best_share_hash() /
+        // advertised_best_share() when the compute thread holds the
+        // exclusive lock — see snapshot_best_share().
+        uint256 best_share;
     };
     void publish_snapshot() {
         TrackerSnapshot s;
@@ -166,11 +171,25 @@ protected:
         s.verified_count = static_cast<int>(m_tracker.verified.size());
         s.head_count = static_cast<int>(m_tracker.chain.get_heads().size());
         s.fork_count = s.head_count;
+        s.best_share = m_best_share_hash;
         std::lock_guard<std::mutex> lock(m_snapshot_mutex);
         m_snapshot = s;
     }
     mutable std::mutex m_snapshot_mutex;
     TrackerSnapshot m_snapshot;
+
+    // ── Lock-free peer-info snapshot (display-only) ──────────────────────
+    // m_peers / m_outbound_addrs are IO-thread-owned and have NO lock; the
+    // dashboard node-status card polls the peer panel from the WebServer HTTP
+    // thread. Iterating those std::maps on the HTTP thread while handle_version
+    // inserts / error()/close_connection erase on the IO thread rebalances the
+    // tree under the reader's iterator → the SAME freed-memory GP-fault this
+    // file's tracker fix closes (TSAN-captured). So the JSON is BUILT on the IO
+    // thread (publish_peer_info_snapshot, at every peer add/remove + the 2s
+    // advert-timer tick for uptime freshness) and the HTTP fn reads this copy
+    // lock-free — mirrors TrackerSnapshot. Guarded by m_snapshot_mutex (a
+    // std::mutex briefly held for the swap, never contended with the tracker).
+    nlohmann::json m_peer_info_snapshot = nlohmann::json::array();
 
     // Identity of the compute thread (m_think_pool's single thread). Used by
     // TrackerReadGuard to skip shared_lock when the caller is already on the
@@ -249,7 +268,20 @@ protected:
     // start_outbound_connections() (both node.cpp) drain the queue into
     // download_shares — the oracle p2p.py handle_version →
     // node.handle_share_hashes join trigger, one hop later.
+    // TODO(dash-async, follow-up): bound this queue with a drop-oldest cap
+    // (mirror MAX_PENDING_ADDS). Today the busy-download path in
+    // download_shares re-enqueues continuations here when the tracker lock is
+    // held, so a sustained think()-busy window could grow it; a cap keeps it
+    // bounded like m_pending_adds. Not a crash risk (drained every 2s).
     std::vector<std::pair<std::weak_ptr<peer_t>, uint256>> m_peer_best_adverts;
+
+    // ── Peer-count mirror ───────────────────────────────────────────────
+    // m_peers (pool/node.hpp base) is IO-thread-owned and has no lock; the
+    // best-share election needs only "any peers?" and is reachable from the
+    // WebServer HTTP thread + the compute thread (via best_share_hash), so
+    // it reads this atomic mirror instead of touching the map. Updated at
+    // the two mutation sites (handle_version insert, error() erase).
+    std::atomic<size_t> m_peer_count{0};
 
     // ── Outbound dialing (btc/ltc start_outbound_connections port) ──────
     static constexpr size_t DEFAULT_TARGET_OUTBOUND_PEERS = 8;
@@ -456,8 +488,10 @@ public:
             else
                 ++it;
         }
+        m_peer_count.store(m_peers.size(), std::memory_order_relaxed);
         m_pending_outbound.erase(service);
         m_outbound_addrs.erase(service);
+        publish_peer_info_snapshot();   // IO thread: refresh the display snapshot
         base_t::error(err, service, where);
     }
 
@@ -466,7 +500,10 @@ public:
         cancel_peer_share_requests(service);
         m_pending_outbound.erase(service);
         m_outbound_addrs.erase(service);
+        // base close may drop the peer from m_peers; refresh AFTER so the
+        // snapshot reflects the post-close map (IO thread).
         base_t::close_connection(service);
+        publish_peer_info_snapshot();
     }
 
     void cancel_peer_share_requests(const NetService& service)
@@ -504,6 +541,17 @@ public:
     /// from send_version() above.
     uint256 advertised_best_share()
     {
+        // Reader discipline (m_tracker_mutex contract above; ltc node.cpp
+        // readvertise_best_share parity): the heads/height walk below reads
+        // the chain containers, which the compute thread's think() mutates
+        // (verified.add / chain.remove → rehash) under the exclusive lock.
+        // Walking them unlocked is the join-burst GP-fault class. try_to_lock:
+        // the IO thread never blocks — busy ⇒ advertise the last published
+        // election (lock-free snapshot; null pre-sync, which a peer treats as
+        // "no advert" and later learns our head via broadcast/re-advert).
+        std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::try_to_lock);
+        if (!lock.owns_lock())
+            return snapshot_best_share();
         if (!m_best_share_hash.IsNull())
             return m_best_share_hash;
         uint256 best;
@@ -566,6 +614,8 @@ public:
 
         peer->m_nonce = msg->m_nonce;
         m_peers[peer->m_nonce] = peer;
+        m_peer_count.store(m_peers.size(), std::memory_order_relaxed);
+        publish_peer_info_snapshot();   // IO thread: refresh the display snapshot
 
         // #754 join trigger (oracle p2p.py handle_version → node.py
         // handle_share_hashes): a peer advertising a best share we don't have
@@ -576,11 +626,20 @@ public:
         // 2s advert timer (start_outbound_connections) drain the queue.
         if (!msg->m_best_share.IsNull())
         {
+            // contains() reads the chain map — take the shared lock
+            // (try_to_lock, IO thread never blocks; the check is log-only,
+            // the advert is queued either way and the drain re-checks under
+            // its own lock).
+            bool known = false;
+            {
+                std::shared_lock<std::shared_mutex> lk(m_tracker_mutex,
+                                                       std::try_to_lock);
+                known = lk.owns_lock() && m_chain->contains(msg->m_best_share);
+            }
             LOG_INFO << "[Pool] Peer " << peer->addr().to_string()
                      << " advertises best share "
                      << msg->m_best_share.ToString().substr(0, 16)
-                     << (m_chain->contains(msg->m_best_share)
-                             ? " (known)" : " (unknown — queued for download)");
+                     << (known ? " (known)" : " (unknown — queued for download)");
             m_peer_best_adverts.emplace_back(peer, msg->m_best_share);
         }
 
@@ -661,11 +720,11 @@ public:
     /// above, next to send_version.)
     uint256 best_share_hash();
 
-    /// Pool-peer info for the dashboard node-status card (ltc node.hpp:302
-    /// parity). Display only — MiningInterface::set_peer_info_fn feeds
-    /// /local_stats {peers:{incoming,outgoing}} and the peer table. Read-only
-    /// over the live m_peers map; touches no share/target/payout state.
-    nlohmann::json get_peer_info_json() const {
+    /// Rebuild the lock-free peer-info snapshot. IO-THREAD ONLY (reads the
+    /// IO-owned m_peers / m_outbound_addrs). Called at every peer add/remove
+    /// and on the 2s advert-timer tick. Publishes under m_snapshot_mutex so
+    /// the HTTP reader (get_peer_info_json) never touches the live maps.
+    void publish_peer_info_snapshot() {
         nlohmann::json arr = nlohmann::json::array();
         for (const auto& [nonce, peer] : m_peers) {
             if (!peer) continue;
@@ -682,7 +741,19 @@ public:
                 {"web_port", 0}
             });
         }
-        return arr;
+        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+        m_peer_info_snapshot = std::move(arr);
+    }
+
+    /// Pool-peer info for the dashboard node-status card (ltc node.hpp:302
+    /// parity). Display only — MiningInterface::set_peer_info_fn feeds
+    /// /local_stats {peers:{incoming,outgoing}} and the peer table. Reachable
+    /// from the WebServer HTTP thread, so it returns the IO-thread-published
+    /// snapshot lock-free — it must NEVER iterate the live m_peers map (that
+    /// races the IO thread's insert/erase → freed-memory GP-fault).
+    nlohmann::json get_peer_info_json() const {
+        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+        return m_peer_info_snapshot;
     }
 
     /// Relay a share (and up to 4 un-broadcast ancestors) to all peers via
@@ -837,6 +908,14 @@ public:
     int get_verified_count() const {
         std::lock_guard<std::mutex> lock(m_snapshot_mutex);
         return m_snapshot.verified_count;
+    }
+    /// Last published best-share election (compute thread publishes under the
+    /// exclusive tracker lock). The busy-fallback for best_share_hash() /
+    /// advertised_best_share() — a torn/unlocked m_best_share_hash read is
+    /// never taken.
+    uint256 snapshot_best_share() const {
+        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+        return m_snapshot.best_share;
     }
 };
 
