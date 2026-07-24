@@ -90,6 +90,7 @@
 #include <core/stratum_server.hpp>             // core::StratumServer — miner-facing accept-loop (run-path caller)
 #include <impl/dash/stratum/work_source.hpp>   // dash::stratum::DASHWorkSource — concrete core::stratum::IWorkSource
 #include <impl/dash/mint_runloop.hpp>          // dash::mint — run-loop share minting (slice 3/3)
+#include <impl/dash/share_messages.hpp>        // dash::validate_message_data — operator message-blob validation (EMIT side, mirrors main_ltc.cpp)
 #include <core/web_server.hpp>                 // core::WebServer — the EXISTING c2pool dashboard (same wiring main_ltc.cpp uses)
 #include <impl/dash/enhanced_node.hpp>         // dash::EnhancedDashNode — core::IMiningNode the WebServer ctor takes
 #include <impl/dash/share_messages.hpp>        // dash::unpack_share_messages — signed transitional-blob DISPLAY+VERIFY feed
@@ -210,6 +211,7 @@ void print_banner(const char* argv0)
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
         << "           [--redistribute pplns|fee|boost|donate]\n"
         << "           [--coin-zmq-hashblock tcp://HOST:PORT]\n"
+        << "           [--message-blob-hex HEX]\n"
         << "       " << argv0 << " --mine-block [--coin-rpc H:P] [--coin-rpc-auth PATH]\n"
         << "           [--testnet] [--payout-pubkey-hash HEX] [--max-nonce N]\n\n"
         << "Status: consensus layer live (X11 PoW, subsidy, oracle CoinParams).\n"
@@ -244,6 +246,12 @@ void print_banner(const char* argv0)
         << "        overrides the miner-facing host shown in the dashboard Stratum\n"
         << "        URL -- for NAT / port-mapped nodes whose outbound IP is not the\n"
         << "        address miners dial; unset => auto-detect (no regression).\n"
+        << "        --message-blob-hex HEX (alias --transition-message) supplies an\n"
+        << "        encrypted authority-signed message_data blob (from\n"
+        << "        util/create_transition_message.py). Validated against the DASH\n"
+        << "        authority keys; drives the dashboard transition-notice panel now,\n"
+        << "        and is embedded in locally minted shares once v36 shares activate\n"
+        << "        (the live v16 wire has no message_data field). No consensus effect.\n"
         << "Consensus: X11 PoW + block identity; 2.5 min spacing; 5 DASH post-V20\n"
         << "        base, -1/14 per 210240; masternode payment 3/4 of block value.\n";
 }
@@ -413,7 +421,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              const std::string& coin_zmq_hashblock,
              const std::string& external_ip,
              const std::string& coin_p2p_magic_hex,
-             bool force_won_block)
+             bool force_won_block,
+             const std::string& operator_message_blob_hex)
 {
     namespace io = boost::asio;
 
@@ -923,6 +932,55 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // ── REAL node-owner fee (already parsed from argv above) ──────────
         if (node_owner_fee > 0.0 && !node_owner_address.empty())
             mi->set_node_fee_from_address(node_owner_fee, node_owner_address);
+
+        // ── V36 transition-message EMIT side (mirror of main_ltc.cpp:3196) ─
+        // (a) Optional operator-provided encrypted authority message blob.
+        //     Validated against the DASH COMBINED_DONATION_SCRIPT authority
+        //     keys and cached on the MiningInterface. It is embedded into
+        //     locally created shares as message_data ONLY once the DASH
+        //     sharechain mints v36 shares (DashV36Share, wire-type 36) — the
+        //     live v16 DashShare wire format has no message_data field, so at
+        //     v16 this blob feeds ONLY the dashboard display/verify path
+        //     (rest_version_signaling fallback). See the mint-path note below.
+        if (!operator_message_blob_hex.empty()) {
+            if (operator_message_blob_hex.size() % 2 != 0) {
+                LOG_ERROR << "--message-blob-hex must have even length";
+                return 1;
+            }
+            std::vector<unsigned char> blob;
+            try {
+                blob = ParseHex(operator_message_blob_hex);
+            } catch (const std::exception& e) {
+                LOG_ERROR << "Invalid --message-blob-hex: " << e.what();
+                return 1;
+            }
+            auto err = dash::validate_message_data(blob);
+            if (!err.empty()) {
+                LOG_ERROR << "Rejected --message-blob-hex: " << err;
+                return 1;
+            }
+            mi->set_operator_message_blob(blob);
+            LOG_INFO << "Operator message blob configured (" << blob.size() << " bytes)";
+        }
+
+        // (b) Load transition message blobs from shipped + data directories.
+        //     Three dirs, mirroring main_ltc.cpp:3219. Each call is a no-op if
+        //     the directory is absent (load_transition_blobs guards is_directory).
+        {
+            std::error_code exe_ec;
+            auto exe_path = std::filesystem::read_symlink("/proc/self/exe", exe_ec);
+            if (!exe_ec) {
+                auto exe_dir = exe_path.parent_path();
+                // 1. Next to executable: <deploy>/transition_messages/
+                mi->load_transition_blobs((exe_dir / "transition_messages").string());
+                // 2. Shipped with source: <repo>/transition_messages/ (build dir layout)
+                mi->load_transition_blobs(
+                    (exe_dir / ".." / ".." / ".." / "transition_messages").string());
+            }
+            // 3. User data dir: ~/.c2pool/transition_messages/
+            auto data_dir = core::filesystem::config_path();
+            mi->load_transition_blobs((data_dir / "transition_messages").string());
+        }
 
         // Auto-detect the public IP for the "connect to this pool" panel.
         // Non-blocking, detached; identical to the LTC path.
@@ -2907,6 +2965,9 @@ int main(int argc, char** argv)
     // Operator-supplied miner-facing host for the dashboard Stratum URL.
     // Empty => auto-detect the outbound public IP (current behaviour).
     std::string external_ip;                   // --external-ip / --stratum-advertise / --public-host
+    // Optional encrypted authority message_data blob for local v36 shares +
+    // dashboard transition-notice display (EMIT side, mirror of main_ltc.cpp).
+    std::string operator_message_blob_hex;     // --message-blob-hex / --transition-message
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
             std::cout << "c2pool-dash " << C2POOL_VERSION << "\n";
@@ -2970,6 +3031,9 @@ int main(int argc, char** argv)
             redistribute_mode = argv[++i];
         else if (std::strcmp(argv[i], "--coin-zmq-hashblock") == 0 && i + 1 < argc)
             coin_zmq_hashblock = argv[++i];   // opt-in dashd ZMQ hashblock endpoint
+        else if ((std::strcmp(argv[i], "--message-blob-hex") == 0 ||
+                  std::strcmp(argv[i], "--transition-message") == 0) && i + 1 < argc)
+            operator_message_blob_hex = argv[++i];  // encrypted authority message_data blob (EMIT side)
         else if ((std::strcmp(argv[i], "--web-port") == 0 ||
                   std::strcmp(argv[i], "--http-port") == 0) && i + 1 < argc) {
             const long p = std::strtol(argv[++i], nullptr, 10);
@@ -3072,7 +3136,8 @@ int main(int argc, char** argv)
                         embedded_mainnet,
                         coin_zmq_hashblock,
                         external_ip,
-                        coin_p2p_magic, force_won_block);
+                        coin_p2p_magic, force_won_block,
+                        operator_message_blob_hex);
     }
     return run_selftest();
 }
