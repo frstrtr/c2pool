@@ -32,6 +32,20 @@
 // dispatcher logs LOUDLY (LOG_ERROR) and reports any()==false so the caller
 // treats it as "block NOT relayed", never a silent lost subsidy.
 //
+// ── RPC-FIRST GATE for stale / height-race blocks (prefer_rpc_first) ─────────
+// A height-race/stale block (the job's parent moved since issue) MIGHT be
+// invalid at its real height. Relaying an unvalidated block to a coin-P2P peer
+// risks DoS-scoring/ban of OUR coin-P2P identity, whereas the local dashd
+// rejects an invalid block for free. So when the caller flags such a block AND
+// a local dashd RPC arm (ARM B) is armed, the dispatcher runs ARM B FIRST and
+// gates the ARM A P2P relay on dashd ACCEPTANCE: a valid race block is relayed
+// (we still race), an invalid one is never pushed to peers. This is a pure
+// ORDERING/gating change on the SAME two arms -- no consensus, PoW, or coinbase
+// bytes are touched. DAEMONLESS (no RPC arm) is unaffected: ARM A stays primary
+// and relays anyway, because it is then the ONLY path to the network and
+// dropping a winnable block is a guaranteed loss. A normal (non-race) block is
+// also unaffected: relay-first as before.
+//
 // Reward/consensus-NEUTRAL: broadcast path only. No PoW hash, share format,
 // coinbase commitment, or PPLNS math is touched. Per-coin isolation:
 // src/impl/dash/ only.
@@ -89,9 +103,72 @@ struct BlockBroadcast
 inline BlockBroadcast broadcast_won_block(const P2pRelaySink& p2p_relay,
                                           const RpcSubmitSink& rpc_submit,
                                           const std::vector<unsigned char>& block_bytes,
-                                          const std::string& block_hex)
+                                          const std::string& block_hex,
+                                          bool prefer_rpc_first = false)
 {
     BlockBroadcast r;
+
+    // RPC-FIRST validation gate for a stale / height-race won block. The block
+    // MIGHT be invalid at its real height, so when the caller asks for it AND a
+    // local dashd RPC arm is armed, validate via ARM B FIRST and relay on ARM A
+    // ONLY if dashd accepted. This keeps an invalid race block off the coin-P2P
+    // network (no peer-ban exposure) while a valid one still races. Daemonless
+    // (no rpc_submit) falls through to the relay-first path below unchanged --
+    // the relay is then the only route to the network.
+    if (prefer_rpc_first && rpc_submit) {
+        // ARM B first: the local dashd validates the block.
+        try {
+            r.rpc_ok = rpc_submit(block_hex);
+            if (r.rpc_ok) r.landed_first = "rpc";
+            LOG_INFO << "[EMB-DASH] height-race won-block: RPC-first submitblock "
+                     << (r.rpc_ok ? "ACCEPTED" : "REJECTED")
+                     << " -- local dashd is the authority at the block's real height.";
+        } catch (const std::exception& e) {
+            LOG_ERROR << "[EMB-DASH] height-race won-block: RPC-first submitblock threw ("
+                      << e.what() << ") -- treating as no-ack; NOT relaying to peers.";
+        } catch (...) {
+            LOG_ERROR << "[EMB-DASH] height-race won-block: RPC-first submitblock threw "
+                         "(non-std) -- treating as no-ack; NOT relaying to peers.";
+        }
+
+        // ARM A only when dashd ACCEPTED: never relay an unvalidated/rejected
+        // race block to a coin-P2P peer (avoids DoS-scoring/ban of our identity).
+        if (r.rpc_ok && p2p_relay) {
+            try {
+                const bool relayed = p2p_relay(block_bytes);
+                if (relayed) {
+                    r.p2p_sent = true;
+                    LOG_INFO << "[EMB-DASH] height-race won-block: dashd-accepted, "
+                                "embedded P2P relay issued (" << block_bytes.size()
+                             << " bytes) -- racing the network.";
+                } else {
+                    LOG_WARNING << "[EMB-DASH] height-race won-block: dashd-accepted but "
+                                   "embedded P2P relay NOT sent (peer not "
+                                   "connected/handshaked) -- dashd already carries it.";
+                }
+            } catch (const std::exception& e) {
+                LOG_ERROR << "[EMB-DASH] height-race won-block: P2P relay threw ("
+                          << e.what() << ") -- dashd already carries the block.";
+            } catch (...) {
+                LOG_ERROR << "[EMB-DASH] height-race won-block: P2P relay threw (non-std) "
+                             "-- dashd already carries the block.";
+            }
+        } else if (!r.rpc_ok) {
+            LOG_WARNING << "[EMB-DASH] height-race won-block: local dashd REJECTED it -- "
+                           "NOT relaying to coin-P2P peers (it was invalid at its real "
+                           "height; rejected for free, no peer-ban exposure).";
+        }
+
+        if (!r.any())
+            LOG_ERROR << "[EMB-DASH] height-race won-block reached NEITHER sink -- "
+                         "block NOT relayed!";
+        else
+            LOG_INFO << "[EMB-DASH] height-race won-block broadcast: rpc="
+                     << (r.rpc_ok ? "ok" : "off") << " p2p="
+                     << (r.p2p_sent ? "sent" : "off")
+                     << " landed_first=" << r.landed_first << ".";
+        return r;
+    }
 
     // ARM A -- embedded P2P relay (ALWAYS-PRIMARY, daemonless). Guarded so a
     // throwing relay sink can NEVER propagate out and skip the RPC backup below

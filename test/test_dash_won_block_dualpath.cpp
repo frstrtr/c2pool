@@ -237,6 +237,93 @@ TEST(DashWonBlockDualPath, DisconnectedP2pWithNoBackupReachesNeither)
     EXPECT_STREQ(r.landed_first, "none");
 }
 
+// ── RPC-FIRST GATE for stale / height-race blocks (prefer_rpc_first) ─────────
+
+// 8) HEIGHT-RACE ORDERING: with a dashd RPC arm armed, a race block is validated
+//    RPC-FIRST and the coin-P2P relay fires ONLY AFTER dashd accepts. Pins the
+//    ordering (RPC call precedes the relay) and that a valid race block still
+//    reaches BOTH arms so we race the network.
+TEST(DashWonBlockDualPath, HeightRaceIsRpcFirstThenRelaysOnAccept)
+{
+    const auto block = make_block_bytes();
+    const std::string block_hex = to_hex(block);
+
+    int seq = 0;
+    int rpc_order = 0, relay_order = 0;
+    std::string submitted_hex;
+
+    RpcSubmitSink rpc = [&](const std::string& hex) -> bool {
+        rpc_order = ++seq; submitted_hex = hex; return true;   // dashd ACCEPTS
+    };
+    std::vector<unsigned char> relayed;
+    P2pRelaySink p2p = [&](const std::vector<unsigned char>& b) -> bool {
+        relay_order = ++seq; relayed = b; return true;
+    };
+
+    const auto r = broadcast_won_block(p2p, rpc, block, block_hex,
+                                       /*prefer_rpc_first=*/true);
+
+    // ORDER: dashd validated FIRST, then the relay fired.
+    ASSERT_EQ(rpc_order, 1);
+    ASSERT_EQ(relay_order, 2);
+    // Valid race block -> both arms carry it; landed_first is the RPC validation.
+    EXPECT_TRUE(r.rpc_ok);
+    EXPECT_TRUE(r.p2p_sent);
+    EXPECT_EQ(relayed, block);
+    EXPECT_EQ(submitted_hex, block_hex);
+    EXPECT_STREQ(r.landed_first, "rpc");
+    EXPECT_TRUE(r.any());
+}
+
+// 9) HEIGHT-RACE INVALID: dashd REJECTS the race block -> the coin-P2P relay is
+//    NEVER invoked (no unvalidated block pushed to peers -> no ban exposure).
+//    The block is rejected locally for free; any()==false (LOUD not-relayed path).
+TEST(DashWonBlockDualPath, HeightRaceRejectedByDashdIsNotRelayedToPeers)
+{
+    const auto block = make_block_bytes();
+    const std::string block_hex = to_hex(block);
+
+    RpcSubmitSink rpc = [&](const std::string&) -> bool {
+        return false;   // dashd REJECTS: invalid at the block's real height
+    };
+    bool relay_attempted = false;
+    P2pRelaySink p2p = [&](const std::vector<unsigned char>&) -> bool {
+        relay_attempted = true; return true;
+    };
+
+    const auto r = broadcast_won_block(p2p, rpc, block, block_hex,
+                                       /*prefer_rpc_first=*/true);
+
+    EXPECT_FALSE(relay_attempted);      // GATED: never relayed an invalid race block
+    EXPECT_FALSE(r.p2p_sent);
+    EXPECT_FALSE(r.rpc_ok);
+    EXPECT_FALSE(r.any());              // rejected locally for free
+    EXPECT_STREQ(r.landed_first, "none");
+}
+
+// 10) HEIGHT-RACE DAEMONLESS: no RPC arm to validate against, so the RPC-first
+//     gate does NOT apply -- ARM A relays anyway (it is the ONLY route to the
+//     network; dropping a winnable block would be a guaranteed loss).
+TEST(DashWonBlockDualPath, HeightRaceDaemonlessStillRelaysPrimary)
+{
+    const auto block = make_block_bytes();
+    const std::string block_hex = to_hex(block);
+
+    std::vector<unsigned char> relayed;
+    P2pRelaySink p2p = [&](const std::vector<unsigned char>& b) -> bool {
+        relayed = b; return true;
+    };
+
+    const auto r = broadcast_won_block(p2p, /*rpc=*/{}, block, block_hex,
+                                       /*prefer_rpc_first=*/true);
+
+    EXPECT_TRUE(r.p2p_sent);            // relay-first fallback: the only path
+    EXPECT_FALSE(r.rpc_ok);
+    EXPECT_EQ(relayed, block);
+    EXPECT_STREQ(r.landed_first, "p2p");
+    EXPECT_TRUE(r.any());
+}
+
 // 8) E5 --coin-p2p-magic override: the embedded coin-P2P wire magic selector.
 //    No override -> the mainnet/testnet defaults are returned BYTE-FOR-BYTE
 //    unchanged (guards the production ARM A dial from regression). An override

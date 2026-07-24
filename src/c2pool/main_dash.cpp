@@ -1184,14 +1184,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
     dash::stratum::DASHWorkSource::SubmitBlockFn stratum_submit_fn =
         [p2p_relay, rpc_submit](const std::vector<unsigned char>& block_bytes,
-                                uint32_t height) -> bool {
+                                uint32_t height,
+                                bool height_race) -> bool {
             const std::string block_hex = HexStr(block_bytes);
             std::cout << "[DASH-STRATUM-BLOCK] won block height=" << height
                       << " bytes=" << block_bytes.size()
+                      << (height_race
+                              ? " (HEIGHT RACE -- RPC-first: dashd validates before"
+                                " any coin-P2P relay)"
+                              : "")
                       << " -- dispatching dual-path (embedded P2P primary + "
                          "submitblock-RPC backup)\n";
             const auto bcast = dash::coin::broadcast_won_block(
-                p2p_relay, rpc_submit, block_bytes, block_hex);
+                p2p_relay, rpc_submit, block_bytes, block_hex,
+                /*prefer_rpc_first=*/height_race);
             if (!bcast.any()) {
                 std::cout << "[DASH-STRATUM-BLOCK] reached NEITHER sink "
                              "(no embedded P2P peer AND no dashd RPC creds) -- "
@@ -1280,7 +1286,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         // 4) Drive the REAL run-path dual-path dispatch.
                         std::vector<unsigned char> block_bytes = ParseHex(mr.block_hex);
                         if (forced_dispatch)
-                            forced_dispatch(block_bytes, work.m_height);
+                            forced_dispatch(block_bytes, work.m_height,
+                                            /*height_race=*/false);
                         else
                             std::cout << "[run] E5 forced-won-block: dispatch sink "
                                          "UNBOUND -- nothing fired\n";

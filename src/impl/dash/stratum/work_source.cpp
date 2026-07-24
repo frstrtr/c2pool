@@ -851,10 +851,16 @@ nlohmann::json DASHWorkSource::mining_submit(
         // GBT-mandated payee SCRIPT by SET MEMBERSHIP — it does NOT compare
         // amounts against the current template (the masternode amount is
         // subsidy + fees and drifts with the mempool on every re-pull; dashd
-        // checks it against the block's OWN fees). Refuse only when the tip has
-        // moved (wrong height) or a mandated payee SCRIPT is genuinely absent;
-        // a guard-side parse failure never blocks a submission.
+        // checks it against the block's OWN fees). Refuse only when a mandated
+        // payee SCRIPT is genuinely absent (PayeeMissing); a moved-tip block is
+        // a HeightRace and IS submitted (dashd is the authority at the block's
+        // real height), and a guard-side parse failure never blocks a submit.
+        // A HeightRace submit is dispatched RPC-FIRST (the is_height_race flag
+        // threaded to submit_block_fn_ below): the local dashd validates the
+        // block before we relay it to any coin-P2P peer, so an invalid race
+        // block is rejected locally for free and never risks a coin-P2P ban.
         bool payee_guard_reject = false;
+        bool is_height_race     = false;
         if (wd) {
             const auto guard = check_submit_payee(
                 coinbase, job->gbt_prevhash, *wd,
@@ -878,13 +884,18 @@ nlohmann::json DASHWorkSource::mining_submit(
                 // network to us); only a 2+ deep bury is unwinnable, and even
                 // then submitting is free (dashd stores a dead orphan). Per the
                 // reward invariant we SUBMIT and let dashd decide -- dropping
-                // would be a guaranteed, irreversible loss. NOT a reject.
+                // would be a guaranteed, irreversible loss. NOT a reject. Flag
+                // it so the broadcaster dispatches RPC-FIRST: the local dashd
+                // validates the block before any coin-P2P relay, so an invalid
+                // race block is rejected for free and never risks a peer-ban.
+                is_height_race = true;
                 LOG_WARNING << "[DASH-STRATUM-PAYEE-GUARD] WON BLOCK is a HEIGHT "
                                "RACE: " << guard.detail
                             << " user=" << username << " job=" << job_id
-                            << " -- submitting anyway; dashd is the authority at "
-                               "the block's real height and will accept if valid, "
-                               "reject for free if not";
+                            << " -- submitting anyway (RPC-first: dashd validates "
+                               "before any coin-P2P relay); dashd is the authority "
+                               "at the block's real height and will accept if "
+                               "valid, reject for free if not";
                 break;
             case PayeeGuardVerdict::Unverifiable:
                 LOG_WARNING << "[DASH-STRATUM-PAYEE-GUARD] guard could not "
@@ -912,7 +923,7 @@ nlohmann::json DASHWorkSource::mining_submit(
             // template was ours.
         } else if (submit_block_fn_) {
             try {
-                reached_network = submit_block_fn_(block_bytes, height);
+                reached_network = submit_block_fn_(block_bytes, height, is_height_race);
             } catch (const std::exception& e) {
                 LOG_ERROR << "[DASH-STRATUM-BLOCK] submit_block_fn threw: " << e.what();
             }

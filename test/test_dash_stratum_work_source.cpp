@@ -118,6 +118,7 @@ struct Fixture {
     dash::coin::NodeCoinState coin_state;             // default: populated()==false
     bool                      submit_called = false;
     uint32_t                  submit_height = 0;
+    bool                      submit_height_race = false;   // guard flagged HeightRace
     std::vector<unsigned char> submitted_block;
     dash::coin::DashWorkData  fallback_work;          // seeded by caller
 
@@ -127,10 +128,12 @@ struct Fixture {
     std::unique_ptr<dash::stratum::DASHWorkSource> make()
     {
         auto submit = [this](const std::vector<unsigned char>& block,
-                             uint32_t height) -> bool {
-            submit_called   = true;
-            submit_height   = height;
-            submitted_block = block;
+                             uint32_t height,
+                             bool height_race) -> bool {
+            submit_called      = true;
+            submit_height      = height;
+            submit_height_race = height_race;
+            submitted_block    = block;
             return true;
         };
         auto fallback = [this]() -> dash::coin::DashWorkData { return fallback_work; };
@@ -1222,6 +1225,7 @@ TEST(DashStratumWorkSource, WonBlockWithMandatedAmountDriftStillSubmits)
     ASSERT_TRUE(result.is_boolean());
     EXPECT_TRUE(result.get<bool>());
     EXPECT_TRUE(rig.fx.submit_called);        // amount drift is NOT a refusal
+    EXPECT_FALSE(rig.fx.submit_height_race);  // same-height Ok -> relay-first, not a race
 }
 
 // A won block across a MOVED tip is a HEIGHT RACE, not a guaranteed loss: a
@@ -1248,6 +1252,7 @@ TEST(DashStratumWorkSource, WonBlockAcrossTipMoveIsSubmittedAsHeightRace)
     ASSERT_TRUE(result.is_boolean());
     EXPECT_TRUE(result.get<bool>());          // the miner's work was honest
     EXPECT_TRUE(rig.fx.submit_called);        // ...and the race block IS dispatched
+    EXPECT_TRUE(rig.fx.submit_height_race);   // ...flagged HeightRace -> RPC-first dispatch
 }
 
 // ── Dashboard stats seam (issue: /local_stats hashrate under-reported) ───────
@@ -1357,7 +1362,7 @@ TEST(DashStratumC1MainnetGate, MainnetPopulatedCoinStateRoutesToDashdFallback)
     ASSERT_TRUE(cs.make_embedded_work_inputs().viable());
 
     auto fallback = []() -> dash::coin::DashWorkData { return rich_work(); };
-    auto submit   = [](const std::vector<unsigned char>&, uint32_t) { return true; };
+    auto submit   = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
 
     // is_testnet=false => mainnet => embedded arm GATED off.
     dash::stratum::DASHWorkSource ws(cs, fallback, submit,
@@ -1394,7 +1399,7 @@ TEST(DashStratumC1MainnetGate, TestnetPopulatedCoinStateServesEmbedded)
     ASSERT_TRUE(cs.populated());
 
     auto fallback = []() -> dash::coin::DashWorkData { return rich_work(); };
-    auto submit   = [](const std::vector<unsigned char>&, uint32_t) { return true; };
+    auto submit   = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
 
     // is_testnet=true => testnet/regtest => embedded arm ENABLED.
     dash::stratum::DASHWorkSource ws(cs, fallback, submit,
@@ -1452,7 +1457,7 @@ TEST(DashStratumC1MainnetGate, EmbeddedCacheHitReValidatesCreditPoolAndReSources
                76, 16, kCurtime, static_cast<uint32_t>(kVersion));
 
     auto fallback = []() -> dash::coin::DashWorkData { return rich_work(); };
-    auto submit   = [](const std::vector<unsigned char>&, uint32_t) { return true; };
+    auto submit   = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
     dash::stratum::DASHWorkSource ws(cs, fallback, submit,
                                      core::stratum::StratumConfig{},
                                      /*is_testnet=*/true);
@@ -1521,7 +1526,7 @@ TEST(DashStratumC1MainnetGate, GbtXcheckServesDashdOnCreditPoolMismatch)
         w.m_coinbase_payload = dash::coin::encode_cbtx(cb);
         return w;
     };
-    auto submit = [](const std::vector<unsigned char>&, uint32_t) { return true; };
+    auto submit = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
     dash::stratum::DASHWorkSource ws(cs, fallback, submit,
                                      core::stratum::StratumConfig{},
                                      /*is_testnet=*/true);
@@ -1575,7 +1580,7 @@ TEST(DashStratumCoinP2pTipInvalidate, InvalidateClosesStalePayeeWindowUnderRefre
 {
     auto current  = std::make_shared<dash::coin::DashWorkData>(rich_work());   // tip A
     auto fallback = [current]() -> dash::coin::DashWorkData { return *current; };
-    auto submit   = [](const std::vector<unsigned char>&, uint32_t) { return true; };
+    auto submit   = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
     dash::coin::NodeCoinState cs;   // unpopulated -> fallback arm
 
     dash::stratum::DASHWorkSource ws(cs, fallback, submit,
@@ -1617,7 +1622,7 @@ TEST(DashStratumCoinP2pTipInvalidate, BumpAloneServesStaleUnderRefreshExecutor)
 {
     auto current  = std::make_shared<dash::coin::DashWorkData>(rich_work());
     auto fallback = [current]() -> dash::coin::DashWorkData { return *current; };
-    auto submit   = [](const std::vector<unsigned char>&, uint32_t) { return true; };
+    auto submit   = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
     dash::coin::NodeCoinState cs;
 
     dash::stratum::DASHWorkSource ws(cs, fallback, submit,
