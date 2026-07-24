@@ -5,6 +5,7 @@
 #include "transaction.hpp"
 #include "mn_state_machine.hpp"
 #include "vendor/smldiff.hpp"   // vendor::CSimplifiedMNListDiff (SML-axis reception feed)
+#include "vendor/llmq_commitment.hpp"  // vendor::CFinalCommitment (qfcommit sourcing leg)
 
 #include <core/uint256.hpp>
 #include <core/events.hpp>
@@ -143,6 +144,14 @@ struct Node
         std::array<uint8_t, 96>  sig{};
     };
     Event<ChainLockSigEvent> new_chainlock_sig;
+
+    // E1 Phase-L sourcing leg: a peer-relayed DKG final commitment off the
+    // coin-P2P `qfcommit` stream (inv MSG_QUORUM_FINAL_COMMITMENT = 21) —
+    // the exact stream dashd's own miner sources block-N's mandatory type-6
+    // txs from. main_dash subscribes the MineableCommitmentCache
+    // (dkg_commitments.hpp): structural admission now, BLS verification
+    // (Phase L) before any template inclusion.
+    Event<coin::vendor::CFinalCommitment> new_qfcommit;
 
     std::map<uint256, coin::Transaction> known_txs;
 };

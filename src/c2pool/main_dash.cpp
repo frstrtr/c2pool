@@ -60,6 +60,9 @@
 #include <impl/dash/coin/coin_p2p_magic.hpp>      // dash::coin::select_coin_p2p_magic — E5 --coin-p2p-magic override (regtest ARM A dial)
 #include <impl/dash/coin/node_coin_state.hpp>  // dash::coin::NodeCoinState (embedded work bundle)
 #include <impl/dash/coin/dkg_window.hpp>       // dash::coin::is_dkg_commitment_window (BLOCKER-1 guard)
+#include <impl/dash/coin/dkg_commitments.hpp>  // E1: build_daemonless_qc_plan (serve DKG windows daemonlessly)
+#include <impl/dash/coin/vendor/bls_verify.hpp>  // E1 Phase-L: make_commitment_bls_verifier (real qc verify seam)
+#include <impl/dash/coin/quorum_member_source.hpp>  // E1 Phase-L: daemonless member-set sourcing (the provider)
 #include <impl/dash/coin/utxo_lane.hpp>    // dash::coin::UtxoLane — embedded UTXO/fee lane (E2b, #738)
 #include <impl/dash/coin/header_chain.hpp>       // dash::coin::HeaderChain — SPV header/tip authority (E2a)
 #include <impl/dash/coin/coin_state_maintainer.hpp>  // dash::coin::CoinStateMaintainer — populate ordering gate (E2a)
@@ -1749,10 +1752,182 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // must include them (which the mnlistdiff-fed set omits) — the embedded
         // arm would produce a bad-qc-missing / wrong-root block. Fail closed to
         // the reward-safe dashd fallback at those heights (it builds the qc block).
+        // With the E1 qc plan below installed this fn is the DORMANT fallback
+        // posture (the plan supersedes it); it stays authoritative whenever the
+        // plan is not installed.
         node_coin_state.set_commitment_window_fn(
             [](uint32_t next_height) {
                 return dash::coin::is_dkg_commitment_window(next_height);
             });
+
+        // E1 — daemonless DKG-window serving (dkg_commitments.hpp). Where the
+        // embedded arm is enabled (testnet, or mainnet behind the explicit
+        // --embedded-mainnet gate-lift; default OFF), DKG mining-window heights
+        // are SERVED instead of refused: the mandatory type-6 commitment set is
+        // derived from local state only — params-table math + quorum base
+        // hashes off the embedded header chain + the mnlistdiff-fed
+        // QuorumManager as dashd's HasMinedCommitment — and filled with the
+        // consensus-valid NULL commitments dashd's own miner mines when it
+        // holds no verified DKG result (real relayed commitments are Phase L,
+        // behind a BLS verifier). merkleRootQuorums stays the PROVEN
+        // active-set root (null commitments never fold in). Any height where
+        // the set cannot be derived (header gap, below the per-network V19
+        // serve floor — which also covers --regtest chains riding the testnet
+        // flag) yields nullopt and the arm fails closed to the dashd fallback,
+        // exactly the old refusal. The emit gate re-derives this same plan and
+        // hard-rejects any template whose type-6 set drifts from it.
+        if (testnet || embedded_mainnet) {
+            const auto qc_net = testnet ? dash::coin::LlmqNetwork::Testnet
+                                        : dash::coin::LlmqNetwork::Mainnet;
+            // Phase-L sourcing leg: collect REAL relayed DKG commitments off
+            // the coin-P2P qfcommit stream (structural admission only). The
+            // cache serves NOTHING into templates until a BLS12-381 verifier
+            // is installed (MineableCommitmentCache::set_bls_verify_fn — the
+            // exact Phase-L follow-up); until then every required slot mines
+            // the consensus-valid null commitment, same as dashd without a
+            // DKG result. [QC-MINEABLE] is the field-checkable signal that
+            // the sourcing leg is live.
+            auto qc_cache =
+                std::make_shared<dash::coin::MineableCommitmentCache>();
+
+            // Phase-L VERIFY leg: install the dashbls-backed verifier on the
+            // cache. verified_for() will only yield a REAL commitment once this
+            // passes dashcore's CFinalCommitment::Verify (membersSig aggregate
+            // over the signers' operator keys + quorumSig against
+            // quorumPublicKey, both over BuildCommitmentHash). The verifier
+            // sources the ordered member operator key set via the provider
+            // below; anything it cannot establish with certainty fails CLOSED
+            // (verified_for -> nullopt -> the slot mines the consensus-valid
+            // null commitment, exactly the pre-Phase-L posture — reward-safe).
+            //
+            // MEMBER-SET SOURCING (E1 Phase-L, the piece that ENABLES real-
+            // commitment serving): the deterministic quorum member selection
+            // (dashcore llmq/utils.cpp ComputeQuorumMembers: score = hash over
+            // proRegTxHash/confirmedHash with the per-quorum V20 modifier,
+            // taken over the SML AS OF the WORK block = base - 8, per v23.1.7
+            // GetAllQuorumMembers — #814 review R2) needs the HISTORICAL SML +
+            // the work block's own cbTx ChainLock. QuorumMemberSource sources
+            // BOTH via ONE getmnlistd(ZERO, workBlock) full snapshot over the
+            // SAME coin-P2P client, deduped by block hash across quorum types
+            // sharing a cycle base (#814 R1), authenticates the snapshot with
+            // DIP-4 client verification against the PoW-verified header chain
+            // (#814 R3 — a lying peer must not supply the member-set root of
+            // trust), computes the ordered member operator-key set (with the
+            // per-MN SML nVersion populating MemberOperatorKey::legacy_scheme
+            // — a mixed quorum needs the scheme flag; Evo-only for the
+            // platform type, #814 R4), and caches it. The provider is a pure
+            // cache lookup (never blocks the template path). NON-ROTATED types
+            // only (llmq_50_60 etc.); rotated (DIP-24) returns nullopt ->
+            // null-serve (qrinfo-based rotated sourcing is a documented
+            // follow-up). Anything uncertain -> nullopt -> fail-closed.
+            auto qc_member_source =
+                std::make_shared<dash::coin::QuorumMemberSource>(
+                    qc_net,
+                    [hc = header_chain.get()](uint32_t h)
+                        -> std::optional<uint256> {
+                        if (auto e = hc->get_header_by_height(h)) return e->hash;
+                        return std::nullopt;
+                    },
+                    [hc = header_chain.get()](const uint256& qh)
+                        -> std::optional<uint32_t> {
+                        if (auto e = hc->get_header(qh)) return e->height;
+                        return std::nullopt;
+                    },
+                    // DIP-4 trust anchor (R3): the PoW-verified header's
+                    // hashMerkleRoot for the awaited work block.
+                    [hc = header_chain.get()](const uint256& bh)
+                        -> std::optional<uint256> {
+                        if (auto e = hc->get_header(bh))
+                            return e->header.m_merkle_root;
+                        return std::nullopt;
+                    },
+                    [cp = coin_p2p.get()](const uint256& base, const uint256& tgt) {
+                        if (cp) cp->send_getmnlistd(base, tgt);
+                    });
+
+            dash::coin::vendor::MemberKeysProvider qc_member_keys =
+                [qc_member_source](uint8_t llmq_type, const uint256& quorum_hash)
+                    -> std::optional<std::vector<dash::coin::vendor::MemberOperatorKey>> {
+                    return qc_member_source->lookup(llmq_type, quorum_hash);
+                };
+            qc_cache->set_bls_verify_fn(
+                dash::coin::vendor::make_commitment_bls_verifier(
+                    std::move(qc_member_keys)));
+            if (dash::coin::vendor::bls_backend_available()) {
+                LOG_INFO << "[QC-PHASE-L] dashbls verifier + member-set sourcing "
+                            "installed (real qc inclusion when the member set is "
+                            "sourced; fail-closed to null-serve otherwise)";
+            }
+
+            // DEMUX: route the source's HISTORICAL getmnlistd replies away from
+            // the tip-SML maintainer (a base=ZERO snapshot would overwrite it).
+            if (coin_p2p) {
+                coin_p2p->set_historical_mnlistdiff_filter(
+                    [qc_member_source]
+                    (const dash::coin::vendor::CSimplifiedMNListDiff& d) {
+                        return qc_member_source->on_mnlistdiff(d);
+                    });
+            }
+
+            coin_feed_subs.push_back(
+                coin_state.new_qfcommit.subscribe(
+                    [qc_cache, qc_net, qc_member_source]
+                    (const dash::coin::vendor::CFinalCommitment& c) {
+                        if (qc_cache->ingest(qc_net, c)) {
+                            LOG_INFO << "[QC-MINEABLE] cached commitment type="
+                                     << static_cast<int>(c.llmqType)
+                                     << " quorum="
+                                     << c.quorumHash.GetHex().substr(0, 16)
+                                     << "... signers=" << c.CountSigners()
+                                     << " cache=" << qc_cache->size();
+                            // Proactively source the member set so it is READY by
+                            // the DKG-window height that must serve it.
+                            qc_member_source->request(c.llmqType, c.quorumHash);
+                        }
+                    }));
+            // COMPLETENESS GATE (definitive-soak block 1520106): the plan is
+            // per-height all-or-nothing — any mandatory slot without a
+            // BLS-verified real commitment (no attested-null evidence source
+            // is wired in production) fails the WHOLE height closed to the
+            // dashd fallback. Log the first gap once per height so the soak
+            // can attribute the fallback (the hot path re-derives the plan
+            // on every template build — do not log unthrottled).
+            auto qc_gap_logged_h = std::make_shared<uint32_t>(0u);
+            node_coin_state.set_qc_plan_fn(
+                [&node_coin_state, hc = header_chain.get(), qc_net, qc_cache,
+                 qc_gap_logged_h]
+                (uint32_t next_h) -> std::optional<dash::coin::QcBlockPlan> {
+                    dash::coin::RequiredQcSlot gap{};
+                    auto plan = dash::coin::build_daemonless_qc_plan(
+                        qc_net, next_h, node_coin_state.qmgr(),
+                        [hc](uint32_t h) -> std::optional<uint256> {
+                            if (auto e = hc->get_header_by_height(h))
+                                return e->hash;
+                            return std::nullopt;
+                        },
+                        [hc](const uint256& qh) -> std::optional<uint32_t> {
+                            if (auto e = hc->get_header(qh)) return e->height;
+                            return std::nullopt;
+                        },
+                        qc_cache.get(),
+                        /*null_evidence=*/nullptr,
+                        &gap);
+                    if (!plan && !gap.quorum_hash.IsNull()
+                        && *qc_gap_logged_h != next_h) {
+                        *qc_gap_logged_h = next_h;
+                        LOG_INFO << "[QC-COMPLETENESS] h=" << next_h
+                                 << " mandatory slot type="
+                                 << static_cast<int>(gap.params.type)
+                                 << " qi=" << gap.quorum_index
+                                 << " quorum="
+                                 << gap.quorum_hash.GetHex().substr(0, 16)
+                                 << "... has no verified real commitment and no"
+                                    " failed-DKG evidence -> WHOLE height"
+                                    " fails closed (arm=dashd-fallback)";
+                    }
+                    return plan;
+                });
+        }
 
         // review PR #780 BLOCKER-2 (HIGH): refuse the embedded arm on a stale or
         // absent bestCL (dashcore CheckCbTxBestChainlock rejects null/older CL).

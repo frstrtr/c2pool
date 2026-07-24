@@ -139,6 +139,38 @@ public:
             return;
         }
 
+        // #814 review R1 hardening (BLOCK-LOSING without it): a ZERO-base diff
+        // REPLACES the whole SML/quorum/credit-pool state — so while we HOLD
+        // state, only a genuine FORWARD tip-resync may do that. A stale
+        // historical full snapshot (e.g. a duplicate Phase-L member-sourcing
+        // reply leaking past the demux, or an unsolicited push from a
+        // malicious peer) whose height is at/below the height we are current
+        // at must NOT roll the tip state back to a ~10-30-block-old block
+        // (wrong merkleRootMNList/merkleRootQuorums on the next template =
+        // lost block if won). The snapshot's own authoritative cbTx.nHeight is
+        // the freshness key; a full snapshot whose cbTx cannot be parsed while
+        // we hold state is equally rejected (cannot prove freshness = fail
+        // closed). Cold (have_at ZERO — first sync or post-reorg/heal wipe)
+        // stays permissive: that IS the resync this guard must not block.
+        if (diff.baseBlockHash.IsNull() && !have_at.IsNull()) {
+            std::optional<uint32_t> snap_h;
+            if (diff.cbTx.type == 5 && !diff.cbTx.extra_payload.empty()) {
+                vendor::CCbTx probe;
+                if (vendor::parse_cbtx(diff.cbTx.extra_payload, probe)
+                    && probe.nHeight > 0)
+                    snap_h = static_cast<uint32_t>(probe.nHeight);
+            }
+            if (!snap_h || *snap_h <= m_sml_current_height) {
+                LOG_WARNING << "[SML] REJECT ZERO-base snapshot @ "
+                            << diff.blockHash.GetHex().substr(0, 16)
+                            << " (h=" << (snap_h ? static_cast<int64_t>(*snap_h) : -1)
+                            << " <= current h=" << m_sml_current_height
+                            << ") — stale/unproven full snapshot must not "
+                               "replace tip state (review #814 R1)";
+                return;
+            }
+        }
+
         // review PR #780 H-1 (HIGH): parse the quorum tail FIRST. quorumsdiff
         // deltas are BASE-RELATIVE — if a tail fails to parse (wire-format drift:
         // proto bump / new CFinalCommitment version), skipping its qmgr apply
@@ -159,6 +191,17 @@ public:
             return;
         }
 
+        // A ZERO-base diff is a FULL snapshot: it must REPLACE the state, not
+        // be upserted onto it — an MN deregistered between our held state and
+        // the snapshot would otherwise linger as a ghost entry (wrong
+        // merkleRootMNList on the next template). Cold/post-wipe states are
+        // empty so this is a no-op there; it only matters for the (now
+        // R1-guarded) forward full-resync over held state.
+        if (diff.baseBlockHash.IsNull()) {
+            m_state.sml().mnList.clear();
+            m_state.qmgr().clear();
+        }
+
         // 1) SML (merkleRootMNList). apply_diff erases deletedMNs, upserts
         //    diff.mnList, and re-sorts by proRegTxHash (memcmp order — the
         //    Bug-A-critical ordering, already pinned by test_dash_simplifiedmns).
@@ -177,6 +220,13 @@ public:
         if (diff.cbTx.type == 5 && !diff.cbTx.extra_payload.empty()) {
             vendor::CCbTx observed;
             if (vendor::parse_cbtx(diff.cbTx.extra_payload, observed)) {
+                // R1-hardening freshness tracker: the height the SML/quorum
+                // state is now current at (authoritative off the diff's own
+                // cbTx). Monotone by construction: incrementals ride the
+                // base-continuity guard, full snapshots the R1 guard above.
+                if (observed.nHeight > 0)
+                    m_sml_current_height =
+                        static_cast<uint32_t>(observed.nHeight);
                 if (observed.nVersion >= vendor::CCbTx::VERSION_CLSIG_AND_BALANCE) {
                     // Seed with the cbTx's OWN nHeight (authoritative off the
                     // wire) as the seed height — the independent freshness key.
@@ -281,6 +331,10 @@ public:
         // a fresh cold-start diff lands, and (b) the next diff is accepted as a
         // full snapshot (base-continuity guard treats ZERO current as cold).
         m_state.set_sml_current_hash(uint256::ZERO);
+        // Reset the R1 freshness tracker too: post-reorg the new branch's
+        // heights may legitimately be at/below the old ones — the cold
+        // full-snapshot resync must not be blocked by the stale-guard.
+        m_sml_current_height = 0;
         // Invalidate the credit-pool seed's freshness too (height -1 != any tip),
         // so the arm fails closed on the credit-pool axis until a fresh re-seed.
         m_state.set_credit_pool(0, uint256::ZERO, -1);
@@ -634,6 +688,11 @@ private:
     bool m_have_mn{false};
     bool m_have_tip{false};
     bool m_have_mn_sml{false};   // a non-empty SML has been applied (CCbTx source)
+
+    // Height the SML/quorum state is current at (0 = unknown/cold), tracked
+    // off each accepted diff's cbTx.nHeight — the freshness key the #814 R1
+    // stale-ZERO-base-snapshot guard compares against.
+    uint32_t m_sml_current_height{0};
 
     // Height the last MN-set snapshot was current at (0 = none/unknown);
     // on_block_connected skips re-applying blocks at or below it.

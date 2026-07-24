@@ -34,6 +34,26 @@ target_link_libraries(dash_block_replay PRIVATE core nlohmann_json::nlohmann_jso
 # links it is c2pool-dash (this slice), so the ltc/btc/doge/dgb build + ctest
 # surfaces are untouched. Per-coin isolation held: src/impl/dash only, no
 # shared-base/core SOURCE edit, dashd RPC fallback preserved.
+# E1 Phase-L: type-6 quorum-commitment BLS verify (coin/vendor/bls_verify.cpp).
+# Compiled UNCONDITIONALLY so the seam symbols (make_commitment_bls_verifier,
+# verify_final_commitment, build_commitment_hash) always resolve; the dashbls
+# backend is linked + the C2POOL_DASH_BLS define is set (PUBLIC, so the sole
+# consumer c2pool-dash inherits it) ONLY when the library was found. Without it
+# the verify functions are fail-closed stubs and NO dashbls dependency enters
+# the build — keeping the Windows main_ltc launcher (shared core only) clean.
+# SAFE-ADDITIVE: the only executable linking dash_bls_verify is c2pool-dash.
+add_library(dash_bls_verify STATIC coin/vendor/bls_verify.cpp)
+target_include_directories(dash_bls_verify PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/btclibs
+    ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(dash_bls_verify PRIVATE core ${Boost_LIBRARIES})
+if(C2POOL_DASH_BLS_AVAILABLE)
+    target_compile_definitions(dash_bls_verify PUBLIC C2POOL_DASH_BLS)
+    target_include_directories(dash_bls_verify PUBLIC ${DASHBLS_INCLUDE_DIR})
+    target_link_libraries(dash_bls_verify PUBLIC ${DASHBLS_LIBRARIES})
+endif()
+
 add_library(dash_rpc STATIC coin/rpc.cpp coin/zmq_tip_notify.cpp)
 target_include_directories(dash_rpc PRIVATE
     ${CMAKE_SOURCE_DIR}/src
