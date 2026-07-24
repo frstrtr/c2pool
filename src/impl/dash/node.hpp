@@ -159,6 +159,11 @@ protected:
         int dead_shares{0};
         int fork_count{0};
         double pool_hashrate{0};
+        // Last published best-share election (m_best_share_hash at publish
+        // time). The lock-free fallback for best_share_hash() /
+        // advertised_best_share() when the compute thread holds the
+        // exclusive lock — see snapshot_best_share().
+        uint256 best_share;
     };
     void publish_snapshot() {
         TrackerSnapshot s;
@@ -166,6 +171,7 @@ protected:
         s.verified_count = static_cast<int>(m_tracker.verified.size());
         s.head_count = static_cast<int>(m_tracker.chain.get_heads().size());
         s.fork_count = s.head_count;
+        s.best_share = m_best_share_hash;
         std::lock_guard<std::mutex> lock(m_snapshot_mutex);
         m_snapshot = s;
     }
@@ -496,6 +502,17 @@ public:
     /// from send_version() above.
     uint256 advertised_best_share()
     {
+        // Reader discipline (m_tracker_mutex contract above; ltc node.cpp
+        // readvertise_best_share parity): the heads/height walk below reads
+        // the chain containers, which the compute thread's think() mutates
+        // (verified.add / chain.remove → rehash) under the exclusive lock.
+        // Walking them unlocked is the join-burst GP-fault class. try_to_lock:
+        // the IO thread never blocks — busy ⇒ advertise the last published
+        // election (lock-free snapshot; null pre-sync, which a peer treats as
+        // "no advert" and later learns our head via broadcast/re-advert).
+        std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::try_to_lock);
+        if (!lock.owns_lock())
+            return snapshot_best_share();
         if (!m_best_share_hash.IsNull())
             return m_best_share_hash;
         uint256 best;
@@ -568,11 +585,20 @@ public:
         // 2s advert timer (start_outbound_connections) drain the queue.
         if (!msg->m_best_share.IsNull())
         {
+            // contains() reads the chain map — take the shared lock
+            // (try_to_lock, IO thread never blocks; the check is log-only,
+            // the advert is queued either way and the drain re-checks under
+            // its own lock).
+            bool known = false;
+            {
+                std::shared_lock<std::shared_mutex> lk(m_tracker_mutex,
+                                                       std::try_to_lock);
+                known = lk.owns_lock() && m_chain->contains(msg->m_best_share);
+            }
             LOG_INFO << "[Pool] Peer " << peer->addr().to_string()
                      << " advertises best share "
                      << msg->m_best_share.ToString().substr(0, 16)
-                     << (m_chain->contains(msg->m_best_share)
-                             ? " (known)" : " (unknown — queued for download)");
+                     << (known ? " (known)" : " (unknown — queued for download)");
             m_peer_best_adverts.emplace_back(peer, msg->m_best_share);
         }
 
@@ -829,6 +855,14 @@ public:
     int get_verified_count() const {
         std::lock_guard<std::mutex> lock(m_snapshot_mutex);
         return m_snapshot.verified_count;
+    }
+    /// Last published best-share election (compute thread publishes under the
+    /// exclusive tracker lock). The busy-fallback for best_share_hash() /
+    /// advertised_best_share() — a torn/unlocked m_best_share_hash read is
+    /// never taken.
+    uint256 snapshot_best_share() const {
+        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+        return m_snapshot.best_share;
     }
 };
 
