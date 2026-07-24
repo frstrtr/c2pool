@@ -12,6 +12,7 @@
 
 #include <core/log.hpp>
 #include <core/hash.hpp>
+#include <core/coin/submitblock_result.hpp>
 namespace btc
 {
 
@@ -437,9 +438,13 @@ bool NodeRPC::submit_block_hex(const std::string& block_hex, bool ignore_failure
 {
 	(void)ignore_failure;
 	auto result = m_client.CallMethod<nlohmann::json>(ID, "submitblock", {block_hex});
-	bool success = result.is_null();
+	// Dual-path contract: a "duplicate"/"inconclusive"/already-have result means
+	// the block already reached the network (our P2P relay, or a peer won the
+	// race) — that is SUCCESS, not failure. See core::coin::submitblock_result_accepted.
+	const bool success = core::coin::submitblock_result_accepted(result);
 	if (success)
-		LOG_INFO << "submit_block_hex accepted";
+		LOG_INFO << "submit_block_hex accepted"
+		         << (result.is_null() ? std::string{} : " (" + result.dump() + ")");
 	else
 		// A won block rejection reason is load-bearing diagnostic data: the
 		// daemon returns a verdict string ("bad-witness-merkle-match",

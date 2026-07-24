@@ -13,6 +13,7 @@
 #include <core/uint256.hpp>
 #include <core/coin/node_iface.hpp>
 #include <core/coin/work_view.hpp>
+#include <core/coin/submitblock_result.hpp>
 
 // ---------------------------------------------------------------------------
 // KATs for core::MiningInterface::submitblock — the SHARED-CORE HTTP won-block
@@ -22,7 +23,11 @@
 // The handler must FORWARD such a block to the coin daemon (never drop it) and
 // return the DAEMON's verdict — accept => success, reject => error. It must NOT
 // synthesize a "stale" error and drop the block before the daemon ever sees it.
-// The normal (matching prev-hash) submit path must be unchanged.
+//
+// REWARD-ACCOUNTING invariant (B1): the found-block callback fires EXACTLY ONCE
+// per block, with the correct stale_info code, AFTER the daemon verdict — an
+// accepted stale/race block must fire 0 (WON), NOT be left recorded only as an
+// eager 253 (ORPHAN/pending), or the dashboard under-credits a real paid win.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -72,15 +77,15 @@ std::string make_header_hex(const std::vector<uint8_t>& prev32) {
 }
 
 // A MiningInterface primed with a live template whose previousblockhash is a
-// known value; returns the 32 internal prev bytes so tests can build matching
-// or mismatching headers.
+// known value; also captures every found-block callback fire (stale_info code)
+// so tests can assert EXACTLY ONE fire per path with the right code.
 struct Fixture {
     core::MiningInterface mi{/*testnet=*/true};
     MockCoinNode          node;
     std::vector<uint8_t>  template_prev32;
+    std::vector<int>      fires;   // stale_info codes captured, in order
 
     Fixture() {
-        // Pick a clearly non-zero template prev-hash.
         const std::string prev_hex =
             "00000000000000000000000000000000000000000000000000000000000000ab";
         uint256 pe;
@@ -96,82 +101,136 @@ struct Fixture {
             {"rules", nlohmann::json::array()},
         };
         mi.set_coin_node(&node);
+        mi.set_on_block_submitted(
+            [this](const std::string&, int stale_info) { fires.push_back(stale_info); });
         mi.refresh_work();  // populates m_cached_template from work_data
     }
+
+    std::string stale_header()  const { return make_header_hex(std::vector<uint8_t>(32, 0x00)); }
+    std::string normal_header() const { return make_header_hex(template_prev32); }
 };
 
 bool is_error(const nlohmann::json& r) {
     return r.is_object() && r.contains("error");
 }
 
-// 1. STALE/RACE block, daemon ACCEPTS -> forwarded, handler returns success.
-TEST(WebServerSubmitBlock, StaleRaceForwardedAndAccepted)
+// ------------------------------ B1 / M3: fire accounting ------------------
+
+// stale + accept => forwarded, single 0-fire (WON — the B1 regression case).
+TEST(WebServerSubmitBlock, StaleAccept_SingleWonFire)
 {
     Fixture f;
     f.node.accept = true;
 
-    // prev-hash that does NOT match the template (all zeros) => "stale"/race.
-    std::string hex = make_header_hex(std::vector<uint8_t>(32, 0x00));
-    int calls_before = f.node.submit_calls;
+    auto r = f.mi.submitblock(f.stale_header());
 
-    auto r = f.mi.submitblock(hex);
-
-    EXPECT_EQ(f.node.submit_calls, calls_before + 1)
-        << "race block MUST be forwarded to the daemon, not dropped";
-    EXPECT_EQ(f.node.last_submitted_hex, hex);
-    EXPECT_FALSE(is_error(r))
-        << "daemon accepted => handler must return success, got: " << r.dump();
+    EXPECT_EQ(f.node.submit_calls, 1) << "race block MUST be forwarded, not dropped";
+    EXPECT_FALSE(is_error(r)) << "accepted => success, got: " << r.dump();
+    ASSERT_EQ(f.fires.size(), 1u) << "exactly ONE found-block callback must fire";
+    EXPECT_EQ(f.fires[0], 0)
+        << "an accepted stale/race block is a WON block (0), not ORPHAN (253)";
 }
 
-// 2. STALE/RACE block, daemon REJECTS -> forwarded, handler returns the reject.
-TEST(WebServerSubmitBlock, StaleRaceForwardedAndRejectReturned)
+// stale + reject => forwarded, single 253 (ORPHAN) fire, reject returned.
+TEST(WebServerSubmitBlock, StaleReject_SingleOrphanFire)
 {
     Fixture f;
-    f.node.accept = false;  // daemon says invalid
+    f.node.accept = false;
 
-    std::string hex = make_header_hex(std::vector<uint8_t>(32, 0x00));
-    int calls_before = f.node.submit_calls;
+    auto r = f.mi.submitblock(f.stale_header());
 
-    auto r = f.mi.submitblock(hex);
-
-    EXPECT_EQ(f.node.submit_calls, calls_before + 1)
-        << "race block MUST reach the daemon before any reject decision";
-    EXPECT_TRUE(is_error(r))
-        << "daemon rejected => handler must return the daemon's reject verdict";
-    // And it must NOT be the old synthetic pre-daemon "stale" drop error.
+    EXPECT_EQ(f.node.submit_calls, 1) << "race block MUST reach the daemon first";
+    EXPECT_TRUE(is_error(r)) << "daemon rejected => handler returns the reject";
     EXPECT_EQ(r["error"].get<std::string>().find("stale"), std::string::npos)
         << "reject must reflect the daemon verdict, not a synthetic stale drop";
+    ASSERT_EQ(f.fires.size(), 1u) << "exactly ONE found-block callback must fire";
+    EXPECT_EQ(f.fires[0], 253) << "a rejected stale/race block records as ORPHAN (253)";
 }
 
-// 3. NORMAL (matching prev-hash) block, daemon ACCEPTS -> forwarded, success.
-//    Guards the byte-identical normal path.
-TEST(WebServerSubmitBlock, NormalMatchingPrevForwardedAndAccepted)
+// normal + accept => forwarded, single 0 (WON) fire, success.
+TEST(WebServerSubmitBlock, NormalAccept_SingleWonFire)
 {
     Fixture f;
     f.node.accept = true;
 
-    std::string hex = make_header_hex(f.template_prev32);  // matches template
-    int calls_before = f.node.submit_calls;
+    auto r = f.mi.submitblock(f.normal_header());
 
-    auto r = f.mi.submitblock(hex);
-
-    EXPECT_EQ(f.node.submit_calls, calls_before + 1)
-        << "normal block must be forwarded to the daemon";
-    EXPECT_FALSE(is_error(r))
-        << "normal accepted block must return success, got: " << r.dump();
+    EXPECT_EQ(f.node.submit_calls, 1);
+    EXPECT_FALSE(is_error(r)) << "normal accepted block must succeed, got: " << r.dump();
+    ASSERT_EQ(f.fires.size(), 1u);
+    EXPECT_EQ(f.fires[0], 0);
 }
 
-// 4. Guard: a too-short payload is still rejected locally (never forwarded).
+// normal + reject => forwarded, error returned, NO won-fire (matches prior
+// telemetry: plain reject recorded nothing; a "false" may be daemon-duplicate).
+TEST(WebServerSubmitBlock, NormalReject_ErrorAndNoFire)
+{
+    Fixture f;
+    f.node.accept = false;
+
+    auto r = f.mi.submitblock(f.normal_header());
+
+    EXPECT_EQ(f.node.submit_calls, 1);
+    EXPECT_TRUE(is_error(r));
+    EXPECT_EQ(f.fires.size(), 0u)
+        << "a non-stale reject must not fire a found-block callback (no DOA mis-count)";
+}
+
+// RPC throw (transport failure) => single DOA fire: 254 non-stale, 253 stale.
+TEST(WebServerSubmitBlock, RpcThrowNonStale_SingleDoaFire)
+{
+    Fixture f;
+    f.node.throw_on_submit = true;
+
+    auto r = f.mi.submitblock(f.normal_header());
+
+    EXPECT_EQ(f.node.submit_calls, 1);
+    EXPECT_TRUE(is_error(r));
+    ASSERT_EQ(f.fires.size(), 1u);
+    EXPECT_EQ(f.fires[0], 254) << "non-stale RPC throw records as DOA (254)";
+}
+
+TEST(WebServerSubmitBlock, RpcThrowStale_SingleOrphanFire)
+{
+    Fixture f;
+    f.node.throw_on_submit = true;
+
+    auto r = f.mi.submitblock(f.stale_header());
+
+    EXPECT_EQ(f.node.submit_calls, 1);
+    EXPECT_TRUE(is_error(r));
+    ASSERT_EQ(f.fires.size(), 1u);
+    EXPECT_EQ(f.fires[0], 253) << "stale RPC throw records as ORPHAN (253)";
+}
+
+// Guard: a too-short payload is rejected locally, never forwarded, never fires.
 TEST(WebServerSubmitBlock, TooShortRejectedLocally)
 {
     Fixture f;
-    int calls_before = f.node.submit_calls;
-
-    auto r = f.mi.submitblock(std::string("00", 2));  // 1 byte, well under 80
-
-    EXPECT_EQ(f.node.submit_calls, calls_before)
-        << "malformed short payload must never reach the daemon";
+    auto r = f.mi.submitblock(std::string("00", 2));
+    EXPECT_EQ(f.node.submit_calls, 0) << "malformed short payload must never reach the daemon";
     EXPECT_TRUE(is_error(r));
+    EXPECT_EQ(f.fires.size(), 0u);
+}
+
+// ------------------------------ M2: duplicate = ACK -----------------------
+
+// The shared classifier used by LTC/BTC/DGB NodeRPC::submit_block_hex: a daemon
+// "duplicate"/"inconclusive"/already-have (the dual-path / race outcome) is an
+// ACK, so a won block never surfaces as a reject through the web_server seam.
+TEST(SubmitblockResult, DuplicateAndInconclusiveAreAck)
+{
+    using core::coin::submitblock_result_accepted;
+    EXPECT_TRUE(submitblock_result_accepted(nlohmann::json()));            // null = accept
+    EXPECT_TRUE(submitblock_result_accepted("duplicate"));
+    EXPECT_TRUE(submitblock_result_accepted("DUPLICATE"));
+    EXPECT_TRUE(submitblock_result_accepted("inconclusive"));
+    EXPECT_TRUE(submitblock_result_accepted("duplicate-inconclusive"));
+    EXPECT_TRUE(submitblock_result_accepted("already have block"));
+    // Genuine rejects stay rejects.
+    EXPECT_FALSE(submitblock_result_accepted("duplicate-invalid"));
+    EXPECT_FALSE(submitblock_result_accepted("high-hash"));
+    EXPECT_FALSE(submitblock_result_accepted("bad-txnmrklroot"));
 }
 
 } // namespace

@@ -1869,14 +1869,13 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
                 LOG_TRACE << "[LTC] submitblock: merkle_root=" << submitted_merkle_root.GetHex();
             }
         }
-        // Fire the race/stale telemetry OUTSIDE the lock (avoid deadlock) so the
-        // race stays visible in metrics — then continue into the submit path
-        // below. stale_info 253 = ORPHAN (stale prev). NOTE: we fire this ONCE
-        // here for the race marker; the accepted/rejected branches below are
-        // guarded on !is_stale so a stale block is never double-recorded.
-        if (is_stale && m_on_block_submitted && hex_data.size() >= 160) {
-            m_on_block_submitted(hex_data.substr(0, 160), 253);
-        }
+        // The race/stale telemetry is NOT fired eagerly here. When the daemon is
+        // RPC-armed, a stale/race block can still be ACCEPTED (we win the race),
+        // and must then be credited as a WON block (stale_info 0) so the consumer
+        // runs broadcast_bestblock + schedule_block_verification and the found
+        // block is NOT left pending/ORPHAN. So we fire EXACTLY ONE callback per
+        // block: AFTER the daemon verdict (RPC arm below), or synchronously in the
+        // embedded / no-verdict arms.
     }
 
     if (m_coin_node && m_coin_node->has_rpc()) {
@@ -1885,10 +1884,12 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
             LOG_INFO << "Block forwarded to coin daemon"
                      << (is_stale ? " (stale/race — daemon is authority on validity)" : "");
             if (accepted) {
-                // Notify P2P layer with stale_info=0 (none — accepted). Suppressed
-                // for a stale/race block, which already fired 253 above (no
-                // double-record); the block is still relayed below.
-                if (!is_stale && m_on_block_submitted && hex_data.size() >= 160) {
+                // WON. Fire the single found-block callback with stale_info 0 EVEN
+                // for a stale/race block: an accepted race is a real, paid win and
+                // must be credited (broadcast_bestblock + schedule_block_verification).
+                // record_found_block dedups by block hash, so firing at verdict time
+                // is double-record-safe.
+                if (m_on_block_submitted && hex_data.size() >= 160) {
                     m_on_block_submitted(hex_data.substr(0, 160), 0);
                 }
                 // Relay full block via P2P for fast propagation
@@ -1896,23 +1897,25 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
                     m_on_block_relay(hex_data);
                 }
             } else {
-                // Daemon REJECTED the block: return its verdict to the caller
-                // (submit_block_hex maps daemon null=accept to true; any non-null
-                // reject/duplicate string to false — the reject reason is logged
-                // by submit_block_hex itself). Do NOT synthesize a "stale" error.
-                // We do NOT fire a found-block callback here (preserving the prior
-                // telemetry, which only recorded on the exception path): a "false"
-                // return can also mean daemon-duplicate (block already accepted via
-                // P2P), and recording that as DOA would mis-count a won block.
+                // Daemon REJECTED (or already had) the block: return its verdict to
+                // the caller instead of a synthetic "stale" error. Fire the single
+                // callback ONLY for a stale/race block, recording it as ORPHAN (253)
+                // so the race stays visible. For a NON-stale block fire nothing —
+                // matching the prior telemetry (which only recorded on the exception
+                // path) — and because a "false" return can also mean daemon-duplicate
+                // (block already accepted via P2P), which must not be mis-counted.
                 LOG_WARNING << "submitblock: coin daemon rejected the block (or already had it)";
+                if (is_stale && m_on_block_submitted && hex_data.size() >= 160) {
+                    m_on_block_submitted(hex_data.substr(0, 160), 253);
+                }
                 return {{"error", "block rejected by coin daemon"}};
             }
         } catch (const std::exception& e) {
             LOG_ERROR << "submitblock failed: " << e.what();
-            // Fire callback with doa stale info (254). Suppressed for a stale/race
-            // block (already fired 253 above — no double-record).
-            if (!is_stale && m_on_block_submitted && hex_data.size() >= 160) {
-                m_on_block_submitted(hex_data.substr(0, 160), 254);
+            // DOA (RPC transport failure — no verdict). Fire the single callback:
+            // 253 for a stale/race block, else 254.
+            if (m_on_block_submitted && hex_data.size() >= 160) {
+                m_on_block_submitted(hex_data.substr(0, 160), is_stale ? 253 : 254);
             }
             return {{"error", std::string(e.what())}};
         }
@@ -1958,11 +1961,12 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
             }
         }
 
-        // Fire block-found callback immediately (synchronous — updates stats).
-        // Suppressed for a stale/race block, which already fired 253 above (no
-        // double-record); the block is still relayed via P2P below regardless.
-        if (!is_stale && m_on_block_submitted && hex_data.size() >= 160)
-            m_on_block_submitted(hex_data.substr(0, 160), 0);
+        // Fire the single found-block callback synchronously (embedded has no
+        // synchronous daemon verdict — it relays via P2P and does async RPC
+        // feedback below). A stale/race block is recorded as ORPHAN (253); a fresh
+        // block as WON (0). The block is still relayed via P2P regardless.
+        if (m_on_block_submitted && hex_data.size() >= 160)
+            m_on_block_submitted(hex_data.substr(0, 160), is_stale ? 253 : 0);
 
         // Thread the slow parts (P2P relay + RPC) so stratum isn't blocked.
         // P2P relay runs FIRST — fast propagation is critical for block acceptance.
@@ -1994,6 +1998,10 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
         }).detach();
     } else {
         LOG_WARNING << "[LTC] submitblock: no coin RPC or embedded node connected, block discarded";
+        // No verdict and no forward path: a stale/race block is genuinely lost
+        // here, so record it as ORPHAN (253) to keep the race visible in metrics.
+        if (is_stale && m_on_block_submitted && hex_data.size() >= 160)
+            m_on_block_submitted(hex_data.substr(0, 160), 253);
     }
 
     return nullptr; // null = accepted in getblocktemplate spec
