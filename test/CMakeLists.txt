@@ -263,6 +263,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_conformance PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
     gtest_add_tests(test_dash_conformance "" AUTO)
 
+    # DASH share-v16 BYTE-PARITY KAT (T1c gate): round-trips REAL captured
+    # p2pool-dash oracle-gate wire bytes (test/data/dash_oracle_corpus.hpp)
+    # through the production load_share/DashFormatter path and demands byte
+    # identity — the real-corpus test the 2026-07-21 audit flagged as missing.
+    # Mirrors the test_dash_conformance link set.
+    add_executable(test_dash_oracle_byte_parity test_dash_oracle_byte_parity.cpp)
+    target_link_libraries(test_dash_oracle_byte_parity PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_oracle_byte_parity PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
+    gtest_add_tests(test_dash_oracle_byte_parity "" AUTO)
+
     # DASH min-protocol-version ratchet gate KAT (#643, option a): pure, header-only
     # policy object; no socket/ltc/pool dependency. Mirrors the test_dash_conformance link set.
     add_executable(test_dash_min_protocol_gate test_dash_min_protocol_gate.cpp)
