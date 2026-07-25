@@ -37,7 +37,7 @@ inline core::CoinParams make_coin_params(bool testnet)
 
     // Subsidy: 50 LTC halving every 840,000 blocks
     p.subsidy_func = [](uint32_t height) -> uint64_t {
-        return uint64_t(50) * 100000000ULL >> ((height + 1) / 840000);
+        return uint64_t(50) * 100000000ULL >> (height / 840000);
     };
 
     p.dust_threshold = 100000;  // 0.001 LTC
