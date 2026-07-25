@@ -3,6 +3,7 @@
 #include "share.hpp"
 #include "mint_runloop.hpp"   // dash::mint::elect_best_share (election policy SSOT)
 #include "known_txs_retention.hpp"  // dash::retain_template_txs / all_txs_backable (F1/F3)
+#include "think_gate.hpp"     // dash::think:: think-slot protocol + clean-cycle tip decision (#854)
 
 #include <cassert>
 
@@ -488,16 +489,37 @@ void NodeImpl::apply_min_protocol_ratchet()
 
 void NodeImpl::run_think()
 {
+    // THREAD-CONFINEMENT (enforced, not assumed — register_template_txs
+    // precedent): the think-slot flags (m_think_running / m_rethink_pending)
+    // are IO-thread-only. Every caller is on the single ioc.run() thread: the
+    // mint hook (add_local_share), the reception path (add_verified_shares,
+    // which posts itself back to m_context after the verify pool), the 2 s
+    // advert drain, and both cycles' IO-phase epilogues. The compute thread
+    // NEVER touches them — it only runs the tracker under the exclusive lock.
+    // A compute-thread caller would break the "release then re-post" handshake
+    // below (it would re-enter the slot it still owns), so trip loudly in
+    // debug builds rather than let it be discovered in production.
+    assert(!is_compute_thread() &&
+           "run_think must not be called from the compute thread — the think "
+           "slot (m_think_running/m_rethink_pending) is IO-thread-confined");
+
     // Serialize: only one think() in flight (compute pool has 1 thread).
-    if (m_think_running.exchange(true)) {
+    // #854: a skipped request is no longer DROPPED — acquire_think_slot()
+    // records it in m_rethink_pending and the cycle that owns the slot
+    // re-posts run_think() when it releases. Without that, a local mint or a
+    // peer best-advert landing during a think/clean IO-phase (tracker lock
+    // already released, flag still true) silently loses its re-election, so
+    // the tip change never reaches the rigs until the 25 s keepalive.
+    if (!dash::think::acquire_think_slot(m_think_running, m_rethink_pending)) {
         static int skip_log = 0;
         if (skip_log++ % 20 == 0)
-            LOG_INFO << "[ASYNC-THINK] skipped — compute thread busy";
+            LOG_INFO << "[ASYNC-THINK] skipped — compute thread busy (re-think queued)";
         return;
     }
     if (!m_context) {
-        // Rig-free (KAT/standalone) node: no IO context to hop back to.
-        m_think_running.store(false);
+        // Rig-free (KAT/standalone) node: no IO context to hop back to, so
+        // there is nowhere to post a queued re-think either — drop it.
+        (void)dash::think::release_think_slot(m_think_running, m_rethink_pending);
         return;
     }
 
@@ -611,16 +633,24 @@ void NodeImpl::run_think()
 
             drain_pending_adds();
 
-            m_think_running.store(false);
+            // #854: release_think_slot() reports whether a run_think() request
+            // was dropped while this cycle held the slot — e.g. the mint that
+            // drain_pending_adds()/add_local_share() just landed. Serve it, or
+            // that share's election (and the miner notify it drives) is lost
+            // until the next timer tick.
+            const bool rethink_owed =
+                dash::think::release_think_slot(m_think_running, m_rethink_pending);
 
-            if (needs_continue)
+            if (needs_continue || rethink_owed)
                 boost::asio::post(*m_context, [this]() { run_think(); });
           } catch (const std::exception& e) {
             LOG_ERROR << "run_think() IO phase failed: " << e.what();
-            m_think_running.store(false);
+            if (dash::think::release_think_slot(m_think_running, m_rethink_pending))
+                boost::asio::post(*m_context, [this]() { run_think(); });
           } catch (...) {
             LOG_ERROR << "run_think() IO phase failed: unknown error";
-            m_think_running.store(false);
+            if (dash::think::release_think_slot(m_think_running, m_rethink_pending))
+                boost::asio::post(*m_context, [this]() { run_think(); });
           }
         });
     });
@@ -812,11 +842,12 @@ void NodeImpl::drain_peer_best_adverts()
             to_download.emplace_back(weak_peer, best);
         }
     }
-    // TODO(dash-async, follow-up): when drain_peer_best_adverts runs FROM the
-    // think() IO-phase, m_think_running is still true, so this run_think() is a
-    // no-op (skipped). A m_rethink_pending flag checked at the end of the think
-    // cycle would guarantee the re-election happens. Benign today: the 2s
-    // advert timer calls drain again shortly, and by then think() has finished.
+    // #854 (was a TODO here): when drain_peer_best_adverts runs FROM the
+    // think() IO-phase, m_think_running is still true, so this run_think()
+    // cannot start a cycle. It is no longer a no-op — acquire_think_slot()
+    // records the request in m_rethink_pending and the owning cycle re-posts
+    // run_think() when it releases, so the re-election is guaranteed rather
+    // than left to the next 2 s advert-timer tick.
     if (rethink)
         run_think();
     for (auto& [weak_peer, best] : to_download)
@@ -913,26 +944,25 @@ void NodeImpl::clean_tracker()
     if (m_clean_running.exchange(true))
         return;
 
-    // Skip if think() is already in flight — the periodic timer will retry.
-    // TODO(dash-async, follow-up): this load()-then-store() is check-then-act;
-    // a run_think() could win the m_think_running flag between the load and the
-    // store below. Benign today because both only ever run on the IO thread
-    // (the timer callbacks are serialized on the single io_context), so there
-    // is no true concurrency — but a compare_exchange on m_think_running would
-    // make the guard symmetric with the exchange() above and future-proof.
-    if (m_think_running.load()) {
-        m_clean_running.store(false);
-        return;
-    }
     if (!m_context) {
         m_clean_running.store(false);
         return;   // rig-free (KAT/standalone) node
     }
 
+    // Take the think slot, which also blocks run_think() re-entry for the
+    // duration of the clean. #854: acquire_clean_slot() is a compare_exchange,
+    // closing the load()-then-store() check-then-act window this prologue used
+    // to carry as a TODO — the guard is now symmetric with the m_clean_running
+    // exchange() above. A failure records NO pending re-think: the think cycle
+    // that won the slot performs the same election clean's Step 1 would, and
+    // the periodic timer retries the prune shortly.
+    if (!dash::think::acquire_clean_slot(m_think_running)) {
+        m_clean_running.store(false);
+        return;
+    }
+
     // Post the entire body to the compute thread: chain modifications happen
     // under the exclusive lock, never concurrent with think() or IO reads.
-    m_think_running.store(true);  // block think() re-entry during clean
-
     boost::asio::post(m_think_pool, [this]() {
       m_compute_thread_id.store(std::this_thread::get_id(), std::memory_order_relaxed);
 
@@ -940,6 +970,14 @@ void NodeImpl::clean_tracker()
       bool bootstrap = false;
       try {
         std::unique_lock lock(m_tracker_mutex);  // exclusive
+
+        // #854: the tip AS THE CLEAN CYCLE FOUND IT. clean_best_changed is
+        // decided against this, not against the value Step 1 has already
+        // written — otherwise an election absorbed by Step 1 (the case a mint
+        // landing during a think IO-phase produces) makes Step 4's comparison
+        // trivially false and no work is pushed to the rigs. Read under the
+        // exclusive lock, on the compute thread, before either think() runs.
+        const uint256 best_at_entry = m_best_share_hash;
 
         auto block_rel_height = m_block_rel_height_fn
             ? m_block_rel_height_fn
@@ -1072,10 +1110,16 @@ void NodeImpl::clean_tracker()
                                           /*bits=*/0, bootstrap);
             m_last_top5_heads = std::move(result.top5_heads);
             if (!result.best.IsNull()) {
-                clean_best_changed = (m_best_share_hash != result.best);
                 m_best_share_hash = result.best;
                 apply_min_protocol_ratchet();  // v36 accept-floor ratchet (dgb node.cpp:2077 parallel)
             }
+            // #854: decide across BOTH thinks — entry tip vs exit tip. Placed
+            // outside the IsNull() guard on purpose: if Step 1 elected a new
+            // tip and Step 4's think returns nothing (e.g. everything it would
+            // have scored was just pruned), m_best_share_hash still carries
+            // Step 1's election and that IS a tip change the rigs must see.
+            clean_best_changed =
+                dash::think::clean_cycle_best_changed(best_at_entry, m_best_share_hash);
             publish_snapshot();
             flush_verified_to_leveldb();
         }
@@ -1100,6 +1144,10 @@ void NodeImpl::clean_tracker()
         try {
             if (clean_best_changed) {
                 LOG_INFO << "[CLEAN] IO-phase: work refresh (best changed)";
+                // Same single fan-out every other tip-change leg uses: the
+                // binding in main_dash.cpp calls dash::stratum::
+                // fire_share_tip_refresh (bump -> notify_all -> dashboard).
+                // No second notify call-site with its own logic.
                 if (m_on_best_share_changed)
                     m_on_best_share_changed();
                 broadcast_share(m_best_share_hash);  // re-announce new head
@@ -1110,8 +1158,14 @@ void NodeImpl::clean_tracker()
         } catch (...) {
             LOG_ERROR << "[CLEAN] IO phase failed: unknown error";
         }
-        m_think_running.store(false);
+        // #854: the clean cycle holds the think slot too, so run_think()
+        // requests that arrived during it (a mint, a peer best-advert) were
+        // queued rather than dropped — serve them now.
+        const bool rethink_owed =
+            dash::think::release_think_slot(m_think_running, m_rethink_pending);
         m_clean_running.store(false);
+        if (rethink_owed)
+            boost::asio::post(*m_context, [this]() { run_think(); });
       });
     });
 }
@@ -1379,6 +1433,11 @@ uint256 NodeImpl::add_local_share(ShareType share)
     }
 
     // Lock released — relay + rescore (both take their own locks / post).
+    // #854: this run_think() is the ONLY thing that promotes the share we just
+    // minted to the tip and thereby pushes fresh work to the rigs. It used to
+    // be dropped outright whenever it landed during a think/clean IO-phase
+    // (IO thread, tracker lock already released, m_think_running still true) —
+    // the residual missed-notify path. acquire_think_slot() now queues it.
     broadcast_share(hash);
     run_think();
     return hash;

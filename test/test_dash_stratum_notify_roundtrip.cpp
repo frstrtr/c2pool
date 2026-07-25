@@ -39,6 +39,7 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <map>
@@ -49,6 +50,7 @@
 #include <impl/dash/coinbase_builder.hpp>  // merkle_branches_raw, sha256d, EXTRANONCE2_SIZE
 #include <impl/dash/stratum/tip_refresh.hpp>   // fire_share_tip_refresh (tip-change fan-out)
 #include <impl/dash/local_mint_ledger.hpp>     // LocalMintLedger / classify_local_mint
+#include <impl/dash/think_gate.hpp>            // acquire/release_think_slot, clean_cycle_best_changed (#854)
 #include <btclibs/util/strencodings.h>     // HexStr
 #include <core/uint256.hpp>
 
@@ -464,4 +466,256 @@ TEST(DashLocalMintLedger, PendingSetIsBounded) {
     EXPECT_EQ(s.pending, static_cast<uint64_t>(dash::mint::LocalMintLedger::kMaxPending));
     EXPECT_EQ(s.dropped, 10u);
     EXPECT_DOUBLE_EQ(s.orphan_rate, 0.0);   // nothing settled -> no rate invented
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// #854 — the RESIDUAL missed-notify paths #853 did not cover.
+//
+// #853 fixed the callback (it now pushes mining.notify instead of only
+// invalidating the cached payload). What it could not fix from that seam is
+// WHEN the callback runs at all. Two pre-existing holes in src/impl/dash/
+// node.cpp kept a real sharechain tip change from ever reaching it:
+//
+//   (A) CLEAN Step 1 absorbs the election. clean_tracker() runs think() twice
+//       and BOTH passes assign m_best_share_hash; the pre-#854 code decided
+//       "did the tip move" inside Step 4 only, against the value Step 1 had
+//       ALREADY written — so an election that materialised in Step 1 compared
+//       equal, clean_best_changed stayed false and nothing was pushed.
+//
+//   (B) The skipped-think race. run_think() bailed out when m_think_running
+//       was set and DROPPED the request. A local mint (add_local_share) or a
+//       peer best-advert lands on the IO thread during a think/clean IO-phase
+//       — tracker lock already released, flag still true — so the re-election
+//       that would promote the just-minted share to the tip never ran.
+//
+// Both then fall through to the 25 s keepalive, which is NON-clean
+// (clean_jobs is keyed on the COIN prevhash, core/stratum_server.cpp:1711), so
+// the ASIC drains its queued stale work first: a rare bounded sibling burst.
+//
+// These KATs run the REAL landed helpers (src/impl/dash/think_gate.hpp) and
+// the REAL fan-out (fire_share_tip_refresh), and each one carries the
+// pre-#854 formula verbatim alongside so the divergence is pinned, not
+// asserted. Every pre-#854 expectation below FAILS against master.
+//
+// Consensus-neutral by construction: nothing here (or in the code it pins)
+// reads or writes a share, a timestamp, a gentx, a ref_hash, a PPLNS weight,
+// or the won-block path. It decides only when an election re-runs and when
+// miners are told.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Mirrors NodeImpl::clean_tracker()'s compute phase: `best` stands in for
+// m_best_share_hash, and the two arguments are what each think() elected
+// (null = think returned no best, e.g. everything scorable was just pruned).
+struct CleanCycleSim {
+    uint256 best;
+
+    // The LANDED (#854) decision: entry tip vs exit tip, across both thinks.
+    bool run(const uint256& step1_best, const uint256& step4_best) {
+        const uint256 best_at_entry = best;
+        if (!step1_best.IsNull()) best = step1_best;    // Step 1
+        if (!step4_best.IsNull()) best = step4_best;    // Step 4
+        return dash::think::clean_cycle_best_changed(best_at_entry, best);
+    }
+
+    // The pre-#854 decision, verbatim from master: computed inside Step 4's
+    // IsNull() guard, against the value Step 1 already overwrote.
+    bool run_pre854(const uint256& step1_best, const uint256& step4_best) {
+        bool clean_best_changed = false;
+        if (!step1_best.IsNull()) best = step1_best;
+        if (!step4_best.IsNull()) {
+            clean_best_changed = (best != step4_best);
+            best = step4_best;
+        }
+        return clean_best_changed;
+    }
+};
+
+// What the rigs actually see: the clean IO-phase fires the shared fan-out.
+int notifies_for(bool clean_best_changed) {
+    SpyLog log;
+    SpyWorkSource ws{&log};
+    SpyStratumServer ss{&log};
+    SpyWebServer web{&log};
+    if (clean_best_changed)
+        dash::stratum::fire_share_tip_refresh(&ws, &ss, &web);
+    return ss.notifies;
+}
+
+} // namespace
+
+// (15) THE #854 REGRESSION PIN: a tip change absorbed by CLEAN Step 1 must
+//      still push work. Step 4 re-elects the SAME share Step 1 just installed,
+//      which is exactly what happens when the election has already converged
+//      by the time the prune finishes.
+TEST(DashCleanCycleTipRefresh, TipChangeAbsorbedByStep1PushesNotify) {
+    const uint256 A = fill_hash(0xA1);   // tip as the clean cycle found it
+    const uint256 B = fill_hash(0xB2);   // the new tip (e.g. our fresh mint)
+
+    CleanCycleSim sim{A};
+    EXPECT_TRUE(sim.run(/*step1=*/B, /*step4=*/B))
+        << "tip moved A->B inside the clean cycle but the cycle reported no change";
+    EXPECT_EQ(sim.best, B);
+    EXPECT_EQ(notifies_for(true), 1);
+
+    // Master's formula on the same inputs: B != B -> false -> zero notifies.
+    CleanCycleSim pre{A};
+    EXPECT_FALSE(pre.run_pre854(B, B));
+    EXPECT_EQ(notifies_for(false), 0);
+}
+
+// (16) Step 1 elects, Step 4's think returns nothing (its scorable heads were
+//      pruned). Step 1's election still stands in m_best_share_hash and IS the
+//      tip the rigs must be moved to — master skipped the flag entirely here,
+//      because it lived inside Step 4's IsNull() guard.
+TEST(DashCleanCycleTipRefresh, Step1ElectionSurvivesEmptyStep4) {
+    const uint256 A = fill_hash(0xA1), B = fill_hash(0xB2);
+
+    CleanCycleSim sim{A};
+    EXPECT_TRUE(sim.run(/*step1=*/B, /*step4=*/uint256()));
+    EXPECT_EQ(sim.best, B);
+
+    CleanCycleSim pre{A};
+    EXPECT_FALSE(pre.run_pre854(B, uint256()));
+}
+
+// (17) No regression on the path master DID handle: the tip moves only in
+//      Step 4 (the prune changed the scoring). Both formulas agree.
+TEST(DashCleanCycleTipRefresh, Step4OnlyTipChangeStillPushesNotify) {
+    const uint256 A = fill_hash(0xA1), C = fill_hash(0xC3);
+
+    CleanCycleSim sim{A};
+    EXPECT_TRUE(sim.run(/*step1=*/A, /*step4=*/C));
+    CleanCycleSim pre{A};
+    EXPECT_TRUE(pre.run_pre854(A, C));
+    EXPECT_EQ(notifies_for(true), 1);
+}
+
+// (18) A quiet clean cycle must NOT push: no tip change, no notify. Clean runs
+//      on a periodic timer, so a false positive here would spam every rig with
+//      clean_jobs=true and throw away queued work for nothing.
+TEST(DashCleanCycleTipRefresh, UnchangedTipDoesNotPush) {
+    const uint256 A = fill_hash(0xA1);
+
+    CleanCycleSim sim{A};
+    EXPECT_FALSE(sim.run(A, A));
+    EXPECT_FALSE(sim.run(uint256(), uint256()));   // neither think elected
+    EXPECT_EQ(sim.best, A);
+    EXPECT_EQ(notifies_for(false), 0);
+
+    // And a node that has never elected anything is not a tip change.
+    CleanCycleSim fresh{uint256()};
+    EXPECT_FALSE(fresh.run(uint256(), uint256()));
+}
+
+// (19) THE SKIP-RACE PIN: a run_think() request that loses the slot is QUEUED,
+//      and the owning cycle serves it on release. Pre-#854 it was dropped.
+TEST(DashThinkGate, SkippedRunThinkIsQueuedAndServed) {
+    std::atomic<bool> running{false}, pending{false};
+
+    // Cycle #1 takes the slot.
+    ASSERT_TRUE(dash::think::acquire_think_slot(running, pending));
+
+    // IO-phase of cycle #1: a local mint lands and calls run_think().
+    EXPECT_FALSE(dash::think::acquire_think_slot(running, pending))
+        << "a second cycle must not start while one is in flight";
+    EXPECT_TRUE(pending.load()) << "the dropped request was not remembered";
+
+    // Cycle #1 releases: it is told a re-think is owed, and the flag is
+    // consumed so the re-think happens exactly once.
+    EXPECT_TRUE(dash::think::release_think_slot(running, pending));
+    EXPECT_FALSE(pending.load());
+    EXPECT_FALSE(running.load());
+
+    // The owed re-think runs and finds nothing further queued.
+    ASSERT_TRUE(dash::think::acquire_think_slot(running, pending));
+    EXPECT_FALSE(dash::think::release_think_slot(running, pending));
+}
+
+// (20) N dropped requests collapse into ONE re-think — think() is a full
+//      re-election over the current chain, so one pass subsumes them all. This
+//      is what keeps the fix from turning a burst into a think storm.
+TEST(DashThinkGate, ManySkipsCollapseToOneRethink) {
+    std::atomic<bool> running{false}, pending{false};
+    ASSERT_TRUE(dash::think::acquire_think_slot(running, pending));
+    for (int i = 0; i < 16; ++i)
+        EXPECT_FALSE(dash::think::acquire_think_slot(running, pending));
+    EXPECT_TRUE(dash::think::release_think_slot(running, pending));
+    EXPECT_FALSE(dash::think::release_think_slot(running, pending));
+}
+
+// (21) An idle cycle owes nothing: no spurious re-post, no think loop.
+TEST(DashThinkGate, QuietCycleOwesNoRethink) {
+    std::atomic<bool> running{false}, pending{false};
+    ASSERT_TRUE(dash::think::acquire_think_slot(running, pending));
+    EXPECT_FALSE(dash::think::release_think_slot(running, pending));
+    EXPECT_FALSE(running.load());
+}
+
+// (22) The CLEAN slot is a compare_exchange (closing the pre-#854
+//      load()-then-store() check-then-act window) and a lost CLEAN queues
+//      NOTHING — the think that beat it already performs that election, and
+//      clean's own periodic timer retries the prune.
+TEST(DashThinkGate, CleanSlotIsAtomicAndQueuesNothing) {
+    std::atomic<bool> running{false}, pending{false};
+
+    ASSERT_TRUE(dash::think::acquire_clean_slot(running));
+    EXPECT_TRUE(running.load());
+
+    // A think starting now must lose, and IS queued (it is a real election).
+    EXPECT_FALSE(dash::think::acquire_think_slot(running, pending));
+    EXPECT_TRUE(pending.load());
+
+    // A second clean must lose, and must NOT leave the flag set on its own.
+    std::atomic<bool> running2{true}, pending2{false};
+    EXPECT_FALSE(dash::think::acquire_clean_slot(running2));
+    EXPECT_FALSE(pending2.load());
+
+    // Clean's IO-phase release serves the think that was queued during it.
+    EXPECT_TRUE(dash::think::release_think_slot(running, pending));
+}
+
+// (23) End to end, the production sequence: a share is minted while a think
+//      cycle is in its IO-phase; the queued re-think elects it as the new tip;
+//      the tip change fires the SAME fan-out every other leg uses, so the rigs
+//      are pushed a clean job. Pre-#854 the request was dropped and the rigs
+//      saw nothing until the (non-clean) 25 s keepalive.
+TEST(DashThinkGate, MintDuringThinkIoPhaseStillReachesTheMiners) {
+    const uint256 OLD_TIP = fill_hash(0x51);
+    const uint256 MINTED  = fill_hash(0x52);
+
+    SpyLog log;
+    SpyWorkSource ws{&log};
+    SpyStratumServer ss{&log};
+    SpyWebServer web{&log};
+
+    std::atomic<bool> running{false}, pending{false};
+    uint256 best = OLD_TIP;
+
+    // Cycle #1 runs and elects nothing new.
+    ASSERT_TRUE(dash::think::acquire_think_slot(running, pending));
+    // ... IO-phase (lock released, flag still set): add_local_share() lands
+    //     MINTED in the chain and calls run_think().
+    const bool started_now = dash::think::acquire_think_slot(running, pending);
+    EXPECT_FALSE(started_now);
+    // Cycle #1 releases and is told to serve the queued re-think.
+    ASSERT_TRUE(dash::think::release_think_slot(running, pending));
+
+    // The owed re-think: the election now sees MINTED as the best head.
+    ASSERT_TRUE(dash::think::acquire_think_slot(running, pending));
+    const uint256 best_at_entry = best;
+    best = MINTED;
+    const bool best_changed = (best != best_at_entry);
+    EXPECT_FALSE(dash::think::release_think_slot(running, pending));
+
+    ASSERT_TRUE(best_changed);
+    if (best_changed)
+        dash::stratum::fire_share_tip_refresh(&ws, &ss, &web);
+
+    EXPECT_EQ(ss.notifies, 1) << "the freshly minted tip never reached the rigs";
+    ASSERT_EQ(log.calls.size(), 3u);
+    EXPECT_EQ(log.calls[0], "bump");
+    EXPECT_EQ(log.calls[1], "notify");
+    EXPECT_EQ(log.calls[2], "web");
 }

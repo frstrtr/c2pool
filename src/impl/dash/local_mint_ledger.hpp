@@ -50,6 +50,28 @@ enum class MintVerdict {
 /// height and get_nth_parent_via_skip() is the O(log n) Bitcoin-Core skip-list
 /// walk — the same two primitives the producer walks already use. The caller
 /// holds the tracker read guard.
+///
+/// ── LOCK-SAFETY NOTE (do not delete — #828 GP-fault crash class) ────────────
+/// Both primitives are NON-CONST and mutate lazily-built caches, yet the only
+/// caller (main_dash.cpp's best-share-changed binding) holds a SHARED tracker
+/// lock, so two of them can run concurrently. That is safe TODAY, and ONLY
+/// because each cache carries its own internal LEAF mutex:
+///
+///   * get_acc_height() -> TrackerView::get_delta() populates m_deltas /
+///     m_reverse_deltas / m_delta_refs / m_reverse_delta_refs, all serialized
+///     by TrackerView::m_cache_mutex (src/sharechain/tracker_view.hpp:118-124);
+///   * get_nth_parent_via_skip() -> DistanceSkipList builds m_skips lazily,
+///     serialized by DistanceSkipList::m_skips_mutex (src/sharechain/
+///     skip_list.hpp:76-80), documented there as a leaf — taken around each
+///     individual map operation, with m_previous_fn invoked outside it, so it
+///     never nests with the tracker lock.
+///
+/// Strip either leaf mutex — e.g. a "faster" unsynchronized height/skip cache
+/// refactor — and this call becomes one thread rehashing an unordered_map
+/// while another iterates it: the exact freed-memory dereference of the #828
+/// GP-fault class. If you touch those caches, either keep the leaf mutexes or
+/// promote this call site to the EXCLUSIVE tracker lock. Do NOT reason "the
+/// tracker lock protects it" — the tracker lock is SHARED here, by design.
 template <typename ChainT>
 inline MintVerdict classify_local_mint(ChainT& chain,
                                        const uint256& best_share,
