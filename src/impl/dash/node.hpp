@@ -769,7 +769,10 @@ public:
     /// the message_shares wire codec (+ remember_tx/forget_tx for txs the
     /// peer lacks). try_to_lock; deferred if the compute thread is busy.
     void broadcast_share(const uint256& share_hash);
-    void send_shares(peer_ptr peer, const std::vector<uint256>& share_hashes);
+    /// Returns the hashes actually SENT to `peer` (those passing the tx-
+    /// completeness gate); broadcast_share marks only these as shared (F2).
+    std::vector<uint256> send_shares(peer_ptr peer,
+                                     const std::vector<uint256>& share_hashes);
 
     /// Insert a locally-minted, ALREADY self-verified share into the tracker
     /// (+ LevelDB persist + attempt_verify), then broadcast + run_think.
