@@ -423,4 +423,94 @@ TEST(BtcReconstructWiring, FailClosedShareBroadcastsNothing)
     EXPECT_EQ(submit_calls, 0);
 }
 
+
+// =============================================================================
+// G1 BYTE-PARITY KAT -- reconstruct_won_block(...).hex vs an INDEPENDENTLY
+// composed block serialization (fixtures-only; rides btc_share_test; no
+// production code, no CMake/build.yml, no shared-core edit).
+//
+// NON-CIRCULAR: the expected side is assembled here field-by-field through the
+// PackStream primitive in the exact wire order BlockType::Serialize documents
+// (block.hpp:48-56,92) -- fixed uint32 version, prev, merkle_root, time, bits,
+// nonce, then CompactSize(tx count) ++ each tx's non-witness bytes (witness-less
+// fixtures => TX_WITH_WITNESS == TX_NO_WITNESS). A refactor that reorders a
+// header field, drops the count prefix, or mis-orders [gentx]++other_txs fails
+// HERE even though every other reconstruct_test assertion (SUT-vs-SUT) stays
+// green.
+
+// CompactSize for the tx-count fixtures used below (all < 0xfd => single byte).
+void put_compact_size(std::vector<unsigned char>& out, uint64_t n)
+{
+    ASSERT_LT(n, 0xfdu) << "fixtures keep tx count in the single-byte CompactSize range";
+    out.push_back(static_cast<unsigned char>(n));
+}
+
+// Independent wire composition of the reconstructed block (see banner).
+std::string expected_block_hex(const SmallBlockHeaderType& sh,
+                               const uint256& merkle_root,
+                               const std::vector<std::vector<unsigned char>>& txs_nonwitness)
+{
+    PackStream ps;
+    uint32_t v32 = static_cast<uint32_t>(sh.m_version);
+    ps << v32;                    // fixed 4-byte LE (NOT the small-header VarInt)
+    ps << sh.m_previous_block;    // 32
+    ps << merkle_root;            // 32
+    ps << sh.m_timestamp;         // 4 LE
+    ps << sh.m_bits;              // 4 LE
+    ps << sh.m_nonce;             // 4 LE
+
+    std::vector<unsigned char> out(
+        reinterpret_cast<const unsigned char*>(ps.data()),
+        reinterpret_cast<const unsigned char*>(ps.data()) + ps.size());
+    put_compact_size(out, txs_nonwitness.size());
+    for (const auto& t : txs_nonwitness) out.insert(out.end(), t.begin(), t.end());
+    return to_hex_lower(out);
+}
+
+// --- Parity 1: coinbase-only block, empty merkle link => root == gentx txid ----
+TEST(BtcReconstructByteParity, CoinbaseOnlyMatchesIndependentWire)
+{
+    auto sh = make_small_header();
+    auto gentx = make_gentx();
+    auto gid = gentx_txid(gentx);
+    ::btc::MerkleLink empty;
+
+    auto r = reconstruct_won_block(sh, LEGACY_VER, empty, std::nullopt, gentx, gid, {});
+    EXPECT_EQ(r.hex, expected_block_hex(sh, gid, { gentx_nonwitness_bytes(gentx) }));
+}
+
+// --- Parity 2: gentx + one template tx, root walked one branch, order [cb, t1] -
+TEST(BtcReconstructByteParity, TemplateTxOrderedMatchesIndependentWire)
+{
+    auto sh = make_small_header();
+    auto gentx = make_gentx();
+    auto gid = gentx_txid(gentx);
+    auto tx1 = make_tx(10);
+    auto t1id = other_tx_txid(tx1);
+    auto link = one_branch_link(t1id);
+
+    auto r = reconstruct_won_block(sh, LEGACY_VER, link, std::nullopt, gentx, gid, { tx1 });
+    EXPECT_EQ(r.hex, expected_block_hex(sh, pair_hash(gid, t1id),
+                                        { gentx_nonwitness_bytes(gentx),
+                                          gentx_nonwitness_bytes(tx1) }));
+}
+
+// --- Parity 3: hex is exactly the lowercase encoding of the relayed bytes ------
+TEST(BtcReconstructByteParity, HexIsLowercaseOfRelayBytes)
+{
+    auto sh = make_small_header();
+    auto gentx = make_gentx();
+    auto gid = gentx_txid(gentx);
+    auto tx1 = make_tx(10);
+    auto t1id = other_tx_txid(tx1);
+    auto link = one_branch_link(t1id);
+
+    auto r = reconstruct_won_block(sh, LEGACY_VER, link, std::nullopt, gentx, gid, { tx1 });
+    EXPECT_EQ(r.hex, to_hex_lower(r.bytes));
+    EXPECT_EQ(r.hex, expected_block_hex(sh, pair_hash(gid, t1id),
+                                        { gentx_nonwitness_bytes(gentx),
+                                          gentx_nonwitness_bytes(tx1) }));
+}
+
+
 } // namespace
