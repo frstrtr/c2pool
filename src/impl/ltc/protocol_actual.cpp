@@ -260,7 +260,10 @@ void Actual::HANDLER(remember_tx)
         peer->m_remembered_txs.insert_or_assign(tx_hash, full_tx);
 
         if (!m_known_txs.contains(tx_hash))
+        {
             m_known_txs.emplace(tx_hash, std::move(full_tx));
+            m_known_txs_order.push_back(tx_hash); // recency for bounded eviction
+        }
     }
 }
 

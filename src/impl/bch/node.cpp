@@ -1385,8 +1385,13 @@ void NodeImpl::prune_shares(const uint256& /*best_share*/)
     // Cache cleanup (kept from original)
     if (m_shared_share_hashes.size() > m_max_shared_hashes)
         m_shared_share_hashes.clear();
+    // Recency-preserving bounded eviction (was: wholesale clear()). Dropping the
+    // whole cache at once destroyed every forwardable tx byte, so a share relay
+    // that referenced a just-dropped tx could no longer remember_tx-forward it
+    // and the canonical peer disconnected with "referenced unknown transaction".
+    // Evict oldest-first down to the cap, keeping the most-recently-learned txs.
     if (m_known_txs.size() > m_max_known_txs)
-        m_known_txs.clear();
+        core::evict_known_txs_to_cap(m_known_txs, m_known_txs_order, m_max_known_txs);
     if (m_raw_share_cache.size() > m_max_raw_shares)
         m_raw_share_cache.clear();
 }

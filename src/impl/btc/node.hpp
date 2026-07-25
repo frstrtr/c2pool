@@ -12,6 +12,7 @@
 #include <pool/protocol.hpp>
 #include <core/message.hpp>
 #include <core/reply_matcher.hpp>
+#include <core/known_txs_eviction.hpp>
 #include <sharechain/prepared_list.hpp>
 #include <c2pool/storage/sharechain_storage.hpp>
 
@@ -54,6 +55,13 @@ protected:
     // Global pool of known transactions, populated by remember_tx and coin daemon.
     // Protocol handlers look up tx hashes here when processing shares.
     std::map<uint256, coin::Transaction> m_known_txs;
+    // Insertion-order recency sidecar for m_known_txs. Recorded at each NEW
+    // remember_tx insert; consumed by prune_shares to evict OLDEST-first down to
+    // m_max_known_txs instead of the old wholesale clear() (which dropped every
+    // forwardable tx byte at once -> canonical "referenced unknown transaction"
+    // disconnect). Tx-forwarding only; no consensus/mint state. See
+    // core::evict_known_txs_to_cap (core/known_txs_eviction.hpp).
+    std::deque<uint256> m_known_txs_order;
 
     // Thread pool for parallel share_init_verify (scrypt CPU work).
     // Keeps expensive crypto off the io_context thread.
