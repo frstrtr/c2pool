@@ -564,6 +564,89 @@ TEST(HeaderChainValidate, RealScryptDigestFeedsSatisfactionGate)
 }
 
 // ---------------------------------------------------------------------------
+// EXTERNALLY-ANCHORED Scrypt PoW parity KAT (criterion-2 anchor, integrator
+// 2026-07-26). The self-derived case above pins drift-freedom; this pins
+// CORRECTNESS against an INDEPENDENT expectation on a REAL DGB mainnet header,
+// so a scrypt/LE-conversion bug that happened to be stable would still be caught.
+//
+// Fixture: DigiByte MAINNET genesis block (height 0). DGB launched Scrypt-only
+// (multi-algo MultiShield arrived at block 145000), so the genesis PoW is a real
+// scrypt_1024_1_1_256 block. Header fields are the authoritative constants from
+// upstream DigiByte-Core src/kernel/chainparams.cpp CMainParams @8a3fd47b:
+//   nVersion 1, hashPrevBlock 0, nTime 1389388394, nBits 0x1e0ffff0,
+//   nNonce 2447652, hashMerkleRoot (display)
+//     72ddd9496b004221ed0557358846d9248ecd4c440ebd28ed901efc18757d0fad
+// Serialized 80-byte header (little-endian wire form):
+//   010000000000000000000000000000000000000000000000000000000000000000000000
+//   ad0f7d7518fc1e90ed28bd0e444ccd8e24d94688355705ed2142006b49d9dd72
+//   6a62d052f0ff0f1e24592500
+// AUTHENTICITY: sha256d(header) reproduces the published genesis block hash
+//   7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496
+// (assert in DigiByte-Core chainparams.cpp:185) -- so these 80 bytes ARE the
+// real chain block 0, not a fabricated fixture.
+//
+// EXPECTED DIGEST SOURCE -- independent of our btclibs/crypto/scrypt.cpp: the
+// expected value below was computed with OpenSSL scrypt via Python
+//   hashlib.scrypt(header, salt=header, n=1024, r=1, p=1, dklen=32)
+// which is exactly the canonical Litecoin/DGB scrypt_1024_1_1_256 parameter set.
+//   scrypt digest (raw little-endian bytes):
+//     80ecb6b7897994e323dce44000845211e1af6091674f5e689b79ebe057010000
+// That value also satisfies the genesis nBits target (pow <= target), i.e. it is
+// a VALID PoW for block 0 -- a second, chain-level cross-check of the digest.
+// ---------------------------------------------------------------------------
+TEST(HeaderChainValidate, RealGenesisScryptDigestMatchesIndependentOracle)
+{
+    // Rebuild the exact 80-byte DGB mainnet genesis header from its wire fields.
+    unsigned char header[80];
+    std::memset(header, 0, sizeof(header));
+    auto put_le32 = [&](int off, uint32_t v) {
+        header[off + 0] = (unsigned char)(v);
+        header[off + 1] = (unsigned char)(v >> 8);
+        header[off + 2] = (unsigned char)(v >> 16);
+        header[off + 3] = (unsigned char)(v >> 24);
+    };
+    put_le32(0, 1u);                 // nVersion
+    // hashPrevBlock [4..36) stays zero (genesis).
+    // hashMerkleRoot [36..68): internal (LE) order = the display root reversed.
+    static const unsigned char merkle_le[32] = {
+        0xad,0x0f,0x7d,0x75,0x18,0xfc,0x1e,0x90,0xed,0x28,0xbd,0x0e,0x44,0x4c,0xcd,0x8e,
+        0x24,0xd9,0x46,0x88,0x35,0x57,0x05,0xed,0x21,0x42,0x00,0x6b,0x49,0xd9,0xdd,0x72,
+    };
+    std::memcpy(header + 36, merkle_le, 32);
+    put_le32(68, 1389388394u);       // nTime
+    put_le32(72, 0x1e0ffff0u);       // nBits
+    put_le32(76, 2447652u);          // nNonce
+
+    unsigned char digest[32];
+    scrypt_1024_1_1_256(reinterpret_cast<char*>(header),
+                        reinterpret_cast<char*>(digest));
+
+    // Byte-parity vs the OpenSSL-computed expectation (independent implementation).
+    static const unsigned char expected_le[32] = {
+        0x80,0xec,0xb6,0xb7,0x89,0x79,0x94,0xe3,0x23,0xdc,0xe4,0x40,0x00,0x84,0x52,0x11,
+        0xe1,0xaf,0x60,0x91,0x67,0x4f,0x5e,0x68,0x9b,0x79,0xeb,0xe0,0x57,0x01,0x00,0x00,
+    };
+    EXPECT_EQ(0, std::memcmp(digest, expected_le, 32));
+
+    // Same expectation as from_le_bytes limbs (the satisfaction-gate view).
+    u256 h = u256::from_le_bytes(digest);
+    EXPECT_EQ(h.limb[0], 0xe3947989b7b6ec80ULL);
+    EXPECT_EQ(h.limb[1], 0x1152840040e4dc23ULL);
+    EXPECT_EQ(h.limb[2], 0x685e4f679160afe1ULL);
+    EXPECT_EQ(h.limb[3], 0x00000157e0eb799bULL);
+
+    // The real digest flows the ingest satisfaction gate exactly as a live tip
+    // would: against a max target it is VALID and credits work.
+    HeaderChain hc;
+    u256 max_target; for (int i = 0; i < 4; ++i) max_target.limb[i] = 0xffffffffffffffffULL;
+    HeaderSample tip{SCRYPT, 1389388394};
+    tip.target   = max_target;
+    tip.pow_hash = h;
+    EXPECT_EQ(hc.validate_and_append(tip), IngestResult::VALIDATED_SCRYPT);
+    EXPECT_EQ(hc.size(), 1u);
+}
+
+// ---------------------------------------------------------------------------
 // MTP MONOTONICITY INGEST GUARD (M3 7b -- ContextualCheckBlockHeader
 // "time-too-old"). A Scrypt header's nTime must be STRICTLY GREATER than the
 // median timestamp of the tip and its (up to) 10 nearest ancestors. This is the
