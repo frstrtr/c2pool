@@ -583,6 +583,25 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
         if (stratum_server->start()) {
             // Wire the local-share bridge to the now-constructed stratum server.
             *stratum_notify = [srv = stratum_server.get()]() { srv->notify_all(); };
+
+            // Ring the SAME work-refresh on a PARENT-CHAIN new tip, not only on
+            // a local share. HeaderChain fires m_on_tip_changed when the BCH tip
+            // advances (network block via embedded P2P / RPC fallback); ring
+            // stratum_notify so every miner is pushed a fresh mining.notify
+            // (clean_jobs) built on the NEW prevhash instead of grinding a stale
+            // height-1 template until the next share. cached_template() already
+            // rebuilds on a tip_hash change (the poll half); this closes the
+            // PUSH half. m_on_tip_changed is single-slot and unused elsewhere in
+            // the BCH tree. stratum_notify captured by shared_ptr copy so the
+            // sink outlives ioc.run() alongside the daemon that owns the chain.
+            daemon.chain().set_on_tip_changed(
+                [stratum_notify](const uint256& /*old_tip*/, uint32_t /*old_h*/,
+                                 const uint256& new_tip, uint32_t new_h) {
+                    if (*stratum_notify) (*stratum_notify)();
+                    LOG_INFO << "[BCH-POOL] parent tip -> h=" << new_h << " "
+                             << new_tip.GetHex().substr(0, 16)
+                             << " : pushed clean mining.notify to miners";
+                });
             LOG_INFO << "[BCH-POOL] stratum listening on " << stratum_addr << ":"
                      << stratum_port << " (BCHWorkSource: SHA256d, no-segwit,"
                      << " CashTokens transparent-carry; hit block routes the"
