@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "PageLaunch.hpp"
 
+#include "CoinProfiles.hpp"
+#include "LaunchCommand.hpp"
 #include "SettingsStore.hpp"
 
 #include <QDir>
@@ -16,6 +18,10 @@
 
 namespace {
 
+using c2pool_qt::CliFamily;
+using c2pool_qt::CoinProfile;
+using c2pool_qt::coinProfile;
+
 struct PortDefaults {
     int p2p;
     int stratum;
@@ -25,11 +31,24 @@ struct PortDefaults {
 
 PortDefaults defaultsForNetwork(const QString& chain, bool testnet)
 {
+    const CoinProfile& p = coinProfile(chain);
+    const int rpc = testnet ? p.rpcPortTestnet : p.rpcPortMainnet;
+
+    // PerCoinRun coins (c2pool-dash / -dgb / -bch) use the profile's
+    // miner-facing / dashboard port suggestions; the "p2p sharechain"
+    // spin doubles as the sharechain listen port.
+    if (p.cli == CliFamily::PerCoinRun) {
+        const int stratum = p.stratumPortDefault;
+        const int http = p.supportsWebPort ? p.webPortDefault : 0;
+        const int listen = testnet ? 19339 : 9339;  // sharechain listen suggestion
+        return {listen, stratum, http, rpc};
+    }
+
+    // LegacyUnified coins keep the Python-p2pool-compatible port layout.
     if (chain == "bitcoin") {
         const int p2p = testnet ? 19333 : 9333;
         const int stratum = testnet ? 19332 : 9332;
         const int http = (stratum + 1 == p2p) ? stratum + 2 : stratum + 1;
-        const int rpc = testnet ? 18332 : 8332;
         return {p2p, stratum, http, rpc};
     }
 
@@ -37,14 +56,12 @@ PortDefaults defaultsForNetwork(const QString& chain, bool testnet)
         const int p2p = testnet ? 44556 : 22556;
         const int stratum = testnet ? 44555 : 22555;
         const int http = stratum + 2;
-        const int rpc = testnet ? 44555 : 22555;
         return {p2p, stratum, http, rpc};
     }
 
     const int p2p = testnet ? 19338 : 9338;
     const int stratum = testnet ? 19327 : 9327;
     const int http = stratum + 1;
-    const int rpc = testnet ? 19332 : 9332;
     return {p2p, stratum, http, rpc};
 }
 
@@ -133,11 +150,25 @@ void PageLaunch::setupUi()
         form->addRow("Mode:", modeCombo_);
 
         chainCombo_ = new QComboBox;
-        chainCombo_->addItems({"litecoin", "bitcoin", "dogecoin"});
+        {
+            int n = 0;
+            const c2pool_qt::CoinProfile* profs = c2pool_qt::coinProfiles(n);
+            for (int i = 0; i < n; ++i)
+                chainCombo_->addItem(profs[i].displayLabel, profs[i].symbol);
+        }
+        chainCombo_->setToolTip(
+            "Coin-generic (profile-driven). LTC/BTC/DOGE use the unified\n"
+            "`c2pool --net …` binary; DASH/DGB/BCH use the dedicated per-coin\n"
+            "binary with the reward-safe --coin-rpc arm.");
         form->addRow("Blockchain:", chainCombo_);
 
         testnetCheck_ = new QCheckBox("Use testnet");
         form->addRow("Network:", testnetCheck_);
+
+        coinNoteLabel_ = new QLabel;
+        coinNoteLabel_->setWordWrap(true);
+        coinNoteLabel_->setStyleSheet("color: #555; font-size: 11px;");
+        form->addRow("", coinNoteLabel_);
 
         vbox->addWidget(g);
     }
@@ -182,11 +213,14 @@ void PageLaunch::setupUi()
 
     // ── 4. Parent Coin Daemon ─────────────────────────────────────────────────
     {
-        auto* g = makeGroup("Parent Coin Daemon (litecoind / bitcoind)");
+        auto* g = makeGroup("Parent Coin Daemon");
+        coindGroup_ = g;
         auto* form = new QFormLayout(g);
 
         coindHostEdit_ = new QLineEdit("127.0.0.1");
-        coindHostEdit_->setToolTip("--coind-address / --rpchost");
+        coindHostEdit_->setToolTip(
+            "Legacy (LTC/BTC/DOGE): --coind-address / --rpchost\n"
+            "Per-coin (DASH/DGB): host of --coin-rpc HOST:PORT");
         form->addRow("RPC host:", coindHostEdit_);
 
         coindPortSpin_ = new QSpinBox;
@@ -219,6 +253,22 @@ void PageLaunch::setupUi()
         coindP2pAddrEdit_->setToolTip("--coind-p2p-address  (defaults to RPC host)");
         form->addRow("P2P address:", coindP2pAddrEdit_);
 
+        // Per-coin binaries (DASH/DGB/BCH) read rpcuser/rpcpassword from the
+        // coin's .conf so the password NEVER lands on argv. Blank ⇒ default
+        // conf path for that coin.
+        rpcConfPathEdit_ = new QLineEdit;
+        rpcConfPathEdit_->setToolTip(
+            "--coin-rpc-auth / --rpc-conf PATH\n"
+            "bitcoin.conf-style file carrying rpcuser/rpcpassword. The\n"
+            "password is read from here, never placed on the command line.\n"
+            "Blank ⇒ the binary's default conf path.");
+        form->addRow("RPC conf file:", rpcConfPathEdit_);
+
+        dataDirEdit_ = new QLineEdit;
+        dataDirEdit_->setPlaceholderText("~/.c2pool (default)");
+        dataDirEdit_->setToolTip("--data-dir PATH  (per-instance state root; isolates co-located instances)");
+        form->addRow("Data dir:", dataDirEdit_);
+
         vbox->addWidget(g);
     }
 
@@ -228,7 +278,7 @@ void PageLaunch::setupUi()
         auto* form = new QFormLayout(g);
 
         addressEdit_ = new QLineEdit;
-        addressEdit_->setPlaceholderText("LTC/BTC/DOGE payout address");
+        addressEdit_->setPlaceholderText("payout address for the selected coin");
         addressEdit_->setToolTip("--address / --solo-address  (YOUR mining payout address)");
         form->addRow("Payout address:", addressEdit_);
 
@@ -441,6 +491,68 @@ void PageLaunch::setupUi()
         vbox->addWidget(g);
     }
 
+    // ── 10. ★ Advanced / embedded (opt-in, REWARD-UNSAFE) ────────────────────
+    // Default OFF. This is the ONLY place --coin-p2p-connect /
+    // --embedded-mainnet may be emitted. The default per-coin launch is the
+    // reward-SAFE dashd-RPC arm. See the DASH hotel incident: an unguarded
+    // embedded arm produced reward-unsafe blocks.
+    {
+        auto* g = makeGroup("Advanced / embedded (opt-in — REWARD-UNSAFE)");
+        embeddedGroup_ = g;
+        g->setStyleSheet(
+            "QGroupBox { font-weight: bold; margin-top: 6px; "
+            "  border: 1px solid #b04020; border-radius: 4px; }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 8px; color: #b04020; }");
+        auto* gLayout = new QVBoxLayout(g);
+
+        embeddedWarnLabel_ = new QLabel(
+            "⚠ These options dial the coin's own P2P network directly and/or "
+            "let this node produce mainnet blocks WITHOUT the validated dashd-RPC "
+            "arm. They are REWARD-UNSAFE until validated for your coin and MUST "
+            "stay OFF for normal mining. Leave everything here unchecked to run "
+            "the safe RPC arm.");
+        embeddedWarnLabel_->setWordWrap(true);
+        embeddedWarnLabel_->setStyleSheet("color: #b04020;");
+        gLayout->addWidget(embeddedWarnLabel_);
+
+        embeddedP2pCheck_ = new QCheckBox(
+            "Enable embedded coin-network P2P (--coin-p2p-connect) — reward-unsafe");
+        embeddedP2pCheck_->setChecked(false);   // ★ default OFF
+        embeddedP2pCheck_->setToolTip(
+            "--coin-p2p-connect HOST:PORT (repeatable)\n"
+            "OPT-IN. Dials the coin network directly instead of relying only on\n"
+            "the dashd-RPC submitblock arm. Default OFF — leave unchecked unless\n"
+            "you are deliberately validating the embedded arm.");
+        gLayout->addWidget(embeddedP2pCheck_);
+
+        embeddedP2pPeersEdit_ = new QPlainTextEdit;
+        embeddedP2pPeersEdit_->setMaximumHeight(60);
+        embeddedP2pPeersEdit_->setEnabled(false);
+        embeddedP2pPeersEdit_->setPlaceholderText(
+            "One coin-P2P HOST:PORT per line (e.g. 127.0.0.1:9999)");
+        gLayout->addWidget(embeddedP2pPeersEdit_);
+
+        embeddedMainnetCheck_ = new QCheckBox(
+            "Enable embedded MAINNET block production (--embedded-mainnet) — reward-unsafe");
+        embeddedMainnetCheck_->setChecked(false);   // ★ default OFF
+        embeddedMainnetCheck_->setToolTip(
+            "--embedded-mainnet (DASH)\n"
+            "Lifts the gate that keeps embedded mainnet block production OFF.\n"
+            "Reward-unsafe until validated. Default OFF.");
+        gLayout->addWidget(embeddedMainnetCheck_);
+
+        connect(embeddedP2pCheck_, &QCheckBox::stateChanged, this, [this](int st) {
+            embeddedP2pPeersEdit_->setEnabled(st == Qt::Checked);
+            onBuildPreview();
+        });
+        connect(embeddedMainnetCheck_, &QCheckBox::stateChanged, this,
+                [this](int) { onBuildPreview(); });
+        connect(embeddedP2pPeersEdit_, &QPlainTextEdit::textChanged, this,
+                [this]() { onBuildPreview(); });
+
+        vbox->addWidget(g);
+    }
+
     // ── 8. Command preview + controls ────────────────────────────────────────
     {
         auto* g = makeGroup("Generated Command");
@@ -486,7 +598,25 @@ void PageLaunch::setupUi()
 // Command builder
 // ─────────────────────────────────────────────────────────────────────────────
 
+QString PageLaunch::currentChain() const
+{
+    const QString data = chainCombo_->currentData().toString();
+    return data.isEmpty() ? chainCombo_->currentText() : data;
+}
+
 QString PageLaunch::buildCommand() const
+{
+    // Dispatch on the coin's CLI family. LTC/BTC/DOGE use the unified
+    // `c2pool --net …` binary; DASH/DGB/BCH use the dedicated per-coin
+    // binary with the reward-SAFE --coin-rpc arm.
+    const QString chain = currentChain();
+    const c2pool_qt::CoinProfile& prof = c2pool_qt::coinProfile(chain);
+    return prof.cli == c2pool_qt::CliFamily::PerCoinRun
+               ? buildPerCoinCommand()
+               : buildLegacyCommand();
+}
+
+QString PageLaunch::buildLegacyCommand() const
 {
     QStringList parts;
 
@@ -501,7 +631,7 @@ QString PageLaunch::buildCommand() const
 
     // Network
     if (testnetCheck_->isChecked()) parts << "--testnet";
-    const QString chain = chainCombo_->currentText();
+    const QString chain = currentChain();
     if (chain != "litecoin") parts << "--net" << chain;
 
     // Ports
@@ -617,6 +747,70 @@ QString PageLaunch::buildCommand() const
     return parts.join(" ");
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-coin run-loop command (c2pool-dash / -dgb / -bch)
+//
+// ★ REWARD SAFETY: builds the dashd-RPC arm by default —
+//   `<binary> <subcommand> [--testnet] --coin-rpc HOST:PORT
+//    [--coin-rpc-auth PATH] [--stratum PORT] [--web-port PORT]
+//    [--data-dir PATH] …`. The embedded reward-UNSAFE flags
+//   (--coin-p2p-connect / --embedded-mainnet) are appended ONLY when the
+//   explicit, default-OFF "Advanced / embedded (opt-in)" controls are
+//   checked. With those unchecked the generated command NEVER contains
+//   them — proven by the reward-safe launch test.
+// ─────────────────────────────────────────────────────────────────────────────
+QString PageLaunch::buildPerCoinCommand() const
+{
+    const QString chain = currentChain();
+    const c2pool_qt::CoinProfile& prof = c2pool_qt::coinProfile(chain);
+
+    // Marshal form + profile state into the Qt-free command core. The
+    // reward-safety invariant (embedded flags gated behind default-OFF
+    // opt-ins) lives in build_percoin_argv() and is unit-tested there.
+    c2pool_qt::PerCoinParams pp;
+    pp.binary     = binaryEdit_->text().trimmed().toStdString();
+    pp.subcommand = prof.subcommand.toStdString();
+    if (dataDirEdit_) pp.dataDir = dataDirEdit_->text().trimmed().toStdString();
+
+    pp.testnet             = testnetCheck_->isChecked();
+    pp.supportsTestnetFlag = prof.supportsTestnetFlag;
+
+    pp.coinRpcFlag = prof.coinRpcFlag.toStdString();
+    pp.rpcHost     = coindHostEdit_->text().trimmed().toStdString();
+    pp.rpcPort     = coindPortSpin_->value();
+    pp.rpcAuthFlag = prof.rpcAuthFlag.toStdString();
+    if (rpcConfPathEdit_) pp.confPath = rpcConfPathEdit_->text().trimmed().toStdString();
+
+    pp.stratumPort = stratumPortSpin_->value();
+
+    pp.supportsWebPort = prof.supportsWebPort;
+    pp.webPort         = httpPortSpin_->value();
+    pp.webHost         = httpHostEdit_->text().trimmed().toStdString();
+
+    pp.sharechainPortFlag = prof.sharechainPortFlag.toStdString();
+    pp.sharechainPort     = p2pPortSpin_->value();
+    for (const QString& line : seedNodesEdit_->toPlainText().split('\n', Qt::SkipEmptyParts))
+        pp.addnodes.push_back(line.trimmed().toStdString());
+
+    pp.payoutAddress = addressEdit_->text().trimmed().toStdString();
+    pp.fee           = feeSpinBox_->value();
+    pp.giveAuthor    = giveAuthorSpinBox_->value();
+    pp.redistribute  = redistributeCombo_->currentText().toStdString();
+    pp.messageBlob   = messageBlobEdit_->text().trimmed().toStdString();
+
+    // ── ★ Embedded reward-UNSAFE arm — OPT-IN ONLY (default OFF) ──────────
+    pp.embeddedP2p = embeddedP2pCheck_ && embeddedP2pCheck_->isChecked();
+    if (pp.embeddedP2p && embeddedP2pPeersEdit_) {
+        for (const QString& line :
+             embeddedP2pPeersEdit_->toPlainText().split('\n', Qt::SkipEmptyParts))
+            pp.embeddedP2pPeers.push_back(line.trimmed().toStdString());
+    }
+    pp.embeddedMainnet = embeddedMainnetCheck_ && embeddedMainnetCheck_->isChecked();
+
+    return QString::fromStdString(
+        c2pool_qt::join_argv(c2pool_qt::build_percoin_argv(pp)));
+}
+
 QString PageLaunch::suggestedApiBaseUrl() const
 {
     return QString("http://127.0.0.1:%1").arg(httpPortSpin_->value());
@@ -633,14 +827,76 @@ void PageLaunch::onBuildPreview()
 
 void PageLaunch::updateNetworkDefaults()
 {
-    const PortDefaults defaults = defaultsForNetwork(chainCombo_->currentText(), testnetCheck_->isChecked());
+    const QString chain = currentChain();
+    const c2pool_qt::CoinProfile& prof = c2pool_qt::coinProfile(chain);
+    const bool testnet = testnetCheck_->isChecked();
+
+    const PortDefaults defaults = defaultsForNetwork(chain, testnet);
     p2pPortSpin_->setValue(defaults.p2p);
     stratumPortSpin_->setValue(defaults.stratum);
-    httpPortSpin_->setValue(defaults.http);
+    if (defaults.http > 0)
+        httpPortSpin_->setValue(defaults.http);
     coindPortSpin_->setValue(defaults.rpc);
 
+    // Snap the binary path to the profile default on an explicit chain change.
+    binaryEdit_->setText("./build/bin/" + prof.binary);
+
+    applyProfileUi();
     onBuildPreview();
     emitApiBaseUrlChanged();
+}
+
+void PageLaunch::applyProfileUi()
+{
+    const QString chain = currentChain();
+    const c2pool_qt::CoinProfile& prof = c2pool_qt::coinProfile(chain);
+    const bool perCoin = (prof.cli == c2pool_qt::CliFamily::PerCoinRun);
+
+    // Relabel the parent-daemon group with the coin's daemon name.
+    if (coindGroup_)
+        coindGroup_->setTitle(
+            QStringLiteral("Parent Coin Daemon (%1)").arg(prof.daemonLabel));
+
+    // Suggest the coin's default RPC conf path (PerCoinRun only).
+    if (rpcConfPathEdit_) {
+        rpcConfPathEdit_->setPlaceholderText(
+            perCoin && !prof.confHint.isEmpty()
+                ? QStringLiteral("%1 (default)").arg(prof.confHint)
+                : QStringLiteral("(legacy coin uses RPC user/password below)"));
+        rpcConfPathEdit_->setEnabled(perCoin);
+    }
+    if (dataDirEdit_)
+        dataDirEdit_->setEnabled(perCoin);
+
+    // Show the embedded reward-unsafe opt-in only for PerCoinRun coins;
+    // --embedded-mainnet is DASH-only. It always stays default-OFF.
+    if (embeddedGroup_)
+        embeddedGroup_->setVisible(perCoin);
+    if (embeddedMainnetCheck_)
+        embeddedMainnetCheck_->setVisible(chain == QStringLiteral("dash"));
+
+    // Per-coin note: CLI arm, masternode-payee, experimental status.
+    if (coinNoteLabel_) {
+        QString note;
+        if (perCoin) {
+            note = QStringLiteral(
+                       "%1 · %2 · binary %3 · reward-safe %4 arm (creds from %5).")
+                       .arg(prof.displayLabel, prof.algoLabel, prof.binary,
+                            prof.rpcAuthFlag.isEmpty() ? QStringLiteral("RPC")
+                                                       : prof.rpcAuthFlag,
+                            prof.confHint);
+        } else {
+            note = QStringLiteral("%1 · %2 · unified c2pool binary (--net %3).")
+                       .arg(prof.displayLabel, prof.algoLabel, prof.symbol);
+        }
+        if (prof.masternodePayee)
+            note += QStringLiteral("  Masternode-payee coin (block reward is split "
+                                   "with the masternode network).");
+        if (prof.experimental)
+            note += QStringLiteral("  ⚠ per-coin binary still stabilising — deeper "
+                                   "controls are TODO (qt-steward).");
+        coinNoteLabel_->setText(note);
+    }
 }
 
 void PageLaunch::emitApiBaseUrlChanged()
@@ -729,7 +985,7 @@ void PageLaunch::saveSettings() const
     s.beginGroup(launchGroupPath());
     s.setValue("binary",        binaryEdit_->text());
     s.setValue("mode",          modeCombo_->currentIndex());
-    s.setValue("chain",         chainCombo_->currentText());
+    s.setValue("chain",         currentChain());
     s.setValue("testnet",       testnetCheck_->isChecked());
     s.setValue("p2pPort",       p2pPortSpin_->value());
     s.setValue("stratumPort",   stratumPortSpin_->value());
@@ -752,6 +1008,14 @@ void PageLaunch::saveSettings() const
     s.setValue("seedNodes",     seedNodesEdit_->toPlainText());
     s.setValue("configFile",    configFileEdit_->text());
     s.setValue("messageBlob",   messageBlobEdit_->text());
+    // Per-coin run-loop fields
+    if (rpcConfPathEdit_) s.setValue("rpcConfPath", rpcConfPathEdit_->text());
+    if (dataDirEdit_)     s.setValue("dataDir",     dataDirEdit_->text());
+    // Embedded reward-UNSAFE opt-in state (persisted so it is never silently
+    // re-enabled; defaults stay OFF on load).
+    if (embeddedP2pCheck_)     s.setValue("embeddedP2p",      embeddedP2pCheck_->isChecked());
+    if (embeddedP2pPeersEdit_) s.setValue("embeddedP2pPeers", embeddedP2pPeersEdit_->toPlainText());
+    if (embeddedMainnetCheck_) s.setValue("embeddedMainnet",  embeddedMainnetCheck_->isChecked());
 
     // Merged chains
     s.remove("merged");
@@ -774,11 +1038,15 @@ void PageLaunch::loadSettings()
     binaryEdit_->setText(s.value("binary", "./build/bin/c2pool").toString());
     modeCombo_->setCurrentIndex(s.value("mode", 1).toInt());
     {
-        const int idx = chainCombo_->findText(s.value("chain", "litecoin").toString());
+        // Chain persisted by symbol (combo userData). Fall back to legacy
+        // display-text match for older settings written before profiles.
+        const QString saved = s.value("chain", "litecoin").toString();
+        int idx = chainCombo_->findData(saved);
+        if (idx < 0) idx = chainCombo_->findText(saved);
         chainCombo_->setCurrentIndex(idx >= 0 ? idx : 0);
     }
     testnetCheck_->setChecked(s.value("testnet", true).toBool());
-    const PortDefaults defaults = defaultsForNetwork(chainCombo_->currentText(), testnetCheck_->isChecked());
+    const PortDefaults defaults = defaultsForNetwork(currentChain(), testnetCheck_->isChecked());
     p2pPortSpin_->setValue(s.value("p2pPort", defaults.p2p).toInt());
     stratumPortSpin_->setValue(s.value("stratumPort", defaults.stratum).toInt());
     httpPortSpin_->setValue(s.value("httpPort", defaults.http).toInt());
@@ -803,6 +1071,20 @@ void PageLaunch::loadSettings()
     seedNodesEdit_->setPlainText(s.value("seedNodes").toString());
     configFileEdit_->setText(s.value("configFile").toString());
     messageBlobEdit_->setText(s.value("messageBlob").toString());
+    // Per-coin run-loop fields
+    if (rpcConfPathEdit_) rpcConfPathEdit_->setText(s.value("rpcConfPath").toString());
+    if (dataDirEdit_)     dataDirEdit_->setText(s.value("dataDir").toString());
+    // Embedded reward-UNSAFE opt-in — restore prior state (still defaults OFF
+    // for a fresh profile).
+    if (embeddedP2pCheck_)
+        embeddedP2pCheck_->setChecked(s.value("embeddedP2p", false).toBool());
+    if (embeddedP2pPeersEdit_) {
+        embeddedP2pPeersEdit_->setPlainText(s.value("embeddedP2pPeers").toString());
+        if (embeddedP2pCheck_)
+            embeddedP2pPeersEdit_->setEnabled(embeddedP2pCheck_->isChecked());
+    }
+    if (embeddedMainnetCheck_)
+        embeddedMainnetCheck_->setChecked(s.value("embeddedMainnet", false).toBool());
 
     // Merged chains
     mergedTable_->setRowCount(0);
@@ -818,6 +1100,7 @@ void PageLaunch::loadSettings()
     s.endArray();
     s.endGroup();
 
+    applyProfileUi();  // refresh labels/visibility for the loaded chain (keeps ports)
     onBuildPreview();
     emitApiBaseUrlChanged();
 }

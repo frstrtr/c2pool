@@ -150,4 +150,17 @@ if(C2POOL_QT_BUILD_TESTS)
         target_compile_definitions(c2pool-qt_test_embedded_leak PRIVATE
             C2POOL_QT_DEV_BUNDLE=1)
     endif()
+
+    # ── ★ Reward-safety gate ─────────────────────────────────────────────
+    # Proves the per-coin launch command core never emits the reward-UNSAFE
+    # embedded arm (--coin-p2p-connect / --embedded-mainnet) by default and
+    # that the default parent-daemon link is the reward-SAFE --coin-rpc arm.
+    # Qt-free (LaunchCommand.hpp is std-only) so it runs anywhere.
+    enable_testing()
+    add_executable(c2pool-qt_test_reward_safe_launch
+        test/test_reward_safe_launch.cpp
+    )
+    target_include_directories(c2pool-qt_test_reward_safe_launch PRIVATE src)
+    add_test(NAME reward_safe_launch
+             COMMAND c2pool-qt_test_reward_safe_launch)
 endif()
