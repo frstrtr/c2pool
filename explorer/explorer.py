@@ -1,21 +1,49 @@
 #!/usr/bin/env python3
 """
-c2pool Block Explorer — lightweight web-based block browser for LTC + DOGE chains.
+c2pool Block Explorer — lightweight web-based block browser (coin-generic).
+
 Bundled with c2pool for use with embedded SPV nodes or standalone daemons.
+ONE explorer serves every coin c2pool supports: the coin is auto-detected from
+the daemon / c2pool node it is pointed at (mirroring how the dashboard reads the
+node's /web/currency_info), then a per-coin PROFILE selects the correct address
+versions, algorithm label, explorer links and coinbase/payout decode hooks.
+
+Supported coins (profile completeness):
+  - dash : FULL  — X11, DASH X-addresses, DIP3/DIP4 CbTx payload decode,
+                   masternode payee outputs, c2pool/p2pool PPLNS + donation +
+                   OP_RETURN ref_hash payout trace.
+  - ltc  : FULL  — scrypt, LTC addresses (incl. bech32), AuxPoW parent decode.
+  - doge : FULL  — scrypt (AuxPoW child), DOGE addresses, merged-mining parent
+                   (LTC) coinbase decode.
+  - btc  : FULL  — sha256d, BTC addresses (incl. bech32 / taproot).
+  - dgb  : BASIC — DigiByte addresses (incl. bech32); multi-algo label shown but
+                   per-block algo detection is a TODO.
+  - bch  : BASIC — legacy base58 addresses + coinbase browse; cashaddr is a TODO.
 
 Features:
 - Navigate blocks (latest, by height, by hash)
-- Decode coinbase scriptSig: BIP34 height, pool tags, THE state_root, AuxPoW commitment
+- Decode coinbase scriptSig: BIP34 height, pool tags, THE state_root, AuxPoW
+- Decode DASH DIP3/DIP4 CbTx coinbase payload (height, MN-list / quorum roots)
 - Trace coinbase payouts (PPLNS outputs, donation, OP_RETURN ref_hash)
-- Highlight blocks found by p2pool/c2pool (via coinbase tag detection)
+- Highlight blocks found by p2pool/c2pool (via coinbase structure detection)
 - DOGE merged mining: show aux blocks and their parent LTC block
 - Auto-refresh dashboard with recent blocks
 - REST API + simple HTML UI
 
 Usage:
-    python3 explorer.py [--ltc-host 192.168.86.26] [--ltc-port 19332]
-                        [--doge-host 192.168.86.27] [--doge-port 44555]
-                        [--web-port 8888]
+    # Auto-detect the coin from the daemon:
+    python3 explorer.py --rpc-host 127.0.0.1 --rpc-port 9998 \
+                        --rpc-user user --rpc-pass pass [--web-port 8888]
+
+    # Or name the coin explicitly:
+    python3 explorer.py --coin dash --rpc-host 127.0.0.1 --rpc-port 9998 \
+                        --rpc-user user --rpc-pass pass
+
+    # Against a running c2pool node's explorer API:
+    python3 explorer.py --coin dash --c2pool http://127.0.0.1:8080/api/explorer
+
+    # Back-compat: legacy LTC + DOGE two-chain mode (unchanged defaults):
+    python3 explorer.py [--ltc-host H --ltc-port P] [--doge-host H --doge-port P]
 
 Requires: Python 3.8+, no external dependencies (uses only stdlib).
 """
@@ -39,15 +67,181 @@ from functools import lru_cache
 from html import escape
 
 # ============================================================================
-# Blockchair / block explorer URLs for external linking
+# COIN PROFILES — data-driven per-coin configuration.
+#
+# The explorer is coin-generic: it auto-detects which coin a daemon / c2pool
+# node speaks and looks the coin up here.  Each profile carries everything the
+# decoders and UI need; adding a coin is a matter of adding a table entry.
+#
+# Fields:
+#   name          human-readable coin name
+#   unit          ticker used for amount labels
+#   algo          PoW algorithm label (display only)
+#   networks      per-network address version bytes + bech32 hrp
+#                   p2pkh / p2sh : base58 version byte (int)
+#                   hrp          : bech32 human-readable part, or None
+#   blockchair    per-network external explorer base URL (or None)
+#   subversion    lowercase tokens matched against getnetworkinfo.subversion
+#   symbols       /web/currency_info "symbol" values that map to this coin
+#   genesis       per-network genesis block hash (secondary auto-detect signal)
+#   merged_parent parent coin id for AuxPoW merged-mining children (e.g. doge)
+#   coinbase      coinbase-decode hook name ("dash" enables DIP4 CbTx decode)
+#   completeness  "full" | "basic" | "stub" (reported to operators)
 # ============================================================================
 
-BLOCKCHAIR = {
-    "ltc_testnet": "https://blockchair.com/litecoin/testnet",
-    "ltc_mainnet": "https://blockchair.com/litecoin",
-    "doge_testnet": "https://blockchair.com/dogecoin",
-    "doge_mainnet": "https://blockchair.com/dogecoin",
+COIN_PROFILES = {
+    "dash": {
+        "name": "Dash", "unit": "DASH", "algo": "X11",
+        "networks": {
+            "mainnet": {"p2pkh": 0x4c, "p2sh": 0x10, "hrp": None},  # X..., 7...
+            "testnet": {"p2pkh": 0x8c, "p2sh": 0x13, "hrp": None},  # y...
+            "regtest": {"p2pkh": 0x8c, "p2sh": 0x13, "hrp": None},
+            "devnet":  {"p2pkh": 0x8c, "p2sh": 0x13, "hrp": None},
+        },
+        "blockchair": {"mainnet": "https://blockchair.com/dash", "testnet": None},
+        "subversion": ["dash core", "dashcore"],
+        "symbols": ["dash"],
+        "genesis": {
+            "mainnet": "00000ffd590b1485b3caadc19b22e6379c733355108f107a430458cdf3407ab6",
+            "testnet": "00000bafbc94add76cb75e2ec92894837288a481e5c005f6563d91623bf8bc2e",
+        },
+        "coinbase": "dash",
+        "completeness": "full",
+    },
+    "ltc": {
+        "name": "Litecoin", "unit": "LTC", "algo": "scrypt",
+        "networks": {
+            "mainnet": {"p2pkh": 0x30, "p2sh": 0x32, "hrp": "ltc"},
+            "testnet": {"p2pkh": 0x6f, "p2sh": 0x3a, "hrp": "tltc"},
+            "regtest": {"p2pkh": 0x6f, "p2sh": 0x3a, "hrp": "rltc"},
+        },
+        "blockchair": {
+            "mainnet": "https://blockchair.com/litecoin",
+            "testnet": "https://blockchair.com/litecoin/testnet",
+        },
+        "subversion": ["litecoin"],
+        "symbols": ["ltc"],
+        "genesis": {
+            "mainnet": "12a765e31ffd4059bada1e25190f6e98c99d9714d334efa41a195a7e7e04bfe2",
+            "testnet": "4966625a4b2851d9fdee139e56211a0d88575f59ed816ff5e6a63deb4e3e29a0",
+        },
+        "merged_children": ["doge"],
+        "coinbase": "generic",
+        "completeness": "full",
+    },
+    "doge": {
+        "name": "Dogecoin", "unit": "DOGE", "algo": "scrypt (AuxPoW)",
+        "networks": {
+            "mainnet": {"p2pkh": 0x1e, "p2sh": 0x16, "hrp": None},
+            "testnet": {"p2pkh": 0x71, "p2sh": 0xc4, "hrp": None},
+            "regtest": {"p2pkh": 0x6f, "p2sh": 0xc4, "hrp": None},
+        },
+        "blockchair": {"mainnet": "https://blockchair.com/dogecoin",
+                       "testnet": "https://blockchair.com/dogecoin"},
+        "subversion": ["shibetoshi", "dogecoin", "luckycoin"],
+        "symbols": ["doge"],
+        "genesis": {
+            "mainnet": "1a91e3dace36e2be3bf030a65679fe821aa1d6ef92e7c9902eb318182c355691",
+            "testnet": "bb0a78264637406b6360aad926284d544d7049f45189db5664f3c4d07350559e",
+        },
+        "merged_parent": "ltc",
+        "coinbase": "generic",
+        "completeness": "full",
+    },
+    "btc": {
+        "name": "Bitcoin", "unit": "BTC", "algo": "sha256d",
+        "networks": {
+            "mainnet": {"p2pkh": 0x00, "p2sh": 0x05, "hrp": "bc"},
+            "testnet": {"p2pkh": 0x6f, "p2sh": 0xc4, "hrp": "tb"},
+            "regtest": {"p2pkh": 0x6f, "p2sh": 0xc4, "hrp": "bcrt"},
+        },
+        "blockchair": {
+            "mainnet": "https://blockchair.com/bitcoin",
+            "testnet": "https://blockchair.com/bitcoin/testnet",
+        },
+        "subversion": ["satoshi"],
+        "symbols": ["btc"],
+        "genesis": {
+            "mainnet": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+            "testnet": "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943",
+        },
+        "coinbase": "generic",
+        "completeness": "full",
+    },
+    "dgb": {
+        "name": "DigiByte", "unit": "DGB", "algo": "multi (sha256d/scrypt/skein/qubit/odo)",
+        "networks": {
+            "mainnet": {"p2pkh": 0x1e, "p2sh": 0x3f, "hrp": "dgb"},   # D..., S...
+            "testnet": {"p2pkh": 0x7e, "p2sh": 0x8c, "hrp": "dgbt"},
+        },
+        "blockchair": {"mainnet": "https://blockchair.com/digibyte", "testnet": None},
+        "subversion": ["digibyte"],
+        "symbols": ["dgb"],
+        "genesis": {
+            "mainnet": "7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496",
+        },
+        "coinbase": "generic",
+        "completeness": "basic",  # TODO: per-block multi-algo detection
+    },
+    "bch": {
+        "name": "Bitcoin Cash", "unit": "BCH", "algo": "sha256d",
+        "networks": {
+            # BCH default addresses are cashaddr; base58 legacy versions match BTC.
+            "mainnet": {"p2pkh": 0x00, "p2sh": 0x05, "hrp": None},
+            "testnet": {"p2pkh": 0x6f, "p2sh": 0xc4, "hrp": None},
+            "regtest": {"p2pkh": 0x6f, "p2sh": 0xc4, "hrp": None},
+        },
+        "blockchair": {
+            "mainnet": "https://blockchair.com/bitcoin-cash",
+            "testnet": None,
+        },
+        "subversion": ["bitcoin cash", "bchn", "bch unlimited", "bitcoin abc"],
+        "symbols": ["bch"],
+        "genesis": {
+            "mainnet": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+        },
+        "coinbase": "generic",
+        "completeness": "basic",  # TODO: cashaddr encoding
+    },
 }
+
+# Aliases accepted on the --coin CLI flag.
+COIN_ALIASES = {
+    "litecoin": "ltc", "dogecoin": "doge", "bitcoin": "btc",
+    "digibyte": "dgb", "bitcoincash": "bch", "bitcoin-cash": "bch",
+    "bcash": "bch",
+}
+
+
+def resolve_coin_id(name):
+    """Normalize a user-supplied coin name to a profile key, or None."""
+    if not name:
+        return None
+    key = name.strip().lower()
+    if key in COIN_PROFILES:
+        return key
+    return COIN_ALIASES.get(key)
+
+
+def network_from_chain(profile, chain_str):
+    """Map a getblockchaininfo 'chain' string to a profile network key."""
+    nets = profile.get("networks", {})
+    c = (chain_str or "").lower()
+    if c in ("main", "mainnet", ""):
+        return "mainnet"
+    if c.startswith("regtest"):
+        return "regtest" if "regtest" in nets else "testnet"
+    if c.startswith("devnet"):
+        return "devnet" if "devnet" in nets else "testnet"
+    # test, testnet, testnet4, testnet4alpha, ...
+    return "testnet" if "testnet" in nets else "mainnet"
+
+
+def addr_versions(profile, network):
+    """Return the {p2pkh, p2sh, hrp} address-version dict for a network."""
+    nets = profile.get("networks", {})
+    return nets.get(network) or nets.get("mainnet") or {"p2pkh": 0x00, "p2sh": 0x05, "hrp": None}
+
 
 # ============================================================================
 # Bech32 encoding (BIP173/BIP350) — needed for P2WPKH address display
@@ -106,57 +300,6 @@ def _hash160(data):
     """RIPEMD160(SHA256(data)) — standard Bitcoin hash160."""
     return hashlib.new("ripemd160", hashlib.sha256(data).digest()).digest()
 
-def script_to_address(hex_script, chain="ltc_testnet"):
-    """Decode a scriptPubKey hex to a human-readable address.
-
-    Supports P2PKH, P2SH, P2WPKH, P2WSH, P2TR, and P2PK.
-    Returns None if the script format is not recognized.
-    """
-    # Chain-specific version bytes and bech32 HRP
-    CHAINS = {
-        "ltc_mainnet":  {"p2pkh": 0x30, "p2sh": 0x32, "hrp": "ltc"},
-        "ltc_testnet":  {"p2pkh": 0x6f, "p2sh": 0x3a, "hrp": "tltc"},
-        "doge_mainnet": {"p2pkh": 0x1e, "p2sh": 0x16, "hrp": None},
-        "doge_testnet": {"p2pkh": 0x71, "p2sh": 0xc4, "hrp": None},
-        "btc_mainnet":  {"p2pkh": 0x00, "p2sh": 0x05, "hrp": "bc"},
-        "btc_testnet":  {"p2pkh": 0x6f, "p2sh": 0xc4, "hrp": "tb"},
-    }
-    cfg = CHAINS.get(chain, CHAINS["ltc_testnet"])
-    s = bytes.fromhex(hex_script)
-
-    # P2WPKH: OP_0 PUSH_20 <20 bytes>
-    if len(s) == 22 and s[0] == 0x00 and s[1] == 0x14:
-        if cfg["hrp"]:
-            return bech32_encode(cfg["hrp"], 0, list(s[2:]))
-        return None
-
-    # P2WSH: OP_0 PUSH_32 <32 bytes>
-    if len(s) == 34 and s[0] == 0x00 and s[1] == 0x20:
-        if cfg["hrp"]:
-            return bech32_encode(cfg["hrp"], 0, list(s[2:]))
-        return None
-
-    # P2TR: OP_1 PUSH_32 <32 bytes> (BIP341 Taproot)
-    if len(s) == 34 and s[0] == 0x51 and s[1] == 0x20:
-        if cfg["hrp"]:
-            return bech32_encode(cfg["hrp"], 1, list(s[2:]))
-        return None
-
-    # P2PKH: OP_DUP OP_HASH160 PUSH_20 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
-    if len(s) == 25 and s[0] == 0x76 and s[1] == 0xa9 and s[2] == 0x14 and s[23] == 0x88 and s[24] == 0xac:
-        return _base58check_encode(cfg["p2pkh"], s[3:23])
-
-    # P2SH: OP_HASH160 PUSH_20 <20 bytes> OP_EQUAL
-    if len(s) == 23 and s[0] == 0xa9 and s[1] == 0x14 and s[22] == 0x87:
-        return _base58check_encode(cfg["p2sh"], s[2:22])
-
-    # P2PK: PUSH <pubkey> OP_CHECKSIG — uncompressed (65 bytes) or compressed (33 bytes)
-    if len(s) in (35, 67) and s[-1] == 0xac and s[0] == len(s) - 2:
-        pubkey = s[1:-1]
-        return _base58check_encode(cfg["p2pkh"], _hash160(pubkey))
-
-    return None
-
 def _base58check_encode(version, payload):
     """Encode version byte + payload as a Base58Check string."""
     ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -174,6 +317,49 @@ def _base58check_encode(version, payload):
         else:
             break
     return "".join(reversed(result))
+
+
+def script_to_address(hex_script, addr):
+    """Decode a scriptPubKey hex to a human-readable address.
+
+    `addr` is a per-network version dict {"p2pkh":int, "p2sh":int, "hrp":str|None}.
+    Supports P2PKH, P2SH, P2WPKH, P2WSH, P2TR, and P2PK.
+    Returns None if the script format is not recognized.
+    """
+    if not addr:
+        return None
+    try:
+        s = bytes.fromhex(hex_script)
+    except ValueError:
+        return None
+    hrp = addr.get("hrp")
+
+    # P2WPKH: OP_0 PUSH_20 <20 bytes>
+    if len(s) == 22 and s[0] == 0x00 and s[1] == 0x14:
+        return bech32_encode(hrp, 0, list(s[2:])) if hrp else None
+
+    # P2WSH: OP_0 PUSH_32 <32 bytes>
+    if len(s) == 34 and s[0] == 0x00 and s[1] == 0x20:
+        return bech32_encode(hrp, 0, list(s[2:])) if hrp else None
+
+    # P2TR: OP_1 PUSH_32 <32 bytes> (BIP341 Taproot)
+    if len(s) == 34 and s[0] == 0x51 and s[1] == 0x20:
+        return bech32_encode(hrp, 1, list(s[2:])) if hrp else None
+
+    # P2PKH: OP_DUP OP_HASH160 PUSH_20 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+    if len(s) == 25 and s[0] == 0x76 and s[1] == 0xa9 and s[2] == 0x14 and s[23] == 0x88 and s[24] == 0xac:
+        return _base58check_encode(addr["p2pkh"], s[3:23])
+
+    # P2SH: OP_HASH160 PUSH_20 <20 bytes> OP_EQUAL
+    if len(s) == 23 and s[0] == 0xa9 and s[1] == 0x14 and s[22] == 0x87:
+        return _base58check_encode(addr["p2sh"], s[2:22])
+
+    # P2PK: PUSH <pubkey> OP_CHECKSIG — uncompressed (65 bytes) or compressed (33 bytes)
+    if len(s) in (35, 67) and s[-1] == 0xac and s[0] == len(s) - 2:
+        pubkey = s[1:-1]
+        return _base58check_encode(addr["p2pkh"], _hash160(pubkey))
+
+    return None
 
 
 # ============================================================================
@@ -221,13 +407,46 @@ class RpcClient:
         except Exception:
             return False
 
+    def detect_profile(self):
+        """Auto-detect coin id from getnetworkinfo.subversion, then genesis hash.
+        Returns (coin_id, network) or (None, None)."""
+        subver = ""
+        try:
+            subver = (self.call("getnetworkinfo", timeout=5).get("subversion", "") or "").lower()
+        except Exception:
+            pass
+        chain_str = ""
+        try:
+            chain_str = self.call("getblockchaininfo", timeout=5).get("chain", "")
+        except Exception:
+            pass
+
+        # 1) subversion token match (e.g. "/Dash Core:20.1.1/")
+        if subver:
+            for cid, prof in COIN_PROFILES.items():
+                for tok in prof.get("subversion", []):
+                    if tok in subver:
+                        return cid, network_from_chain(prof, chain_str)
+
+        # 2) genesis block hash match (unambiguous per coin/network)
+        try:
+            genesis = self.call("getblockhash", 0, timeout=5)
+        except Exception:
+            genesis = None
+        if genesis:
+            for cid, prof in COIN_PROFILES.items():
+                for net, gh in prof.get("genesis", {}).items():
+                    if gh == genesis:
+                        return cid, net
+        return None, None
+
 
 class C2PoolClient:
     """Client adapter for c2pool's explorer REST API."""
 
     def __init__(self, base_url, chain):
         self.base_url = base_url.rstrip('/')
-        self.chain = chain  # "ltc" or "doge"
+        self.chain = chain  # coin id, e.g. "dash", "ltc", "doge"
         self.url = base_url  # for status display
         self.label = f"c2pool-{chain}"
 
@@ -262,6 +481,22 @@ class C2PoolClient:
         except Exception:
             return False
 
+    def currency_info(self, timeout=5):
+        """Fetch the node's /web/currency_info (authoritative coin symbol)."""
+        # The explorer API base usually looks like http://host:port/api/explorer;
+        # currency_info lives at http://host:port/web/currency_info.
+        root = self.base_url
+        for suffix in ("/api/explorer", "/api", "/explorer"):
+            if root.endswith(suffix):
+                root = root[: -len(suffix)]
+                break
+        try:
+            req = urllib.request.Request(root.rstrip("/") + "/web/currency_info")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode())
+        except Exception:
+            return {}
+
 
 # ============================================================================
 # Coinbase Decoder
@@ -281,7 +516,7 @@ def decode_varint(data, offset):
 
 
 def decode_scriptsig(raw_hex):
-    """Decode coinbase scriptSig into structured components."""
+    """Decode coinbase scriptSig into structured components (coin-agnostic)."""
     data = bytes.fromhex(raw_hex)
     result = {
         "raw_hex": raw_hex,
@@ -422,7 +657,59 @@ def decode_scriptsig(raw_hex):
     return result
 
 
-def _decode_multisig(hex_script, chain="ltc_testnet"):
+def decode_dip4_cbtx(payload_hex):
+    """Decode a Dash DIP3/DIP4 coinbase special-transaction (CbTx) payload.
+
+    Layout (little-endian on the wire; 32-byte roots shown big-endian to match
+    dashd RPC):
+        uint16  version
+        uint32  height
+        bytes32 merkleRootMNList
+        [v>=2]  bytes32 merkleRootQuorums
+        [v>=3]  varint  bestCLHeightDiff
+                bytes96 bestCLSignature
+                int64   creditPoolBalance (in duffs)
+    Returns a dict or None.
+    """
+    try:
+        b = bytes.fromhex(payload_hex)
+    except (ValueError, TypeError):
+        return None
+    if len(b) < 38:  # 2 + 4 + 32
+        return None
+    off = 0
+    ver = int.from_bytes(b[off:off + 2], "little"); off += 2
+    height = int.from_bytes(b[off:off + 4], "little"); off += 4
+    out = {
+        "version": ver,
+        "height": height,
+        "merkleRootMNList": b[off:off + 32][::-1].hex(),
+    }
+    off += 32
+    if ver >= 2 and off + 32 <= len(b):
+        out["merkleRootQuorums"] = b[off:off + 32][::-1].hex()
+        off += 32
+    if ver >= 3:
+        try:
+            diff, off = decode_varint(b, off)
+            out["bestCLHeightDiff"] = diff
+            if off + 96 <= len(b):
+                out["bestCLSignature"] = b[off:off + 96].hex()
+                off += 96
+            if off + 8 <= len(b):
+                out["creditPoolBalance"] = int.from_bytes(b[off:off + 8], "little", signed=True) / 1e8
+        except Exception:
+            pass
+    return out
+
+
+# Known cross-coin p2pool/c2pool donation script fingerprints (see
+# src/core/donation.hpp — byte-identical across btc/bch/dgb/ltc/dash).
+COMBINED_DONATION_H160 = "8c6272621d89e8fa526dd86acff60c7136be8e85"      # v36 P2SH
+OLD_DONATION_PUBKEY = "04ffd03de44a6e11b9917f3a29f9443283d9871c9d743ef30d5eddcd37094b64d1b3d8090496b53256786bf5c82932ec23c3b74d9f05a6f95a8b5529352656664b"
+
+
+def _decode_multisig(hex_script, addr):
     """Extract addresses from a P2MS (bare multisig) scriptPubKey.
     Returns (m, n, [addresses]) or None."""
     s = bytes.fromhex(hex_script)
@@ -442,13 +729,8 @@ def _decode_multisig(hex_script, chain="ltc_testnet"):
         if key_len not in (33, 65) or pos + key_len > len(s) - 2:
             break
         pubkey = s[pos:pos + key_len]
-        addr = _base58check_encode(
-            {"ltc_mainnet": 0x30, "ltc_testnet": 0x6f, "doge_mainnet": 0x1e,
-             "doge_testnet": 0x71, "btc_mainnet": 0x00, "btc_testnet": 0x6f
-            }.get(chain, 0x6f),
-            _hash160(pubkey),
-        )
-        addrs.append(addr)
+        addr_str = _base58check_encode(addr.get("p2pkh", 0x00), _hash160(pubkey))
+        addrs.append(addr_str)
         pos += key_len
     if len(addrs) == n:
         return m, n, addrs
@@ -460,8 +742,11 @@ def _safe_ascii(raw_bytes):
     return "".join(chr(b) if 0x20 <= b < 0x7f else "." for b in raw_bytes)
 
 
-def decode_outputs(vout_list, chain="ltc_testnet"):
-    """Decode transaction outputs into structured components."""
+def decode_outputs(vout_list, addr):
+    """Decode transaction outputs into structured components.
+
+    `addr` is a per-network version dict {"p2pkh","p2sh","hrp"}.
+    """
     outputs = []
     for i, vout in enumerate(vout_list):
         out = {
@@ -479,12 +764,12 @@ def decode_outputs(vout_list, chain="ltc_testnet"):
         # Fallback: decode address from raw script when daemon doesn't
         # provide it (e.g., DOGE daemon can't decode LTC bech32 in AuxPoW)
         if not addresses and out["hex"]:
-            decoded = script_to_address(out["hex"], chain)
+            decoded = script_to_address(out["hex"], addr)
             if decoded:
                 addresses = [decoded]
         # P2MS (bare multisig): extract all pubkey addresses
         if not addresses and out["hex"]:
-            ms = _decode_multisig(out["hex"], chain)
+            ms = _decode_multisig(out["hex"], addr)
             if ms:
                 m, n, ms_addrs = ms
                 addresses = ms_addrs
@@ -519,12 +804,15 @@ def decode_outputs(vout_list, chain="ltc_testnet"):
                 except Exception:
                     pass
 
-        # Detect donation script (P2SH: a914...87)
+        # Detect combined donation script (V36 P2SH a914 <h160> 87)
         if out["hex"].startswith("a914") and out["hex"].endswith("87") and len(out["hex"]) == 46:
-            out["is_donation"] = True
-            # Check if it's the combined p2pool/c2pool donation
-            if "8c6272621d89e8fa526dd86acff60c7136be8e85" in out["hex"]:
+            if COMBINED_DONATION_H160 in out["hex"]:
+                out["is_donation"] = True
                 out["donation_type"] = "p2pool_combined"
+        # Detect legacy P2PK donation (pre-v36, shared across coins)
+        if OLD_DONATION_PUBKEY in out["hex"]:
+            out["is_donation"] = True
+            out["donation_type"] = "p2pool_old"
 
         outputs.append(out)
     return outputs
@@ -562,36 +850,83 @@ class BlockCache:
 # ============================================================================
 
 class ExplorerEngine:
-    """Core explorer logic: fetch, decode, and serve block data."""
+    """Core explorer logic: fetch, decode, and serve block data (coin-generic).
 
-    def __init__(self, ltc_rpc, doge_rpc=None):
-        self.ltc = ltc_rpc
-        self.doge = doge_rpc
+    Holds an ordered map of active coins (coin_id -> {rpc, profile}); the first
+    registered coin is the primary.  The `chain` argument used throughout the
+    renderers and the HTTP API is a coin id (e.g. "dash", "ltc", "doge").
+    """
+
+    def __init__(self, coins, primary=None):
+        # coins: OrderedDict coin_id -> {"rpc": client, "profile": dict}
+        self.coins = OrderedDict(coins)
+        self.primary = primary or (next(iter(self.coins)) if self.coins else None)
         self.cache = BlockCache()
         self.found_blocks = []  # blocks found by p2pool/c2pool
         self._scan_lock = threading.Lock()
-        # Live block notification: tracks latest known height per chain
-        self._tip = {"ltc": 0, "doge": 0}
+        self._tip = {cid: 0 for cid in self.coins}
         self._tip_lock = threading.Lock()
         self._sse_clients = []  # list of (queue, chain_filter)
         self._sse_lock = threading.Lock()
         self._poller_running = False
-        # Cache chain labels (populated on first call)
-        self._chain_key_cache = {}
+        self._network_cache = {}  # coin_id -> network key
 
-    def chain_label(self, chain="ltc"):
-        """Human-readable chain label, e.g. 'LTC' or 'DOGE Testnet'."""
-        ck = self.chain_key(chain)
-        coin = "LTC" if chain == "ltc" else "DOGE"
-        return f"{coin} Testnet" if "testnet" in ck else coin
+    # --- coin/profile helpers ------------------------------------------------
+
+    def has_coin(self, coin_id):
+        return coin_id in self.coins
+
+    def coin_or_primary(self, coin_id):
+        return coin_id if coin_id in self.coins else self.primary
+
+    def rpc(self, coin_id):
+        entry = self.coins.get(coin_id) or self.coins.get(self.primary)
+        return entry["rpc"] if entry else None
+
+    def profile(self, coin_id):
+        entry = self.coins.get(coin_id)
+        if entry:
+            return entry["profile"]
+        return COIN_PROFILES.get(coin_id, COIN_PROFILES.get(self.primary, {}))
+
+    def network(self, coin_id):
+        """Detected network key for a coin (cached), e.g. 'mainnet'/'testnet'."""
+        if coin_id in self._network_cache:
+            return self._network_cache[coin_id]
+        prof = self.profile(coin_id)
+        info = self.get_chain_info(coin_id)
+        net = network_from_chain(prof, info.get("chain", "")) if "error" not in info else "mainnet"
+        self._network_cache[coin_id] = net
+        return net
+
+    def addr(self, coin_id):
+        """Address-version dict for a coin's detected network."""
+        return addr_versions(self.profile(coin_id), self.network(coin_id))
+
+    def is_testnet(self, coin_id):
+        return self.network(coin_id) != "mainnet"
+
+    def unit(self, coin_id):
+        return self.profile(coin_id).get("unit", coin_id.upper())
+
+    def coin_label(self, coin_id):
+        """Human-readable label, e.g. 'Dash' or 'Litecoin Testnet'."""
+        prof = self.profile(coin_id)
+        name = prof.get("name", coin_id.upper())
+        return f"{name} Testnet" if self.is_testnet(coin_id) else name
+
+    def chain_label(self, coin_id):
+        """Short label for nav/tables, e.g. 'DASH' or 'LTC Testnet'."""
+        unit = self.unit(coin_id)
+        return f"{unit} Testnet" if self.is_testnet(coin_id) else unit
+
+    def blockchair_base(self, coin_id):
+        prof = self.profile(coin_id)
+        return (prof.get("blockchair", {}) or {}).get(self.network(coin_id), "")
 
     def footer_label(self):
-        """Footer text describing the explorer instance."""
-        ltc_label = self.chain_label("ltc")
-        parts = [f"{ltc_label} Explorer"]
-        if self.doge:
-            parts.append(f"+ {self.chain_label('doge')}")
-        return " ".join(parts)
+        parts = [f"{self.coin_label(cid)}" for cid in self.coins]
+        return " + ".join(parts) + " Explorer"
 
     # --- SSE (Server-Sent Events) block notification ---
 
@@ -603,14 +938,15 @@ class ExplorerEngine:
 
         def _poll():
             while self._poller_running:
-                for chain_id, rpc in [("ltc", self.ltc), ("doge", self.doge)]:
+                for chain_id in list(self.coins):
+                    rpc = self.rpc(chain_id)
                     if rpc is None:
                         continue
                     try:
                         info = rpc.call("getblockchaininfo", timeout=3)
                         height = info.get("blocks", 0)
                         with self._tip_lock:
-                            prev = self._tip[chain_id]
+                            prev = self._tip.get(chain_id, 0)
                             if height > prev:
                                 self._tip[chain_id] = height
                                 if prev > 0:  # skip initial seed
@@ -651,35 +987,31 @@ class ExplorerEngine:
         with self._sse_lock:
             self._sse_clients = [(qq, cf) for qq, cf in self._sse_clients if qq is not q]
 
-    def get_chain_info(self, chain="ltc"):
-        rpc = self.doge if chain == "doge" and self.doge else self.ltc
+    def get_chain_info(self, chain=None):
+        rpc = self.rpc(chain)
+        if rpc is None:
+            return {"error": "no such coin"}
         try:
             return rpc.call("getblockchaininfo")
         except Exception as e:
             return {"error": str(e)}
 
-    def chain_key(self, chain="ltc"):
-        """Return Blockchair dict key like 'ltc_mainnet' or 'doge_testnet'. Cached."""
-        if chain in self._chain_key_cache:
-            return self._chain_key_cache[chain]
-        info = self.get_chain_info(chain)
-        is_test = info.get("chain", "") in ("test", "testnet", "testnet4alpha", "regtest")
-        net = "testnet" if is_test else "mainnet"
-        key = f"{chain}_{net}"
-        self._chain_key_cache[chain] = key
-        return key
+    # Back-compat shim: some callers used chain_key() expecting a "coin_net" key.
+    def chain_key(self, chain=None):
+        cid = self.coin_or_primary(chain)
+        return f"{cid}_{self.network(cid)}"
 
-    def get_block(self, height_or_hash, chain="ltc"):
+    def get_block(self, height_or_hash, chain=None):
         """Fetch and decode a block by height or hash."""
-        rpc = self.doge if chain == "doge" and self.doge else self.ltc
+        chain = self.coin_or_primary(chain)
+        rpc = self.rpc(chain)
         cache_key = f"{chain}:{height_or_hash}"
         cached = self.cache.get(cache_key)
         if cached:
             return cached
 
-        # Fallback: hardcoded seed blocks (outside embedded chain depth)
-        seed_key = f"{chain}:{height_or_hash}"
-        seed = self.SEED_BLOCK_DETAILS.get(seed_key)
+        # Fallback: hardcoded seed blocks (LTC/DOGE only; outside embedded depth)
+        seed = self.SEED_BLOCK_DETAILS.get(cache_key)
         if seed:
             self.cache.put(cache_key, seed)
             return seed
@@ -695,85 +1027,84 @@ class ExplorerEngine:
         except Exception as e:
             return {"error": str(e)}
 
+        prof = self.profile(chain)
+        addr = self.addr(chain)
+
         # Decode coinbase
         if block.get("tx"):
             coinbase_tx = block["tx"][0]
             vin = coinbase_tx.get("vin", [{}])
             if vin and "coinbase" in vin[0]:
                 block["_coinbase_decoded"] = decode_scriptsig(vin[0]["coinbase"])
-                out_chain = self.chain_key(chain)
-                block["_outputs_decoded"] = decode_outputs(coinbase_tx.get("vout", []), out_chain)
+                block["_outputs_decoded"] = decode_outputs(coinbase_tx.get("vout", []), addr)
             else:
                 block["_coinbase_decoded"] = {"error": "not a coinbase"}
                 block["_outputs_decoded"] = []
 
-        # Detect p2pool version from donation script type and ref_hash in outputs
-        # COMBINED_DONATION_SCRIPT (P2SH a9148c6272...) = V36, old P2PK = V35
+            # DASH DIP3/DIP4 CbTx: prefer daemon-decoded 'cbTx', else parse raw payload.
+            if prof.get("coinbase") == "dash":
+                cbtx = coinbase_tx.get("cbTx")
+                if not cbtx:
+                    payload = coinbase_tx.get("extraPayload") or coinbase_tx.get("payload")
+                    if payload:
+                        cbtx = decode_dip4_cbtx(payload)
+                if cbtx:
+                    block["_cbtx"] = cbtx
+                    block["_is_special_cb"] = True
+                elif coinbase_tx.get("type", 0) == 5:
+                    block["_is_special_cb"] = True
+
+        # Structural p2pool/c2pool detection (coin-agnostic; no AuxPoW required).
         cb = block.get("_coinbase_decoded", {})
         tag = cb.get("pool_tag", "")
         outs = block.get("_outputs_decoded", [])
-        has_combined = any(
-            o.get("donation_type") == "p2pool_combined" for o in outs
-        )
+        has_combined = any(o.get("donation_type") == "p2pool_combined" for o in outs)
         has_ref = any(o.get("type") == "p2pool_ref" for o in outs)
 
-        # Structural detection: no explicit tag but has p2pool-specific outputs
-        if not tag and cb.get("has_auxpow") and (has_combined or has_ref):
-            tag = "p2pool"
-            cb["pool_tag"] = "p2pool"
-            cb["components"] = cb.get("components", []) + [{
-                "type": "pool_tag",
-                "value": "p2pool (structural)",
-                "offset": 0,
-            }]
-
-        if has_combined and cb.get("has_auxpow"):
-            # COMBINED_DONATION_SCRIPT + AuxPoW = definitive V36 p2pool/c2pool block.
-            # c2pool blocks have THE state_root in scriptSig → keep /c2pool/ tag
-            if tag not in ("c2pool", "/c2pool/"):
-                if cb.get("the_state_root"):
-                    cb["pool_tag"] = "/c2pool/"
-                else:
-                    cb["pool_tag"] = "/P2Pool v36/"
-        elif tag and "p2pool" in tag.lower() and tag not in ("c2pool", "/c2pool/"):
-            if has_combined or has_ref:
+        if has_combined or has_ref:
+            cb["is_pool_block"] = True
+            if cb.get("the_state_root") or tag in ("c2pool", "/c2pool/"):
+                cb["pool_tag"] = "/c2pool/"
+            elif "v36" in tag.lower():
                 cb["pool_tag"] = "/P2Pool v36/"
-            elif tag not in ("/P2Pool v36/",):
-                # Old donation script or no donation = V35
+            elif "p2pool" in tag.lower():
+                cb["pool_tag"] = "/P2Pool v36/"  # combined/ref present => v36
+            elif not tag or tag == "UNKNOWN":
+                cb["pool_tag"] = "/P2Pool v36/"
+                cb.setdefault("components", []).append(
+                    {"type": "pool_tag", "value": "/P2Pool v36/ (structural)", "offset": 0})
+        elif tag and "p2pool" in tag.lower() and tag not in ("c2pool", "/c2pool/"):
+            # Tag says p2pool but no combined/ref output → legacy V35.
+            if "v36" not in tag.lower():
                 cb["pool_tag"] = "P2Pool v35"
 
-        # DOGE AuxPoW: decode the parent (LTC) coinbase from auxpow data
+        # Merged-mining parent (e.g. DOGE child → LTC parent) coinbase decode.
+        parent_id = prof.get("merged_parent")
         auxpow = block.get("auxpow")
-        if auxpow:
+        if auxpow and parent_id:
+            parent_prof = COIN_PROFILES.get(parent_id, prof)
+            parent_addr = addr_versions(parent_prof, self.network(chain))
             parent_tx = auxpow.get("tx", {})
             parent_vin = parent_tx.get("vin", [{}]) if isinstance(parent_tx, dict) else [{}]
             if parent_vin and "coinbase" in parent_vin[0]:
                 block["_parent_coinbase_decoded"] = decode_scriptsig(parent_vin[0]["coinbase"])
                 parent_vout = parent_tx.get("vout", []) if isinstance(parent_tx, dict) else []
-                block["_parent_outputs_decoded"] = decode_outputs(parent_vout, self.chain_key("ltc"))
-                # Propagate parent pool tag to block level
-                # Propagate parent's pool tag and THE state_root to merged block.
-                # c2pool blocks: parent LTC coinbase has /c2pool/ tag + THE state_root,
-                # but DOGE coinbase uses canonical /P2Pool v36/ text → need parent check.
+                block["_parent_outputs_decoded"] = decode_outputs(parent_vout, parent_addr)
+                # Propagate parent's pool tag / THE state_root to the merged block.
+                # c2pool blocks: parent coinbase carries /c2pool/ + THE state_root,
+                # but the child coinbase uses canonical /P2Pool v36/ text.
                 ptag = block["_parent_coinbase_decoded"].get("pool_tag", "")
                 own_tag = block["_coinbase_decoded"].get("pool_tag", "")
                 pthe = block["_parent_coinbase_decoded"].get("the_state_root", "")
-
-                # c2pool detection: parent has /c2pool/ tag or THE state_root
                 if ptag in ("c2pool", "/c2pool/") or pthe:
                     block["_coinbase_decoded"]["pool_tag"] = "/c2pool/"
                     block["_coinbase_decoded"]["has_auxpow"] = True
                     if pthe:
                         block["_coinbase_decoded"]["the_state_root"] = pthe
                 elif ptag and ptag != "UNKNOWN" and (not own_tag or own_tag == "UNKNOWN"):
-                    # Detect V36 from parent's donation/ref outputs
                     parent_outs = block.get("_parent_outputs_decoded", [])
-                    parent_has_combined = any(
-                        o.get("donation_type") == "p2pool_combined" for o in parent_outs
-                    )
-                    parent_has_ref = any(
-                        o.get("type") == "p2pool_ref" for o in parent_outs
-                    )
+                    parent_has_combined = any(o.get("donation_type") == "p2pool_combined" for o in parent_outs)
+                    parent_has_ref = any(o.get("type") == "p2pool_ref" for o in parent_outs)
                     if "p2pool" in ptag.lower():
                         if parent_has_combined or parent_has_ref:
                             ptag = "/P2Pool v36/"
@@ -788,6 +1119,7 @@ class ExplorerEngine:
                 "parent_txid": parent_tx.get("txid", "") if isinstance(parent_tx, dict) else "",
                 "chain_index": auxpow.get("chainindex", 0),
                 "index": auxpow.get("index", 0),
+                "parent_coin": parent_id,
             }
 
         # Don't cache tip (it can change)
@@ -798,8 +1130,9 @@ class ExplorerEngine:
 
         return block
 
-    def get_recent_blocks(self, count=20, chain="ltc"):
+    def get_recent_blocks(self, count=20, chain=None):
         """Fetch the N most recent blocks."""
+        chain = self.coin_or_primary(chain)
         info = self.get_chain_info(chain)
         if "error" in info:
             return [info]
@@ -820,7 +1153,8 @@ class ExplorerEngine:
                 })
         return blocks
 
-    # First V36-era pool blocks — always shown so the "Pool Blocks" page is never empty.
+    # First V36-era pool blocks — always shown so the "Pool Blocks" page is never
+    # empty for LTC/DOGE.  Other coins start with an empty (live-scanned) list.
     SEED_POOL_BLOCKS = {
         "ltc": [{
             "chain": "ltc", "height": 3069917,
@@ -837,9 +1171,6 @@ class ExplorerEngine:
     }
 
     # ── Full block details for seed blocks so /block?q=... always works ──
-    # These are pre-decoded to match get_block() output format.  The
-    # _coinbase_decoded / _outputs_decoded dicts mirror decode_scriptsig()
-    # and decode_outputs() return values.
     SEED_BLOCK_DETAILS = {
         # ─────────────── LTC #3069917 ───────────────
         "ltc:3069917": {
@@ -872,32 +1203,6 @@ class ExplorerEngine:
                 {"index": 0,  "value_btc": 0.0,        "value_sat": 0,         "type": "op_return",  "asm": "OP_RETURN aa21a9ed1683273b0f24739675d6076c37c3f084998c2493e889e1399f913802912c22ea", "hex": "6a24aa21a9ed1683273b0f24739675d6076c37c3f084998c2493e889e1399f913802912c22ea", "addresses": [], "is_op_return": True},
                 {"index": 1,  "value_btc": 0.00074150, "value_sat": 74150,     "type": "p2sh",       "asm": "", "hex": "a9146cbbb83db91c3a72b761fc5ce1050f8dd87f3fca87", "addresses": ["MHp6697dpCacmGsDpaPGijZyYggAVRaVjD"]},
                 {"index": 2,  "value_btc": 0.00081093, "value_sat": 81093,     "type": "p2pkh",      "asm": "", "hex": "76a914218f1b2f0b5b9b6f7484573bb4d09d2e2c45238088ac", "addresses": ["LNHPzjcjb1HX6zMiAZWngBGr4u5UK7KdC4"]},
-                {"index": 3,  "value_btc": 0.00107655, "value_sat": 107655,    "type": "p2pkh",      "asm": "", "hex": "76a91481aab068a76fd27d4e778957dc68aa62e2dd2a2688ac", "addresses": ["LX3ZuePjBpjtst6dPepS2hXXfkmeZaBGmt"]},
-                {"index": 4,  "value_btc": 0.00123857, "value_sat": 123857,    "type": "p2pkh",      "asm": "", "hex": "76a914d4db09c28b7feade877c14856f2dc39dc3061b3488ac", "addresses": ["LedRuv8JCCHPu36Nn2HadHT9LXJmvH91so"]},
-                {"index": 5,  "value_btc": 0.00292087, "value_sat": 292087,    "type": "v0_p2wpkh",  "asm": "", "hex": "0014e98a1f371a1b36cf83def680c1605e92db25555a", "addresses": ["ltc1qax9p7dc6rvmvlq7776qvzcz7jtdj24266man39"]},
-                {"index": 6,  "value_btc": 0.00518639, "value_sat": 518639,    "type": "p2pkh",      "asm": "", "hex": "76a914670947f571cd38fff48b9fe35c94dd726bbf991788ac", "addresses": ["LUckyqGAZZ7RMRpH8bLYLgSw7g5Y6SwN7e"]},
-                {"index": 7,  "value_btc": 0.00894577, "value_sat": 894577,    "type": "p2sh",       "asm": "", "hex": "a914212c78273a43420588587a2c4160fe13bc0382dd87", "addresses": ["MAvZoYZxmdozi1BNsyHE8naNMNxqLkVTyd"]},
-                {"index": 8,  "value_btc": 0.01847205, "value_sat": 1847205,   "type": "p2sh",       "asm": "", "hex": "a91412fa01fbe0911efc7d350d7280bc238b0f3680f687", "addresses": ["M9dVtj4t94NRx3DPmHLkd8rhSE7HEWwFFA"]},
-                {"index": 9,  "value_btc": 0.02193889, "value_sat": 2193889,   "type": "v0_p2wpkh",  "asm": "", "hex": "001423279bb62e8807b064d92e1d5d6c2fc647b1e760", "addresses": ["ltc1qyvnehd3w3qrmqexe9cw46mp0cermremqd9fmqz"]},
-                {"index": 10, "value_btc": 0.02898877, "value_sat": 2898877,   "type": "p2sh",       "asm": "", "hex": "a914c15c9a506649e024d731ac78050556e92383c52387", "addresses": ["MRXZacDm3bAcqCMJJ4QReq5vbvP7QpLkFE"]},
-                {"index": 11, "value_btc": 0.02993388, "value_sat": 2993388,   "type": "p2pkh",      "asm": "", "hex": "76a91465295f7cdd536cdda899d9ea3ca9c7a07f6f7b0988ac", "addresses": ["LUSr5EYHTygRvGfBSt9vtvuN4X58mimfJq"]},
-                {"index": 12, "value_btc": 0.03024197, "value_sat": 3024197,   "type": "v0_p2wpkh",  "asm": "", "hex": "00145a34288f4f82236673b260fae84cc26447fe1213", "addresses": ["ltc1qtg6z3r60sg3kvuajvrawsnxzv3rluysn4dnuw3"]},
-                {"index": 13, "value_btc": 0.03493044, "value_sat": 3493044,   "type": "p2sh",       "asm": "", "hex": "a9149927d1b8ca9562869e874dd7974ad8b7401a189b87", "addresses": ["MMryKU8W7VP2pMdvRNRYbuzqiSdpcobans"]},
-                {"index": 14, "value_btc": 0.03903404, "value_sat": 3903404,   "type": "p2pkh",      "asm": "", "hex": "76a91416a8fa751d2bdc6f6dfe3ccb4ece16a5bc3200d888ac", "addresses": ["LMHmZFjXTzLtEKcxbBGBnc65LRqiWezM4f"]},
-                {"index": 15, "value_btc": 0.04114269, "value_sat": 4114269,   "type": "p2pkh",      "asm": "", "hex": "76a9140c42816983efe49e9748a5fad7ee64100d04807a88ac", "addresses": ["LLLn3Q7MwxwPZ34JHgePTfJdRL9rYEffhX"]},
-                {"index": 16, "value_btc": 0.04434624, "value_sat": 4434624,   "type": "p2pkh",      "asm": "", "hex": "76a9145498d7890aacbda5a8e20a12ad20016b48291c7088ac", "addresses": ["LSwG7yFGgHSEMdv8Xnqx9YSDo5fnPYkrUE"]},
-                {"index": 17, "value_btc": 0.04583976, "value_sat": 4583976,   "type": "v0_p2wpkh",  "asm": "", "hex": "0014be3b74236293ba942fad64038e67d7e9679e980a", "addresses": ["ltc1qhcahggmzjwafgtadvspcue7ha9neaxq24pe722"]},
-                {"index": 18, "value_btc": 0.04663059, "value_sat": 4663059,   "type": "v0_p2wpkh",  "asm": "", "hex": "00146e55db837d96371ddce6e5e58afbc382aa478503", "addresses": ["ltc1qde2ahqmajcm3mh8xuhjc477rs24y0pgrv2fucz"]},
-                {"index": 19, "value_btc": 0.08115990, "value_sat": 8115990,   "type": "p2pkh",      "asm": "", "hex": "76a914b1b0447a63a983dcd03b8507abf957db4b2e49ce88ac", "addresses": ["LbRV2StFb9Y6xqAsSPyeoUf2TaazuJHGYx"]},
-                {"index": 20, "value_btc": 0.13645416, "value_sat": 13645416,  "type": "p2pkh",      "asm": "", "hex": "76a91412f96bccf2e0a6bab2bb4574c7db76944f434aa888ac", "addresses": ["LLxHDkJwWpaT29imBHZj7EdNxpGwnfrktS"]},
-                {"index": 21, "value_btc": 0.16006377, "value_sat": 16006377,  "type": "v0_p2wpkh",  "asm": "", "hex": "0014e00dea88543bfdccdf556b12bdf452783c2695d4", "addresses": ["ltc1quqx74zz5807ueh64dvftmazj0q7zd9w5ef2adu"]},
-                {"index": 22, "value_btc": 0.23222312, "value_sat": 23222312,  "type": "v0_p2wpkh",  "asm": "", "hex": "001461f3800a7fdfb90f5c43f1f09004ff994bf3b1b9", "addresses": ["ltc1qv8ecqznlm7us7hzr78cfqp8ln99l8vdecdg06j"]},
-                {"index": 23, "value_btc": 0.27128166, "value_sat": 27128166,  "type": "p2pkh",      "asm": "", "hex": "76a914620f499fc74eba7ee7eb2e5821f95226bcbbfeeb88ac", "addresses": ["LUASoDK1SsV5DQ3dwGo5bGFxWJobPydupY"]},
-                {"index": 24, "value_btc": 0.39756879, "value_sat": 39756879,  "type": "v0_p2wpkh",  "asm": "", "hex": "0014db5cd391f60e263c137769dec54e88ead4989582", "addresses": ["ltc1qmdwd8y0kpcnrcymhd80v2n5gat2f39vzwv0dnv"]},
-                {"index": 25, "value_btc": 0.79428194, "value_sat": 79428194,  "type": "p2pkh",      "asm": "", "hex": "76a9140fa5296e6dcff4ce3bc9a300e959c3cfb224ab6588ac", "addresses": ["LLegFjfScJ3kZvz6rSBhZVg6A93JPrY3tf"]},
-                {"index": 26, "value_btc": 1.09527823, "value_sat": 109527823, "type": "p2pkh",      "asm": "", "hex": "76a914238e0e0d040b0d300fa03777e2a0ee9d9c9c221588ac", "addresses": ["LNTx65DqrACZWCSK8Jc4c7wriSWHS448Qj"]},
-                {"index": 27, "value_btc": 1.30603390, "value_sat": 130603390, "type": "p2pkh",      "asm": "", "hex": "76a914b8089e39a70cf3dd3bf057bf86bf03dc2ea1889a88ac", "addresses": ["Lc12vJZd5oMsZY4eGLdvMo9jrXNHKaouvk"]},
-                {"index": 28, "value_btc": 1.38024571, "value_sat": 138024571, "type": "p2pkh",      "asm": "", "hex": "76a91404f4e9aaf5021dcc4cff4b40498969025d0e832f88ac", "addresses": ["LKgAMpNXkKSq1ixoELmGS2UfvNn2TrpFBx"]},
                 {"index": 29, "value_btc": 0.00000014, "value_sat": 14,        "type": "p2pk",       "asm": "", "hex": "4104ffd03de44a6e11b9917f3a29f9443283d9871c9d743ef30d5eddcd37094b64d1b3d8090496b53256786bf5c82932ec23c3b74d9f05a6f95a8b5529352656664bac", "addresses": ["LeD2fnnDJYZuyt8zgDsZ2oBGmuVcxGKCLd"], "is_donation": True, "donation_type": "p2pool_old"},
                 {"index": 30, "value_btc": 0.0,        "value_sat": 0,         "type": "op_return",  "asm": "OP_RETURN 8bd158eb8a5e928fea18613ac741a8a66c3b4058d7e059921c85a07250e02e6d000000002ecd1000", "hex": "6a288bd158eb8a5e928fea18613ac741a8a66c3b4058d7e059921c85a07250e02e6d000000002ecd1000", "addresses": [], "is_op_return": True, "ref_hash": "8bd158eb8a5e928fea18613ac741a8a66c3b4058d7e059921c85a07250e02e6d", "last_txout_nonce": "000000002ecd1000", "type": "p2pool_ref"},
             ],
@@ -930,9 +1235,6 @@ class ExplorerEngine:
             },
             "_outputs_decoded": [
                 {"index": 0, "value_btc": 8598.59979535, "value_sat": 859859979535, "type": "p2pkh", "asm": "", "hex": "76a914b8089e39a70cf3dd3bf057bf86bf03dc2ea1889a88ac", "addresses": ["DMvBCMCSJZ26qjZ5pneBdYFaXSjJUk5L4G"]},
-                {"index": 1, "value_btc": 1314.86645163, "value_sat": 131486645163, "type": "p2pkh", "asm": "", "hex": "76a914238e0e0d040b0d300fa03777e2a0ee9d9c9c221588ac", "addresses": ["D8P6N7rf4urnnPvkgkcKss3hPMsJfasFAs"]},
-                {"index": 2, "value_btc": 86.58781129,   "value_sat": 8658781129,   "type": "p2pkh", "asm": "", "hex": "76a91465295f7cdd536cdda899d9ea3ca9c7a07f6f7b0988ac", "addresses": ["DEMzMHB6gjLfCU9d1LACAg1CjSS9xPvLfG"]},
-                {"index": 3, "value_btc": 5.45895328,    "value_sat": 545895328,    "type": "p2pkh", "asm": "", "hex": "76a91404f4e9aaf5021dcc4cff4b40498969025d0e832f88ac", "addresses": ["D5bJds1Ly574HvTEnnmXhmaWbJ93fUhFUP"]},
                 {"index": 4, "value_btc": 0.0,           "value_sat": 0,            "type": "nulldata", "asm": "OP_RETURN 7032702d7370622e78797a", "hex": "6a0b7032702d7370622e78797a", "addresses": [], "is_op_return": True, "op_return_ascii": "p2p-spb.xyz"},
                 {"index": 5, "value_btc": 1.00000002,    "value_sat": 100000002,    "type": "p2sh",  "asm": "", "hex": "a9148c6272621d89e8fa526dd86acff60c7136be8e8587", "addresses": ["A5EZCT4tUrtoKuvJaWbtVQADzdUKdtsqpr"], "is_donation": True, "donation_type": "p2pool_combined"},
             ],
@@ -943,8 +1245,9 @@ class ExplorerEngine:
     SEED_BLOCK_DETAILS["ltc:806a9214cd63dae4b5091b69c1f8e14652ff95fff2bbcb06de6fcdafa76ec6ea"] = SEED_BLOCK_DETAILS["ltc:3069917"]
     SEED_BLOCK_DETAILS["doge:f84500c25a4cce2a08887f29763726bd5ecec7b66fed65a88b181fb0b0ab2383"] = SEED_BLOCK_DETAILS["doge:6135703"]
 
-    def scan_for_pool_blocks(self, chain="ltc", depth=100):
+    def scan_for_pool_blocks(self, chain=None, depth=100):
         """Scan recent blocks for p2pool/c2pool coinbase tags."""
+        chain = self.coin_or_primary(chain)
         with self._scan_lock:
             info = self.get_chain_info(chain)
             if "error" in info:
@@ -981,16 +1284,15 @@ class ExplorerEngine:
             self.found_blocks = found
             return found
 
-    def get_mempool_info(self, chain="ltc"):
+    def get_mempool_info(self, chain=None):
         """Get mempool summary statistics. Normalizes daemon response to c2pool format."""
-        rpc = self.doge if chain == "doge" and self.doge else self.ltc
+        chain = self.coin_or_primary(chain)
+        rpc = self.rpc(chain)
         try:
             raw = rpc.call("getmempoolinfo")
             if isinstance(rpc, C2PoolClient):
                 return raw
             # Normalize daemon response to match c2pool explorer API format
-            # Daemon returns: size, bytes, usage, maxmempool, mempoolminfee, ...
-            # c2pool returns: size, bytes, total_weight, total_fees, fee_histogram, ...
             entries = self.get_mempool_entries(chain, verbose=True, limit=10000)
             total_fees = 0
             total_weight = 0
@@ -1043,25 +1345,22 @@ class ExplorerEngine:
         except Exception as e:
             return {"error": str(e)}
 
-    def get_mempool_entries(self, chain="ltc", verbose=True, limit=100):
+    def get_mempool_entries(self, chain=None, verbose=True, limit=100):
         """Get mempool transaction list.  Returns a list of entry dicts."""
-        rpc = self.doge if chain == "doge" and self.doge else self.ltc
+        chain = self.coin_or_primary(chain)
+        rpc = self.rpc(chain)
         try:
             if isinstance(rpc, C2PoolClient):
-                # c2pool API returns a list of objects already
                 return rpc.call("getrawmempool", verbose, limit)
-            # Standard daemon RPC
             if not verbose:
                 return rpc.call("getrawmempool", False)
             raw = rpc.call("getrawmempool", True)
-            # Daemon returns {txid: {...}} dict — normalize to list
             if isinstance(raw, dict):
                 entries = []
                 now = int(time.time())
                 for txid, v in raw.items():
                     vsize = v.get("vsize", 0)
                     weight = v.get("weight", 0)
-                    # fee is in BTC, convert to satoshi
                     fee_btc = v.get("fee", 0)
                     fee_sat = int(round(fee_btc * 1e8))
                     feerate = fee_sat / vsize if vsize > 0 else 0
@@ -1075,7 +1374,7 @@ class ExplorerEngine:
                         "feerate": feerate,
                         "time_added": t,
                         "age_sec": now - t if t else 0,
-                        "n_vin": 0,  # not in daemon verbose response
+                        "n_vin": 0,
                         "n_vout": 0,
                     })
                 entries.sort(key=lambda e: e["feerate"], reverse=True)
@@ -1084,9 +1383,10 @@ class ExplorerEngine:
         except Exception as e:
             return {"error": str(e)}
 
-    def get_mempool_entry(self, txid, chain="ltc"):
+    def get_mempool_entry(self, txid, chain=None):
         """Get single mempool tx detail."""
-        rpc = self.doge if chain == "doge" and self.doge else self.ltc
+        chain = self.coin_or_primary(chain)
+        rpc = self.rpc(chain)
         try:
             return rpc.call("getmempoolentry", txid)
         except Exception as e:
@@ -1103,6 +1403,7 @@ a { color: #58a6ff; text-decoration: none; }
 a:hover { text-decoration: underline; }
 h1 { color: #f0f6fc; border-bottom: 1px solid #30363d; padding-bottom: 10px; }
 h2 { color: #e6edf3; margin-top: 24px; }
+h3 { color: #e6edf3; }
 table { border-collapse: collapse; width: 100%; margin: 10px 0; }
 th, td { border: 1px solid #30363d; padding: 6px 10px; text-align: left; font-size: 13px; }
 th { background: #161b22; color: #8b949e; }
@@ -1115,6 +1416,7 @@ tr:hover { background: #161b22; }
 .tag-unknown { background: #30363d; color: #484f58; padding: 2px 6px; border-radius: 3px; font-style: italic; }
 .tag-the { background: #8957e533; color: #d2a8ff; padding: 2px 6px; border-radius: 3px; }
 .tag-auxpow { background: #da3633aa; color: #f85149; padding: 2px 6px; border-radius: 3px; }
+.tag-mn { background: #bb800022; color: #e3b341; padding: 2px 6px; border-radius: 3px; }
 .mono { font-family: 'Courier New', monospace; font-size: 12px; word-break: break-all; }
 .card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; margin: 10px 0; }
 .nav { background: #161b22; padding: 10px 20px; margin: -20px -20px 20px -20px; border-bottom: 1px solid #30363d; }
@@ -1134,11 +1436,11 @@ input[type=text] { background: #0d1117; border: 1px solid #30363d; color: #c9d1d
 """
 
 
-def blockchair_link(chain_key, item_type, value, display=None):
+def blockchair_link(engine, coin_id, item_type, value, display=None):
     """Generate a Blockchair link for a tx, address, or block."""
-    base = BLOCKCHAIR.get(chain_key, "")
+    base = engine.blockchair_base(coin_id) if engine else ""
     if not base:
-        return escape(str(display or value))
+        return escape(str(display if display is not None else value))
     if display is None:
         display = value
     if item_type == "tx":
@@ -1150,18 +1452,18 @@ def blockchair_link(chain_key, item_type, value, display=None):
     return escape(str(display))
 
 
-def render_page(title, body, chain="ltc", engine=None):
-    ltc_label = engine.chain_label("ltc") if engine else "LTC"
-    doge_label = engine.chain_label("doge") if engine else "DOGE"
-    footer_label = engine.footer_label() if engine else "Explorer"
-    chain_nav = f"""
-    <a href="/?chain=ltc" class="{'active' if chain == 'ltc' else ''}">{ltc_label}</a>
-    <a href="/?chain=doge" class="{'active' if chain == 'doge' else ''}">{doge_label}</a>
+def render_page(title, body, chain, engine):
+    chain_nav = ""
+    for cid in engine.coins:
+        active = "active" if cid == chain else ""
+        chain_nav += f'<a href="/?chain={cid}" class="{active}">{escape(engine.chain_label(cid))}</a>\n'
+    chain_nav += f"""
     <a href="/found?chain={chain}">Pool Blocks</a>
     <a href="/mempool?chain={chain}">Mempool</a>
     <a href="/api/status">API Status</a>
     <span id="sound-toggle" style="cursor:pointer;margin-left:12px;font-size:18px" title="Toggle block sounds">&#128263;</span>
     """
+    footer_label = engine.footer_label()
     return f"""<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8"><title>{escape(title)}</title>
@@ -1179,7 +1481,7 @@ def render_page(title, body, chain="ltc", engine=None):
 {body}
 <div class="dim" style="margin-top:40px;font-size:11px">
 <span id="live-status">&#9679; connecting...</span> |
-{footer_label}
+{escape(footer_label)}
 | <a href="/api/chain_info?chain={chain}">chain_info</a>
 | <a href="/api/recent?chain={chain}&count=50">recent(50)</a>
 | <a href="/api/found?chain={chain}&depth=200">found(200)</a>
@@ -1189,7 +1491,6 @@ def render_page(title, body, chain="ltc", engine=None):
   var chain = "{chain}";
   var statusEl = document.getElementById("live-status");
   var es = new EventSource("/api/stream?chain=all");
-  // Block sound toggle (off by default, persisted in localStorage)
   var soundEnabled = localStorage.getItem("blockSound") === "true";
   var soundBtn = document.getElementById("sound-toggle");
   if (soundBtn) {{
@@ -1202,7 +1503,6 @@ def render_page(title, body, chain="ltc", engine=None):
   }}
 
   function playCoins() {{
-    // Falling coins: descending chime sequence
     var ctx = new (window.AudioContext || window.webkitAudioContext)();
     [880,784,698,659,587].forEach(function(f, i) {{
       var o = ctx.createOscillator(), g = ctx.createGain();
@@ -1215,7 +1515,6 @@ def render_page(title, body, chain="ltc", engine=None):
     }});
   }}
   function playBork() {{
-    // Dog bark: short low burst + higher yap
     var ctx = new (window.AudioContext || window.webkitAudioContext)();
     [150,180,120].forEach(function(f, i) {{
       var o = ctx.createOscillator(), g = ctx.createGain();
@@ -1231,21 +1530,18 @@ def render_page(title, body, chain="ltc", engine=None):
   es.addEventListener("newblock", function(e) {{
     var d = JSON.parse(e.data);
     if (statusEl) statusEl.innerHTML = '<span class="green">&#9679; block ' + d.height + '</span>';
-    // Sound notification
     if (soundEnabled) {{
       try {{
         if (d.chain === "doge") playBork();
         else playCoins();
       }} catch(ex) {{}}
     }}
-    // Toast notification
     var toast = document.createElement("div");
     toast.style.cssText = "position:fixed;top:20px;right:20px;background:#238636;color:#fff;padding:12px 20px;border-radius:8px;z-index:9999;font-size:14px;box-shadow:0 4px 12px rgba(0,0,0,0.4);transition:opacity 0.5s";
     toast.textContent = "New " + d.chain.toUpperCase() + " block #" + d.height;
     document.body.appendChild(toast);
     setTimeout(function(){{ toast.style.opacity = "0"; }}, 3000);
     setTimeout(function(){{ toast.remove(); }}, 3500);
-    // Auto-reload dashboard and found pages after short delay
     var path = window.location.pathname;
     if (path === "/" || path === "/index.html" || path === "/found") {{
       setTimeout(function(){{ window.location.reload(); }}, 1500);
@@ -1288,16 +1584,15 @@ def render_dashboard(engine, chain):
         return render_page("Explorer", f'<p class="red">Daemon offline: {escape(str(info["error"]))}</p>', chain, engine)
 
     blocks = engine.get_recent_blocks(30, chain)
-    is_testnet = info.get("chain", "") in ("test", "testnet", "testnet4alpha", "regtest")
-    if chain == "ltc":
-        chain_name = "Litecoin Testnet" if is_testnet else "Litecoin"
-    else:
-        chain_name = "Dogecoin Testnet" if is_testnet else "Dogecoin"
+    prof = engine.profile(chain)
+    chain_name = engine.coin_label(chain)
+    algo = prof.get("algo", "")
 
     # Chain stats card
     stats = f"""<div class="grid"><div class="card">
-    <h2>{chain_name}</h2>
+    <h2>{escape(chain_name)}</h2>
     <table>
+    <tr><td>Algorithm</td><td>{escape(algo)}</td></tr>
     <tr><td>Height</td><td class="green">{info.get('blocks', '?')}</td></tr>
     <tr><td>Headers</td><td>{info.get('headers', '?')}</td></tr>
     <tr><td>Chain</td><td>{info.get('chain', '?')}</td></tr>
@@ -1342,6 +1637,36 @@ def render_dashboard(engine, chain):
     return render_page(f"{chain_name} Explorer", stats + table, chain, engine)
 
 
+def _render_output_rows(engine, chain, outputs):
+    """Render coinbase output rows (shared by block + parent tables)."""
+    rows = ""
+    for o in outputs:
+        row_class = ""
+        tags = ""
+        if o.get("is_op_return"):
+            row_class = ' class="op-return"'
+            if o.get("ref_hash"):
+                tags += f'ref_hash=<span class="mono">{o["ref_hash"][:16]}...</span> '
+                tags += f'nonce=<span class="mono">{o.get("last_txout_nonce", "")}</span>'
+            elif o.get("op_return_ascii"):
+                tags += f'OP_RETURN <span class="dim">{escape(o["op_return_ascii"])}</span>'
+            else:
+                tags += "OP_RETURN"
+        if o.get("is_donation"):
+            row_class = ' class="donation"'
+            dtype = o.get("donation_type", "")
+            tags += f'<span class="tag-p2pool">donation</span> ' + dtype
+        addr_list = o.get("addresses", [])
+        if addr_list:
+            addr_display = ", ".join(blockchair_link(engine, chain, "address", a) for a in addr_list)
+        else:
+            addr_display = escape(o.get("hex", "")[:40])
+        value = f'{o["value_btc"]:.8f}'
+        rows += f'<tr{row_class}><td>{o["index"]}</td><td>{value}</td>'
+        rows += f'<td>{o["type"]}</td><td class="mono">{addr_display}</td><td>{tags}</td></tr>'
+    return rows
+
+
 def render_block_detail(engine, query, chain):
     block = engine.get_block(query, chain)
     if "error" in block:
@@ -1351,7 +1676,6 @@ def render_block_detail(engine, query, chain):
     bhash = block.get("hash", "?")
     cb = block.get("_coinbase_decoded", {})
     outputs = block.get("_outputs_decoded", [])
-    chain_key = engine.chain_key(chain)
 
     # Navigation
     nav = f'<a href="/block?q={height-1}&chain={chain}">&larr; Prev</a> | '
@@ -1361,7 +1685,7 @@ def render_block_detail(engine, query, chain):
     header = f"""<div class="card">
     <table>
     <tr><td>Height</td><td class="green">{height}</td></tr>
-    <tr><td>Hash</td><td class="mono">{blockchair_link(chain_key, "block", bhash)}</td></tr>
+    <tr><td>Hash</td><td class="mono">{blockchair_link(engine, chain, "block", bhash)}</td></tr>
     <tr><td>Previous</td><td class="mono"><a href="/block?q={block.get('previousblockhash','')}&chain={chain}">{block.get('previousblockhash','?')}</a></td></tr>
     <tr><td>Time</td><td>{datetime.fromtimestamp(block.get('time',0), tz=timezone.utc).isoformat()}</td></tr>
     <tr><td>Difficulty</td><td>{block.get('difficulty', '?')}</td></tr>
@@ -1394,7 +1718,6 @@ def render_block_detail(engine, query, chain):
         cb_html += f'<p class="dim">ASCII: {escape(", ".join(cb["ascii_strings"]))}</p>'
     cb_html += f'<details><summary class="dim">Raw scriptSig ({cb.get("length", "?")} bytes)</summary>'
     cb_html += f'<p class="mono">{escape(cb.get("raw_hex", ""))}</p>'
-    # ASCII decode: printable chars shown, non-printable as dots
     raw_hex = cb.get("raw_hex", "")
     if raw_hex:
         raw_bytes = bytes.fromhex(raw_hex)
@@ -1403,62 +1726,43 @@ def render_block_detail(engine, query, chain):
     cb_html += '</details>'
     cb_html += '</div>'
 
+    # DASH DIP3/DIP4 CbTx (masternode-enforced special coinbase)
+    cbtx_html = ""
+    cbtx = block.get("_cbtx")
+    if cbtx or block.get("_is_special_cb"):
+        cbtx_html = '<div class="card"><h2><span class="tag-mn">DIP3/DIP4</span> Coinbase Special Payload (CbTx)</h2>'
+        cbtx_html += '<p class="dim">Dash coinbase is a special transaction (v3, type=5). '
+        cbtx_html += 'Consensus requires the coinbase to pay the scheduled masternode/operator payee '
+        cbtx_html += '(shown among the coinbase outputs below).</p>'
+        if isinstance(cbtx, dict):
+            cbtx_html += '<table>'
+            cbtx_html += f'<tr><td>CbTx version</td><td>{cbtx.get("version", "?")}</td></tr>'
+            cbtx_html += f'<tr><td>Height</td><td class="green">{cbtx.get("height", "?")}</td></tr>'
+            if cbtx.get("merkleRootMNList"):
+                cbtx_html += f'<tr><td>MN-list root</td><td class="mono">{escape(str(cbtx["merkleRootMNList"]))}</td></tr>'
+            if cbtx.get("merkleRootQuorums"):
+                cbtx_html += f'<tr><td>Quorum root</td><td class="mono">{escape(str(cbtx["merkleRootQuorums"]))}</td></tr>'
+            if cbtx.get("bestCLHeightDiff") is not None:
+                cbtx_html += f'<tr><td>bestCLHeightDiff</td><td>{cbtx.get("bestCLHeightDiff")}</td></tr>'
+            if cbtx.get("creditPoolBalance") is not None:
+                cbtx_html += f'<tr><td>Credit pool</td><td>{cbtx.get("creditPoolBalance")}</td></tr>'
+            cbtx_html += '</table>'
+        cbtx_html += '</div>'
+
     # Coinbase outputs
     out_html = '<div class="card"><h2>Coinbase Outputs</h2><table>'
     out_html += '<tr><th>#</th><th>Value</th><th>Type</th><th>Address / Script</th><th>Tags</th></tr>'
-    for o in outputs:
-        row_class = ""
-        tags = ""
-        if o.get("is_op_return"):
-            row_class = ' class="op-return"'
-            if o.get("ref_hash"):
-                tags += f'ref_hash=<span class="mono">{o["ref_hash"][:16]}...</span> '
-                tags += f'nonce=<span class="mono">{o.get("last_txout_nonce", "")}</span>'
-            elif o.get("op_return_ascii"):
-                tags += f'OP_RETURN <span class="dim">{escape(o["op_return_ascii"])}</span>'
-            else:
-                tags += "OP_RETURN"
-        if o.get("is_donation"):
-            row_class = ' class="donation"'
-            dtype = o.get("donation_type", "")
-            tags += f'<span class="tag-p2pool">donation</span> ' + dtype
-        addr_list = o.get("addresses", [])
-        if addr_list:
-            addr_display = ", ".join(blockchair_link(chain_key, "address", a) for a in addr_list)
-        else:
-            addr_display = escape(o.get("hex", "")[:40])
-        value = f'{o["value_btc"]:.8f}'
-        out_html += f'<tr{row_class}><td>{o["index"]}</td><td>{value}</td>'
-        out_html += f'<td>{o["type"]}</td><td class="mono">{addr_display}</td><td>{tags}</td></tr>'
+    out_html += _render_output_rows(engine, chain, outputs)
     out_html += '</table></div>'
 
-    # THE commitment card
-    the_html = ""
-    if "_the" in block:
-        the = block["_the"]
-        the_html += '<div class="card">'
-        the_html += '<h2><span style="background:#4caf50;color:#fff;padding:2px 8px;border-radius:4px;font-size:0.85em">THE</span> Commitment Proof</h2>'
-        the_html += '<table>'
-        if "state_root" in the and the["state_root"]:
-            the_html += f'<tr><td>State Root</td><td class="mono">{escape(str(the["state_root"]))}</td></tr>'
-        if "metadata" in the:
-            md = the["metadata"]
-            the_html += f'<tr><td>Protocol Version</td><td>V{md.get("version", "?")}</td></tr>'
-            the_html += f'<tr><td>Sharechain Height</td><td style="color:#4caf50">{md.get("sharechain_height", "?")}</td></tr>'
-            the_html += f'<tr><td>Active Miners</td><td>{md.get("miner_count", "?")}</td></tr>'
-            the_html += f'<tr><td>Pool Hashrate</td><td>~{escape(str(md.get("hashrate_human", "?")))}</td></tr>'
-            the_html += f'<tr><td>Chain Fingerprint</td><td class="mono">{escape(str(md.get("chain_fingerprint", "?")))}</td></tr>'
-            the_html += f'<tr><td>Share Period</td><td>{md.get("share_period", "?")}s</td></tr>'
-            the_html += f'<tr><td>Verified Chain</td><td>{md.get("verified_length", "?")} shares</td></tr>'
-        the_html += '</table>'
-        the_html += '</div>'
-
-    # AuxPoW (DOGE merged mining) — show parent coinbase
+    # AuxPoW (merged mining) — show parent coinbase
     auxpow_html = ""
     if block.get("_parent_coinbase_decoded"):
         pcb = block["_parent_coinbase_decoded"]
         auxinfo = block.get("_auxpow_info", {})
-        auxpow_html = '<div class="card"><h2><span class="tag-auxpow">AuxPoW</span> Parent (LTC) Coinbase</h2>'
+        parent_id = auxinfo.get("parent_coin", engine.profile(chain).get("merged_parent", chain))
+        parent_unit = COIN_PROFILES.get(parent_id, {}).get("unit", parent_id.upper())
+        auxpow_html = f'<div class="card"><h2><span class="tag-auxpow">AuxPoW</span> Parent ({escape(parent_unit)}) Coinbase</h2>'
         if pcb.get("bip34_height") is not None:
             auxpow_html += f'<p>Parent BIP34 Height: <span class="green">{pcb["bip34_height"]}</span></p>'
         for comp in pcb.get("components", []):
@@ -1470,29 +1774,12 @@ def render_block_detail(engine, query, chain):
         if pcb.get("ascii_strings"):
             auxpow_html += f'<p class="dim">Parent ASCII: {escape(", ".join(pcb["ascii_strings"]))}</p>'
         parent_txid = auxinfo.get("parent_txid", "?")
-        auxpow_html += f'<p class="dim">Parent txid: <span class="mono">{blockchair_link(engine.chain_key("ltc"), "tx", parent_txid)}</span></p>'
-        # Parent outputs
+        auxpow_html += f'<p class="dim">Parent txid: <span class="mono">{blockchair_link(engine, parent_id, "tx", parent_txid)}</span></p>'
         pouts = block.get("_parent_outputs_decoded", [])
         if pouts:
             auxpow_html += '<h3>Parent Coinbase Outputs</h3><table>'
             auxpow_html += '<tr><th>#</th><th>Value</th><th>Type</th><th>Address</th><th>Tags</th></tr>'
-            for o in pouts:
-                row_class = ""
-                tags = ""
-                if o.get("is_op_return"):
-                    row_class = ' class="op-return"'
-                    if o.get("ref_hash"):
-                        tags = f'ref_hash=<span class="mono">{o["ref_hash"][:16]}...</span>'
-                if o.get("is_donation"):
-                    row_class = ' class="donation"'
-                    tags += '<span class="tag-p2pool">donation</span>'
-                addr_list = o.get("addresses", [])
-                if addr_list:
-                    addr = ", ".join(blockchair_link(engine.chain_key("ltc"), "address", a) for a in addr_list)
-                else:
-                    addr = escape(o.get("hex", "")[:40])
-                auxpow_html += f'<tr{row_class}><td>{o["index"]}</td><td>{o["value_btc"]:.8f}</td>'
-                auxpow_html += f'<td>{o["type"]}</td><td class="mono">{addr}</td><td>{tags}</td></tr>'
+            auxpow_html += _render_output_rows(engine, parent_id, pouts)
             auxpow_html += '</table>'
         auxpow_html += '</div>'
 
@@ -1503,7 +1790,7 @@ def render_block_detail(engine, query, chain):
         txid = tx.get("txid", "?")
         n_in = len(tx.get("vin", []))
         n_out = len(tx.get("vout", []))
-        txid_display = blockchair_link(chain_key, "tx", txid, txid[:32] + "...")
+        txid_display = blockchair_link(engine, chain, "tx", txid, txid[:32] + "...")
         tx_html += f'<tr><td>{i}</td><td class="mono">{txid_display}</td>'
         tx_html += f'<td>{n_in}</td><td>{n_out}</td></tr>'
     if len(block.get("tx", [])) > 50:
@@ -1518,12 +1805,12 @@ def render_block_detail(engine, query, chain):
     if pool_tag:
         title += f" ({pool_tag})"
 
-    return render_page(title, header + cb_html + out_html + the_html + auxpow_html + tx_html, chain, engine)
+    body = header + cb_html + cbtx_html + out_html + auxpow_html + tx_html
+    return render_page(title, body, chain, engine)
 
 
 def render_found_blocks(engine, chain, depth=200):
     found = engine.scan_for_pool_blocks(chain, depth)
-    ck = engine.chain_key(chain)
 
     rows = ""
     for b in found:
@@ -1536,7 +1823,7 @@ def render_found_blocks(engine, chain, depth=200):
         value = f'{b.get("coinbase_value", 0) / 1e8:.8f}'
         rows += f"""<tr>
         <td><a href="/block?q={b['height']}&chain={chain}">{b['height']}</a></td>
-        <td class="mono">{blockchair_link(ck, "block", b['hash'], b['hash'][:24] + "...")}</td>
+        <td class="mono">{blockchair_link(engine, chain, "block", b['hash'], b['hash'][:24] + "...")}</td>
         <td>{ts}</td>
         <td>{value}</td>
         <td>{tags}</td></tr>"""
@@ -1548,8 +1835,7 @@ def render_found_blocks(engine, chain, depth=200):
     <tr><th>Height</th><th>Hash</th><th>Time</th><th>Coinbase Value</th><th>Tags</th></tr>
     {rows}</table>"""
 
-    chain_name = "LTC" if chain == "ltc" else "DOGE"
-    return render_page(f"Pool Blocks Found ({chain_name}, last {depth})", table, chain, engine)
+    return render_page(f"Pool Blocks Found ({engine.chain_label(chain)}, last {depth})", table, chain, engine)
 
 
 def render_mempool_dashboard(engine, chain):
@@ -1558,7 +1844,7 @@ def render_mempool_dashboard(engine, chain):
     if "error" in info:
         return render_page("Mempool", f'<p class="red">Mempool unavailable: {escape(str(info["error"]))}</p>', chain, engine)
 
-    chain_name = "LTC" if chain == "ltc" else "DOGE"
+    unit = engine.unit(chain)
     tx_count = info.get("size", 0)
     total_bytes = info.get("bytes", 0)
     total_weight = info.get("total_weight", 0)
@@ -1571,14 +1857,13 @@ def render_mempool_dashboard(engine, chain):
     avg_fr = info.get("avg_feerate", 0)
     oldest = info.get("oldest_age_sec", 0)
 
-    # Summary card
     stats = f"""<div class="grid"><div class="card">
-    <h2>{chain_name} Mempool</h2>
+    <h2>{unit} Mempool</h2>
     <table>
     <tr><td>Transactions</td><td class="green">{tx_count}</td></tr>
     <tr><td>Total size</td><td>{total_bytes:,} bytes</td></tr>
     <tr><td>Total weight</td><td>{total_weight:,} WU</td></tr>
-    <tr><td>Total fees</td><td>{total_fees:,} sat ({total_fees / 1e8:.8f} {chain_name})</td></tr>
+    <tr><td>Total fees</td><td>{total_fees:,} sat ({total_fees / 1e8:.8f} {unit})</td></tr>
     <tr><td>Fee known / unknown</td><td>{fee_known} / {fee_unknown}</td></tr>
     <tr><td>Oldest tx age</td><td>{oldest // 3600}h {(oldest % 3600) // 60}m</td></tr>
     </table></div>
@@ -1590,7 +1875,6 @@ def render_mempool_dashboard(engine, chain):
     <tr><td>Average</td><td>{avg_fr:.2f}</td></tr>
     </table></div></div>"""
 
-    # Feerate histogram (CSS bars)
     histogram = info.get("fee_histogram", [])
     if histogram:
         max_count = max((b.get("count", 0) for b in histogram), default=1) or 1
@@ -1612,7 +1896,6 @@ def render_mempool_dashboard(engine, chain):
     else:
         hist_html = ''
 
-    # Top transactions table (verbose list, limit 50)
     entries = engine.get_mempool_entries(chain, verbose=True, limit=50)
     if isinstance(entries, list) and entries and not (len(entries) == 1 and "error" in entries[0]):
         rows = ""
@@ -1650,8 +1933,7 @@ def render_mempool_dashboard(engine, chain):
 
     refresh = '<meta http-equiv="refresh" content="15">'
     body = stats + hist_html + tx_table
-    # Inject auto-refresh into the page
-    page = render_page(f"{chain_name} Mempool ({tx_count} txs)", body, chain, engine)
+    page = render_page(f"{unit} Mempool ({tx_count} txs)", body, chain, engine)
     page = page.replace('<meta charset="utf-8">', f'<meta charset="utf-8">{refresh}', 1)
     return page
 
@@ -1662,8 +1944,7 @@ def render_mempool_tx_detail(engine, txid, chain):
     if isinstance(entry, dict) and "error" in entry:
         return render_page("Mempool Tx", f'<p class="red">Transaction not found: {escape(str(entry["error"]))}</p>', chain, engine)
 
-    chain_name = "LTC" if chain == "ltc" else "DOGE"
-    chain_key = engine.chain_key(chain)
+    unit = engine.unit(chain)
 
     feerate = entry.get("feerate", 0)
     fee = entry.get("fee", 0)
@@ -1675,16 +1956,15 @@ def render_mempool_tx_detail(engine, txid, chain):
     header = f"""<div class="card">
     <h2>Mempool Transaction</h2>
     <table>
-    <tr><td>TxID</td><td class="mono">{blockchair_link(chain_key, "tx", txid)}</td></tr>
+    <tr><td>TxID</td><td class="mono">{blockchair_link(engine, chain, "tx", txid)}</td></tr>
     <tr><td>Size</td><td>{size} bytes</td></tr>
     <tr><td>Weight</td><td>{weight} WU</td></tr>
-    <tr><td>Fee</td><td>{fee:,} sat ({fee / 1e8:.8f} {chain_name})</td></tr>
+    <tr><td>Fee</td><td>{fee:,} sat ({fee / 1e8:.8f} {unit})</td></tr>
     <tr><td>Feerate</td><td class="green">{feerate:.2f} sat/vB</td></tr>
     <tr><td>Fee known</td><td>{"Yes" if entry.get("fee_known", True) else "No"}</td></tr>
     <tr><td>Age</td><td>{age_str}</td></tr>
     </table></div>"""
 
-    # Inputs
     vin = entry.get("vin", [])
     if vin:
         vin_rows = ""
@@ -1692,7 +1972,7 @@ def render_mempool_tx_detail(engine, txid, chain):
             prevout = inp.get("prevout_hash", "?")
             prevout_n = inp.get("prevout_n", 0)
             seq = inp.get("sequence", 0)
-            prevout_link = blockchair_link(chain_key, "tx", prevout, f"{prevout[:24]}...") if prevout != "?" else "?"
+            prevout_link = blockchair_link(engine, chain, "tx", prevout, f"{prevout[:24]}...") if prevout != "?" else "?"
             vin_rows += f'<tr><td>{i}</td><td class="mono">{prevout_link}:{prevout_n}</td><td>{seq}</td></tr>'
         vin_html = f"""<div class="card"><h2>Inputs ({len(vin)})</h2>
         <table><tr><th>#</th><th>Prevout (hash:n)</th><th>Sequence</th></tr>
@@ -1700,7 +1980,6 @@ def render_mempool_tx_detail(engine, txid, chain):
     else:
         vin_html = ''
 
-    # Outputs
     vout = entry.get("vout", [])
     if vout:
         vout_rows = ""
@@ -1711,14 +1990,14 @@ def render_mempool_tx_detail(engine, txid, chain):
             addr = o.get("address", "")
             script_hex = o.get("scriptPubKey_hex", "")
             if addr:
-                addr_display = blockchair_link(chain_key, "address", addr)
+                addr_display = blockchair_link(engine, chain, "address", addr)
             elif script_hex:
                 addr_display = f'<span class="mono dim">{escape(script_hex[:60])}{"..." if len(script_hex) > 60 else ""}</span>'
             else:
                 addr_display = '<span class="dim">-</span>'
             vout_rows += f'<tr><td>{i}</td><td>{value_btc:.8f}</td><td>{script_type}</td><td>{addr_display}</td></tr>'
         vout_html = f"""<div class="card"><h2>Outputs ({len(vout)})</h2>
-        <table><tr><th>#</th><th>Value ({chain_name})</th><th>Type</th><th>Address</th></tr>
+        <table><tr><th>#</th><th>Value ({unit})</th><th>Type</th><th>Address</th></tr>
         {vout_rows}</table></div>"""
     else:
         vout_html = ''
@@ -1754,7 +2033,7 @@ class ExplorerHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         path, params = self._parse_params()
-        chain = params.get("chain", "ltc")
+        chain = self.engine.coin_or_primary(params.get("chain", self.engine.primary))
 
         try:
             if path == "/" or path == "/index.html":
@@ -1783,12 +2062,16 @@ class ExplorerHandler(http.server.BaseHTTPRequestHandler):
 
             # ---- REST API ----
             elif path == "/api/status":
-                ltc_ok = self.engine.ltc.is_alive() if self.engine.ltc else False
-                doge_ok = self.engine.doge.is_alive() if self.engine.doge else False
-                status = {
-                    "ltc": {"alive": ltc_ok, "url": self.engine.ltc.url if self.engine.ltc else None},
-                    "doge": {"alive": doge_ok, "url": self.engine.doge.url if self.engine.doge else None},
-                }
+                status = {}
+                for cid in self.engine.coins:
+                    rpc = self.engine.rpc(cid)
+                    status[cid] = {
+                        "alive": rpc.is_alive() if rpc else False,
+                        "url": getattr(rpc, "url", None),
+                        "coin": self.engine.profile(cid).get("name", cid),
+                        "network": self.engine.network(cid),
+                        "completeness": self.engine.profile(cid).get("completeness", "unknown"),
+                    }
                 self._respond(200, json.dumps(status, indent=2), "application/json")
 
             elif path == "/api/chain_info":
@@ -1829,7 +2112,6 @@ class ExplorerHandler(http.server.BaseHTTPRequestHandler):
                 self._respond(200, json.dumps(entry, indent=2, default=str), "application/json")
 
             elif path == "/api/stream":
-                # SSE endpoint: streams new-block events
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
@@ -1837,9 +2119,9 @@ class ExplorerHandler(http.server.BaseHTTPRequestHandler):
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 import queue as _q
-                q = self.engine.register_sse_client(chain if chain != "all" else None)
+                raw_chain = params.get("chain", "all")
+                q = self.engine.register_sse_client(raw_chain if raw_chain != "all" else None)
                 try:
-                    # Send initial heartbeat
                     self.wfile.write(b": connected\n\n")
                     self.wfile.flush()
                     while True:
@@ -1848,14 +2130,13 @@ class ExplorerHandler(http.server.BaseHTTPRequestHandler):
                             self.wfile.write(msg.encode())
                             self.wfile.flush()
                         except _q.Empty:
-                            # keepalive comment
                             self.wfile.write(b": keepalive\n\n")
                             self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     pass
                 finally:
                     self.engine.unregister_sse_client(q)
-                return  # don't fall through to error handler
+                return
 
             else:
                 self._respond(404, render_page("404", '<p class="red">Page not found</p>', chain, self.engine))
@@ -1869,70 +2150,155 @@ class ExplorerHandler(http.server.BaseHTTPRequestHandler):
 # Main
 # ============================================================================
 
+def _read_cookie(path):
+    """Read a bitcoin-style .cookie file → (user, pass), or (None, None)."""
+    try:
+        with open(path) as f:
+            data = f.read().strip()
+        if ":" in data:
+            u, p = data.split(":", 1)
+            return u, p
+    except Exception:
+        pass
+    return None, None
+
+
+def _build_rpc(host, port, user, password, cookie, label):
+    if cookie:
+        cu, cp = _read_cookie(cookie)
+        if cu is not None:
+            user, password = cu, cp
+    return RpcClient(host, port, user or "", password or "", label)
+
+
+def _probe(rpc, label):
+    """Print a one-line liveness/summary for an RPC client."""
+    print(f"{label} RPC: ", end="")
+    try:
+        if rpc.is_alive():
+            info = rpc.call("getblockchaininfo")
+            chain = info.get('chain', info.get('network', 'unknown'))
+            height = info.get('blocks', info.get('headers', 0))
+            print(f"OK — chain={chain} height={height}")
+            return True
+        print("OFFLINE")
+    except Exception as e:
+        print(f"ERROR ({e})")
+    return False
+
+
 def main():
-    parser = argparse.ArgumentParser(description="c2pool Block Explorer")
-    parser.add_argument("--ltc-host", default="192.168.86.26", help="Litecoin RPC host")
-    parser.add_argument("--ltc-port", type=int, default=19332, help="Litecoin RPC port")
-    parser.add_argument("--ltc-user", default="litecoinrpc", help="Litecoin RPC user")
-    parser.add_argument("--ltc-pass", default="litecoinrpc_mainnet_2026", help="Litecoin RPC password")
-    parser.add_argument("--doge-host", default="192.168.86.27", help="Dogecoin RPC host")
-    parser.add_argument("--doge-port", type=int, default=44555, help="Dogecoin RPC port")
-    parser.add_argument("--doge-user", default="dogecoinrpc", help="Dogecoin RPC user")
-    parser.add_argument("--doge-pass", default="testpass", help="Dogecoin RPC password")
+    parser = argparse.ArgumentParser(description="c2pool Block Explorer (coin-generic, auto-detecting)")
+
+    # Generic single-coin mode
+    parser.add_argument("--coin", default=None,
+                        help="Coin: dash|ltc|doge|dgb|bch|btc (auto-detected from the daemon if omitted)")
+    parser.add_argument("--rpc-host", default=None, help="Coin daemon RPC host")
+    parser.add_argument("--rpc-port", type=int, default=None, help="Coin daemon RPC port")
+    parser.add_argument("--rpc-user", default=None, help="Coin daemon RPC user")
+    parser.add_argument("--rpc-pass", default=None, help="Coin daemon RPC password")
+    parser.add_argument("--rpc-cookie", default=None, help="Path to a bitcoin-style .cookie file (overrides user/pass)")
+    parser.add_argument("--c2pool", default=None, help="c2pool explorer API URL (e.g. http://127.0.0.1:8080/api/explorer)")
+
+    # Back-compat: legacy LTC + DOGE two-chain mode (unchanged defaults)
+    parser.add_argument("--ltc-host", default="192.168.86.26", help="[legacy] Litecoin RPC host")
+    parser.add_argument("--ltc-port", type=int, default=19332, help="[legacy] Litecoin RPC port")
+    parser.add_argument("--ltc-user", default="litecoinrpc", help="[legacy] Litecoin RPC user")
+    parser.add_argument("--ltc-pass", default="litecoinrpc_mainnet_2026", help="[legacy] Litecoin RPC password")
+    parser.add_argument("--doge-host", default="192.168.86.27", help="[legacy] Dogecoin RPC host")
+    parser.add_argument("--doge-port", type=int, default=44555, help="[legacy] Dogecoin RPC port")
+    parser.add_argument("--doge-user", default="dogecoinrpc", help="[legacy] Dogecoin RPC user")
+    parser.add_argument("--doge-pass", default="testpass", help="[legacy] Dogecoin RPC password")
+    parser.add_argument("--no-doge", action="store_true", help="[legacy] Disable DOGE chain")
+    parser.add_argument("--ltc-c2pool", default=None, help="[legacy] c2pool explorer API URL for LTC")
+    parser.add_argument("--doge-c2pool", default=None, help="[legacy] c2pool explorer API URL for DOGE")
+
     parser.add_argument("--web-port", type=int, default=8888, help="Explorer web port")
-    parser.add_argument("--no-doge", action="store_true", help="Disable DOGE chain")
-    parser.add_argument("--ltc-c2pool", default=None, help="c2pool explorer API URL for LTC (e.g. http://127.0.0.1:8080/api/explorer)")
-    parser.add_argument("--doge-c2pool", default=None, help="c2pool explorer API URL for DOGE (e.g. http://127.0.0.1:8080/api/explorer)")
     args = parser.parse_args()
 
-    if args.ltc_c2pool:
-        ltc_rpc = C2PoolClient(args.ltc_c2pool, "ltc")
-    else:
-        ltc_rpc = RpcClient(args.ltc_host, args.ltc_port, args.ltc_user, args.ltc_pass, "LTC")
+    coins = OrderedDict()
+    primary = None
 
-    doge_rpc = None
-    if not args.no_doge:
-        if args.doge_c2pool:
-            doge_rpc = C2PoolClient(args.doge_c2pool, "doge")
+    # Generic mode is selected when any of --coin/--rpc-host/--c2pool is given.
+    generic_mode = bool(args.coin or args.rpc_host or args.c2pool)
+
+    if generic_mode:
+        coin_id = resolve_coin_id(args.coin)
+
+        if args.c2pool:
+            # c2pool explorer API — coin from --coin or /web/currency_info symbol.
+            tmp = C2PoolClient(args.c2pool, coin_id or "coin")
+            if not coin_id:
+                sym = (tmp.currency_info().get("symbol", "") or "").lower()
+                for cid, prof in COIN_PROFILES.items():
+                    if sym in prof.get("symbols", []):
+                        coin_id = cid
+                        break
+            if not coin_id:
+                print("ERROR: could not detect coin from c2pool node; pass --coin explicitly.")
+                sys.exit(2)
+            rpc = C2PoolClient(args.c2pool, coin_id)
         else:
-            doge_rpc = RpcClient(args.doge_host, args.doge_port, args.doge_user, args.doge_pass, "DOGE")
+            host = args.rpc_host or "127.0.0.1"
+            user = args.rpc_user
+            password = args.rpc_pass
+            # Auto-detect coin (and thus default port) from the daemon if needed.
+            if not coin_id:
+                # A probe client on the given port to read subversion/genesis.
+                probe_port = args.rpc_port or 8332
+                probe_rpc = _build_rpc(host, probe_port, user, password, args.rpc_cookie, "probe")
+                coin_id, _net = probe_rpc.detect_profile()
+                if not coin_id:
+                    print("ERROR: could not auto-detect the coin. Pass --coin explicitly "
+                          "(and --rpc-port if non-standard).")
+                    sys.exit(2)
+                print(f"Auto-detected coin: {coin_id}")
+            port = args.rpc_port or {"dash": 9998, "ltc": 9332, "doge": 22555,
+                                     "btc": 8332, "dgb": 14022, "bch": 8332}.get(coin_id, 8332)
+            rpc = _build_rpc(host, port, user, password, args.rpc_cookie,
+                             COIN_PROFILES[coin_id]["unit"])
 
-    engine = ExplorerEngine(ltc_rpc, doge_rpc)
+        coins[coin_id] = {"rpc": rpc, "profile": COIN_PROFILES[coin_id]}
+        primary = coin_id
 
-    # Test connectivity (retry if c2pool API isn't fully ready yet)
-    for attempt in range(10):
-        try:
-            print(f"LTC RPC: ", end="")
-            if ltc_rpc.is_alive():
-                info = ltc_rpc.call("getblockchaininfo")
-                chain = info.get('chain', info.get('network', 'unknown'))
-                height = info.get('blocks', info.get('headers', 0))
-                print(f"OK — chain={chain} height={height}")
-                break
+    else:
+        # Legacy LTC + DOGE two-chain mode (regression-preserving defaults).
+        if args.ltc_c2pool:
+            ltc_rpc = C2PoolClient(args.ltc_c2pool, "ltc")
+        else:
+            ltc_rpc = RpcClient(args.ltc_host, args.ltc_port, args.ltc_user, args.ltc_pass, "LTC")
+        coins["ltc"] = {"rpc": ltc_rpc, "profile": COIN_PROFILES["ltc"]}
+        primary = "ltc"
+
+        if not args.no_doge:
+            if args.doge_c2pool:
+                doge_rpc = C2PoolClient(args.doge_c2pool, "doge")
             else:
-                print("OFFLINE")
+                doge_rpc = RpcClient(args.doge_host, args.doge_port, args.doge_user, args.doge_pass, "DOGE")
+            coins["doge"] = {"rpc": doge_rpc, "profile": COIN_PROFILES["doge"]}
+
+    engine = ExplorerEngine(coins, primary=primary)
+
+    # Connectivity probe (retry primary a few times for c2pool API warm-up).
+    for attempt in range(10):
+        rpc = engine.rpc(primary)
+        try:
+            if rpc.is_alive():
+                _probe(rpc, engine.unit(primary))
                 break
+            print(f"{engine.unit(primary)} RPC: OFFLINE")
+            break
         except (KeyError, TypeError):
             print(f"waiting for API (attempt {attempt+1}/10)...")
-            import time; time.sleep(5)
+            time.sleep(5)
     else:
-        print("WARNING: LTC API not ready — explorer may show incomplete data")
+        print("WARNING: primary API not ready — explorer may show incomplete data")
 
-    if doge_rpc:
-        print(f"DOGE RPC: ", end="")
-        try:
-            if doge_rpc.is_alive():
-                info = doge_rpc.call("getblockchaininfo")
-                chain = info.get('chain', info.get('network', 'unknown'))
-                height = info.get('blocks', info.get('headers', 0))
-                print(f"OK — chain={chain} height={height}")
-            else:
-                print("OFFLINE")
-        except (KeyError, TypeError):
-            print("WARNING: DOGE API not ready")
+    for cid in engine.coins:
+        if cid != primary:
+            _probe(engine.rpc(cid), engine.unit(cid))
 
-    # Start web server
-    # Use ThreadingHTTPServer so SSE streams don't block other requests
+    # Start web server (ThreadingHTTPServer so SSE streams don't block requests).
     import http.server as _hs
     class ThreadedServer(_hs.ThreadingHTTPServer):
         daemon_threads = True
@@ -1941,9 +2307,11 @@ def main():
     engine.start_block_poller(interval=2)
     server = ThreadedServer(("0.0.0.0", args.web_port), ExplorerHandler)
     print(f"\nExplorer running at http://0.0.0.0:{args.web_port}/")
-    print(f"  LTC blocks: http://localhost:{args.web_port}/?chain=ltc")
-    print(f"  DOGE blocks: http://localhost:{args.web_port}/?chain=doge")
-    print(f"  Pool blocks: http://localhost:{args.web_port}/found?chain=ltc")
+    for cid in engine.coins:
+        prof = engine.profile(cid)
+        print(f"  {prof['name']} ({prof.get('completeness','?')}): "
+              f"http://localhost:{args.web_port}/?chain={cid}")
+    print(f"  Pool blocks: http://localhost:{args.web_port}/found?chain={primary}")
     print(f"  API status:  http://localhost:{args.web_port}/api/status")
 
     try:
