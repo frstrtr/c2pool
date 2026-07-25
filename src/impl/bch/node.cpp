@@ -354,11 +354,13 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
         // issues (up to TX_ADVERT_MAX_HASHES_PER_MESSAGE hashes, ~32 KB) and it
         // goes LAST, after the tiny getaddrs/addrme (and any sharereq) above.
         // core::Socket::write starts a composed async_write with no outbound
-        // queue (core/socket.cpp:110-137), so a large write that overlaps a
-        // later one would interleave bytes mid-message and get us dropped on a
-        // bad checksum. The small writes above each drain in a single
-        // write_some before this one begins issuing continuations. See
-        // core/tx_advertiser.hpp for the full write-safety rationale.
+        // queue (core/socket.cpp:110-137), so initiating another write while one
+        // is still draining interleaves bytes mid-message and gets us dropped on
+        // a bad checksum. Going last means NOTHING follows it in this handler;
+        // the ~32 KB advert may well take several write_some rounds, which is
+        // harmless precisely because nothing else is queued behind it, and the
+        // per-peer min-emit interval keeps the next timer sweep from landing on
+        // top of it. See core/tx_advertiser.hpp.
         advertise_known_txs(peer);
 
         return pool::PeerConnectionType::legacy;

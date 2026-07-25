@@ -443,7 +443,13 @@ public:
                 current.insert(entry.first);
         }
 
-        auto advertise_one = [&current](const peer_ptr& p)
+        // One clock reading for the whole sweep: run_tx_advert uses it both to
+        // apply the per-peer min-emit interval (never two writes in flight on
+        // one socket) and to stamp the peer after a send. IO-thread-local, so
+        // Peer::m_tx_advert needs no locking.
+        const auto now = std::chrono::steady_clock::now();
+
+        auto advertise_one = [&current, now](const peer_ptr& p)
         {
             if (!p)
                 return;
@@ -452,7 +458,8 @@ public:
                 [&p](const std::vector<uint256>& hashes)
                 { p->write(btc::message_have_tx::make_raw(hashes)); },
                 [&p](const std::vector<uint256>& hashes)
-                { p->write(btc::message_losing_tx::make_raw(hashes)); });
+                { p->write(btc::message_losing_tx::make_raw(hashes)); },
+                core::TX_ADVERT_MAX_HASHES_PER_MESSAGE, now);
         };
 
         if (only_peer)
