@@ -37,6 +37,10 @@
 #include <impl/btc/share_check.hpp>      // RefHashParams + compute_ref_hash_for_work
 #include <impl/btc/share_tracker.hpp>    // get_v35_expected_payouts
 #include <impl/btc/stratum/work_source.hpp>
+#include <impl/btc/coin/template_capture.hpp>     // per-share template retain -> won-block reconstruct (slice 7/7)
+#include <impl/btc/coin/template_other_txs.hpp>    // make_template_other_txs_fn bridge (#840)
+#include <impl/btc/coin/reconstruct_won_block.hpp> // make_reconstruct_closure — faithful won-block body (#839)
+#include <impl/btc/coin/won_block_dispatch.hpp>    // make_on_block_found — dual-path won-block dispatch (#744)
 
 #include <core/coin/utxo.hpp>
 #include <core/coin/utxo_view_cache.hpp>
@@ -902,6 +906,14 @@ int main(int argc, char* argv[])
         return coin_node.submit_block_for_connect(block_bytes);
     };
 
+    // Per-share template retention for the won-block reconstructor (slice 7/7).
+    // create_share_fn seeds it (keyed by the freshly-minted share_hash) with the
+    // template's non-coinbase tx set; a won share replays that EXACT set so the
+    // reconstructed block body is merkle-consistent with the share-committed
+    // header. Declared BEFORE work_source so it OUTLIVES the create_share_fn that
+    // captures it and the m_on_block_found closure that reads its provider().
+    btc::coin::TemplateCapture template_capture;
+
     // Construct the work source. Holds non-owning refs to chain + mempool;
     // both outlive it (stack-scoped main() lifetime).
     auto work_source = std::make_shared<btc::stratum::BTCWorkSource>(
@@ -1194,7 +1206,7 @@ int main(int argc, char* argv[])
     //     what the coinbase OP_RETURN claims
     //   - calls tracker.add(share) — attempt_verify runs later in think()
     work_source->set_create_share_fn(
-        [p2p_node_raw, auto_ratchet](const std::vector<unsigned char>& full_coinbase,
+        [p2p_node_raw, auto_ratchet, &template_capture](const std::vector<unsigned char>& full_coinbase,
                        const std::vector<uint8_t>&        header_80b,
                        const core::stratum::JobSnapshot&  job,
                        const std::vector<unsigned char>& payout_script)
@@ -1311,6 +1323,16 @@ int main(int argc, char* argv[])
             lk.unlock();
 
             if (!share_hash.IsNull()) {
+                // Retain the template's non-coinbase tx set keyed by THIS share's
+                // hash for the won-block reconstructor (#840 decode contract:
+                // [{"data": <raw-tx-hex>}, ...] in template order). A capture MISS
+                // at won time decodes to empty -> a valid coinbase-only block.
+                nlohmann::json tmpl_txs = nlohmann::json::array();
+                if (job.tx_data)
+                    for (const auto& tx_hex : *job.tx_data)
+                        tmpl_txs.push_back(nlohmann::json::object({{"data", tx_hex}}));
+                template_capture.capture(share_hash, std::move(tmpl_txs));
+
                 p2p_node_raw->broadcast_share(share_hash);
                 p2p_node_raw->notify_local_share(share_hash);
                 LOG_INFO << "[BTC-CREATE-SHARE] OK + broadcast: hash="
@@ -1321,6 +1343,95 @@ int main(int argc, char* argv[])
 
     LOG_INFO << "[BTC-STRATUM] sharechain write path wired (mining_submit"
              << " → create_local_share → broadcast_share + notify_local_share)";
+
+    // ── #744 won-block DISPATCH wire (reconstructor slice 7/7 — FINAL) ─────
+    //
+    // Un-stub tracker.m_on_block_found. A share that clears the PARENT target
+    // (share_init_verify flags g_last_init_is_block; attempt_verify fires the
+    // callback, share_tracker.hpp:536) now reconstructs the FULL parent block
+    // from live tracker state + the captured template txs and dispatches it on
+    // the connect-authoritative dual path — closing the silent won-block DROP.
+    //
+    // THREADING: m_on_block_found fires on the COMPUTE thread (think()'s single
+    // m_think_pool thread) while it holds m_tracker_mutex EXCLUSIVELY, so the
+    // field/gentx providers read tracker().chain DIRECTLY and must NOT take
+    // read_tracker() (self-deadlock). The two network sinks (NodeP2P relay,
+    // NodeRPC submitblock) are single-thread-confined to the io_context, so each
+    // io::post's its write onto ioc; make_on_block_found's dual-path audit then
+    // reflects arm AVAILABILITY (has_p2p/has_rpc — a "reached NEITHER" only when
+    // BOTH arms are absent = a genuine lost subsidy), while the real daemon
+    // verdict is logged by submit_block_hex (#752) + pending_submits on ioc.
+    {
+        auto reconstruct = btc::coin::make_reconstruct_closure(
+            /*share_fields_fn=*/
+            [p2p_node_raw](const uint256& h)
+                -> btc::coin::WonShareReconstructFields {
+                btc::coin::WonShareReconstructFields f;
+                bool found = false;
+                p2p_node_raw->tracker().chain.get_share(h).invoke([&](auto* obj) {
+                    f.small_header  = obj->m_min_header;
+                    f.share_version = std::decay_t<decltype(*obj)>::version;
+                    f.merkle_link   = obj->m_merkle_link;
+                    if constexpr (requires { obj->m_segwit_data; }) {
+                        if (obj->m_segwit_data.has_value())
+                            f.txid_merkle_link =
+                                obj->m_segwit_data->m_txid_merkle_link;
+                    }
+                    found = true;
+                });
+                if (!found)
+                    throw std::runtime_error(
+                        "won-share fields: share absent from chain");
+                return f;
+            },
+            /*gentx_bytes_fn=*/
+            [p2p_node_raw](const uint256& h) -> std::vector<unsigned char> {
+                std::vector<unsigned char> bytes;
+                bool found = false;
+                auto& tracker = p2p_node_raw->tracker();
+                tracker.chain.get_share(h).invoke([&](auto* obj) {
+                    // Regenerate the share's SSOT gentx byte-for-byte. GST derives
+                    // use_v36_pplns = v36_active || is_v36_active(ShareT::version),
+                    // so passing v36_active=false is IDENTICAL to the verify-path
+                    // call (share_check.hpp:1807, which uses the share's OWN
+                    // compile-time version) -> the bytes hash to the committed
+                    // txid, merkle-consistent.
+                    (void)btc::generate_share_transaction(
+                        *obj, tracker, /*dump_diag=*/false,
+                        /*v36_active=*/false, /*out_gentx_bytes=*/&bytes);
+                    found = true;
+                });
+                if (!found || bytes.empty())
+                    throw std::runtime_error(
+                        "won-share gentx regen: share absent / empty gentx");
+                return bytes;
+            },
+            /*template_other_txs_fn=*/
+            btc::coin::make_template_other_txs_fn(template_capture.provider()));
+
+        p2p_node_raw->tracker().m_on_block_found = btc::coin::make_on_block_found(
+            /*reconstruct=*/std::move(reconstruct),
+            /*relay_p2p=*/[&ioc, coin = &coin_node](
+                              const std::vector<unsigned char>& block_bytes)
+                              -> bool {
+                // NodeP2P is single-thread-confined to ioc — post the relay write.
+                io::post(ioc, [coin, b = block_bytes]() {
+                    coin->submit_block_p2p_raw(b);
+                });
+                return coin->has_p2p();   // arm available => not a lost subsidy
+            },
+            /*submit_rpc=*/[&ioc, coin = &coin_node](const std::string& block_hex)
+                               -> bool {
+                // NodeRPC shares ioc's stream — post the submitblock write.
+                io::post(ioc, [coin, hex = block_hex]() {
+                    coin->submit_block_hex_str(hex);
+                });
+                return coin->has_rpc();
+            });
+    }
+    LOG_INFO << "[BTC] won-block dispatch WIRED: m_on_block_found -> faithful"
+             << " reconstruct (share fields + SSOT gentx + captured template txs)"
+             << " -> dual-path (P2P relay + submitblock RPC) — reconstructor 7/7";
 
     // Share-target: leave at 0 → frozen_ref.bits=0 / frozen_ref.max_bits=0
     // → override_bits=0 in create_local_share_v35 → share.m_bits is taken

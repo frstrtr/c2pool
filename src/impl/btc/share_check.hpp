@@ -962,7 +962,7 @@ build_payout_outputs_excluding_donation(
 }
 
 template <typename ShareT, typename TrackerT>
-uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool dump_diag = false, bool v36_active = false)
+uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool dump_diag = false, bool v36_active = false, std::vector<unsigned char>* out_gentx_bytes = nullptr)
 {
     auto gst_t0 = std::chrono::steady_clock::now();
     constexpr int64_t ver = ShareT::version;
@@ -1411,6 +1411,16 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
     auto tx_span = std::span<const unsigned char>(
         reinterpret_cast<const unsigned char*>(tx.data()), tx.size());
     auto txid = Hash(tx_span);
+
+    // Expose the exact non-witness gentx serialization to the won-block
+    // reconstructor (slice 7): these are the SAME bytes hashed to `txid`, so a
+    // block reframed from them is merkle-consistent with the share's committed
+    // header root. Opt-in (nullptr default) -> byte-identical for every existing
+    // caller.
+    if (out_gentx_bytes)
+        out_gentx_bytes->assign(
+            reinterpret_cast<const unsigned char*>(tx.data()),
+            reinterpret_cast<const unsigned char*>(tx.data()) + tx.size());
 
     // V36 hash_link cross-check: compute prefix hash_link from our coinbase
     // and compare with the share's stored hash_link. If states differ,

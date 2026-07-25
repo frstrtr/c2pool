@@ -158,6 +158,17 @@ public:
             /*ignore_failure=*/true);
     }
 
+    /// Submit a pre-HEX-ENCODED block to bitcoind via submitblock. The won-block
+    /// reconstructor already produced the canonical block hex; feed it straight to
+    /// the RPC (no bytes round-trip). Returns true iff the daemon accepted (or the
+    /// block was a duplicate); false when the RPC leg is UNARMED (m_rpc null).
+    bool submit_block_hex_str(const std::string& block_hex)
+    {
+        if (!m_rpc)
+            return false;
+        return m_rpc->submit_block_hex(block_hex, /*ignore_failure=*/true);
+    }
+
     /// Broadcast a WON block with FALLBACK semantics: P2P relay is primary,
     /// the submitblock RPC fires only if P2P is unavailable or the relay did
     /// not succeed (NOT always-both). Returns true iff the block reached at
