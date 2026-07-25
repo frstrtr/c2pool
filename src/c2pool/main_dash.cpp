@@ -589,6 +589,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
         auto* mi = web_server->get_mining_interface();
 
+        // ── Peer-info liveness: serialize the HTTP-cache rebuild onto the
+        // io_context thread (main_ltc.cpp parity). Once the io_context is wired,
+        // thread_safe_wrap serves the WebServer's HTTP thread a published RCU
+        // snapshot (CacheEntry::get) while the periodic refresh below rebuilds
+        // those caches on THIS thread — the same thread that mutates the
+        // peer/tracker containers in think(). That removes the dashboard-thread-
+        // vs-think() read race at its source (the GP-fault crash class),
+        // completing the wiring that mark_last_cache_tip_driven() below and the
+        // already-merged published-snapshot reads (#828/#830) were built for.
+        // Defense-in-depth: the snapshots keep the read safe on any thread; this
+        // keeps the rebuild off the HTTP thread. Threading/liveness only — no
+        // share/consensus/subsidy/payout path is touched.
+        mi->set_io_context(&ioc);
+
         // ── Real, non-negotiable node identity ────────────────────────────
         mi->set_coin_label("DASH");
 
@@ -2794,6 +2808,32 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                          "off); the 3 s poll is the active tip-notify path\n";
 #endif
         }
+    }
+
+    // ── HTTP cache refresh timer (main_ltc.cpp:7343 parity) ──────────────
+    // Every 2 s rebuild all zero-arg dashboard caches on the io_context thread
+    // so the WebServer's HTTP thread reads pre-computed RCU snapshots instead of
+    // racing think() on the live peer/tracker containers. Pairs with the
+    // mi->set_io_context(&ioc) wired at web-server standup; only armed when the
+    // dashboard is enabled (web_port != 0 → web_server present). The initial
+    // populate gives the dashboard data on the first HTTP hit instead of the
+    // CacheEntry default-constructed value. Display/liveness only — touches no
+    // share/consensus/subsidy/payout path.
+    if (web_server) {
+        auto* cache_mi = web_server->get_mining_interface();
+        auto cache_timer = std::make_shared<io::steady_timer>(ioc);
+        auto cache_tick =
+            std::make_shared<std::function<void(const boost::system::error_code&)>>();
+        *cache_tick = [cache_timer, cache_tick, cache_mi](
+                          const boost::system::error_code& ec) {
+            if (ec) return;   // cancelled at shutdown
+            cache_mi->refresh_http_caches();
+            cache_timer->expires_after(std::chrono::seconds(2));
+            cache_timer->async_wait(*cache_tick);
+        };
+        cache_mi->refresh_http_caches();   // initial populate
+        cache_timer->expires_after(std::chrono::seconds(2));
+        cache_timer->async_wait(*cache_tick);
     }
 
     std::cout << "[run] run-loop up (Ctrl-C to stop); won blocks relay DUAL-PATH:\n"
