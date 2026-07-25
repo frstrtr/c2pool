@@ -422,10 +422,17 @@ TEST(WebHonestyRegression, VersionSignalingSurfacesOnRatchetingDgb) {
 // (apply_min_protocol_ratchet lifts 1700->3600 on >=95% work-weighted v36 desire).
 // The pre-#496 blanket suppression predated that armed ratchet; keeping it would
 // now be the LIE -- hiding a genuinely-armed transition. So DASH version_signaling
-// must surface the TRUTHFUL pre-crossing state: show_transition=true, status
-// "waiting", 0% v36 votes, floor 1700 (target 3600), v36 not yet active. Showing
-// "0% v36, waiting, floor 1700" is honest (a transition is real and armed); the
-// old empty {} is not. Mirrors what main_dash.cpp's stats fn emits pre-crossing.
+// must surface the TRUTHFUL pre-crossing PAYLOAD: non-empty, status "waiting",
+// 0% v36 votes, floor 1700 (target 3600), v36 not yet active.
+//
+// The BANNER, however, is pending-upgrade UI and stays DARK here: the pool has a
+// current share version (16) and NOBODY is signalling anything higher, so there
+// is no pending upgrade to announce. (This expectation was show_transition=true
+// while classic_transition was hardcoded false and the gate reduced to
+// "current_share_type < 36" -- permanently true on a coin whose share FORMAT is
+// v16 for the whole crossing, so the banner/authority notice/progress bar would
+// have hung on forever at a truthful-but-pointless 0%.) Serving the honest
+// payload and lighting the banner are separate concerns; only the latter moved.
 TEST(WebHonestyRegression, VersionSignalingTruthfulPreCrossingDash) {
     MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
     // Real DASH pre-crossing shape: wire-format v16 shares, all still DESIRING v16
@@ -454,9 +461,16 @@ TEST(WebHonestyRegression, VersionSignalingTruthfulPreCrossingDash) {
         << "DASH now ratchets v16->v36 -- the crossing gauge must surface the real "
            "pre-crossing state, not the pre-armed-ratchet empty suppression";
 
-    // Truthful pre-crossing: a transition is armed but no v36 votes yet.
-    EXPECT_TRUE(r.value("show_transition", false))
-        << "an armed-but-unstarted crossing IS a transition to show (honestly at 0%)";
+    // Truthful pre-crossing: the payload is served, but with a current share
+    // version of 16 and ZERO higher-version signal there is no pending upgrade,
+    // so the banner / authority notice / progress bar stay hidden.
+    EXPECT_FALSE(r.value("show_transition", true))
+        << "nobody is signalling a version higher than the v16 the pool produces "
+           "-- the pending-upgrade banner must stay dark";
+    EXPECT_FALSE(r.value("is_transitioning", true))
+        << "a pool sitting at v16 with zero v36 signal is NOT transitioning";
+    EXPECT_EQ(r.value("dominant_desired_version", -1), 16)
+        << "the only signalled desired version is 16 -- not higher than current";
     EXPECT_EQ(r.value("status", std::string{}), "waiting")
         << "0 v36 votes on a ready chain -> waiting-for-upgrade, not a fabricated cross";
     EXPECT_EQ(r["target_version"].get<int>(), 36);
@@ -489,6 +503,295 @@ TEST(WebHonestyRegression, VersionSignalingEmptyUntilRealCrossingState) {
     });
     EXPECT_TRUE(mi.rest_version_signaling().empty())
         << "fewer than 10 shares -- no real crossing state, so no banner (honest)";
+}
+
+// --- v36 transition-banner gate truth table ---------------------------------
+// Operator rule: the transition banner, the signed authority message and the
+// progress bar are shown ONLY when there IS a current share version AND a
+// DIFFERENT, HIGHER desired version is genuinely being signalled for it. That is
+// the pool-level aggregate of the per-share "Signals V36" tag the dashboard
+// already renders (dashboard.html: share.dv >= 36 && share.V < 36).
+//
+// The gate used to be `current_share_type < 36` (its "dominant vote differs from
+// current" term was hardcoded false), which reduced to "show whenever the chain
+// is not 100% v36-FORMAT" -- permanently true on DASH, whose shares are
+// wire-format v16 across the whole crossing.
+//
+// Dust floor: a desired version only counts once it holds >= 1% of the flat
+// full-chain vote tally OR >= 1% of the work-weighted sampling window (either
+// qualifies -- a fresh signal lands in the flat tally long before it ages into
+// the sampling window, which is the "propagating" phase). On an 8640-share LTC
+// window that is ~86 shares; on DASH's 4320 it is ~43.
+
+// (a) DASH ACCEPTANCE CASE -- verbatim from the live hotel prod node
+//     (109.161.57.3:8080/version_signaling): share format 16 across the whole
+//     4320-share window, 100% of shares desiring 16, ZERO v36 votes, accept-floor
+//     still cold at 1700. Nothing higher is signalled, so the banner, the
+//     authority message and the progress bar are ALL hidden. Before the gate fix
+//     this prod node served show_transition=true forever (16 < 36 was permanently
+//     true) and showed a "V16 -> V36 Transition" banner at a fixed 0%.
+TEST(WebHonestyRegression, TransitionBannerHiddenWhenNoHigherVersionSignalled) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 4320},
+            {"chain_height", 8664},
+            {"chain_length", 4320},
+            {"shares_by_version", {{"16", 4320}}},
+            {"shares_by_desired_version", {{"16", 4320}}},
+            {"sampling_desired_version", {{"16", 6.740268185691459e16}}},
+            {"deepest_v36_position", 0},
+            {"v36_contiguous_from_tip", 0},
+            {"min_protocol_version", 1700},
+            {"new_min_protocol_version", 3600},
+            {"advertised_protocol_version", 3600},
+            {"live_share_version", 16},
+        };
+    });
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty()) << "the payload itself is still served -- only the gate moved";
+    EXPECT_EQ(r.value("current_share_type", 0), 16);
+    EXPECT_EQ(r.value("dominant_desired_version", -1), 16);
+    EXPECT_EQ(r.value("overall_v36_votes", -1), 0);
+    EXPECT_DOUBLE_EQ(r.value("sampling_signaling", -1.0), 0.0);
+    EXPECT_FALSE(r.value("show_transition", true))
+        << "current=16, desired=16 -- no HIGHER version, so no pending upgrade: "
+           "banner, authority message and progress bar must all stay hidden";
+    EXPECT_FALSE(r.value("is_transitioning", true));
+    // Still honest about the armed-but-unstarted ratchet underneath.
+    EXPECT_EQ(r.value("min_protocol_version", 0), 1700);
+    EXPECT_FALSE(r["auto_ratchet"].value("v36_active", true));
+}
+
+// (b) LTC PROD (voidbind.com, captured live mid-cross): format v35 everywhere,
+//     59.79% of the full-chain vote already desiring V36, 19.15% work-weighted in
+//     the sampling window. A genuinely higher version IS signalled -> banner SHOWN.
+//     Also pins the gauges the banner renders (chain maturity, propagation bar,
+//     sampling-signaling text) so the shared-core gate change cannot regress them.
+TEST(WebHonestyRegression, TransitionBannerShownOnLiveLtcCrossing) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 8640},
+            {"chain_height", 17801},
+            {"chain_length", 8640},
+            {"shares_by_version", {{"35", 8640}}},
+            {"shares_by_desired_version", {{"35", 3474}, {"36", 5166}}},
+            {"sampling_desired_version",
+                 {{"35", 222623983195438.0}, {"36", 52734697861119.0}}},
+            {"deepest_v36_position", 8638},
+            {"v36_contiguous_from_tip", 2},
+        };
+    });
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty());
+    EXPECT_EQ(r.value("current_share_type", 0), 35);
+    EXPECT_EQ(r.value("dominant_desired_version", -1), 36)
+        << "V36 holds 59.79% of the flat vote -- far above the 1% dust floor";
+    EXPECT_TRUE(r.value("show_transition", false))
+        << "LTC prod is genuinely mid-transition -- the banner must stay lit";
+    EXPECT_TRUE(r.value("is_transitioning", false));
+
+    // Anti-regression: the gauges rendered inside the banner are untouched.
+    EXPECT_DOUBLE_EQ(r.value("chain_maturity", 0.0), 100.0);
+    EXPECT_TRUE(r.value("chain_ready", false));
+    EXPECT_DOUBLE_EQ(r.value("overall_v36_vote_pct", 0.0), 59.79);
+    EXPECT_NEAR(r.value("sampling_signaling", 0.0), 19.15, 0.02);
+    EXPECT_NEAR(r.value("propagation_pct", 0.0), 99.98, 0.01);
+    EXPECT_EQ(r.value("status", std::string{}), "signaling");
+    EXPECT_EQ(r.value("deepest_v36_position", 0), 8638);
+    EXPECT_EQ(r.value("shares_to_window", -1), 2);
+}
+
+// (b2) Anti-regression for the MIXED-format window LTC enters once V36 shares
+//      start landing: current_share_type is the MAX format seen, so it reads 36
+//      the moment ONE v36 share exists. The gate must key off the LAGGARD side of
+//      the window (shares still on v35) or the banner would vanish at 1 share in.
+TEST(WebHonestyRegression, TransitionBannerStaysLitAcrossMixedFormatWindow) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 8640},
+            {"chain_height", 17801},
+            {"chain_length", 8640},
+            // 8639 shares still on v35, one already minted at v36.
+            {"shares_by_version", {{"35", 8639}, {"36", 1}}},
+            {"shares_by_desired_version", {{"36", 8640}}},
+            {"sampling_desired_version", {{"36", 1.0e15}}},
+        };
+    });
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty());
+    EXPECT_EQ(r.value("current_share_type", 0), 36) << "max format seen is 36";
+    EXPECT_EQ(r.value("lowest_share_type", 0), 35) << "but 8639 shares still lag at v35";
+    EXPECT_TRUE(r.value("show_transition", false))
+        << "the rollout is still in flight -- banner must not vanish on the first "
+           "v36 share just because current_share_type is the MAX format";
+}
+
+// (c) COMPLETED: every share on the target format, chain > 3x length -> confirmed.
+//     Nothing pending -> banner HIDDEN, status "no_transition".
+TEST(WebHonestyRegression, TransitionBannerHiddenOnceCrossingConfirmed) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 8640},
+            {"chain_height", 8640 * 3},
+            {"chain_length", 8640},
+            {"shares_by_version", {{"36", 8640}}},
+            {"shares_by_desired_version", {{"36", 8640}}},
+            {"sampling_desired_version", {{"36", 1.0e15}}},
+        };
+    });
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty());
+    EXPECT_EQ(r.value("current_share_type", 0), 36);
+    EXPECT_FALSE(r.value("show_transition", true))
+        << "the crossing is complete and confirmed -- nothing left to announce";
+    EXPECT_EQ(r.value("status", std::string{}), "no_transition");
+    EXPECT_DOUBLE_EQ(r.value("transition_progress", 0.0), 100.0);
+}
+
+// (d) DUST: a single stray V36 signal in an 8640-share window (0.0116% flat, ~0%
+//     work-weighted) is below the 1% floor -> banner stays HIDDEN. One replayed or
+//     mistuned share must not flip prod into "transition" mode.
+TEST(WebHonestyRegression, TransitionBannerHiddenOnDustSignalBelowFloor) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 8640},
+            {"chain_height", 8640},
+            {"chain_length", 8640},
+            {"shares_by_version", {{"35", 8640}}},
+            {"shares_by_desired_version", {{"35", 8639}, {"36", 1}}},
+            // One dust vote against ~1e15 of v35 work: far below 1% weighted too.
+            {"sampling_desired_version", {{"35", 1.0e15}, {"36", 1.0e9}}},
+            {"deepest_v36_position", 12},
+        };
+    });
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty());
+    EXPECT_EQ(r.value("dominant_desired_version", -1), 35)
+        << "a 0.0116% V36 signal does not clear the 1% dust floor";
+    EXPECT_FALSE(r.value("show_transition", true))
+        << "a single stray V36 share must not light the prod transition banner";
+    // The truthful vote tally is still served -- only the banner gate is dark.
+    EXPECT_EQ(r.value("overall_v36_votes", -1), 1);
+}
+
+// (d2) Just OVER the floor: 1% of the window genuinely signalling V36 is a real
+//      emerging rollout and DOES light the banner. Pins the floor from both sides.
+TEST(WebHonestyRegression, TransitionBannerShownOnceSignalClearsFloor) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 8640},
+            {"chain_height", 8640},
+            {"chain_length", 8640},
+            {"shares_by_version", {{"35", 8640}}},
+            {"shares_by_desired_version", {{"35", 8553}, {"36", 87}}},  // 1.007%
+            {"sampling_desired_version", {{"35", 1.0e15}}},
+        };
+    });
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty());
+    EXPECT_EQ(r.value("dominant_desired_version", -1), 36);
+    EXPECT_TRUE(r.value("show_transition", false))
+        << "1.007% of the window signalling V36 is a real rollout, not dust";
+}
+
+// (d3) The floor is checked on the work-weighted sampling window TOO: a signal
+//      that is dust by flat count but material by hashrate still counts.
+TEST(WebHonestyRegression, TransitionBannerShownOnWorkWeightedSignalAlone) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 8640},
+            {"chain_height", 8640},
+            {"chain_length", 8640},
+            {"shares_by_version", {{"35", 8640}}},
+            {"shares_by_desired_version", {{"35", 8630}, {"36", 10}}},  // 0.12% flat
+            // ...but those 10 shares carry 20% of the sampling-window work.
+            {"sampling_desired_version", {{"35", 8.0e14}, {"36", 2.0e14}}},
+        };
+    });
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty());
+    EXPECT_EQ(r.value("dominant_desired_version", -1), 36);
+    EXPECT_TRUE(r.value("show_transition", false))
+        << "20% of sampling-window WORK on V36 is a real signal even though the "
+           "flat share count is under the floor";
+}
+
+// (e) DASH POST-LATCH: DASH share FORMAT never becomes 36, so the format-count
+//     all_target test can never fire for it. Once the accept-floor ratchet has
+//     latched (stats fn reports live_share_version 36) the crossing is done and
+//     the banner must go dark rather than hang on forever at 100% signalling.
+TEST(WebHonestyRegression, TransitionBannerHiddenOnceDashRatchetLatched) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 4320},
+            {"chain_height", 4320},
+            {"chain_length", 4320},
+            {"shares_by_version", {{"16", 4320}}},
+            {"shares_by_desired_version", {{"36", 4320}}},
+            {"sampling_desired_version", {{"36", 1.0e15}}},
+            {"min_protocol_version", 3600},
+            {"new_min_protocol_version", 3600},
+            {"live_share_version", 36},
+        };
+    });
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty());
+    EXPECT_TRUE(r["auto_ratchet"].value("v36_active", false));
+    EXPECT_FALSE(r.value("show_transition", true))
+        << "the ratchet has latched -- no upgrade is pending any more";
+}
+
+// (e2) DASH MID-CROSSING: format still v16, but the pool is now signalling V36
+//      well above the floor and the floor has NOT latched -> banner SHOWN.
+TEST(WebHonestyRegression, TransitionBannerShownDuringRealDashCrossing) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 4320},
+            {"chain_height", 4320},
+            {"chain_length", 4320},
+            {"shares_by_version", {{"16", 4320}}},
+            {"shares_by_desired_version", {{"16", 2000}, {"36", 2320}}},
+            {"sampling_desired_version", {{"16", 4.0e14}, {"36", 6.0e14}}},
+            {"min_protocol_version", 1700},
+            {"new_min_protocol_version", 3600},
+            {"live_share_version", 16},
+        };
+    });
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty());
+    EXPECT_EQ(r.value("current_share_type", 0), 16);
+    EXPECT_EQ(r.value("dominant_desired_version", -1), 36);
+    EXPECT_TRUE(r.value("show_transition", false))
+        << "DASH v16 shares with a majority signalling V36 IS a pending upgrade";
+    EXPECT_NEAR(r.value("sampling_signaling", 0.0), 60.0, 0.01);
+}
+
+// (f) No share-format data at all: there is no current share version, so there is
+//     nothing for a desired version to be HIGHER than -> banner hidden.
+TEST(WebHonestyRegression, TransitionBannerHiddenWithoutACurrentShareVersion) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 100},
+            {"chain_height", 100},
+            {"chain_length", 8640},
+            {"shares_by_desired_version", {{"36", 100}}},
+        };
+    });
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty());
+    EXPECT_EQ(r.value("current_share_type", -1), 0);
+    EXPECT_FALSE(r.value("show_transition", true))
+        << "no current share version reported -- nothing to transition FROM";
 }
 
 // ---------------------------------------------------------------------------
