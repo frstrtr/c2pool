@@ -659,3 +659,151 @@ TEST(DashMintRunloop, DonationFieldDecaysPplnsWeight)
     EXPECT_EQ(w.donation_weight, att * static_cast<uint32_t>(donation));
     EXPECT_EQ(w.total_weight, att * 65535u);
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// (8) 1.67% pool-share cap END-TO-END through build_producer_job.
+//
+// The producer job's desired_target is now the ORACLE per-miner modulation
+// (work.py:309-312) instead of a flat params.max_target. What lands in the
+// share is clip(desired, (pre_target3//30, pre_target3)) — the band applied
+// LAST by compute_share_target — so these KATs assert the JOB's committed
+// share_bits, i.e. the consensus-visible field.
+//
+// Fixture: REAL mainnet params on an EMPTY chain -> the genesis retarget arm,
+// pre_target3 = params.max_target (bdiff 1), band = [MAX//30 (bdiff 30), MAX].
+// SHARE_PERIOD = 20 s.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+uint32_t job_share_bits(double local_hash_rate, uint32_t* max_bits_out = nullptr)
+{
+    const core::CoinParams params = dash::make_coin_params(false);
+    dash::ShareTracker tracker;
+    tracker.m_coin_params = params;
+
+    auto wd = make_workdata();
+    const auto payout_script = dash::pubkey_hash_to_script2(h160_uniform(0x63));
+    auto built = build_producer_job(tracker.chain, params, uint256(),
+                                    payout_script, wd, wd.m_curtime,
+                                    /*share_nonce=*/7, /*donation=*/0, "c2pool",
+                                    local_hash_rate);
+    if (!built) return 0;
+    if (max_bits_out) *max_bits_out = built->job.share_max_bits;
+    return built->job.share_bits;
+}
+}  // namespace
+
+// Unknown/zero rate degrades to "no meaningful cap": desired == max_target,
+// exactly the pre-cap value. Also pins the DEFAULT-ARGUMENT overload (the call
+// shape every other KAT in this file uses) to the same result — the cap is
+// opt-in via a measured rate, never implicit.
+TEST(DashMintRunloopPoolShareCap, ZeroRateIsPreCapBehaviour)
+{
+    uint32_t max_bits = 0;
+    EXPECT_EQ(job_share_bits(0.0, &max_bits), 0x1d00ffffu);
+    EXPECT_EQ(max_bits, 0x1d00ffffu);
+
+    const core::CoinParams params = dash::make_coin_params(false);
+    dash::ShareTracker tracker;
+    tracker.m_coin_params = params;
+    auto wd = make_workdata();
+    const auto payout_script = dash::pubkey_hash_to_script2(h160_uniform(0x63));
+    auto legacy = build_producer_job(tracker.chain, params, uint256(),
+                                     payout_script, wd, wd.m_curtime, 7, 0, "c2pool");
+    ASSERT_TRUE(legacy.has_value());
+    EXPECT_EQ(legacy->job.share_bits, 0x1d00ffffu);
+
+    // desired_share_target itself must be bit-identical to the old constant.
+    EXPECT_EQ(dash::mint::desired_share_target(params, 0.0).GetHex(),
+              params.max_target.GetHex());
+}
+
+// A SMALL miner is inert: 1 MH/s -> cap bdiff 0.2788 (EASIER than pre_target3
+// at bdiff 1) -> upper clip -> unchanged bits.
+TEST(DashMintRunloopPoolShareCap, SmallMinerUnaffected)
+{
+    EXPECT_EQ(job_share_bits(1e6), 0x1d00ffffu);
+}
+
+// A MID miner lands strictly inside the band: 100 MH/s -> cap bdiff 27.8835,
+// between pre_target3 (1) and the MAX//30 edge (30).
+//   avg = int(1e8*20/0.0167) = 119760479041 ; target = 2**256//avg - 1
+//   compact(target) = 0x1c092e50
+TEST(DashMintRunloopPoolShareCap, MidMinerInsideBand)
+{
+    EXPECT_EQ(job_share_bits(1e8), 0x1c092e50u);
+}
+
+// A LARGE miner clamps AT the band edge, never beyond. 43 TH/s (the live node's
+// measured rate) -> cap bdiff 11989898, ~4e5x past the MAX//30 edge -> the
+// emitted bits are compact(MAX_TARGET//30) = 0x1c088880 (bdiff exactly 30).
+// max_bits is untouched, so peers recompute the SAME band and accept.
+TEST(DashMintRunloopPoolShareCap, LargeMinerClampsAtBandEdge)
+{
+    uint32_t max_bits = 0;
+    EXPECT_EQ(job_share_bits(43e12, &max_bits), 0x1c088880u);
+    EXPECT_EQ(max_bits, 0x1d00ffffu);
+
+    // Canonical acceptance: a peer re-derives our bits by feeding OUR OWN
+    // emitted target back through clip(.., (pre3//30, pre3)) +
+    // from_target_upper_bound and requiring the SAME bits (p2pool Share.check()
+    // regenerates share_info and compares equal). Compact encoding truncates,
+    // so a naive "target >= pre3//30" check is the wrong predicate; the fixed
+    // point is what wire-compat actually requires.
+    const uint256 pre3    = chain::bits_to_target(max_bits);
+    const uint256 emitted = chain::bits_to_target(0x1c088880u);
+    EXPECT_LE(emitted, pre3);           // never EASIER than the pool target
+    const uint256 band_lo = pre3 / 30;
+    EXPECT_EQ(chain::target_to_bits_upper_bound(
+                  dash::producer::clip(emitted, band_lo, pre3)),
+              0x1c088880u);
+
+    // An absurd rate cannot push it past the edge either -- including rates
+    // whose raw cap overflows the uint64 narrowing (saturation path).
+    EXPECT_EQ(job_share_bits(1e18), 0x1c088880u);
+    EXPECT_EQ(job_share_bits(1e30), 0x1c088880u);
+}
+
+// The cap does NOT perturb anything else the job commits to: with the SAME
+// inputs and a rate that leaves the cap inert, the gentx bytes / ref_hash /
+// nonce64 offset are byte-identical to the pre-cap build.
+TEST(DashMintRunloopPoolShareCap, InertCapLeavesJobBytesIdentical)
+{
+    const core::CoinParams params = dash::make_coin_params(false);
+    dash::ShareTracker tracker;
+    tracker.m_coin_params = params;
+    auto wd = make_workdata();
+    const auto payout_script = dash::pubkey_hash_to_script2(h160_uniform(0x63));
+
+    auto a = build_producer_job(tracker.chain, params, uint256(), payout_script,
+                                wd, wd.m_curtime, 7, 0, "c2pool");
+    auto b = build_producer_job(tracker.chain, params, uint256(), payout_script,
+                                wd, wd.m_curtime, 7, 0, "c2pool", /*rate=*/1e6);
+    ASSERT_TRUE(a.has_value());
+    ASSERT_TRUE(b.has_value());
+    EXPECT_EQ(a->job.gentx_bytes, b->job.gentx_bytes);
+    EXPECT_EQ(a->job.ref_hash.GetHex(), b->job.ref_hash.GetHex());
+    EXPECT_EQ(a->job.nonce64_offset, b->job.nonce64_offset);
+    EXPECT_EQ(a->frozen.desired_timestamp, b->frozen.desired_timestamp);
+    EXPECT_EQ(a->frozen.desired_target.GetHex(), b->frozen.desired_target.GetHex());
+}
+
+// A capped job stays MINT-CONSISTENT: the frozen desired_target the registry
+// stores is the modulated one, so the mint-time rebuild reproduces the same
+// committed bits (the byte-parity invariant the whole producer path rests on).
+TEST(DashMintRunloopPoolShareCap, FrozenDesiredTargetIsTheModulatedOne)
+{
+    const core::CoinParams params = dash::make_coin_params(false);
+    dash::ShareTracker tracker;
+    tracker.m_coin_params = params;
+    auto wd = make_workdata();
+    const auto payout_script = dash::pubkey_hash_to_script2(h160_uniform(0x63));
+
+    auto built = build_producer_job(tracker.chain, params, uint256(), payout_script,
+                                    wd, wd.m_curtime, 7, 0, "c2pool", 43e12);
+    ASSERT_TRUE(built.has_value());
+    EXPECT_EQ(built->frozen.desired_target.GetHex(),
+              dash::mint::desired_share_target(params, 43e12).GetHex());
+    EXPECT_EQ(built->frozen.desired_target.GetHex(),
+        "000000000000016635c48b2e932ea609a3b4aa32cefaa1ba023ea945da766f85");
+}

@@ -27,6 +27,7 @@
 #include <impl/dash/share.hpp>
 #include <impl/dash/params.hpp>
 #include <impl/dash/coinbase_builder.hpp>   // coinbase::merkle_branches_raw (drift fence)
+#include <impl/dash/stratum/work_target.hpp> // stratum::cap_pool_share (1.67% pool-share cap)
 
 #include <core/coin_params.hpp>
 #include <core/hash.hpp>
@@ -176,6 +177,155 @@ TEST(DashShareProducerRetarget, FastPoolClampsToNineTenths) {
     auto st = dash::producer::compute_share_target(sc.chain, tip, uint256(1), params);
     EXPECT_EQ(st.max_bits, 0x1c1ccccbu);
     EXPECT_EQ(st.bits, 0x1c00f5c2u);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// (c2) 1.67% pool-share cap COMPOSED WITH the chain band clip.
+//
+// The cap (work.py:309-312, dash::stratum::cap_pool_share) only ever produces a
+// *desired* target; the value that reaches the share's committed m_bits is
+// clip(desired, (pre_target3//30, pre_target3)) — applied LAST inside
+// compute_share_target_pure. These KATs pin that composition so a capped target
+// can never leave the band canonical check() accepts.
+//
+// Chain: 100 shares at bits 0x1c1fffff, 200 s spacing (the SlowPool fixture) ->
+//   prev_max    = 0x1fffff * 2^200
+//   pre_target3 = prev_max*11//10 = 0x2333321999...  (compact 0x1c233332, bdiff 7.2726)
+//   band_lo     = pre_target3//30 = 0x012c5f8962fc... (compact 0x1c012c5f, bdiff 218.18)
+// SHARE_PERIOD = 20 s (dash::SharechainConfig SSOT).
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+// The mint path's desired-target policy, replicated here over the PUBLIC
+// helpers so this KAT pins the COMPOSITION (cap -> band) without pulling the
+// run-loop header in: identical to dash::mint::desired_share_target.
+uint256 capped_desired(const core::CoinParams& params, double local_hash_rate) {
+    uint256 d;
+    d.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    d = dash::stratum::cap_pool_share(d, local_hash_rate,
+                                      static_cast<uint32_t>(params.share_period));
+    if (params.max_target < d)
+        d = params.max_target;
+    return d;
+}
+constexpr uint32_t BITS_PRE3    = 0x1c233332u;  // compact(pre_target3)
+constexpr uint32_t BITS_BAND_LO = 0x1c012c5fu;  // compact(pre_target3//30) — the HARD edge
+
+uint256 build_slow_pool_tip(SyntheticChain& sc) {
+    return build_uniform_chain(sc, 100, 0x1c1fffffu, 1000000, 200, h160_uniform(0x11));
+}
+}  // namespace
+
+// No measured hashrate -> cap inert -> desired == max_target -> upper band clip
+// -> bits == compact(pre_target3). BIT-IDENTICAL to the pre-cap behaviour.
+TEST(DashShareProducerCapBand, ZeroHashrateIsUnchanged) {
+    const auto params = dash::make_coin_params(false);
+    SyntheticChain sc;
+    uint256 tip = build_slow_pool_tip(sc);
+
+    auto ref = dash::producer::compute_share_target(sc.chain, tip, params.max_target, params);
+    auto st  = dash::producer::compute_share_target(sc.chain, tip,
+                   capped_desired(params, /*local_hash_rate=*/0.0), params);
+    EXPECT_EQ(st.bits, ref.bits);
+    EXPECT_EQ(st.max_bits, ref.max_bits);
+    EXPECT_EQ(st.bits, BITS_PRE3);
+}
+
+// A SMALL miner is unaffected: 1 MH/s -> cap bdiff 0.2788, i.e. EASIER than
+// pre_target3 (bdiff 7.27) -> the upper clip returns pre_target3 unchanged.
+TEST(DashShareProducerCapBand, SmallMinerUnaffected) {
+    const auto params = dash::make_coin_params(false);
+    SyntheticChain sc;
+    uint256 tip = build_slow_pool_tip(sc);
+
+    auto st = dash::producer::compute_share_target(sc.chain, tip,
+                  capped_desired(params, /*local_hash_rate=*/1e6), params);
+    EXPECT_EQ(st.bits, BITS_PRE3);
+    EXPECT_EQ(st.max_bits, BITS_PRE3);
+}
+
+// A MID miner lands strictly INSIDE the band — proving the clamp is a real clip
+// and not an unconditional snap to the edge. 100 MH/s -> avg = int(1e8*20/0.0167)
+// = 119760479041 -> target = 2**256//avg - 1 = 0x092e50e904436073... (bdiff
+// 27.8835), between pre_target3 (7.27) and band_lo (218.18).
+// Derive (python3): "%08x" % compact(2**256//119760479041 - 1)
+TEST(DashShareProducerCapBand, MidMinerInsideBand) {
+    const auto params = dash::make_coin_params(false);
+    SyntheticChain sc;
+    uint256 tip = build_slow_pool_tip(sc);
+
+    auto st = dash::producer::compute_share_target(sc.chain, tip,
+                  capped_desired(params, /*local_hash_rate=*/1e8), params);
+    EXPECT_EQ(st.bits, 0x1c092e50u);
+    EXPECT_EQ(st.max_bits, BITS_PRE3);
+}
+
+// ── The canonical acceptance predicate ───────────────────────────────────────
+// A peer does NOT range-check our bits directly. p2pool's Share.check() re-runs
+// generate_transaction() feeding OUR OWN emitted bits' target back in as
+// `desired_target` and requires the regenerated share_info to compare equal —
+// i.e. the emitted bits must be a FIXED POINT of
+//
+//   bits |-> from_target_upper_bound(clip(bits.target, (pre3//30, pre3)))
+//
+// A plain "target inside the band" assertion is the WRONG check: compact
+// encoding is mantissa-TRUNCATING, so the target that round-trips out of the
+// band-edge bits is always <= pre3//30 by up to one mantissa ulp. What matters
+// is that re-clipping and re-encoding lands on the same 32-bit bits value.
+namespace {
+bool peer_recheck_accepts(const dash::producer::ShareTarget& st) {
+    const uint256 pre3    = chain::bits_to_target(st.max_bits);
+    const uint256 band_lo = pre3 / 30;
+    const uint256 emitted = chain::bits_to_target(st.bits);
+    return chain::target_to_bits_upper_bound(
+               dash::producer::clip(emitted, band_lo, pre3)) == st.bits;
+}
+}  // namespace
+
+// A LARGE miner is clamped AT the band edge, not beyond it. 43 TH/s (the live
+// node's measured rate) -> cap bdiff 11989898, ~1.65e6x harder than pre_target3
+// and ~10x harder than band_lo -> clipped UP to exactly pre_target3//30.
+// This is the wire-safety assertion: the emitted bits ARE the band edge value
+// and they survive a canonical peer's re-derivation unchanged.
+TEST(DashShareProducerCapBand, LargeMinerClampsAtBandEdgeNotBeyond) {
+    const auto params = dash::make_coin_params(false);
+    SyntheticChain sc;
+    uint256 tip = build_slow_pool_tip(sc);
+
+    const uint256 desired = capped_desired(params, /*local_hash_rate=*/43e12);
+    auto st = dash::producer::compute_share_target(sc.chain, tip, desired, params);
+
+    EXPECT_EQ(st.bits, BITS_BAND_LO);
+    EXPECT_EQ(st.max_bits, BITS_PRE3);   // max_bits is NOT modulated
+
+    // The raw (unclipped) cap really WAS outside the band, so the clamp fired...
+    const uint256 pre3 = chain::bits_to_target(st.max_bits);
+    const uint256 band_lo = pre3 / 30;
+    EXPECT_LT(desired, band_lo);
+    // ...and the emitted bits are still what a canonical peer re-derives.
+    EXPECT_TRUE(peer_recheck_accepts(st));
+    // The emitted target never gets EASIER than the pool target either.
+    EXPECT_LE(chain::bits_to_target(st.bits), pre3);
+}
+
+// Sweep: over a wide hashrate range — including rates whose raw cap overflows
+// the uint64 narrowing in average_attempts_to_target — the emitted bits are
+// ALWAYS a fixed point of the canonical re-derivation.
+TEST(DashShareProducerCapBand, EmittedBitsAlwaysSurvivePeerRecheck) {
+    const auto params = dash::make_coin_params(false);
+    SyntheticChain sc;
+    uint256 tip = build_slow_pool_tip(sc);
+
+    for (double hr : {0.0, 1.0, 1e3, 1e6, 1e8, 1e9, 1e10, 1e12, 43e12, 1e18, 1e30}) {
+        auto st = dash::producer::compute_share_target(sc.chain, tip,
+                      capped_desired(params, hr), params);
+        const uint256 pre3    = chain::bits_to_target(st.max_bits);
+        const uint256 emitted = chain::bits_to_target(st.bits);
+        ASSERT_NE(st.bits, 0u) << "hr=" << hr;
+        ASSERT_FALSE(emitted.IsNull()) << "hr=" << hr;
+        EXPECT_LE(emitted, pre3) << "hr=" << hr;               // never easier than the pool target
+        EXPECT_TRUE(peer_recheck_accepts(st)) << "hr=" << hr;  // canonical acceptance
+    }
 }
 
 TEST(DashShareProducerRetarget, SlowPoolClampsToElevenTenths) {
