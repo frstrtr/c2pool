@@ -2754,6 +2754,65 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // refresh trio (the second is_new_tip() returns false → no-op).
         auto tip_dedup = std::make_shared<dash::coin::TipHashDedup>();
 
+        // ── p2p `bestblock` announcement (canonical node.py:137-140) ────────
+        // Canonical p2pool watches the coin daemon's best-block header and
+        // pushes it to every pool peer:
+        //     @self.node.best_block_header.changed.watch
+        //     def _(header):
+        //         for peer in self.peers.itervalues():
+        //             peer.send_bestblock(header=header)
+        // DASH never sent `bestblock` at all (it only HANDLED the inbound one,
+        // protocol_actual.cpp:191). LTC/DGB/BCH/BTC each expose
+        // broadcast_bestblock(); the DASH port is dash::NodeImpl::broadcast_bestblock.
+        //
+        // Trigger: the ALREADY-DEDUPED tip-notify choke point below
+        // (fire_refresh), so exactly ONE announcement per genuinely new dashd
+        // tip -- ~1 per 2.5 min -- and a poll+ZMQ double-observation of the same
+        // block cannot double-send. The header itself is fetched with a single
+        // `getblockheader <tip> false` on the dedicated rpc_pool thread (never
+        // on the io thread), then parsed and broadcast back on ioc. Any failure
+        // is swallowed: bestblock is advisory, and the next tip re-announces.
+        //
+        // REWARD-SAFETY: announcement only. It does not touch the template, the
+        // share chain, the mint path, the coinbase/payee, or the won-block
+        // dispatch -- it is a read of dashd's tip header plus a socket write.
+        std::function<void(const std::string&)> announce_bestblock =
+            [rpc = rpc.get(), rpc_pool, &ioc, &p2p_node](const std::string& tip_hex) {
+                uint256 tip;
+                tip.SetHex(tip_hex);
+                if (tip.IsNull())
+                    return;
+                boost::asio::post(*rpc_pool, [rpc, tip, &ioc, &p2p_node]() {
+                    std::string hdr_hex;
+                    try {
+                        // BLOCKING -- BACKGROUND THREAD (never the io thread).
+                        auto r = rpc->getblockheader(tip, /*verbose=*/false);
+                        if (r.is_string())
+                            hdr_hex = r.get<std::string>();
+                    } catch (const std::exception& e) {
+                        LOG_WARNING << "[Pool] bestblock: getblockheader failed "
+                                       "(non-fatal, next tip re-announces): "
+                                    << e.what();
+                        return;
+                    } catch (...) {
+                        return; // never crash on an advisory announcement
+                    }
+                    if (hdr_hex.size() != 160)
+                        return; // not an 80-byte header -- refuse to send garbage
+                    boost::asio::post(ioc, [hdr_hex = std::move(hdr_hex), &p2p_node]() {
+                        try {
+                            dash::coin::BlockHeaderType hdr;
+                            PackStream ps(ParseHex(hdr_hex));
+                            ps >> hdr;
+                            p2p_node.broadcast_bestblock(hdr);
+                        } catch (const std::exception& e) {
+                            LOG_WARNING << "[Pool] bestblock: header unpack failed: "
+                                        << e.what();
+                        }
+                    });
+                });
+            };
+
         // The refresh trio, shared by both paths. Runs on the io_context thread
         // ONLY (the poll follow-up is posted back to ioc; the ZMQ callback posts
         // onto ioc), so ws/ss/dedup are never touched concurrently. `verb`
@@ -2764,7 +2823,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // a benign idle-timeout reconnect.
         std::function<bool(const std::string&, const char*, const char*)>
             fire_refresh = [ws = work_source.get(), ss = stratum_server.get(),
-                            tip_dedup](const std::string& tip,
+                            tip_dedup, announce_bestblock](const std::string& tip,
                                        const char* source, const char* verb) {
                 if (!tip_dedup->is_new_tip(tip))
                     return false; // dedup: coalesce a poll+ZMQ double-fire on one tip
@@ -2772,6 +2831,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     "tip-notify: dashd best-block changed");
                 ws->bump_work_generation();
                 ss->notify_all();
+                // Canonical node.py:137-140 — announce the new tip header to
+                // every pool peer. Deduped by is_new_tip() above, so exactly
+                // one announcement per genuinely new block.
+                announce_bestblock(tip);
                 LOG_INFO << "[Stratum] " << source << ": " << tip.substr(0, 16)
                          << " -> " << verb;
                 std::cout << "[Stratum] " << source << ": " << tip.substr(0, 16)

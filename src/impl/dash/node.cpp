@@ -4,6 +4,8 @@
 #include "mint_runloop.hpp"   // dash::mint::elect_best_share (election policy SSOT)
 #include "known_txs_retention.hpp"  // dash::retain_template_txs / all_txs_backable (F1/F3)
 
+#include <cassert>
+
 #include <core/uint256.hpp>
 #include <core/common.hpp>
 #include <core/random.hpp>
@@ -829,6 +831,21 @@ void NodeImpl::start_outbound_connections()
     if (!m_context)
         return;  // rig-free (KAT/standalone) node
 
+    // ── have_tx / losing_tx delta sweep ──────────────────────────────────
+    // Started before the outbound-dialing early-return below: a node with
+    // outbound dialing disabled still accepts inbound peers and must still
+    // advertise its tx pool to them. Advert-only, no consensus state.
+    m_tx_advert_timer = std::make_unique<core::Timer>(m_context, true);
+    m_tx_advert_timer->start(core::TX_ADVERT_INTERVAL_SECONDS,
+                             [this]() { advertise_known_txs(); });
+
+    // ── canonical addr-discovery sweep (p2p.py:794-799) ──────────────────
+    // Also started before the dialing early-return: an inbound-only node needs to
+    // learn addresses. Self-limiting — getaddrs_sweep() is a no-op once the
+    // AddrStore reaches PREFERRED_ADDR_STORAGE (1000) or while we have no peers.
+    m_getaddrs_timer = std::make_unique<core::Timer>(m_context, true);
+    m_getaddrs_timer->start(20, [this]() { getaddrs_sweep(); });
+
     // Advert-drain pump: handle_version (inline, link-free for the KAT
     // targets) only QUEUES a peer's advertised best share; this timer is the
     // node.cpp-side consumer that turns the queue into sharereq dispatches.
@@ -1370,6 +1387,18 @@ uint256 NodeImpl::add_local_share(ShareType share)
 void NodeImpl::register_template_txs(const std::vector<coin::Transaction>& txs,
                                      const std::vector<uint256>& hashes)
 {
+    // THREAD-CONFINEMENT (enforced, not assumed): every m_known_txs mutator in
+    // this lane must run OFF the compute thread — the two remember_tx ingests
+    // (protocol_actual.cpp:263 / protocol_legacy.cpp:299) are IO-thread by
+    // construction, and so is this one (producer-job cache miss on the stratum
+    // path). advertise_known_txs() reads the map from the IO thread on exactly
+    // that basis. A compute-thread caller here would turn that read into a
+    // genuine data race, so trip loudly in debug builds rather than let it be
+    // discovered in production.
+    assert(!is_compute_thread() &&
+           "register_template_txs must not run on the compute thread — "
+           "m_known_txs is IO-thread-confined (see advertise_known_txs)");
+
     if (txs.size() != hashes.size()) {
         LOG_WARNING << "[register_template_txs] size mismatch txs=" << txs.size()
                     << " hashes=" << hashes.size() << " — skipped";

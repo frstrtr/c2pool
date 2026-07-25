@@ -33,6 +33,7 @@
 #include <pool/protocol.hpp>
 #include <pool/share_download.hpp>  // shared downloader helpers (#754)
 #include <core/reply_matcher.hpp>
+#include <core/tx_advertiser.hpp>
 #include <c2pool/storage/sharechain_storage.hpp>
 
 #include <boost/asio/thread_pool.hpp>
@@ -297,6 +298,16 @@ protected:
     size_t m_max_peers = 30;
     size_t m_target_outbound_peers = DEFAULT_TARGET_OUTBOUND_PEERS;
     std::unique_ptr<core::Timer> m_connect_timer;   // 30s dial maintenance
+    // Periodic have_tx/losing_tx delta sweep (core/tx_advertiser.hpp). Cadence
+    // mirrors the canonical known-tx removal loop, node.py:298 t.start(10).
+    std::unique_ptr<core::Timer> m_tx_advert_timer;
+    // Canonical addr-discovery sweep timer (p2p.py:794-799). Flat 20 s, the
+    // mean of canonical's random.expovariate(1/20) re-arm.
+    std::unique_ptr<core::Timer> m_getaddrs_timer;
+    // Canonical p2p.py:759 preferred_storage default: stop asking for more
+    // addresses once the store holds this many. Keeps the AddrStore bounded
+    // well under the pool/node.hpp got_addr() hard cap of 10000.
+    static constexpr size_t PREFERRED_ADDR_STORAGE = 1000;
     std::unique_ptr<core::Timer> m_advert_timer;    // 2s best-advert drain
     std::set<NetService> m_pending_outbound;  // addresses currently being dialed
     std::set<NetService> m_outbound_addrs;    // established outbound peers
@@ -626,6 +637,34 @@ public:
         m_peer_count.store(m_peers.size(), std::memory_order_relaxed);
         publish_peer_info_snapshot();   // IO thread: refresh the display snapshot
 
+        // Ask the freshly-handshaked peer for addresses. Straight port of the
+        // LTC reference (src/impl/ltc/node.cpp:309, also dgb node.cpp:318 /
+        // bch node.cpp:316 / btc node.cpp:316); count=8 is exactly canonical
+        // (p2p.py:797 send_getaddrs(count=8)). DASH never sent this, so its
+        // AddrStore only ever held the configured --addnode/--connect seeds and
+        // the node had ZERO organic peer discovery. The reply lands in the
+        // existing HANDLER(addrs) -> got_addr() path, which is already bounded
+        // (pool/node.hpp got_addr caps the store at 10000). Discovery only; no
+        // consensus/mint state touched.
+        peer->write(dash::message_getaddrs::make_raw(8));
+
+        // Canonical p2p.py:276 — one FULL have_tx as soon as the handshake
+        // completes, so the peer's view of our tx pool starts correct (and its
+        // dashboard stops showing us as txpool = 0). Subsequent sweeps send
+        // deltas only. Advert-only; no consensus/mint state touched.
+        //
+        // ORDERING IS LOAD-BEARING: this is the LARGEST write the handshake
+        // issues (up to TX_ADVERT_MAX_HASHES_PER_MESSAGE hashes, ~32 KB) and it
+        // goes LAST. core::Socket::write starts a composed async_write with no
+        // outbound queue (core/socket.cpp:110-137), so initiating another write
+        // while one is still draining interleaves bytes mid-message and gets us
+        // dropped on a bad checksum. Going last means NOTHING follows it in this
+        // handler; the ~32 KB advert may well take several write_some rounds,
+        // which is harmless precisely because nothing else is queued behind it,
+        // and the per-peer min-emit interval keeps the next timer sweep from
+        // landing on top of it. See core/tx_advertiser.hpp.
+        advertise_known_txs(peer);
+
         // #754 join trigger (oracle p2p.py handle_version → node.py
         // handle_share_hashes): a peer advertising a best share we don't have
         // is THE download entry point for an empty node joining an
@@ -816,6 +855,131 @@ public:
     /// from the run loop after listen(). Body in node.cpp (ltc
     /// node.cpp:1289-1327 port).
     void start_outbound_connections();
+
+    // ── have_tx / losing_tx advertisement (SEND side) ─────────────────────
+    // c2pool was RECEIVE-ONLY for the p2pool tx-pool advertisement: the
+    // protocol handlers ingest a peer's have_tx/losing_tx into
+    // Peer::m_remote_txs, but we never advertised our OWN known-tx set. Every
+    // canonical p2pool dashboard therefore rendered this node with txpool = 0
+    // (real p2pool peers report 12k-16k), and peers could not tell which txs we
+    // already hold, so remember_tx forwarded whole tx bodies needlessly.
+    //
+    // Canonical (p2pool python, p2pool/p2p.py): ONE full have_tx immediately
+    // after the version handshake (p2p.py:276), then pure deltas off the
+    // known_txs_var change events — added -> send_have_tx (p2p.py:243-248),
+    // removed -> send_losing_tx (p2p.py:250-259), transitioned -> both in that
+    // order (p2p.py:261-274). c2pool has no reactive variable, so
+    // Peer::m_tx_advert reconstructs the per-peer view and each sweep emits the
+    // diff; the sweep cadence mirrors node.py:298's 10s forget_old_txs loop.
+    // See core/tx_advertiser.hpp for the full derivation and the wire bound.
+    //
+    // Header-inline on purpose: the DASH handle_version vtable body must stay
+    // link-free for the rig-free KAT targets, and this touches only
+    // header-only message types plus peer->write.
+    //
+    // REWARD-SAFETY: tx hashes only. No consensus, share validation, subsidy,
+    // coinbase, payee or won-block state is read or written here.
+    void advertise_known_txs(peer_ptr only_peer = nullptr)
+    {
+        // THREAD-CONFINEMENT INVARIANT: every m_known_txs mutator in the DASH
+        // lane runs on the IO thread — the two remember_tx ingests
+        // (protocol_actual.cpp:263, protocol_legacy.cpp:299) and
+        // register_template_txs() -> dash::retain_template_txs(). Unlike the
+        // LTC/DGB/BCH/BTC lanes there is NO compute-thread evictor here:
+        // prune_shares() / core::evict_known_txs_to_cap do not exist in this
+        // lane. This sweep is also IO-thread, so the map is same-thread-safe.
+        //
+        // The shared try-lock below is therefore DEFENSIVE, not load-bearing for
+        // m_known_txs: it keeps this reader inside the established #828
+        // discipline for anything tracker-adjacent, and it is what a future
+        // compute-thread evictor would need. Do NOT read it as evidence that one
+        // exists — if you add one, this lock becomes required, not optional.
+        // try_to_lock, never block: if the compute thread is mid-cycle we skip
+        // and the next sweep carries the identical delta 10 s later.
+        std::set<uint256> current;
+        {
+            std::shared_lock<std::shared_mutex> lk(m_tracker_mutex, std::try_to_lock);
+            if (!lk.owns_lock())
+                return;
+            for (const auto& entry : m_known_txs)
+                current.insert(entry.first);
+        }
+
+        // One clock reading for the whole sweep: run_tx_advert uses it both to
+        // apply the per-peer min-emit interval (never two writes in flight on
+        // one socket) and to stamp the peer after a send. IO-thread-local, so
+        // Peer::m_tx_advert needs no locking.
+        const auto now = std::chrono::steady_clock::now();
+
+        auto advertise_one = [&current, now](const peer_ptr& p)
+        {
+            if (!p)
+                return;
+            core::run_tx_advert(
+                p->m_tx_advert, current,
+                [&p](const std::vector<uint256>& hashes)
+                { p->write(dash::message_have_tx::make_raw(hashes)); },
+                [&p](const std::vector<uint256>& hashes)
+                { p->write(dash::message_losing_tx::make_raw(hashes)); },
+                core::TX_ADVERT_MAX_HASHES_PER_MESSAGE, now);
+        };
+
+        if (only_peer)
+        {
+            advertise_one(only_peer);
+            return;
+        }
+        // m_peers is IO-thread-owned and mutated only on this thread
+        // (handle_version insert / error() erase), so plain iteration is safe.
+        for (auto& entry : m_peers)
+            advertise_one(entry.second);
+    }
+
+    /// Broadcast a new best-block notification to every connected pool peer.
+    /// Straight port of the LTC reference (src/impl/ltc/node.hpp:316-320; same
+    /// body in dgb node.hpp:339 / btc node.hpp:320 / bch node.hpp:562), which
+    /// DASH lacked entirely. Canonical trigger is node.py:137-140
+    /// (`best_block_header.changed` -> `peer.send_bestblock(header=header)` for
+    /// every peer), i.e. one message per NEW COIN TIP — on DASH that is ~1 per
+    /// 2.5 min, and the caller (main_dash.cpp) fires it only through the
+    /// already-deduped tip-notify path, so a poll+ZMQ double-observation of the
+    /// same block cannot double-send.
+    ///
+    /// The peer-side HANDLER(bestblock) deliberately does NOT relay
+    /// (protocol_actual.cpp:197), so this cannot amplify across the network.
+    ///
+    /// IO-THREAD ONLY (reads the IO-owned m_peers). Advert-only: no consensus,
+    /// share validation, subsidy, coinbase, payee or won-block state.
+    void broadcast_bestblock(const coin::BlockHeaderType& header)
+    {
+        for (auto& entry : m_peers)
+            if (entry.second)
+                entry.second->write(dash::message_bestblock::make_raw(header));
+    }
+
+    /// Periodic address-discovery sweep. Canonical p2p.py:794-799 (Node._think,
+    /// driven by deferral.run_repeatedly): when the addr store is below
+    /// `preferred_storage` (p2p.py:759 default 1000) and we have any peers, ask
+    /// ONE randomly chosen peer for 8 addresses. Canonical re-arms with
+    /// random.expovariate(1/20) (mean 20 s); core::Timer has no exponential
+    /// jitter, so we use a flat 20 s — same mean, strictly bounded tail.
+    ///
+    /// This is the only piece here with no existing c2pool precedent (LTC/DGB/
+    /// BCH/BTC send getaddrs on handshake only), so it is deliberately the most
+    /// conservative shape possible: one 4-byte request per 20 s to one peer,
+    /// and it stops entirely once the store reaches 1000 entries. Discovery
+    /// only; no consensus/mint state.
+    void getaddrs_sweep()
+    {
+        if (m_peers.empty())
+            return;
+        if (m_addrs.len() >= PREFERRED_ADDR_STORAGE)
+            return; // canonical `len(self.addr_store) < self.preferred_storage`
+        auto it = m_peers.begin();
+        std::advance(it, core::random::random_int(0, static_cast<int>(m_peers.size())));
+        if (it != m_peers.end() && it->second)
+            it->second->write(dash::message_getaddrs::make_raw(8));
+    }
 
     void set_target_outbound_peers(size_t count) { m_target_outbound_peers = count; }
     void set_max_peers(size_t count) { m_max_peers = count; }
