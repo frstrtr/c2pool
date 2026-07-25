@@ -4,6 +4,8 @@
 #include "mint_runloop.hpp"   // dash::mint::elect_best_share (election policy SSOT)
 #include "known_txs_retention.hpp"  // dash::retain_template_txs / all_txs_backable (F1/F3)
 
+#include <cassert>
+
 #include <core/uint256.hpp>
 #include <core/common.hpp>
 #include <core/random.hpp>
@@ -1385,6 +1387,18 @@ uint256 NodeImpl::add_local_share(ShareType share)
 void NodeImpl::register_template_txs(const std::vector<coin::Transaction>& txs,
                                      const std::vector<uint256>& hashes)
 {
+    // THREAD-CONFINEMENT (enforced, not assumed): every m_known_txs mutator in
+    // this lane must run OFF the compute thread — the two remember_tx ingests
+    // (protocol_actual.cpp:263 / protocol_legacy.cpp:299) are IO-thread by
+    // construction, and so is this one (producer-job cache miss on the stratum
+    // path). advertise_known_txs() reads the map from the IO thread on exactly
+    // that basis. A compute-thread caller here would turn that read into a
+    // genuine data race, so trip loudly in debug builds rather than let it be
+    // discovered in production.
+    assert(!is_compute_thread() &&
+           "register_template_txs must not run on the compute thread — "
+           "m_known_txs is IO-thread-confined (see advertise_known_txs)");
+
     if (txs.size() != hashes.size()) {
         LOG_WARNING << "[register_template_txs] size mismatch txs=" << txs.size()
                     << " hashes=" << hashes.size() << " — skipped";

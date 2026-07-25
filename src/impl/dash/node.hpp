@@ -637,12 +637,6 @@ public:
         m_peer_count.store(m_peers.size(), std::memory_order_relaxed);
         publish_peer_info_snapshot();   // IO thread: refresh the display snapshot
 
-        // Canonical p2p.py:276 — one FULL have_tx as soon as the handshake
-        // completes, so the peer's view of our tx pool starts correct (and its
-        // dashboard stops showing us as txpool = 0). Subsequent sweeps send
-        // deltas only. Advert-only; no consensus/mint state touched.
-        advertise_known_txs(peer);
-
         // Ask the freshly-handshaked peer for addresses. Straight port of the
         // LTC reference (src/impl/ltc/node.cpp:309, also dgb node.cpp:318 /
         // bch node.cpp:316 / btc node.cpp:316); count=8 is exactly canonical
@@ -653,6 +647,21 @@ public:
         // (pool/node.hpp got_addr caps the store at 10000). Discovery only; no
         // consensus/mint state touched.
         peer->write(dash::message_getaddrs::make_raw(8));
+
+        // Canonical p2p.py:276 — one FULL have_tx as soon as the handshake
+        // completes, so the peer's view of our tx pool starts correct (and its
+        // dashboard stops showing us as txpool = 0). Subsequent sweeps send
+        // deltas only. Advert-only; no consensus/mint state touched.
+        //
+        // ORDERING IS LOAD-BEARING: this is the LARGEST write the handshake
+        // issues (up to TX_ADVERT_MAX_HASHES_PER_MESSAGE hashes, ~32 KB) and it
+        // goes LAST. core::Socket::write starts a composed async_write with no
+        // outbound queue (core/socket.cpp:110-137), so a large write that
+        // overlaps a later one would interleave bytes mid-message and get us
+        // dropped on a bad checksum. The tiny getaddrs above (~28 bytes) drains
+        // in a single write_some before this one begins issuing continuations.
+        // See core/tx_advertiser.hpp for the full write-safety rationale.
+        advertise_known_txs(peer);
 
         // #754 join trigger (oracle p2p.py handle_version → node.py
         // handle_share_hashes): a peer advertising a best share we don't have
@@ -870,12 +879,21 @@ public:
     // coinbase, payee or won-block state is read or written here.
     void advertise_known_txs(peer_ptr only_peer = nullptr)
     {
-        // m_known_txs is mutated by the COMPUTE thread inside prune_shares()
-        // (core::evict_known_txs_to_cap) under the exclusive tracker lock. This
-        // runs on the IO thread, so take the same NON-BLOCKING shared lock the
-        // other IO-thread readers use (the #828 freed-memory GP-fault class)
-        // and simply skip if the compute thread is mid-cycle — the next sweep
-        // carries the identical delta 10s later.
+        // THREAD-CONFINEMENT INVARIANT: every m_known_txs mutator in the DASH
+        // lane runs on the IO thread — the two remember_tx ingests
+        // (protocol_actual.cpp:263, protocol_legacy.cpp:299) and
+        // register_template_txs() -> dash::retain_template_txs(). Unlike the
+        // LTC/DGB/BCH/BTC lanes there is NO compute-thread evictor here:
+        // prune_shares() / core::evict_known_txs_to_cap do not exist in this
+        // lane. This sweep is also IO-thread, so the map is same-thread-safe.
+        //
+        // The shared try-lock below is therefore DEFENSIVE, not load-bearing for
+        // m_known_txs: it keeps this reader inside the established #828
+        // discipline for anything tracker-adjacent, and it is what a future
+        // compute-thread evictor would need. Do NOT read it as evidence that one
+        // exists — if you add one, this lock becomes required, not optional.
+        // try_to_lock, never block: if the compute thread is mid-cycle we skip
+        // and the next sweep carries the identical delta 10 s later.
         std::set<uint256> current;
         {
             std::shared_lock<std::shared_mutex> lk(m_tracker_mutex, std::try_to_lock);

@@ -38,14 +38,41 @@
 // fewer and larger messages than canonical, and no way for a burst of inbound
 // txs to turn into a burst of outbound adverts.
 //
-// Size bound: canonical wraps oversized sends in p2p.py:230 `fragment()`, which
-// recursively halves a payload that raises p2protocol.TooLong (the 3 MiB
-// max_payload of p2p.py:41). Rather than reproduce the throw/retry, we chunk
-// up-front at TX_ADVERT_MAX_HASHES_PER_MESSAGE = 10000 hashes -> ~320 KB, which
-// is an order of magnitude under the canonical 3 MiB ceiling and is exactly the
-// bound canonical itself applies to the RECEIVING side of have_tx
-// (p2p.py:494-495 truncates remote_tx_hashes to 10000), so a larger chunk could
-// never be fully retained by the peer anyway.
+// ── Write-safety bound: ONE MESSAGE PER PEER PER SWEEP ──────────────────────
+// This is a HARD constraint imposed by c2pool's socket layer, not by canonical.
+//
+// core::Socket::write (core/socket.cpp:110-137) starts a composed
+// boost::asio::async_write IMMEDIATELY — there is NO outbound queue. Asio's
+// contract forbids initiating a second composed write on a descriptor before the
+// first completes: two overlapping composed writes interleave their
+// async_write_some continuations FIFO per descriptor, so any write larger than
+// the kernel send buffer that overlaps another write splices bytes INTO THE
+// MIDDLE of the other message. The result is a framing/checksum error and the
+// canonical peer drops us.
+//
+// The advertiser is the first systematic large-burst writer in the tree, so it
+// must not rely on a queue that does not exist yet:
+//
+//   1. A sweep emits AT MOST ONE message to a given peer. Never a chunk burst,
+//      never have_tx immediately followed by losing_tx.
+//   2. A message carries at most TX_ADVERT_MAX_HASHES_PER_MESSAGE hashes, sized
+//      so the whole payload comfortably fits a single write_some on a fresh
+//      socket (see the constant).
+//   3. Only what was ACTUALLY emitted is committed to the per-peer view, so the
+//      remainder is recomputed and sent by the next sweep. A 10k-tx pool simply
+//      converges over ~100 s of sweeps instead of one multi-chunk burst — which
+//      is indistinguishable to a canonical peer, since have_tx is advisory.
+//
+// Canonical solves the same size problem differently: p2p.py:230 `fragment()`
+// recursively halves a payload that raises p2protocol.TooLong (against the 3 MiB
+// max_payload of p2p.py:41). We cannot use that shape, because fragment() emits
+// the halves BACK-TO-BACK — exactly the overlapping-write pattern our socket
+// layer cannot survive. Spreading across sweeps is the queue-free equivalent.
+//
+// FOLLOW-UP (deliberately NOT done here): the proper fix is an outbound write
+// queue in core::Socket, which would also cure the PRE-EXISTING violation in the
+// share-broadcast path (dash/node.cpp:1290/1301/1307 issues three back-to-back
+// writes) for every coin. That is a core change needing its own review.
 //
 // REWARD-SAFETY: advertisement only. Nothing here reads or writes consensus
 // state, share validation, subsidy, coinbase, payee, or the won-block path. A
@@ -54,8 +81,9 @@
 
 #pragma once
 
-#include <chrono>
+#include <algorithm>
 #include <cstddef>
+#include <iterator>
 #include <set>
 #include <vector>
 
@@ -63,15 +91,27 @@
 
 namespace core {
 
-// Max tx hashes per have_tx / losing_tx message. Mirrors the canonical
-// receive-side cap (p2p.py:494 truncates remote_tx_hashes to 10000) and keeps
-// every emitted payload ~320 KB, far under canonical's 3 MiB max_payload.
-inline constexpr std::size_t TX_ADVERT_MAX_HASHES_PER_MESSAGE = 10000;
+// Max tx hashes in a single have_tx / losing_tx message.
+//
+// 1000 hashes = 32000 bytes of payload (plus a 3-byte list varint and the
+// packet header) ~= 32 KB. That is comfortably inside a single write_some on a
+// fresh socket even at the conservative end of default kernel send-buffer
+// sizing, which is what keeps this write from overlapping the next one in the
+// absence of an outbound queue (see the header comment).
+//
+// Canonical's own receive side truncates its view of a peer's tx set at 10000
+// hashes (p2p.py:494-495), so this is well inside anything a canonical peer
+// would retain, and two orders of magnitude under canonical's 3 MiB max_payload
+// (p2p.py:41). MUST stay <= 2000 — larger risks a partial write_some and the
+// interleaving described above.
+inline constexpr std::size_t TX_ADVERT_MAX_HASHES_PER_MESSAGE = 1000;
 
 // Delta-sweep cadence in seconds. Mirrors node.py:298 forget_old_txs t.start(10).
 inline constexpr int TX_ADVERT_INTERVAL_SECONDS = 10;
 
-// What one sweep would put on the wire for one peer.
+// A set of hashes destined for the wire. Used both for the FULL outstanding
+// delta (plan_tx_advert) and for the truncated subset a single sweep actually
+// emits (run_tx_advert's return value).
 struct TxAdvertPlan
 {
     std::vector<uint256> m_have;   // newly known -> have_tx
@@ -91,6 +131,7 @@ struct TxAdvertState
 
 // Pure diff: current known-tx hash set vs what the peer has already been told.
 // `current` may be any ordered/unordered set of uint256 supporting find()/end().
+// Does NOT mutate `state`.
 template <typename HashSet>
 inline TxAdvertPlan plan_tx_advert(const TxAdvertState& state, const HashSet& current)
 {
@@ -104,72 +145,81 @@ inline TxAdvertPlan plan_tx_advert(const TxAdvertState& state, const HashSet& cu
     return plan;
 }
 
-// Fold a committed plan into the per-peer view.
-inline void commit_tx_advert(TxAdvertState& state, const TxAdvertPlan& plan)
+// Fold an EMITTED plan into the per-peer view. Only ever called with hashes that
+// actually reached the socket — committing more than was sent is a permanent
+// per-peer desync, because the un-sent remainder would never resurface in a
+// later diff.
+inline void commit_tx_advert(TxAdvertState& state, const TxAdvertPlan& emitted)
 {
-    for (const auto& h : plan.m_have)
+    for (const auto& h : emitted.m_have)
         state.m_advertised.insert(h);
-    for (const auto& h : plan.m_losing)
+    for (const auto& h : emitted.m_losing)
         state.m_advertised.erase(h);
     state.m_initial_sent = true;
 }
 
-// Split a hash list into wire-sized chunks (see TX_ADVERT_MAX_HASHES_PER_MESSAGE).
-// An empty input yields no chunks — we never emit an empty message.
-inline std::vector<std::vector<uint256>>
-chunk_tx_hashes(const std::vector<uint256>& hashes, std::size_t max_per_message)
-{
-    std::vector<std::vector<uint256>> out;
-    if (hashes.empty() || max_per_message == 0)
-        return out;
-    for (std::size_t i = 0; i < hashes.size(); i += max_per_message)
-    {
-        const std::size_t n = std::min(max_per_message, hashes.size() - i);
-        out.emplace_back(hashes.begin() + i, hashes.begin() + i + n);
-    }
-    return out;
-}
-
 // Drive one advert sweep for one peer.
 //
-// Computes the delta, emits it through the coin-specific senders in canonical
-// order (have_tx before losing_tx, p2p.py:264-267), chunked to the wire bound,
-// and folds the result into `state`. Returns the plan so callers can log/test.
+// Emits AT MOST ONE message (see the write-safety bound in the header comment):
+// the first `max_per_message` outstanding have_tx hashes if there are any,
+// otherwise the first `max_per_message` outstanding losing_tx hashes. Additions
+// therefore always precede retractions across sweeps, preserving canonical's
+// have-before-losing ordering (p2p.py:264-267). Whatever is left over is
+// recomputed from scratch by the next sweep, so nothing is lost and nothing is
+// sent twice.
 //
-// send_have / send_losing are invoked as f(const std::vector<uint256>&) once per
-// chunk and are never called with an empty vector. They MUST NOT throw; a coin
-// wrapper that can fail should swallow and let the next sweep retry (the state
-// is only committed after the senders return).
+// Returns the subset that was ACTUALLY emitted (and committed).
+//
+// send_have / send_losing are invoked as f(const std::vector<uint256>&) at most
+// once each, and at most one of the two per call. They MUST NOT throw; the state
+// is only committed after the sender returns.
 template <typename HashSet, typename SendHave, typename SendLosing>
 inline TxAdvertPlan run_tx_advert(TxAdvertState& state, const HashSet& current,
                                   SendHave&& send_have, SendLosing&& send_losing,
                                   std::size_t max_per_message = TX_ADVERT_MAX_HASHES_PER_MESSAGE)
 {
-    TxAdvertPlan plan = plan_tx_advert(state, current);
+    // A zero budget can emit nothing, so it must also COMMIT nothing — otherwise
+    // the per-peer view would record hashes that never reached the wire and the
+    // diff would never resurface them (permanent desync). Fail closed.
+    if (max_per_message == 0)
+        return {};
+
+    const TxAdvertPlan outstanding = plan_tx_advert(state, current);
+    const bool initial = !state.m_initial_sent;
 
     // Canonical sends nothing when a change event carries no entries
     // (p2p.py:244 `if added:` / p2p.py:251 `if removed:`). The one exception is
     // the handshake advert (p2p.py:276), which canonical issues unconditionally
     // — including with an empty tx_hashes list — so a peer that has just
     // connected always learns our (possibly empty) view exactly once.
-    const bool initial = !state.m_initial_sent;
-    if (plan.empty() && !initial)
-        return plan;
+    if (outstanding.empty() && !initial)
+        return {};
 
-    if (initial && plan.m_have.empty())
+    TxAdvertPlan emitted;
+    if (!outstanding.m_have.empty())
     {
-        send_have(std::vector<uint256>{});
+        const auto n = static_cast<std::ptrdiff_t>(
+            std::min(max_per_message, outstanding.m_have.size()));
+        emitted.m_have.assign(outstanding.m_have.begin(),
+                              std::next(outstanding.m_have.begin(), n));
+        send_have(emitted.m_have);
+    }
+    else if (!outstanding.m_losing.empty())
+    {
+        const auto n = static_cast<std::ptrdiff_t>(
+            std::min(max_per_message, outstanding.m_losing.size()));
+        emitted.m_losing.assign(outstanding.m_losing.begin(),
+                                std::next(outstanding.m_losing.begin(), n));
+        send_losing(emitted.m_losing);
     }
     else
     {
-        for (const auto& chunk : chunk_tx_hashes(plan.m_have, max_per_message))
-            send_have(chunk);
+        // initial && nothing outstanding: the unconditional p2p.py:276 advert.
+        send_have(std::vector<uint256>{});
     }
-    for (const auto& chunk : chunk_tx_hashes(plan.m_losing, max_per_message))
-        send_losing(chunk);
 
-    commit_tx_advert(state, plan);
-    return plan;
+    commit_tx_advert(state, emitted);
+    return emitted;
 }
 
 } // namespace core

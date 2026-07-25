@@ -23,7 +23,6 @@
 //   p2p.py:261-274  transitioned      -> have_tx(added) THEN losing_tx(removed)
 //   p2p.py:494-495  receiver truncates its view at 10000 hashes (our chunk cap)
 
-using core::chunk_tx_hashes;
 using core::plan_tx_advert;
 using core::run_tx_advert;
 using core::TxAdvertPlan;
@@ -172,108 +171,199 @@ TEST(TxAdvertiser, EvictionEmitsLosingTx)
     EXPECT_EQ(st.m_advertised, hashes(6, 10));
 }
 
-// p2p.py:261-274 (transitioned): additions go out BEFORE retractions, so a peer
-// that re-learns a hash in the same sweep never ends up with it retracted.
+// p2p.py:261-274 (transitioned): additions go out BEFORE retractions. With the
+// one-message-per-sweep bound this becomes "adds this sweep, retractions the
+// next" — the ordering canonical guarantees is preserved across sweeps.
 TEST(TxAdvertiser, MixedDeltaSendsHaveBeforeLosing)
 {
     TxAdvertState st;
     Wire w0;
     sweep(st, hashes(1, 5), w0);
 
-    Wire w;
-    auto plan = sweep(st, hashes(4, 9), w); // drop 1..3, add 6..9
+    Wire a;
+    sweep(st, hashes(4, 9), a); // drop 1..3, add 6..9
+    ASSERT_EQ(a.msgs.size(), 1u);
+    EXPECT_EQ(a.msgs[0].kind, Wire::Kind::have);
+    EXPECT_EQ(std::set<uint256>(a.msgs[0].hashes.begin(), a.msgs[0].hashes.end()), hashes(6, 9));
 
-    ASSERT_EQ(w.msgs.size(), 2u);
-    EXPECT_EQ(w.msgs[0].kind, Wire::Kind::have);
-    EXPECT_EQ(w.msgs[1].kind, Wire::Kind::losing);
-    EXPECT_EQ(std::set<uint256>(w.msgs[0].hashes.begin(), w.msgs[0].hashes.end()), hashes(6, 9));
-    EXPECT_EQ(std::set<uint256>(w.msgs[1].hashes.begin(), w.msgs[1].hashes.end()), hashes(1, 3));
+    Wire b;
+    sweep(st, hashes(4, 9), b);
+    ASSERT_EQ(b.msgs.size(), 1u);
+    EXPECT_EQ(b.msgs[0].kind, Wire::Kind::losing);
+    EXPECT_EQ(std::set<uint256>(b.msgs[0].hashes.begin(), b.msgs[0].hashes.end()), hashes(1, 3));
+
+    Wire c;
+    sweep(st, hashes(4, 9), c);
+    EXPECT_TRUE(c.msgs.empty());
 }
 
 // No hash is ever advertised twice across a long run of sweeps, and a hash that
 // is retracted and later re-learned IS advertised again (exactly once more).
+// Each state is swept to quiescence so the one-message-per-sweep budget does not
+// hide an outstanding delta.
 TEST(TxAdvertiser, NothingAdvertisedTwiceAndReLearnReAdvertises)
 {
     TxAdvertState st;
     std::vector<uint256> ever_advertised;
 
-    auto record = [&](Wire& w) {
-        for (const auto& h : w.all(Wire::Kind::have))
-            ever_advertised.push_back(h);
+    // Sweep `pool` until nothing more is emitted, recording every have_tx hash.
+    auto drain = [&](const std::set<uint256>& pool) {
+        for (int i = 0; i < 20; ++i) {
+            Wire w;
+            sweep(st, pool, w);
+            if (w.msgs.empty())
+                return;
+            ASSERT_EQ(w.msgs.size(), 1u);
+            for (const auto& h : w.all(Wire::Kind::have))
+                ever_advertised.push_back(h);
+        }
+        FAIL() << "advert never reached quiescence";
     };
 
-    Wire a; sweep(st, hashes(1, 4), a); record(a);
-    Wire b; sweep(st, hashes(1, 4), b); record(b);   // no change
-    Wire c; sweep(st, hashes(3, 6), c); record(c);   // drop 1,2 add 5,6
-    Wire d; sweep(st, hashes(3, 6), d); record(d);   // no change
+    drain(hashes(1, 4));   // advertise 1,2,3,4
+    drain(hashes(1, 4));   // no change -> nothing
+    drain(hashes(3, 6));   // drop 1,2 (losing_tx); add 5,6
+    drain(hashes(3, 6));   // no change -> nothing
 
-    // 1,2,3,4 then 5,6 — six adverts, no duplicates.
     EXPECT_EQ(ever_advertised.size(), 6u);
     EXPECT_EQ(std::set<uint256>(ever_advertised.begin(), ever_advertised.end()).size(), 6u);
+    EXPECT_EQ(st.m_advertised, hashes(3, 6));
 
-    // Re-learn hash 1 (evicted at sweep c): it must be advertised again.
-    Wire e; sweep(st, hashes(1, 6), e); record(e);
-    const auto again = e.all(Wire::Kind::have);
-    ASSERT_EQ(again.size(), 2u);
-    EXPECT_EQ(std::set<uint256>(again.begin(), again.end()), hashes(1, 2));
+    // Re-learn 1,2 (retracted above): they must be advertised again.
+    drain(hashes(1, 6));
     EXPECT_EQ(ever_advertised.size(), 8u);
+    EXPECT_EQ(st.m_advertised, hashes(1, 6));
 }
 
-// Wire bound: a pool at exactly the cap is one message; cap+1 is two, and the
-// split is complete and non-overlapping (canonical fragments instead, p2p.py:230).
-TEST(TxAdvertiser, ChunkBoundaryExactAndOverflow)
+// Write-safety bound: a sweep emits AT MOST ONE message. core::Socket::write has
+// no outbound queue (socket.cpp:110-137), so a chunk burst would overlap composed
+// async_writes and interleave bytes mid-message -> bad checksum -> the canonical
+// peer drops us. Over-budget hashes are NOT committed; they resurface next sweep.
+TEST(TxAdvertiser, OneMessagePerSweepAndCommitsOnlyWhatWasEmitted)
 {
-    constexpr size_t cap = 4;
+    constexpr size_t budget = 4;
+    TxAdvertState st;
+    Wire w;
 
-    {
-        TxAdvertState st;
-        Wire w;
-        sweep(st, hashes(1, cap), w, cap);
-        ASSERT_EQ(w.msgs.size(), 1u);
-        EXPECT_EQ(w.msgs[0].hashes.size(), cap);
-    }
-    {
-        TxAdvertState st;
-        Wire w;
-        sweep(st, hashes(1, cap + 1), w, cap);
-        ASSERT_EQ(w.msgs.size(), 2u);
-        EXPECT_EQ(w.msgs[0].hashes.size(), cap);
-        EXPECT_EQ(w.msgs[1].hashes.size(), 1u);
-        const auto all = w.all(Wire::Kind::have);
-        EXPECT_EQ(std::set<uint256>(all.begin(), all.end()), hashes(1, cap + 1));
-    }
-    {
-        // Retractions chunk on the same bound.
-        TxAdvertState st;
-        Wire w0;
-        sweep(st, hashes(1, 9), w0, cap);
-        Wire w;
-        sweep(st, std::set<uint256>{}, w, cap);
-        EXPECT_EQ(w.count(Wire::Kind::have), 0u);
-        EXPECT_EQ(w.count(Wire::Kind::losing), 3u); // 4 + 4 + 1
-        EXPECT_EQ(w.all(Wire::Kind::losing).size(), 9u);
-    }
+    sweep(st, hashes(1, 10), w, budget);
+
+    // Exactly one message, exactly `budget` hashes.
+    ASSERT_EQ(w.msgs.size(), 1u);
+    EXPECT_EQ(w.msgs[0].kind, Wire::Kind::have);
+    EXPECT_EQ(w.msgs[0].hashes.size(), budget);
+    // ...and ONLY those are recorded as advertised — committing the un-sent
+    // remainder would be a permanent per-peer desync.
+    EXPECT_EQ(st.m_advertised.size(), budget);
+    for (const auto& h : w.msgs[0].hashes)
+        EXPECT_TRUE(st.m_advertised.count(h));
 }
 
-// The default cap is the canonical receive-side truncation bound (p2p.py:494),
-// so we never emit a message a canonical peer could not fully retain, and the
-// payload stays ~320 KB — far under canonical's 3 MiB max_payload (p2p.py:41).
-TEST(TxAdvertiser, DefaultChunkCapMatchesCanonicalReceiverBound)
+// The remainder is carried by the FOLLOWING sweeps until the pool converges,
+// with no hash sent twice and none dropped.
+TEST(TxAdvertiser, RemainderIsAdvertisedOnSubsequentSweeps)
 {
-    EXPECT_EQ(core::TX_ADVERT_MAX_HASHES_PER_MESSAGE, 10000u);
+    constexpr size_t budget = 4;
+    TxAdvertState st;
+    const auto pool = hashes(1, 10);
+
+    std::vector<uint256> ever;
+    size_t sweeps = 0;
+    for (; sweeps < 20; ++sweeps) {
+        Wire w;
+        sweep(st, pool, w, budget);
+        if (w.msgs.empty())
+            break;
+        ASSERT_EQ(w.msgs.size(), 1u); // never more than one message per sweep
+        EXPECT_LE(w.msgs[0].hashes.size(), budget);
+        for (const auto& h : w.msgs[0].hashes)
+            ever.push_back(h);
+    }
+
+    // ceil(10/4) = 3 sweeps of adverts, then a 4th that emits nothing.
+    EXPECT_EQ(sweeps, 3u);
+    EXPECT_EQ(ever.size(), 10u);
+    EXPECT_EQ(std::set<uint256>(ever.begin(), ever.end()), pool); // complete, no dupes
+    EXPECT_EQ(st.m_advertised, pool);
+}
+
+// Retractions are budgeted the same way, and additions always drain FIRST
+// (canonical have-before-losing, p2p.py:264-267) — so a sweep never emits a
+// have_tx and a losing_tx back to back.
+TEST(TxAdvertiser, LosingTxIsBudgetedAndDrainsAfterHaveTx)
+{
+    constexpr size_t budget = 4;
+    TxAdvertState st;
+
+    // Seed 9 advertised hashes over 3 sweeps.
+    for (int i = 0; i < 3; ++i) { Wire w; sweep(st, hashes(1, 9), w, budget); }
+    ASSERT_EQ(st.m_advertised, hashes(1, 9));
+
+    // Now the pool drops to {1..2} AND gains {20..21}: adds go first.
+    std::set<uint256> next = hashes(1, 2);
+    next.insert(H(20));
+    next.insert(H(21));
+
+    Wire a;
+    sweep(st, next, a, budget);
+    ASSERT_EQ(a.msgs.size(), 1u);
+    EXPECT_EQ(a.msgs[0].kind, Wire::Kind::have);
+    EXPECT_EQ(std::set<uint256>(a.msgs[0].hashes.begin(), a.msgs[0].hashes.end()),
+              (std::set<uint256>{H(20), H(21)}));
+
+    // Only once additions are exhausted do retractions start, one message each.
+    Wire b;
+    sweep(st, next, b, budget);
+    ASSERT_EQ(b.msgs.size(), 1u);
+    EXPECT_EQ(b.msgs[0].kind, Wire::Kind::losing);
+    EXPECT_EQ(b.msgs[0].hashes.size(), budget);
+
+    Wire c;
+    sweep(st, next, c, budget);
+    ASSERT_EQ(c.msgs.size(), 1u);
+    EXPECT_EQ(c.msgs[0].kind, Wire::Kind::losing);
+    EXPECT_EQ(c.msgs[0].hashes.size(), 3u); // 7 retractions total: 4 + 3
+
+    Wire d;
+    sweep(st, next, d, budget);
+    EXPECT_TRUE(d.msgs.empty());
+    EXPECT_EQ(st.m_advertised, next);
+}
+
+// Fail closed on a zero budget: nothing can be emitted, so nothing may be
+// committed. Committing under a zero budget would mark hashes advertised that
+// never reached the wire -> they would never resurface in a later diff.
+TEST(TxAdvertiser, ZeroBudgetEmitsNothingAndCommitsNothing)
+{
+    TxAdvertState st;
+    Wire w;
+
+    auto plan = sweep(st, hashes(1, 5), w, /*cap=*/0);
+
+    EXPECT_TRUE(plan.empty());
+    EXPECT_TRUE(w.msgs.empty());
+    EXPECT_TRUE(st.m_advertised.empty());
+    EXPECT_FALSE(st.m_initial_sent);   // the handshake advert is still owed
+
+    // A later sweep with a real budget still delivers the full set.
+    Wire w2;
+    sweep(st, hashes(1, 5), w2, 10);
+    ASSERT_EQ(w2.msgs.size(), 1u);
+    EXPECT_EQ(w2.msgs[0].hashes.size(), 5u);
+    EXPECT_EQ(st.m_advertised, hashes(1, 5));
+}
+
+// The default per-message bound must stay inside a single write_some on a fresh
+// socket (the no-outbound-queue constraint) and inside canonical's own receiver
+// truncation (p2p.py:494) and max_payload (p2p.py:41).
+TEST(TxAdvertiser, DefaultBoundsAreWireSafe)
+{
+    EXPECT_LE(core::TX_ADVERT_MAX_HASHES_PER_MESSAGE, 2000u);
+    // 32 bytes/hash + framing must stay well under a conservative 64 KB sndbuf.
+    EXPECT_LE(core::TX_ADVERT_MAX_HASHES_PER_MESSAGE * 32u + 64u, 64u * 1024u);
+    // ...and inside what a canonical peer would even retain / accept.
+    EXPECT_LE(core::TX_ADVERT_MAX_HASHES_PER_MESSAGE, 10000u);
     EXPECT_LE(core::TX_ADVERT_MAX_HASHES_PER_MESSAGE * 32u, 3145728u);
     EXPECT_EQ(core::TX_ADVERT_INTERVAL_SECONDS, 10);
-}
-
-// chunk_tx_hashes never yields an empty chunk — an empty delta must produce no
-// message at all (canonical `if added:` / `if removed:` guards).
-TEST(TxAdvertiser, ChunkingNeverEmitsEmptyChunks)
-{
-    EXPECT_TRUE(chunk_tx_hashes({}, 10).empty());
-    const std::vector<uint256> one{H(1)};
-    const auto c = chunk_tx_hashes(one, 10);
-    ASSERT_EQ(c.size(), 1u);
-    EXPECT_EQ(c[0].size(), 1u);
 }
 
 // plan_tx_advert is pure: it must not mutate the state it inspects.
