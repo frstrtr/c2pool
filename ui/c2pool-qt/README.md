@@ -1,8 +1,10 @@
-# c2pool Qt Control Panel (MVP Scaffold)
+# c2pool Qt Control Panel
 
-This is the initial mining-first MVP scaffold for the desktop control panel.
+Desktop control panel for c2pool. First-pass toward full finalization —
+the qt-steward owns deeper controls; this cut makes the launcher
+coin-generic and reward-safe.
 
-Implemented in this first cut:
+Implemented:
 
 - Qt Widgets app shell
 - Sidebar navigation
@@ -11,18 +13,61 @@ Implemented in this first cut:
 - Logs page
 - Basic node/miner monitoring refresh loop
 - Log export action (calls /logs/export endpoint)
+- **Coin-generic launch** (profile-driven, `src/CoinProfiles.hpp`):
+  litecoin, bitcoin, dogecoin, dash, digibyte, bitcoincash
+- **Reward-safe launch defaults** (see below)
+
+## Coins & launch CLIs
+
+c2pool ships two launch CLIs; the chain profile records which one each coin
+uses, plus its binary, daemon, algo and default RPC ports:
+
+| Coin | Binary | Daemon | Algo | Launch CLI |
+|------|--------|--------|------|------------|
+| litecoin | `c2pool` | litecoind | Scrypt | unified `--net litecoin` |
+| bitcoin | `c2pool` | bitcoind | SHA-256d | unified `--net bitcoin` |
+| dogecoin | `c2pool` | dogecoind | Scrypt (AuxPoW) | unified `--net dogecoin` |
+| dash | `c2pool-dash` | dashd | X11 | per-coin `--run` (masternode-payee) |
+| digibyte | `c2pool-dgb` | digibyted | Scrypt | per-coin `--run` (experimental) |
+| bitcoincash | `c2pool-bch` | bitcoind (BCHN) | SHA-256d | per-coin `--pool` (experimental) |
+
+Adding a coin is a row in `CoinProfiles.hpp`, not a scattered code edit —
+mirroring the coin-generic web dashboard/explorer.
+
+## ★ Reward safety
+
+The default per-coin launch profile is the reward-SAFE dashd-RPC arm
+(`--coin-rpc HOST:PORT` + `--coin-rpc-auth PATH`; the rpcpassword is read
+from the coin's .conf and never placed on argv). The embedded coin-network
+arm (`--coin-p2p-connect` / `--embedded-mainnet`) is reward-UNSAFE until
+validated and is **default OFF** — it is emitted only from the explicit
+"Advanced / embedded (opt-in — REWARD-UNSAFE)" controls. See the DASH hotel
+incident that motivated this gate.
+
+The invariant is unit-tested Qt-free in `test/test_reward_safe_launch.cpp`
+(the default DASH command omits both flags); build tests with
+`-DC2POOL_QT_BUILD_TESTS=ON` and run via `ctest`.
+
+## TODO (qt-steward)
+
+- Deeper per-coin controls for the DGB/BCH run-loops (ZMQ, anchors,
+  sharechain isolation, etc.)
+- Address-flavour validation per coin
+- Wiring the per-coin binaries' full flag surface
 
 ## Build
 
 ```bash
-cmake -S ui/qt-control-panel -B build-qt-mvp
-cmake --build build-qt-mvp -j4
+cmake -S ui/c2pool-qt -B build-qt
+cmake --build build-qt -j4
 ```
+
+Requires Qt6 (Widgets, Network, WebEngineCore/Widgets, WebChannel).
 
 ## Run
 
 ```bash
-./build-qt-mvp/c2pool-qt-control-panel
+./build-qt/c2pool-qt
 ```
 
 Default API base URL in the app:
@@ -38,5 +83,6 @@ Use the top bar to change base URL and refresh pages.
 
 ## Current status
 
-This is a functional skeleton meant to start MVP implementation quickly.
-Data mapping, UI polish, and deeper controls will be implemented incrementally.
+First-pass finalization: coin-generic + reward-safe launch land here; data
+mapping, UI polish, and deeper per-coin controls continue incrementally
+(qt-steward).

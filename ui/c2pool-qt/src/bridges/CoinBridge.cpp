@@ -49,6 +49,18 @@ constexpr CoinConstants kKnownCoins[] = {
      "https://digiexplorer.info/block/",
      "https://testnetexplorer.digibyteservers.io/block/",
      36, 8640},
+    // dash — X11, masternode-payee; mainnet PUBKEY 76 (X…) / SCRIPT 16 (7…),
+    // testnet PUBKEY 140 (y…) / SCRIPT 19 (see impl/dash/params.hpp)
+    {"dash",      "Dash",      76, 16, 140, 19,
+     "https://blockchair.com/dash/block/",
+     "https://blockexplorer.one/dash/testnet/blockHash/",
+     36, 8640},
+    // bitcoincash — SHA-256d; legacy base58 versions mirror bitcoin
+    // (mainnet PUBKEY 0 / SCRIPT 5, testnet 111 / 196)
+    {"bitcoincash", "Bitcoin Cash", 0, 5, 111, 196,
+     "https://blockchair.com/bitcoin-cash/block/",
+     "https://blockexplorer.one/bitcoin-cash/testnet/blockHash/",
+     36, 8640},
 };
 
 const CoinConstants* findCoin(const QString& chain)
