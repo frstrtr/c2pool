@@ -92,6 +92,8 @@
 #include <core/stratum_server.hpp>             // core::StratumServer — miner-facing accept-loop (run-path caller)
 #include <impl/dash/stratum/work_source.hpp>   // dash::stratum::DASHWorkSource — concrete core::stratum::IWorkSource
 #include <impl/dash/mint_runloop.hpp>          // dash::mint — run-loop share minting (slice 3/3)
+#include <impl/dash/stratum/tip_refresh.hpp>   // dash::stratum::fire_share_tip_refresh — bump + notify_all + dashboard refresh
+#include <impl/dash/local_mint_ledger.hpp>     // dash::mint::LocalMintLedger — display-only local orphan/sibling gauge
 #include <impl/dash/share_messages.hpp>        // dash::validate_message_data — operator message-blob validation (EMIT side, mirrors main_ltc.cpp)
 #include <c2pool/storage/found_block_store.hpp>  // FoundBlockStore/Record + LevelDBStore (persistence, main_ltc parity)
 #include <core/web_server.hpp>                 // core::WebServer — the EXISTING c2pool dashboard (same wiring main_ltc.cpp uses)
@@ -569,6 +571,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                   << " seed peer[s]); share-download leg ARMED\n";
 
 
+    // ── Local-mint orphan/sibling gauge (display only) ────────────────────
+    // Declared HERE (before the dashboard wiring) because two later blocks
+    // need it: the sharechain stats fn reads it, and the mint fn records into
+    // it. shared_ptr so both closures can hold it without lifetime coupling to
+    // this frame. Nothing consensus-visible reads this — see
+    // local_mint_ledger.hpp.
+    auto mint_ledger = std::make_shared<dash::mint::LocalMintLedger>();
+
     // ── DASH web dashboard standup (the EXISTING c2pool dashboard) ────────
     // This is main_ltc.cpp's WebServer wiring, reused verbatim where the DASH
     // side has a real source for the datum. No stub metrics are invented: a
@@ -748,7 +758,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // tally + work-weighted sampling mirror what apply_min_protocol_ratchet
             // keys on (version_negotiation::get_desired_version_weights), so the
             // dashboard shows the SAME numbers the ratchet decides on.
-            mi->set_sharechain_stats_fn([node_ptr]() -> nlohmann::json {
+            mi->set_sharechain_stats_fn([node_ptr, mint_ledger]() -> nlohmann::json {
                 // Last-good cache (mirrors main_ltc.cpp's stats_fn): think() holds the
                 // tracker lock frequently during normal operation, and returning a
                 // 4-field snapshot then would make the transition gauge (which reads
@@ -766,6 +776,23 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 out["verified_count"] = snap.verified_count;
                 out["orphan_shares"]  = snap.orphan_shares;
                 out["dead_shares"]    = snap.dead_shares;
+
+                // ── Local-mint orphan/sibling gauge (display only) ─────────────
+                // snap.orphan_shares/dead_shares are the sharechain-wide StaleInfo
+                // tally, and every share WE mint is stamped StaleInfo::none — so a
+                // locally minted share that is verified and then loses the head
+                // race shows up in NEITHER. These fields answer the question those
+                // cannot: of the shares this node minted, how many are still on the
+                // best chain? Consensus-invisible (no StaleInfo stamping change).
+                {
+                    const auto lm = mint_ledger->stats();
+                    out["local_minted_shares"]   = lm.minted;
+                    out["local_on_chain_shares"] = lm.on_chain;
+                    out["local_orphan_shares"]   = lm.orphaned;
+                    out["local_pending_shares"]  = lm.pending;
+                    out["local_gone_shares"]     = lm.gone;
+                    out["local_orphan_rate"]     = lm.orphan_rate;
+                }
 
                 // Protocol-floor gauge inputs (v16→v36 crossing). The live accept-floor
                 // is the ratchet output (1700 pre-crossing → 3600 once ≥95% v36-weighted);
@@ -794,6 +821,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         cached["fork_count"]     = snap.fork_count;
                         cached["min_protocol_version"]  = live_floor;
                         cached["live_share_version"]    = out["live_share_version"];
+                        // Local-mint gauge is lock-free (its own mutex) — always fresh.
+                        cached["local_minted_shares"]   = out["local_minted_shares"];
+                        cached["local_on_chain_shares"] = out["local_on_chain_shares"];
+                        cached["local_orphan_shares"]   = out["local_orphan_shares"];
+                        cached["local_pending_shares"]  = out["local_pending_shares"];
+                        cached["local_gone_shares"]     = out["local_gone_shares"];
+                        cached["local_orphan_rate"]     = out["local_orphan_rate"];
                         return cached;
                     }
                     out["chain_height"] = snap.chain_count;
@@ -1750,7 +1784,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // commitment, deterministic producer rebuild (X11 identity gate +
         // pow<=target ban-safety gate inside), tracker insert + broadcast.
         work_source->set_mint_share_fn(
-            [node_ptr, mint_params, mint_registry](
+            [node_ptr, mint_params, mint_registry, mint_ledger](
                 const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256
             {
                 if (in.ref_hash.IsNull()) {
@@ -1794,6 +1828,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 LOG_INFO << "[MINT] share " << minted.GetHex().substr(0, 16)
                          << " minted onto the sharechain (prev="
                          << in.prev_share_hash.GetHex().substr(0, 16) << ")";
+                // Display-only: remember what we minted so the best-share-changed
+                // leg below can tell us later whether it stayed on the best chain
+                // (see local_mint_ledger.hpp). Never gates the mint.
+                mint_ledger->record_mint(minted);
                 return minted;
             });
 
@@ -1818,15 +1856,56 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     guard->chain, mint_params, prev_share_hash, block_bits);
             });
 
-        // New best share -> stratum work refresh (sessions re-notify) AND a
+        // New best share -> PUSH new work to every stratum session, plus a
         // debounced dashboard work refresh, so /api tip + graphs move on the
         // real tip-change event (main_ltc.cpp:2768) rather than a poll timer.
+        //
+        // The notify_all() leg is the fix for the sibling/orphan defect: this
+        // callback used to only bump_work_generation(), which INVALIDATES the
+        // served payload but pushes nothing. Connected rigs therefore kept
+        // hashing the previous prev_share_hash until their per-session
+        // keepalive timer fired (StratumConfig::keepalive_notify_sec = 25 s,
+        // work_source.cpp; stratum_server.cpp idle-timer leg), and because the
+        // producer job_cache is keyed (prev_share_hash, payout_script) every
+        // solve in that window rebuilt the SAME frozen job -> a fan of siblings
+        // at one sharechain height instead of a linear chain. notify_all()
+        // issues send_notify_work(force_clean=true), i.e. clean_jobs=true, so
+        // the miner switches to the new prev_share immediately (p2pool
+        // behaviour) -- exactly what the coin-tip legs below already do
+        // (set_on_state_dirty, the coin-P2P tip leg, and fire_refresh).
+        //
+        // stratum_server is captured BY REFERENCE (the sibling lambda's style):
+        // the acceptor is constructed further down, and stays null under
+        // --stratum-port 0. fire_share_tip_refresh null-guards every leg.
+        //
+        // Reward-safety: a tip change means a NEW prev_share_hash -> a new
+        // job_cache key -> a fresh build_producer_job. No existing share's
+        // committed bytes are touched; we only stop re-serving a stale job.
         {
             core::WebServer* web = web_server.get();   // may be null (dashboard off)
             p2p_node.set_on_best_share_changed(
-                [ws = work_source.get(), web]() {
-                    ws->bump_work_generation();
-                    if (web) web->trigger_work_refresh_debounced();
+                [ws = work_source.get(), web, &stratum_server, node_ptr,
+                 mint_ledger]() {
+                    dash::stratum::fire_share_tip_refresh(
+                        ws, stratum_server.get(), web);
+
+                    // Display-only: settle the local-mint orphan gauge against
+                    // the new best chain. Runs AFTER the notify (miners first)
+                    // and on a try-lock read guard, so a busy tracker simply
+                    // defers the verdict to the next tip change.
+                    if (mint_ledger->pending_count() > 0) {
+                        auto guard = node_ptr->read_tracker();
+                        if (guard) {
+                            const uint256 best = node_ptr->snapshot_best_share();
+                            auto& chain = guard->chain;
+                            mint_ledger->settle(
+                                [&chain, &best](const uint256& h) {
+                                    return dash::mint::classify_local_mint(
+                                        chain, best, h,
+                                        dash::mint::LocalMintLedger::kSettleDepth);
+                                });
+                        }
+                    }
                 });
         }
 

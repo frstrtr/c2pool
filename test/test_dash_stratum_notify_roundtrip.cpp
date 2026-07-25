@@ -41,11 +41,14 @@
 
 #include <cstddef>
 #include <cstring>
+#include <map>
 #include <span>
 #include <string>
 #include <vector>
 
 #include <impl/dash/coinbase_builder.hpp>  // merkle_branches_raw, sha256d, EXTRANONCE2_SIZE
+#include <impl/dash/stratum/tip_refresh.hpp>   // fire_share_tip_refresh (tip-change fan-out)
+#include <impl/dash/local_mint_ledger.hpp>     // LocalMintLedger / classify_local_mint
 #include <btclibs/util/strencodings.h>     // HexStr
 #include <core/uint256.hpp>
 
@@ -225,4 +228,240 @@ TEST(DashStratumNotifyRoundtrip, GoldenAnchors) {
     EXPECT_EQ(coinbase_hash(E2_A).GetHex(),    GOLD_CBHASH_A);
     EXPECT_EQ(coinbase_hash(E2_B).GetHex(),    GOLD_CBHASH_B);
     EXPECT_EQ(merkle_branches_raw(leaves_with(coinbase_hash(E2_ZERO)))[1].GetHex(), GOLD_BRANCH1);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Sharechain tip-change -> stratum PUSH fan-out, and the local-mint gauge.
+//
+// Same file/target as the notify wire-contract KATs above (allowlisted), one
+// step upstream: WHEN does a notify get pushed at all. The production defect
+// these pin: the sharechain best-share-changed callback only invalidated the
+// served payload (bump_work_generation) and never called notify_all(), so rigs
+// kept hashing the previous prev_share_hash until the 25 s keepalive timer
+// fired. The producer job_cache is keyed (prev_share_hash, payout_script), so
+// every solve inside that window rebuilt the SAME frozen job -> siblings at one
+// sharechain height (measured 4.13 shares/height, ~76% orphan) instead of a
+// linear chain.
+//
+// (a) fire_share_tip_refresh (src/impl/dash/stratum/tip_refresh.hpp) is the
+//     REAL fan-out the run loop binds -- these run the landed code, not a copy.
+// (b) LocalMintLedger/classify_local_mint (src/impl/dash/local_mint_ledger.hpp)
+//     is the display-only gauge that makes the failure visible: of the shares
+//     WE minted, how many are still on the best chain. Consensus-invisible.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// ── Fan-out spies ────────────────────────────────────────────────────────────
+struct SpyLog { std::vector<std::string> calls; };
+
+struct SpyWorkSource {
+    SpyLog* log; int bumps = 0;
+    void bump_work_generation() { ++bumps; log->calls.push_back("bump"); }
+};
+struct SpyStratumServer {
+    SpyLog* log; int notifies = 0;
+    void notify_all() { ++notifies; log->calls.push_back("notify"); }
+};
+struct SpyWebServer {
+    SpyLog* log; int refreshes = 0;
+    void trigger_work_refresh_debounced() { ++refreshes; log->calls.push_back("web"); }
+};
+
+// ── Fake sharechain: the three primitives classify_local_mint uses ───────────
+class FakeChain {
+public:
+    void add(const uint256& hash, const uint256& parent, int32_t height) {
+        m_parent[hash] = parent;
+        m_height[hash] = height;
+    }
+    bool contains(const uint256& h) const { return m_height.count(h) != 0; }
+    int32_t get_acc_height(const uint256& h) {
+        auto it = m_height.find(h);
+        return it == m_height.end() ? 0 : it->second;
+    }
+    uint256 get_nth_parent_via_skip(const uint256& h, int32_t n) const {
+        uint256 cur = h;
+        for (int32_t i = 0; i < n; ++i) {
+            auto it = m_parent.find(cur);
+            if (it == m_parent.end()) return uint256();
+            cur = it->second;
+        }
+        return cur;
+    }
+private:
+    std::map<uint256, uint256> m_parent;
+    std::map<uint256, int32_t> m_height;
+};
+
+// A linear chain h1..h6 (heights 1..6) plus one SIBLING of h4 (same parent h3).
+// h1 is the root; sibling shares h4's parent and height but not the best chain.
+struct SiblingFixture {
+    FakeChain chain;
+    uint256 h[7];
+    uint256 sibling;
+    SiblingFixture() {
+        for (int i = 1; i <= 6; ++i) h[i] = fill_hash(static_cast<unsigned char>(0x10 + i));
+        chain.add(h[1], uint256(), 1);
+        for (int i = 2; i <= 6; ++i) chain.add(h[i], h[i - 1], i);
+        sibling = fill_hash(0xAB);
+        chain.add(sibling, h[3], 4);            // same height as h4, off the best chain
+    }
+};
+
+} // namespace
+
+// (8) THE REGRESSION PIN: a sharechain tip change must PUSH work to the miners,
+//     not merely invalidate the cached payload. bump-only is the defect.
+TEST(DashSharechainTipRefresh, TipChangePushesNotifyToMiners) {
+    SpyLog log;
+    SpyWorkSource ws{&log};
+    SpyStratumServer ss{&log};
+    SpyWebServer web{&log};
+
+    dash::stratum::fire_share_tip_refresh(&ws, &ss, &web);
+
+    EXPECT_EQ(ws.bumps, 1);
+    EXPECT_EQ(ss.notifies, 1) << "sharechain tip change did not push mining.notify "
+                                 "-- rigs keep the stale prev_share_hash job";
+    EXPECT_EQ(web.refreshes, 1);
+    // Order matters: invalidate the payload BEFORE pushing, so the notify a
+    // session builds is sourced from the new tip, and notify the miners BEFORE
+    // the dashboard (miners first).
+    ASSERT_EQ(log.calls.size(), 3u);
+    EXPECT_EQ(log.calls[0], "bump");
+    EXPECT_EQ(log.calls[1], "notify");
+    EXPECT_EQ(log.calls[2], "web");
+}
+
+// (9) Every leg is independently optional: --stratum-port 0 (no acceptor) and
+//     the dashboard-off build must not fault, and must not lose the bump.
+TEST(DashSharechainTipRefresh, LegsAreNullTolerant) {
+    SpyLog log;
+    SpyWorkSource ws{&log};
+    SpyStratumServer ss{&log};
+
+    dash::stratum::fire_share_tip_refresh(&ws, static_cast<SpyStratumServer*>(nullptr),
+                                          static_cast<SpyWebServer*>(nullptr));
+    EXPECT_EQ(ws.bumps, 1);
+    EXPECT_EQ(ss.notifies, 0);
+
+    dash::stratum::fire_share_tip_refresh(static_cast<SpyWorkSource*>(nullptr), &ss,
+                                          static_cast<SpyWebServer*>(nullptr));
+    EXPECT_EQ(ws.bumps, 1);
+    EXPECT_EQ(ss.notifies, 1);
+}
+
+// (10) One notify per tip change -- N tip changes push N times (the keepalive
+//      timer is a SAFETY net, never the work-delivery mechanism).
+TEST(DashSharechainTipRefresh, OneNotifyPerTipChange) {
+    SpyLog log;
+    SpyWorkSource ws{&log};
+    SpyStratumServer ss{&log};
+    SpyWebServer web{&log};
+    for (int i = 0; i < 7; ++i)
+        dash::stratum::fire_share_tip_refresh(&ws, &ss, &web);
+    EXPECT_EQ(ss.notifies, 7);
+    EXPECT_EQ(ws.bumps, 7);
+}
+
+// (11) Gauge: a mint that is still an ancestor of the best share is on-chain;
+//      a sibling at the same height is not. This is the number that was 0.
+TEST(DashLocalMintLedger, ClassifiesOnChainVsSibling) {
+    SiblingFixture f;
+    const int32_t depth = dash::mint::LocalMintLedger::kSettleDepth;   // 3
+
+    // best = h6 -> h3 is buried 3 deep: settled, on-chain.
+    EXPECT_EQ(dash::mint::classify_local_mint(f.chain, f.h[6], f.h[3], depth),
+              dash::mint::MintVerdict::on_chain);
+    // The sibling of h4 is buried 2 deep at best=h6 -> still pending...
+    EXPECT_EQ(dash::mint::classify_local_mint(f.chain, f.h[6], f.sibling, depth),
+              dash::mint::MintVerdict::pending);
+    // ...and h4 itself is likewise pending at that depth (symmetry check).
+    EXPECT_EQ(dash::mint::classify_local_mint(f.chain, f.h[6], f.h[4], depth),
+              dash::mint::MintVerdict::pending);
+
+    // Grow the chain to h7/h8 so the height-4 pair settles: h4 on-chain,
+    // its sibling off-chain (an orphan that earns nothing).
+    uint256 h7 = fill_hash(0x21), h8 = fill_hash(0x22);
+    f.chain.add(h7, f.h[6], 7);
+    f.chain.add(h8, h7, 8);
+    EXPECT_EQ(dash::mint::classify_local_mint(f.chain, h8, f.h[4], depth),
+              dash::mint::MintVerdict::on_chain);
+    EXPECT_EQ(dash::mint::classify_local_mint(f.chain, h8, f.sibling, depth),
+              dash::mint::MintVerdict::off_chain);
+}
+
+// (12) Unknowables never inflate the rate: a hash the tracker no longer holds
+//      settles as `gone`, and a null best share stays pending.
+TEST(DashLocalMintLedger, PrunedAndUnknownAreNotCountedAsOrphans) {
+    SiblingFixture f;
+    const int32_t depth = dash::mint::LocalMintLedger::kSettleDepth;
+    EXPECT_EQ(dash::mint::classify_local_mint(f.chain, f.h[6], fill_hash(0x77), depth),
+              dash::mint::MintVerdict::gone);
+    EXPECT_EQ(dash::mint::classify_local_mint(f.chain, uint256(), f.h[1], depth),
+              dash::mint::MintVerdict::pending);
+}
+
+// (13) End-to-end gauge: mint 2 winners + 2 siblings, settle against the best
+//      chain, read the rate. 50% here; the live node measured ~76%.
+TEST(DashLocalMintLedger, SettlesAndReportsOrphanRate) {
+    SiblingFixture f;
+    uint256 sib2 = fill_hash(0xCD);
+    f.chain.add(sib2, f.h[1], 2);          // sibling of h2
+
+    dash::mint::LocalMintLedger ledger;
+    ledger.record_mint(f.h[2]);
+    ledger.record_mint(sib2);
+    ledger.record_mint(f.h[3]);
+    ledger.record_mint(f.sibling);         // sibling of h4
+
+    EXPECT_EQ(ledger.stats().minted, 4u);
+    EXPECT_EQ(ledger.stats().pending, 4u);
+
+    auto settle_against = [&](const uint256& best) {
+        ledger.settle([&](const uint256& h) {
+            return dash::mint::classify_local_mint(
+                f.chain, best, h, dash::mint::LocalMintLedger::kSettleDepth);
+        });
+    };
+
+    // best = h6: heights 2 and 3 are deep enough; height 4 is not.
+    settle_against(f.h[6]);
+    auto s = ledger.stats();
+    EXPECT_EQ(s.on_chain, 2u);             // h2, h3
+    EXPECT_EQ(s.orphaned, 1u);             // sib2
+    EXPECT_EQ(s.pending,  1u);             // f.sibling — still too shallow
+    EXPECT_DOUBLE_EQ(s.orphan_rate, 1.0 / 3.0);
+
+    // Chain grows two more: the height-4 sibling now settles as an orphan.
+    uint256 h7 = fill_hash(0x21), h8 = fill_hash(0x22);
+    f.chain.add(h7, f.h[6], 7);
+    f.chain.add(h8, h7, 8);
+    settle_against(h8);
+    s = ledger.stats();
+    EXPECT_EQ(s.minted,   4u);
+    EXPECT_EQ(s.on_chain, 2u);
+    EXPECT_EQ(s.orphaned, 2u);
+    EXPECT_EQ(s.pending,  0u);
+    EXPECT_DOUBLE_EQ(s.orphan_rate, 0.5);
+}
+
+// (14) The gauge is bounded and cheap: the un-settled set can never grow past
+//      kMaxPending, and evictions are accounted (never silently lost).
+TEST(DashLocalMintLedger, PendingSetIsBounded) {
+    dash::mint::LocalMintLedger ledger;
+    const std::size_t over = dash::mint::LocalMintLedger::kMaxPending + 10;
+    for (std::size_t i = 0; i < over; ++i) {
+        std::vector<unsigned char> raw(32, 0);
+        raw[0] = static_cast<unsigned char>(i & 0xff);
+        raw[1] = static_cast<unsigned char>((i >> 8) & 0xff);
+        raw[2] = 0x01;             // never the null hash (record_mint ignores null)
+        ledger.record_mint(uint256(raw));
+    }
+    auto s = ledger.stats();
+    EXPECT_EQ(s.minted,  static_cast<uint64_t>(over));
+    EXPECT_EQ(s.pending, static_cast<uint64_t>(dash::mint::LocalMintLedger::kMaxPending));
+    EXPECT_EQ(s.dropped, 10u);
+    EXPECT_DOUBLE_EQ(s.orphan_rate, 0.0);   // nothing settled -> no rate invented
 }
