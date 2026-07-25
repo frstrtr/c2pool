@@ -465,9 +465,9 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
     return {ref_hash, nonce};
 }
 
-// Thread-local state from share_init_verify — read by attempt_verify() without re-computing scrypt.
+// Thread-local state from share_init_verify — read by attempt_verify() without re-computing the SHA256d PoW.
 inline thread_local bool g_last_init_is_block = false;
-inline thread_local uint256 g_last_pow_hash;  // scrypt hash of the share header
+inline thread_local uint256 g_last_pow_hash;  // SHA256d hash of the share header
 
 // ============================================================================
 // share_init_verify()
