@@ -345,6 +345,24 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
             peer->write(std::move(addrme_msg));
         }
 
+        // Canonical p2p.py:276 — one FULL have_tx as soon as the handshake
+        // completes, so the peer's view of our tx pool starts correct (and its
+        // dashboard stops showing us as txpool = 0). Subsequent sweeps send
+        // deltas only. Advert-only; no consensus/mint state touched.
+        //
+        // ORDERING IS LOAD-BEARING: this is the LARGEST write the handshake
+        // issues (up to TX_ADVERT_MAX_HASHES_PER_MESSAGE hashes, ~32 KB) and it
+        // goes LAST, after the tiny getaddrs/addrme (and any sharereq) above.
+        // core::Socket::write starts a composed async_write with no outbound
+        // queue (core/socket.cpp:110-137), so initiating another write while one
+        // is still draining interleaves bytes mid-message and gets us dropped on
+        // a bad checksum. Going last means NOTHING follows it in this handler;
+        // the ~32 KB advert may well take several write_some rounds, which is
+        // harmless precisely because nothing else is queued behind it, and the
+        // per-peer min-emit interval keeps the next timer sweep from landing on
+        // top of it. See core/tx_advertiser.hpp.
+        advertise_known_txs(peer);
+
         return pool::PeerConnectionType::legacy;
 }
 
@@ -1289,6 +1307,17 @@ void NodeImpl::shutdown()
 
 void NodeImpl::start_outbound_connections()
 {
+    // ── have_tx / losing_tx delta sweep ──────────────────────────────────
+    // Started BEFORE the outbound-dialing early-return below: a node with
+    // outbound dialing disabled still accepts inbound peers and must still
+    // advertise its tx pool to them. Advert-only, no consensus state.
+    if (m_context)
+    {
+        m_tx_advert_timer = std::make_unique<core::Timer>(m_context, true);
+        m_tx_advert_timer->start(core::TX_ADVERT_INTERVAL_SECONDS,
+                                 [this]() { advertise_known_txs(); });
+    }
+
     if (m_target_outbound_peers == 0)
     {
         LOG_INFO << "Outbound peer dialing disabled (target=0)";

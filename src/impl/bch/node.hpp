@@ -34,6 +34,7 @@
 #include <pool/sharechain_node.hpp>
 #include <pool/protocol.hpp>
 #include <core/message.hpp>
+#include <core/tx_advertiser.hpp>
 #include <core/reply_matcher.hpp>
 #include <core/known_txs_eviction.hpp>
 #include <sharechain/prepared_list.hpp>
@@ -644,6 +645,77 @@ public:
     /// Maintains target outbound peer count active outbound connections.
     void start_outbound_connections();
 
+    // ── have_tx / losing_tx advertisement (SEND side) ─────────────────────
+    // c2pool was RECEIVE-ONLY for the p2pool tx-pool advertisement: the
+    // protocol handlers ingest a peer's have_tx/losing_tx into
+    // Peer::m_remote_txs, but we never advertised our OWN known-tx set. Every
+    // canonical p2pool dashboard therefore rendered this node with txpool = 0
+    // (real p2pool peers report 12k-16k), and peers could not tell which txs we
+    // already hold, so remember_tx forwarded whole tx bodies needlessly.
+    //
+    // Canonical (p2pool python, p2pool/p2p.py): ONE full have_tx immediately
+    // after the version handshake (p2p.py:276), then pure deltas off the
+    // known_txs_var change events — added -> send_have_tx (p2p.py:243-248),
+    // removed -> send_losing_tx (p2p.py:250-259), transitioned -> both in that
+    // order (p2p.py:261-274). c2pool has no reactive variable, so
+    // Peer::m_tx_advert reconstructs the per-peer view and each sweep emits the
+    // diff; the sweep cadence mirrors node.py:298's 10s forget_old_txs loop.
+    // See core/tx_advertiser.hpp for the full derivation and the wire bound.
+    //
+    // Header-inline to match the DASH lane (whose handle_version vtable body
+    // must stay link-free for the rig-free KAT targets); this touches only
+    // header-only message types plus peer->write.
+    //
+    // REWARD-SAFETY: tx hashes only. No consensus, share validation, subsidy,
+    // coinbase, payee or won-block state is read or written here.
+    void advertise_known_txs(peer_ptr only_peer = nullptr)
+    {
+        // m_known_txs is mutated by the COMPUTE thread inside prune_shares()
+        // (core::evict_known_txs_to_cap) under the exclusive tracker lock. This
+        // runs on the IO thread, so take the same NON-BLOCKING shared lock the
+        // other IO-thread readers use (the #828 freed-memory GP-fault class)
+        // and simply skip if the compute thread is mid-cycle — the next sweep
+        // carries the identical delta 10s later.
+        std::set<uint256> current;
+        {
+            std::shared_lock<std::shared_mutex> lk(m_tracker_mutex, std::try_to_lock);
+            if (!lk.owns_lock())
+                return;
+            for (const auto& entry : m_known_txs)
+                current.insert(entry.first);
+        }
+
+        // One clock reading for the whole sweep: run_tx_advert uses it both to
+        // apply the per-peer min-emit interval (never two writes in flight on
+        // one socket) and to stamp the peer after a send. IO-thread-local, so
+        // Peer::m_tx_advert needs no locking.
+        const auto now = std::chrono::steady_clock::now();
+
+        auto advertise_one = [&current, now](const peer_ptr& p)
+        {
+            if (!p)
+                return;
+            core::run_tx_advert(
+                p->m_tx_advert, current,
+                [&p](const std::vector<uint256>& hashes)
+                { p->write(bch::message_have_tx::make_raw(hashes)); },
+                [&p](const std::vector<uint256>& hashes)
+                { p->write(bch::message_losing_tx::make_raw(hashes)); },
+                core::TX_ADVERT_MAX_HASHES_PER_MESSAGE, now);
+        };
+
+        if (only_peer)
+        {
+            advertise_one(only_peer);
+            return;
+        }
+        // m_peers is IO-thread-owned and mutated only on this thread
+        // (handle_version insert / error() erase), so plain iteration is safe.
+        for (auto& entry : m_peers)
+            advertise_one(entry.second);
+    }
+
+
     /// Set desired number of outbound peers maintained by connection loop.
     /// A value of 0 disables outbound dialing.
     void set_target_outbound_peers(size_t count) { m_target_outbound_peers = count; }
@@ -796,6 +868,9 @@ protected:
     size_t m_max_peers = 30;
     size_t m_target_outbound_peers = DEFAULT_TARGET_OUTBOUND_PEERS;
     std::unique_ptr<core::Timer> m_connect_timer;
+    // Periodic have_tx/losing_tx delta sweep (core/tx_advertiser.hpp). Cadence
+    // mirrors the canonical known-tx removal loop, node.py:298 t.start(10).
+    std::unique_ptr<core::Timer> m_tx_advert_timer;
     std::unique_ptr<core::Timer> m_readvert_timer; // one-shot ROOT-2 re-advert
     std::set<NetService> m_pending_outbound;   // addresses currently being dialed
     std::set<NetService> m_outbound_addrs;     // successfully connected outbound peers
