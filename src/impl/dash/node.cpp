@@ -2,6 +2,7 @@
 #include "node.hpp"
 #include "share.hpp"
 #include "mint_runloop.hpp"   // dash::mint::elect_best_share (election policy SSOT)
+#include "known_txs_retention.hpp"  // dash::retain_template_txs / all_txs_backable (F1/F3)
 
 #include <core/uint256.hpp>
 #include <core/common.hpp>
@@ -1140,27 +1141,43 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
     if (!m_chain->contains(share_hash))
         return;
 
-    // Walk back up to 5 shares, collecting the not-yet-broadcast ones.
+    // Walk back up to 5 shares, collecting the not-yet-broadcast ones. code
+    // review F2: do NOT mark them shared here — the tx-completeness gate in
+    // send_shares can skip a share for ALL peers (unbacked now, or zero peers),
+    // and marking before the send would leave a skipped chain TIP permanently
+    // "already shared" and never re-pushed → silent PPLNS-credit loss. We mark
+    // only what actually reached >= 1 peer, below.
     std::vector<uint256> to_send;
     int32_t height = m_chain->get_height(share_hash);
     int32_t walk = std::min(height, 5);
     for (auto [hash, data] : m_chain->get_chain(share_hash, walk)) {
         if (m_shared_share_hashes.count(hash))
             break;
-        m_shared_share_hashes.insert(hash);
         to_send.push_back(hash);
     }
     if (to_send.empty())
         return;
 
-    for (auto& [nonce, peer] : m_peers)
-        send_shares(peer, to_send);
+    std::set<uint256> actually_sent;
+    for (auto& [nonce, peer] : m_peers) {
+        auto sent = send_shares(peer, to_send);
+        actually_sent.insert(sent.begin(), sent.end());
+    }
+    // Mark ONLY shares that reached a peer; anything skipped for every peer (or
+    // with no peers connected) stays un-marked and is retried on the next
+    // broadcast — once its txs are retained or a peer appears.
+    for (const auto& h : actually_sent)
+        m_shared_share_hashes.insert(h);
 }
 
-void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hashes)
+std::vector<uint256> NodeImpl::send_shares(peer_ptr peer,
+                                           const std::vector<uint256>& share_hashes)
 {
     // Caller (broadcast_share) already holds a shared tracker lock; this
     // method only READS chain + m_known_txs and writes to the peer socket.
+    // Returns the hashes of the shares actually SENT to this peer (F2): the
+    // caller marks only those as broadcast, so a share skipped for all peers is
+    // retried rather than silently withheld.
     std::vector<ShareType> shares;
     for (const auto& hash : share_hashes) {
         if (!m_chain->contains(hash))
@@ -1171,7 +1188,58 @@ void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hash
         }
     }
     if (shares.empty())
-        return;
+        return {};
+
+    // ── Tx-completeness gate (canonical p2pool p2p.py:404 parity) ───────────
+    // A v13+ share references its new transactions by hash
+    // (new_transaction_hashes); a canonical peer that cannot resolve those txs
+    // DISCONNECTS us with "referenced unknown transaction" (p2p.py:403-404,
+    // handle_shares / handle_remember_tx). We re-announce the best chain's head
+    // and up to 5 ancestors (ROOT-2 re-announce, broadcast_share), and shares
+    // pulled via sharereply arrive WITHOUT their txs (the reply carries no tx
+    // bytes), so their tx bytes are absent from m_known_txs. Sending such a
+    // share unbacked is exactly what makes the public canonical seeds drop the
+    // connection ~300ms after handshake — the isolation root cause.
+    //
+    // So only broadcast a share when we HOLD the bytes of EVERY referenced new
+    // tx (m_known_txs), so remember_tx below can always forward them. code
+    // review F3: gating on m_remote_txs (the peer's have_tx advert) alone is
+    // weaker than canonical — that advert can be stale (the peer may have dropped
+    // the tx), and sending hash-only for a tx the peer no longer holds is exactly
+    // the disconnect. Requiring the bytes is the canonical invariant
+    // (sendShares broadcasts only txs in known_txs); m_remote_txs is used ONLY
+    // below to choose hash-vs-bytes encoding. Skipping the rest costs no
+    // propagation — a downloaded share is by definition already on the network we
+    // fetched it from, and our own minted shares are backable by construction
+    // (add_local_share declines a solve whose txs are not retained).
+    {
+        std::vector<ShareType> sendable;
+        sendable.reserve(shares.size());
+        size_t skipped_incomplete = 0;
+        for (auto& share : shares) {
+            bool backable = true;
+            share.invoke([&](auto* obj) {
+                backable = dash::all_txs_backable(obj->m_new_transaction_hashes,
+                                                  m_known_txs);
+            });
+            if (backable)
+                sendable.push_back(std::move(share));
+            else
+                ++skipped_incomplete;
+        }
+        if (skipped_incomplete > 0) {
+            static int skip_log = 0;
+            if (skip_log++ % 20 == 0)
+                LOG_INFO << "[send_shares] skipped " << skipped_incomplete
+                         << " share(s) whose new-tx bytes we do not hold "
+                            "(downloaded via sharereply / template-evicted) to "
+                         << peer->addr().to_string()
+                         << " — avoids canonical 'unknown transaction' disconnect";
+        }
+        if (sendable.empty())
+            return {};
+        shares.swap(sendable);
+    }
 
     // Forward the txs the peer needs BEFORE the shares (p2pool remember_tx
     // protocol) — a share referencing unknown txs makes the receiving oracle
@@ -1225,6 +1293,14 @@ void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hash
 
     LOG_INFO << "[Pool] Sent " << shares.size() << " share(s) (+"
              << needed_txs.size() << " tx refs) to " << peer->addr().to_string();
+
+    // F2: report exactly which shares reached this peer so the caller marks only
+    // those broadcast (a share skipped for all peers stays un-marked → retried).
+    std::vector<uint256> sent;
+    sent.reserve(shares.size());
+    for (auto& share : shares)
+        sent.push_back(share.hash());
+    return sent;
 }
 
 uint256 NodeImpl::add_local_share(ShareType share)
@@ -1246,6 +1322,31 @@ uint256 NodeImpl::add_local_share(ShareType share)
         if (m_chain->contains(hash)) {
             LOG_WARNING << "[MINT] duplicate local share " << hash.GetHex().substr(0, 16);
             return uint256::ZERO;
+        }
+
+        // F1-sub (by-construction backability): DECLINE a solve whose template
+        // txs are no longer retained in m_known_txs, rather than mint a share
+        // send_shares would then have to withhold. FrozenJobRegistry
+        // (mint_runloop.hpp) is a FIFO cap-512 with NO TTL and re-put refreshes,
+        // so a solve can arrive from an arbitrarily-old job — no finite retention
+        // window is a provable bound, so the only by-construction guarantee is to
+        // fail closed here: every share we add is fully forwardable. The miner
+        // keeps the pseudoshare credit; the next solve on a fresh job mints. The
+        // deduped rolling template window (register_template_txs) keeps declines
+        // rare — this fires only for genuinely stale solves past the window.
+        {
+            bool backable = true;
+            share.invoke([&](auto* obj) {
+                backable = dash::all_txs_backable(obj->m_new_transaction_hashes,
+                                                  m_known_txs);
+            });
+            if (!backable) {
+                LOG_WARNING << "[MINT] local share " << hash.GetHex().substr(0, 16)
+                            << " references template tx(s) no longer retained — "
+                               "declined (stale job past retention window; retry "
+                               "on next solve)";
+                return uint256::ZERO;
+            }
         }
 
         m_tracker.add(share);
@@ -1274,17 +1375,22 @@ void NodeImpl::register_template_txs(const std::vector<coin::Transaction>& txs,
                     << " hashes=" << hashes.size() << " — skipped";
         return;
     }
-    // Drop the PREVIOUS template's leftovers that the new template no longer
-    // carries, then insert the new set — m_known_txs stays bounded by one
-    // template (plus reception-protocol remembered txs, which are peer-scoped).
-    std::set<uint256> new_set(hashes.begin(), hashes.end());
-    for (const auto& old_hash : m_template_tx_hashes) {
-        if (!new_set.count(old_hash))
-            m_known_txs.erase(old_hash);
-    }
-    for (size_t i = 0; i < txs.size(); ++i)
-        m_known_txs.insert_or_assign(hashes[i], txs[i]);
-    m_template_tx_hashes = std::move(new_set);
+    // Retain a rolling window of the last RETAINED_TEMPLATE_TX_SETS DISTINCT
+    // templates; a tx leaves m_known_txs only once it has fallen out of EVERY
+    // retained set — so a share minted on any recent job (the miner may solve a
+    // job whose template has since rotated) and a ROOT-2 re-announce a few
+    // rotations later can still forward the referenced tx bytes via remember_tx.
+    //
+    // code review F1: register_template_txs is called per producer-job cache
+    // MISS = per (prev_share_hash, payout_script) (main_dash.cpp:1539, key
+    // :1450), NOT per template rotation. A ~50-payout-script cluster re-registers
+    // the SAME template ~50 times on one tip, so pushing each unconditionally
+    // would collapse the window to a single template. retain_template_txs()
+    // dedups by TEMPLATE IDENTITY (the tx-hash set): a set already retained just
+    // refreshes recency and consumes no slot, so the window holds N DISTINCT
+    // templates (≈ minutes of stale-solve coverage), not N re-registrations.
+    dash::retain_template_txs(m_recent_template_tx_sets, m_known_txs,
+                              hashes, txs, RETAINED_TEMPLATE_TX_SETS);
 }
 
 } // namespace dash
