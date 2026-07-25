@@ -146,6 +146,18 @@ protected:
     boost::asio::thread_pool m_think_pool{1};
     std::atomic<bool> m_think_running{false};
     std::atomic<bool> m_clean_running{false};
+    // #854: a run_think() request that arrives while a cycle is already in
+    // flight used to be DROPPED. It is reachable on the hot path — a local
+    // mint (add_local_share) or a peer best-advert drain landing during a
+    // think/clean IO-phase, when the tracker lock is already released but
+    // m_think_running is still true — and the dropped election is the tip
+    // change that never reaches the rigs. Set by dash::think::
+    // acquire_think_slot() when the slot is busy, consumed by
+    // dash::think::release_think_slot() at the end of the running cycle,
+    // which then re-posts run_think(). Both flags are IO-thread-only (single
+    // ioc.run() thread in main_dash); the compute thread never touches them.
+    // Protocol + rationale: src/impl/dash/think_gate.hpp.
+    std::atomic<bool> m_rethink_pending{false};
     mutable std::shared_mutex m_tracker_mutex;
 
     // ── Lock-free stats snapshot ─────────────────────────────────────────
