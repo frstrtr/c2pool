@@ -305,12 +305,6 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
         m_peers[peer->m_nonce] = peer;
         publish_peer_info_snapshot();   // IO thread: refresh the display snapshot
 
-        // Canonical p2p.py:276 — one FULL have_tx as soon as the handshake
-        // completes, so the peer's view of our tx pool starts correct (and its
-        // dashboard stops showing us as txpool = 0). Subsequent sweeps send
-        // deltas only. Advert-only; no consensus/mint state touched.
-        advertise_known_txs(peer);
-
         // Request peers from the newly established connection
         {
             auto getaddrs_msg = btc::message_getaddrs::make_raw(8);
@@ -350,6 +344,22 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
             auto addrme_msg = btc::message_addrme::make_raw(port);
             peer->write(std::move(addrme_msg));
         }
+
+        // Canonical p2p.py:276 — one FULL have_tx as soon as the handshake
+        // completes, so the peer's view of our tx pool starts correct (and its
+        // dashboard stops showing us as txpool = 0). Subsequent sweeps send
+        // deltas only. Advert-only; no consensus/mint state touched.
+        //
+        // ORDERING IS LOAD-BEARING: this is the LARGEST write the handshake
+        // issues (up to TX_ADVERT_MAX_HASHES_PER_MESSAGE hashes, ~32 KB) and it
+        // goes LAST, after the tiny getaddrs/addrme (and any sharereq) above.
+        // core::Socket::write starts a composed async_write with no outbound
+        // queue (core/socket.cpp:110-137), so a large write that overlaps a
+        // later one would interleave bytes mid-message and get us dropped on a
+        // bad checksum. The small writes above each drain in a single
+        // write_some before this one begins issuing continuations. See
+        // core/tx_advertiser.hpp for the full write-safety rationale.
+        advertise_known_txs(peer);
 
         return pool::PeerConnectionType::legacy;
 }
