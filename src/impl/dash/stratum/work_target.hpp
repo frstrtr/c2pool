@@ -43,6 +43,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 
 #include <core/target_utils.hpp>   // chain::bits_to_target / target_to_average_attempts
 #include <core/uint256.hpp>        // uint256 / uint288
@@ -54,6 +55,18 @@ namespace dash::stratum {
 //   [1, 2**256-1]. Mirrors c2pool_refactored.cpp:4453-4458 (LTC reference).
 // `avg_attempts` is a double (hashrate*time arithmetic). Values <= 1.0 mean
 // "no meaningful cap" and yield the maximum target (2**256-1).
+//
+// SATURATION (fail-safe, not oracle-divergent): the uint64 narrowing below is
+// UNDEFINED BEHAVIOUR once avg_attempts >= 2**64, and on x86-64 it yields 0 ->
+// a "Division by zero" THROW out of the caller. Cap 1 multiplies the miner's
+// hashrate by SHARE_PERIOD/0.0167 (~1198x for DASH), so that boundary is only
+// ~1.5e16 H/s of measured local rate -- reachable by a large aggregator, and a
+// throw on the producer-job path would silently disable minting entirely
+// (work_source.cpp catches it and degrades to the non-producer coinbase).
+// Saturating the divisor at UINT64_MAX yields 2**256//2**64 - 1: a target far
+// harder than any chain band, so the subsequent clip pins it to the band's hard
+// edge -- the same answer the unbounded oracle integer would clip to. The
+// oracle's own value is only ever observable INSIDE the band.
 inline uint256 average_attempts_to_target(double avg_attempts)
 {
     uint256 max_t;
@@ -61,9 +74,16 @@ inline uint256 average_attempts_to_target(double avg_attempts)
     if (!(avg_attempts > 1.0))
         return max_t;
 
+    // 2**64 exactly, as a double: any avg_attempts at or above it cannot be
+    // narrowed to uint64. (NaN falls out through the !(>1.0) guard above.)
+    constexpr double kTwo64 = 18446744073709551616.0;
+    const uint64_t avg_u64 = (avg_attempts >= kTwo64)
+        ? std::numeric_limits<uint64_t>::max()
+        : static_cast<uint64_t>(avg_attempts);
+
     uint288 two_256;
     two_256.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
-    uint288 avg_288(static_cast<uint64_t>(avg_attempts));
+    uint288 avg_288(avg_u64);
     uint288 t_288 = two_256 / avg_288;
     if (t_288 > uint288(1))
         t_288 = t_288 - uint288(1);

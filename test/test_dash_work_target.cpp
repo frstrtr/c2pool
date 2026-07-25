@@ -42,6 +42,27 @@ TEST(DashWorkTarget, AverageAttemptsToTargetExact)
         "0000000000eb08174d325a04e29e57c52c14f6dcfc48f79979535e202dcecf3d");
 }
 
+// average_attempts_to_target SATURATES instead of invoking UB / throwing when
+// avg_attempts >= 2**64. The uint64 narrowing is undefined there and on x86-64
+// produces 0 -> "Division by zero" out of the divide. Cap 1 scales the miner's
+// hashrate by SHARE_PERIOD/0.0167 (~1198x), so the boundary is only ~1.5e16 H/s
+// of measured rate; a throw on the producer-job path would disable minting.
+// Saturating at UINT64_MAX gives 2**256//2**64 - 1 -- harder than any chain
+// band, so the band clip pins it to the edge (see the CapBand KATs).
+TEST(DashWorkTarget, AverageAttemptsToTargetSaturatesAboveU64)
+{
+    const char* SAT_HEX =
+        "0000000000000001000000000000000100000000000000010000000000000000";
+    EXPECT_EQ(average_attempts_to_target(1e20).GetHex(), SAT_HEX);
+    EXPECT_EQ(average_attempts_to_target(1e40).GetHex(), SAT_HEX);
+    // Cap 1 must not throw for any plausible (or implausible) local rate.
+    uint256 start; start.SetHex(MAX_TARGET_HEX);
+    EXPECT_NO_THROW((void)cap_pool_share(start, 1e18,
+                        dash::SharechainConfig::SHARE_PERIOD));
+    EXPECT_NO_THROW((void)cap_pool_share(start, 1e30,
+                        dash::SharechainConfig::SHARE_PERIOD));
+}
+
 // Cap 1 (pool-share, 1.67%): local_hash_rate=1e9 H/s, SHARE_PERIOD=20.
 //   avg = int(1e9 * 20 / 0.0167) = 1197604790419
 //   target = average_attempts_to_target(avg)  (same value as above)
@@ -63,6 +84,57 @@ TEST(DashWorkTarget, Cap1NoHashrateNoOp)
     uint256 start; start.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
     EXPECT_EQ(cap_pool_share(start, 0.0, dash::SharechainConfig::SHARE_PERIOD).GetHex(),
               start.GetHex());
+}
+
+// ── Cap 1 at the LIVE production operating point ────────────────────────────
+// Measured on the hotel DASH node: local_hash_rate ~= 43 TH/s, SHARE_PERIOD 20.
+//   avg    = int(43e12 * 20 / 0.0167)     = 51497005988023952
+//   target = 2**256 // avg - 1
+// Derive (python3): "%064x" % (2**256//51497005988023952 - 1)
+// The double->uint64 truncation in average_attempts_to_target is EXACTLY what
+// python's int(43e12*20/0.0167) reproduces (both are IEEE-754 doubles), so this
+// vector also pins the truncation, not just the big-int division.
+TEST(DashWorkTarget, Cap1ProductionOperatingPoint)
+{
+    uint256 start; start.SetHex(MAX_TARGET_HEX);
+    uint256 capped = cap_pool_share(start, /*local_hash_rate=*/43e12,
+                                    dash::SharechainConfig::SHARE_PERIOD);
+    EXPECT_EQ(capped.GetHex(),
+        "000000000000016635c48b2e932ea609a3b4aa32cefaa1ba023ea945da766f85");
+}
+
+// ── Cap 1 is INERT for a small miner ────────────────────────────────────────
+// The cap only ever binds once the miner exceeds 1.67% of the pool rate the
+// current share target implies. Feed cap_pool_share the pool's own share
+// target as `desired` (what the mint path effectively compares against after
+// the band clip) and check the min() leaves it untouched.
+//
+// pre_target3 pinned at share difficulty 40000 (the value observed on the live
+// node): pre3 = 0xFFFF*2**208 // 40000. Implied pool rate = ata(pre3)/20 =
+// 8.59e12 H/s, so the cap binds only above 1.67% of that = 1.43e11 H/s.
+//   100 GH/s  -> cap difficulty 27883 < 40000 -> cap target EASIER -> no-op.
+TEST(DashWorkTarget, Cap1SmallMinerInert)
+{
+    uint256 pre3;
+    pre3.SetHex("000000000001a36c8b4395810624dd2f1a9fbe76c8b4395810624dd2f1a9fbe7");
+    EXPECT_EQ(cap_pool_share(pre3, /*local_hash_rate=*/1e11,
+                             dash::SharechainConfig::SHARE_PERIOD).GetHex(),
+              pre3.GetHex());
+}
+
+// ...and it DOES bind for a miner past that threshold: 1 TH/s -> cap difficulty
+// 278834 > 40000, so the min() takes the (harder) cap target.
+//   avg = int(1e12*20/0.0167) = 1197604790419161
+// Derive (python3): "%064x" % (2**256//1197604790419161 - 1)
+TEST(DashWorkTarget, Cap1LargeMinerBinds)
+{
+    uint256 pre3;
+    pre3.SetHex("000000000001a36c8b4395810624dd2f1a9fbe76c8b4395810624dd2f1a9fbe7");
+    uint256 capped = cap_pool_share(pre3, /*local_hash_rate=*/1e12,
+                                    dash::SharechainConfig::SHARE_PERIOD);
+    EXPECT_LT(capped, pre3);
+    EXPECT_EQ(capped.GetHex(),
+        "0000000000003c2b080360d2c25f6b37738a73ba1fd9f288bd67b93cf5e4af28");
 }
 
 // Cap 2 (dust ease): block_bits=0x1b00ffff, subsidy=5e8, SPREAD=10,

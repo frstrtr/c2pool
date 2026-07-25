@@ -36,6 +36,7 @@
 #include "coinbase_builder.hpp"        // push_bip34_height (BIP34 scriptSig SSOT)
 #include "coin/rpc_data.hpp"           // dash::coin::DashWorkData
 #include "stratum/work_source.hpp"     // DASHWorkSource::{MintShareInputs, ProducerJob, PplnsWeights}
+#include "stratum/work_target.hpp"     // dash::stratum::modulate_desired_share_target (Cap 1)
 
 #include <core/coin_params.hpp>
 #include <core/target_utils.hpp>
@@ -62,16 +63,57 @@ namespace dash::mint {
 // producer walks are backward from prev_share_hash and therefore deterministic
 // even if the chain has since grown).
 //
-// desired_target policy: params.max_target. The oracle clips desired into
-// [pre_target3/30, pre_target3] (data.py:141-145), so max_target clips to
-// pre_target3 — the pool's ACTUAL current share target. Per-miner pseudoshare
-// difficulty stays a session/vardiff concern; the share target the mint gate
-// enforces is the network one.
+// desired_target policy: the ORACLE per-miner modulation (work.py:308-312),
+// Cap 1 only — the 1.67% pool-share cap:
+//
+//   desired = 2**256-1
+//   desired = min(desired, average_attempts_to_target(
+//                              local_hash_rate * SHARE_PERIOD / 0.0167))
+//   desired = min(desired, params.max_target)      <- c2pool ceiling, unchanged
+//
+// and then generate_prospective_share_info -> compute_share_target clips it
+// into the chain band [pre_target3//30, pre_target3] (data.py:141-145). The
+// band clip is applied LAST and is the ONLY thing that reaches the share's
+// committed m_bits, so a modulated desired can never leave the range canonical
+// peers' check() accepts: too easy -> pre_target3, too hard -> pre_target3//30.
+//
+// local_hash_rate == 0 (fresh start, no measured pseudoshares, non-P2PKH
+// credentials, stratum server down) degrades to "no meaningful cap": Cap 1 is
+// a no-op, desired == params.max_target, i.e. BIT-IDENTICAL to the pre-cap
+// behaviour (max_target >= pre_target3 always clips to pre_target3 -- the
+// pool's current share target).
+//
+// Cap 2 (the dust-threshold EASE, work.py:317-326) is deliberately NOT wired
+// here: it needs a pool-attempts-per-second estimate at job time and only ever
+// makes the target EASIER, i.e. it cannot mitigate the over-minting this cap
+// addresses. work_target.hpp carries it for the later port.
+//
+// Per-miner pseudoshare (vardiff) difficulty stays a session concern and is
+// untouched; the share target the mint gate enforces is the modulated one.
 struct ProducerJobBuild
 {
     dash::stratum::DASHWorkSource::ProducerJob job;   // gentx bytes + split point + ref_hash + bits
     dash::stratum::FrozenMintJob               frozen; // per-job mint context (registry payload)
 };
+
+// desired_share_target — the pre-clip desired target a producer job commits to.
+// Pure (KAT-able): oracle Cap 1 over the coin's SHARE_PERIOD, then floored by
+// the c2pool max_target ceiling so the local_hash_rate == 0 path reproduces the
+// pre-cap value EXACTLY. compute_share_target applies the [pre_target3//30,
+// pre_target3] band afterwards; nothing here can escape it.
+inline uint256 desired_share_target(const core::CoinParams& params,
+                                    double local_hash_rate)
+{
+    dash::stratum::WorkTargetInputs wt;
+    wt.local_hash_rate = local_hash_rate;
+    wt.share_period    = static_cast<uint32_t>(params.share_period);
+    wt.dust_gate       = false;   // Cap 2 not wired (see the note above)
+
+    uint256 desired = dash::stratum::modulate_desired_share_target(wt);
+    if (params.max_target < desired)
+        desired = params.max_target;
+    return desired;
+}
 
 template <typename ChainT>
 inline std::optional<ProducerJobBuild> build_producer_job(
@@ -83,7 +125,8 @@ inline std::optional<ProducerJobBuild> build_producer_job(
     uint32_t desired_timestamp,
     uint32_t share_nonce,
     uint16_t donation,
-    const std::string& pool_tag)
+    const std::string& pool_tag,
+    double local_hash_rate = 0.0)
 {
     // Miner identity: DASH sharechain payouts are P2PKH-keyed (share_data
     // pubkey_hash). Non-P2PKH -> no producer job (the caller's non-producer
@@ -125,7 +168,7 @@ inline std::optional<ProducerJobBuild> build_producer_job(
     }
     pin.desired_tx_hashes  = wd.m_tx_hashes;
     pin.desired_timestamp  = desired_timestamp;
-    pin.desired_target     = params.max_target;
+    pin.desired_target     = desired_share_target(params, local_hash_rate);
 
     auto info = dash::producer::generate_prospective_share_info(chain, params, pin);
 

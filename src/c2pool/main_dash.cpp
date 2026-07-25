@@ -101,6 +101,8 @@
 #include <impl/dash/share_messages.hpp>        // dash::unpack_share_messages — signed transitional-blob DISPLAY+VERIFY feed
 #include <core/log.hpp>
 
+#include <algorithm>    // std::copy (pool-share-cap pubkey_hash extract)
+#include <array>        // std::array<uint8_t,20> — AddrRateMap key
 #include <chrono>
 #include <ctime>
 #include <optional>
@@ -1676,7 +1678,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             std::map<ProducerJobKey, ProducerJobCacheEntry>>();
 
         work_source->set_producer_job_fn(
-            [node_ptr, mint_params, mint_registry, job_cache, fee_policy](
+            // stratum_server is captured BY REFERENCE (the sibling lambdas'
+            // established style — set_on_best_share_changed below, and
+            // set_on_state_dirty): the acceptor is constructed further down and
+            // stays null under --stratum-port 0, and it is reset BEFORE
+            // work_source unwinds, so every use is null-guarded. It supplies the
+            // per-address hashrate the 1.67% pool-share cap modulates on.
+            [node_ptr, mint_params, mint_registry, job_cache, fee_policy,
+             &stratum_server](
                 const uint256& prev_share_hash,
                 const std::vector<unsigned char>& payout_script,
                 const dash::coin::DashWorkData& wd)
@@ -1761,13 +1770,72 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                     "redistribute policy (node-owner)";
                 }
 
+                // ── Canonical 1.67% pool-share cap input (work.py:309-312) ──
+                //
+                // The measured hashrate of THIS miner, keyed on its own payout
+                // pubkey_hash — the same RateMonitor aggregation p2pool's
+                // get_local_addr_rates() feeds the cap with. Mirrors the LTC
+                // wiring (main_ltc.cpp:4504-4550, with the band clip at
+                // :4595-4597): pull the hash160 straight out of the P2PKH payout
+                // script, look it up, apply Cap 1, and hand the result to
+                // compute_share_target as the pre-clip desired target.
+                //
+                // Keyed on the MINER's script, NOT identity->payout_script: the
+                // --fee/--redistribute substitution changes whose PPLNS weight
+                // the share carries, but the work was done by this miner and the
+                // cap is a property of that work rate.
+                //
+                // Unknown rate (fresh session, no pseudoshare in the RateMonitor
+                // window, non-P2PKH credentials, --stratum-port 0) -> 0.0 -> the
+                // cap is inert and the desired target is bit-identical to the
+                // previous params.max_target behaviour.
+                //
+                // Lock note: get_local_addr_rates() takes only StratumServer's
+                // RateMonitor/cache LEAF mutexes (no sessions_mutex_, no
+                // m_work_mutex), so no new lock-order edge is introduced on the
+                // build_connection_coinbase path.
+                double local_hash_rate = 0.0;
+                if (stratum_server && payout_script.size() == 25 &&
+                    payout_script[0] == 0x76 && payout_script[1] == 0xa9 &&
+                    payout_script[2] == 0x14 && payout_script[23] == 0x88 &&
+                    payout_script[24] == 0xac)
+                {
+                    std::array<uint8_t, 20> miner_pubkey{};
+                    std::copy(payout_script.begin() + 3, payout_script.begin() + 23,
+                              miner_pubkey.begin());
+                    const auto rates = stratum_server->get_local_addr_rates();
+                    auto it = rates.find(miner_pubkey);
+                    if (it != rates.end() && it->second > 0.0)
+                        local_hash_rate = it->second;
+                }
+
                 auto built = dash::mint::build_producer_job(
                     guard->chain, mint_params, prev_share_hash,
                     identity->payout_script, wd,
                     static_cast<uint32_t>(std::time(nullptr)), share_nonce,
-                    identity->donation_u16, /*pool_tag=*/"c2pool");
+                    identity->donation_u16, /*pool_tag=*/"c2pool",
+                    local_hash_rate);
                 if (!built)
                     return std::nullopt;
+
+                {
+                    // Observability for the consensus-visible target choice:
+                    // what the cap asked for vs what the chain band allowed.
+                    static int cap_log = 0;
+                    if (cap_log++ % 50 == 0) {
+                        const uint256 desired = dash::mint::desired_share_target(
+                            mint_params, local_hash_rate);
+                        LOG_INFO << "[MINT-CAP] local_hr=" << local_hash_rate
+                                 << " H/s desired="
+                                 << desired.GetHex().substr(0, 16)
+                                 << " -> share_bits=0x" << std::hex
+                                 << built->job.share_bits << " max_bits=0x"
+                                 << built->job.share_max_bits << std::dec
+                                 << " share_diff="
+                                 << chain::target_to_difficulty(
+                                        chain::bits_to_target(built->job.share_bits));
+                    }
+                }
 
                 mint_registry->put(built->job.ref_hash, built->frozen);
                 // Template txs -> m_known_txs so share relay can serve
