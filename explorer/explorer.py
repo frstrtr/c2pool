@@ -22,7 +22,7 @@ Supported coins (profile completeness):
 
 Features:
 - Navigate blocks (latest, by height, by hash)
-- Decode coinbase scriptSig: BIP34 height, pool tags, THE state_root, AuxPoW
+- Decode coinbase scriptSig: BIP34 height, pool tags (incl. bare "c2pool"), AuxPoW
 - Decode DASH DIP3/DIP4 CbTx coinbase payload (height, MN-list / quorum roots)
 - Trace coinbase payouts (PPLNS outputs, donation, OP_RETURN ref_hash)
 - Highlight blocks found by p2pool/c2pool (via coinbase structure detection)
@@ -619,24 +619,13 @@ def decode_scriptsig(raw_hex):
         result["pool_tag"] = "UNKNOWN"
         result["components"].append({"type": "pool_tag", "value": "UNKNOWN", "offset": 0})
 
-    # THE state_root: 32 bytes after pool tag (if present)
-    # Look for 32 non-zero bytes after known tags
-    tag_end = -1
-    for tag in [b"/c2pool/", b"/P2Pool/"]:
-        idx = remaining.find(tag)
-        if idx >= 0:
-            tag_end = idx + len(tag)
-            break
-
-    if tag_end >= 0 and tag_end + 32 <= len(remaining):
-        candidate = remaining[tag_end:tag_end + 32]
-        if any(b != 0 for b in candidate):
-            result["components"].append({
-                "type": "THE state_root",
-                "value": candidate.hex(),
-                "offset": pos + tag_end,
-            })
-            result["the_state_root"] = candidate.hex()
+    # NB: c2pool does NOT write a state_root into the coinbase scriptSig.
+    # Verified against the real hotel DASH won-block 2507753 (integrator
+    # 2026-07-25): the scriptSig carries only a BARE ascii "c2pool" tag (no
+    # slashes) and NO state_root. Detecting on a slashed "/c2pool/" tag or on a
+    # scriptSig state_root both fail on real chain data. The on-chain state
+    # commitment is the DIP4 CbTx payload (merkleRootMNList / merkleRootQuorums
+    # / bestCLSignature), parsed at tx level by decode_dip4_cbtx() — not here.
 
     # Extract readable ASCII from post-AuxPoW bytes only (binary AuxPoW data
     # produces misleading ASCII fragments)
@@ -1061,11 +1050,16 @@ class ExplorerEngine:
         has_combined = any(o.get("donation_type") == "p2pool_combined" for o in outs)
         has_ref = any(o.get("type") == "p2pool_ref" for o in outs)
 
-        if has_combined or has_ref:
+        if "c2pool" in tag.lower():
+            # A bare "c2pool" scriptSig tag is the definitive c2pool signal on its
+            # own — a standalone (non-merged-mined) DASH block need not carry the
+            # combined-donation output. Flag it regardless of donation heuristics
+            # and normalize display to "/c2pool/".
             cb["is_pool_block"] = True
-            if cb.get("the_state_root") or tag in ("c2pool", "/c2pool/"):
-                cb["pool_tag"] = "/c2pool/"
-            elif "v36" in tag.lower():
+            cb["pool_tag"] = "/c2pool/"
+        elif has_combined or has_ref:
+            cb["is_pool_block"] = True
+            if "v36" in tag.lower():
                 cb["pool_tag"] = "/P2Pool v36/"
             elif "p2pool" in tag.lower():
                 cb["pool_tag"] = "/P2Pool v36/"  # combined/ref present => v36
@@ -1090,17 +1084,15 @@ class ExplorerEngine:
                 block["_parent_coinbase_decoded"] = decode_scriptsig(parent_vin[0]["coinbase"])
                 parent_vout = parent_tx.get("vout", []) if isinstance(parent_tx, dict) else []
                 block["_parent_outputs_decoded"] = decode_outputs(parent_vout, parent_addr)
-                # Propagate parent's pool tag / THE state_root to the merged block.
-                # c2pool blocks: parent coinbase carries /c2pool/ + THE state_root,
-                # but the child coinbase uses canonical /P2Pool v36/ text.
+                # Propagate the parent's pool tag to the merged block.
+                # c2pool blocks: the parent coinbase carries the bare "c2pool"
+                # tag; the child coinbase uses canonical /P2Pool v36/ text. There
+                # is NO scriptSig state_root to propagate (it does not exist).
                 ptag = block["_parent_coinbase_decoded"].get("pool_tag", "")
                 own_tag = block["_coinbase_decoded"].get("pool_tag", "")
-                pthe = block["_parent_coinbase_decoded"].get("the_state_root", "")
-                if ptag in ("c2pool", "/c2pool/") or pthe:
+                if "c2pool" in ptag.lower():
                     block["_coinbase_decoded"]["pool_tag"] = "/c2pool/"
                     block["_coinbase_decoded"]["has_auxpow"] = True
-                    if pthe:
-                        block["_coinbase_decoded"]["the_state_root"] = pthe
                 elif ptag and ptag != "UNKNOWN" and (not own_tag or own_tag == "UNKNOWN"):
                     parent_outs = block.get("_parent_outputs_decoded", [])
                     parent_has_combined = any(o.get("donation_type") == "p2pool_combined" for o in parent_outs)
@@ -1112,8 +1104,6 @@ class ExplorerEngine:
                             ptag = "P2Pool v35"
                     block["_coinbase_decoded"]["pool_tag"] = ptag
                     block["_coinbase_decoded"]["has_auxpow"] = True
-                elif pthe:
-                    block["_coinbase_decoded"]["the_state_root"] = pthe
             block["_auxpow_info"] = {
                 "parent_blockhash": auxpow.get("parentblock", "")[:64] if isinstance(auxpow.get("parentblock"), str) else "",
                 "parent_txid": parent_tx.get("txid", "") if isinstance(parent_tx, dict) else "",
