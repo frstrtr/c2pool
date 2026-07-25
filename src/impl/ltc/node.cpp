@@ -304,6 +304,12 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
         m_peers[peer->m_nonce] = peer;
         publish_peer_info_snapshot();   // IO thread: refresh the display snapshot
 
+        // Canonical p2p.py:276 — one FULL have_tx as soon as the handshake
+        // completes, so the peer's view of our tx pool starts correct (and its
+        // dashboard stops showing us as txpool = 0). Subsequent sweeps send
+        // deltas only. Advert-only; no consensus/mint state touched.
+        advertise_known_txs(peer);
+
         // Request peers from the newly established connection
         {
             auto getaddrs_msg = ltc::message_getaddrs::make_raw(8);
@@ -1317,6 +1323,17 @@ void NodeImpl::shutdown()
 
 void NodeImpl::start_outbound_connections()
 {
+    // ── have_tx / losing_tx delta sweep ──────────────────────────────────
+    // Started BEFORE the outbound-dialing early-return below: a node with
+    // outbound dialing disabled still accepts inbound peers and must still
+    // advertise its tx pool to them. Advert-only, no consensus state.
+    if (m_context)
+    {
+        m_tx_advert_timer = std::make_unique<core::Timer>(m_context, true);
+        m_tx_advert_timer->start(core::TX_ADVERT_INTERVAL_SECONDS,
+                                 [this]() { advertise_known_txs(); });
+    }
+
     if (m_target_outbound_peers == 0)
     {
         LOG_INFO << "Outbound peer dialing disabled (target=0)";
