@@ -633,6 +633,7 @@ TEST(DashSuperblock, TemplateEmitsSuperblockOutputs) {
         /*curtime*/1'700'000'100u, /*version*/0x20000000u,
         /*underfill*/nullptr, /*sml*/nullptr, /*qmgr*/nullptr,
         /*bestcl_h*/0, k_zero_cl_sig, /*credit_pool*/0,
+        /*qc_commitments*/nullptr, /*quorum_root_override*/nullptr,
         DASH_MN_RR_HEIGHT_TESTNET, /*superblock_payments*/nullptr);
 
     // Funded superblock: one payee of 5 DASH.
@@ -642,6 +643,7 @@ TEST(DashSuperblock, TemplateEmitsSuperblockOutputs) {
         0x1e0ffff0, 1'700'000'000u, 140, 19,
         1'700'000'100u, 0x20000000u,
         nullptr, nullptr, nullptr, 0, k_zero_cl_sig, 0,
+        /*qc_commitments*/nullptr, /*quorum_root_override*/nullptr,
         DASH_MN_RR_HEIGHT_TESTNET, &sched);
 
     // Coinbase value augmented by exactly the superblock total.
