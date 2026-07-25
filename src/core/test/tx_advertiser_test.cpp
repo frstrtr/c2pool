@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <set>
 #include <vector>
 
@@ -65,10 +66,30 @@ struct Wire
     }
 };
 
+// Monotonic virtual clock. Every sweep() advances it by the production sweep
+// cadence, so the per-peer min-emit interval never fires incidentally in the
+// KATs that are exercising delta logic. A fresh TxAdvertState starts at "never
+// emitted", so the clock carrying across tests is harmless. The interval guard
+// itself is driven explicitly via sweep_at().
+std::chrono::steady_clock::time_point& vclock()
+{
+    static std::chrono::steady_clock::time_point t{};
+    return t;
+}
+
 TxAdvertPlan sweep(TxAdvertState& st, const std::set<uint256>& current, Wire& w,
                    size_t cap = core::TX_ADVERT_MAX_HASHES_PER_MESSAGE)
 {
-    return run_tx_advert(st, current, w.have_fn(), w.losing_fn(), cap);
+    vclock() += std::chrono::seconds(core::TX_ADVERT_INTERVAL_SECONDS);
+    return run_tx_advert(st, current, w.have_fn(), w.losing_fn(), cap, vclock());
+}
+
+// Sweep at an explicit instant, for the min-emit-interval KATs.
+TxAdvertPlan sweep_at(TxAdvertState& st, const std::set<uint256>& current, Wire& w,
+                      std::chrono::steady_clock::time_point at,
+                      size_t cap = core::TX_ADVERT_MAX_HASHES_PER_MESSAGE)
+{
+    return run_tx_advert(st, current, w.have_fn(), w.losing_fn(), cap, at);
 }
 
 } // namespace
@@ -352,18 +373,110 @@ TEST(TxAdvertiser, ZeroBudgetEmitsNothingAndCommitsNothing)
     EXPECT_EQ(st.m_advertised, hashes(1, 5));
 }
 
-// The default per-message bound must stay inside a single write_some on a fresh
-// socket (the no-outbound-queue constraint) and inside canonical's own receiver
-// truncation (p2p.py:494) and max_payload (p2p.py:41).
+// The default per-message bound keeps the message SIZE predictable and stays
+// inside what a canonical peer will retain (p2p.py:494) and accept (p2p.py:41).
+//
+// It deliberately does NOT assert that a message fits one write_some: ~32 KB
+// needs >= 2 rounds at the Linux default tcp_wmem[1] of 16384. Safety comes from
+// exclusivity, not size — one message per sweep, nothing else written in the
+// same event, and the min-emit interval below.
 TEST(TxAdvertiser, DefaultBoundsAreWireSafe)
 {
     EXPECT_LE(core::TX_ADVERT_MAX_HASHES_PER_MESSAGE, 2000u);
-    // 32 bytes/hash + framing must stay well under a conservative 64 KB sndbuf.
-    EXPECT_LE(core::TX_ADVERT_MAX_HASHES_PER_MESSAGE * 32u + 64u, 64u * 1024u);
-    // ...and inside what a canonical peer would even retain / accept.
-    EXPECT_LE(core::TX_ADVERT_MAX_HASHES_PER_MESSAGE, 10000u);
-    EXPECT_LE(core::TX_ADVERT_MAX_HASHES_PER_MESSAGE * 32u, 3145728u);
+    // Inside what a canonical peer would even retain / accept.
+    EXPECT_LE(core::TX_ADVERT_MAX_HASHES_PER_MESSAGE, 10000u);      // p2p.py:494
+    EXPECT_LE(core::TX_ADVERT_MAX_HASHES_PER_MESSAGE * 32u, 3145728u); // p2p.py:41
+    // The min-emit interval must be a real gap, and must not exceed the sweep
+    // cadence — otherwise it would throttle steady-state adverts rather than
+    // only suppressing a sweep landing on the handshake advert.
+    EXPECT_GT(core::TX_ADVERT_MIN_EMIT_INTERVAL_SECONDS, 0);
+    EXPECT_LE(core::TX_ADVERT_MIN_EMIT_INTERVAL_SECONDS, core::TX_ADVERT_INTERVAL_SECONDS);
     EXPECT_EQ(core::TX_ADVERT_INTERVAL_SECONDS, 10);
+}
+
+// N2: one message per SWEEP is not one message IN FLIGHT. A sweep landing on top
+// of a just-sent advert (the handshake case: direct advert, then the 10 s timer
+// fires a fraction of a second later) must emit NOTHING, or core::Socket::write
+// initiates a second composed write while the first still drains and the two
+// interleave -> bad checksum -> canonical disconnect.
+TEST(TxAdvertiser, SweepWithinMinIntervalEmitsNothingAndLosesNothing)
+{
+    using namespace std::chrono;
+    const auto t0 = steady_clock::time_point{} + hours(1);
+    TxAdvertState st;
+
+    // Handshake advert: never emitted before, so it always goes out.
+    Wire w0;
+    sweep_at(st, hashes(1, 3), w0, t0);
+    ASSERT_EQ(w0.msgs.size(), 1u);
+    EXPECT_EQ(st.m_advertised, hashes(1, 3));
+    EXPECT_EQ(st.m_last_emit, t0);
+
+    // A sweep 1 s later, with NEW hashes outstanding, is suppressed entirely.
+    Wire w1;
+    auto plan = sweep_at(st, hashes(1, 6), w1, t0 + seconds(1));
+    EXPECT_TRUE(plan.empty());
+    EXPECT_TRUE(w1.msgs.empty());
+    EXPECT_EQ(st.m_advertised, hashes(1, 3));   // nothing committed
+    EXPECT_EQ(st.m_last_emit, t0);              // stamp untouched
+
+    // Still suppressed one tick before the interval elapses.
+    Wire w2;
+    sweep_at(st, hashes(1, 6), w2,
+             t0 + seconds(core::TX_ADVERT_MIN_EMIT_INTERVAL_SECONDS) - milliseconds(1));
+    EXPECT_TRUE(w2.msgs.empty());
+
+    // At the interval it goes out — and the hashes suppressed above are NOT
+    // lost, because nothing was committed for them.
+    Wire w3;
+    const auto t3 = t0 + seconds(core::TX_ADVERT_MIN_EMIT_INTERVAL_SECONDS);
+    sweep_at(st, hashes(1, 6), w3, t3);
+    ASSERT_EQ(w3.msgs.size(), 1u);
+    EXPECT_EQ(w3.msgs[0].kind, Wire::Kind::have);
+    EXPECT_EQ(std::set<uint256>(w3.msgs[0].hashes.begin(), w3.msgs[0].hashes.end()),
+              hashes(4, 6));
+    EXPECT_EQ(st.m_advertised, hashes(1, 6));
+    EXPECT_EQ(st.m_last_emit, t3);
+}
+
+// The guard must not throttle steady state: at the production sweep cadence
+// (10 s) every sweep with an outstanding delta still emits.
+TEST(TxAdvertiser, SteadyStateSweepCadenceIsNeverThrottled)
+{
+    using namespace std::chrono;
+    auto t = steady_clock::time_point{} + hours(2);
+    TxAdvertState st;
+
+    for (uint64_t i = 1; i <= 5; ++i) {
+        Wire w;
+        sweep_at(st, hashes(1, i), w, t);
+        ASSERT_EQ(w.msgs.size(), 1u) << "suppressed at sweep " << i;
+        t += seconds(core::TX_ADVERT_INTERVAL_SECONDS);
+    }
+    EXPECT_EQ(st.m_advertised, hashes(1, 5));
+}
+
+// A suppressed sweep must not consume the unconditional handshake advert: if the
+// very first call is suppressed, m_initial_sent stays false and the advert is
+// still owed. (Only reachable if a caller passes an already-stamped state.)
+TEST(TxAdvertiser, SuppressionDoesNotConsumeTheInitialAdvert)
+{
+    using namespace std::chrono;
+    const auto t0 = steady_clock::time_point{} + hours(3);
+    TxAdvertState st;
+    st.m_last_emit = t0;   // pretend something was just written to this peer
+
+    Wire w;
+    sweep_at(st, std::set<uint256>{}, w, t0 + seconds(1));
+    EXPECT_TRUE(w.msgs.empty());
+    EXPECT_FALSE(st.m_initial_sent);
+
+    Wire w2;
+    sweep_at(st, std::set<uint256>{}, w2,
+             t0 + seconds(core::TX_ADVERT_MIN_EMIT_INTERVAL_SECONDS));
+    ASSERT_EQ(w2.msgs.size(), 1u);
+    EXPECT_TRUE(w2.msgs[0].hashes.empty());
+    EXPECT_TRUE(st.m_initial_sent);
 }
 
 // plan_tx_advert is pure: it must not mutate the state it inspects.

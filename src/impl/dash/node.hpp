@@ -656,11 +656,13 @@ public:
         // ORDERING IS LOAD-BEARING: this is the LARGEST write the handshake
         // issues (up to TX_ADVERT_MAX_HASHES_PER_MESSAGE hashes, ~32 KB) and it
         // goes LAST. core::Socket::write starts a composed async_write with no
-        // outbound queue (core/socket.cpp:110-137), so a large write that
-        // overlaps a later one would interleave bytes mid-message and get us
-        // dropped on a bad checksum. The tiny getaddrs above (~28 bytes) drains
-        // in a single write_some before this one begins issuing continuations.
-        // See core/tx_advertiser.hpp for the full write-safety rationale.
+        // outbound queue (core/socket.cpp:110-137), so initiating another write
+        // while one is still draining interleaves bytes mid-message and gets us
+        // dropped on a bad checksum. Going last means NOTHING follows it in this
+        // handler; the ~32 KB advert may well take several write_some rounds,
+        // which is harmless precisely because nothing else is queued behind it,
+        // and the per-peer min-emit interval keeps the next timer sweep from
+        // landing on top of it. See core/tx_advertiser.hpp.
         advertise_known_txs(peer);
 
         // #754 join trigger (oracle p2p.py handle_version → node.py
@@ -903,7 +905,13 @@ public:
                 current.insert(entry.first);
         }
 
-        auto advertise_one = [&current](const peer_ptr& p)
+        // One clock reading for the whole sweep: run_tx_advert uses it both to
+        // apply the per-peer min-emit interval (never two writes in flight on
+        // one socket) and to stamp the peer after a send. IO-thread-local, so
+        // Peer::m_tx_advert needs no locking.
+        const auto now = std::chrono::steady_clock::now();
+
+        auto advertise_one = [&current, now](const peer_ptr& p)
         {
             if (!p)
                 return;
@@ -912,7 +920,8 @@ public:
                 [&p](const std::vector<uint256>& hashes)
                 { p->write(dash::message_have_tx::make_raw(hashes)); },
                 [&p](const std::vector<uint256>& hashes)
-                { p->write(dash::message_losing_tx::make_raw(hashes)); });
+                { p->write(dash::message_losing_tx::make_raw(hashes)); },
+                core::TX_ADVERT_MAX_HASHES_PER_MESSAGE, now);
         };
 
         if (only_peer)
