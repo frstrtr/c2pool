@@ -4995,6 +4995,14 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
 
     // Matches p2pool's get_version_signaling() — all fields the dashboard JS expects.
     constexpr int TARGET_VERSION = 36;
+    // Dust floor for "is a HIGHER version genuinely being signalled?" (display
+    // only — see the transition-detection block below). A desired version only
+    // counts as a real upgrade signal once it holds at least this share of the
+    // vote. The tally denominators are the full-chain window (8640 shares for
+    // the LTC family, 4320 for DASH), so 1% is ~86 / ~43 shares — far above a
+    // stray or replayed single share, and orders of magnitude below any real
+    // rollout (LTC's live v35→v36 cross sits at 59.8% flat / 19.2% work-weighted).
+    constexpr double DESIRED_SIGNAL_FLOOR_PCT = 1.0;
     // ETA cadence for the propagation countdown (display only): DASH mints one
     // share every 20s, the LTC-family every 10s.
     const int share_period_sec = (m_blockchain == Blockchain::DASH) ? 20 : 10;
@@ -5024,6 +5032,11 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
     // ── Share type counts (format VERSION) ──
     int overall_v36_shares = 0;
     int current_share_type = 0;
+    // Lowest share FORMAT still present in the window — the shares that would
+    // have to move for an upgrade to complete. current_share_type is the MAX
+    // format seen, so during a mixed window it already reads the new version;
+    // the gate below needs the laggard side of the same window.
+    int lowest_share_type = 0;
     nlohmann::json share_types_json = nlohmann::json::object();
     if (sc.contains("shares_by_version") && sc["shares_by_version"].is_object()) {
         auto& sv = sc["shares_by_version"];
@@ -5036,8 +5049,16 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
             share_types_json[ver] = {{"name", name}, {"count", c}, {"percentage", pct}};
             if (v >= TARGET_VERSION) overall_v36_shares += c;
             if (v > current_share_type) current_share_type = v;
+            if (c > 0 && (lowest_share_type == 0 || v < lowest_share_type)) lowest_share_type = v;
         }
     }
+
+    // Highest desired version that clears DESIRED_SIGNAL_FLOOR_PCT on either the
+    // flat full-chain vote tally or the work-weighted sampling window. Both are
+    // consulted (whichever is higher wins) because a fresh signal shows up in the
+    // full-chain tally long before it ages into the sampling window — that is
+    // exactly the "propagating" phase the banner exists to announce.
+    int dominant_desired = 0;
 
     // ── Desired version counts (voting — full chain) ──
     int overall_v36_votes = 0;
@@ -5051,6 +5072,7 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
             double pct = overall_total > 0 ? (c * 100.0 / overall_total) : 0;
             full_chain_versions[ver] = {{"count", c}, {"percentage", pct}};
             if (v >= TARGET_VERSION) overall_v36_votes += c;
+            if (pct >= DESIRED_SIGNAL_FLOOR_PCT && v > dominant_desired) dominant_desired = v;
         }
     }
 
@@ -5070,16 +5092,6 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
     auto tit = share_type_names.find(target_version);
     std::string target_version_name = (tit != share_type_names.end()) ? tit->second : "V" + std::to_string(target_version);
 
-    // ── Transition detection ──
-    bool successor_transition = (current_share_type < TARGET_VERSION);  // V35 → V36
-    bool classic_transition = false;  // dominant vote differs from current
-    bool is_transitioning = classic_transition || successor_transition;
-
-    // ── show_transition: golden border ──
-    bool all_target = (overall_total > 0 && overall_v36_shares == overall_total);
-    bool confirmed = all_target && chain_height >= chain_length * 3;
-    bool show_transition = (is_transitioning || !confirmed) && !confirmed && !all_target;
-
     // ── Sampling window signaling (CHAIN_LENGTH/10 shares from tip, work-weighted like p2pool) ──
     int sampling_window_size = chain_length / 10;
     double sampling_v36_weight = 0;
@@ -5094,13 +5106,55 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
         }
         // Build versions_json with percentages from work weights
         for (auto& [ver, weight] : sc["sampling_desired_version"].items()) {
+            int v = std::stoi(ver);
             double w = weight.get<double>();
             double pct = sampling_total_weight > 0 ? (w * 100.0 / sampling_total_weight) : 0;
             versions_json[ver] = {{"weight", w}, {"percentage", pct}};
+            if (pct >= DESIRED_SIGNAL_FLOOR_PCT && v > dominant_desired) dominant_desired = v;
         }
     }
     double sampling_signaling = sampling_total_weight > 0
         ? (sampling_v36_weight * 100.0 / sampling_total_weight) : 0;
+
+    // ── Transition detection ─────────────────────────────────────────────────
+    // The crossing banner, the signed authority notice and the progress bar are
+    // PENDING-UPGRADE UI. They may only light while an upgrade is genuinely
+    // pending, i.e. when there IS a current share version AND a *different,
+    // HIGHER* desired version is actually being signalled for it. That is the
+    // pool-level aggregate of the per-share rule the dashboard already applies
+    // to its "Signals V36" tag (share.dv >= 36 && share.V < 36): desired
+    // STRICTLY HIGHER than what is being produced.
+    //
+    // Previously this was:
+    //     successor_transition = (current_share_type < TARGET_VERSION);
+    //     classic_transition   = false;                 // never computed
+    //     is_transitioning     = classic || successor;
+    //     show_transition      = (is_transitioning || !confirmed) && !confirmed && !all_target;
+    // The "dominant vote differs from current" term was hardcoded false, so the
+    // whole gate reduced to "show whenever the chain is not 100% target-FORMAT".
+    // On a coin whose share format never becomes 36 — DASH stays wire-format v16
+    // across its entire v16→v36 accept-floor crossing — that is permanently true,
+    // so the banner, authority message and progress bar would have hung on
+    // forever while the pool signalled 100% desired-v16 and nobody signalled 36.
+    bool has_current_share_version = (current_share_type > 0);
+    bool higher_desired_signalled =
+        (lowest_share_type > 0 && dominant_desired > lowest_share_type);
+    bool classic_transition = has_current_share_version && higher_desired_signalled;
+    bool is_transitioning = classic_transition;
+
+    // ── show_transition: golden border ──
+    bool all_target = (overall_total > 0 && overall_v36_shares == overall_total);
+    bool confirmed = all_target && chain_height >= chain_length * 3;
+    // Completion signal for coins whose share FORMAT never reaches the target, so
+    // the format-count all_target above can never fire for them: those coins hand
+    // the ratchet-derived version through the stats fn as "live_share_version"
+    // (DASH — see main_dash.cpp). Only an explicitly reported value counts; the
+    // m_cached_share_version fallback used by the auto_ratchet block below
+    // defaults to 36 and would wrongly read as "already latched" on a coin that
+    // never sets it.
+    bool latched = sc.contains("live_share_version") && sc["live_share_version"].is_number()
+                   && sc["live_share_version"].get<int64_t>() >= TARGET_VERSION;
+    bool show_transition = is_transitioning && !confirmed && !all_target && !latched;
 
     // ── Propagation depth (needed for status logic) ──
     int deepest_v36_pos = sc.value("deepest_v36_position", 0);
@@ -5199,6 +5253,11 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
     result["overall_total"] = overall_total;
     result["show_transition"] = show_transition;
     result["is_transitioning"] = is_transitioning;
+    // Gate inputs, surfaced so an operator can see WHY the banner is (not) lit
+    // instead of guessing. Display-only, additive.
+    result["dominant_desired_version"] = dominant_desired;
+    result["lowest_share_type"] = lowest_share_type;
+    result["desired_signal_floor_pct"] = DESIRED_SIGNAL_FLOOR_PCT;
     result["transition_progress"] = std::round(transition_progress * 100) / 100.0;
     result["thresholds"] = {{"accept", 60}, {"activate", 95}};
     result["status"] = status;
