@@ -100,7 +100,8 @@ public:
 
         // ── Transactions from mempool (fee-sorted when UTXO available) ──
         auto [selected_txs, total_fees] =
-            pool.get_sorted_txs_with_fees(MAX_BLOCK_WEIGHT - COINBASE_RESERVE);
+            pool.get_sorted_txs_with_fees(MAX_BLOCK_WEIGHT - COINBASE_RESERVE,
+                                          /*fill_unknown_fee=*/true);
 
         // coinbasevalue = block reward + included transaction fees
         uint64_t coinbasevalue = subsidy + total_fees;
