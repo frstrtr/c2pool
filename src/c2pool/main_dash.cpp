@@ -91,6 +91,7 @@
 #include <impl/dash/stratum/work_source.hpp>   // dash::stratum::DASHWorkSource — concrete core::stratum::IWorkSource
 #include <impl/dash/mint_runloop.hpp>          // dash::mint — run-loop share minting (slice 3/3)
 #include <impl/dash/share_messages.hpp>        // dash::validate_message_data — operator message-blob validation (EMIT side, mirrors main_ltc.cpp)
+#include <c2pool/storage/found_block_store.hpp>  // FoundBlockStore/Record + LevelDBStore (persistence, main_ltc parity)
 #include <core/web_server.hpp>                 // core::WebServer — the EXISTING c2pool dashboard (same wiring main_ltc.cpp uses)
 #include <impl/dash/enhanced_node.hpp>         // dash::EnhancedDashNode — core::IMiningNode the WebServer ctor takes
 #include <impl/dash/share_messages.hpp>        // dash::unpack_share_messages — signed transitional-blob DISPLAY+VERIFY feed
@@ -590,6 +591,58 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
         // ── Real, non-negotiable node identity ────────────────────────────
         mi->set_coin_label("DASH");
+
+        // --- Persistent found-block storage (DASH) ---
+        // Parity with main_ltc.cpp:1977 — won DASH blocks survive node
+        // restarts on the dashboard /recent_blocks + history cards instead of
+        // vanishing every bounce. Dedicated LevelDB under the per-net data
+        // dir. Persistence/display only; touches no share/consensus path.
+        {
+            std::string fblk_db_path = (core::filesystem::config_path()
+                / net_subdir / "found_blocks_db").string();
+            auto fblk_leveldb = std::make_shared<core::LevelDBStore>(
+                fblk_db_path, core::LevelDBOptions{});
+            if (fblk_leveldb->open()) {
+                auto fblk_store = std::make_shared<c2pool::storage::FoundBlockStore>(*fblk_leveldb);
+                using MI = core::MiningInterface;
+                mi->set_found_block_persistence(
+                    [fblk_store, fblk_leveldb](const MI::FoundBlock& blk) -> bool {
+                        c2pool::storage::FoundBlockRecord rec;
+                        rec.chain = blk.chain;
+                        rec.height = blk.height;
+                        rec.block_hash = blk.hash;
+                        rec.timestamp = blk.ts;
+                        rec.status = static_cast<uint8_t>(blk.status);
+                        rec.check_count = blk.check_count;
+                        rec.confirmations = blk.confirmations;
+                        rec.last_checked = static_cast<uint64_t>(std::time(nullptr));
+                        return fblk_store->store(rec);
+                    },
+                    [fblk_store, fblk_leveldb]() -> std::vector<MI::FoundBlock> {
+                        auto records = fblk_store->load_all();
+                        std::vector<MI::FoundBlock> result;
+                        result.reserve(records.size());
+                        for (const auto& rec : records) {
+                            MI::FoundBlock blk;
+                            blk.height = rec.height;
+                            blk.hash = rec.block_hash;
+                            blk.ts = rec.timestamp;
+                            blk.status = static_cast<MI::BlockStatus>(rec.status);
+                            blk.check_count = rec.check_count;
+                            blk.chain = rec.chain;
+                            blk.confirmations = rec.confirmations;
+                            result.push_back(std::move(blk));
+                        }
+                        return result;
+                    }
+                );
+                mi->load_persisted_found_blocks();
+                LOG_INFO << "[Pool] DASH found-block persistence enabled at " << fblk_db_path;
+            } else {
+                LOG_WARNING << "[Pool] DASH found-block persistence DISABLED (LevelDB open failed at "
+                            << fblk_db_path << ")";
+            }
+        }
 #ifdef C2POOL_VERSION
         mi->set_pool_version("c2pool/" C2POOL_VERSION);
 #endif
@@ -1412,14 +1465,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 [ws](uint32_t height, const uint256& block_hash,
                      const std::string& miner, bool reached_network) {
                     auto* mi = ws->get_mining_interface();
+                    // Enrich the recorded win with the block reward + real pool
+                    // hashrate so the dashboard shows a truthful value instead of
+                    // 0 (main_ltc.cpp:2988 parity). Display only.
+                    double pool_hr = mi->get_local_hashrate();
+                    uint64_t subsidy = 0;
+                    {
+                        auto tmpl = mi->get_current_work_template();
+                        if (!tmpl.is_null() && tmpl.contains("coinbasevalue"))
+                            subsidy = tmpl["coinbasevalue"].get<uint64_t>();
+                    }
                     mi->record_found_block(
                         height, block_hash,
                         static_cast<uint64_t>(std::time(nullptr)),
                         "DASH", miner, block_hash.GetHex(),
                         mi->get_network_difficulty(),
                         /*share_difficulty=*/0.0,
-                        /*pool_hashrate=*/0.0,
-                        /*subsidy=*/0);
+                        pool_hr,
+                        subsidy);
                     if (!reached_network)
                         LOG_WARNING << "[DASH] recorded found block height="
                                     << height << " that reached NO network sink";

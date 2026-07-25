@@ -402,7 +402,8 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_share_producer_bind.cpp
         test_dash_mint_runloop.cpp
         test_dash_share_download.cpp
-        test_dash_v36_share.cpp)
+        test_dash_v36_share.cpp
+        test_dash_known_txs_retention.cpp)
     target_link_libraries(test_dash_share_hash_link PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -411,6 +412,17 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_dash_share_hash_link PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
     gtest_add_tests(test_dash_share_hash_link "" AUTO)
+
+    # test_dash_known_txs_retention.cpp: pure retention/eviction semantics of the
+    # known-tx pool that backs share broadcast (register_template_txs) — rolling
+    # window, evict-only-after-a-tx-falls-out-of-ALL-retained-sets, the F1
+    # template-identity dedup (N payout scripts on one template => ONE slot, not
+    # N), recency refresh, and the F3/F2 broadcast gate. Header-only over
+    # impl/dash/known_txs_retention.hpp + core (uint256). FOLDED into the
+    # EXISTING allowlisted target test_dash_share_hash_link above (added to its
+    # sources) — avoids the #769 new-target/allowlist trap (a standalone target
+    # is not in build.yml's --target list, so CI never builds it and CTest
+    # reports the tests "Not Run"). Its gtest cases run under that target.
 
     # DASH block-subsidy + UTXO adapter (S7 foundation slice): GetBlockSubsidy /
     # masternode + platform reward split (subsidy.hpp) consumed through the
