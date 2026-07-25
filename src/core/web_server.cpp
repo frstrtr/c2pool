@@ -3623,6 +3623,23 @@ nlohmann::json MiningInterface::rest_local_stats()
     }
     result["shares"] = {{"total", total_shares}, {"orphan", orphan_shares}, {"dead", dead_shares}};
 
+    // local_shares — fate of the shares THIS node minted (display only).
+    // shares{orphan,dead} above is the sharechain-wide StaleInfo tally, which
+    // by construction cannot see a locally minted share that was accepted and
+    // then lost the head race (we stamp StaleInfo::none on our own mints). A
+    // coin whose stats fn publishes the local-mint gauge (DASH) gets this extra
+    // object; every other coin's payload is byte-identical to before.
+    if (cached_sc.contains("local_minted_shares")) {
+        result["local_shares"] = {
+            {"minted",      cached_sc.value("local_minted_shares",   uint64_t(0))},
+            {"on_chain",    cached_sc.value("local_on_chain_shares", uint64_t(0))},
+            {"orphan",      cached_sc.value("local_orphan_shares",   uint64_t(0))},
+            {"pending",     cached_sc.value("local_pending_shares",  uint64_t(0))},
+            {"gone",        cached_sc.value("local_gone_shares",     uint64_t(0))},
+            {"orphan_rate", cached_sc.value("local_orphan_rate",     0.0)},
+        };
+    }
+
     // efficiency = valid / total (null if no shares)
     if (total_shares > 0) {
         int valid = total_shares - orphan_shares - dead_shares;
