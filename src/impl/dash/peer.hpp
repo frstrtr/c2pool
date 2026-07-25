@@ -21,6 +21,7 @@
 #include <set>
 #include <string>
 
+#include <core/tx_advertiser.hpp>
 #include <core/uint256.hpp>
 
 namespace dash
@@ -39,6 +40,12 @@ struct Peer
     // === remembered-transaction protocol state ===
     std::set<uint256> m_remote_txs;                       // hashes the remote peer has advertised
     std::map<uint256, coin::Transaction> m_remembered_txs; // full txs keyed by hash
+
+    // Send side of the tx-pool advertisement: our reconstruction of what this
+    // peer believes WE hold, so each sweep can emit only the delta as
+    // have_tx / losing_tx. Mirror image of m_remote_txs above (what the peer
+    // told us IT holds). See core/tx_advertiser.hpp for canonical semantics.
+    core::TxAdvertState m_tx_advert;
 };
 
 }; // namespace dash

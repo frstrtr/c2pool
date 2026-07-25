@@ -829,6 +829,21 @@ void NodeImpl::start_outbound_connections()
     if (!m_context)
         return;  // rig-free (KAT/standalone) node
 
+    // ── have_tx / losing_tx delta sweep ──────────────────────────────────
+    // Started before the outbound-dialing early-return below: a node with
+    // outbound dialing disabled still accepts inbound peers and must still
+    // advertise its tx pool to them. Advert-only, no consensus state.
+    m_tx_advert_timer = std::make_unique<core::Timer>(m_context, true);
+    m_tx_advert_timer->start(core::TX_ADVERT_INTERVAL_SECONDS,
+                             [this]() { advertise_known_txs(); });
+
+    // ── canonical addr-discovery sweep (p2p.py:794-799) ──────────────────
+    // Also started before the dialing early-return: an inbound-only node needs to
+    // learn addresses. Self-limiting — getaddrs_sweep() is a no-op once the
+    // AddrStore reaches PREFERRED_ADDR_STORAGE (1000) or while we have no peers.
+    m_getaddrs_timer = std::make_unique<core::Timer>(m_context, true);
+    m_getaddrs_timer->start(20, [this]() { getaddrs_sweep(); });
+
     // Advert-drain pump: handle_version (inline, link-free for the KAT
     // targets) only QUEUES a peer's advertised best share; this timer is the
     // node.cpp-side consumer that turns the queue into sharereq dispatches.
