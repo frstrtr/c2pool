@@ -82,6 +82,11 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_redistribute_address PRIVATE ltc_coin c2pool_storage pool)  # OBJECT-lib SCC direct-naming (#22/#39)
 
+    # ci-allowlist-exempt: test_phase0_live  -- live-only harness (needs a running coin daemon); not CI-built by design
+    # ci-allowlist-exempt: test_phase1_live  -- live-only harness (needs a running coin daemon); not CI-built by design
+    # ci-allowlist-exempt: test_phase2_live  -- live-only harness (needs a running coin daemon); not CI-built by design
+    # ci-allowlist-exempt: test_phase3_live  -- live-only harness (needs a running coin daemon); not CI-built by design
+    # ci-allowlist-exempt: test_phase4_live  -- live-only harness (needs a running coin daemon); not CI-built by design
     add_executable(test_phase0_live test_phase0_live.cpp)
     target_link_libraries(test_phase0_live PRIVATE
         GTest::gtest_main GTest::gtest
@@ -507,6 +512,15 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_quorum_root PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_quorum_root "" AUTO)
 
+    # KNOWN COVERAGE GAP (surfaced by the top-level drift-guard, #883 follow-up):
+    # the three targets below are gated behind C2POOL_DASH_BLS, but NO workflow
+    # in .github/workflows/ currently enables that flag, so they are never built
+    # or run in CI. Exempted here to keep the guard green; the real fix is a
+    # linux-dash-bls CI job (decision pending with integrator). Do NOT remove
+    # these exemptions without either adding that job or deleting the targets.
+    # ci-allowlist-exempt: test_dash_bls_verify  -- C2POOL_DASH_BLS-gated; no CI job enables it yet (coverage gap tracked)
+    # ci-allowlist-exempt: test_dash_quorum_members  -- C2POOL_DASH_BLS-gated; no CI job enables it yet (coverage gap tracked)
+    # ci-allowlist-exempt: test_dash_quorum_member_source  -- C2POOL_DASH_BLS-gated; no CI job enables it yet (coverage gap tracked)
     if(C2POOL_DASH_BLS)  # gate the BLS-backend-requiring Phase-L test executables to the BLS-ON build
     # E1 Phase-L: type-6 quorum-commitment BLS verify KAT. Links dash_bls_verify
     # (which carries the C2POOL_DASH_BLS define + dashbls include/libs PUBLIC when

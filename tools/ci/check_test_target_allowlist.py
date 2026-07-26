@@ -23,6 +23,11 @@ import glob
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BUILD_YML = os.path.join(REPO, ".github", "workflows", "build.yml")
 COIN_GLOB = os.path.join(REPO, "src", "impl", "*", "test", "CMakeLists.txt")
+# The top-level shared test tree is ALSO a NOT_BUILT surface: a standalone
+# add_executable here that is missing from build.yml is silently "Not Run"
+# too (this is why targets get hand-folded into allowlisted executables to
+# dodge the trap). Audit it with the same fail-closed rule.
+TOP_LEVEL_TEST = os.path.join(REPO, "test", "CMakeLists.txt")
 
 
 def strip_comment(line):
@@ -106,8 +111,14 @@ def main():
     allowlist = build_yml_targets(BUILD_YML)
     violations = []
     audited = 0
-    for cml in sorted(glob.glob(COIN_GLOB)):
-        coin = cml.split(os.sep)[-3]
+    roots = sorted(glob.glob(COIN_GLOB))
+    if os.path.exists(TOP_LEVEL_TEST):
+        roots.append(TOP_LEVEL_TEST)
+    for cml in roots:
+        # Label: coin name for a per-coin tree (src/impl/<coin>/test/...),
+        # "test/" for the shared top-level tree.
+        rel = os.path.relpath(cml, REPO)
+        coin = cml.split(os.sep)[-3] if rel.startswith("src" + os.sep) else "test/"
         with open(cml) as f:
             exempt = parse_exemptions(f.read())
         for tgt in sorted(parse_coin_targets(cml)):
@@ -129,7 +140,7 @@ def main():
 
     print("CI drift-guard OK: %d per-coin test target(s) across %d coin lane(s) "
           "all present in build.yml --target allowlist."
-          % (audited, len(glob.glob(COIN_GLOB))))
+          % (audited, len(glob.glob(COIN_GLOB)) + (1 if os.path.exists(TOP_LEVEL_TEST) else 0)))
     return 0
 
 
