@@ -1,5 +1,35 @@
 # Changelog
 
+## [Unreleased]
+
+### DASH — daemonless masternode-set seed (E2d)
+- **Release-pinned masternode-set checkpoint + forward replay** — `--embedded-mainnet`
+  can now cold-start the payout-bearing masternode set without a dashd RPC. This was
+  the last structurally daemon-dependent input on the DASH daemonless path.
+- ⚠ **This introduces a documented TRUST ANCHOR.** The pinned masternode set is data
+  the release build asserts; it cannot be header-authenticated, because the P2P
+  Simplified MN List omits `scriptPayout`/`nLastPaidHeight` and neither is committed
+  in `merkleRootMNList`. The node independently verifies the anchor's **chain
+  position** against its own PoW-validated header chain, its **SHA-256 integrity
+  digest**, and **every replayed block's coinbase** against the projected payee — but
+  the set contents at the anchor height are trusted. Fully trustless DIP-3-height
+  replay remains planned as a later opt-in verify-mode. See the README section
+  "DASH daemonless masternode-set checkpoint — trust anchor" and
+  `src/impl/dash/coin/checkpoints/README.md`.
+- **Fails closed, loudly.** A missing, unpinned, corrupt, wrong-network,
+  wrong-chain-position, stale or contradicted anchor refuses to serve embedded
+  templates rather than guessing a payee. New `--embedded-mn-bridge-max N` bounds how
+  far back an anchor may be (default 20000 blocks, ≈34 days).
+- **Anchors are pinned at release time**, not by hand:
+  `tools/dash/gen_mn_checkpoint.py pin --network mainnet --rpc-url ... ` rewrites the
+  checkpoint and prints the provenance block for the release notes;
+  `... verify PATH` re-validates one already in the tree.
+- **Anti-mint latch** — on the embedded arm, masternode-readiness now requires an
+  authoritative height-stamped snapshot. Previously a cold daemonless start could arm
+  itself off a single ProRegTx observed in a live block and serve a template whose
+  entire payment queue was that one accidental registration.
+
+
 ## [0.14.0-v36] - 2026-07-10
 
 ### Licensing
