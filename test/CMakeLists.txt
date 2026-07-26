@@ -513,14 +513,16 @@ if (BUILD_TESTING AND GTest_FOUND)
     gtest_add_tests(test_dash_quorum_root "" AUTO)
 
     # KNOWN COVERAGE GAP (surfaced by the top-level drift-guard, #883 follow-up):
-    # the three targets below are gated behind C2POOL_DASH_BLS, but NO workflow
-    # in .github/workflows/ currently enables that flag, so they are never built
-    # or run in CI. Exempted here to keep the guard green; the real fix is a
-    # linux-dash-bls CI job (decision pending with integrator). Do NOT remove
-    # these exemptions without either adding that job or deleting the targets.
-    # ci-allowlist-exempt: test_dash_bls_verify  -- C2POOL_DASH_BLS-gated; no CI job enables it yet (coverage gap tracked)
-    # ci-allowlist-exempt: test_dash_quorum_members  -- C2POOL_DASH_BLS-gated; no CI job enables it yet (coverage gap tracked)
-    # ci-allowlist-exempt: test_dash_quorum_member_source  -- C2POOL_DASH_BLS-gated; no CI job enables it yet (coverage gap tracked)
+    # the three targets below are gated behind C2POOL_DASH_BLS, but no workflow
+    # in .github/workflows/ enables that flag yet, so they are never built or run
+    # in CI. Integrator decision 2026-07-26: restore coverage (fail-closed shape
+    # kept). Coverage is being closed by PR #890 (ci/dash-bls-enable), which
+    # builds+ships DASH with the real BLS backend linked. These exemptions are
+    # SELF-RETIRING: remove all three in a one-line follow-up once #890 lands.
+    # Do NOT remove them before then without adding an equivalent BLS-ON CI job.
+    # ci-allowlist-exempt: test_dash_bls_verify  -- C2POOL_DASH_BLS-gated; coverage restored by PR #890 (ci/dash-bls-enable) — remove exemption when #890 lands
+    # ci-allowlist-exempt: test_dash_quorum_members  -- C2POOL_DASH_BLS-gated; coverage restored by PR #890 (ci/dash-bls-enable) — remove exemption when #890 lands
+    # ci-allowlist-exempt: test_dash_quorum_member_source  -- C2POOL_DASH_BLS-gated; coverage restored by PR #890 (ci/dash-bls-enable) — remove exemption when #890 lands
     if(C2POOL_DASH_BLS)  # gate the BLS-backend-requiring Phase-L test executables to the BLS-ON build
     # E1 Phase-L: type-6 quorum-commitment BLS verify KAT. Links dash_bls_verify
     # (which carries the C2POOL_DASH_BLS define + dashbls include/libs PUBLIC when
