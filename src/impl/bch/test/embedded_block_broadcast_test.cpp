@@ -60,6 +60,11 @@ struct SinkThrew : std::exception {
 
 } // namespace
 
+// F2/F3 share-broadcast gate KATs (broadcast_gate_test.cpp). Kept in its own
+// TU but run from this already-allowlisted executable, so it is compiled and
+// executed in CI without a new --target the token cannot add to build.yml.
+int run_share_broadcast_gate_checks();
+
 int main() {
     boost::asio::io_context ioc;
     TestConfig config;
@@ -156,6 +161,9 @@ int main() {
         }
         CHECK(!threw_out);
     }
+
+    // Share-broadcast completeness gate + mark-after-send (separate TU).
+    failures += run_share_broadcast_gate_checks();
 
     if (failures == 0) {
         std::cout << "embedded_block_broadcast_test: ALL PASS\n";

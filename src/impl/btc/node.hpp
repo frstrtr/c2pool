@@ -377,9 +377,13 @@ public:
     /// Set the software version string announced to peers in P2P version messages.
     void set_software_version(std::string ver) { m_software_version = std::move(ver); }
 
-    /// Send a set of shares (with any needed txs) to a single peer.
-    /// Skips shares that originated from that peer.
-    void send_shares(peer_ptr peer, const std::vector<uint256>& share_hashes);
+    /// Send a set of shares (with any needed txs) to a single peer, and return
+    /// the subset actually written (F2). Shares dropped by the tx-completeness
+    /// gate, or the whole batch when the tracker lock is unavailable, are
+    /// reported as NOT sent, so the caller leaves them un-marked and retries
+    /// them on the next broadcast.
+    std::vector<uint256> send_shares(peer_ptr peer,
+                                     const std::vector<uint256>& share_hashes);
 
     /// F3: retain a freshly-minted share's TEMPLATE tx set so every referenced
     /// new-tx is forwardable (remember_tx) and the share is backable. Called

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 // Pure, unit-testable bookkeeping for the known-transaction pool that backs
-// share broadcast (remember_tx forwarding). Ported to the BTC variant from
+// share broadcast (remember_tx forwarding). Ported to the BCH variant from
 // src/impl/dash/known_txs_retention.hpp so the retention/eviction and
 // broadcast-gate semantics can be exercised without a live node.
 //
@@ -46,7 +46,7 @@
 
 #include <core/uint256.hpp>
 
-namespace btc {
+namespace bch {
 
 // Retain the tx set of a newly-registered template in a rolling window of the
 // last `cap` DISTINCT templates, inserting its tx bytes into `known_txs`.
@@ -123,25 +123,6 @@ inline bool all_txs_backable(const std::vector<uint256>& tx_hashes,
     return true;
 }
 
-// F3 send-gate over a batch: returns the indices of shares that are backable —
-// every referenced new-tx hash is held. send_shares transmits ONLY these and
-// withholds the rest (a share we cannot fully forward would trip the peer's
-// "referenced unknown transaction" disconnect). Pure so the wiring's withhold
-// decision is unit-testable: mutating this to admit-all (push every index)
-// reddens BtcSendGate.WithholdsShareMissingTemplateTx.
-template <typename Held>
-inline std::vector<std::size_t> select_backable_shares(
-    const std::vector<std::vector<uint256>>& per_share_refs,
-    const Held& held)
-{
-    std::vector<std::size_t> out;
-    out.reserve(per_share_refs.size());
-    for (std::size_t i = 0; i < per_share_refs.size(); ++i)
-        if (all_txs_backable(per_share_refs[i], held))
-            out.push_back(i);
-    return out;
-}
-
 // Batch form of the F3 gate. Keeps in `shares` only the entries every one of
 // whose referenced new-tx hashes we hold, and returns how many were dropped.
 // `hashes_of(share)` yields that share's referenced new-tx hashes.
@@ -197,4 +178,4 @@ inline std::size_t broadcast_and_mark(MarkedSet& marked, Peers& peers,
     return actually_sent.size();
 }
 
-} // namespace btc
+} // namespace bch

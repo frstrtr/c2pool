@@ -222,6 +222,12 @@ if(BUILD_TESTING)
     # allowlisted target rather than a new add_executable -- a new one would
     # silently report "Not Run" (see merged PR #868). Still bch-only, so the
     # per-coin isolation invariant holds.
+    # F2/F3 share-broadcast gate KATs ride bch_embedded_block_broadcast_test (an
+    # already-allowlisted --target). The bch test tree has no GTest harness and a
+    # standalone target would need a build.yml entry this repo's CI token cannot
+    # add, which CTest would then report as a silently-passing NOT_BUILT sentinel.
+    target_sources(bch_embedded_block_broadcast_test PRIVATE broadcast_gate_test.cpp)
+
     add_executable(bch_g2_block_assembly_roundtrip_test
         g2_block_assembly_roundtrip_test.cpp
         ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/transaction.cpp)
