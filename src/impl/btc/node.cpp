@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "node.hpp"
+#include "known_txs_retention.hpp"      // F3 retain_template_txs + select_backable_shares
+#include "coin/template_other_txs.hpp"  // deserialize_template_other_txs (GBT data[] -> MutableTransaction)
 
 #include <core/common.hpp>
 #include <core/hash.hpp>
@@ -679,6 +681,52 @@ std::vector<btc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
 	return shares;
 }
 
+void NodeImpl::register_template_txs(const uint256& share_hash,
+                                     const nlohmann::json& template_txs)
+{
+    // Decode the GBT transactions[] (`data` = with-witness hex) OUTSIDE the node
+    // lock — the hex parse is the heavy part and must never run under
+    // m_tracker_mutex. Fail CLOSED on a malformed entry (retain nothing) rather
+    // than poison the retention window.
+    std::vector<coin::MutableTransaction> mtxs;
+    try {
+        mtxs = coin::deserialize_template_other_txs(template_txs);
+    } catch (const std::exception& e) {
+        LOG_WARNING << "[Pool] register_template_txs decode failed for share "
+                    << share_hash.GetHex().substr(0, 16) << ": " << e.what();
+        return;
+    }
+    if (mtxs.empty())
+        return;
+
+    // Key each tx exactly as the remember_tx handler does —
+    // Hash(pack(TX_WITH_WITNESS(tx))) — so the retained bytes are addressable by
+    // the same hash a share or peer references and forwarding stays consistent.
+    std::vector<uint256> hashes;
+    std::vector<coin::Transaction> txs;
+    hashes.reserve(mtxs.size());
+    txs.reserve(mtxs.size());
+    for (auto& mtx : mtxs) {
+        auto packed = pack(coin::TX_WITH_WITNESS(mtx));
+        hashes.push_back(Hash(packed.get_span()));
+        txs.emplace_back(mtx);
+    }
+
+    // Only the map mutation is serialized. A blocking unique_lock matches the
+    // stratum-thread write posture already used by create_local_share (main_btc
+    // drops that lock before calling us); the IO thread never blocks here. The
+    // retention window (not m_known_txs_order) owns these entries' lifecycle.
+    {
+        std::unique_lock<std::shared_mutex> lk(m_tracker_mutex);
+        btc::retain_template_txs(m_template_recent_sets, m_known_txs,
+                                 hashes, txs, kTemplateRetainCap);
+    }
+
+    LOG_INFO << "[Pool] register_template_txs share=" << share_hash.GetHex().substr(0, 16)
+              << " retained " << hashes.size() << " template tx(s), window="
+              << m_template_recent_sets.size();
+}
+
 void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hashes)
 {
     // try_to_lock per the architectural rule (node.hpp:67) — see freeze
@@ -714,22 +762,61 @@ void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hash
     if (shares.empty())
         return;
 
-    // Collect transactions that the peer doesn't know about
-    std::set<uint256> needed_txs;
+    // (b) Extract each share's referenced new-tx hashes. BTC shares carry these
+    // inside m_tx_info (btc::ShareTxInfo), NOT as a top-level
+    // m_new_transaction_hashes — the old `requires { obj->m_new_transaction_hashes }`
+    // matched no BTC share type, so the whole block below was silently dead for
+    // ALL versions. Guarding on m_tx_info makes it correct-by-construction for
+    // v17/v33 (which populate it) and dormant on v35 (share_check leaves it empty
+    // for version >= 34) — dormant, never silently dead.
+    std::vector<std::vector<uint256>> per_share_refs;
+    per_share_refs.reserve(shares.size());
     for (auto& share : shares)
     {
+        std::vector<uint256> refs;
         share.invoke([&](auto* obj) {
-            if constexpr (requires { obj->m_new_transaction_hashes; })
-            {
-                for (const auto& th : obj->m_new_transaction_hashes)
-                {
-                    if (!peer->m_remote_txs.count(th) &&
-                        !peer->m_remembered_txs.count(th))
-                        needed_txs.insert(th);
-                }
-            }
+            if constexpr (requires { obj->m_tx_info; })
+                for (const auto& th : obj->m_tx_info.m_new_transaction_hashes)
+                    refs.push_back(th);
         });
+        per_share_refs.push_back(std::move(refs));
     }
+
+    // (a) F3 backable-broadcast gate: withhold any share whose referenced
+    // new-txs we do NOT all hold — transmitting it would trip the peer's
+    // "referenced unknown transaction" disconnect. The gate reads m_known_txs
+    // the same way the needed_txs lookup below does (send_shares' established
+    // access posture for this map). Dormant on v35 (empty refs -> vacuously
+    // backable); live for v17/v33 and any future tx-carrying share.
+    const auto sendable_idx = btc::select_backable_shares(per_share_refs, m_known_txs);
+    if (sendable_idx.size() != shares.size())
+    {
+        LOG_WARNING << "[Pool] Withholding " << (shares.size() - sendable_idx.size())
+                    << " unbacked share(s) from " << peer->addr().to_string()
+                    << " (referenced template tx not held)";
+        std::vector<ShareType> kept_shares;
+        std::vector<std::vector<uint256>> kept_refs;
+        kept_shares.reserve(sendable_idx.size());
+        kept_refs.reserve(sendable_idx.size());
+        for (auto i : sendable_idx)
+        {
+            kept_shares.push_back(std::move(shares[i]));
+            kept_refs.push_back(std::move(per_share_refs[i]));
+        }
+        shares = std::move(kept_shares);
+        per_share_refs = std::move(kept_refs);
+        if (shares.empty())
+            return;
+    }
+
+    // Collect transactions the peer doesn't know about, over the surviving
+    // (backable) shares only.
+    std::set<uint256> needed_txs;
+    for (const auto& refs : per_share_refs)
+        for (const auto& th : refs)
+            if (!peer->m_remote_txs.count(th) &&
+                !peer->m_remembered_txs.count(th))
+                needed_txs.insert(th);
 
     // Send remember_tx for txs the peer needs
     if (!needed_txs.empty())
