@@ -346,7 +346,8 @@ public:
     /// Transactions with known fees are prioritized; unknown-fee txs fill remaining space.
     /// Returns total_fees across all selected transactions (known fees only).
     std::pair<std::vector<SelectedTx>, uint64_t>
-    get_sorted_txs_with_fees(uint32_t max_weight) const {
+    get_sorted_txs_with_fees(uint32_t max_weight,
+                             bool fill_unknown_fee = false) const {
         std::lock_guard<std::mutex> lock(m_mutex);
 
         std::vector<SelectedTx> result;
@@ -388,10 +389,53 @@ public:
             selected.insert(entry.txid);
         }
 
-        // Unknown-fee txs excluded from template — they'll be included
-        // after fee revalidation once UTXO processes their input blocks.
-        // Including them with fee=0 would cause coinbasevalue mismatch
-        // vs p2pool (which gets accurate fees from daemon GBT).
+        // ── Pass 2: fill remaining weight with unknown-fee txs (opt-in) ─────
+        // Root cause of the [EMB-DOGE]/[EMB-DGB] TemplateBuilder UNDERFILL:
+        // Pass 1 above skips EVERY fee_known=false tx, so an embedded UTXO set
+        // that cannot resolve a large multi-input tx's fee (input unconfirmed /
+        // spent from an in-mempool parent) drops that tx from the template
+        // entirely — a near-empty block on a non-empty mempool. The GBT shapers
+        // already emit these with fee=null and p2pool excludes null-fee txs from
+        // the coinbasevalue (base_subsidy fallback, data.py:876-884), so
+        // including them here is a template-fill completion that leaves
+        // total_fees — hence coinbasevalue and the gentx — byte-for-byte
+        // unchanged. Consensus-neutral for the share; opt-in so the proven LTC
+        // parent path stays untouched.
+        if (fill_unknown_fee) {
+            auto* utxo2 = m_utxo.load();
+            for (const auto& [ts, txid] : m_time_index) {
+                if (selected.count(txid)) continue;                 // in Pass 1 already
+                auto pit = m_pool.find(txid);
+                if (pit == m_pool.end()) continue;
+                const auto& entry = pit->second;
+                if (entry.fee_known) continue;                      // Pass 1 territory
+                if (total_weight + entry.weight > max_weight) continue;
+
+                // Same input-existence guard as Pass 1: never pack a tx that
+                // spends an output absent from BOTH the UTXO set and the mempool
+                // (CPFP parent). Genuinely stale txs stay excluded.
+                if (utxo2) {
+                    bool inputs_ok = true;
+                    for (const auto& vin : entry.tx.vin) {
+                        core::coin::Outpoint op(vin.prevout.hash, vin.prevout.index);
+                        core::coin::Coin coin;
+                        if (!utxo2->get_coin(op, coin)) {
+                            if (!m_pool.count(vin.prevout.hash) ||
+                                vin.prevout.index >= m_pool.at(vin.prevout.hash).tx.vout.size()) {
+                                inputs_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (!inputs_ok) continue;
+                }
+
+                total_weight += entry.weight;
+                // fee intentionally NOT summed — unknown, shaped as fee=null.
+                result.push_back({entry.tx, 0, false});
+                selected.insert(entry.txid);
+            }
+        }
 
         return {std::move(result), total_fees};
     }
