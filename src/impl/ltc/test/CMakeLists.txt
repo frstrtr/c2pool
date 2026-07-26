@@ -1,5 +1,11 @@
 if (BUILD_TESTING AND GTest_FOUND)
-    add_executable(share_test share_test.cpp f11_donation_invariance_test.cpp emergency_decay_overflow_test.cpp wirecompat_runtime_test.cpp desired_version_tally_test.cpp auto_ratchet_sim_test.cpp auto_ratchet_tail_guard_test.cpp chain_walk_window_test.cpp doge_template_underfill_test.cpp)
+    # broadcast_tx_completeness_test.cpp: the LTC/DOGE share-broadcast
+    # tx-completeness gate and mark-only-what-was-sent de-dup rule, exercised
+    # against the REAL ltc::ShareType variants. FOLDED into the EXISTING
+    # allowlisted `share_test` target rather than a new add_executable — a
+    # standalone target is absent from build.yml's --target list, so CI would
+    # never build it and CTest would report it "Not Run" (the #769 trap).
+    add_executable(share_test share_test.cpp f11_donation_invariance_test.cpp emergency_decay_overflow_test.cpp wirecompat_runtime_test.cpp desired_version_tally_test.cpp auto_ratchet_sim_test.cpp auto_ratchet_tail_guard_test.cpp chain_walk_window_test.cpp doge_template_underfill_test.cpp broadcast_tx_completeness_test.cpp)
     target_link_libraries(share_test PRIVATE
         GTest::gtest_main GTest::gtest
         core ltc

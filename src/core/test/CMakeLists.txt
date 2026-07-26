@@ -23,7 +23,14 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # every coin because all five node lanes share this one socket layer. Same
     # reasoning as above: FOLDED into the EXISTING allowlisted core_test target,
     # never a new add_executable (the #769 "Not Run" trap).
-    add_executable(core_test pack_test.cpp events_test.cpp chain_test.cpp packet_test.cpp block_broadcast_test.cpp broadcast_convergence_matrix_test.cpp core_merkle_branches_test.cpp version_gate_test.cpp filesystem_test.cpp web_server_submitblock_test.cpp known_txs_eviction_test.cpp tx_advertiser_test.cpp socket_write_queue_test.cpp)
+    #
+    # known_txs_backing_test.cpp: the coin-generic share-broadcast tx-completeness
+    # gate and the mark-only-what-was-sent de-dup rule (core/known_txs_backing.hpp),
+    # hoisted out of impl/dash/known_txs_retention.hpp so every node lane consumes
+    # ONE definition instead of each growing a copy. Same reasoning again:
+    # header-only over core, so it is FOLDED into the EXISTING allowlisted
+    # core_test target, never a new add_executable (the #769 "Not Run" trap).
+    add_executable(core_test pack_test.cpp events_test.cpp chain_test.cpp packet_test.cpp block_broadcast_test.cpp broadcast_convergence_matrix_test.cpp core_merkle_branches_test.cpp version_gate_test.cpp filesystem_test.cpp web_server_submitblock_test.cpp known_txs_eviction_test.cpp tx_advertiser_test.cpp socket_write_queue_test.cpp known_txs_backing_test.cpp)
     target_link_libraries(core_test PRIVATE GTest::gtest_main core c2pool_merged_mining GTest::gtest)
     target_link_libraries(core_test PRIVATE c2pool_payout c2pool_hashrate ltc_coin)  # OBJECT-lib SCC direct-naming (#22/#39)
 

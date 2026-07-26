@@ -367,8 +367,11 @@ public:
     void set_software_version(std::string ver) { m_software_version = std::move(ver); }
 
     /// Send a set of shares (with any needed txs) to a single peer.
-    /// Skips shares that originated from that peer.
-    void send_shares(peer_ptr peer, const std::vector<uint256>& share_hashes);
+    /// Skips shares that originated from that peer, and shares whose new-tx
+    /// bytes we do not hold (F3 tx-completeness gate).
+    /// Returns the hashes ACTUALLY written to that peer; broadcast_share marks
+    /// only those as shared (F2), so an abandoned or gated batch is retried.
+    std::vector<uint256> send_shares(peer_ptr peer, const std::vector<uint256>& share_hashes);
 
     /// Broadcast a locally-generated (or newly-received) share to all peers.
     void broadcast_share(const uint256& share_hash);
