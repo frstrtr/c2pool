@@ -1807,6 +1807,27 @@ nlohmann::json MiningInterface::getblocktemplate(const nlohmann::json& params, c
     };
 }
 
+// #886 recent-won-block dedup helpers. Keyed on the BLOCK HASH, recorded only
+// on a SUCCESSFUL submit. Linear scan over a bounded FIFO (<=256) — the won-block
+// path is rare, so this is trivially cheap and avoids a std::hash<uint256>.
+bool MiningInterface::already_submitted_block(const uint256& block_hash) const
+{
+    std::lock_guard<std::mutex> lk(m_recent_submit_mutex);
+    for (const auto& h : m_recent_submitted_blocks)
+        if (h == block_hash) return true;
+    return false;
+}
+
+void MiningInterface::mark_block_submitted(const uint256& block_hash)
+{
+    std::lock_guard<std::mutex> lk(m_recent_submit_mutex);
+    for (const auto& h : m_recent_submitted_blocks)
+        if (h == block_hash) return;              // already recorded
+    m_recent_submitted_blocks.push_back(block_hash);
+    while (m_recent_submitted_blocks.size() > kRecentSubmitCap)
+        m_recent_submitted_blocks.pop_front();
+}
+
 nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const std::string& request_id)
 {
     LOG_TRACE << "[LTC] submitblock: received " << hex_data.length() / 2 << " bytes";
@@ -7143,22 +7164,33 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                             expected_merkle = reconstruct_merkle_root(coinbase_hex, branches);
                         }
 
+                        // #886 BUG 2: the merkle self-check is ADVISORY ONLY,
+                        // never a refusal. expected_merkle is rebuilt from
+                        // job/cache; a template roll between job freeze and submit
+                        // yields a benign FALSE mismatch. Log loudly, then SUBMIT
+                        // ANYWAY and let the daemon be the authority (mirrors BTC
+                        // work_source.cpp:802). INVARIANT: never REFUSE a block the
+                        // daemon might accept — a false refusal is a guaranteed loss.
                         if (header_merkle != expected_merkle) {
-                            LOG_ERROR << "Block merkle_root mismatch!"
-                                      << " header=" << header_merkle.GetHex()
-                                      << " expected=" << expected_merkle.GetHex();
-                        } else {
-                            // Skip duplicate blocks at the same prev_block
-                            // (multiple shares can meet the target at the same height)
-                            uint256 prev_block;
-                            std::memcpy(prev_block.data(), block_bytes.data() + 4, 32);
-                            static uint256 s_last_submitted_prev;
-                            if (prev_block != s_last_submitted_prev) {
-                                s_last_submitted_prev = prev_block;
-                                uint256 block_hash = Hash(std::span<const unsigned char>(block_bytes.data(), block_bytes.size()));
+                            LOG_WARNING << "Block merkle self-check DIVERGENCE"
+                                        << " header=" << header_merkle.GetHex()
+                                        << " expected=" << expected_merkle.GetHex()
+                                        << " — submitting anyway (daemon is authority; template roll or leaf-set bug)";
+                        }
+                        // #886 BUG 1: dedup on the BLOCK HASH (not prev-hash — many
+                        // distinct valid blocks share one prev), recorded ONLY on a
+                        // SUCCESSFUL submit so a failed submit (stale template,
+                        // transient RPC, -1 verdict) stays resubmittable. Bounded +
+                        // thread-safe (see already_submitted_block).
+                        {
+                            uint256 block_hash = Hash(std::span<const unsigned char>(block_bytes.data(), block_bytes.size()));
+                            if (!already_submitted_block(block_hash)) {
                                 LOG_INFO << "[BLOCK] Parent block found by " << username
                                          << " hash=" << block_hash.GetHex().substr(0,16);
-                                submitblock(block_hex);
+                                auto submit_res = submitblock(block_hex);
+                                if (!submit_res.contains("error")) {
+                                    mark_block_submitted(block_hash);
+                                }
                             }
                         }
                     }
@@ -7530,22 +7562,26 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                             expected_merkle = reconstruct_merkle_root(coinbase_hex, branches);
                         }
 
+                        // #886 BUG 2: merkle self-check is ADVISORY ONLY (see
+                        // solo path). A template roll yields a benign FALSE
+                        // mismatch; log loudly then SUBMIT ANYWAY, daemon decides.
                         if (header_merkle != expected_merkle) {
-                            LOG_ERROR << "Pool block merkle_root mismatch!"
-                                      << " header=" << header_merkle.GetHex()
-                                      << " expected=" << expected_merkle.GetHex();
-                        } else {
-                            // Skip duplicate blocks at the same prev_block
-                            uint256 prev_block;
-                            std::memcpy(prev_block.data(), block_bytes.data() + 4, 32);
-                            static uint256 s_last_pool_submitted_prev;
-                            if (prev_block != s_last_pool_submitted_prev) {
-                                s_last_pool_submitted_prev = prev_block;
-                                uint256 block_hash = Hash(std::span<const unsigned char>(block_bytes.data(), block_bytes.size()));
+                            LOG_WARNING << "Pool block merkle self-check DIVERGENCE"
+                                        << " header=" << header_merkle.GetHex()
+                                        << " expected=" << expected_merkle.GetHex()
+                                        << " — submitting anyway (daemon is authority; template roll or leaf-set bug)";
+                        }
+                        // #886 BUG 1: dedup on BLOCK HASH, recorded only on success.
+                        {
+                            uint256 block_hash = Hash(std::span<const unsigned char>(block_bytes.data(), block_bytes.size()));
+                            if (!already_submitted_block(block_hash)) {
                                 LOG_INFO << "[BLOCK] " << (merged_found ? "Twin" : "Parent")
                                          << " block found by " << username
                                          << " hash=" << block_hash.GetHex().substr(0,16);
-                                submitblock(block_hex);
+                                auto submit_res = submitblock(block_hex);
+                                if (!submit_res.contains("error")) {
+                                    mark_block_submitted(block_hash);
+                                }
                             }
                         }
                     }
