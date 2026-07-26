@@ -1,0 +1,105 @@
+name: LTC gate G3a — populated-regtest block-production
+
+# ltc-doge-production-steward 2026-07-26. Required-gate for LTC (+DOGE aux) G3a:
+# assert LTC populated block assembly + production, incl. the DOGE merged-aux
+# child. CI plumbing only — NO consensus knowledge here. The ltc/doge lane owns
+# the harness (PR #679 g3a_populated_block_regtest_test.cpp), the ctest target
+# (LtcG3aPopulated), and the gate script.
+#
+# TEST_ENTRYPOINT is tests/gates/ltc_g3a_regtest_block_production.sh, which
+# self-configures (conan + cmake, override via BUILD_DIR) and runs two arms:
+#   * CI arm (network-free, always on): the ltc_g3a_populated_test harness via
+#     `ctest -R '^LtcG3aPopulated$' -V`, guarded by an empty-suite check AND a
+#     G3A_ASSERTIONS_PASSED>=38 floor (rejects a gutted/hollow harness).
+#   * Live regtest arm (opt-in): runs only when LTC_RPC_PASS + DOGE_RPC_PASS are
+#     exported (isolated regtest litecoind + dogecoind on the runner). Absent
+#     creds it is a documented, deterministic skip — the CI arm still carries the
+#     gate. (The live testbed-VM standup is the only remaining G3b-live blocker;
+#     it does NOT fence this network-free G3a gate.)
+#
+# Neutral-skip: on branches lacking the entrypoint the job is a green no-op.
+# Register as a required check only after a confirmed non-hollow green rollup on
+# the runner (integrator's step, not the lane's).
+
+on:
+  push:
+    branches: [master, ltc-doge/ltc-g3a-regtest-gate]
+  pull_request:
+    branches: [master]
+
+jobs:
+  g3a-regtest-block-production:
+    name: LTC gate G3a — populated-regtest block-production
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set per-job Conan home
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+          else
+            echo "CONAN_HOME=$HOME/.conan2-ci/$RUNNER_NAME" >> "$GITHUB_ENV"
+          fi
+
+      - name: Check gate entrypoint presence
+        id: presence
+        run: |
+          if [ -f "tests/gates/ltc_g3a_regtest_block_production.sh" ]; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+            echo "::notice::G3a entrypoint present — running LTC populated block-production gate."
+          else
+            echo "exists=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::tests/gates/ltc_g3a_regtest_block_production.sh not on this branch — neutral skip."
+          fi
+
+      - name: Install system dependencies
+        if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            g++ cmake make libleveldb-dev libsecp256k1-dev
+
+      - uses: actions/setup-python@v6
+        if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'
+        with: { python-version: '3.12' }
+
+      - name: Install Conan 2
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version
+          fi
+
+      - name: Show committed Conan profile
+        if: steps.presence.outputs.exists == '1'
+        run: conan profile show -pr:a=ci/conan/linux-gcc13.profile
+
+      - name: Restore Conan cache (github-hosted only)
+        if: runner.environment == 'github-hosted' && steps.presence.outputs.exists == '1'
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/conan2
+          key: conan2-ubuntu24-gcc13-ltc-g3a-${{ hashFiles('conanfile.txt', 'ci/conan/linux-gcc13.profile', 'conan.lock') }}
+          restore-keys: |
+            conan2-ubuntu24-gcc13-ltc-g3a-
+            conan2-ubuntu24-gcc13-
+
+      - name: Clean stale build dir (self-hosted workspace is reused)
+        if: steps.presence.outputs.exists == '1' && runner.environment != 'github-hosted'
+        run: rm -rf build_g3a
+
+      - name: Run G3a populated block-production gate (ltc/doge-lane TEST_ENTRYPOINT)
+        if: steps.presence.outputs.exists == '1'
+        env:
+          BUILD_DIR: ${{ github.workspace }}/build_g3a
+          LTC_RPC_PASS: ${{ secrets.LTC_RPC_PASS }}
+          DOGE_RPC_PASS: ${{ secrets.DOGE_RPC_PASS }}
+        run: bash tests/gates/ltc_g3a_regtest_block_production.sh
+
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace
