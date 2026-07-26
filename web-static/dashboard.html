@@ -5847,8 +5847,8 @@
                         html += '<div class="tt-block" style="color:#ff8000;border-color:rgba(255,128,0,0.4)">TWIN BLOCK — LEGENDARY</div>';
                     } else {
                         var blockLabel = [];
-                        if (isLtcBlock) blockLabel.push('<span style="color:#ffd700">LTC BLOCK</span>');
-                        if (isDogeBlock) blockLabel.push('<span style="color:#00e5ff">DOGE BLOCK</span>');
+                        if (isLtcBlock) blockLabel.push('<span style="color:#ffd700">' + (((typeof currency_info!=="undefined"&&currency_info.symbol)||"LTC").toUpperCase()) + ' BLOCK</span>');
+                        if (isDogeBlock) blockLabel.push('<span style="color:#00e5ff">' + (((typeof currency_info!=="undefined"&&currency_info.merged_child_symbol)||"DOGE").toUpperCase()) + ' BLOCK</span>');
                         html += '<div class="tt-block">' + blockLabel.join(' ') + '</div>';
                     }
                 }
