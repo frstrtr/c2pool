@@ -393,7 +393,7 @@ complete examples with all options documented.
 | -- | `explorer_url` | -- | Explorer URL injected into dashboard nav (e.g. `http://localhost:9090`) |
 | -- | `explorer_depth_ltc` | 288 | LTC blocks to keep in explorer store |
 | -- | `explorer_depth_doge` | 1440 | DOGE blocks to keep in explorer store |
-| `--coinbase-text` | `coinbase_text` | /c2pool/ | Custom coinbase scriptSig text |
+| `--coinbase-text` | `coinbase_text` | see below | Custom coinbase scriptSig text |
 | `--message-blob-hex` | -- | -- | V36 authority message blob |
 | `--doge-testnet4alpha` | `doge_testnet4alpha` | false | Use DOGE testnet4alpha |
 
@@ -465,7 +465,7 @@ Every block found by c2pool embeds structured data in the coinbase scriptSig:
 ```
 [4]  BIP34 block height (consensus)
 [44] AuxPoW merged mining commitment (when active)
-[N]  Operator text (--coinbase-text, default "/c2pool/")
+[N]  Operator text (--coinbase-text, see per-lane defaults below)
 [32] THE state root (sharechain state commitment)
 [M]  THE metadata (pool analytics, fills remaining space)
      Total: 100 bytes (Bitcoin consensus limit)
@@ -474,6 +474,29 @@ Every block found by c2pool embeds structured data in the coinbase scriptSig:
 The THE state root commits the sharechain state at block-find time (PPLNS
 distribution, chain height, difficulty). Any node can verify a found block's
 payouts match the committed state root.
+
+### Operator text defaults
+
+`--coinbase-text` is capped at 64 bytes (20 when merged mining is active, since
+the AuxPoW commitment shares the same 100-byte budget).
+
+| Lane | Default operator text |
+|------|-----------------------|
+| LTC (`c2pool`) | `/c2pool/` |
+| DASH (`c2pool-dash`) mainnet | `/P2Pool-DASH/c2pool/` |
+| DASH (`c2pool-dash`) testnet / regtest | `/P2Pool-tDASH/c2pool/` |
+
+The DASH default embeds the canonical p2pool marker (`COINBASEEXT` from the
+p2pool-dash oracle `networks/dash.py`) because block explorers attribute blocks
+to a pool by coinbase text — [chainz.cryptoid.info](https://chainz.cryptoid.info/dash/extraction.dws?30.htm)
+lists the pool as `P2Pool-DASH` and does not know the string `c2pool`. The
+`c2pool/` suffix records which implementation mined the block. The coinbase text
+is not consensus-bearing (peers never re-derive it), so overriding it cannot
+orphan a share — but an override that drops `/P2Pool-DASH/` makes your blocks
+unattributable on explorers.
+
+DASH sources this default from its coin SSOT (`src/impl/dash/config_pool.hpp`);
+the same pattern is available for the other lanes but is not yet wired there.
 
 ---
 

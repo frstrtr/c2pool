@@ -46,6 +46,7 @@
 #include <impl/dash/coin/subsidy.hpp>
 
 #include <core/coin_params.hpp>
+#include <core/coinbase_builder.hpp>       // c2pool::MAX_OPERATOR_TEXT_SOLO (--coinbase-text budget SSOT)
 #include <core/core_util.hpp>              // raise_nofile_limit (hotel interim fix #4)
 #include <core/uint256.hpp>
 #include <core/netaddress.hpp>             // NetService (dashd RPC endpoint)
@@ -220,7 +221,7 @@ void print_banner(const char* argv0)
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
         << "           [--redistribute pplns|fee|boost|donate]\n"
         << "           [--coin-zmq-hashblock tcp://HOST:PORT]\n"
-        << "           [--message-blob-hex HEX]\n"
+        << "           [--message-blob-hex HEX] [--coinbase-text TEXT]\n"
         << "       " << argv0 << " --mine-block [--coin-rpc H:P] [--coin-rpc-auth PATH]\n"
         << "           [--testnet] [--payout-pubkey-hash HEX] [--max-nonce N]\n\n"
         << "Status: consensus layer live (X11 PoW, subsidy, oracle CoinParams).\n"
@@ -244,6 +245,16 @@ void print_banner(const char* argv0)
         << "        (default mainnet bf0c6bbd / testnet cee2caff; regtest fcc1b7dc).\n"
         << "        --regtest-force-won-block (regtest E5 harness, fail-closed) drives\n"
         << "        ONE real won block through the run-path dual-path dispatch.\n"
+        << "        --coinbase-text TEXT sets the coinbase scriptSig text written\n"
+        << "        after the BIP34 height push (README \"Coinbase structure\"; max\n"
+        << "        64 bytes, no merged mining on the DASH lane). Default\n"
+        << "        \"/P2Pool-DASH/c2pool/\" (testnet \"/P2Pool-tDASH/c2pool/\") --\n"
+        << "        the /P2Pool-DASH/ marker is what block explorers match on to\n"
+        << "        attribute a block to this pool; the c2pool suffix says which\n"
+        << "        implementation mined it. Non-consensus: the coinbase text is\n"
+        << "        never re-derived by peers, so overriding it cannot orphan a\n"
+        << "        share -- but an override that drops /P2Pool-DASH/ makes your\n"
+        << "        blocks unattributable on explorers.\n"
         << "        --coin-p2p-discover arms the DASH-isolated peer manager: seed\n"
         << "        (dnsseed.dash.org + fixed) bootstrap, source-scored + group-diverse\n"
         << "        (Sybil-capped) peer selection, anchors, and a self-healing dial\n"
@@ -507,6 +518,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // linkable and --run opens an actual socket instead of only echoing the
     // topology. Mirrors the dgb::Node bring-up (src/c2pool/main_dgb.cpp).
     dash::SharechainConfig::is_testnet = testnet;
+
+    // Effective coinbase scriptSig text, resolved from the coin SSOT (operator
+    // --coinbase-text override, else the network default). Logged at startup so
+    // the bytes explorers will see are visible without decoding a block.
+    std::cout << "[run] coinbase text: \""
+              << dash::SharechainConfig::coinbase_text(testnet) << "\""
+              << (dash::SharechainConfig::coinbase_text_override.empty()
+                      ? " (default; --coinbase-text to customize)"
+                      : " (--coinbase-text override)")
+              << "\n";
 
     // Bucket-1 ISOLATION PRIMITIVE: DASH keeps its own net subdir + PREFIX,
     // per-coin AND per-pool-instance, in v36 and v37 — never standardised.
@@ -1529,8 +1550,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             work.m_coinbase_value, work.m_packed_payments, payout_pkh,
                             empty_weights, /*total_weight=*/0, params);
                         auto layout = dash::coinbase::build(
-                            work, tx_outs, /*pool_tag=*/"c2pool", params,
-                            /*ref_hash=*/uint256::ZERO);
+                            work, tx_outs,
+                            /*coinbase_text=*/dash::SharechainConfig::coinbase_text(params.is_testnet),
+                            params, /*ref_hash=*/uint256::ZERO);
                         // 3) X11-mine to satisfy the template bits.
                         dash::coin::MineResult mr = dash::coin::mine_block(
                             work, layout.bytes, /*max_nonce=*/2000000ull);
@@ -1852,7 +1874,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     guard->chain, mint_params, prev_share_hash,
                     identity->payout_script, wd,
                     static_cast<uint32_t>(std::time(nullptr)), share_nonce,
-                    identity->donation_u16, /*pool_tag=*/"c2pool",
+                    identity->donation_u16,
+                    /*coinbase_text=*/dash::SharechainConfig::coinbase_text(mint_params.is_testnet),
                     local_hash_rate);
                 if (!built)
                     return std::nullopt;
@@ -3459,8 +3482,10 @@ int run_mine_block(bool testnet, const std::string& rpc_endpoint,
         empty_weights, /*total_weight=*/0, params);
     // ref_hash is the PPLNS commitment; for a standalone producer block we use
     // zero (no sharechain commitment) -- consensus-irrelevant to dashd validity.
-    auto layout = dash::coinbase::build(work, tx_outs, /*pool_tag=*/"c2pool",
-                                        params, /*ref_hash=*/uint256::ZERO);
+    auto layout = dash::coinbase::build(
+        work, tx_outs,
+        /*coinbase_text=*/dash::SharechainConfig::coinbase_text(params.is_testnet),
+        params, /*ref_hash=*/uint256::ZERO);
     std::cout << "[mine] coinbase built: " << layout.bytes.size()
               << " bytes, " << tx_outs.size() << " outputs\n";
 
@@ -3533,6 +3558,7 @@ int main(int argc, char** argv)
     uint16_t    stratum_port = 0;              // 0 disables the Stratum accept-loop; --stratum sets it
     bool embedded_utxo = false;                // --embedded-utxo: arm the E2b UTXO/fee lane (opt-in)
     double dev_donation = 0.1;                 // --give-author (donation_percentage; README default 0.1%)
+    std::string coinbase_text;                 // --coinbase-text (empty => network default from the SSOT)
     double node_owner_fee = 0.0;               // -f / --fee (node_owner_fee; default 0)
     std::string node_owner_address;            // --node-owner-address (fee destination)
     // Web dashboard (the EXISTING c2pool dashboard, same defaults as main_ltc.cpp:
@@ -3603,6 +3629,8 @@ int main(int argc, char** argv)
             embedded_superblock = true;
         else if (std::strcmp(argv[i], "--embedded-utxo") == 0)
             embedded_utxo = true;
+        else if (std::strcmp(argv[i], "--coinbase-text") == 0 && i + 1 < argc)
+            coinbase_text = argv[++i];
         else if ((std::strcmp(argv[i], "--give-author") == 0 ||
                   std::strcmp(argv[i], "--dev-donation") == 0) && i + 1 < argc)
             dev_donation = std::strtod(argv[++i], nullptr);
@@ -3649,6 +3677,23 @@ int main(int argc, char** argv)
             }
         }
         // --selftest is the default; accepted explicitly for symmetry.
+    }
+
+    // ── --coinbase-text: resolve ONCE, here, before any coinbase is built ────
+    // DASH has no merged mining and writes no THE state-root/metadata tail, so
+    // the operator slot is bounded by MAX_OPERATOR_TEXT_SOLO (README "Coinbase
+    // structure"); the BIP34 height push (<=5 B) plus 64 B stays well inside the
+    // 100-byte scriptSig limit. Stored on the coin SSOT rather than threaded
+    // through every call so the stratum job path and the share-mint path cannot
+    // disagree -- a one-byte divergence between them would make the node
+    // self-reject its own shares.
+    if (!coinbase_text.empty()) {
+        if (coinbase_text.size() > c2pool::MAX_OPERATOR_TEXT_SOLO) {
+            std::cout << "[args] --coinbase-text too long: " << coinbase_text.size()
+                      << " bytes (max " << c2pool::MAX_OPERATOR_TEXT_SOLO << ")\n";
+            return 2;
+        }
+        dash::SharechainConfig::coinbase_text_override = coinbase_text;
     }
 
     print_banner(argv[0]);

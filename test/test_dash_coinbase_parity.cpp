@@ -29,6 +29,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -243,4 +244,296 @@ TEST(DashCoinbaseParity, V36DonationFloorOneSat) {
 
     uint64_t sum = 0; for (auto& o : outs) sum += o.amount;
     EXPECT_EQ(sum, subsidy);                            // invariant preserved
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (11)-(19) Coinbase text — the canonical p2pool marker + --coinbase-text.
+//
+// Block explorers attribute blocks to a pool BY COINBASE TEXT.
+// chainz.cryptoid.info/dash/extraction.dws?30.htm registers the pool as
+// "P2Pool-DASH"; it has no knowledge of the string "c2pool". Before this,
+// c2pool's DASH coinbase read `03c751266332706f6f6c` = BIP34 height + "c2pool",
+// so blocks the pool won through c2pool (2511241, 2511303) were attributed to
+// nobody. The default coinbase text is now the oracle COINBASEEXT payload
+// ("/P2Pool-DASH/", networks/dash.py:11) plus a "c2pool/" implementation tag,
+// sourced from the coin SSOT (config_pool.hpp) and overridable per-pool with
+// --coinbase-text.
+//
+// NOT consensus-bearing: the coinbase text is a customizable parameter.
+// COINBASEEXT appears nowhere in the oracle's data.py; the scriptSig travels as
+// share_info.share_data.coinbase and Share.check() re-derives the gentx from the
+// RECEIVED share's own coinbase field. What these tests DO guard is FRAMING —
+// the BIP34 height push must stay first, the 100-byte bound must hold, and the
+// stratum extranonce2 slot must not move.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// Oracle marker payloads, transcribed independently of config_pool.hpp so a
+// silent edit to the SSOT cannot silently move these KATs with it.
+//   networks/dash.py:11          '0D2F5032506F6F6C2D444153482F' = 0x0D "/P2Pool-DASH/"
+//   networks/dash_testnet.py:11  '0E2F5032506F6F6C2D74444153482F' = 0x0E "/P2Pool-tDASH/"
+const std::string kOracleMarkerMain = "/P2Pool-DASH/";
+const std::string kOracleMarkerTest = "/P2Pool-tDASH/";
+
+std::string ascii(const std::vector<unsigned char>& v) {
+    return std::string(v.begin(), v.end());
+}
+
+// RAII for the pool-level --coinbase-text override: it is a process global, so
+// one test must not leak into the next.
+struct ScopedCoinbaseText {
+    std::string saved;
+    explicit ScopedCoinbaseText(const std::string& v)
+        : saved(dash::SharechainConfig::coinbase_text_override) {
+        dash::SharechainConfig::coinbase_text_override = v;
+    }
+    ~ScopedCoinbaseText() {
+        dash::SharechainConfig::coinbase_text_override = saved;
+    }
+};
+
+} // namespace
+
+// (11) MAINNET KAT — exact scriptSig bytes at the real height of the block the
+//      pool won on 2026-07-24 (2511303 = 0x2651c7 -> BIP34 push `03 c7 51 26`).
+TEST(DashCoinbaseMarker, MainnetScriptSigKAT) {
+    ScopedCoinbaseText no_override("");
+    auto s = dash::coinbase::build_coinbase_scriptsig(
+        /*height=*/2511303, /*coinbase_text=*/"", /*testnet=*/false);
+
+    EXPECT_EQ(hex(s),
+              "03c75126"                                    // BIP34 push3, height 2511303 LE
+              "2f5032506f6f6c2d444153482f6332706f6f6c2f");  // "/P2Pool-DASH/c2pool/"
+    EXPECT_EQ(s.size(), 24u);
+    EXPECT_EQ(ascii(s).substr(4), "/P2Pool-DASH/c2pool/");
+    // The marker an explorer matches on is present verbatim.
+    EXPECT_NE(ascii(s).find(kOracleMarkerMain), std::string::npos);
+}
+
+// (12) TESTNET KAT — the tDASH variant, never the mainnet string. (c2pool has
+//      no separate regtest sharechain profile: main_dash.cpp maps --regtest
+//      onto testnet=true, so regtest emits these same bytes.)
+TEST(DashCoinbaseMarker, TestnetScriptSigKAT) {
+    ScopedCoinbaseText no_override("");
+    auto s = dash::coinbase::build_coinbase_scriptsig(
+        /*height=*/950000, /*coinbase_text=*/"", /*testnet=*/true);
+
+    EXPECT_EQ(hex(s),
+              "03f07e0e"                                      // BIP34 push3, height 950000 LE
+              "2f5032506f6f6c2d74444153482f6332706f6f6c2f");  // "/P2Pool-tDASH/c2pool/"
+    EXPECT_EQ(s.size(), 25u);
+    EXPECT_EQ(ascii(s).substr(4), "/P2Pool-tDASH/c2pool/");
+    EXPECT_NE(ascii(s).find(kOracleMarkerTest), std::string::npos);
+    // Testnet must NOT carry the mainnet marker.
+    EXPECT_EQ(ascii(s).find(kOracleMarkerMain), std::string::npos);
+}
+
+// (13) NEGATIVE CONTROL — the bytes c2pool used to emit. This is the exact
+//      scriptSig observed on live mainnet block 2511303 before the change; it
+//      must satisfy none of the assertions above, proving they discriminate.
+TEST(DashCoinbaseMarker, LegacyBareTagIsNotAttributable) {
+    ScopedCoinbaseText no_override("");
+
+    // Reconstruct the pre-change form: BIP34 height + raw "c2pool", no marker.
+    std::vector<unsigned char> legacy = dash::coinbase::push_bip34_height(2511303);
+    for (char c : std::string("c2pool"))
+        legacy.push_back(static_cast<unsigned char>(c));
+
+    EXPECT_EQ(hex(legacy), "03c751266332706f6f6c");     // as seen on-chain
+    EXPECT_EQ(ascii(legacy).find("P2Pool"), std::string::npos);
+    EXPECT_EQ(ascii(legacy).find(kOracleMarkerMain), std::string::npos);
+
+    auto now = dash::coinbase::build_coinbase_scriptsig(2511303, "", false);
+    EXPECT_NE(hex(now), hex(legacy));
+    // The BIP34 height push is byte-identical across old and new — the text is
+    // appended, never displacing dashd's ContextualCheckBlock prefix.
+    EXPECT_EQ(hex(now).substr(0, 8), hex(legacy).substr(0, 8));
+}
+
+// (14) SSOT wiring — config_pool.hpp carries the oracle hex verbatim (push
+//      opcode included) and coinbaseext_text() strips exactly that opcode.
+TEST(DashCoinbaseMarker, ConfigPoolCarriesOracleConstant) {
+    EXPECT_EQ(dash::SharechainConfig::COINBASEEXT_HEX,
+              "0D2F5032506F6F6C2D444153482F");
+    EXPECT_EQ(dash::SharechainConfig::TESTNET_COINBASEEXT_HEX,
+              "0E2F5032506F6F6C2D74444153482F");
+
+    // Raw oracle bytes: leading push opcode == payload length.
+    const std::string m = dash::SharechainConfig::coinbaseext_bytes(false);
+    ASSERT_EQ(m.size(), 14u);
+    EXPECT_EQ(static_cast<unsigned char>(m[0]), 0x0D);
+    EXPECT_EQ(m.size() - 1, static_cast<size_t>(static_cast<unsigned char>(m[0])));
+    const std::string t = dash::SharechainConfig::coinbaseext_bytes(true);
+    ASSERT_EQ(t.size(), 15u);
+    EXPECT_EQ(static_cast<unsigned char>(t[0]), 0x0E);
+    EXPECT_EQ(t.size() - 1, static_cast<size_t>(static_cast<unsigned char>(t[0])));
+
+    // Text form == the ASCII an explorer reads.
+    EXPECT_EQ(dash::SharechainConfig::coinbaseext_text(false), kOracleMarkerMain);
+    EXPECT_EQ(dash::SharechainConfig::coinbaseext_text(true),  kOracleMarkerTest);
+
+    EXPECT_EQ(dash::SharechainConfig::default_coinbase_text(false),
+              "/P2Pool-DASH/c2pool/");
+    EXPECT_EQ(dash::SharechainConfig::default_coinbase_text(true),
+              "/P2Pool-tDASH/c2pool/");
+}
+
+// (15) --coinbase-text override: the operator value replaces the default on
+//      BOTH the explicit-argument path and the SSOT-resolved path, and the
+//      default returns once the override is cleared.
+TEST(DashCoinbaseMarker, OperatorOverrideReplacesDefault) {
+    {
+        ScopedCoinbaseText ov("/my-pool/");
+        EXPECT_EQ(dash::SharechainConfig::coinbase_text(false), "/my-pool/");
+        auto s = dash::coinbase::build_coinbase_scriptsig(2511303, "", false);
+        EXPECT_EQ(hex(s), "03c75126" "2f6d792d706f6f6c2f");   // "/my-pool/"
+        EXPECT_EQ(ascii(s).find(kOracleMarkerMain), std::string::npos);
+
+        // An explicit non-empty argument still wins over the pool setting —
+        // that is what the E5/--mine-block call sites pass.
+        auto e = dash::coinbase::build_coinbase_scriptsig(2511303, "/other/", false);
+        EXPECT_EQ(ascii(e).substr(4), "/other/");
+    }
+    // Override scope ended -> default restored.
+    ScopedCoinbaseText no_override("");
+    EXPECT_EQ(dash::SharechainConfig::coinbase_text(false), "/P2Pool-DASH/c2pool/");
+}
+
+// (16) 100-byte bound + BIP34 integrity under an absurd text. The oracle rejects
+//      share_data['coinbase'] outside 2..100 bytes (data.py:315) and work.py
+//      slices [:100]; the height push must survive both.
+TEST(DashCoinbaseMarker, TruncationRespectsBoundAndKeepsHeightPush) {
+    ScopedCoinbaseText no_override("");
+    const std::string absurd(400, 'X');
+    auto s = dash::coinbase::build_coinbase_scriptsig(2511303, absurd, false);
+
+    EXPECT_EQ(s.size(), dash::coinbase::MAX_SCRIPTSIG_LEN);   // exactly 100, never more
+    EXPECT_GE(s.size(), 2u);
+    // BIP34 height push intact and still FIRST.
+    auto h = dash::coinbase::push_bip34_height(2511303);
+    ASSERT_GE(s.size(), h.size());
+    EXPECT_TRUE(std::equal(h.begin(), h.end(), s.begin()));
+
+    // Worst-case BIP34 push is 5 bytes (4-byte CScriptNum + length); even then
+    // the default text is nowhere near the cap, and --coinbase-text is bounded
+    // at c2pool::MAX_OPERATOR_TEXT_SOLO (64) by main_dash.cpp.
+    auto tall = dash::coinbase::push_bip34_height(0x7FFFFFFFu);
+    EXPECT_EQ(tall.size(), 5u);
+    auto s2 = dash::coinbase::build_coinbase_scriptsig(0x7FFFFFFFu, "", false);
+    EXPECT_EQ(s2.size(), 5u + 20u);
+    EXPECT_LT(5u + 64u, dash::coinbase::MAX_SCRIPTSIG_LEN);
+    EXPECT_NE(ascii(s2).find(kOracleMarkerMain), std::string::npos);
+}
+
+// (17) END-TO-END: the text actually lands in the coinbase TX that
+//      coinbase::build() serializes (this is the tx a winning miner submits).
+//      Fixed tx prefix: [version 4][vin count 1][prev_hash 32][prev_n 4] = 41
+//      bytes, so the scriptSig VarStr length byte sits at offset 41.
+TEST(DashCoinbaseMarker, BuildEmitsMarkerInSerializedCoinbase) {
+    ScopedCoinbaseText no_override("");
+    auto params = dash::make_coin_params(/*testnet=*/false);
+    ASSERT_FALSE(params.is_testnet);
+
+    dash::coin::DashWorkData work;
+    work.m_height         = 2511303;
+    work.m_coinbase_value = 5000000000ull;
+    work.m_bits           = 0x1b0404cb;
+
+    std::vector<unsigned char> finder_h(20, 0x07);
+    auto tx_outs = dash::coinbase::compute_dash_payouts(
+        work.m_coinbase_value, /*payments=*/{}, uint160(finder_h),
+        /*weights=*/{}, /*total_weight=*/0, params);
+
+    auto layout = dash::coinbase::build(
+        work, tx_outs,
+        dash::SharechainConfig::coinbase_text(params.is_testnet),
+        params, uint256::ZERO);
+
+    const auto expected = dash::coinbase::build_coinbase_scriptsig(
+        work.m_height, /*coinbase_text=*/"", params.is_testnet);
+
+    ASSERT_GT(layout.bytes.size(), 41u + 1u + expected.size());
+    EXPECT_EQ(layout.bytes[41], static_cast<unsigned char>(expected.size()));
+    std::vector<unsigned char> on_wire(layout.bytes.begin() + 42,
+                                       layout.bytes.begin() + 42 + expected.size());
+    EXPECT_EQ(hex(on_wire), hex(expected));
+    EXPECT_EQ(hex(on_wire),
+              "03c751262f5032506f6f6c2d444153482f6332706f6f6c2f");
+
+    // FRAMING: the split point is derived from the tx TAIL, so a longer
+    // scriptSig cannot move the 8-byte extranonce2 slot — coinb2 stays
+    // [locktime||payload] and the advertised extranonce2_size is unchanged.
+    auto split = dash::coinbase::split_coinb(layout);
+    EXPECT_EQ(dash::coinbase::EXTRANONCE2_SIZE, 8u);
+    EXPECT_EQ(split.coinb1_hex.size(), layout.nonce64_offset * 2);
+    EXPECT_EQ(split.coinb2_hex.size(),
+              (layout.bytes.size() - layout.nonce64_offset - 8) * 2);
+    EXPECT_EQ(split.coinb2_hex, "00000000");            // locktime only, no payload
+    EXPECT_EQ(layout.nonce64_offset, layout.ref_hash_offset + 32);
+}
+
+// (18) Testnet params select the testnet text end-to-end (build() reads
+//      params.is_testnet, not the mutable process-global).
+TEST(DashCoinbaseMarker, BuildHonoursTestnetParams) {
+    ScopedCoinbaseText no_override("");
+    auto params = dash::make_coin_params(/*testnet=*/true);
+    ASSERT_TRUE(params.is_testnet);
+
+    dash::coin::DashWorkData work;
+    work.m_height         = 950000;
+    work.m_coinbase_value = 5000000000ull;
+
+    std::vector<unsigned char> finder_h(20, 0x07);
+    auto tx_outs = dash::coinbase::compute_dash_payouts(
+        work.m_coinbase_value, /*payments=*/{}, uint160(finder_h),
+        /*weights=*/{}, /*total_weight=*/0, params);
+    auto layout = dash::coinbase::build(
+        work, tx_outs,
+        dash::SharechainConfig::coinbase_text(params.is_testnet),
+        params, uint256::ZERO);
+
+    const size_t len = layout.bytes[41];
+    std::vector<unsigned char> on_wire(layout.bytes.begin() + 42,
+                                       layout.bytes.begin() + 42 + len);
+    EXPECT_EQ(hex(on_wire),
+              "03f07e0e2f5032506f6f6c2d74444153482f6332706f6f6c2f");
+    EXPECT_EQ(ascii(on_wire).find(kOracleMarkerMain), std::string::npos);
+}
+
+// (19) The SHARE-MINT path and the BLOCK-COINBASE path derive their scriptSig
+//      from the same helper. If they ever disagree by one byte the minted
+//      share's gentx stops matching the block coinbase and the node
+//      self-rejects, so pin the equality explicitly: what mint_runloop.hpp
+//      writes into share_data['coinbase'] is exactly what build() serializes.
+TEST(DashCoinbaseMarker, MintAndBlockCoinbaseScriptSigsAgree) {
+    ScopedCoinbaseText no_override("");
+    for (bool testnet : {false, true}) {
+        auto params = dash::make_coin_params(testnet);
+        dash::coin::DashWorkData work;
+        work.m_height         = testnet ? 950000u : 2511303u;
+        work.m_coinbase_value = 5000000000ull;
+
+        const std::string resolved =
+            dash::SharechainConfig::coinbase_text(params.is_testnet);
+
+        // mint_runloop.hpp::build_producer_job body, verbatim.
+        auto mint_sig = dash::coinbase::build_coinbase_scriptsig(
+            work.m_height, resolved, params.is_testnet);
+        ASSERT_GE(mint_sig.size(), 2u);
+        ASSERT_LE(mint_sig.size(), dash::coinbase::MAX_SCRIPTSIG_LEN);
+
+        std::vector<unsigned char> finder_h(20, 0x07);
+        auto tx_outs = dash::coinbase::compute_dash_payouts(
+            work.m_coinbase_value, /*payments=*/{}, uint160(finder_h),
+            /*weights=*/{}, /*total_weight=*/0, params);
+        auto layout = dash::coinbase::build(
+            work, tx_outs, resolved, params, uint256::ZERO);
+
+        const size_t len = layout.bytes[41];
+        std::vector<unsigned char> block_sig(
+            layout.bytes.begin() + 42, layout.bytes.begin() + 42 + len);
+        EXPECT_EQ(hex(block_sig), hex(mint_sig)) << "testnet=" << testnet;
+    }
 }

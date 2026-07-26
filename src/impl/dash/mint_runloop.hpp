@@ -33,7 +33,7 @@
 
 #include "share_producer.hpp"
 #include "share_producer_bind.hpp"     // FrozenMintJob, build_mint_share
-#include "coinbase_builder.hpp"        // push_bip34_height (BIP34 scriptSig SSOT)
+#include "coinbase_builder.hpp"        // build_coinbase_scriptsig (BIP34 + coinbase-text SSOT)
 #include "coin/rpc_data.hpp"           // dash::coin::DashWorkData
 #include "stratum/work_source.hpp"     // DASHWorkSource::{MintShareInputs, ProducerJob, PplnsWeights}
 #include "stratum/work_target.hpp"     // dash::stratum::modulate_desired_share_target (Cap 1)
@@ -125,7 +125,7 @@ inline std::optional<ProducerJobBuild> build_producer_job(
     uint32_t desired_timestamp,
     uint32_t share_nonce,
     uint16_t donation,
-    const std::string& pool_tag,
+    const std::string& coinbase_text,
     double local_hash_rate = 0.0)
 {
     // Miner identity: DASH sharechain payouts are P2PKH-keyed (share_data
@@ -137,16 +137,17 @@ inline std::optional<ProducerJobBuild> build_producer_job(
     if (wd.m_bits == 0 || wd.m_height == 0)
         return std::nullopt;   // no real template -> nothing to commit to
 
-    // share_data['coinbase'] — BIP34 height push + pool tag, capped at the
-    // verifier's 100-byte scriptSig bound (oracle work.py packs height+flags
-    // and slices [:100]). push_bip34_height is the same SSOT coinbase::build
-    // uses, so the share-gentx scriptSig matches dashd's bad-cb-height check.
-    std::vector<unsigned char> script_sig = dash::coinbase::push_bip34_height(wd.m_height);
-    for (char c : pool_tag) {
-        if (script_sig.size() >= 100) break;
-        script_sig.push_back(static_cast<unsigned char>(c));
-    }
-    if (script_sig.size() < 2 || script_sig.size() > 100)
+    // share_data['coinbase'] — BIP34 height push + the pool's coinbase text
+    // (default "/P2Pool-DASH/c2pool/"), capped at the verifier's 100-byte
+    // scriptSig bound (oracle work.py packs height+flags+COINBASEEXT and slices
+    // [:100]). build_coinbase_scriptsig is the SHARED SSOT coinbase::build uses, so
+    // this share-gentx scriptSig is byte-identical to the block coinbase served
+    // over stratum (a divergence here would make the node self-reject its own
+    // shares) and still carries dashd's bad-cb-height BIP34 prefix first.
+    std::vector<unsigned char> script_sig =
+        dash::coinbase::build_coinbase_scriptsig(wd.m_height, coinbase_text, params.is_testnet);
+    if (script_sig.size() < 2 ||
+        script_sig.size() > dash::coinbase::MAX_SCRIPTSIG_LEN)
         return std::nullopt;   // verifier bound (share_check) — fail-closed
 
     dash::producer::ProducerJobInputs pin;
