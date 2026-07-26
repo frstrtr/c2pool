@@ -1331,6 +1331,12 @@ int main(int argc, char* argv[])
                 if (job.tx_data)
                     for (const auto& tx_hex : *job.tx_data)
                         tmpl_txs.push_back(nlohmann::json::object({{"data", tx_hex}}));
+                // F3: hand the template's tx set to the node (which owns
+                // m_known_txs and takes its own lock) so every tx this share's
+                // template committed to is forwardable and the share is backable
+                // BEFORE we broadcast it. Must precede the capture move.
+                p2p_node_raw->register_template_txs(share_hash, tmpl_txs);
+
                 template_capture.capture(share_hash, std::move(tmpl_txs));
 
                 p2p_node_raw->broadcast_share(share_hash);

@@ -25,6 +25,8 @@
 #include <shared_mutex>
 #include <random>
 #include <thread>
+#include <set>
+#include <nlohmann/json.hpp>
 
 namespace btc
 {
@@ -63,6 +65,18 @@ protected:
     // disconnect). Tx-forwarding only; no consensus/mint state. See
     // core::evict_known_txs_to_cap (core/known_txs_eviction.hpp).
     std::deque<uint256> m_known_txs_order;
+
+    // F3 template-tx retention window (btc::retain_template_txs). Rolling
+    // history of the last kTemplateRetainCap DISTINCT locally-minted templates'
+    // tx-hash SETS; register_template_txs feeds each freshly-minted share's
+    // template txs here so their bytes live in m_known_txs and every referenced
+    // new-tx stays forwardable (the F3 backable invariant). Guarded by
+    // m_tracker_mutex like m_known_txs. Template txs are lifecycle-owned by this
+    // window (erased only when they fall out of every retained set) and are
+    // deliberately NOT enrolled in m_known_txs_order, so the global cap eviction
+    // and this window never fight over the same entries. Tx-forwarding only.
+    std::deque<std::set<uint256>> m_template_recent_sets;
+    static constexpr std::size_t kTemplateRetainCap = 8;
 
     // Thread pool for parallel share_init_verify (scrypt CPU work).
     // Keeps expensive crypto off the io_context thread.
@@ -366,6 +380,16 @@ public:
     /// Send a set of shares (with any needed txs) to a single peer.
     /// Skips shares that originated from that peer.
     void send_shares(peer_ptr peer, const std::vector<uint256>& share_hashes);
+
+    /// F3: retain a freshly-minted share's TEMPLATE tx set so every referenced
+    /// new-tx is forwardable (remember_tx) and the share is backable. Called
+    /// from create_share_fn on the stratum thread; it hands us the template tx
+    /// set (GBT transactions[] json) and NOTHING else — ownership of m_known_txs
+    /// stays here, and this takes m_tracker_mutex internally (the heavy hex
+    /// decode happens BEFORE the lock). See DASH #828: unlocked cross-thread
+    /// reads of node-owned structures racing think() are a live crash class.
+    void register_template_txs(const uint256& share_hash,
+                               const nlohmann::json& template_txs);
 
     /// Broadcast a locally-generated (or newly-received) share to all peers.
     void broadcast_share(const uint256& share_hash);

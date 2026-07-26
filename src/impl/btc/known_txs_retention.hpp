@@ -114,4 +114,23 @@ inline bool all_txs_backable(const std::vector<uint256>& tx_hashes,
     return true;
 }
 
+// F3 send-gate over a batch: returns the indices of shares that are backable —
+// every referenced new-tx hash is held. send_shares transmits ONLY these and
+// withholds the rest (a share we cannot fully forward would trip the peer's
+// "referenced unknown transaction" disconnect). Pure so the wiring's withhold
+// decision is unit-testable: mutating this to admit-all (push every index)
+// reddens BtcSendGate.WithholdsShareMissingTemplateTx.
+template <typename Held>
+inline std::vector<std::size_t> select_backable_shares(
+    const std::vector<std::vector<uint256>>& per_share_refs,
+    const Held& held)
+{
+    std::vector<std::size_t> out;
+    out.reserve(per_share_refs.size());
+    for (std::size_t i = 0; i < per_share_refs.size(); ++i)
+        if (all_txs_backable(per_share_refs[i], held))
+            out.push_back(i);
+    return out;
+}
+
 } // namespace btc

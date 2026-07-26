@@ -99,3 +99,29 @@ TEST(BtcKnownTxsBackable, UnheldTxIsNotBackable)
     EXPECT_FALSE(btc::all_txs_backable(std::vector<uint256>{A, C}, held));  // C unheld -> withhold
     EXPECT_TRUE(btc::all_txs_backable(std::vector<uint256>{}, held));       // no refs -> trivially backable
 }
+
+
+// F3 WIRING (send_shares gate): send_shares extracts each share's referenced
+// new-tx hashes and transmits ONLY the backable ones via
+// btc::select_backable_shares(per_share_refs, m_known_txs). This exercises that
+// exact SSOT function against a std::map keyed like m_known_txs.
+//
+// Non-hollow guard: mutating select_backable_shares to admit-all (push every
+// index) makes this ASSERT_EQ(size, 2) go red; the correct gate drops share 1.
+TEST(BtcSendGate, WithholdsShareMissingTemplateTx)
+{
+    // Same value shape as NodeImpl::m_known_txs (map keyed by tx hash).
+    const std::map<uint256, int> held{{A, 1}, {B, 2}};
+
+    // Three shares' referenced-new-tx hash lists, in send order.
+    const std::vector<std::vector<uint256>> per_share_refs{
+        {A, B},   // share 0: both held        -> send
+        {A, C},   // share 1: C unheld         -> WITHHOLD
+        {},       // share 2: no refs (v35)    -> send (vacuously backable)
+    };
+
+    const auto sendable = btc::select_backable_shares(per_share_refs, held);
+    ASSERT_EQ(sendable.size(), 2u);   // exactly the unbacked share 1 is dropped
+    EXPECT_EQ(sendable[0], 0u);
+    EXPECT_EQ(sendable[1], 2u);       // share 2 kept, indices preserved
+}
