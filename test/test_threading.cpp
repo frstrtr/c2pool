@@ -557,8 +557,18 @@ TEST(VerifyShareThreading, Phase2HoldsLockAgainstComputePrune)
     auto io_body = [&] {
         for (int iter = 0; iter < 20000 && !stop.load(std::memory_order_relaxed); ++iter) {
             // processing_shares_phase2: hold lock across the mutation body.
+            // The first iteration acquires BLOCKING so at least one real
+            // acquisition + under-lock deref is GUARANTEED to exercise the
+            // invariant even when the compute thread monopolises the lock under
+            // sanitizer slowdown on a contended runner (io_ops would otherwise
+            // stay 0 and trip the self-check with nothing actually wrong —
+            // issue #883). Later iterations keep try_to_lock so the non-blocking
+            // defer path is still exercised.
             {
-                std::unique_lock<std::shared_mutex> lock(chain_mutex, std::try_to_lock);
+                std::unique_lock<std::shared_mutex> lock =
+                    (iter == 0)
+                        ? std::unique_lock<std::shared_mutex>(chain_mutex)
+                        : std::unique_lock<std::shared_mutex>(chain_mutex, std::try_to_lock);
                 if (!lock.owns_lock()) { defers.fetch_add(1); continue; }
                 for (auto& [id, node] : chain) {
                     node->touched.fetch_add(1, std::memory_order_relaxed); // deref UNDER lock
