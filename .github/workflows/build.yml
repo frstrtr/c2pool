@@ -1270,8 +1270,11 @@ jobs:
       - name: Assert the BLS-only KATs reported as run
         working-directory: build_dash_bls
         run: |
-          ./test/test_dash_bls_verify     > bls_kat.log 2>&1
-          ./test/test_dash_quorum_members >> bls_kat.log 2>&1
+          # `|| true`: pass/fail is already gated by the ctest step above. Here
+          # the only question is which cases EXIST, so a non-zero exit must not
+          # abort before the per-case report below is printed.
+          ./test/test_dash_bls_verify     > bls_kat.log 2>&1 || true
+          ./test/test_dash_quorum_members >> bls_kat.log 2>&1 || true
           log="$(cat bls_kat.log)"
           missing=0
           for t in \
