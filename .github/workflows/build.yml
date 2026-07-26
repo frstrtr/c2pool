@@ -475,6 +475,7 @@ jobs:
                     bch_coinbase_kat_segwit_predicate_test \
                     bch_coinbase_kat_bytevector_test \
                     bch_coinbase_author_kat_test \
+                    bch_donation_flip_kat_test \
                     bch_cashtokens_transparency_test \
                     bch_cashaddr_kat_test \
                     bch_block_connector_test bch_block_ordering_test \
@@ -609,6 +610,7 @@ jobs:
                     bch_coinbase_kat_segwit_predicate_test \
                     bch_coinbase_kat_bytevector_test \
                     bch_coinbase_author_kat_test \
+                    bch_donation_flip_kat_test \
                     bch_cashtokens_transparency_test \
                     bch_cashaddr_kat_test \
                     bch_block_connector_test bch_block_ordering_test \
