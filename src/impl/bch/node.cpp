@@ -1062,6 +1062,20 @@ uint256 NodeImpl::advertised_best_share()
     return uint256::ZERO;
 }
 
+// ROOT-2 re-advert. Unlike ltc/dgb (which have a dedicated readvertise that
+// bypasses the de-dup set), this delegates to broadcast_share, so the walk still
+// breaks on the first hash already in m_shared_share_hashes.
+//
+// Interaction with the F2 marking change: marking is now a strict SUBSET of what
+// the pre-fix code marked (only hashes a peer actually accepted). The walk breaks
+// later or in the same place, never earlier, so this re-advert re-pushes a
+// superset of what it used to — monotonically better, no regression. It is
+// strictly better in the case that motivated ROOT-2: head shares minted while no
+// peer was connected are no longer marked, so a peer that handshook during the
+// empty window now receives them. It does NOT fully close ROOT-2 here — head
+// shares already accepted by some OTHER peer stay marked and the walk still
+// breaks, exactly as before. Closing that needs the ltc/dgb-style de-dup-bypass
+// readvertise; pre-existing gap, out of scope for this change.
 void NodeImpl::readvertise_best()
 {
     if (m_peers.empty())

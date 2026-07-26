@@ -841,6 +841,12 @@ std::vector<uint256> NodeImpl::send_shares(peer_ptr peer,
     return sent;
 }
 
+// PRE-WIRING — NOT REACHED ON DGB TODAY (#884). main_dgb.cpp binds no
+// create/mint-share fn, so this function and notify_local_share have zero
+// callers repo-wide: DGB never mints a local share. The F2 mark-after-send fix
+// below is applied so the seam is correct on the day #884 binds the mint path,
+// and so btc/dgb/bch stay symmetric — it protects nothing at runtime yet. DGB's
+// LIVE send path is readvertise_best_share() above.
 void NodeImpl::broadcast_share(const uint256& share_hash)
 {
     // try_to_lock per the architectural rule (node.hpp:67) — see freeze
@@ -1116,16 +1122,19 @@ void NodeImpl::readvertise_best_share()
     if (to_send.empty())
         return;
 
+    // Advertise-only path: deliberately ignores the de-dup set, so nothing is
+    // marked here. But record only what was ACTUALLY written — a share the F3
+    // completeness gate withheld must not be blamed for a later peer drop, which
+    // would mark it rejected and make the walk above `continue` past it forever.
+    // This is DGB's LIVE reward-critical marking path; broadcast_share below is
+    // dead until the mint seam is bound (#884).
     auto now = std::chrono::steady_clock::now();
-    for (auto& [nonce, peer] : m_peers) {
-        // Advertise-only path: deliberately ignores the de-dup set, so nothing
-        // is marked here. Still record only what was ACTUALLY written — a
-        // gate-skipped share must not be blamed for a later peer drop (that
-        // would mark it rejected and block every future re-broadcast).
-        std::vector<uint256> sent = send_shares(peer, to_send);
-        if (!sent.empty())
+    readvertise_and_record(
+        m_peers, to_send,
+        [&](peer_ptr& peer) { return send_shares(peer, to_send); },
+        [&](peer_ptr& peer, const std::vector<uint256>& sent) {
             m_last_broadcast_to[peer->addr()] = {sent, now};
-    }
+        });
     LOG_INFO << "[readvertise] re-pushed " << to_send.size()
              << " head share(s) to " << m_peers.size() << " peer(s) (ROOT-2)";
 }
