@@ -1258,11 +1258,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
               << (run_arm.discover_implied ? " discovery=implied-by-opt-in" : "")
               << ")\n";
 
-    // ── E1: OPT-IN embedded coin-network P2P dial (--coin-p2p-connect) ────
-    // GUARANTEE: with no --coin-p2p-connect on argv, coin_p2p stays null and
-    // this block is a no-op — the run path is unchanged and the mining-hotel
-    // prod posture (NodeCoinState unpopulated -> dashd-RPC fallback) is
-    // untouched. The coin-network wire MAGIC (dashd pchMessageStart: mainnet
+    // ── E1: OPT-IN embedded coin-network P2P dial ─────────────────────────
+    // GUARANTEE: this block is a no-op unless the invocation asked for a
+    // coin-state feed — an explicit --coin-p2p-connect / --coin-p2p-discover,
+    // or the --embedded-mainnet opt-in that implies one (#738). With NONE of
+    // those on argv, coin_p2p stays null, the run path is unchanged and the
+    // mining-hotel prod posture (NodeCoinState unpopulated -> dashd-RPC
+    // fallback) is untouched. Arming the feed alone still does NOT move the
+    // arm: without --embedded-mainnet, work_source keeps serving the dashd
+    // fallback no matter what this block populates. The coin-network wire MAGIC (dashd pchMessageStart: mainnet
     // bf0c6bbd / testnet cee2caff, same constants as the slice-1 launcher
     // dispatch) is DISTINCT from the sharechain PREFIX set above — different
     // layers, never conflated. The client rides the SAME ioc as the
@@ -1418,8 +1422,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // holds a non-owning const ref to it). It is declared here, in run_node's
     // scope, BEFORE work_source; the explicit stratum_server.reset() after
     // ioc.run() tears the acceptor down while node_coin_state is still alive.
-    // Default (unpopulated) bundle: populated()==false, so get_work() takes the
-    // retained dashd-fallback arm -- correct + documented for the 4a standup.
+    // Constructed UNPOPULATED: populated()==false, so get_work() takes the
+    // retained dashd-fallback arm until a coin-state feed publishes a tip. With
+    // no feed armed (run_arm.coin_feed_armed == false) nothing ever publishes
+    // one, and the fallback arm is the whole run.
     //
     // E2b (#738) UTXO/fee lane: utxo_lane is declared BEFORE node_coin_state
     // deliberately -- attach() hands the lane's UTXOViewCache pointer to the
