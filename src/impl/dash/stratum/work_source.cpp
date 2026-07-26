@@ -816,6 +816,87 @@ nlohmann::json DASHWorkSource::mining_submit(
     // pseudoshare is instead recorded via record_best_pseudoshare(), which the
     // core stratum session calls on the vardiff-accept path.
 
+    // ── Sharechain mint (#887) ───────────────────────────────────────────────
+    // Assemble the found-share fields and hand them to the mint seam. SHARED by
+    // both accept classes: block_target <= share_target, so a solve that meets
+    // the block target meets the share target too — it is the highest-work
+    // share this node will ever produce, and the sharechain and the coin
+    // blockchain are independent systems. Before #887 the won-block arm
+    // returned without ever reaching the mint, forfeiting our own PPLNS weight
+    // in the very window the block pays out from and denying peers our best
+    // work. LTC has always minted on both classes (web_server.cpp).
+    //
+    // ORDERING — reward invariant: on the won-block arm this runs AFTER the
+    // block has already been dispatched, never before. The mint walks the
+    // tracker, can decline, and can throw; the block submit must never sit
+    // behind any of that. Nothing below can affect a dispatch that already
+    // happened.
+    //
+    // CONSENSUS: unchanged. Share construction, target derivation and
+    // serialisation are entirely inside the (untouched) mint seam — this
+    // changes only WHETHER it is invoked, not what it builds.
+    //
+    // SINGLE-CALL CONTRACT: it MOVES `coinbase` / `branch_hashes` into the mint
+    // inputs, so exactly one classify arm may invoke it, exactly once. The
+    // won-block arm therefore calls it only after block_bytes is fully built.
+    auto mint_solved_share = [&](bool won_block) {
+        const char* tag = won_block ? "[DASH-STRATUM-BLOCK-SHARE]"
+                                    : "[DASH-STRATUM-SHARE]";
+        MintShareFn mint_fn;
+        {
+            std::lock_guard<std::mutex> lk(mint_share_mutex_);
+            mint_fn = mint_share_fn_;
+        }
+
+        uint256 share_hash;
+        if (mint_fn) {
+            MintShareInputs in;
+            in.header_bytes.assign(header, header + 80);
+            in.subsidy         = job->subsidy;
+            in.prev_share_hash = job->prev_share_hash;
+            in.merkle_branches = std::move(branch_hashes);
+            in.payout_script   = core::address_to_script(username);
+            in.pow_hash        = pow_hash;
+            // ref_hash: the coinb1/coinb2 split sits immediately after the
+            // 32-byte OP_RETURN ref_hash (before the 8B nonce64 slot), so the
+            // commitment is the coinb1 tail. Raw LE-internal bytes — embedded
+            // via ref_hash.data() at build time, recovered the same way.
+            if (coinb1_bytes.size() >= 32)
+                std::memcpy(in.ref_hash.begin(),
+                            coinb1_bytes.data() + coinb1_bytes.size() - 32, 32);
+            // nonce64 = LE u64 of extranonce1 || extranonce2 (4+4 bytes).
+            if (en1_bytes.size() + en2_bytes.size() == 8) {
+                unsigned char n64[8];
+                std::memcpy(n64, en1_bytes.data(), en1_bytes.size());
+                std::memcpy(n64 + en1_bytes.size(), en2_bytes.data(), en2_bytes.size());
+                uint64_t v = 0;
+                for (int i = 7; i >= 0; --i) v = (v << 8) | n64[i];
+                in.last_txout_nonce = v;
+            }
+            in.tx_data         = job->tx_data;
+            in.coinbase_bytes  = std::move(coinbase);
+            try {
+                share_hash = mint_fn(in);
+            } catch (const std::exception& e) {
+                LOG_WARNING << tag << " mint_share_fn threw: "
+                            << e.what() << " -- share not minted";
+            }
+        }
+
+        if (!share_hash.IsNull()) {
+            LOG_INFO << tag << " ACCEPTED + MINTED user=" << username
+                     << " share_hash=" << share_hash.GetHex().substr(0, 16)
+                     << " job=" << job_id;
+        } else if (mint_fn) {
+            LOG_INFO << tag << " accepted (mint deferred/declined) "
+                        "user=" << username << " job=" << job_id;
+        } else {
+            LOG_WARNING << tag << " accepted WITHOUT sharechain "
+                           "credit (mint seam unbound -- set_mint_share_fn): user="
+                        << username << " job=" << job_id;
+        }
+    };
+
     // 6. Classify (tighten-first: block target before share target).
     if (pow_hash <= block_target) {
         // A full network block. NEVER drop it.
@@ -950,6 +1031,21 @@ nlohmann::json DASHWorkSource::mining_submit(
             if (fb_fn) fb_fn(height, pow_hash, username, reached_network);
         }
 
+        // #887: the won block is a SHARE too. Everything above (guard verdict,
+        // dispatch, dashboard record) has already run, so nothing here can
+        // delay, gate or endanger the block submit -- the mint is strictly
+        // downstream of it.
+        //
+        // UNCONDITIONAL, including after a payee-guard reject: the guard is a
+        // COIN-side verdict about a stale masternode payee, and the sharechain
+        // is a different system with its own acceptance rule (the mint's own
+        // X11-identity + pow<=own-committed-target gates). The existing reject
+        // branch above already says as much -- "the share still counts for the
+        // miner; the stale template was ours" -- and the share arm below has
+        // never consulted the payee guard either. Withholding here would be a
+        // second, self-inflicted loss on top of the forfeited block.
+        mint_solved_share(/*won_block=*/true);
+
         bump(true);
         return nlohmann::json(true);
     }
@@ -959,59 +1055,7 @@ nlohmann::json DASHWorkSource::mining_submit(
         // share fields to the mint seam. While the DASH node-side share-
         // creation seam is unbound, accept for vardiff + LOUD log (documented
         // 4d follow-up) -- never a silent drop, never a false reject.
-        MintShareFn mint_fn;
-        {
-            std::lock_guard<std::mutex> lk(mint_share_mutex_);
-            mint_fn = mint_share_fn_;
-        }
-
-        uint256 share_hash;
-        if (mint_fn) {
-            MintShareInputs in;
-            in.header_bytes.assign(header, header + 80);
-            in.subsidy         = job->subsidy;
-            in.prev_share_hash = job->prev_share_hash;
-            in.merkle_branches = std::move(branch_hashes);
-            in.payout_script   = core::address_to_script(username);
-            in.pow_hash        = pow_hash;
-            // ref_hash: the coinb1/coinb2 split sits immediately after the
-            // 32-byte OP_RETURN ref_hash (before the 8B nonce64 slot), so the
-            // commitment is the coinb1 tail. Raw LE-internal bytes — embedded
-            // via ref_hash.data() at build time, recovered the same way.
-            if (coinb1_bytes.size() >= 32)
-                std::memcpy(in.ref_hash.begin(),
-                            coinb1_bytes.data() + coinb1_bytes.size() - 32, 32);
-            // nonce64 = LE u64 of extranonce1 || extranonce2 (4+4 bytes).
-            if (en1_bytes.size() + en2_bytes.size() == 8) {
-                unsigned char n64[8];
-                std::memcpy(n64, en1_bytes.data(), en1_bytes.size());
-                std::memcpy(n64 + en1_bytes.size(), en2_bytes.data(), en2_bytes.size());
-                uint64_t v = 0;
-                for (int i = 7; i >= 0; --i) v = (v << 8) | n64[i];
-                in.last_txout_nonce = v;
-            }
-            in.tx_data         = job->tx_data;
-            in.coinbase_bytes  = std::move(coinbase);
-            try {
-                share_hash = mint_fn(in);
-            } catch (const std::exception& e) {
-                LOG_WARNING << "[DASH-STRATUM-SHARE] mint_share_fn threw: "
-                            << e.what() << " -- share not minted";
-            }
-        }
-
-        if (!share_hash.IsNull()) {
-            LOG_INFO << "[DASH-STRATUM-SHARE] ACCEPTED + MINTED user=" << username
-                     << " share_hash=" << share_hash.GetHex().substr(0, 16)
-                     << " job=" << job_id;
-        } else if (mint_fn) {
-            LOG_INFO << "[DASH-STRATUM-SHARE] accepted (mint deferred/declined) "
-                        "user=" << username << " job=" << job_id;
-        } else {
-            LOG_WARNING << "[DASH-STRATUM-SHARE] accepted WITHOUT sharechain "
-                           "credit (mint seam unbound -- set_mint_share_fn): user="
-                        << username << " job=" << job_id;
-        }
+        mint_solved_share(/*won_block=*/false);
 
         bump(true);
         return nlohmann::json(true);

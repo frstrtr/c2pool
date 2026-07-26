@@ -212,6 +212,14 @@ if(BUILD_TESTING)
     # Needs coin/transaction.cpp for the MutableTransaction ctors, same as
     # block_connector_test; link set and header-only-over-coin/*.hpp posture are
     # otherwise identical, so per-coin isolation stays clean.
+    #
+    # #887 fold-in: the same file now also drives BCHWorkSource::mining_submit
+    # to pin that a WON BLOCK is written to the sharechain as well (block
+    # dispatch first, share write strictly after). That needs bch_stratum
+    # (work_source.cpp) and its bch_coin dependency. FOLDED into this EXISTING
+    # allowlisted target rather than a new add_executable -- a new one would
+    # silently report "Not Run" (see merged PR #868). Still bch-only, so the
+    # per-coin isolation invariant holds.
     add_executable(bch_g2_block_assembly_roundtrip_test
         g2_block_assembly_roundtrip_test.cpp
         ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/transaction.cpp)
@@ -219,6 +227,7 @@ if(BUILD_TESTING)
     target_link_libraries(bch_g2_block_assembly_roundtrip_test PRIVATE
         core pool sharechain
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
+        bch_stratum bch_coin
         btclibs)
     add_test(NAME bch_g2_block_assembly_roundtrip_test COMMAND bch_g2_block_assembly_roundtrip_test)
 endif()

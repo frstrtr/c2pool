@@ -49,13 +49,20 @@
 #include <string>
 #include <vector>
 
+#include <memory>
+#include <stdexcept>
+
 #include "../coin/block.hpp"
 #include "../coin/block_assembly.hpp"
+#include "../coin/header_chain.hpp"
 #include "../coin/mempool.hpp"
 #include "../coin/merkle.hpp"
 #include "../coin/reconstruct_won_block.hpp"
 #include "../coin/transaction.hpp"
 #include "../stratum/coinbase_slot_guard.hpp"
+#include "../stratum/work_source.hpp"
+
+#include <core/stratum_types.hpp>
 
 namespace {
 
@@ -349,6 +356,138 @@ void test_truncation_and_trailing_bytes()
     CHECK(std::string(hv.reason).find("no transactions") != std::string::npos);
 }
 
+// ---------------------------------------------------------------------------
+// #887 -- the block-winning share must ALSO be written to the sharechain.
+//
+// BCHWorkSource::mining_submit classifies tighten-first: block target, then
+// share target. block_target <= share_target, so a solve that clears the block
+// target clears the share target BY DEFINITION -- it is the highest-work share
+// this node will ever produce. Before #887 the won-block arm dispatched the
+// block and RETURNED, so create_share_fn_ was never reached and that share was
+// discarded: our own PPLNS weight in the very window the block pays out from,
+// and the strongest share peers would ever have seen from us, forfeited on
+// every block won. LTC has always written on both classes (core/web_server.cpp).
+//
+// The sharechain and the coin blockchain are independent systems; the solve
+// belongs in both.
+//
+// Determinism: SHA256d of a fixed header is not steerable, so the outcome CLASS
+// is pinned by the TARGETS, not the hash (the dgb_work_source_test idiom).
+// block_nbits 0x2100ffff expands to 0xffff << 240 (~2^256): every practical
+// digest clears it -> WonBlock. 0x03000001 expands to 1: none clears it.
+// ---------------------------------------------------------------------------
+
+struct WorkSourceRig {
+    bch::coin::BCHChainParams params = bch::coin::BCHChainParams::mainnet();
+    bch::coin::HeaderChain    chain{params};
+    bch::coin::Mempool        mempool;
+    bool                      submit_called = false;
+
+    std::unique_ptr<bch::stratum::BCHWorkSource> make()
+    {
+        auto fn = [this](const std::vector<unsigned char>&, uint32_t) -> bool {
+            submit_called = true;
+            return true;
+        };
+        return std::make_unique<bch::stratum::BCHWorkSource>(
+            chain, mempool, /*is_testnet=*/false, fn);
+    }
+};
+
+core::stratum::JobSnapshot make_submit_job(uint32_t share_bits,
+                                           const std::string& block_nbits)
+{
+    core::stratum::JobSnapshot j;
+    j.coinb1       = "01000000";            // minimal well-formed coinbase head
+    j.coinb2       = "00000000";            // minimal coinbase tail
+    j.gbt_prevhash = std::string(64, '0');  // 32-byte prevhash, BE display hex
+    j.nbits        = "1e0fffff";            // header (share) bits
+    j.version      = 0x20000000u;
+    j.share_bits   = share_bits;
+    j.block_nbits  = block_nbits;
+    j.subsidy      = 312500000ULL;
+    return j;
+}
+
+void test_won_block_also_writes_share()
+{
+    WorkSourceRig rig;
+    auto ws = rig.make();
+
+    bool share_written = false;
+    bool saw_block_already_submitted = false;
+    std::size_t seen_header_size = 0;
+    ws->set_create_share_fn(
+        [&](const std::vector<unsigned char>&,
+            const std::vector<uint8_t>&       header_80b,
+            const core::stratum::JobSnapshot&,
+            const std::vector<unsigned char>&) -> uint256
+        {
+            share_written    = true;
+            seen_header_size = header_80b.size();
+            // Reward-invariant witness: the block MUST already be dispatched.
+            saw_block_already_submitted = rig.submit_called;
+            return uint256(uint64_t(0xb10c5));
+        });
+
+    auto job = make_submit_job(/*share_bits=*/0x2100ffffu, /*block_nbits=*/"2100ffff");
+    auto result = ws->mining_submit(
+        "bchtest.worker1", "job-won-share", "00000000", "00000000",
+        "60000000", "00000000", "rid", /*merged_addresses=*/{}, &job);
+
+    CHECK(result.is_boolean() && result.get<bool>());
+    CHECK(rig.submit_called);                 // block dispatched, unchanged
+    CHECK(share_written);                     // ...AND the share is written
+    CHECK(saw_block_already_submitted);       // block FIRST, always
+    CHECK(seen_header_size == 80u);
+}
+
+void test_won_block_survives_throwing_share_write()
+{
+    WorkSourceRig rig;
+    auto ws = rig.make();
+    ws->set_create_share_fn(
+        [](const std::vector<unsigned char>&,
+           const std::vector<uint8_t>&,
+           const core::stratum::JobSnapshot&,
+           const std::vector<unsigned char>&) -> uint256 {
+            throw std::runtime_error("share write blew up");
+        });
+
+    auto job = make_submit_job(/*share_bits=*/0x2100ffffu, /*block_nbits=*/"2100ffff");
+    auto result = ws->mining_submit(
+        "bchtest.worker1", "job-won-throw", "00000000", "00000000",
+        "60000000", "00000000", "rid", /*merged_addresses=*/{}, &job);
+
+    CHECK(rig.submit_called);                     // block reached the sink
+    CHECK(result.is_boolean() && result.get<bool>());  // throw did not escape
+}
+
+void test_plain_share_still_writes_and_does_not_broadcast()
+{
+    WorkSourceRig rig;
+    auto ws = rig.make();
+    bool share_written = false;
+    ws->set_create_share_fn(
+        [&](const std::vector<unsigned char>&,
+            const std::vector<uint8_t>&,
+            const core::stratum::JobSnapshot&,
+            const std::vector<unsigned char>&) -> uint256 {
+            share_written = true;
+            return uint256(uint64_t(0x5157));
+        });
+
+    // block target 1 -> no digest is a block; share target maximal -> accepted.
+    auto job = make_submit_job(/*share_bits=*/0x2100ffffu, /*block_nbits=*/"03000001");
+    auto result = ws->mining_submit(
+        "bchtest.worker1", "job-share", "00000000", "00000000",
+        "60000000", "00000000", "rid", /*merged_addresses=*/{}, &job);
+
+    CHECK(result.is_boolean() && result.get<bool>());
+    CHECK(share_written);
+    CHECK(!rig.submit_called);
+}
+
 } // namespace
 
 int main()
@@ -358,6 +497,9 @@ int main()
     test_degraded_reference_hash_absent();
     test_job_builder_commitment_slot_invariant();
     test_truncation_and_trailing_bytes();
+    test_won_block_also_writes_share();
+    test_won_block_survives_throwing_share_write();
+    test_plain_share_still_writes_and_does_not_broadcast();
 
     if (failures) {
         std::cerr << failures << " CHECK(s) failed\n";

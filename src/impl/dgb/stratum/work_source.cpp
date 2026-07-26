@@ -526,6 +526,81 @@ nlohmann::json DGBWorkSource::mining_submit(
         }
     };
 
+    // -- Sharechain mint (#887) --
+    // Hand the found-share fields to the run-loop mint dispatch
+    // (try_mint_share -> mint_local_share_with_ratchet, #294). SHARED by both
+    // accept classes: block_target <= share_target, so a solve that meets the
+    // block target meets the share target too -- it is the highest-work share
+    // this node will ever produce, and the sharechain and the coin blockchain
+    // are independent systems. Before #887 the WonBlock case returned without
+    // ever reaching this seam, forfeiting our own PPLNS weight in the very
+    // window the block pays out from and denying peers our best work. LTC has
+    // always minted on both classes (web_server.cpp).
+    //
+    // PRE-WIRING ON DGB (#884): main_dgb.cpp never calls set_mint_share_fn, so
+    // DGB cannot mint ANY local share today -- neither this one nor an ordinary
+    // ShareAccept. try_mint_share logs the unbound seam loudly and returns
+    // null. This change makes the WonBlock arm REACH the seam so that DGB gets
+    // the fix for free the moment #884 binds it; it does not by itself make a
+    // DGB mint happen.
+    //
+    // ORDERING -- reward invariant: on the WonBlock arm this runs AFTER the
+    // block has already been dispatched, never before. The mint can decline and
+    // can throw; the block submit must never sit behind any of that.
+    //
+    // CONSENSUS: unchanged. Share construction, target derivation and
+    // serialisation live entirely inside the (untouched) mint seam -- this
+    // changes only WHETHER it is invoked, not what it builds.
+    auto mint_solved_share = [&](bool won_block) {
+        const char* tag = won_block ? "[DGB-STRATUM-BLOCK-SHARE]"
+                                    : "[DGB-STRATUM-SHARE]";
+        MintShareInputs in;
+        in.header_bytes    = header;
+        in.coinbase_bytes  = coinbase;
+        in.subsidy         = job->subsidy;
+        in.prev_share      = job->prev_share_hash;
+        in.merkle_branches = branch_hashes;
+        in.payout_script   = core::address_to_script(username);
+        // Redistribute V2 (#307): a miner with empty/broken stratum creds
+        // yields no payout script. When the operator opted into a
+        // --redistribute policy (fallback bound) let it choose the pubkey this
+        // node stamps onto the minted share; else leave it empty (byte-
+        // identical to before). Fail-safe: an empty fallback is left empty.
+        if (in.payout_script.empty()) {
+            FallbackPayoutFn fb;
+            { std::lock_guard<std::mutex> lk(fallback_payout_mutex_); fb = fallback_payout_fn_; }
+            if (fb) {
+                in.payout_script = fb();
+                if (!in.payout_script.empty())
+                    LOG_INFO << tag << " empty payout addr (user=" << username
+                             << ") -> redistribute policy stamped fallback script ("
+                             << in.payout_script.size() << "B)";
+            }
+        }
+        in.segwit_active   = job->segwit_active;
+
+        uint256 share_hash;
+        try {
+            share_hash = try_mint_share(in);
+        } catch (const std::exception& e) {
+            LOG_WARNING << tag << " mint dispatch threw: " << e.what()
+                        << " -- share not minted";
+        }
+
+        if (!share_hash.IsNull()) {
+            LOG_INFO << tag << " ACCEPTED + MINTED user=" << username
+                     << " share_hash=" << share_hash.GetHex().substr(0, 16)
+                     << " job=" << job_id;
+        } else {
+            // PoW was valid (cleared the share target) so the miner still gets a
+            // success reply; the share just earned no sharechain credit (no mint
+            // fn wired, or the mint deferred/failed). try_mint_share logs the
+            // reason -- never a silent drop.
+            LOG_INFO << tag << " accepted (no sharechain credit) user="
+                     << username << " job=" << job_id;
+        }
+    };
+
     switch (klass) {
     case dgb::coin::SubmitClass::WonBlock: {
         // pow_hash <= block_target -> a full network block. NEVER drop it.
@@ -609,53 +684,20 @@ nlohmann::json DGBWorkSource::mining_submit(
                       << " height=" << height << " not broadcast -- lost subsidy!";
         }
 
+        // #887: the won block is a SHARE too. The dispatch above has already
+        // happened, so nothing here can delay, gate or endanger the block
+        // submit -- the mint is strictly downstream of it. Pre-wiring on DGB
+        // until #884 binds set_mint_share_fn in main_dgb.cpp.
+        mint_solved_share(/*won_block=*/true);
+
         bump_accepted();
         return nlohmann::json(true);
     }
 
     case dgb::coin::SubmitClass::ShareAccept: {
         // share_target >= pow_hash > block_target -> meets sharechain difficulty
-        // but not the full block. Hand the found-share fields to the run-loop
-        // mint dispatch (try_mint_share -> mint_local_share_with_ratchet, #294).
-        MintShareInputs in;
-        in.header_bytes    = header;
-        in.coinbase_bytes  = coinbase;
-        in.subsidy         = job->subsidy;
-        in.prev_share      = job->prev_share_hash;
-        in.merkle_branches = branch_hashes;
-        in.payout_script   = core::address_to_script(username);
-        // Redistribute V2 (#307): a miner with empty/broken stratum creds
-        // yields no payout script. When the operator opted into a
-        // --redistribute policy (fallback bound) let it choose the pubkey this
-        // node stamps onto the minted share; else leave it empty (byte-
-        // identical to before). Fail-safe: an empty fallback is left empty.
-        if (in.payout_script.empty()) {
-            FallbackPayoutFn fb;
-            { std::lock_guard<std::mutex> lk(fallback_payout_mutex_); fb = fallback_payout_fn_; }
-            if (fb) {
-                in.payout_script = fb();
-                if (!in.payout_script.empty())
-                    LOG_INFO << "[DGB-STRATUM-SHARE] empty payout addr (user=" << username
-                             << ") -> redistribute policy stamped fallback script ("
-                             << in.payout_script.size() << "B)";
-            }
-        }
-        in.segwit_active   = job->segwit_active;
-
-        uint256 share_hash = try_mint_share(in);
-
-        if (!share_hash.IsNull()) {
-            LOG_INFO << "[DGB-STRATUM-SHARE] ACCEPTED + MINTED user=" << username
-                     << " share_hash=" << share_hash.GetHex().substr(0, 16)
-                     << " job=" << job_id;
-        } else {
-            // PoW was valid (cleared the share target) so the miner still gets a
-            // success reply; the share just earned no sharechain credit (no mint
-            // fn wired, or the mint deferred/failed). try_mint_share logs the
-            // reason -- never a silent drop.
-            LOG_INFO << "[DGB-STRATUM-SHARE] accepted (no sharechain credit) user="
-                     << username << " job=" << job_id;
-        }
+        // but not the full block.
+        mint_solved_share(/*won_block=*/false);
 
         bump_accepted();
         return nlohmann::json(true);
