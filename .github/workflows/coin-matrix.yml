@@ -12,6 +12,8 @@ name: Coin matrix
 # split, the other coins activate automatically without YAML changes).
 
 on:
+  # additive: callable by ci-required.yml aggregator (no push/PR behaviour change)
+  workflow_call:
   push:
     branches: [master, btc-embedded, dash-spv-embedded, dgb/pool-pillars-port, windows-build, service-update]
   pull_request:

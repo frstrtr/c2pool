@@ -22,6 +22,8 @@ name: DASH gate G3a — populated-regtest block-production
 # non-hollow green rollup on the runner.
 
 on:
+  # additive: callable by ci-required.yml aggregator (no push/PR behaviour change)
+  workflow_call:
   push:
     branches: [master, dash-spv-embedded]
   pull_request:
