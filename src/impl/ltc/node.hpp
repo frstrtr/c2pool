@@ -56,6 +56,26 @@ protected:
 
     // Global pool of known transactions, populated by remember_tx and coin daemon.
     // Protocol handlers look up tx hashes here when processing shares.
+    //
+    // ⚠ THREAD DISCIPLINE — IO-THREAD CONFINED, AND ONLY WEAKLY SO.
+    // The remember_tx ingest (protocol_actual.cpp / protocol_legacy.cpp) inserts
+    // here holding NO lock at all. That is tolerable only while every other
+    // participant is the same io thread, because then the accesses are simply
+    // serialised by being on one thread. Consequences:
+    //
+    //   * Every READER must be on the io thread. The F3 tx-completeness gate in
+    //     send_shares reads this map, which is precisely why broadcast_share is
+    //     reached via post_broadcast_share() from the mining-submit thread rather
+    //     than called there directly — an off-thread read would race an unlocked
+    //     std::map::emplace, the freed-memory / GP-fault class.
+    //   * If a reader ever genuinely has to run off the io thread, taking a
+    //     shared lock on the reader alone does NOT make it safe: a shared lock
+    //     gives no protection against a writer that takes no lock. The
+    //     remember_tx insert would have to come under the same lock first.
+    //   * Residual, PRE-EXISTING and not addressed here: prune_shares() evicts
+    //     from this map on the COMPUTE thread under the exclusive tracker lock,
+    //     which the unlocked io-thread insert does not respect. That race exists
+    //     independently of anything above and wants its own fix.
     std::map<uint256, coin::Transaction> m_known_txs;
     // Insertion-order recency sidecar for m_known_txs. Recorded at each NEW
     // remember_tx insert; consumed by prune_shares to evict OLDEST-first down to
@@ -184,6 +204,14 @@ public:
             [](uint256, peer_ptr, std::vector<uint256>, uint64_t, std::vector<uint256>){})
     {
         m_tracker.m_params = &m_coin_params;
+        // pool::BaseNode's default ctor leaves these INDETERMINATE (see its
+        // "todo: init" markers). Anything that null-checks them — e.g.
+        // post_broadcast_share and broadcast_share — would otherwise read a
+        // garbage pointer on this construction path. Null them here rather than
+        // touch the shared base, which the other coin lanes also derive from.
+        m_context = nullptr;
+        m_chain = nullptr;
+        m_config = nullptr;
     }
 
     NodeImpl(boost::asio::io_context* ctx, config_t* config)
@@ -367,11 +395,52 @@ public:
     void set_software_version(std::string ver) { m_software_version = std::move(ver); }
 
     /// Send a set of shares (with any needed txs) to a single peer.
-    /// Skips shares that originated from that peer.
-    void send_shares(peer_ptr peer, const std::vector<uint256>& share_hashes);
+    /// Skips shares that originated from that peer, and shares whose new-tx
+    /// bytes we do not hold (F3 tx-completeness gate).
+    /// Returns the hashes ACTUALLY written to that peer; broadcast_share marks
+    /// only those as shared (F2), so an abandoned or gated batch is retried.
+    std::vector<uint256> send_shares(peer_ptr peer, const std::vector<uint256>& share_hashes);
 
     /// Broadcast a locally-generated (or newly-received) share to all peers.
+    ///
+    /// MUST be called on the io_context thread with NO tracker lock held by the
+    /// calling thread. It takes a shared try-lock on m_tracker_mutex, and a
+    /// std::shared_mutex refuses a shared lock to a thread that already holds it
+    /// exclusively — so calling this from inside an exclusive-lock scope silently
+    /// defers every single time and broadcasts nothing at all. Off-thread callers
+    /// must use post_broadcast_share() instead.
     void broadcast_share(const uint256& share_hash);
+
+    /// Queue broadcast_share() onto the io_context thread.
+    ///
+    /// This is the entry point for every caller that is NOT already on the io
+    /// thread — in particular the stratum mining-submit path, which creates the
+    /// local share while holding the tracker mutex EXCLUSIVELY. Two reasons:
+    ///
+    ///   1. Lock discipline. Deferring past the end of the caller's exclusive
+    ///      scope is what makes broadcast_share's shared try-lock able to
+    ///      succeed at all (see the note above).
+    ///   2. m_known_txs thread confinement. The F3 tx-completeness gate in
+    ///      send_shares READS m_known_txs, and the remember_tx ingest
+    ///      (protocol_actual.cpp / protocol_legacy.cpp) WRITES it with no lock
+    ///      whatsoever. That is only survivable while every reader and writer is
+    ///      the same io thread. Broadcasting straight from the submit thread
+    ///      would add a cross-thread reader racing an unlocked std::map::emplace
+    ///      — the freed-memory / GP-fault class. Posting keeps the read on the
+    ///      io thread and does not widen the existing exposure.
+    void post_broadcast_share(const uint256& share_hash);
+
+    /// Diagnostics for the lock discipline above: how many broadcast_share calls
+    /// deferred on the tracker try-lock, and how many acquired it and proceeded.
+    /// A deferred count that tracks share creation 1:1 with zero acquisitions is
+    /// the signature of a caller holding the exclusive lock across the call.
+    uint64_t broadcast_deferred_count() const { return m_broadcast_deferred.load(); }
+    uint64_t broadcast_acquired_count() const { return m_broadcast_acquired.load(); }
+    /// Incremented once per broadcast_share call that got all the way to the
+    /// per-peer send_shares loop with a non-empty batch. This is the number that
+    /// was pinned at ZERO in production while the mining-submit path called
+    /// broadcast_share inline under its exclusive lock.
+    uint64_t broadcast_reached_send_count() const { return m_broadcast_reached_send.load(); }
 
     /// Start downloading shares from a peer, beginning at `target_hash`.
     /// Recursively fetches parents until the chain is connected or CHAIN_LENGTH reached.
@@ -601,6 +670,10 @@ protected:
     std::string m_node_payout_script_hex;
     std::set<uint256> m_shared_share_hashes;  // de-dup set for broadcast_share
     std::set<uint256> m_rejected_share_hashes; // shares rejected by peers — never re-broadcast
+    // broadcast_share tracker try-lock outcome counters (see the accessors above).
+    std::atomic<uint64_t> m_broadcast_deferred{0};
+    std::atomic<uint64_t> m_broadcast_acquired{0};
+    std::atomic<uint64_t> m_broadcast_reached_send{0};
     std::set<uint256> m_downloading_shares;   // hashes currently being fetched
 
     // Track share hashes that peers couldn't provide (empty reply).

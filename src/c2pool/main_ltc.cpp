@@ -4938,7 +4938,14 @@ int main(int argc, char* argv[]) {
                     if (p.stale_info == 253)      stale = ltc::StaleInfo::orphan;
                     else if (p.stale_info == 254)  stale = ltc::StaleInfo::doa;
 
-                    // tracker_lock (blocking shared_lock) acquired at top of try block.
+                    // tracker_lock: EXCLUSIVE unique_lock(try_to_lock), acquired at
+                    // the top of this try block (rationale there — this path WRITES
+                    // the tracker via create_local_share). NOT a blocking
+                    // shared_lock, as this comment used to claim. It is held across
+                    // everything below, which is why the broadcast must be POSTED
+                    // rather than called inline: broadcast_share takes a shared
+                    // try-lock and a shared_mutex refuses that to a thread that
+                    // already holds it exclusively.
 
                     // Pass frozen fields from template time so ref_hash matches coinbase.
                     uint256 share_hash = ltc::create_local_share(
@@ -4979,11 +4986,22 @@ int main(int argc, char* argv[]) {
                     }
                     ++s_created;
 
-                    // Broadcast to all connected peers
+                    // Broadcast to all connected peers.
+                    //
+                    // POSTED, not called inline. We are holding tracker_lock
+                    // EXCLUSIVELY right here, and broadcast_share opens with a
+                    // shared try-lock on that same mutex — which a thread holding
+                    // the write lock can never obtain. Calling it inline took the
+                    // "tracker busy — deferring" early return on every single
+                    // share, so this node broadcast nothing it minted. Posting
+                    // runs it on the io thread after this scope has released the
+                    // lock, and keeps the m_known_txs read in send_shares on the
+                    // same thread as the unlocked remember_tx ingest that writes
+                    // that map.
                     try {
-                        p2p_node->broadcast_share(share_hash);
+                        p2p_node->post_broadcast_share(share_hash);
                     } catch (const std::exception& e) {
-                        LOG_ERROR << "broadcast_share failed: " << e.what();
+                        LOG_ERROR << "post_broadcast_share failed: " << e.what();
                     }
 
                     // CRITICAL: Update best share immediately so refresh_work()

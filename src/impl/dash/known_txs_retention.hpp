@@ -21,6 +21,10 @@
 //     transaction" disconnect unreachable by construction, and — paired with the
 //     mint-time decline of shares whose txs are not retained — makes "every share
 //     we mint/broadcast is backable" a by-construction invariant.
+//     It is coin-generic, so it now LIVES IN core/known_txs_backing.hpp and is
+//     merely re-exported below; retain_template_txs() stays here because the
+//     template-set registration it serves is DASH-only (the other lanes fill
+//     m_known_txs from inbound peer remember_tx alone).
 
 #pragma once
 
@@ -29,9 +33,16 @@
 #include <set>
 #include <vector>
 
+#include <core/known_txs_backing.hpp>
 #include <core/uint256.hpp>
 
 namespace dash {
+
+// all_txs_backable is coin-generic and now lives in core/known_txs_backing.hpp,
+// so the LTC/DOGE, BTC, DGB and BCH lanes share ONE definition instead of each
+// growing a copy. Re-exported here so every existing dash::all_txs_backable call
+// site keeps resolving unchanged — same function, same semantics, one home.
+using core::all_txs_backable;
 
 // Retain the tx set of a newly-registered template in a rolling window of the
 // last `cap` DISTINCT templates, inserting its tx bytes into `known_txs`.
@@ -92,20 +103,6 @@ inline void retain_template_txs(std::deque<std::set<uint256>>& recent_sets,
                 known_txs.erase(h);
         }
     }
-}
-
-// True iff every hash in `tx_hashes` is present in `held` (the bytes we hold,
-// e.g. m_known_txs). The canonical broadcast gate: a share is backable — safe to
-// send without risking the peer's "referenced unknown transaction" disconnect —
-// only when we can forward every referenced tx.
-template <typename Held>
-inline bool all_txs_backable(const std::vector<uint256>& tx_hashes,
-                             const Held& held)
-{
-    for (const auto& h : tx_hashes)
-        if (held.find(h) == held.end())
-            return false;
-    return true;
 }
 
 } // namespace dash
