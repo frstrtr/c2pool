@@ -10,3 +10,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
     gtest_add_tests(share_test "" AUTO)
 endif()
+
+if (BUILD_TESTING)
+    # G3a populated-block production harness (PR #679, LTC parent + DOGE merged-aux).
+    # Standalone check()-based main() -- depends only on the header-only
+    # core::version_gate SSOT; ctest-registered here so the G3a gate is non-hollow.
+    add_executable(ltc_g3a_populated_test g3a_populated_block_regtest_test.cpp)
+    target_include_directories(ltc_g3a_populated_test PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/btclibs)
+    add_test(NAME LtcG3aPopulated COMMAND ltc_g3a_populated_test)
+endif()
