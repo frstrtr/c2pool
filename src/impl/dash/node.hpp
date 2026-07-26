@@ -22,6 +22,7 @@
 #include "share_tracker.hpp"
 #include "peer.hpp"
 #include "min_protocol_gate.hpp"
+#include "tracker_acquire.hpp"       // #889: bounded acquisition — BLOCK-WINNING mint path only
 #include "auto_ratchet.hpp"          // dash::apply_min_protocol_ratchet_decision (v36 accept-floor ratchet)
 #include "version_negotiation.hpp"   // dash::version_negotiation::get_desired_version_weights (ratchet window)
 #include "messages.hpp"
@@ -243,6 +244,12 @@ protected:
     // Best-share election result — published by run_think() on the compute
     // thread under m_tracker_mutex (mirrors btc::NodeImpl::m_best_share_hash).
     uint256 m_best_share_hash;
+
+    // #889: block-winning mints forfeited because the BOUNDED wait on the
+    // exclusive tracker lock expired. Written from the stratum IO thread only,
+    // read from anywhere (dashboard/KAT) — atomic, relaxed; it is a diagnostic
+    // gauge, not a synchronisation point.
+    std::atomic<uint64_t> m_block_share_lock_forfeits{0};
 
     // ── v36 min-protocol accept-floor ratchet (#643/#646, mirrors dgb) ──────────
     // Runtime P2P accept-floor, seeded from the COLD config floor (1700, accept-all)
@@ -829,7 +836,29 @@ public:
     /// (+ LevelDB persist + attempt_verify), then broadcast + run_think.
     /// Returns the share hash, or ZERO when the tracker lock is busy or the
     /// share is a duplicate (fail-closed: caller declines the mint).
-    uint256 add_local_share(ShareType share);
+    ///
+    /// #889 `block_winning`: true ONLY when this solve already cleared the COIN
+    /// BLOCK target. That share is unrepeatable — there is no next solve — and a
+    /// share that is never minted is also a block no p2pool peer can ever see
+    /// (they detect pool blocks through the sharechain, not through a block
+    /// announcement). It therefore takes a BOUNDED WAIT on the exclusive lock
+    /// instead of the single try. false (the default) is the ordinary share
+    /// path: byte-for-byte today's `try_to_lock` decline, deliberately unchanged.
+    ///
+    /// CALLER CONTRACT (#878/#881): a `block_winning` caller MUST hold no
+    /// tracker lock. The block-arm caller (main_dash.cpp's mint lambda, reached
+    /// from the stratum handler) holds zero locks; the compute thread is guarded
+    /// against explicitly inside.
+    uint256 add_local_share(ShareType share, bool block_winning = false);
+
+    /// #889 observability: block-winning mints lost because the bounded wait on
+    /// the tracker expired. MUST stay 0 in production — every increment is one
+    /// won block that is invisible to the whole p2pool network. Each one also
+    /// emits a LOG_ERROR; this counter is what makes it aggregatable instead of
+    /// a line someone has to notice.
+    uint64_t block_share_lock_forfeits() const {
+        return m_block_share_lock_forfeits.load(std::memory_order_relaxed);
+    }
 
     /// Register the current template's txs in m_known_txs so send_shares can
     /// serve remember_tx for a minted share's new_transaction_hashes. The
@@ -1017,16 +1046,29 @@ public:
     /// RAII guard for IO-thread tracker reads.
     /// - IO thread:      acquires shared_lock(try_to_lock); falsy if busy.
     /// - Compute thread: skips locking (exclusive already held); always truthy.
+    ///
+    /// #889: an optional `urgency` selects a BOUNDED WAIT instead of the single
+    /// try. It defaults to Opportunistic, so every existing call site keeps
+    /// today's exact non-blocking behaviour; only the block-winning mint (which
+    /// has no "next solve" to fall back on) passes BlockWinning.
     class TrackerReadGuard {
         std::shared_lock<std::shared_mutex> lock_;
         ShareTracker& tracker_;
         bool ok_;
     public:
-        TrackerReadGuard(std::shared_mutex& mtx, ShareTracker& t, bool on_compute)
+        TrackerReadGuard(std::shared_mutex& mtx, ShareTracker& t, bool on_compute,
+                         tracker_acquire::Urgency urgency =
+                             tracker_acquire::Urgency::Opportunistic)
             : lock_(mtx, std::defer_lock), tracker_(t)
         {
-            if (on_compute) ok_ = true;          // exclusive lock already held
-            else            ok_ = lock_.try_lock();
+            if (on_compute) {
+                ok_ = true;                      // exclusive lock already held
+            } else if (urgency == tracker_acquire::Urgency::Opportunistic) {
+                ok_ = lock_.try_lock();          // unchanged: single try, skip if busy
+            } else {
+                lock_ = tracker_acquire::shared(mtx, urgency, /*on_compute=*/false);
+                ok_ = lock_.owns_lock();
+            }
         }
         TrackerReadGuard(TrackerReadGuard&&) = default;
         TrackerReadGuard(const TrackerReadGuard&) = delete;
@@ -1046,8 +1088,14 @@ public:
     /// Preferred tracker accessor for IO-thread callbacks. On the IO thread it
     /// acquires shared_lock(try_to_lock) (check `if (!guard)`); on the compute
     /// thread it skips locking (exclusive already held).
-    TrackerReadGuard read_tracker() {
-        return TrackerReadGuard(m_tracker_mutex, m_tracker, is_compute_thread());
+    ///
+    /// #889: pass tracker_acquire::Urgency::BlockWinning ONLY from a solve that
+    /// already cleared the BLOCK target, and ONLY from a caller holding zero
+    /// locks (#878/#881). Everything else keeps the default, i.e. no change.
+    TrackerReadGuard read_tracker(tracker_acquire::Urgency urgency =
+                                      tracker_acquire::Urgency::Opportunistic) {
+        return TrackerReadGuard(m_tracker_mutex, m_tracker, is_compute_thread(),
+                                urgency);
     }
 
     /// Acquire shared (reader) lock on the tracker mutex — BLOCKING. Only for

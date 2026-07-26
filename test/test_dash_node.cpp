@@ -207,3 +207,252 @@ TEST(DashNodeDispatch, NodeBridgeAliasBindsLegacyActual)
                   "Actual must derive from NodeImpl");
     SUCCEED();
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #889 — the BLOCK-WINNING mint must not be forfeited by a momentarily busy
+//        tracker.
+//
+// THE DEFECT. add_local_share() acquires the exclusive tracker lock with
+// std::try_to_lock and DECLINES when the compute thread is mid-think(). For an
+// ordinary share that is a sound trade: the decline costs one share and the
+// NEXT solve mints instead. A block-winning share has no next solve — the block
+// is found once — so the same decline permanently forfeits the highest-work
+// share the node will ever produce.
+//
+// AND IT IS NOT ONLY OUR SHARE WEIGHT. p2pool nodes do not learn about a pool
+// block from a block announcement; they detect it THROUGH THE SHARECHAIN, by
+// watching for a share with pow_hash <= header['bits'].target
+// (p2pool/node.py:145-147). A block-winning share that never enters the
+// sharechain is therefore a won block that NO peer — including our own oracle —
+// can ever record. The try_to_lock decline reproduces the full #887 symptom,
+// just intermittently and far harder to notice.
+//
+// WHAT THESE TESTS PIN. Nothing existing covers this: every prior mint KAT runs
+// against a FREE tracker, where try_to_lock and a bounded wait are
+// indistinguishable. These hold the real m_tracker_mutex EXCLUSIVELY from
+// another thread — exactly the state think() puts it in — and drive the mint.
+//
+//   1. block-winning  + tracker held -> the share STILL LANDS (this is the fix)
+//   2. ordinary share + tracker held -> still declines (the trade we must NOT
+//      change; also the negative control that proves test 1 is not passing
+//      merely because the lock happened to be free)
+//   3. budget expiry  -> declines LOUDLY and COUNTED, never silently
+//
+// NOTE (#895): these are plain TESTs, not #ifdef-guarded, so gtest_add_tests
+// (AUTO) registers cases that genuinely execute.
+
+#include <impl/dash/tracker_acquire.hpp>
+
+#include <atomic>
+#include <chrono>
+#include <thread>
+
+namespace {
+
+// Minimal locally-minted share. add_local_share() only needs a non-null
+// identity hash and (for the F1-sub backability gate) an empty
+// m_new_transaction_hashes — everything the real producer builds on top of that
+// is share CONSTRUCTION, which #889 does not touch. Heap-allocated because
+// dash::ShareType is a non-owning variant handle: the tracker takes ownership
+// on a successful add, and the caller reclaims on a decline (main_dash.cpp).
+dash::ShareType make_local_share(unsigned char tag)
+{
+    auto* s = new dash::DashShare();
+    // NB uint256::begin() is a uint32_t* over 8 WORDS (core/uint256.hpp), not a
+    // byte pointer. Word 7 is the most significant, so it renders first in
+    // GetHex() -- the share is then identifiable in the very log lines these
+    // tests pin the behaviour of.
+    s->m_hash.begin()[7] = 0x89000000u | static_cast<uint32_t>(tag);
+    return dash::ShareType(s);
+}
+
+void discard(dash::ShareType& share)
+{
+    share.invoke([](auto* obj) { delete obj; });
+}
+
+// Holds the node's REAL exclusive tracker lock for `hold`, i.e. reproduces a
+// think() cycle in flight. Signals once the lock is actually held so the test
+// body can never race ahead of it.
+class ExclusiveTrackerHolder {
+public:
+    ExclusiveTrackerHolder(std::shared_mutex& mtx, std::chrono::milliseconds hold)
+    {
+        thread_ = std::thread([this, &mtx, hold] {
+            std::unique_lock<std::shared_mutex> lk(mtx);
+            held_.store(true);
+            std::this_thread::sleep_for(hold);
+            held_.store(false);
+        });
+        // Spin until the lock is genuinely held — no sleep-and-hope.
+        while (!held_.load())
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    ~ExclusiveTrackerHolder() { if (thread_.joinable()) thread_.join(); }
+private:
+    std::atomic<bool> held_{false};
+    std::thread thread_;
+};
+
+} // namespace
+
+// 9. ★ THE REGRESSION. Tracker held EXCLUSIVELY; a block-winning mint still
+//    lands. Pre-#889 this returned ZERO and the share — and with it every
+//    peer's only way of seeing the block — was gone for good.
+TEST(DashBlockWinningMint, LandsWhileTrackerHeldExclusively)
+{
+    TestNode node;
+    ASSERT_EQ(node.tracker().chain.size(), 0u);
+
+    constexpr auto kHold = std::chrono::milliseconds(400);
+    const auto t0 = std::chrono::steady_clock::now();
+
+    uint256 minted;
+    {
+        ExclusiveTrackerHolder holder(node.tracker_mutex(), kHold);
+        auto share = make_local_share(0xB1);
+        minted = node.add_local_share(share, /*block_winning=*/true);
+        if (minted.IsNull())
+            discard(share);
+    }
+    const auto waited = std::chrono::steady_clock::now() - t0;
+
+    // The share landed.
+    EXPECT_FALSE(minted.IsNull())
+        << "block-winning share forfeited by a busy tracker (#889)";
+    EXPECT_EQ(node.tracker().chain.size(), 1u);
+    // No forfeit was recorded — the wait succeeded, it did not merely give up.
+    EXPECT_EQ(node.block_share_lock_forfeits(), 0u);
+
+    // It genuinely WAITED for the holder rather than finding a free lock: the
+    // call could not have returned before the holder released. This is what
+    // makes the test a real exercise of the bounded acquire and not an
+    // accidental pass on an idle mutex.
+    EXPECT_GE(waited, kHold - std::chrono::milliseconds(50));
+}
+
+// 10. THE TRADE WE MUST NOT CHANGE (and the in-tree negative control for #9):
+//     an ORDINARY share under the identical held lock still declines, exactly
+//     as before. If #9 ever passed because the lock was free, this would fail
+//     alongside it.
+TEST(DashBlockWinningMint, OrdinaryShareStillDeclinesWhileTrackerHeld)
+{
+    TestNode node;
+
+    uint256 minted;
+    {
+        ExclusiveTrackerHolder holder(node.tracker_mutex(),
+                                      std::chrono::milliseconds(400));
+        auto share = make_local_share(0xC2);
+        minted = node.add_local_share(share, /*block_winning=*/false);
+        if (minted.IsNull())
+            discard(share);
+    }
+
+    EXPECT_TRUE(minted.IsNull())
+        << "the ordinary share path must keep today's try_to_lock decline";
+    EXPECT_EQ(node.tracker().chain.size(), 0u);
+    EXPECT_EQ(node.block_share_lock_forfeits(), 0u);
+}
+
+// 11. Default argument keeps every existing caller on the ordinary path — the
+//     fix cannot leak into share traffic by omission.
+TEST(DashBlockWinningMint, DefaultArgumentIsTheOpportunisticPath)
+{
+    TestNode node;
+
+    uint256 minted;
+    {
+        ExclusiveTrackerHolder holder(node.tracker_mutex(),
+                                      std::chrono::milliseconds(300));
+        auto share = make_local_share(0xD3);
+        minted = node.add_local_share(share);   // no second argument
+        if (minted.IsNull())
+            discard(share);
+    }
+    EXPECT_TRUE(minted.IsNull());
+}
+
+// 12. THE BOUND IS REAL AND THE FORFEIT IS LOUD. Hold the tracker past the
+//     whole budget: the mint declines (fail-closed, unchanged end state) but
+//     now increments a counter and logs at ERROR. A silent drop is the defect;
+//     an accounted one is the fix's failure mode.
+//
+//     Runtime is BLOCK_SHARE_LOCK_BUDGET + margin by construction — that is the
+//     property under test, not incidental slowness.
+TEST(DashBlockWinningMint, BudgetExpiryIsACountedForfeitNotASilentDrop)
+{
+    TestNode node;
+    ASSERT_EQ(node.block_share_lock_forfeits(), 0u);
+
+    const auto over_budget =
+        dash::tracker_acquire::BLOCK_SHARE_LOCK_BUDGET
+        + std::chrono::milliseconds(300);
+
+    uint256 minted;
+    std::chrono::steady_clock::duration waited{};
+    {
+        ExclusiveTrackerHolder holder(node.tracker_mutex(), over_budget);
+        auto share = make_local_share(0xE4);
+        const auto t0 = std::chrono::steady_clock::now();
+        minted = node.add_local_share(share, /*block_winning=*/true);
+        waited = std::chrono::steady_clock::now() - t0;
+        if (minted.IsNull())
+            discard(share);
+    }
+
+    EXPECT_TRUE(minted.IsNull());
+    // It spent the WHOLE budget before giving up — not an instant try_to_lock
+    // decline wearing a counter. (This is also what keeps the test a fix
+    // detector: without the bounded wait it returns in ~0 ms.)
+    EXPECT_GE(waited, dash::tracker_acquire::BLOCK_SHARE_LOCK_BUDGET
+                          - std::chrono::milliseconds(100));
+    EXPECT_EQ(node.tracker().chain.size(), 0u);
+    EXPECT_EQ(node.block_share_lock_forfeits(), 1u)
+        << "an expired budget must be COUNTED, not dropped silently";
+}
+
+// 13. The acquisition primitive itself: Opportunistic is one try (today's
+//     behaviour, bit-for-bit), BlockWinning waits, and the compute-thread guard
+//     never waits — the #878/#881 deadlock hazard, closed at the source.
+TEST(DashBlockWinningMint, AcquirePrimitiveContract)
+{
+    using namespace dash::tracker_acquire;
+    std::shared_mutex mtx;
+
+    {   // free mutex: both urgencies succeed immediately
+        auto a = exclusive(mtx, Urgency::Opportunistic);
+        EXPECT_TRUE(a.owns_lock());
+    }
+    {
+        auto a = exclusive(mtx, Urgency::BlockWinning);
+        EXPECT_TRUE(a.owns_lock());
+    }
+
+    {   // held mutex: Opportunistic gives up at once, BlockWinning waits it out
+        ExclusiveTrackerHolder holder(mtx, std::chrono::milliseconds(250));
+        {
+            auto a = exclusive(mtx, Urgency::Opportunistic);
+            EXPECT_FALSE(a.owns_lock());
+        }
+        {
+            // Compute-thread guard: already owns the exclusive lock, so it must
+            // NEVER wait here — waiting would be the #878/#881 self-deadlock.
+            auto a = exclusive(mtx, Urgency::BlockWinning,
+                               /*on_compute_thread=*/true);
+            EXPECT_FALSE(a.owns_lock());
+        }
+        {
+            auto a = exclusive(mtx, Urgency::BlockWinning);
+            EXPECT_TRUE(a.owns_lock());
+        }
+    }
+
+    {   // budget expiry returns a NON-OWNING lock, so callers decline exactly
+        // as they do today rather than proceeding unlocked
+        ExclusiveTrackerHolder holder(mtx, std::chrono::milliseconds(400));
+        auto a = exclusive(mtx, Urgency::BlockWinning, /*on_compute_thread=*/false,
+                           std::chrono::milliseconds(50));
+        EXPECT_FALSE(a.owns_lock());
+    }
+}

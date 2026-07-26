@@ -857,6 +857,12 @@ nlohmann::json DASHWorkSource::mining_submit(
             in.merkle_branches = std::move(branch_hashes);
             in.payout_script   = core::address_to_script(username);
             in.pow_hash        = pow_hash;
+            // #889: tell the mint binding this solve is a WON BLOCK, so it
+            // takes a bounded wait on the tracker rather than the ordinary
+            // try-and-decline. The block has already been dispatched above —
+            // this flag can only affect how hard we try to MINT, never the
+            // submit. On the share arm it stays false: unchanged behaviour.
+            in.won_block       = won_block;
             // ref_hash: the coinb1/coinb2 split sits immediately after the
             // 32-byte OP_RETURN ref_hash (before the 8B nonce64 slot), so the
             // commitment is the coinb1 tail. Raw LE-internal bytes — embedded

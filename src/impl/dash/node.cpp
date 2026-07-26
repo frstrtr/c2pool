@@ -1374,20 +1374,65 @@ std::vector<uint256> NodeImpl::send_shares(peer_ptr peer,
     return sent;
 }
 
-uint256 NodeImpl::add_local_share(ShareType share)
+uint256 NodeImpl::add_local_share(ShareType share, bool block_winning)
 {
     const uint256 hash = share.hash();
     if (hash.IsNull())
         return uint256::ZERO;
 
     {
-        // Exclusive tracker lock, non-blocking (architectural rule): if the
-        // compute thread is mid-think, DECLINE the mint (fail-closed) — the
-        // miner keeps the pseudoshare credit, the next solve mints.
-        std::unique_lock lock(m_tracker_mutex, std::try_to_lock);
+        // Exclusive tracker lock.
+        //
+        // ORDINARY SHARE (block_winning == false) — UNCHANGED. Non-blocking
+        // (architectural rule, node.hpp): if the compute thread is mid-think,
+        // DECLINE the mint (fail-closed) — the miner keeps the pseudoshare
+        // credit, the next solve mints. That trade is correct and stays exactly
+        // as it was; tracker_acquire::exclusive() with Urgency::Opportunistic is
+        // literally the same single `try_to_lock`.
+        //
+        // BLOCK-WINNING SHARE (#889) — BOUNDED WAIT. There is no next solve: the
+        // block is found once, so a decline here permanently forfeits the
+        // highest-work share this node will ever produce. Worse, it is not only
+        // OUR share weight. p2pool nodes detect a pool block by watching for a
+        // SHARE with pow_hash <= header bits target (p2pool/node.py:145-147), so
+        // a block-winning share that never enters the sharechain is a block NO
+        // peer — not even our own oracle — can ever record. A momentarily busy
+        // tracker must not be allowed to do that.
+        //
+        // ⚠️ THE BLOCK IS ALREADY SUBMITTED BEFORE WE GET HERE. The won-block
+        // arm in stratum/work_source.cpp dispatches the block via
+        // submit_block_fn_ and only THEN calls the mint seam (#887/#888
+        // ordering, with an ordering-witness KAT pinning it). So whatever this
+        // wait costs, it can never delay, gate or endanger the block submit.
+        //
+        // #878/#881 GUARD: the compute thread already owns this mutex
+        // exclusively, so it must never wait on it. is_compute_thread() degrades
+        // the bounded path to a single try there. The live block-winning caller
+        // (main_dash.cpp's mint lambda, reached from the stratum handler via
+        // process_message -> handle_submit -> mining_submit) holds zero locks.
+        const auto urgency = block_winning
+            ? tracker_acquire::Urgency::BlockWinning
+            : tracker_acquire::Urgency::Opportunistic;
+        auto lock = tracker_acquire::exclusive(m_tracker_mutex, urgency,
+                                               is_compute_thread());
         if (!lock.owns_lock()) {
-            LOG_WARNING << "[MINT] tracker busy — local share "
-                        << hash.GetHex().substr(0, 16) << " declined (retry on next solve)";
+            if (block_winning) {
+                // LOUD + COUNTED. A silent drop is precisely the defect; this
+                // is the only remaining way a won block can go unseen, and it
+                // must be impossible to miss in a log or a dashboard.
+                m_block_share_lock_forfeits.fetch_add(1, std::memory_order_relaxed);
+                LOG_ERROR << "[MINT-BLOCK] FORFEIT — tracker still busy after "
+                          << tracker_acquire::BLOCK_SHARE_LOCK_BUDGET.count()
+                          << "ms; BLOCK-WINNING share "
+                          << hash.GetHex().substr(0, 16)
+                          << " NOT minted. The block itself was already "
+                             "submitted, but no p2pool peer will see it and its "
+                             "PPLNS weight is lost. forfeits="
+                          << m_block_share_lock_forfeits.load(std::memory_order_relaxed);
+            } else {
+                LOG_WARNING << "[MINT] tracker busy — local share "
+                            << hash.GetHex().substr(0, 16) << " declined (retry on next solve)";
+            }
             return uint256::ZERO;
         }
         if (m_chain->contains(hash)) {
@@ -1412,10 +1457,26 @@ uint256 NodeImpl::add_local_share(ShareType share)
                                                   m_known_txs);
             });
             if (!backable) {
-                LOG_WARNING << "[MINT] local share " << hash.GetHex().substr(0, 16)
-                            << " references template tx(s) no longer retained — "
-                               "declined (stale job past retention window; retry "
-                               "on next solve)";
+                // #889 scope note: this decline is NOT the lock hazard and is
+                // deliberately NOT bypassed for a block-winning share — minting
+                // a share whose txs we cannot serve would produce a share
+                // send_shares must withhold, i.e. the same invisibility by a
+                // different route. It is escalated to LOG_ERROR on the block
+                // path only so the loss is never quiet.
+                if (block_winning) {
+                    LOG_ERROR << "[MINT-BLOCK] BLOCK-WINNING share "
+                              << hash.GetHex().substr(0, 16)
+                              << " references template tx(s) no longer retained "
+                                 "— NOT minted (stale job past the retention "
+                                 "window). The block itself was already "
+                                 "submitted; this is a separate, non-lock "
+                                 "forfeit — see register_template_txs retention.";
+                } else {
+                    LOG_WARNING << "[MINT] local share " << hash.GetHex().substr(0, 16)
+                                << " references template tx(s) no longer retained — "
+                                   "declined (stale job past retention window; retry "
+                                   "on next solve)";
+                }
                 return uint256::ZERO;
             }
         }

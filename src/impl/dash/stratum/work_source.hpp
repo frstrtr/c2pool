@@ -124,6 +124,16 @@ public:
         /// Template tx hex frozen with the job (shared, may be null) — the
         /// run-loop registers these for share relay (remember_tx serving).
         std::shared_ptr<const std::vector<std::string>> tx_data;
+        /// #889: this solve already cleared the COIN BLOCK target — the block
+        /// has ALREADY been dispatched by the time the mint seam is invoked
+        /// (#887/#888 ordering). It matters because the share is unrepeatable:
+        /// there is no next solve to mint instead, and p2pool peers detect a
+        /// pool block ONLY by seeing a share that meets the block target
+        /// (p2pool/node.py:145-147), so failing to mint it also makes the won
+        /// block invisible to the entire network. The mint binding uses this to
+        /// take a BOUNDED WAIT on the tracker instead of the ordinary
+        /// try-and-decline. false on the ordinary share arm — unchanged path.
+        bool                       won_block{false};
     };
     /// Returns the minted share hash, or null-uint256 when the mint was
     /// declined/deferred (reason logged by the callee).
