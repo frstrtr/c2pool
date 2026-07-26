@@ -117,9 +117,10 @@ endif()
 # (dash_bls_verify) + its KAT consume it, never the shared core the Windows
 # main_ltc launcher builds ([[reference_windows_ci_conan_flake]]: Windows CI
 # builds only the LTC launcher, so DASH-only BLS code cannot break it). When the
-# option is OFF (default) or the library is not found, dash_bls_verify compiles a
-# fail-closed stub and the DKG-window serve path keeps the pre-Phase-L
-# null-commitment posture exactly — no dashbls dependency enters any build.
+# option is OFF (the default), dash_bls_verify compiles a fail-closed stub and
+# the DKG-window serve path keeps the pre-Phase-L null-commitment posture
+# exactly — no dashbls dependency enters any build. Turning the option ON and
+# NOT finding the library is an error, not a fallback (see below).
 #
 # Build the library once for the CI factory with scripts/build_dashbls.sh (builds
 # dash's OWN src/dashbls subtree at the v23.1.7 tag — byte-identical to dashd);
