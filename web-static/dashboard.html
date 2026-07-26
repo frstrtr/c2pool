@@ -1678,7 +1678,7 @@
                     <div style="font-size: 0.9rem; font-weight: 600; margin-bottom: 5px;">⛏️ Miner Configuration</div>
                     <div style="font-size: 0.85rem; font-family: monospace; background: rgba(0,0,0,0.3); padding: 8px; border-radius: 4px;">
                         <div><strong>Stratum URL:</strong> <span id="miner-url">detecting...</span></div>
-                        <div style="margin-top: 3px;"><strong>Username:</strong> <span style="color: #ffc107;">&lt;<span class="parent-symbol-hint">ADDR</span>&gt;</span><span style="color: #888;">,</span><span style="color: #c3a634;">&lt;DOGE_ADDR&gt;</span><span style="color: #888;">.WORKER</span></div>
+                        <div style="margin-top: 3px;"><strong>Username:</strong> <span style="color: #ffc107;">&lt;<span class="parent-symbol-hint">ADDR</span>&gt;</span><span class="merged-child-hint"><span style="color: #888;">,</span><span style="color: #c3a634;">&lt;<span class="merged-child-symbol-hint">DOGE</span>_ADDR&gt;</span></span><span style="color: #888;">.WORKER</span></div>
                         <div style="margin-top: 3px;"><strong>Password:</strong> <span style="color: #888;">anything</span></div>
                     </div>
                 </div>
@@ -2820,6 +2820,17 @@
             d3.selectAll('.symbol-small').text(sym);
             d3.select('#currency-symbol').text(sym);
             d3.selectAll('.parent-symbol-hint').text(sym + '_ADDR');
+            // Worker-username format is coin-topology-driven: a merged parent
+            // (LTC->DOGE) shows PARENT_ADDR,CHILD_ADDR.WORKER; a standalone coin
+            // (DASH/BTC/DGB) shows just PARENT_ADDR.WORKER. Never serve merged-
+            // mining worker instructions on a coin with no merged child.
+            var mergedChild = info && info.merged_child_symbol;
+            if (mergedChild) {
+                d3.selectAll('.merged-child-symbol-hint').text(mergedChild);
+                d3.selectAll('.merged-child-hint').style('display', null);
+            } else {
+                d3.selectAll('.merged-child-hint').style('display', 'none');
+            }
             d3.select('#parent_chain_peers_title').text(chainName);
             if (info && info.block_period) {
                 parentBlockPeriodMs = info.block_period * 1000;

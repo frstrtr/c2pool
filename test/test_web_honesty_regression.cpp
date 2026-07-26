@@ -1117,3 +1117,28 @@ TEST(WebGaugeParity, DisplayLookbehindIsOneHourOfSharesNotTargetLookbehind) {
     EXPECT_NE(3600u / ltc::PoolConfig::SHARE_PERIOD,
               ltc::PoolConfig::TARGET_LOOKBEHIND);
 }
+
+// Coin-topology honesty (2026-07-26 integrator HIGH): a standalone parent (DASH)
+// must NOT advertise a merged child -- serving LTC+DOGE merged-mining worker-
+// username instructions on a DASH pool misconfigures a live tenant. The
+// dashboard's Username line is driven by currency_info.merged_child_symbol, so
+// that field must be present ONLY for a genuine merged parent (LTC->DOGE) and
+// ABSENT for standalone coins. Not #ifdef-guarded (issue #895): always runs.
+TEST(WebHonestyRegression, CurrencyInfoNoFalseMergedChildOnDash) {
+    MiningInterface dash(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+    json d = dash.rest_web_currency_info();
+    EXPECT_EQ(d.value("symbol", std::string()), "DASH");
+    EXPECT_FALSE(d.contains("merged_child_symbol"))
+        << "DASH is a standalone parent with no merged child; advertising one "
+           "serves wrong LTC+DOGE worker-username instructions to tenants";
+    // Branding/explorer must be DASH, never a hardcoded litecoin fallback.
+    std::string dpfx = d.value("address_explorer_url_prefix", std::string());
+    EXPECT_NE(dpfx.find("dash"), std::string::npos);
+    EXPECT_EQ(dpfx.find("litecoin"), std::string::npos);
+
+    MiningInterface ltc(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+    json l = ltc.rest_web_currency_info();
+    EXPECT_EQ(l.value("merged_child_symbol", std::string()), "DOGE")
+        << "LTC parent merge-mines DOGE; the merged worker-username format is "
+           "correct here";
+}
