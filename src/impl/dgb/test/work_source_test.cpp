@@ -31,6 +31,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 
 namespace {
 
@@ -302,6 +303,70 @@ TEST(DgbWorkSource, MiningSubmitShareAcceptDispatchesMint)
     EXPECT_FALSE(fx.submit_called);        // NOT a block -> no broadcast
     EXPECT_EQ(seen.header_bytes.size(), 80u);   // 80-byte header forwarded
     EXPECT_EQ(seen.subsidy, 500000000ULL);      // subsidy carried from the job
+}
+
+// -- #887 WonBlock -> mint SEAM reachability (PRE-WIRING ONLY on DGB) ---------
+//
+// block_target <= share_target, so a WonBlock solve clears the share target
+// too -- it is the highest-work share the node will ever produce and belongs on
+// the sharechain as well as in the coin block. Before #887 the WonBlock case
+// returned right after the broadcaster, so the mint seam was never reached.
+//
+// SCOPE HONESTY -- this KAT proves ONLY that the WonBlock arm now REACHES
+// DGBWorkSource::try_mint_share, with a mint fn the TEST binds itself. It does
+// NOT prove a DGB share is minted in production: per #884 main_dgb.cpp never
+// calls set_mint_share_fn, so DGB cannot mint ANY local share today (not this
+// one, and not an ordinary ShareAccept either). The DGB half of #887 is
+// pre-wiring that pays off the moment #884 binds the seam.
+TEST(DgbWorkSource, MiningSubmitWonBlockAlsoReachesMintSeam)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    bool minted = false;
+    bool mint_saw_block_already_submitted = false;
+    dgb::stratum::DGBWorkSource::MintShareInputs seen;
+    ws->set_mint_share_fn(
+        [&](const dgb::stratum::DGBWorkSource::MintShareInputs& got) -> uint256 {
+            minted = true;
+            seen   = got;
+            // Reward-invariant witness: the broadcaster must already have run.
+            mint_saw_block_already_submitted = fx.submit_called;
+            uint256 h; h.SetHex(
+                "00000000000000000000000000000000000000000000000000000000000b10c6");
+            return h;
+        });
+    // Maximal target on BOTH bits: every Scrypt digest clears the block target
+    // -> WonBlock. The broadcaster fires AND the mint seam is reached.
+    auto job = make_job(/*share_bits=*/0x2100ffffu, /*block_nbits=*/"2100ffff");
+    auto result = ws->mining_submit(
+        "DGBaddr.worker1", "job-won-share", kEN1, kEN2, kNT, kNON, "rid",
+        /*merged_addresses=*/{}, &job);
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());       // won block -> accepted reply
+    EXPECT_TRUE(fx.submit_called);         // block still broadcast, unchanged
+    EXPECT_TRUE(minted);                   // ...and the mint seam is reached
+    EXPECT_TRUE(mint_saw_block_already_submitted);  // block dispatched FIRST
+    EXPECT_EQ(seen.header_bytes.size(), 80u);
+    EXPECT_EQ(seen.subsidy, 500000000ULL);
+}
+
+// REWARD INVARIANT: a mint that throws must not cost the block, and must not
+// turn a won block into a stratum reject.
+TEST(DgbWorkSource, MiningSubmitWonBlockSurvivesAThrowingMint)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    ws->set_mint_share_fn(
+        [](const dgb::stratum::DGBWorkSource::MintShareInputs&) -> uint256 {
+            throw std::runtime_error("mint blew up");
+        });
+    auto job = make_job(/*share_bits=*/0x2100ffffu, /*block_nbits=*/"2100ffff");
+    auto result = ws->mining_submit(
+        "DGBaddr.worker1", "job-won-throw", kEN1, kEN2, kNT, kNON, "rid",
+        /*merged_addresses=*/{}, &job);
+    EXPECT_TRUE(fx.submit_called);         // block reached the broadcaster
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());       // and the throw did not escape
 }
 
 TEST(DgbWorkSource, MiningSubmitLowDifficultyRejectsNeitherDispatch)

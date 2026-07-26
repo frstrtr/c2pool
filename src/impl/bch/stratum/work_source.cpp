@@ -690,6 +690,52 @@ nlohmann::json BCHWorkSource::mining_submit(
 
     auto pow_hex_short = pow_hash.GetHex().substr(0, 16);
 
+    // -- Sharechain write (#887) --
+    // Dispatch to create_share_fn_ (v36 share add). SHARED by both accept
+    // classes: block_target <= share_target, so a solve that meets the block
+    // target meets the share target too -- it is the highest-work share this
+    // node will ever produce, and the sharechain and the coin blockchain are
+    // independent systems. Before #887 the won-block arm returned without ever
+    // reaching this seam, forfeiting our own PPLNS weight in the very window
+    // the block pays out from and denying peers our best work. LTC has always
+    // written on both classes (web_server.cpp).
+    //
+    // ORDERING -- reward invariant: on the won-block arm this runs AFTER the
+    // block has already been dispatched, never before. create_share_fn_ takes
+    // the exclusive tracker lock, can decline, and can throw; the block submit
+    // must never sit behind any of that.
+    //
+    // CONSENSUS: unchanged. Share construction, target derivation and
+    // serialisation live entirely inside the (untouched) create_local_share
+    // seam -- this changes only WHETHER it is invoked, not what it builds.
+    auto write_solved_share = [&](bool won_block) {
+        const char* tag = won_block ? "[BCH-STRATUM-BLOCK-SHARE]"
+                                    : "[BCH-STRATUM-SHARE]";
+        CreateShareFn create_fn;
+        { std::lock_guard<std::mutex> lk(callback_mutex_); create_fn = create_share_fn_; }
+
+        uint256 share_hash;
+        if (create_fn) {
+            auto payout_script = core::address_to_script(username);
+            try { share_hash = create_fn(coinbase, header, *job, payout_script); }
+            catch (const std::exception& e) {
+                LOG_WARNING << tag << " create_share_fn threw: " << e.what()
+                            << " -- share not added";
+            }
+        }
+
+        if (!share_hash.IsNull())
+            LOG_INFO << tag << " ACCEPTED + ADDED user=" << username
+                     << " share_hash=" << share_hash.GetHex().substr(0, 16)
+                     << " pow_hash=" << pow_hex_short << " job=" << job_id;
+        else if (create_fn)
+            LOG_INFO << tag << " accepted (deferred) user=" << username
+                     << " pow_hash=" << pow_hex_short << " job=" << job_id;
+        else
+            LOG_INFO << tag << " accepted (no-tracker) user=" << username
+                     << " pow_hash=" << pow_hex_short << " job=" << job_id;
+    };
+
     // -- Classify --
     if (!(pow_hash > block_target)) {
         // BLOCK FOUND.
@@ -731,6 +777,11 @@ nlohmann::json BCHWorkSource::mining_submit(
                       << height << " not broadcast -- lost subsidy!";
         }
 
+        // #887: the won block is a SHARE too. The dispatch above has already
+        // happened, so nothing here can delay, gate or endanger the block
+        // submit -- the sharechain write is strictly downstream of it.
+        write_solved_share(/*won_block=*/true);
+
         {
             std::lock_guard<std::mutex> lk(workers_mutex_);
             for (auto& [sid, w] : workers_) { (void)sid; if (w.username == username) { w.accepted++; break; } }
@@ -740,29 +791,7 @@ nlohmann::json BCHWorkSource::mining_submit(
 
     if (!(pow_hash > share_target)) {
         // Share meets sharechain target -> create_share_fn_ (v36 share add).
-        CreateShareFn create_fn;
-        { std::lock_guard<std::mutex> lk(callback_mutex_); create_fn = create_share_fn_; }
-
-        uint256 share_hash;
-        if (create_fn) {
-            auto payout_script = core::address_to_script(username);
-            try { share_hash = create_fn(coinbase, header, *job, payout_script); }
-            catch (const std::exception& e) {
-                LOG_WARNING << "[BCH-STRATUM-SHARE] create_share_fn threw: " << e.what()
-                            << " -- share not added";
-            }
-        }
-
-        if (!share_hash.IsNull())
-            LOG_INFO << "[BCH-STRATUM-SHARE] ACCEPTED + ADDED user=" << username
-                     << " share_hash=" << share_hash.GetHex().substr(0, 16)
-                     << " pow_hash=" << pow_hex_short << " job=" << job_id;
-        else if (create_fn)
-            LOG_INFO << "[BCH-STRATUM-SHARE] accepted (deferred) user=" << username
-                     << " pow_hash=" << pow_hex_short << " job=" << job_id;
-        else
-            LOG_INFO << "[BCH-STRATUM-SHARE] accepted (no-tracker) user=" << username
-                     << " pow_hash=" << pow_hex_short << " job=" << job_id;
+        write_solved_share(/*won_block=*/false);
 
         {
             std::lock_guard<std::mutex> lk(workers_mutex_);

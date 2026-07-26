@@ -36,9 +36,11 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <functional>
+#include <stdexcept>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -622,6 +624,107 @@ TEST(DashStratumWorkSource, MiningSubmitRoutesShareIntoMintSeam)
               reassemble(rig.job.coinb1, rig.en1, rig.en2, rig.job.coinb2));
     EXPECT_EQ(seen.subsidy, kCoinbaseValue);
     EXPECT_EQ(seen.pow_hash, rig.pow_for(nonce));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// #887 -- the block-winning share must ALSO be minted onto the sharechain.
+//
+// block_target <= share_target, so a solve that clears the block target clears
+// the share target by definition: it is the highest-work share this node will
+// ever produce. Before #887 the won-block arm dispatched the block and
+// RETURNED, so the mint seam was never reached -- forfeiting our own PPLNS
+// weight in the very window the block pays out from, on every block won.
+//
+// The two systems are independent (sharechain vs coin blockchain); the solve
+// belongs in BOTH.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Positive: a WonBlock submit reaches the broadcaster AND the mint seam, and
+// the fields handed to the mint describe the SAME solve that was dispatched.
+TEST(DashStratumWorkSource, MiningSubmitWonBlockAlsoMintsTheShare)
+{
+    SubmitRig rig;
+    // Trivial block target -> deterministic WonBlock (same setup as
+    // MiningSubmitWonBlockAssemblesAndBroadcasts).
+    rig.job.share_bits  = 0x207fffffu;
+    rig.job.block_nbits = "207fffff";
+    const uint256 block_target = dash::coin::target_from_nbits(0x207fffffu);
+    const uint256 share_target = dash::coin::target_from_nbits(0x207fffffu);
+    const uint32_t nonce = rig.find_nonce([&](const uint256& pow) {
+        return pow <= block_target;
+    });
+    // The premise of the fix: a block solve is also a share solve.
+    ASSERT_LE(rig.pow_for(nonce), share_target);
+
+    bool mint_called = false;
+    dash::stratum::DASHWorkSource::MintShareInputs seen;
+    rig.ws->set_mint_share_fn(
+        [&](const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256 {
+            mint_called = true;
+            seen = in;
+            uint256 h;
+            h.SetHex("5555555555555555555555555555555555555555555555555555555555555555");
+            return h;
+        });
+
+    auto result = rig.submit(nonce);
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());
+
+    // The block still goes out -- unchanged, and first.
+    ASSERT_TRUE(rig.fx.submit_called);
+    EXPECT_EQ(rig.fx.submit_height, 424242u);
+
+    // ...AND the winning share is minted (the #887 fix).
+    ASSERT_TRUE(mint_called);
+    EXPECT_EQ(seen.header_bytes, rig.header_for(nonce));
+    EXPECT_EQ(seen.pow_hash, rig.pow_for(nonce));
+    EXPECT_EQ(seen.subsidy, kCoinbaseValue);
+    EXPECT_EQ(seen.coinbase_bytes,
+              reassemble(rig.job.coinb1, rig.en1, rig.en2, rig.job.coinb2));
+    // The minted share describes the block that was dispatched: the block's
+    // first 80 bytes ARE this share's header.
+    ASSERT_GE(rig.fx.submitted_block.size(), 80u);
+    EXPECT_TRUE(std::equal(seen.header_bytes.begin(), seen.header_bytes.end(),
+                           rig.fx.submitted_block.begin()));
+}
+
+// REWARD INVARIANT: the block submit runs FIRST and is never gated by the
+// mint. A mint that throws (tracker error, rebuild fault) must not cost the
+// block -- and must not turn a won block into a stratum reject either.
+TEST(DashStratumWorkSource, MiningSubmitWonBlockDispatchesBeforeAndDespiteAThrowingMint)
+{
+    SubmitRig rig;
+    rig.job.share_bits  = 0x207fffffu;
+    rig.job.block_nbits = "207fffff";
+    const uint256 block_target = dash::coin::target_from_nbits(0x207fffffu);
+    const uint32_t nonce = rig.find_nonce([&](const uint256& pow) {
+        return pow <= block_target;
+    });
+
+    // Ordering witness: the mint records whether the block had already been
+    // dispatched by the time it ran. Anything other than "already dispatched"
+    // means the mint was wired AHEAD of the submit -- the one arrangement this
+    // codebase forbids on a reward path.
+    bool mint_saw_block_already_submitted = false;
+    bool mint_called = false;
+    rig.ws->set_mint_share_fn(
+        [&](const dash::stratum::DASHWorkSource::MintShareInputs&) -> uint256 {
+            mint_called = true;
+            mint_saw_block_already_submitted = rig.fx.submit_called;
+            throw std::runtime_error("mint blew up");
+        });
+
+    auto result = rig.submit(nonce);
+
+    // Block dispatched, and the throw did not escape mining_submit.
+    ASSERT_TRUE(rig.fx.submit_called);
+    EXPECT_EQ(rig.fx.submit_height, 424242u);
+    ASSERT_TRUE(mint_called);
+    EXPECT_TRUE(mint_saw_block_already_submitted);
+    // Won block still answers the miner with the accepted reply.
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
