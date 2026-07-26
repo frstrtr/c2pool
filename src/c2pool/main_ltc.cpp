@@ -2903,8 +2903,15 @@ int main(int argc, char* argv[]) {
                         if (!guard->chain.contains(best)) return s_last_good;
                         int height = guard->chain.get_height(best);
                         if (height < 3) return s_last_good;
-                        auto lookbehind = std::min(height - 1,
-                            static_cast<int>(ltc::PoolConfig::TARGET_LOOKBEHIND));
+                        // DISPLAY LOOKBEHIND (#864): p2pool web.py get_global_stats()
+                        // averages the gauge over ONE HOUR of shares --
+                        // min(height, 3600//SHARE_PERIOD) -- not TARGET_LOOKBEHIND.
+                        // DISPLAY ONLY: the CONSENSUS retarget keeps TARGET_LOOKBEHIND
+                        // (p2pool data.py:137,140) and is untouched; m_pool_hashrate_fn
+                        // is read exclusively by web_server REST handlers.
+                        const int display_lookbehind =
+                            3600 / static_cast<int>(ltc::PoolConfig::share_period());
+                        auto lookbehind = std::min(height - 1, display_lookbehind);
                         auto aps = guard->get_pool_attempts_per_second(best, lookbehind, false);
                         double hr = static_cast<double>(aps.GetLow64());
                         if (hr > 0) s_last_good = hr;
@@ -3474,6 +3481,21 @@ int main(int argc, char* argv[]) {
                 result["shares_by_miner"]   = sr.miner_counts;
                 result["average_difficulty"] = sr.share_count > 0
                     ? sr.difficulty_sum / sr.share_count : 1.0;
+                // p2pool web.py get_global_stats() reports the pool's share-difficulty
+                // FLOOR, target_to_difficulty(tracker.items[best_share].max_target) --
+                // a different quantity from the window average above, which is what
+                // /global_stats had been publishing as min_difficulty (#864). Display
+                // only; read straight off the best share's header.
+                if (!best.IsNull() && chain.contains(best)) {
+                    try {
+                        auto& bcd = chain.get(best);
+                        bcd.share.invoke([&](auto* s) {
+                            if (s->m_max_bits != 0)
+                                result["min_difficulty"] = chain::target_to_difficulty(
+                                    chain::bits_to_target(s->m_max_bits));
+                        });
+                    } catch (...) { /* no floor to report; field stays absent -> null */ }
+                }
                 result["heaviest_fork_weight"] = chain.size() > 0
                     ? static_cast<double>(best_height) / static_cast<double>(chain.size())
                     : 0.0;
