@@ -9,8 +9,10 @@
 // shape: the router body is byte-identical to Legacy, but the HANDLER bodies
 // carry the genuine Actual-generation differences the reviewer diffs against
 // the oracle -- they are NOT a qualifier-swap of bch::Legacy:
-//   * addrme self-probe is 127.0.0.1 (Legacy: 127.0.0.0), and the relay
-//     guard is !m_peers.empty() (Legacy: m_peers.empty()).
+//   * addrme self-probe is 127.0.0.1 (Legacy: 127.0.0.0). The relay guard is
+//     !m_peers.empty() in BOTH generations -- Legacy's inverted m_peers.empty()
+//     was a defect, not a generation difference, and was corrected to match
+//     canonical p2pool p2p.py handle_addrme.
 //   * shares preserves the original raw bytes (chain::RawShare raw_copy)
 //     before deserialization consumes them and feeds the 3-arg
 //     result.add(share, txs, raw_copy) (Legacy: 2-arg add).
@@ -68,7 +70,7 @@ void Actual::handle_message(std::unique_ptr<RawMessage> rmsg, peer_ptr peer)
 // ---------------------------------------------------------------------------
 // Peer-book HANDLER cluster (addrs / addrme / ping / getaddrs).
 // Mechanical mirror of btc::Actual peer-book handlers; addrme carries the
-// Actual-generation 127.0.0.1 / !m_peers.empty() form. Zero v36 surface.
+// Actual-generation 127.0.0.1 self-probe form. Zero v36 surface.
 // ---------------------------------------------------------------------------
 
 void Actual::HANDLER(addrs)

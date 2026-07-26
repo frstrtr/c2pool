@@ -30,7 +30,14 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # ONE definition instead of each growing a copy. Same reasoning again:
     # header-only over core, so it is FOLDED into the EXISTING allowlisted
     # core_test target, never a new add_executable (the #769 "Not Run" trap).
-    add_executable(core_test pack_test.cpp events_test.cpp chain_test.cpp packet_test.cpp block_broadcast_test.cpp broadcast_convergence_matrix_test.cpp core_merkle_branches_test.cpp version_gate_test.cpp filesystem_test.cpp web_server_submitblock_test.cpp known_txs_eviction_test.cpp tx_advertiser_test.cpp socket_write_queue_test.cpp known_txs_backing_test.cpp)
+    # random_choice_guard_test.cpp: the #869 addrme peer-relay guard. Covers the
+    # core/random.hpp empty-container backstop plus a source KAT pinning the
+    # !m_peers.empty() / !m_connections.empty() relay predicates across all five
+    # per-coin protocol_legacy.cpp / protocol_actual.cpp addrme+addrs handlers.
+    # Same reasoning as above: FOLDED into the EXISTING allowlisted core_test
+    # target, never a new add_executable.
+    add_executable(core_test pack_test.cpp events_test.cpp chain_test.cpp packet_test.cpp block_broadcast_test.cpp broadcast_convergence_matrix_test.cpp core_merkle_branches_test.cpp version_gate_test.cpp filesystem_test.cpp web_server_submitblock_test.cpp known_txs_eviction_test.cpp tx_advertiser_test.cpp socket_write_queue_test.cpp known_txs_backing_test.cpp random_choice_guard_test.cpp)
+    target_compile_definitions(core_test PRIVATE C2POOL_SRC_ROOT="${CMAKE_SOURCE_DIR}/src")
     target_link_libraries(core_test PRIVATE GTest::gtest_main core c2pool_merged_mining GTest::gtest)
     target_link_libraries(core_test PRIVATE c2pool_payout c2pool_hashrate ltc_coin)  # OBJECT-lib SCC direct-naming (#22/#39)
 
