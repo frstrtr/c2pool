@@ -88,6 +88,128 @@ struct SharechainConfig
     static const std::string& identifier_hex() { return is_testnet ? TESTNET_IDENTIFIER_HEX : IDENTIFIER_HEX; }
     static const std::string& prefix_hex()     { return is_testnet ? TESTNET_PREFIX_HEX     : PREFIX_HEX; }
 
+    // ---- COINBASEEXT: the canonical p2pool coinbase marker ------------------
+    // SOURCE OF TRUTH: oracle networks/dash.py:11 / dash_testnet.py:11 —
+    //     dash.py         COINBASEEXT = '0D2F5032506F6F6C2D444153482F'.decode('hex')
+    //     dash_testnet.py COINBASEEXT = '0E2F5032506F6F6C2D74444153482F'.decode('hex')
+    // Transcribed VERBATIM, including the leading one-byte push opcode (0x0D =
+    // push 13, the length of "/P2Pool-DASH/"; 0x0E = push 14 for
+    // "/P2Pool-tDASH/"), so this header pins the oracle constant exactly as the
+    // oracle writes it. What c2pool EMITS is the text payload with the push
+    // opcode stripped — see coinbaseext_text() for why.
+    //
+    // WHY IT EXISTS: block explorers attribute blocks to a pool BY COINBASE
+    // TEXT. chainz.cryptoid.info/dash/extraction.dws?30.htm registers the pool
+    // as "P2Pool-DASH" and has no knowledge of the string "c2pool", so blocks
+    // c2pool won for the p2pool-dash sharechain were credited to nobody.
+    //
+    // CONSENSUS STATUS: NOT consensus-bearing — the coinbase text is a
+    // customizable parameter (that is what --coinbase-text is). COINBASEEXT
+    // appears NOWHERE in the oracle's data.py (the consensus module); it lives
+    // only in networks/*.py and the stratum assembly at work.py:339. The
+    // scriptSig travels on the wire as share_info.share_data.coinbase (VarStr,
+    // 2..100 B) and Share.check() re-derives the gentx from the RECEIVED
+    // share's own coinbase field, never from a network constant. Framing notes
+    // (BIP34 prefix, extranonce offsets) on build_coinbase_scriptsig().
+    //
+    // REGTEST: the oracle's dash_regtest.py:11 constant
+    // '0F2F5032506F6F6C2D724441534828' is MALFORMED — it declares push-15 but
+    // carries only 14 bytes, and its final byte is 0x28 '(' where a '/' (0x2F)
+    // was clearly intended ("/P2Pool-rDASH("). c2pool has no separate regtest
+    // sharechain profile (main_dash.cpp maps --regtest onto testnet=true), so a
+    // c2pool regtest node emits the tDASH marker and the oracle typo is not
+    // reproduced. Recorded here so the divergence is deliberate, not drift.
+    static inline const std::string COINBASEEXT_HEX         = "0D2F5032506F6F6C2D444153482F";
+    static inline const std::string TESTNET_COINBASEEXT_HEX = "0E2F5032506F6F6C2D74444153482F";
+
+    // Implementation tag appended after the marker so a human reading the
+    // coinbase can tell WHICH p2pool implementation produced the block. Shared
+    // by mainnet and testnet.
+    static inline const std::string IMPL_TAG = "c2pool/";
+
+    // Explicit-network forms — PREFERRED. Callers on the coinbase path already
+    // hold core::CoinParams::is_testnet, so they never have to trust the mutable
+    // process-global below (and tests can exercise both networks in one binary).
+    static const std::string& coinbaseext_hex(bool testnet)
+    {
+        return testnet ? TESTNET_COINBASEEXT_HEX : COINBASEEXT_HEX;
+    }
+    static const std::string& coinbaseext_hex() { return coinbaseext_hex(is_testnet); }
+
+    // COINBASEEXT decoded to raw bytes, push opcode INCLUDED — the oracle's
+    // literal constant. Local decoder: this header is the SSOT the conformance
+    // tests pin and deliberately carries no dependency beyond
+    // <cstdint>/<string>/uint256.
+    static std::string coinbaseext_bytes(bool testnet)
+    {
+        const std::string& h = coinbaseext_hex(testnet);
+        auto nib = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        std::string out;
+        out.reserve(h.size() / 2);
+        for (size_t i = 0; i + 1 < h.size(); i += 2) {
+            const int hi = nib(h[i]), lo = nib(h[i + 1]);
+            if (hi < 0 || lo < 0) return {};          // malformed SSOT -> emit nothing
+            out.push_back(static_cast<char>((hi << 4) | lo));
+        }
+        return out;
+    }
+    static std::string coinbaseext_bytes() { return coinbaseext_bytes(is_testnet); }
+
+    // The marker TEXT — COINBASEEXT with its leading push opcode stripped:
+    //     mainnet "/P2Pool-DASH/"   testnet "/P2Pool-tDASH/"
+    //
+    // This, not the raw constant, is what c2pool writes. The push opcode is
+    // dropped deliberately: c2pool exposes the coinbase scriptSig payload as an
+    // operator-settable TEXT parameter (--coinbase-text, README "Coinbase
+    // structure"), and a bare control byte inside a text field would be lost the
+    // moment an operator overrode it — the default would then behave unlike
+    // every other value the field can take. Attribution is unaffected: explorers
+    // key on the coinbase TEXT (cryptoid lists this pool as "P2Pool-DASH"), and
+    // the ASCII substring "/P2Pool-DASH/" is byte-identical to what a canonical
+    // p2pool-dash node renders. The push byte is a script-encoding artefact of
+    // p2pool's assembly, not part of the name.
+    //
+    // Fail-closed: if the SSOT hex is ever edited into an inconsistent state
+    // (leading byte != payload length, as in the oracle's own regtest constant),
+    // this returns the decoded bytes unchanged rather than silently trimming a
+    // real character.
+    static std::string coinbaseext_text(bool testnet)
+    {
+        std::string b = coinbaseext_bytes(testnet);
+        if (b.size() >= 2 &&
+            static_cast<unsigned char>(b[0]) == b.size() - 1)
+            return b.substr(1);
+        return b;
+    }
+
+    // Default coinbase scriptSig text for this network:
+    //     mainnet "/P2Pool-DASH/c2pool/"     testnet "/P2Pool-tDASH/c2pool/"
+    // The p2pool marker makes explorers attribute the block to the pool; the
+    // c2pool suffix says which implementation mined it.
+    static std::string default_coinbase_text(bool testnet)
+    {
+        return coinbaseext_text(testnet) + IMPL_TAG;
+    }
+
+    // ---- Operator override (--coinbase-text / pool.yaml coinbase_text) -------
+    // Pool-level runtime setting, resolved ONCE at startup in main_dash.cpp
+    // before any coinbase is built. Empty means "use the network default".
+    // Lives here rather than being threaded through every build call so the
+    // stratum job path and the share-mint path cannot end up disagreeing.
+    static inline std::string coinbase_text_override;
+
+    static std::string coinbase_text(bool testnet)
+    {
+        return coinbase_text_override.empty() ? default_coinbase_text(testnet)
+                                              : coinbase_text_override;
+    }
+    static std::string coinbase_text() { return coinbase_text(is_testnet); }
+
     // ---- Dust threshold (payout-dust semantic) -----------------------------
     // DUST_THRESHOLD: minimum per-recipient payout to justify a coinbase output.
     // SOURCE: p2pool-dash oracle DUST_THRESHOLD = 0.001e8 = 100000 satoshi

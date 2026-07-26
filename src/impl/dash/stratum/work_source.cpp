@@ -695,7 +695,9 @@ core::stratum::CoinbaseResult DASHWorkSource::build_connection_coinbase(
             weights, total_weight, params);
 
         dash::coinbase::CoinbaseLayout layout = dash::coinbase::build(
-            *wd, tx_outs, /*pool_tag=*/"c2pool", params, ref_hash);
+            *wd, tx_outs,
+            /*coinbase_text=*/dash::SharechainConfig::coinbase_text(params.is_testnet),
+            params, ref_hash);
         dash::coinbase::CoinbSplit split = dash::coinbase::split_coinb(layout);
 
         core::stratum::CoinbaseResult out;

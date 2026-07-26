@@ -11,8 +11,8 @@
 //   [TxIn:
 //      [prev_hash 32B zeros][prev_n 0xFFFFFFFF]
 //      [VarStr scriptSig:
-//         [BIP34 height push][pool_tag]          ← no extranonce here anymore
-//      ]
+//         [BIP34 height push][coinbase text]
+//      ]                                          ← no extranonce here anymore
 //      [sequence 0xFFFFFFFF]
 //   ]
 //   [vout VarInt]
@@ -37,6 +37,7 @@
 
 #include "coin/transaction.hpp"
 #include "coin/rpc_data.hpp"
+#include "config_pool.hpp"                 // SSOT: SharechainConfig::COINBASEEXT_HEX / IMPL_TAG
 #include "share_check.hpp"                 // decode_payee_script, pubkey_hash_to_script2, DONATION_SCRIPT
 #include "payout_muldiv.hpp"               // dash::payout::payout_share (MSVC-portable 128-bit muldiv)
 
@@ -253,6 +254,84 @@ inline std::vector<unsigned char> push_bip34_height(uint32_t height)
     return out;
 }
 
+// Maximum coinbase scriptSig length. Oracle data.py Share.__init__ rejects a
+// share whose share_data['coinbase'] is outside 2..100 bytes, and work.py:339
+// slices the assembled stratum scriptSig to [:100]. Both bounds are the same
+// number; every scriptSig c2pool emits goes through build_coinbase_scriptsig()
+// so neither can be breached from one path only.
+static constexpr size_t MAX_SCRIPTSIG_LEN = 100;
+
+// ── build_coinbase_scriptsig — THE single coinbase-scriptSig SSOT ───────────
+//
+// Emits:  [BIP34 height push][coinbase text]              truncated to 100 B
+//
+// mainnet, height 2511303, default text:
+//   03 c75126 | 2f 50 32 50 6f 6f 6c 2d 44 41 53 48 2f 63 32 70 6f 6f 6c 2f
+//   = push3 "\xc7\x51\x26"  +  "/P2Pool-DASH/c2pool/"                (24 bytes)
+//
+// `coinbase_text` is the operator-facing text slot (--coinbase-text /
+// pool.yaml coinbase_text, README "Coinbase structure"). Pass an empty string
+// to take the network default from the SSOT — SharechainConfig::coinbase_text()
+// resolves the override-or-default, so the stratum job path and the share-mint
+// path cannot end up disagreeing.
+//
+// WHY THIS DEFAULT
+//   * "/P2Pool-DASH/" is the oracle's COINBASEEXT payload (networks/dash.py:11;
+//     testnet "/P2Pool-tDASH/"). Block explorers attribute blocks to a pool by
+//     coinbase text — chainz.cryptoid.info registers this pool as "P2Pool-DASH"
+//     and has no knowledge of the string "c2pool", so before this every block
+//     the pool won through c2pool was credited to nobody.
+//   * "c2pool/" follows so a human reading the coinbase can still tell WHICH
+//     p2pool implementation produced the block.
+//
+// FRAMING — the two things that must not move
+//   1. BIP34. The height push stays FIRST and can never be displaced or
+//      truncated: dashd's ContextualCheckBlock compares the scriptSig PREFIX to
+//      CScript() << nHeight, so anything appended after it is invisible to that
+//      check. Worst case the push is 5 bytes (data-push of a 4-byte
+//      CScriptNum), leaving 95 for the text; the default needs 20 (mainnet) /
+//      21 (testnet) and --coinbase-text is capped at 64 by the caller, so the
+//      100-byte truncation cannot reach back into the height push.
+//   2. Extranonce offsets. DASH's stratum extranonce2 is the 8-byte nonce64
+//      inside the OP_RETURN output, NOT inside the scriptSig. coinb1/coinb2
+//      split at nonce64_offset, which build() derives from the tx TAIL
+//      (total - payload - 4 - 8). A longer scriptSig lengthens coinb1 and
+//      leaves the advertised extranonce2_size (8) and coinb2 byte-identical.
+//
+// CONSENSUS: the coinbase text is a customizable parameter and is not part of
+// what peers re-derive. Oracle data.py Share.check() calls
+// generate_transaction(tracker, SELF.share_info['share_data'], ...) — it feeds
+// the RECEIVED share's own coinbase field back in; COINBASEEXT appears nowhere
+// in data.py. c2pool's mirror, share_check.hpp::generate_share_transaction,
+// likewise does `tx << share.m_coinbase`. The hash_link is length-agnostic
+// (prefix_to_hash_link/check_hash_link derive the 64-byte-block split from the
+// actual prefix length, and dash's hash_link_type carries extra_data as a
+// VarStr precisely so a variable-length prefix works). Empirically: c2pool has
+// been writing "c2pool" — matching no network constant — and canonical
+// p2pool-dash peers accept its shares with zero bans across thousands of shares
+// and two dashd-confirmed mainnet blocks (2511241, 2511303).
+//
+// The ONE hazard this function exists to close: dash builds the scriptSig in
+// TWO places — coinbase::build() (the stratum job / real block coinbase) and
+// mint::build_producer_job() (share_data['coinbase']). If those two ever
+// disagree by a single byte, the minted share's gentx no longer matches the
+// block coinbase and the node self-rejects. They now both call this.
+inline std::vector<unsigned char> build_coinbase_scriptsig(
+    uint32_t height, const std::string& coinbase_text, bool testnet)
+{
+    std::vector<unsigned char> script = push_bip34_height(height);
+
+    const std::string text = coinbase_text.empty()
+        ? dash::SharechainConfig::coinbase_text(testnet)
+        : coinbase_text;
+
+    for (unsigned char c : text) {
+        if (script.size() >= MAX_SCRIPTSIG_LEN) break;   // oracle work.py [:100]
+        script.push_back(c);
+    }
+    return script;
+}
+
 // Convert compact nbits → share difficulty (Bitcoin bdiff formula).
 inline double bits_to_difficulty(uint32_t nbits)
 {
@@ -275,16 +354,16 @@ inline double bits_to_difficulty(uint32_t nbits)
 //                      DONATION_SCRIPT so gentx_before_refhash lines up.
 //                      Zero-value entries are emitted as-is (callers that
 //                      want to strip them should do so before calling).
-//   pool_tag         — short tag in coinbase scriptSig (no extranonce)
-//   params           — coin params (unused here; retained for symmetry)
+//   coinbase_text    — operator coinbase scriptSig text (--coinbase-text);
+//                      empty -> the network default from the SSOT (no extranonce)
+//   params           — coin params; params.is_testnet selects the network default
 //   ref_hash         — 32B PPLNS commitment embedded in OP_RETURN
 inline CoinbaseLayout build(const dash::coin::DashWorkData& work,
                             const std::vector<MinerPayout>& tx_outs_ordered,
-                            const std::string& pool_tag,
+                            const std::string& coinbase_text,
                             const core::CoinParams& params,
                             const uint256& ref_hash)
 {
-    (void)params;
     using namespace dash::coin;
 
     MutableTransaction tx;
@@ -295,10 +374,11 @@ inline CoinbaseLayout build(const dash::coin::DashWorkData& work,
     in.prevout.index = 0xFFFFFFFFu;
     in.sequence      = 0xFFFFFFFFu;
     {
-        std::vector<unsigned char> script;
-        auto h_push = push_bip34_height(work.m_height);
-        script.insert(script.end(), h_push.begin(), h_push.end());
-        script.insert(script.end(), pool_tag.begin(), pool_tag.end());
+        // SSOT: same helper mint::build_producer_job uses for
+        // share_data['coinbase'] — the two must stay byte-identical or a
+        // minted share's gentx stops matching the block coinbase.
+        auto script = build_coinbase_scriptsig(
+            work.m_height, coinbase_text, params.is_testnet);
         in.scriptSig = OPScript(script.data(), script.data() + script.size());
     }
     tx.vin.push_back(std::move(in));

@@ -385,8 +385,13 @@ TEST(DashStratumWorkSource, ConnectionCoinbaseIsByteIdenticalToVerifierSSOT)
     auto tx_outs = dash::coinbase::compute_dash_payouts(
         kCoinbaseValue, w.m_packed_payments, fixture_miner_pkh(),
         weights, /*total_weight=*/1, params);
-    auto layout = dash::coinbase::build(w, tx_outs, "c2pool", params,
-                                        /*ref_hash=*/uint256::ZERO);
+    // Coinbase text comes from the coin SSOT (config_pool.hpp), the same source
+    // build_connection_coinbase resolves — pinning the literal here would make
+    // this byte-identity test fail the moment the pool's coinbase text changes,
+    // which is exactly the knob --coinbase-text exposes.
+    auto layout = dash::coinbase::build(
+        w, tx_outs, dash::SharechainConfig::coinbase_text(params.is_testnet),
+        params, /*ref_hash=*/uint256::ZERO);
     EXPECT_EQ(reassembled, layout.bytes);
 
     // Value splits: worker payout = subsidy - masternode share; the single
