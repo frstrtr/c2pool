@@ -2,6 +2,8 @@
 #pragma once
 
 #include <memory>
+#include <core/log.hpp>
+#include <core/p2p_message_stats.hpp>
 #include <core/timer.hpp>
 #include <core/socket.hpp>
 namespace pool
@@ -42,8 +44,27 @@ public:
         m_socket->close();
     }
 
+    /// SEND choke point for the pool protocol. EVERY outbound pool message in
+    /// every coin lane goes through here (verified: the only other
+    /// Socket::write callers are the coin-daemon p2p connections, a different
+    /// protocol), which is why the outbound counter lives here and not in the
+    /// per-coin protocol files.
+    ///
+    /// Observe-only: the counter is a relaxed fetch_add and the message is
+    /// forwarded byte-unchanged.
     void write(std::unique_ptr<RawMessage> rmsg)
     {
+        if (rmsg)
+        {
+            auto& stats = core::obs::p2p_stats();
+            stats.count_out(rmsg->m_command);
+            // Off by default; nothing in-tree enables it. Counters are the
+            // hot-path mechanism, this is the opt-in magnifying glass.
+            if (stats.trace_enabled.load(std::memory_order_relaxed))
+                LOG_DEBUG_POOL << "[p2p-msg] out "
+                               << std::string(core::obs::trim_command(rmsg->m_command))
+                               << " -> " << m_socket->get_addr().to_string();
+        }
         m_socket->write(std::move(rmsg));
     }
 

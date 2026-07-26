@@ -16,6 +16,7 @@
 
 #include "web_server.hpp"
 #include "filesystem.hpp"
+#include "p2p_message_stats.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -26,6 +27,65 @@
 #include <system_error>
 
 namespace core {
+
+// ── /p2p_stats — read-only p2p wire observability ──────────────────────
+//
+// Serialises core::obs::p2p_stats() (src/core/p2p_message_stats.hpp). Pure
+// reader: it loads relaxed atomics and formats them. It calls NOTHING on the
+// node, takes no lock, and can never block the IO or compute thread — which is
+// also why it lives here rather than behind a MiningInterface accessor.
+//
+// Answers, per message type and direction, "did this actually move on the
+// wire?" — a question that previously had NO observable answer at any
+// verbosity, so a log-grep returning zero was misread as "not implemented".
+static nlohmann::json build_p2p_stats_json()
+{
+    const auto& s = obs::p2p_stats();
+
+    nlohmann::json messages = nlohmann::json::object();
+    for (std::size_t i = 0; i < obs::P2P_MESSAGE_COUNT; ++i) {
+        const auto m = static_cast<obs::P2PMessage>(i);
+        messages[std::string(obs::p2p_message_name(m))] = {
+            {"in",  s.get_in(m)},
+            {"out", s.get_out(m)}
+        };
+    }
+
+    const auto samples   = s.ts_delta_samples.load(std::memory_order_relaxed);
+    const auto saturated = s.ts_delta_saturated.load(std::memory_order_relaxed);
+    const auto order_size = s.known_txs_order_size.load(std::memory_order_relaxed);
+
+    nlohmann::json out;
+    out["messages"]  = std::move(messages);
+    out["totals"]    = {{"in", s.total_in()}, {"out", s.total_out()}};
+    out["trace_enabled"] = s.trace_enabled.load(std::memory_order_relaxed);
+
+    // Tx-pool visibility. known_txs_order_size is null on lanes with no
+    // recency deque (DASH), NOT 0 — an absent sidecar is not an empty one.
+    out["txpool"] = {
+        {"known_txs_size",           s.known_txs_size.load(std::memory_order_relaxed)},
+        {"known_txs_order_size",     order_size < 0 ? nlohmann::json(nullptr)
+                                                    : nlohmann::json(order_size)},
+        {"last_have_tx_advert_size", s.last_have_tx_advert_size.load(std::memory_order_relaxed)},
+        {"last_losing_tx_advert_size", s.last_losing_tx_advert_size.load(std::memory_order_relaxed)},
+        {"have_tx_adverts_sent",     s.have_tx_adverts_sent.load(std::memory_order_relaxed)},
+        {"updated_at",               s.known_txs_updated_at.load(std::memory_order_relaxed)}
+    };
+
+    // Sharechain embedded-timestamp health. tip_lag_seconds and
+    // saturation_fraction are the honest early-warning pair; pool_hash_rate /
+    // min_difficulty are NOT (under saturation they measure floor history).
+    out["sharechain_timestamps"] = {
+        {"tip_embedded_timestamp", s.tip_embedded_timestamp.load(std::memory_order_relaxed)},
+        {"tip_lag_seconds",        s.tip_lag_seconds.load(std::memory_order_relaxed)},
+        {"clip_upper_bound",       s.ts_clip_upper_bound.load(std::memory_order_relaxed)},
+        {"delta_samples",          samples},
+        {"delta_saturated",        saturated},
+        {"saturation_fraction",    samples ? static_cast<double>(saturated) / samples : 0.0},
+        {"updated_at",             s.sharechain_updated_at.load(std::memory_order_relaxed)}
+    };
+    return out;
+}
 
 
 // ── Security helpers ───────────────────────────────────────────────────
@@ -380,6 +440,8 @@ void HttpSession::process_request()
                 rest_result = mining_interface_->rest_v36_status();
             else if (target == "/tracker_debug")
                 rest_result = mining_interface_->rest_tracker_debug();
+            else if (target == "/p2p_stats")
+                rest_result = build_p2p_stats_json();
 
             // Merged mining endpoints
             else if (target == "/merged_stats")
