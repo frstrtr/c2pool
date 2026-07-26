@@ -78,6 +78,14 @@ struct EmbeddedWorkInputs {
     std::vector<vendor::CFinalCommitment> qc_commitments;
     bool                             has_quorum_root_override{false};
     uint256                          quorum_root_override;
+    // E-SUPERBLOCK seam: the governance-sourced treasury payout schedule for a
+    // FUNDED superblock height (superblock.hpp::get_superblock_payments). Held
+    // by value so it outlives the build closure. Empty => normal block (either
+    // a non-superblock height or a confidently-unfunded superblock). It is only
+    // ever populated when NodeCoinState resolved a trigger-confident, budget-
+    // valid schedule; an under-synced superblock view leaves has_state=false
+    // (viable()==false) so the arm fails closed to dashd instead.
+    std::vector<SuperblockPayment>   superblock_payments;
 
     bool viable() const {
         return has_state && mnstates != nullptr && mempool != nullptr;
@@ -132,7 +140,10 @@ inline WorkSelection select_dash_work(
                 emb.qc_commitments.empty() ? nullptr : &emb.qc_commitments,
                 emb.has_quorum_root_override ? &emb.quorum_root_override
                                              : nullptr,
-                emb.mn_rr_height);
+                emb.mn_rr_height,
+                // E-SUPERBLOCK: funded superblock schedule (empty => normal block).
+                emb.superblock_payments.empty() ? nullptr
+                                                : &emb.superblock_payments);
         },
         dashd_fallback);
 }
