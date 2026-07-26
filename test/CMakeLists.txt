@@ -307,6 +307,14 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_node PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining c2pool_storage pool)  # OBJECT-lib SCC direct-naming (#22/#39)
+    # #889: the block-winning-mint KATs drive the REAL NodeImpl::add_local_share
+    # against the REAL m_tracker_mutex held exclusively by another thread, so
+    # this target now needs the `dash` OBJECT lib (node.cpp) it previously only
+    # type-checked against. No new add_executable — folded into the existing
+    # allowlisted target. `dash`'s own deps (core pool sharechain c2pool_storage
+    # dash_x11 btclibs json boost secp256k1) are already on this line or come in
+    # transitively; nothing outside src/impl/dash is added.
+    target_link_libraries(test_dash_node PRIVATE dash sharechain)
     gtest_add_tests(test_dash_node "" AUTO)
 
     # DASH S8 per-miner work-target MODULATION KAT (work.py:308-326 oracle pin):

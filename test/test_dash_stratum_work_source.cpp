@@ -23,6 +23,7 @@
 #include <impl/dash/coin/zmq_tip_notify.hpp>  // dash::coin::TipHashDedup, zmq_hashblock_frame_to_hex (ZMQ hashblock instant tip-notify)
 #include <impl/dash/crypto/hash_x11.hpp>
 #include <impl/dash/params.hpp>
+#include <impl/dash/tracker_acquire.hpp>            // #889 bounded block-winning acquisition
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>  // CSimplifiedMNListEntry (embedded SML seed)
 #include <impl/dash/coin/vendor/cbtx.hpp>           // parse_cbtx (read served creditPool)
 #include <impl/dash/coin/embedded_gbt.hpp>          // encode_cbtx (GBT-xcheck fallback fixture)
@@ -38,11 +39,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <stdexcept>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <span>
 #include <string>
 #include <thread>
@@ -730,6 +733,230 @@ TEST(DashStratumWorkSource, MiningSubmitWonBlockDispatchesBeforeAndDespiteAThrow
     // Won block still answers the miner with the accepted reply.
     ASSERT_TRUE(result.is_boolean());
     EXPECT_TRUE(result.get<bool>());
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// #889 -- a BUSY TRACKER must not forfeit the block-winning share.
+//
+// #888 made the block arm REACH the mint seam. This is about that mint then
+// being DECLINED: every tracker acquisition on the mint path is try_to_lock and
+// gives up if the compute thread is mid-think(). For an ordinary share that is
+// right -- the next solve mints. A block-winning share has no next solve, so
+// the same decline is permanent, and because p2pool peers detect a pool block
+// by watching the sharechain for a share meeting the block target
+// (p2pool/node.py:145-147), the won block also becomes invisible to every node
+// on the network. A momentary lock contention reproduces the whole #887
+// symptom.
+//
+// The seam carries `won_block` so the mint binding can take a BOUNDED WAIT on
+// that path ONLY. These pin (a) the flag actually reaches the mint, set on the
+// block arm and clear on the share arm, and (b) end to end through
+// mining_submit: with the tracker HELD EXCLUSIVELY by another thread, a
+// block-target submit still lands its share while an ordinary one still
+// declines.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// The block arm marks the solve as block-winning; nothing else about the mint
+// inputs changes.
+TEST(DashStratumWorkSource, MiningSubmitWonBlockFlagsTheMintAsBlockWinning)
+{
+    SubmitRig rig;
+    rig.job.share_bits  = 0x207fffffu;
+    rig.job.block_nbits = "207fffff";
+    const uint256 block_target = dash::coin::target_from_nbits(0x207fffffu);
+    const uint32_t nonce = rig.find_nonce([&](const uint256& pow) {
+        return pow <= block_target;
+    });
+
+    bool mint_called = false;
+    bool seen_won_block = false;
+    rig.ws->set_mint_share_fn(
+        [&](const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256 {
+            mint_called = true;
+            seen_won_block = in.won_block;
+            uint256 h;
+            h.SetHex("6666666666666666666666666666666666666666666666666666666666666666");
+            return h;
+        });
+
+    auto result = rig.submit(nonce);
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());
+    ASSERT_TRUE(rig.fx.submit_called);      // block out first, unchanged
+    ASSERT_TRUE(mint_called);
+    EXPECT_TRUE(seen_won_block)
+        << "the mint seam must be told this solve already won a block -- "
+           "without it the binding cannot know a decline is permanent (#889)";
+}
+
+// ...and the ordinary share arm does NOT. This is the guard that the bounded
+// wait can never leak onto ordinary share traffic, where try-and-decline is
+// the correct trade and must stay exactly as it is.
+TEST(DashStratumWorkSource, MiningSubmitOrdinaryShareIsNotFlaggedBlockWinning)
+{
+    SubmitRig rig;
+    // Easy share target, impossible block target -> deterministic share arm.
+    rig.job.share_bits  = 0x207fffffu;
+    rig.job.block_nbits = "1d00ffff";
+    const uint256 share_target = dash::coin::target_from_nbits(0x207fffffu);
+    const uint256 block_target = dash::coin::target_from_nbits(0x1d00ffffu);
+    const uint32_t nonce = rig.find_nonce([&](const uint256& pow) {
+        return pow <= share_target && pow > block_target;
+    });
+
+    bool mint_called = false;
+    bool seen_won_block = true;             // must be overwritten with false
+    rig.ws->set_mint_share_fn(
+        [&](const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256 {
+            mint_called = true;
+            seen_won_block = in.won_block;
+            uint256 h;
+            h.SetHex("7777777777777777777777777777777777777777777777777777777777777777");
+            return h;
+        });
+
+    auto result = rig.submit(nonce);
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());
+    EXPECT_FALSE(rig.fx.submit_called);     // not a block
+    ASSERT_TRUE(mint_called);
+    EXPECT_FALSE(seen_won_block);
+}
+
+// ★ THE REGRESSION, end to end through mining_submit: the tracker is HELD
+//   EXCLUSIVELY by another thread for the whole call -- exactly the state
+//   think() puts it in -- and a block-target submit STILL lands its share.
+//
+//   The bound mint here mirrors the production binding's lock discipline
+//   (main_dash.cpp): it derives urgency from in.won_block and acquires through
+//   the SAME dash::tracker_acquire helper the live path uses, so what is under
+//   test is the shipped mechanism, not a stand-in for it.
+//
+//   The paired ordinary-share case is the negative control: identical held
+//   lock, identical helper, and it declines -- which is what proves the block
+//   case is not passing merely because the mutex happened to be free.
+TEST(DashStratumWorkSource, WonBlockShareMintsThroughAnExclusivelyHeldTracker)
+{
+    std::shared_mutex tracker_mutex;        // stands in for NodeImpl::m_tracker_mutex
+
+    // Holder thread: takes the exclusive lock and keeps it, like a think()
+    // cycle in flight. Spin-wait until it is genuinely held so the submit can
+    // never race ahead of it.
+    std::atomic<bool> held{false};
+    std::atomic<bool> stop{false};
+    std::thread holder([&] {
+        std::unique_lock<std::shared_mutex> lk(tracker_mutex);
+        held.store(true);
+        while (!stop.load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    });
+    while (!held.load())
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+
+    // Release the tracker shortly after the submit begins -- a think() cycle
+    // ends, it does not last forever. A try_to_lock mint gives up instantly and
+    // loses the share; a bounded one rides it out.
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        stop.store(true);
+    });
+
+    auto mint_under_lock =
+        [&](const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256 {
+            const auto urgency = in.won_block
+                ? dash::tracker_acquire::Urgency::BlockWinning
+                : dash::tracker_acquire::Urgency::Opportunistic;
+            auto lk = dash::tracker_acquire::exclusive(tracker_mutex, urgency);
+            if (!lk.owns_lock())
+                return uint256();           // declined -- share lost
+            uint256 h;
+            h.SetHex("8888888888888888888888888888888888888888888888888888888888888888");
+            return h;                        // minted
+        };
+
+    // --- the block arm ---
+    SubmitRig rig;
+    rig.job.share_bits  = 0x207fffffu;
+    rig.job.block_nbits = "207fffff";
+    const uint256 block_target = dash::coin::target_from_nbits(0x207fffffu);
+    const uint32_t nonce = rig.find_nonce([&](const uint256& pow) {
+        return pow <= block_target;
+    });
+
+    bool minted = false;
+    bool block_was_out_before_the_wait = false;
+    rig.ws->set_mint_share_fn(
+        [&](const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256 {
+            // ORDERING WITNESS: whatever the wait below costs, the block has
+            // ALREADY been dispatched. This is the invariant #888 established
+            // and #889 must not regress -- if a bounded wait ever moved ahead
+            // of the submit, this flips false.
+            block_was_out_before_the_wait = rig.fx.submit_called;
+            const uint256 h = mint_under_lock(in);
+            minted = !h.IsNull();
+            return h;
+        });
+
+    auto result = rig.submit(nonce);
+
+    holder.join();
+    releaser.join();
+
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());
+    ASSERT_TRUE(rig.fx.submit_called);
+    EXPECT_TRUE(block_was_out_before_the_wait)
+        << "the block submit must remain strictly first and unconditional";
+    EXPECT_TRUE(minted)
+        << "a busy tracker forfeited the block-winning share -- the block is "
+           "then invisible to every p2pool peer (#889)";
+}
+
+// Negative control for the test above: same helper, same permanently-held
+// tracker, ORDINARY share -> declines, unchanged from today.
+TEST(DashStratumWorkSource, OrdinaryShareStillDeclinesThroughAHeldTracker)
+{
+    std::shared_mutex tracker_mutex;
+    std::atomic<bool> held{false};
+    std::atomic<bool> stop{false};
+    std::thread holder([&] {
+        std::unique_lock<std::shared_mutex> lk(tracker_mutex);
+        held.store(true);
+        while (!stop.load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    });
+    while (!held.load())
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+
+    SubmitRig rig;
+    rig.job.share_bits  = 0x207fffffu;
+    rig.job.block_nbits = "1d00ffff";
+    const uint256 share_target = dash::coin::target_from_nbits(0x207fffffu);
+    const uint256 block_target = dash::coin::target_from_nbits(0x1d00ffffu);
+    const uint32_t nonce = rig.find_nonce([&](const uint256& pow) {
+        return pow <= share_target && pow > block_target;
+    });
+
+    bool minted = true;
+    rig.ws->set_mint_share_fn(
+        [&](const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256 {
+            const auto urgency = in.won_block
+                ? dash::tracker_acquire::Urgency::BlockWinning
+                : dash::tracker_acquire::Urgency::Opportunistic;
+            auto lk = dash::tracker_acquire::exclusive(tracker_mutex, urgency);
+            minted = lk.owns_lock();
+            return uint256();
+        });
+
+    auto result = rig.submit(nonce);
+    stop.store(true);
+    holder.join();
+
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());
+    EXPECT_FALSE(rig.fx.submit_called);
+    EXPECT_FALSE(minted)
+        << "ordinary shares must keep the try-and-decline trade (#889 scope)";
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

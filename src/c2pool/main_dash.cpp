@@ -1930,12 +1930,44 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     return uint256();
                 }
 
+                // #889: a WON BLOCK is unrepeatable — there is no next solve to
+                // mint instead, and an unminted block-winning share is a block
+                // no p2pool peer can ever see (they detect pool blocks by
+                // watching the sharechain for a share meeting the block target,
+                // p2pool/node.py:145-147). So the block arm takes a BOUNDED WAIT
+                // for the tracker; the ordinary share arm keeps today's single
+                // try-and-decline, which is the right trade when the next solve
+                // mints. THE BLOCK IS ALREADY SUBMITTED at this point — the
+                // won-block arm in work_source.cpp dispatches it before invoking
+                // this seam — so no wait here can delay or endanger it.
+                //
+                // #878/#881: this lambda holds ZERO locks on entry (stratum
+                // asio handler -> process_message -> handle_submit ->
+                // mining_submit -> mint seam; verified lock-free end to end),
+                // which is what makes a bounded wait viable instead of a
+                // deadlock. The guard below is scoped and RELEASED before
+                // add_local_share takes the exclusive lock — never nested.
+                const auto urgency = in.won_block
+                    ? dash::tracker_acquire::Urgency::BlockWinning
+                    : dash::tracker_acquire::Urgency::Opportunistic;
+
                 std::optional<dash::producer::BuiltShare> built;
                 {
-                    auto guard = node_ptr->read_tracker();
+                    auto guard = node_ptr->read_tracker(urgency);
                     if (!guard) {
-                        LOG_WARNING << "[MINT] tracker busy — solve declined "
-                                       "(retry on next share)";
+                        if (in.won_block) {
+                            LOG_ERROR << "[MINT-BLOCK] FORFEIT — tracker still "
+                                         "busy after "
+                                      << dash::tracker_acquire::
+                                             BLOCK_SHARE_LOCK_BUDGET.count()
+                                      << "ms; cannot even REBUILD the "
+                                         "block-winning share. The block was "
+                                         "already submitted, but no p2pool peer "
+                                         "will see it.";
+                        } else {
+                            LOG_WARNING << "[MINT] tracker busy — solve declined "
+                                           "(retry on next share)";
+                        }
                         return uint256();
                     }
                     built = dash::mint::mint_from_inputs(
@@ -1949,7 +1981,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
                 dash::ShareType share;
                 share = new dash::DashShare(std::move(built->share));
-                const uint256 minted = node_ptr->add_local_share(share);
+                // #889: same urgency for the tracker WRITE. add_local_share
+                // still returns ZERO if the bounded wait expires — the decline
+                // is preserved, it is just no longer silent (LOG_ERROR + a
+                // forfeit counter) and no longer triggered by a merely
+                // momentary think().
+                const uint256 minted =
+                    node_ptr->add_local_share(share, in.won_block);
                 if (minted.IsNull()) {
                     // Not inserted (busy/duplicate) — reclaim the allocation.
                     share.invoke([](auto* obj) { delete obj; });
