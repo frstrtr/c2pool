@@ -21,6 +21,8 @@ name: BCH gate G3a — populated-regtest block production
 # (operator-side ruleset).
 
 on:
+  # additive: callable by ci-required.yml aggregator (no push/PR behaviour change)
+  workflow_call:
   push:
     branches: [master]
   pull_request:

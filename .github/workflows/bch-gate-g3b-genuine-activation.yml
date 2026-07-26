@@ -18,6 +18,8 @@ name: BCH gate G3b — genuine Upgrade9 activation
 # check only after a confirmed non-hollow green rollup (operator-side ruleset).
 
 on:
+  # additive: callable by ci-required.yml aggregator (no push/PR behaviour change)
+  workflow_call:
   push:
     branches: [master]
   pull_request:

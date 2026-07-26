@@ -19,6 +19,8 @@ name: DASH gate G1 — byte-parity KAT
 # only after a confirmed non-hollow green rollup on the runner.
 
 on:
+  # additive: callable by ci-required.yml aggregator (no push/PR behaviour change)
+  workflow_call:
   push:
     branches: [master, dash-spv-embedded]
   pull_request:
