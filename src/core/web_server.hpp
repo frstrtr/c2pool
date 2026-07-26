@@ -8,6 +8,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <deque>
 #include <future>
 #include <set>
 #include <map>
@@ -128,6 +129,15 @@ public:
     nlohmann::json submitwork(const std::string& nonce, const std::string& header, const std::string& mix, const std::string& request_id = "");
     nlohmann::json getblocktemplate(const nlohmann::json& params = nlohmann::json::array(), const std::string& request_id = "");
     nlohmann::json submitblock(const std::string& hex_data, const std::string& request_id = "");
+
+    // Recent-won-block dedup (#886). Keyed on the BLOCK HASH (SHA256d of the
+    // 80-byte header), NOT the prev-hash: many distinct valid blocks share one
+    // prev, so a prev-hash key drops real winnable blocks. Membership is
+    // recorded ONLY on a SUCCESSFUL submit, so a failed submit leaves the block
+    // eligible for resubmission by the next share. Bounded FIFO, own mutex
+    // (mining_submit runs on many stratum session threads). Public for KATs.
+    bool already_submitted_block(const uint256& block_hash) const;
+    void mark_block_submitted(const uint256& block_hash);
     
     // Pool stats and info methods
     nlohmann::json getinfo(const std::string& request_id = "");
@@ -1013,6 +1023,11 @@ private:
     std::string             m_cached_coinb1;
     std::string             m_cached_coinb2;
     mutable std::mutex      m_work_mutex;
+
+    // Recent-won-block dedup state (#886) — see already_submitted_block().
+    mutable std::mutex      m_recent_submit_mutex;
+    std::deque<uint256>     m_recent_submitted_blocks;
+    static constexpr size_t kRecentSubmitCap = 256;
 
     // Block-found callback (header_hex, stale_info: 0=none, 253=orphan, 254=doa)
     std::function<void(const std::string&, int)> m_on_block_submitted;

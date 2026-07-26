@@ -5,6 +5,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -231,6 +232,90 @@ TEST(SubmitblockResult, DuplicateAndInconclusiveAreAck)
     EXPECT_FALSE(submitblock_result_accepted("duplicate-invalid"));
     EXPECT_FALSE(submitblock_result_accepted("high-hash"));
     EXPECT_FALSE(submitblock_result_accepted("bad-txnmrklroot"));
+}
+
+
+// ------------- #886 BUG 1: recent-won-block dedup, keyed on BLOCK HASH --------
+//
+// The pre-fix code kept a process-lifetime `static uint256 s_last_*_submitted_prev`,
+// assigned BEFORE submitblock ran and keyed on the PREV-hash. That (a) permanently
+// retired a prev-hash on an ATTEMPTED submit — so a second, DISTINCT valid block at
+// the same prev was silently never submitted — and (b) never recorded the actual
+// result. The fix keys on the BLOCK HASH and records ONLY on a successful submit.
+
+uint256 mk_hash(uint32_t seed) {
+    uint256 h;                                   // zero-initialised
+    std::memcpy(h.data(), &seed, sizeof(seed));  // distinct hash per seed
+    return h;
+}
+
+// The core regression: two DISTINCT blocks sharing one prev must BOTH be
+// submittable. (Prev-hash keying dropped the second; block-hash keying does not.)
+TEST(RecentBlockDedup, DistinctBlocksSamePrev_BothSubmittable)
+{
+    core::MiningInterface mi{/*testnet=*/true};
+    uint256 a = mk_hash(1), b = mk_hash(2);      // same prev in reality, different block
+
+    EXPECT_FALSE(mi.already_submitted_block(a));
+    mi.mark_block_submitted(a);                  // A submitted successfully
+    EXPECT_TRUE(mi.already_submitted_block(a));
+    EXPECT_FALSE(mi.already_submitted_block(b))
+        << "a DISTINCT block must remain submittable — the #886 BUG 1 regression";
+}
+
+// A block whose submit FAILED is never marked, so it stays resubmittable — the
+// caller invariant that fixes the "retired-on-attempt, submit then failed" loss.
+TEST(RecentBlockDedup, UnmarkedBlockStaysSubmittable)
+{
+    core::MiningInterface mi{/*testnet=*/true};
+    uint256 a = mk_hash(7);
+    EXPECT_FALSE(mi.already_submitted_block(a));
+    EXPECT_FALSE(mi.already_submitted_block(a)) << "querying must not implicitly record";
+}
+
+// Marking is idempotent: a duplicate successful submit does not double-record.
+TEST(RecentBlockDedup, MarkIsIdempotent)
+{
+    core::MiningInterface mi{/*testnet=*/true};
+    uint256 a = mk_hash(3);
+    mi.mark_block_submitted(a);
+    mi.mark_block_submitted(a);
+    EXPECT_TRUE(mi.already_submitted_block(a));
+}
+
+// The set is bounded (kRecentSubmitCap == 256): oldest entries are evicted, so it
+// cannot grow without bound over a long-running process.
+TEST(RecentBlockDedup, BoundedFifoEvictsOldest)
+{
+    core::MiningInterface mi{/*testnet=*/true};
+    const uint32_t CAP = 256;                     // mirrors kRecentSubmitCap
+    for (uint32_t i = 0; i < CAP + 10; ++i) mi.mark_block_submitted(mk_hash(i));
+    EXPECT_FALSE(mi.already_submitted_block(mk_hash(0)))   << "oldest must be evicted";
+    EXPECT_FALSE(mi.already_submitted_block(mk_hash(9)))   << "oldest must be evicted";
+    EXPECT_TRUE (mi.already_submitted_block(mk_hash(10)));
+    EXPECT_TRUE (mi.already_submitted_block(mk_hash(CAP + 9)));
+}
+
+// Thread-safety: the pre-fix static was written unsynchronised from many stratum
+// session threads. Concurrent mark/query must not race or crash, and bounding
+// must still hold. (Run under TSan to catch the data race the static had.)
+TEST(RecentBlockDedup, ConcurrentMarksAreSafeAndBounded)
+{
+    core::MiningInterface mi{/*testnet=*/true};
+    std::vector<std::thread> ts;
+    for (int t = 0; t < 8; ++t) {
+        ts.emplace_back([&mi, t]() {
+            for (uint32_t i = 0; i < 200; ++i) {
+                uint32_t seed = static_cast<uint32_t>(t) * 1000u + i;
+                mi.mark_block_submitted(mk_hash(seed));
+                (void)mi.already_submitted_block(mk_hash(seed));
+            }
+        });
+    }
+    for (auto& th : ts) th.join();
+    // 1600 distinct marks >> cap(256): an early one MUST have been evicted, proving
+    // the bound held across concurrent writers without corruption.
+    EXPECT_FALSE(mi.already_submitted_block(mk_hash(0)));
 }
 
 } // namespace
