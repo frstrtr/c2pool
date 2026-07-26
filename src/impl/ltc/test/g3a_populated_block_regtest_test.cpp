@@ -67,7 +67,9 @@
 using core::version_gate::is_v36_active;
 
 static int g_fails = 0;
+static int g_total = 0;
 static void check(bool ok, const char* label) {
+    ++g_total;
     std::printf("  %s %s\n", ok ? "PASS" : "FAIL", label);
     if (!ok) ++g_fails;
 }
@@ -295,6 +297,7 @@ int main() {
     check(assemble_populated(35).tx_types == assemble_populated(36).tx_types,
           "populated tx set is identical across v35/v36 (encoding never steers assembly)");
 
+    std::printf("G3A_ASSERTIONS_PASSED=%d\n", g_total - g_fails);
     std::printf(g_fails ? "\nFAILED (%d)\n" : "\nALL PASS\n", g_fails);
     return g_fails ? 1 : 0;
 }
