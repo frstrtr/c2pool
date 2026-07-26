@@ -856,6 +856,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 int deepest_v36_pos = 0;
                 int v36_contiguous_from_tip = 0;
                 bool contiguous = true;
+                // Gauge inputs the SHARED core /global_stats path expects and DASH
+                // never published, so it fell back to a literal 1.0 (#864):
+                //   min_difficulty  = target_to_difficulty(best_share.max_target)
+                //                     -- p2pool web.py get_global_stats(). This is
+                //                     the pool's share-difficulty FLOOR, NOT the
+                //                     window average; the two are different
+                //                     quantities and only the floor is p2pool's.
+                //   average_difficulty = window mean of the per-share difficulty,
+                //                     which getinfo()/rest_sharechain_stats read.
+                // Both DISPLAY ONLY. m_max_bits / m_bits are read straight off the
+                // share header; nothing here mutates the tracker or the retarget.
+                double best_min_difficulty = 0.0;
+                double difficulty_sum = 0.0;
                 const int skip_count   = std::min(chain_ht, chain_len * 9 / 10);
                 const int sample_count = std::min(chain_ht - skip_count, chain_len / 10);
                 uint256 sampling_start;
@@ -869,6 +882,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             desired_counts[dv] += 1;
                             format_v16 += 1;  // DashShare is wire-format v16
                             miner_counts[s->m_pubkey_hash.GetHex()] += 1;
+                            // i == 0 is the best share (get_chain walks tip-first).
+                            if (i == 0 && s->m_max_bits != 0)
+                                best_min_difficulty = chain::target_to_difficulty(
+                                    chain::bits_to_target(s->m_max_bits));
+                            if (s->m_bits != 0)
+                                difficulty_sum += chain::target_to_difficulty(
+                                    chain::bits_to_target(s->m_bits));
                             if (dv >= 36) {
                                 deepest_v36_pos = i + 1;
                                 if (contiguous) v36_contiguous_from_tip = i + 1;
@@ -885,6 +905,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // main_ltc.cpp, where total_shares is the windowed skiplist count), so
                 // the gauge's version percentages divide by the same denominator.
                 out["total_shares"] = format_v16;
+
+                // Only publish when we actually measured one; an absent key makes
+                // /global_stats emit min_difficulty:null, which is the honest
+                // answer on a chain too young to have a floor (p2pool returns the
+                // whole payload as None below 10 shares).
+                if (best_min_difficulty > 0.0)
+                    out["min_difficulty"] = best_min_difficulty;
+                if (format_v16 > 0 && difficulty_sum > 0.0)
+                    out["average_difficulty"] = difficulty_sum / format_v16;
 
                 nlohmann::json sbv = nlohmann::json::object();
                 if (format_v16 > 0) sbv["16"] = format_v16;
@@ -991,9 +1020,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
             // ── REAL pool hashrate (ported from main_ltc.cpp:2865) ────────
             // dash::ShareTracker::get_pool_attempts_per_second is the same
-            // p2pool estimator LTC uses (share_tracker.hpp:1353), over DASH's
-            // own TARGET_LOOKBEHIND. Returns the last good value on lock
-            // contention rather than a spurious 0.
+            // p2pool estimator LTC uses (share_tracker.hpp:1353). Returns the
+            // last good value on lock contention rather than a spurious 0.
+            //
+            // DISPLAY LOOKBEHIND (#864): p2pool web.py get_global_stats() averages
+            // the gauge over ONE HOUR of shares -- min(height, 3600//SHARE_PERIOD)
+            // -- which is 180 shares on DASH, not TARGET_LOOKBEHIND (100). This is
+            // the DISPLAY window ONLY. The CONSENSUS retarget keeps
+            // TARGET_LOOKBEHIND (p2pool data.py:137,140), and c2pool already
+            // matches canonical there; nothing on this hook feeds the retarget --
+            // m_pool_hashrate_fn is read exclusively by web_server REST handlers.
             mi->set_pool_hashrate_fn([node_ptr]() -> double {
                 static double s_last_good = 0.0;
                 auto best = node_ptr->best_share_hash();
@@ -1003,9 +1039,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 if (!guard->chain.contains(best)) return s_last_good;
                 int height = guard->chain.get_height(best);
                 if (height < 3) return s_last_good;
-                auto lookbehind = std::min(
-                    height - 1,
-                    static_cast<int>(dash::SharechainConfig::TARGET_LOOKBEHIND));
+                const int display_lookbehind =
+                    3600 / static_cast<int>(dash::SharechainConfig::share_period());
+                auto lookbehind = std::min(height - 1, display_lookbehind);
                 auto aps = guard->get_pool_attempts_per_second(best, lookbehind, false);
                 double hr = static_cast<double>(aps.GetLow64());
                 if (hr > 0) s_last_good = hr;

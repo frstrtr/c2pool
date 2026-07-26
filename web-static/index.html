@@ -223,7 +223,11 @@
                 d3.json('../global_stats', function(global_stats) {
                     d3.select('#pool_rate').text(d3.format('.3s')(global_stats.pool_hash_rate) + 'H/s');
                     d3.select('#pool_stale').text(d3.format('.2p')(global_stats.pool_stale_prop));
-                    d3.select('#difficulty').text(d3.format('.3r')(global_stats.min_difficulty));
+                    // min_difficulty is null when the coin has no measurable share-difficulty
+                    // floor yet (young chain / stats hook not wired). Say so rather than
+                    // formatting a null into a number that reads as a real floor.
+                    d3.select('#difficulty').text(global_stats.min_difficulty == null
+                        ? '\u2014' : d3.format('.3r')(global_stats.min_difficulty));
                     
                     var time_to_block = local_stats.attempts_to_block/global_stats.pool_hash_rate;
                     d3.select('#time_to_block').text(format_dt(time_to_block));

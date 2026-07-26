@@ -2675,11 +2675,22 @@ nlohmann::json MiningInterface::rest_global_stats()
     nlohmann::json result = nlohmann::json::object();
     
     double pool_rate = 0.0;
-    double share_diff = 1.0;
     int unique_miners = 0;
     int total_shares = 0;
     int orphan_shares = 0, dead_shares = 0;
     int chain_height = 0;
+
+    // p2pool web.py get_global_stats() reports the pool's FLOOR share
+    // difficulty, not the sharechain average:
+    //     min_difficulty = target_to_difficulty(tracker.items[best_share].max_target)
+    // These are different quantities -- max_target is the per-share difficulty
+    // FLOOR carried in the share header, while the average is a window mean that
+    // drifts with vardiff. The per-coin sharechain-stats hook publishes the
+    // p2pool quantity as "min_difficulty"; a coin that does not publish it has
+    // no honest answer, and p2pool itself returns None for the whole payload
+    // while the chain is too young, so the field is emitted as null rather than
+    // a literal 1.0 that reads as a real floor.
+    std::optional<double> min_difficulty;
 
     // Populate from sharechain
     if (m_sharechain_stats_fn) {
@@ -2692,8 +2703,9 @@ nlohmann::json MiningInterface::rest_global_stats()
             dead_shares = sc["dead_shares"].get<int>();
         if (sc.contains("chain_height"))
             chain_height = sc["chain_height"].get<int>();
-        if (sc.contains("average_difficulty"))
-            share_diff = sc["average_difficulty"].get<double>();
+        if (sc.contains("min_difficulty") && sc["min_difficulty"].is_number()
+            && sc["min_difficulty"].get<double>() > 0.0)
+            min_difficulty = sc["min_difficulty"].get<double>();
         if (sc.contains("shares_by_miner") && sc["shares_by_miner"].is_object())
             unique_miners = static_cast<int>(sc["shares_by_miner"].size());
     }
@@ -2718,10 +2730,25 @@ nlohmann::json MiningInterface::rest_global_stats()
     int stales = orphan_shares + dead_shares;
     int good = total_shares - stales;
     double pool_stale_prop = (good + stales > 0) ? static_cast<double>(stales) / (good + stales) : 0.0;
-    result["pool_hash_rate"] = pool_rate;
-    result["pool_nonstale_hash_rate"] = pool_rate * (1.0 - pool_stale_prop);
+    // p2pool web.py get_global_stats():
+    //     nonstale_hash_rate      = get_pool_attempts_per_second(...)
+    //     pool_nonstale_hash_rate = nonstale_hash_rate
+    //     pool_hash_rate          = nonstale_hash_rate / (1 - stale_prop)
+    // get_pool_attempts_per_second sums the work of shares that actually made
+    // the chain, so the estimator output IS the NON-STALE rate; the gross rate
+    // is that grossed UP by the stale fraction. c2pool had the two fields
+    // assigned the other way round (gross = estimator, nonstale = estimator
+    // scaled DOWN), i.e. both wrong and in opposite directions. Masked so far
+    // only because pool_stale_prop has been 0 in practice.
+    result["pool_nonstale_hash_rate"] = pool_rate;
+    result["pool_hash_rate"] = (pool_stale_prop < 1.0)
+        ? pool_rate / (1.0 - pool_stale_prop)
+        : pool_rate;  // degenerate all-stale window: do not divide by zero
     result["pool_stale_prop"] = pool_stale_prop;
-    result["min_difficulty"] = share_diff;
+    if (min_difficulty)
+        result["min_difficulty"] = *min_difficulty;
+    else
+        result["min_difficulty"] = nullptr;
     result["network_block_difficulty"] = net_diff;
 
     // Additional fields
@@ -3900,7 +3927,11 @@ nlohmann::json MiningInterface::rest_p2pool_global_stats()
     nlohmann::json result = nlohmann::json::object();
     result["pool_hash_rate"] = full.value("pool_hash_rate", 0.0);
     result["pool_stale_prop"] = full.value("pool_stale_prop", 0.0);
-    result["min_difficulty"] = full.value("min_difficulty", 1.0);
+    // Propagate the null through rather than substituting a literal 1.0: an
+    // unknown floor must read as unknown on the p2pool-shaped endpoint too.
+    result["min_difficulty"] = (full.contains("min_difficulty") && full["min_difficulty"].is_number())
+        ? full["min_difficulty"]
+        : nlohmann::json(nullptr);
     result["pool_nonstale_hash_rate"] = full.value("pool_nonstale_hash_rate", 0.0);
     result["network_block_difficulty"] = full.value("network_block_difficulty", 0.0);
     result["network_hashrate"] = full.value("network_hashrate", 0.0);

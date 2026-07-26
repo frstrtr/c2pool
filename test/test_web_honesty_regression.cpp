@@ -18,6 +18,10 @@
 #include <nlohmann/json.hpp>
 
 #include <core/web_server.hpp>
+#include <impl/dash/config_pool.hpp>   // dash::SharechainConfig SHARE_PERIOD / TARGET_LOOKBEHIND
+#include <impl/ltc/config_pool.hpp>    // ltc::PoolConfig  SHARE_PERIOD / TARGET_LOOKBEHIND
+
+#include <cmath>
 
 using namespace core;
 using nlohmann::json;
@@ -950,4 +954,166 @@ TEST(WebHonestyRegression, NodeInfoExternalIpServesOperatorAdvertisedHost) {
     EXPECT_EQ(ni.value("external_ip", std::string{}), "109.161.57.3")
         << "served external_ip must be the operator-advertised miner-facing "
            "host so the dashboard Stratum URL is not the wrong NAT IP";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #864 — /global_stats gauges must agree with canonical p2pool
+//
+// Three independent defects, all DISPLAY-only (no consensus path touched):
+//
+//  (a) min_difficulty fell back to a literal 1.0 for any coin whose
+//      sharechain-stats hook does not publish it (DASH published no
+//      difficulty key at all), so the dashboard showed a fabricated floor.
+//  (b) Even when populated it carried the sharechain AVERAGE difficulty.
+//      p2pool web.py get_global_stats() reports
+//      target_to_difficulty(tracker.items[best_share].max_target) -- the
+//      pool's share-difficulty FLOOR. Different quantity.
+//  (c) The stale relationship was inverted. p2pool:
+//          pool_nonstale_hash_rate = get_pool_attempts_per_second(...)
+//          pool_hash_rate          = nonstale / (1 - stale_prop)
+//      c2pool had pool_hash_rate = aps and nonstale = aps*(1-stale_prop) --
+//      both fields wrong, in opposite directions. Masked while stale_prop==0.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Stats hook shaped like the real per-coin lambdas, with a controllable
+// stale tally and an optionally-absent min_difficulty.
+json make_stats(int total, int orphan, int dead, const json& min_diff)
+{
+    json j{{"total_shares", total},
+           {"orphan_shares", orphan},
+           {"dead_shares", dead},
+           // The average is deliberately far from any plausible floor so a
+           // regression that re-sources min_difficulty from it is unmissable.
+           {"average_difficulty", 1024.0}};
+    if (!min_diff.is_null())
+        j["min_difficulty"] = min_diff;
+    return j;
+}
+
+} // namespace
+
+// (b) The floor is the floor, not the window average.
+TEST(WebGaugeParity, MinDifficultyIsPoolFloorNotSharechainAverage) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    mi.set_sharechain_stats_fn([] { return make_stats(1000, 0, 0, 3.5); });
+    mi.set_pool_hashrate_fn([] { return 1e9; });
+
+    json g = mi.rest_global_stats();
+    ASSERT_TRUE(g["min_difficulty"].is_number());
+    EXPECT_DOUBLE_EQ(g["min_difficulty"].get<double>(), 3.5)
+        << "min_difficulty must be the best share's max_target floor "
+           "(p2pool web.py), never the sharechain average";
+    EXPECT_NE(g["min_difficulty"].get<double>(), 1024.0)
+        << "min_difficulty must not be re-sourced from average_difficulty";
+}
+
+// (a) No floor published => null, never a fabricated 1.0.
+TEST(WebGaugeParity, MinDifficultyIsNullWhenTheCoinPublishesNoFloor) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+    // Exactly the pre-fix DASH shape: chain/stale keys, no difficulty floor.
+    mi.set_sharechain_stats_fn([] { return make_stats(500, 0, 0, json(nullptr)); });
+    mi.set_pool_hashrate_fn([] { return 1e9; });
+
+    json g = mi.rest_global_stats();
+    EXPECT_TRUE(g["min_difficulty"].is_null())
+        << "an unknown difficulty floor must read as unknown, not as a "
+           "literal 1.0 that the dashboard renders as a real value";
+    EXPECT_FALSE(g["min_difficulty"] == 1.0);
+
+    // The p2pool-shaped endpoint must propagate the null, not re-substitute.
+    json p = mi.rest_p2pool_global_stats();
+    EXPECT_TRUE(p["min_difficulty"].is_null())
+        << "/global_stats (p2pool shape) must not restore the 1.0 literal";
+}
+
+TEST(WebGaugeParity, MinDifficultyPropagatesThroughP2poolShapeWhenKnown) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    mi.set_sharechain_stats_fn([] { return make_stats(1000, 0, 0, 8.75); });
+    mi.set_pool_hashrate_fn([] { return 1e9; });
+
+    json p = mi.rest_p2pool_global_stats();
+    ASSERT_TRUE(p["min_difficulty"].is_number());
+    EXPECT_DOUBLE_EQ(p["min_difficulty"].get<double>(), 8.75);
+}
+
+// (c) aps IS the non-stale rate; the gross rate is that grossed UP.
+TEST(WebGaugeParity, StaleRelationshipMatchesP2poolNotItsInverse) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    // 100 shares, 10 stale => pool_stale_prop = 0.10
+    mi.set_sharechain_stats_fn([] { return make_stats(100, 5, 5, 4.0); });
+    mi.set_pool_hashrate_fn([] { return 1e9; });  // get_pool_attempts_per_second
+
+    json g = mi.rest_global_stats();
+    const double aps = 1e9;
+    const double stale = g["pool_stale_prop"].get<double>();
+    ASSERT_DOUBLE_EQ(stale, 0.10);
+
+    EXPECT_DOUBLE_EQ(g["pool_nonstale_hash_rate"].get<double>(), aps)
+        << "p2pool: pool_nonstale_hash_rate = get_pool_attempts_per_second()";
+    EXPECT_DOUBLE_EQ(g["pool_hash_rate"].get<double>(), aps / (1.0 - stale))
+        << "p2pool: pool_hash_rate = nonstale / (1 - stale_prop)";
+
+    // The pre-fix values, pinned as explicitly WRONG so the inversion cannot
+    // come back: gross must exceed non-stale, never fall below it.
+    EXPECT_GT(g["pool_hash_rate"].get<double>(), g["pool_nonstale_hash_rate"].get<double>())
+        << "gross hashrate must be >= non-stale; the inverted form had it lower";
+    EXPECT_NE(g["pool_nonstale_hash_rate"].get<double>(), aps * (1.0 - stale))
+        << "non-stale must not be the estimator scaled DOWN (the pre-fix form)";
+}
+
+// The two fields must stay equal exactly when there are no stales -- the
+// condition that masked the inversion in production.
+TEST(WebGaugeParity, ZeroStalesLeavesBothHashRatesEqual) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    mi.set_sharechain_stats_fn([] { return make_stats(100, 0, 0, 4.0); });
+    mi.set_pool_hashrate_fn([] { return 1e9; });
+
+    json g = mi.rest_global_stats();
+    ASSERT_DOUBLE_EQ(g["pool_stale_prop"].get<double>(), 0.0);
+    EXPECT_DOUBLE_EQ(g["pool_hash_rate"].get<double>(), 1e9);
+    EXPECT_DOUBLE_EQ(g["pool_nonstale_hash_rate"].get<double>(), 1e9);
+}
+
+// Degenerate all-stale window must not divide by zero into inf/NaN.
+TEST(WebGaugeParity, AllStaleWindowDoesNotDivideByZero) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    mi.set_sharechain_stats_fn([] { return make_stats(10, 5, 5, 4.0); });
+    mi.set_pool_hashrate_fn([] { return 1e9; });
+
+    json g = mi.rest_global_stats();
+    ASSERT_DOUBLE_EQ(g["pool_stale_prop"].get<double>(), 1.0);
+    EXPECT_TRUE(std::isfinite(g["pool_hash_rate"].get<double>()));
+    EXPECT_TRUE(std::isfinite(g["pool_nonstale_hash_rate"].get<double>()));
+}
+
+// ── (d) DISPLAY lookbehind vs CONSENSUS retarget lookbehind ────────────────
+// p2pool web.py get_global_stats() averages the gauge over ONE HOUR of shares:
+//     lookbehind = min(height, 3600 // net.SHARE_PERIOD)
+// The CONSENSUS retarget is a different window entirely (p2pool data.py:137,140
+// uses net.TARGET_LOOKBEHIND) and c2pool already matches canonical there. The
+// two must NOT be conflated: this pins the display formula AND pins
+// TARGET_LOOKBEHIND at its canonical per-coin value so a future "unification"
+// cannot drag the retarget along with the gauge.
+TEST(WebGaugeParity, DisplayLookbehindIsOneHourOfSharesNotTargetLookbehind) {
+    // DASH: SHARE_PERIOD 20s -> 3600/20 = 180 display shares; retarget stays 100.
+    EXPECT_EQ(dash::SharechainConfig::SHARE_PERIOD, 20u);
+    EXPECT_EQ(3600u / dash::SharechainConfig::SHARE_PERIOD, 180u)
+        << "DASH display gauge must look back one hour = 180 shares";
+    EXPECT_EQ(dash::SharechainConfig::TARGET_LOOKBEHIND, 100u)
+        << "CONSENSUS retarget lookbehind is canonical and MUST NOT move";
+    EXPECT_NE(3600u / dash::SharechainConfig::SHARE_PERIOD,
+              dash::SharechainConfig::TARGET_LOOKBEHIND)
+        << "display and consensus windows are distinct on DASH -- conflating "
+           "them is exactly the #864 defect";
+
+    // LTC: SHARE_PERIOD 15s -> 3600/15 = 240 display shares; retarget stays 200.
+    EXPECT_EQ(ltc::PoolConfig::SHARE_PERIOD, 15u);
+    EXPECT_EQ(3600u / ltc::PoolConfig::SHARE_PERIOD, 240u)
+        << "LTC display gauge must look back one hour = 240 shares";
+    EXPECT_EQ(ltc::PoolConfig::TARGET_LOOKBEHIND, 200u)
+        << "CONSENSUS retarget lookbehind is canonical and MUST NOT move";
+    EXPECT_NE(3600u / ltc::PoolConfig::SHARE_PERIOD,
+              ltc::PoolConfig::TARGET_LOOKBEHIND);
 }
