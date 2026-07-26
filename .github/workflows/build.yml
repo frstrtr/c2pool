@@ -1319,5 +1319,164 @@ jobs:
         if: always()
         uses: ./.github/actions/prune-runner-workspace
 
+  # ════════════════════════════════════════════════════════════════════════════
+  # DASH with the REAL BLS backend linked (C2POOL_DASH_BLS=ON)
+  #
+  # Every other lane builds DASH with the option OFF, where dash_bls_verify is a
+  # fail-closed stub: correct, but it can never serve a real type-6 quorum
+  # commitment. This job is the one that compiles + exercises the actual
+  # BLS12-381 path, and it is the CI mirror of what the release DASH package now
+  # ships.
+  #
+  # NON-HOLLOW BY CONSTRUCTION — three independent legs, because "the flag was
+  # passed" is not evidence:
+  #   1. cmake FATAL_ERRORs if dashbls is missing (root CMakeLists), so this job
+  #      cannot go green on a silently degraded configure;
+  #   2. scripts/ci/dash_bls_linked_guard.sh inspects the produced c2pool-dash
+  #      binary for dashbls rodata + symbols;
+  #   3. the six BLS-crypto KATs are named EXPLICITLY below and each must
+  #      REPORT AS RUN — they live behind #ifdef C2POOL_DASH_BLS, so a stub
+  #      build makes them vanish rather than fail, which is exactly the
+  #      "silently Not Run" shape that has bitten this repo before.
+  #
+  # DASH-ONLY: nothing here touches the shared core the Windows/LTC launcher
+  # builds; no other job's flags change.
+  # ════════════════════════════════════════════════════════════════════════════
+  linux-dash-bls:
+    name: DASH + real BLS (Linux x86_64)
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set per-job Conan home
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+          else
+            echo "CONAN_HOME=$HOME/.conan2-ci/$RUNNER_NAME" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install system dependencies
+        if: runner.environment == 'github-hosted'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            g++ ccache cmake make libleveldb-dev libsecp256k1-dev
+
+      - uses: actions/setup-python@v6
+        if: ${{ runner.environment == 'github-hosted' }}
+        with: { python-version: '3.12' }
+
+      - name: Install Conan 2
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
+
+      - name: Restore Conan cache (github-hosted only)
+        if: runner.environment == 'github-hosted'
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/conan2
+          key: conan2-ubuntu24-gcc13-${{ hashFiles('conanfile.txt', 'ci/conan/linux-gcc13.profile') }}
+
+      - name: Clean stale build dir (self-hosted workspace is reused)
+        if: runner.environment != 'github-hosted'
+        run: rm -rf build_dash_bls
+
+      - name: Conan install
+        run: |
+          for attempt in 1 2 3; do
+            if conan install . -pr:a=ci/conan/linux-gcc13.profile --build=missing --output-folder=build_dash_bls; then exit 0; fi
+            echo "conan install failed (attempt $attempt/3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          echo "conan install failed after 3 attempts" >&2
+          exit 1
+
+      # Builds dash's own src/dashbls subtree at the pinned tag once per runner
+      # and exports DASHBLS_ROOT. Fails loudly if it cannot produce the prefix.
+      - name: Provision dashbls
+        uses: ./.github/actions/provision-dashbls
+
+      # LEG 1: a missing dashbls is a configure-time FATAL_ERROR, not a warning.
+      - name: Configure (C2POOL_DASH_BLS=ON)
+        run: |
+          cmake -S . -B build_dash_bls \
+            -DCMAKE_TOOLCHAIN_FILE=build_dash_bls/conan_toolchain.cmake \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DC2POOL_DASH_BLS=ON -DDASHBLS_ROOT="$DASHBLS_ROOT"
+
+      - name: Build c2pool-dash + BLS KATs
+        run: |
+          cmake --build build_dash_bls \
+            --target c2pool-dash \
+                     test_dash_bls_verify test_dash_quorum_members \
+                     test_dash_quorum_member_source \
+            -j8
+
+      # LEG 2: the artefact itself carries the dashbls backend.
+      - name: BLS link guard (binary carries dashbls)
+        run: bash scripts/ci/dash_bls_linked_guard.sh build_dash_bls/src/c2pool/c2pool-dash
+
+      - name: Run BLS KATs
+        working-directory: build_dash_bls
+        run: ctest --output-on-failure -j8 -R 'DashBlsVerify|DashQuorumMembers|DashQuorumMemberSource'
+
+      # LEG 3: the BLS-ONLY cases actually ran. Each of these is inside
+      # #ifdef C2POOL_DASH_BLS, so on a stub build they do not fail -- they
+      # cease to exist, and a bare ctest invocation reports green over an empty
+      # set. Requiring each name to appear as a PASSED line closes that.
+      - name: Assert the BLS-only KATs reported as run
+        working-directory: build_dash_bls
+        run: |
+          ./test/test_dash_bls_verify     > bls_kat.log 2>&1
+          ./test/test_dash_quorum_members >> bls_kat.log 2>&1
+          log="$(cat bls_kat.log)"
+          missing=0
+          for t in \
+            DashBlsVerify.RealQuorumSigAcceptsAndTamperRejects \
+            DashBlsVerify.BlsSmokeSignVerify \
+            DashBlsVerify.VerifyFinalCommitmentSyntheticRoundTrip \
+            DashQuorumMembers.RealCommitmentVerifiesWithComputedMembers \
+            DashQuorumMembers.RealPlatformCommitmentVerifiesWithEvoOnlyMembers \
+            DashQuorumMembers.PartialSignersAndValidMembers
+          do
+            # Pure-shell match, not `grep -q` in a pipeline: under pipefail a
+            # `grep -q` that matches SIGPIPEs its producer and the pipeline
+            # reports failure ON SUCCESS. That exact bug turned an earlier draft
+            # of this guard into a false-negative machine.
+            case "$log" in
+              *"OK ] $t"*) echo "  ok   $t" ;;
+              *) echo "  MISS $t did not report as run"; missing=1 ;;
+            esac
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::BLS-only KATs did not run -- the build is BLS-dark despite C2POOL_DASH_BLS=ON"
+            exit 1
+          fi
+
+      - name: Upload build artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-dash-bls-fail
+          path: |
+            build_dash_bls/CMakeFiles/CMakeOutput.log
+            build_dash_bls/CMakeFiles/CMakeError.log
+            build_dash_bls/bls_kat.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace
+
   # Releases are built and published manually (not via CI).
   # See installer/ for packaging scripts (DMG, ZIP, Inno Setup).
