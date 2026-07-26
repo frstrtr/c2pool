@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
+#include <deque>
 #include <map>
+#include <mutex>
 #include <vector>
 #include <string>
 #include <memory>
@@ -73,6 +75,42 @@ class Socket : public std::enable_shared_from_this<Socket>
     NetService m_addr;
     NetService m_addr_local;
 
+    // ── Outbound write queue (issue #863) ──────────────────────────────────
+    //
+    // Asio forbids initiating a second COMPOSED write on a descriptor before
+    // the first one completes: the two async_write_some continuations are
+    // serviced FIFO per descriptor, so a message needing more than one round
+    // gets bytes from the other message spliced into its middle. The peer then
+    // sees a bad length/checksum and drops the connection.
+    //
+    // Every coin's send_shares issues three back-to-back writes on one socket
+    // in a single handler turn (remember_tx -> shares -> forget_tx), and
+    // handle_version writes getaddrs/addrme before the (potentially ~32 KB)
+    // have_tx advert. Because send_shares reports its hashes as "sent" on
+    // SUBMISSION and broadcast_share never retries, a spliced frame loses that
+    // share to that peer permanently — silent PPLNS loss.
+    //
+    // Fix: buffer composed writes here and drain strictly in submission order,
+    // starting the next one only from the previous completion handler, so at
+    // most ONE composed async_write is ever in flight per socket. Same shape as
+    // StratumSession::send_response/do_write (core/stratum_server.cpp).
+    //
+    // m_write_mutex is a LEAF lock: it is only ever held around the deque/flag
+    // mutation and is never held across async_write initiation, an m_node
+    // callback, or any other lock — writes are submitted from node/compute
+    // threads as well as from the io_context thread, so the queue itself must
+    // be guarded, but no new lock-order edge is introduced.
+    //
+    // Deliberately UNCAPPED, unlike StratumSession's backlog cap: before this
+    // queue existed a stalled peer already pinned one PackStream per
+    // overlapping in-flight async_write, so the memory profile is unchanged,
+    // and dropping a queued p2p message would reintroduce exactly the silent
+    // share loss this fixes. A stuck peer is still reaped by the existing
+    // read-side error path.
+    mutable std::mutex m_write_mutex;
+    std::deque<std::shared_ptr<PackStream>> m_write_queue;
+    bool m_writing {false}; // true while a composed async_write is in flight
+
 public:
     // Global P2P traffic counters (all sockets combined)
     static inline std::atomic<uint64_t> g_bytes_recv{0};
@@ -93,6 +131,16 @@ private:
     void abort_connection();
 
     void read();   // moved out-of-line; needs INetwork complete via acquire_node
+
+    // Drain step of the outbound queue: initiates the composed async_write for
+    // the front element and re-arms itself from that write's completion
+    // handler. Never called while another composed write is in flight.
+    void do_write();
+
+    // Drop every still-queued buffer and clear the in-flight flag. Used on
+    // write error / closed socket so the whole queued chain fails together,
+    // exactly as the single pre-queue write failed as a unit.
+    void fail_write_queue();
 
     void read_prefix(std::shared_ptr<Packet> packet);
 	void read_command(std::shared_ptr<Packet> packet);

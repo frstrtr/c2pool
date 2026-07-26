@@ -120,18 +120,92 @@ void Socket::write(std::unique_ptr<RawMessage> msg_data)
     }
 
     auto packet = std::make_shared<PackStream>(Packet::from_message(m_node->get_prefix(), msg_data));
+
+    // Queue, then start the drain ONLY if no composed write is in flight. The
+    // framing is done here (on the caller's thread, as before) so the bytes are
+    // captured in submission order; the wire order is then exactly the order in
+    // which callers reached this line. See the m_write_queue comment in
+    // socket.hpp for why overlapping composed writes cost shares.
+    bool start_drain = false;
+    {
+        std::lock_guard<std::mutex> lock(m_write_mutex);
+        m_write_queue.push_back(std::move(packet));
+        if (!m_writing)
+        {
+            m_writing = true;
+            start_drain = true;
+        }
+    }
+
+    // Outside the lock: do_write() initiates asio work and must never run with
+    // m_write_mutex held (leaf-lock discipline).
+    if (start_drain)
+        do_write();
+}
+
+void Socket::fail_write_queue()
+{
+    std::deque<std::shared_ptr<PackStream>> dropped;
+    {
+        std::lock_guard<std::mutex> lock(m_write_mutex);
+        dropped.swap(m_write_queue);
+        m_writing = false;
+    }
+    // `dropped` is released here, outside the lock.
+}
+
+void Socket::do_write()
+{
+    std::shared_ptr<PackStream> packet;
+    {
+        std::lock_guard<std::mutex> lock(m_write_mutex);
+        if (m_write_queue.empty())
+        {
+            m_writing = false;
+            return;
+        }
+        packet = m_write_queue.front();
+    }
+
+    // Socket closed under us between queueing and draining: fail the whole
+    // chain rather than leave buffers pinned behind a stuck in-flight flag.
+    // Matches the pre-queue behaviour, where write() on a closed socket was a
+    // silent no-op with no error() callback.
+    if (!m_status || !m_socket || !m_socket->is_open())
+    {
+        fail_write_queue();
+        return;
+    }
+
     boost::asio::async_write(*m_socket, boost::asio::buffer(packet->data(), packet->size()),
         [self = shared_from_this(), this, packet](const boost::system::error_code& ec, std::size_t length)
         {
             if (!ec) g_bytes_sent.fetch_add(length, std::memory_order_relaxed);
             if (ec) {
+                // A failed write kills the connection, so everything still
+                // queued behind it could never be delivered either: drop the
+                // chain and report ONCE — exactly what a single failed write
+                // did before the queue existed.
+                fail_write_queue();
                 std::shared_ptr<INetwork> strong;
                 if (!acquire_node(strong)) {
                     abort_connection();
                     return;
                 }
                 m_node->error("Socket::write error: " + ec.message(), get_addr());
+                return;
             }
+
+            {
+                std::lock_guard<std::mutex> lock(m_write_mutex);
+                if (!m_write_queue.empty())
+                    m_write_queue.pop_front();
+            }
+            // Start the NEXT composed write only from here — that ordering is
+            // the whole point of the queue. Not unbounded recursion:
+            // async_write never invokes its handler inline from the initiating
+            // call, so each do_write() returns before the next one runs.
+            do_write();
         }
     );
 }

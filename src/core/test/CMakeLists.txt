@@ -15,7 +15,15 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # EXISTING allowlisted core_test target (never a new add_executable — that is
     # the #769 "Not Run" trap), and one KAT covers every coin because all five
     # node lanes consume this one shared helper.
-    add_executable(core_test pack_test.cpp events_test.cpp chain_test.cpp packet_test.cpp block_broadcast_test.cpp broadcast_convergence_matrix_test.cpp core_merkle_branches_test.cpp version_gate_test.cpp filesystem_test.cpp web_server_submitblock_test.cpp known_txs_eviction_test.cpp tx_advertiser_test.cpp)
+    #
+    # socket_write_queue_test.cpp: the core::Socket OUTBOUND WRITE QUEUE (#863).
+    # Drives a real loopback TCP pair with a small send buffer and submits
+    # overlapping composed writes from off-io threads; without the queue those
+    # writes splice bytes mid-message and the assertions fail. One KAT covers
+    # every coin because all five node lanes share this one socket layer. Same
+    # reasoning as above: FOLDED into the EXISTING allowlisted core_test target,
+    # never a new add_executable (the #769 "Not Run" trap).
+    add_executable(core_test pack_test.cpp events_test.cpp chain_test.cpp packet_test.cpp block_broadcast_test.cpp broadcast_convergence_matrix_test.cpp core_merkle_branches_test.cpp version_gate_test.cpp filesystem_test.cpp web_server_submitblock_test.cpp known_txs_eviction_test.cpp tx_advertiser_test.cpp socket_write_queue_test.cpp)
     target_link_libraries(core_test PRIVATE GTest::gtest_main core c2pool_merged_mining GTest::gtest)
     target_link_libraries(core_test PRIVATE c2pool_payout c2pool_hashrate ltc_coin)  # OBJECT-lib SCC direct-naming (#22/#39)
 
