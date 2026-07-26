@@ -62,6 +62,7 @@
 #include <impl/dash/coin/zmq_tip_notify.hpp> // dash::coin::TipHashDedup / ZmqHashblockSubscriber — dashd ZMQ hashblock INSTANT tip-notify (opt-in, hardening on the #770 poll)
 #include <impl/dash/coin/coin_p2p_magic.hpp>      // dash::coin::select_coin_p2p_magic — E5 --coin-p2p-magic override (regtest ARM A dial)
 #include <impl/dash/coin/node_coin_state.hpp>  // dash::coin::NodeCoinState (embedded work bundle)
+#include <impl/dash/coin/arm_resolution.hpp>   // dash::coin::resolve_embedded_arm (#738 arm decision, one place)
 #include <impl/dash/coin/dkg_window.hpp>       // dash::coin::is_dkg_commitment_window (BLOCKER-1 guard)
 #include <impl/dash/coin/dkg_commitments.hpp>  // E1: build_daemonless_qc_plan (serve DKG windows daemonlessly)
 #include <impl/dash/coin/vendor/bls_verify.hpp>  // E1 Phase-L: make_commitment_bls_verifier (real qc verify seam)
@@ -218,7 +219,7 @@ void print_banner(const char* argv0)
         << "           [--stratum [HOST:]PORT] [--coin-p2p-connect HOST:PORT]... [--coin-p2p-discover]\n"
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
         << "           [--external-ip ADDR]\n"
-        << "           [--embedded-utxo]\n"
+        << "           [--embedded-utxo] [--embedded-mainnet]\n"
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
         << "           [--redistribute pplns|fee|boost|donate]\n"
         << "           [--coin-zmq-hashblock tcp://HOST:PORT]\n"
@@ -242,6 +243,15 @@ void print_banner(const char* argv0)
         << "        clean_jobs notify on the fallback arm; absent/unreachable => the 3 s\n"
         << "        getbestblockhash poll is the active path (requires dashd\n"
         << "        zmqpubhashblock=tcp://HOST:PORT). No consensus effect.\n"
+        << "        --embedded-mainnet (DEFAULT OFF) is the single opt-in for the\n"
+        << "        DAEMONLESS embedded template arm on MAINNET. It lifts the arm gate\n"
+        << "        AND arms the coin-state feed that populates it (seed-based peer\n"
+        << "        discovery unless --coin-p2p-connect names peers), so one flag takes\n"
+        << "        the arm end to end. WITHOUT it a mainnet node ALWAYS serves the\n"
+        << "        reward-safe dashd-RPC fallback: --coin-p2p-connect/--coin-p2p-discover\n"
+        << "        are transport only and NEVER move the arm. Even when armed, every\n"
+        << "        per-template gate (SML fresh at tip, non-superblock, credit-pool seed\n"
+        << "        height, bestCL, MN-payee cursor, DKG plan) fails closed to dashd.\n"
         << "        --coin-p2p-magic HEX overrides the embedded coin-P2P wire magic\n"
         << "        (default mainnet bf0c6bbd / testnet cee2caff; regtest fcc1b7dc).\n"
         << "        --regtest-force-won-block (regtest E5 harness, fail-closed) drives\n"
@@ -1221,6 +1231,33 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         std::cout << "[run] web dashboard disabled (--web-port 0)\n";
     }
 
+    // ── #738: resolve WHICH template arm this invocation takes, ONCE ──────
+    // Before this, taking the embedded arm needed TWO conditions that no single
+    // flag satisfied: the work-source gate (--embedded-mainnet, half 1) AND a
+    // live coin-state feed (--coin-p2p-connect/--coin-p2p-discover, half 2,
+    // which is what constructs the maintainer that flips populated()). The
+    // embedded opt-in armed only half 1, so NodeCoinState was never fed and the
+    // arm could not be taken from any documented invocation. resolve_embedded_
+    // arm() closes that with a ONE-WAY implication: the embedded opt-in implies
+    // its own feed. The converse is deliberately absent — a transport flag NEVER
+    // moves the arm (the hotel incident where --coin-p2p-connect activated an
+    // unguarded embedded arm on a live production node). Pinned by
+    // test_dash_stratum_work_source's DashRunArmResolution suite.
+    const dash::coin::ArmResolution run_arm =
+        dash::coin::resolve_embedded_arm(dash::coin::ArmInputs{
+            testnet, embedded_mainnet,
+            !coin_p2p_targets.empty(), coin_p2p_discover });
+    // Discovery is turned on for a pinned-peer-less embedded opt-in: daemonless
+    // needs somewhere to sync from. Operator-named transport is never overridden.
+    const bool coin_p2p_discover_eff = coin_p2p_discover || run_arm.discover_implied;
+    std::cout << "[run] template arm=" << dash::coin::arm_name(run_arm.arm)
+              << " — " << dash::coin::arm_reason_text(run_arm.reason)
+              << "\n[run]       (embedded_arm_enabled="
+              << (run_arm.embedded_arm_enabled ? "yes" : "no")
+              << " coin_state_feed=" << (run_arm.coin_feed_armed ? "armed" : "off")
+              << (run_arm.discover_implied ? " discovery=implied-by-opt-in" : "")
+              << ")\n";
+
     // ── E1: OPT-IN embedded coin-network P2P dial (--coin-p2p-connect) ────
     // GUARANTEE: with no --coin-p2p-connect on argv, coin_p2p stays null and
     // this block is a no-op — the run path is unchanged and the mining-hotel
@@ -1241,7 +1278,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // Refresh timer declared LAST -> destroyed FIRST: it stops (and its lambda
     // stops capturing coin_p2p / coin_peer_mgr) before either is torn down.
     std::unique_ptr<core::Timer> coin_dial_refresh_timer;
-    if (!coin_p2p_targets.empty() || coin_p2p_discover) {
+    if (run_arm.coin_feed_armed) {
         config.coin()->m_testnet = testnet;
         // Coin-network wire magic (dashd pchMessageStart). Default: mainnet
         // bf0c6bbd / testnet cee2caff. A dev regtest dashd uses a DISTINCT magic
@@ -1258,7 +1295,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         coin_p2p = std::make_unique<dash::coin::p2p::CoinClient<dash::Config>>(
             &ioc, &coin_state, &config, "COIN-P2P");
 
-        if (coin_p2p_discover) {
+        if (coin_p2p_discover_eff) {
             // ── Network-standalone arm: seed-discovered, SCORED, group-diverse
             // peer set INDEPENDENT of the local dashd. The pinned local dashd
             // (--coin-p2p-connect front target, if any) is registered as the
@@ -1345,8 +1382,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 cp->update_dial_targets(std::move(refreshed));
             });
 
-            std::cout << "[run] coin-network P2P DISCOVERY armed (--coin-p2p-discover): "
-                         "DASH-isolated scored/diverse peer set, pinned="
+            std::cout << "[run] coin-network P2P DISCOVERY armed ("
+                      << (run_arm.discover_implied
+                              ? "implied by --embedded-mainnet"
+                              : "--coin-p2p-discover")
+                      << "): DASH-isolated scored/diverse peer set, pinned="
                       << pinned_str << " magic=" << net_magic_hex
                       << " proto=70230 dns_seeds=" << dash::coin::dash_dns_seeds(testnet).size()
                       << " fixed_seeds=" << dash::coin::dash_fixed_seeds(testnet).size()
@@ -2599,7 +2639,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // flag) yields nullopt and the arm fails closed to the dashd fallback,
         // exactly the old refusal. The emit gate re-derives this same plan and
         // hard-rejects any template whose type-6 set drifts from it.
-        if (testnet || embedded_mainnet) {
+        if (run_arm.embedded_arm_enabled) {
             const auto qc_net = testnet ? dash::coin::LlmqNetwork::Testnet
                                         : dash::coin::LlmqNetwork::Mainnet;
             // Phase-L sourcing leg: collect REAL relayed DKG commitments off
@@ -2757,14 +2797,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // Only meaningful when the embedded arm actually serves (testnet or
         // --embedded-mainnet); harmless otherwise (the arm is off, work_source
         // never consults viability).
-        node_coin_state.set_require_fresh_bestcl(testnet || embedded_mainnet);
+        node_coin_state.set_require_fresh_bestcl(run_arm.embedded_arm_enabled);
 
         // SOAK FIX (bad-cbtx-assetlocked-amount): the DIP-0027 credit-pool seed
         // rides a separate on_mnlistdiff step and can lag one block while the SML
         // hash is already at the tip; the accrual then commits a stale
         // creditPoolBalance. Refuse the embedded arm unless the credit-pool seed
         // is current AT the tip, same discipline as the SML axis.
-        node_coin_state.set_require_fresh_credit_pool(testnet || embedded_mainnet);
+        node_coin_state.set_require_fresh_credit_pool(run_arm.embedded_arm_enabled);
 
         // E4 re-soak fix (bad-cb-payee at 1519827): the projected masternode
         // payee is only dashd-exact when the payee queue has folded EVERY
@@ -2780,7 +2820,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // MnStateMachine's forward-contiguity guard + the maintainer's gap
         // fail-closed path (wipe + authoritative protx re-seed) close the
         // gap itself.
-        node_coin_state.set_require_fresh_mn_payee(testnet || embedded_mainnet);
+        node_coin_state.set_require_fresh_mn_payee(run_arm.embedded_arm_enabled);
 
         // H-6: SML/quorum apply and bestCL adoption move ASYNCHRONOUSLY to the
         // header tip. When they advance (catching the SML up to a moved tip, or
@@ -2946,7 +2986,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // getheaders off our current locator + a mempool prime.
         coin_p2p->set_on_handshake_complete(
             [cp = coin_p2p.get(), hc = header_chain.get(), sml_base,
-             discover = coin_p2p_discover]() {
+             discover = coin_p2p_discover_eff]() {
                 LOG_INFO << "[EMB-DASH] handshake complete -> initial sync:"
                             " getheaders + mempool + mnlistdiff(cold)"
                          << (discover ? " + getaddr (peer crawl)" : "");
