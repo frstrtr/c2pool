@@ -124,6 +124,13 @@ void Actual::HANDLER(getaddrs)
     std::vector<addr_record_t> addrs;
     for (const auto& pair : get_good_peers(msg->m_count))
     {
+        // #910: never advertise an address we cannot render on the wire. A
+        // DNS-named seed that the outbound-connect resolver has not resolved
+        // yet used to serialize as 127.0.0.1, pointing every peer that learned
+        // it from us back at itself. Skip it; the next sweep re-offers it once
+        // a dial has resolved the name.
+        if (!pair.addr.is_wire_advertisable())
+            continue;
         addrs.push_back({pair.value.m_service, pair.addr, pair.value.m_last_seen});
     }
 

@@ -7,6 +7,137 @@
 #include <boost/lexical_cast.hpp>
 #include <sstream>
 #include <iomanip>
+#include <mutex>
+#include <shared_mutex>
+#include <unordered_map>
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Resolved-host memo (#910) — see netaddress.hpp for the rationale.
+//
+// Written from the outbound-connect resolver's completion handler
+// (core::Factory's Client::resolve, core/factory.hpp), read from the serializer.
+// Those run on different threads, hence the shared_mutex; the read side is the
+// one on the IO path, so it takes only the shared lock and never does DNS.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+namespace
+{
+    // Sources are bounded by config (--addnode, seed lists), but the memo is fed
+    // from a network-adjacent path, so it gets an explicit ceiling.
+    constexpr size_t MAX_RESOLVED_HOSTS = 1024;
+
+    std::shared_mutex& resolved_hosts_mutex()
+    {
+        static std::shared_mutex m;
+        return m;
+    }
+
+    std::unordered_map<std::string, std::string>& resolved_hosts()
+    {
+        static std::unordered_map<std::string, std::string> m;
+        return m;
+    }
+
+    bool is_numeric_address(const std::string& s)
+    {
+        boost::system::error_code ec;
+        boost::asio::ip::make_address(s, ec);
+        return !ec;
+    }
+
+    bool is_numeric_v4(const std::string& s)
+    {
+        boost::system::error_code ec;
+        boost::asio::ip::make_address_v4(s, ec);
+        return !ec;
+    }
+}
+
+namespace core
+{
+
+void record_resolved_host(const std::string& host, const std::string& ip)
+{
+    // A literal needs no memo, and we refuse to store anything that is not
+    // itself numeric — the memo must never become a second source of names.
+    if (host.empty() || is_numeric_address(host) || !is_numeric_address(ip))
+        return;
+
+    std::unique_lock lock(resolved_hosts_mutex());
+    auto& map = resolved_hosts();
+
+    auto it = map.find(host);
+    if (it != map.end())
+    {
+        if (it->second != ip)
+        {
+            LOG_INFO << "DNS: '" << host << "' moved " << it->second << " -> " << ip;
+            it->second = ip;
+        }
+        return;
+    }
+
+    if (map.size() >= MAX_RESOLVED_HOSTS)
+    {
+        LOG_WARNING << "DNS memo full (" << MAX_RESOLVED_HOSTS
+                    << " hosts); not recording '" << host << "'";
+        return;
+    }
+
+    map.emplace(host, ip);
+    LOG_DEBUG_OTHER << "DNS: '" << host << "' -> " << ip;
+}
+
+std::optional<std::string> lookup_resolved_host(const std::string& host)
+{
+    std::shared_lock lock(resolved_hosts_mutex());
+    const auto& map = resolved_hosts();
+    auto it = map.find(host);
+    if (it == map.end())
+        return std::nullopt;
+    return it->second;
+}
+
+void clear_resolved_hosts()
+{
+    std::unique_lock lock(resolved_hosts_mutex());
+    resolved_hosts().clear();
+}
+
+} // namespace core
+
+std::optional<std::string> NetAddress::wire_ipv4_literal() const
+{
+    // Already a dotted quad: hand it back unchanged so the bytes we emit are
+    // byte-for-byte the bytes we emitted before this fix.
+    if (is_numeric_v4(m_ip))
+        return m_ip;
+
+    // "localhost" genuinely IS 127.0.0.1. That is a real resolution, not the
+    // blanket loopback substitution #910 is about, and it keeps the
+    // default-constructed NetAddress (m_ip == "localhost") serializing to the
+    // same four bytes it always has.
+    if (m_ip == "localhost")
+        return std::string("127.0.0.1");
+
+    // A DNS name: render whatever the outbound-connect resolver last resolved
+    // it to. Never resolve here — this runs on the serialize/IO path.
+    //
+    // Only an A record is usable: the caller splits on '.' and must produce
+    // exactly four bytes, so a memoised AAAA answer is deliberately treated as
+    // "unknown" rather than fed into the IPv4 encoder.
+    auto memo = core::lookup_resolved_host(m_ip);
+    if (memo && is_numeric_v4(*memo))
+        return memo;
+    return std::nullopt;
+}
+
+bool NetAddress::is_wire_advertisable() const
+{
+    if (m_type == NET_IPV6)
+        return is_numeric_address(m_ip);
+    return wire_ipv4_literal().has_value();
+}
 
 void NetAddress::Write_IPV4(PackStream& os) const
 {
@@ -18,14 +149,26 @@ void NetAddress::Write_IPV4(PackStream& os) const
         data = ParseHex(ip);
     } else
     {
+        // #910: a DNS-named address used to be silently rewritten to 127.0.0.1
+        // right here, and that rewrite is what we advertised — pointing every
+        // peer that learned the address from us back at itself. Render the name
+        // as the A record the connect path has already resolved instead.
+        auto literal = wire_ipv4_literal();
+        if (!literal)
+        {
+            // Loud, and NOT loopback. 0.0.0.0 is rejected by is_connectable()
+            // on the receiving side, so it misdirects nobody. Getting here at
+            // all means an unresolved entry slipped past the
+            // is_wire_advertisable() filter on the advertisement path.
+            LOG_ERROR << "Write_IPV4: '" << ip << "' is not an IPv4 literal and has no "
+                      << "resolved address; emitting 0.0.0.0 (unroutable) rather than "
+                      << "loopback. This entry should not have been advertised.";
+            literal = std::string("0.0.0.0");
+        }
+        ip = *literal;
+
         std::vector<std::string> split_res;
         boost::algorithm::split(split_res, ip, boost::is_any_of("."));
-        if (split_res.size() != 4)
-        {
-            // Not a dotted-decimal IPv4 address (e.g. "localhost") — use loopback 127.0.0.1
-            LOG_WARNING << "Write_IPV4: non-dotted address '" << ip << "', substituting 127.0.0.1";
-            split_res = {"127", "0", "0", "1"};
-        }
 
         std::vector<unsigned int> bits;
         for (auto bit: split_res)

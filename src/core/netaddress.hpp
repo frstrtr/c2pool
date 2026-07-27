@@ -22,6 +22,37 @@ enum AddrType
 static const std::array<uint8_t, 12> IPV4_IN_IPV6_PREFIX
     {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF};
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Resolved-host memo (#910)
+//
+// A NetAddress may hold a DNS NAME rather than a numeric literal — that is the
+// entire point of `--addnode rov.p2p-spb.xyz:8999`, and the name has to be kept
+// so every reconnect re-resolves it and the seed survives an IP change.
+//
+// The outbound connect path already resolves those names: core::Factory's
+// Client::resolve() issues one async_resolve() per dial (core/factory.hpp).
+// What follows is nothing more than a memo of THAT resolver's answers, so the
+// serializer can render a name as its real A record without introducing a
+// second resolution path that could disagree, and without ever performing a
+// blocking lookup on the serialize/IO path.
+//
+// Numeric literals are never stored — they need no resolution.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+namespace core
+{
+    /// Memoise a DNS answer produced by the outbound-connect resolver.
+    /// No-op when `host` is already a numeric literal, or `ip` is not one.
+    void record_resolved_host(const std::string& host, const std::string& ip);
+
+    /// Last address the connect path resolved `host` to, if any.
+    /// Pure in-memory lookup — never performs DNS.
+    std::optional<std::string> lookup_resolved_host(const std::string& host);
+
+    /// Test/reset hook. Not called from production paths.
+    void clear_resolved_hosts();
+}
+
 inline auto parse_address(std::string_view address_spec, std::string_view default_service = "https")
 {
     using namespace boost::spirit::x3;
@@ -54,6 +85,24 @@ public:
 
     void set_address(std::string ip) { m_ip = ip; }
     auto address() const { return m_ip; }
+
+    /// The numeric IPv4 literal this address will put on the wire (#910).
+    ///
+    ///   • already a dotted quad  -> itself (byte-for-byte identical wire output)
+    ///   • "localhost"            -> "127.0.0.1" (a genuine resolution, not a fallback)
+    ///   • a DNS name the connect path has resolved -> that A record
+    ///   • anything else          -> nullopt
+    ///
+    /// nullopt means "we do not know where this name points"; it must NEVER be
+    /// turned into loopback — a valid-looking address that misdirects every peer
+    /// that learns it back at itself.
+    std::optional<std::string> wire_ipv4_literal() const;
+
+    /// True when Serialize() will emit a real address for this entry. False for
+    /// a DNS name that has not been resolved yet; such an entry must be skipped
+    /// rather than advertised. Numeric literals — including a legitimate
+    /// `--addnode 127.0.0.1:18999` — are always advertisable.
+    bool is_wire_advertisable() const;
 
     friend bool operator==(const NetAddress& l, const NetAddress& r)
     { return (l.m_type == r.m_type) && (l.m_ip == r.m_ip); }
