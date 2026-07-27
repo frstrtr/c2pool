@@ -91,6 +91,7 @@
 #include <impl/dash/params.hpp>                // dash::make_coin_params (already via top include)
 #include <core/uint256.hpp>                    // uint160 payout pubkey hash
 #include <core/target_utils.hpp>              // chain::target_to_difficulty (dashboard net-diff)
+#include <impl/dash/dashboard_found_block.hpp> // any-participant /recent_blocks feed (peer-found blocks)
 
 #include <core/stratum_server.hpp>             // core::StratumServer — miner-facing accept-loop (run-path caller)
 #include <impl/dash/stratum/work_source.hpp>   // dash::stratum::DASHWorkSource — concrete core::stratum::IWorkSource
@@ -1099,6 +1100,54 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 [ws](double diff, const std::string& miner) {
                     ws->get_mining_interface()->record_share_difficulty(diff, miner);
                 };
+        }
+
+        // ── ANY-PARTICIPANT found-block feed (main_ltc.cpp:4230 parity) ────
+        // /recent_blocks is fed exclusively by record_found_block(), and the
+        // ONLY DASH binding of it was the LOCAL stratum win below
+        // (set_on_found_block_fn). A block found by another pool participant
+        // arrives as a gossiped share whose X11 header hash also clears the
+        // coin BLOCK target; the tracker already fires m_on_block_found for
+        // it (share_tracker.hpp:368/574-578) and ltc/btc/dgb/bch all bind
+        // that hook -- DASH never did, so peer-found blocks paid out but
+        // showed up nowhere on the dashboard.
+        //
+        // LOCKS. The hook fires with the caller holding m_tracker_mutex
+        // EXCLUSIVELY (compute thread in think()->attempt_verify, or
+        // add_local_share's try-lock). read_tracker() is reentrancy-aware and
+        // takes NO lock on the compute thread, so the handler cannot self-
+        // lock; it snapshots plain data and posts the dashboard write -- which
+        // takes m_blocks_mutex and may hit LevelDB -- onto the io_context, so
+        // nothing heavy and no second mutex is entered under the tracker lock.
+        //
+        // DEDUP. A local win is recorded by the stratum arm first and then
+        // re-fires here once #888 mints the winning share; both carry the same
+        // block hash (on DASH the share hash IS X11(block header)) and the same
+        // "DASH" label, and record_found_block dedups on exactly that pair.
+        //
+        // Display only: no submit, mint, target or payout path is reachable.
+        {
+            core::WebServer* ws = web_server.get();
+            dash::Node* node = &p2p_node;
+            p2p_node.tracker().m_on_block_found =
+                dash::dashboard::make_on_block_found(
+                    node, testnet,
+                    [&ioc](std::function<void()> work) {
+                        boost::asio::post(ioc, std::move(work));
+                    },
+                    [ws](const dash::dashboard::FoundBlockRow& row) {
+                        auto* mi = ws->get_mining_interface();
+                        LOG_INFO << "[DASH] GOT BLOCK FROM POOL! height=" << row.height
+                                 << " hash=" << row.block_hash.GetHex().substr(0, 16)
+                                 << " miner=" << row.miner;
+                        mi->record_found_block(
+                            row.height, row.block_hash, row.timestamp,
+                            row.chain, row.miner, row.share_hash,
+                            mi->get_network_difficulty(),
+                            row.share_difficulty,
+                            mi->get_local_hashrate(),
+                            row.subsidy);
+                    });
         }
 
         // ── REAL node-owner fee (already parsed from argv above) ──────────

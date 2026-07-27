@@ -299,7 +299,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # publish/getters, tracker()/read_tracker()/tracker_shared_lock() accessors.
     # Rig-free (no io_context/sockets). Needs pool (BaseNode) + c2pool_storage
     # (SharechainStorage) on top of the dash_x11 + core link set.
-    add_executable(test_dash_node test_dash_node.cpp)
+    # test_dash_dashboard_found_block.cpp is FOLDED into this already-allowlisted
+    # target as a second TU rather than added as a standalone executable: a new
+    # target would need a build.yml --target edit and, until it had one, would
+    # trip CI's NOT_BUILT sentinel (the drift-guard audit, #883/#893). It needs
+    # exactly this link set — NodeImpl + ShareTracker + core MiningInterface.
+    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp)
     target_link_libraries(test_dash_node PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
