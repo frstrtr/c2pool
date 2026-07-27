@@ -567,7 +567,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_bls_verify PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
-    gtest_add_tests(test_dash_bls_verify "" AUTO)
+    gtest_discover_tests(test_dash_bls_verify DISCOVERY_MODE PRE_TEST)
 
     # E1 Phase-L member-set selection: deterministic ComputeQuorumMembers over
     # the SML AS OF the WORK block (base - 8, per v23.1.7 GetAllQuorumMembers —
@@ -588,7 +588,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_quorum_members PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
-    gtest_add_tests(test_dash_quorum_members "" AUTO)
+    gtest_discover_tests(test_dash_quorum_members DISCOVERY_MODE PRE_TEST)
 
     # E1 Phase-L member-set SOURCING PLUMBING (quorum_member_source.hpp): the
     # #814 re-review findings — R1 send-once-per-work-block dedup + strict
@@ -1125,7 +1125,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_coinbase_muldiv PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
-    gtest_add_tests(test_dash_coinbase_muldiv "" AUTO)
+    gtest_discover_tests(test_dash_coinbase_muldiv DISCOVERY_MODE PRE_TEST)
 
     add_executable(test_dash_cb_payee test_dash_cb_payee.cpp)
     target_link_libraries(test_dash_cb_payee PRIVATE
