@@ -52,7 +52,17 @@ void Legacy::HANDLER(addrs)
 
 void Legacy::HANDLER(addrme)
 {
-    if (peer->addr().address() == "127.0.0.0")
+    // #882 — the loopback HOST address, not the loopback NETWORK address.
+    // Canonical p2p.py:281 compares `host == '127.0.0.1'`, and so does the
+    // Actual generation (protocol_actual.cpp:57). Legacy shipped "127.0.0.0",
+    // the /8 network address, which no peer can ever present as its source IP,
+    // so this branch was unreachable and EVERY addrme — including one arriving
+    // over loopback — fell into the else arm below: it recorded
+    // 127.0.0.1:<port> in our AddrStore as if it were a routable peer and then
+    // gossiped that loopback record onward in an addrs message. Legacy is the
+    // only generation live on DASH today. Related to #910, which fixes the
+    // other end of the same subsystem (a hostname serialising AS 127.0.0.1).
+    if (peer->addr().address() == "127.0.0.1")
     {
         if (!m_peers.empty() && (core::random::random_float(0, 1) < 0.8))
         {

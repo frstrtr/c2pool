@@ -88,6 +88,33 @@ public:
     }
 
 	uint16_t listen_port() const { return m_acceptor->local_endpoint().port(); }
+
+	/// Canonical p2p.py:110 — `if self.node.serverfactory.listen_port is not None`.
+	///
+	/// listen_port() above is only valid on a node that actually listens: it
+	/// dereferences the optional acceptor unconditionally (empty for the
+	/// rig-free `Server(nullptr, ...)` construction used by the KAT targets)
+	/// and calls local_endpoint() on it, which THROWS boost::system::system_error
+	/// (bad_descriptor) when the acceptor was never opened. c2pool has a real
+	/// non-listening mode — DASH's `--connect` suppresses the inbound listener
+	/// (src/c2pool/main_dash.cpp:566) — so an advertisement path that needs our
+	/// listen port must be able to ask "are we listening at all?" without
+	/// throwing. That is exactly the question canonical asks before deciding
+	/// whether to advertise, and this is the accessor that answers it.
+	///
+	/// Additive: listen_port() is untouched, so no existing caller changes.
+	std::optional<uint16_t> listen_port_or_none() const noexcept
+	{
+		if (!m_acceptor || !m_acceptor->is_open())
+			return std::nullopt;
+
+		boost::system::error_code ec;
+		const auto ep = m_acceptor->local_endpoint(ec);
+		if (ec)
+			return std::nullopt;
+
+		return ep.port();
+	}
 };
 
 class Client
