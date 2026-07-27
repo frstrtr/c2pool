@@ -166,6 +166,24 @@ private:
 					return;
 				}
 
+				// #910: this is the ONE resolver in the outbound path, and it
+				// has just produced the answer the serializer needs. Memoise
+				// the A record against the configured host string so an
+				// `--addnode rov.p2p-spb.xyz:8999` seed is advertised to peers
+				// by its real address instead of being rewritten to 127.0.0.1
+				// in NetAddress::Write_IPV4. No second lookup is introduced,
+				// so the two paths cannot disagree; the memo is skipped
+				// automatically when the host is already a literal.
+				for (const auto& entry : endpoints)
+				{
+					if (entry.endpoint().address().is_v4())
+					{
+						core::record_resolved_host(addr.address(),
+							entry.endpoint().address().to_string());
+						break;
+					}
+				}
+
 				// If the node WAS managed at registration but is now expired,
 				// it has been destroyed — skip the connect to avoid the UAF
 				// on m_node->connected(socket) inside connect_socket().
