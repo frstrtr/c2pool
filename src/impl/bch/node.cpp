@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "node.hpp"
 
+#include "share_tx_refs.hpp"    // bch::new_tx_hashes -- uniform send-side probe (#905)
+
 #include <core/common.hpp>
 #include <core/hash.hpp>
 #include <core/random.hpp>
@@ -722,14 +724,21 @@ void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hash
     for (auto& share : shares)
     {
         share.invoke([&](auto* obj) {
-            if constexpr (requires { obj->m_new_transaction_hashes; })
+            // Route through the accessor instead of probing
+            // obj->m_new_transaction_hashes directly (as this used to). That flat
+            // probe is FALSE for every BCH variant -- v17/v33 nest the list inside
+            // m_tx_info, v34+ carry no list -- so this whole forwarding block was
+            // unreachable and BCH forwarded no tx bytes (#905). new_tx_hashes()
+            // returns the nested list for v17/v33 and nullptr for v34+ (nothing to
+            // forward), never a silent skip.
+            const auto* new_txs = bch::new_tx_hashes(obj);
+            if (!new_txs)
+                return;
+            for (const auto& th : *new_txs)
             {
-                for (const auto& th : obj->m_new_transaction_hashes)
-                {
-                    if (!peer->m_remote_txs.count(th) &&
-                        !peer->m_remembered_txs.count(th))
-                        needed_txs.insert(th);
-                }
+                if (!peer->m_remote_txs.count(th) &&
+                    !peer->m_remembered_txs.count(th))
+                    needed_txs.insert(th);
             }
         });
     }
