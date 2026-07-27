@@ -1849,15 +1849,15 @@
                 <div class="stat-card">
                     <h3><span class="icon">💰</span> Miners Block Value</h3>
                     <div class="stat-value warning"><span id="block_value_miner">-</span> <small class="symbol-small" id="block_value_symbol">-</small></div>
-                    <div class="stat-sub" style="color: #c3a634; font-size: 1.1em; margin-top: -4px;">+<span id="merged_block_value">-</span> DOGE</div>
-                    <div class="stat-detail" style="white-space: nowrap;">Expected: <span id="time_to_block">-</span> <span style="color: #c3a634;">|</span> <span style="color: #c3a634;"><span id="time_to_merged_block">-</span></span></div>
+                    <div class="stat-sub merged-child-hint" style="color: #c3a634; font-size: 1.1em; margin-top: -4px;">+<span id="merged_block_value">-</span> <span class="merged-child-symbol-hint">DOGE</span></div>
+                    <div class="stat-detail" style="white-space: nowrap;">Expected: <span id="time_to_block">-</span> <span class="merged-child-hint"><span style="color: #c3a634;">|</span> <span style="color: #c3a634;"><span id="time_to_merged_block">-</span></span></span></div>
                 </div>
                 
                 <!-- Third Row: Node Owner Payout -->
                 <div class="stat-card">
                     <h3><span class="icon">💎</span> Node Fee: <span id="node_fee_percent">-</span>%</h3>
                     <div class="stat-value success"><span id="payout_totamount">-</span> <small class="symbol-small" id="node_payout_symbol">-</small></div>
-                    <div class="stat-sub" id="node_merged_payout" style="color: #c3a634; font-size: 1.1em; margin-top: -4px;">+<span id="node_merged_amount">0</span> <span id="node_merged_symbol">DOGE</span></div>
+                    <div class="stat-sub merged-child-hint" id="node_merged_payout" style="color: #c3a634; font-size: 1.1em; margin-top: -4px;">+<span id="node_merged_amount">0</span> <span id="node_merged_symbol" class="merged-child-symbol-hint">DOGE</span></div>
                     <div class="stat-detail">Per block found now</div>
                 </div>
                 
@@ -3099,7 +3099,7 @@
                 }
                 if (local_stats.node_fee_doge != null) {
                     d3.select('#node_merged_amount').text(d3.format(',.2f')(local_stats.node_fee_doge));
-                    d3.select('#node_merged_symbol').text('DOGE');
+                    d3.select('#node_merged_symbol').text((typeof currency_info!=="undefined"&&currency_info.merged_child_symbol)||'DOGE');
                 }
 
                 // Warnings
