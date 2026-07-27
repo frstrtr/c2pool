@@ -28,6 +28,7 @@ set(source
     opscript.hpp
     random.hpp random.cpp
     addr_store.hpp addr_store.cpp
+    p2p_message_stats.hpp
     web_server.hpp web_server.cpp
     http_session.cpp
     stratum_server.hpp stratum_server.cpp

@@ -104,6 +104,64 @@ custom dashboard, or scraping pool metrics.
 | `/ban_stats` | P2P ban statistics |
 | `/api/coin_peers` | Parent-coin daemon peer info |
 | `/api/node_topology` | Sharechain topology graph |
+| `/p2p_stats` | Per-message-type p2p wire counters + tx-pool and embedded-timestamp gauges |
+
+### `/p2p_stats`
+
+Read-only observability for the pool p2p protocol. Before it existed, none of
+the pool message types emitted anything at any verbosity, so "is this message
+type actually moving on the wire?" had no observable answer and a log-grep
+returning zero was easy to misread as "not implemented".
+
+```json
+{
+  "messages": { "shares": { "in": 412, "out": 388 }, "remember_tx": { "in": 9, "out": 14 }, "...": {} },
+  "totals": { "in": 1204, "out": 1189 },
+  "trace_enabled": false,
+  "txpool": {
+    "known_txs_size": 12043,
+    "known_txs_order_size": 12043,
+    "last_have_tx_advert_size": 500,
+    "last_losing_tx_advert_size": 0,
+    "have_tx_adverts_sent": 37,
+    "updated_at": 1785049468
+  },
+  "sharechain_timestamps": {
+    "tip_embedded_timestamp": 1785024952,
+    "tip_lag_seconds": 24516,
+    "clip_upper_bound": 39,
+    "delta_samples": 100,
+    "delta_saturated": 97,
+    "saturation_fraction": 0.97,
+    "updated_at": 1785049468
+  }
+}
+```
+
+* `messages` — one `in`/`out` pair per canonical p2pool message type, counted at
+  the two shared choke points every pool message passes through, so the numbers
+  are identical in meaning across every coin. `unknown` buckets anything that
+  did not match a known command. `verack`/`pong` belong to the coin-daemon p2p
+  layer, not the pool protocol, and read 0 on a healthy pool node — that zero is
+  an answer, not a gap.
+* `txpool` — settles whether a peer dashboard showing `TXPOOL=0` for this node
+  means the pool is genuinely empty (`known_txs_size` 0) or the advert is being
+  suppressed (`known_txs_size` > 0 with no adverts sent).
+  `known_txs_order_size` is `null` on lanes with no recency deque (DASH), which
+  is deliberately distinct from `0`.
+* `sharechain_timestamps` — `tip_lag_seconds` is wall-clock now minus the chain
+  tip's **embedded** `share_data.timestamp`; `saturation_fraction` is the share
+  of the last 100 embedded deltas pinned exactly to the clip upper bound
+  (`2*SHARE_PERIOD - 1`; 39 s on DASH). Upstream p2pool clips embedded
+  timestamps to `[prev+1, prev+2*SHARE_PERIOD-1]`, so once real cadence outruns
+  that bound the embedded clock saturates, the difficulty retarget goes blind to
+  hashrate, and the floor decays. **These two fields are the honest
+  early-warning signal; `pool_hash_rate` and `min_difficulty` are not** — under
+  saturation they are computed from that same saturated history and report floor
+  decay rather than the pool.
+
+`trace_enabled` reports the per-message debug log, which is off by default and
+is not switched on by any code path in-tree; the counters are the mechanism.
 
 ---
 

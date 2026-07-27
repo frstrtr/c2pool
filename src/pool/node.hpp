@@ -14,6 +14,7 @@
 #include <core/config.hpp>
 #include <core/random.hpp>
 #include <core/addr_store.hpp>
+#include <core/p2p_message_stats.hpp>
 
 namespace pool
 {
@@ -208,6 +209,26 @@ public:
 
     void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) override
     {
+        // RECEIVE choke point for the pool protocol: every inbound pool
+        // message in every coin lane is dispatched from here, whether it ends
+        // up in the Legacy (p2pool) or Actual (c2pool) protocol handler. The
+        // inbound counter therefore lives here and NOT in the per-coin
+        // protocol_legacy.cpp / protocol_actual.cpp files.
+        //
+        // Counted BEFORE the connection guard on purpose: a message that
+        // arrives for an already-dropped peer still crossed the wire, and
+        // hiding it would reproduce exactly the blind spot this counter set
+        // exists to close. Observe-only — relaxed fetch_add, message untouched.
+        if (rmsg)
+        {
+            auto& stats = core::obs::p2p_stats();
+            stats.count_in(rmsg->m_command);
+            if (stats.trace_enabled.load(std::memory_order_relaxed))
+                LOG_DEBUG_POOL << "[p2p-msg] in "
+                               << std::string(core::obs::trim_command(rmsg->m_command))
+                               << " <- " << service.to_string();
+        }
+
         // Guard: peer may have been removed by a prior error/timeout while
         // an async_read callback was still in-flight for the same socket.
         if (!Base::m_connections.contains(service))

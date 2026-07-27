@@ -33,6 +33,7 @@
 #include <pool/node.hpp>
 #include <pool/protocol.hpp>
 #include <pool/share_download.hpp>  // shared downloader helpers (#754)
+#include <core/p2p_message_stats.hpp>
 #include <core/reply_matcher.hpp>
 #include <core/tx_advertiser.hpp>
 #include <c2pool/storage/sharechain_storage.hpp>
@@ -187,8 +188,83 @@ protected:
         s.head_count = static_cast<int>(m_tracker.chain.get_heads().size());
         s.fork_count = s.head_count;
         s.best_share = m_best_share_hash;
-        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
-        m_snapshot = s;
+        publish_timestamp_diagnostics();
+        {
+            std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+            m_snapshot = s;
+        }
+    }
+
+    // ── /p2p_stats: embedded-timestamp health of the sharechain tip ─────────
+    //
+    // OBSERVE-ONLY. Publishes the two fields the aggregate gauges cannot give
+    // us honestly:
+    //   (a) tip_lag_seconds — wall-clock now MINUS the tip's EMBEDDED
+    //       share timestamp;
+    //   (b) ts_saturation_fraction — over the last 100 shares, the share of
+    //       embedded deltas pinned to the clip upper bound (2*SHARE_PERIOD-1,
+    //       = 39 s on DASH).
+    //
+    // Upstream p2pool clips every embedded share timestamp to
+    // [prev+1, prev+2*SHARE_PERIOD-1] (data.py:239-242). Once real cadence
+    // outruns that bound the embedded clock saturates, the retarget (which
+    // reads embedded timestamps) goes blind to hashrate, and the floor decays.
+    // pool_hash_rate / min_difficulty are computed FROM that saturated history,
+    // so they measure floor decay, not the pool — which is exactly why these
+    // two raw fields exist as the deploy criterion instead.
+    //
+    // THREADING: reads m_tracker.chain, so it MUST run under the tracker lock.
+    // Called only from publish_snapshot(), whose three call sites are the two
+    // run_think()/clean-cycle compute phases (exclusive m_tracker_mutex held)
+    // and the single-threaded LevelDB load before the compute thread starts.
+    //
+    // COST: bounded at 101 chain lookups per think cycle, no allocation beyond
+    // one 101-entry vector. Nothing here feeds validation, minting or payout.
+    void publish_timestamp_diagnostics()
+    {
+        static constexpr std::size_t SAMPLE_SHARES = 100;
+
+        std::vector<std::uint32_t> ts;
+        ts.reserve(SAMPLE_SHARES + 1);
+
+        uint256 cursor = m_best_share_hash;
+        while (ts.size() <= SAMPLE_SHARES && !cursor.IsNull()
+               && m_tracker.chain.contains(cursor))
+        {
+            std::uint32_t stamp = 0;
+            uint256 prev;
+            m_tracker.chain.get_share(cursor).invoke([&](auto* obj) {
+                stamp = obj->m_timestamp;
+                prev  = obj->m_prev_hash;
+            });
+            ts.push_back(stamp);
+            cursor = prev;
+        }
+
+        const std::uint32_t clip =
+            SharechainConfig::share_period() * 2 - 1;   // 39 s on DASH
+        const auto sat = core::obs::compute_timestamp_saturation(ts, clip);
+        const std::uint32_t tip_ts = ts.empty() ? 0u : ts.front();
+
+        auto& stats = core::obs::p2p_stats();
+        stats.tip_embedded_timestamp.store(tip_ts, std::memory_order_relaxed);
+        stats.tip_lag_seconds.store(
+            core::obs::compute_tip_lag_seconds(
+                static_cast<std::int64_t>(core::timestamp()), tip_ts),
+            std::memory_order_relaxed);
+        stats.ts_delta_samples.store(sat.samples, std::memory_order_relaxed);
+        stats.ts_delta_saturated.store(sat.saturated, std::memory_order_relaxed);
+        stats.ts_clip_upper_bound.store(clip, std::memory_order_relaxed);
+        stats.sharechain_updated_at.store(
+            static_cast<std::int64_t>(core::timestamp()), std::memory_order_relaxed);
+
+        // DELIBERATELY NOT published here: m_known_txs.size(). This body runs
+        // on the COMPUTE thread, and in the DASH lane every m_known_txs mutator
+        // is IO-thread-confined WITHOUT taking the tracker lock (see the
+        // invariant note on advertise_known_txs) — so reading the map from here
+        // would be an unsynchronised cross-thread read of a container being
+        // mutated, the exact #828 discipline this file exists to keep. The
+        // 10 s advert sweep publishes that gauge from the IO thread instead.
     }
     mutable std::mutex m_snapshot_mutex;
     TrackerSnapshot m_snapshot;
@@ -946,6 +1022,16 @@ public:
                 current.insert(entry.first);
         }
 
+        // /p2p_stats gauge: the SEND-side truth behind a peer dashboard showing
+        // TXPOOL=0 for us. If this reads 0 our pool really is empty; if it
+        // reads non-zero while peers still show 0, the advert is the problem,
+        // not the pool. (DASH has no m_known_txs_order recency deque — the
+        // sidecar stays at its -1 "not present in this lane" sentinel.)
+        core::obs::p2p_stats().known_txs_size.store(
+            current.size(), std::memory_order_relaxed);
+        core::obs::p2p_stats().known_txs_updated_at.store(
+            static_cast<std::int64_t>(core::timestamp()), std::memory_order_relaxed);
+
         // One clock reading for the whole sweep: run_tx_advert uses it both to
         // apply the per-peer min-emit interval (never two writes in flight on
         // one socket) and to stamp the peer after a send. IO-thread-local, so
@@ -959,9 +1045,22 @@ public:
             core::run_tx_advert(
                 p->m_tx_advert, current,
                 [&p](const std::vector<uint256>& hashes)
-                { p->write(dash::message_have_tx::make_raw(hashes)); },
+                {
+                    // /p2p_stats: size of the LAST have_tx advert actually put
+                    // on the wire, plus how many we have emitted. A pool with
+                    // known_txs_size > 0 but have_tx_adverts_sent == 0 is a
+                    // suppressed advert; both zero is a genuinely empty pool.
+                    auto& stats = core::obs::p2p_stats();
+                    stats.last_have_tx_advert_size.store(hashes.size(), std::memory_order_relaxed);
+                    stats.have_tx_adverts_sent.fetch_add(1, std::memory_order_relaxed);
+                    p->write(dash::message_have_tx::make_raw(hashes));
+                },
                 [&p](const std::vector<uint256>& hashes)
-                { p->write(dash::message_losing_tx::make_raw(hashes)); },
+                {
+                    core::obs::p2p_stats().last_losing_tx_advert_size.store(
+                        hashes.size(), std::memory_order_relaxed);
+                    p->write(dash::message_losing_tx::make_raw(hashes));
+                },
                 core::TX_ADVERT_MAX_HASHES_PER_MESSAGE, now);
         };
 

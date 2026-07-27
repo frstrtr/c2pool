@@ -1645,6 +1645,17 @@ void NodeImpl::prune_shares(const uint256& /*best_share*/)
     // Evict oldest-first down to the cap, keeping the most-recently-learned txs.
     if (m_known_txs.size() > m_max_known_txs)
         core::evict_known_txs_to_cap(m_known_txs, m_known_txs_order, m_max_known_txs);
+
+    // /p2p_stats gauges (observe-only): the SEND-side truth behind a peer
+    // dashboard reporting TXPOOL=0 for us. Published here because prune_shares
+    // is the periodic pass that already touches both containers. Relaxed
+    // stores, no lock, no consensus/mint/payout state read or written.
+    core::obs::p2p_stats().known_txs_size.store(
+        m_known_txs.size(), std::memory_order_relaxed);
+    core::obs::p2p_stats().known_txs_order_size.store(
+        static_cast<std::int64_t>(m_known_txs_order.size()), std::memory_order_relaxed);
+    core::obs::p2p_stats().known_txs_updated_at.store(
+        static_cast<std::int64_t>(core::timestamp()), std::memory_order_relaxed);
     if (m_raw_share_cache.size() > m_max_raw_shares)
         m_raw_share_cache.clear();
 }
