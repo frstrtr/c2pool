@@ -16,6 +16,11 @@ if(MSVC)
     # toolchain does not guarantee CMake's default /EHsc, so set it explicitly
     # for every MSVC target — the coin binaries and the CI boost_sentinel alike.
     add_compile_options(/EHsc)
+    # /bigobj: main_dash.cpp -- and other coin main_*.cpp as template
+    # instantiation grows -- exceeds MSVC's 65,279-section object limit
+    # and fails C1128. /bigobj raises the cap; it is link-compatible and
+    # has no runtime cost, so apply it to every MSVC target.
+    add_compile_options(/bigobj)
 endif()
 
 # Handle CMake 3.30+ policy for FindBoost removal
