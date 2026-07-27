@@ -722,9 +722,11 @@ std::vector<uint256> NodeImpl::send_shares(peer_ptr peer,
             shares, m_known_txs, [](ShareType& share) {
                 std::vector<uint256> hashes;
                 share.invoke([&](auto* obj) {
-                    if constexpr (requires { obj->m_new_transaction_hashes; })
-                        hashes.assign(obj->m_new_transaction_hashes.begin(),
-                                      obj->m_new_transaction_hashes.end());
+                    // #880: route through the dgb::append_share_tx_refs SSOT
+                    // (#914) instead of the dead flat probe -- the refs live in
+                    // m_tx_info on v17/v33, absent v34+. The old probe was FALSE
+                    // for every version, so this F3 gate never withheld a share.
+                    dgb::append_share_tx_refs(obj, hashes);
                 });
                 return hashes;
             });

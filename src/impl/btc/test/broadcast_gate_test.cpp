@@ -33,10 +33,13 @@
 
 #include <map>
 #include <set>
+#include <utility>
 #include <vector>
 
 #include <core/uint256.hpp>
 #include <impl/btc/known_txs_retention.hpp>
+#include <impl/btc/share.hpp>          // real btc share variants + ShareType
+#include <impl/btc/share_tx_refs.hpp>  // btc::new_tx_hashes SSOT (#880)
 
 namespace {
 
@@ -205,4 +208,106 @@ TEST(BtcBroadcastMarking, WalkStrandedWhenMarkedBeforeSend)
         EXPECT_EQ(marked.size(), 2u);
         EXPECT_TRUE(walk(chain, marked).empty());   // now correctly de-duped
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// #880 REGRESSION: the F3 gate above must be driven by the PRODUCTION probe,
+// not a hand-rolled stand-in. The FakeShare KATs exercise partition_backable's
+// MECHANICS with a top-level new_txs member and a bespoke refs_of -- exactly
+// the shape that let the real bug hide. In production send_shares probed
+// `requires { obj->m_new_transaction_hashes; }`, which is FALSE for every BTC
+// share variant (the list is nested in m_tx_info), so the gate collected empty
+// refs, every share was vacuously backable, and the gate silently no-op'd for
+// ALL versions -- a share referencing a tx the peer lacked was broadcast anyway
+// and tripped the canonical "referenced unknown transaction" disconnect.
+//
+// These KATs build REAL btc share types and drive them through the SAME
+// btc::new_tx_hashes SSOT that node.cpp's partition_backable refs_of now uses.
+// FAILS-BEFORE: revert btc::new_tx_hashes (or the gate) to the flat probe and
+// the v17/v33 expectations collapse -- the unbacked share is no longer withheld.
+// ---------------------------------------------------------------------------
+namespace {
+
+// The exact refs_of node.cpp installs on partition_backable: route the variant
+// through the btc::new_tx_hashes SSOT.
+std::vector<uint256> production_refs_of(btc::ShareType& share)
+{
+    std::vector<uint256> hashes;
+    share.invoke([&](auto* obj) {
+        if (const auto* new_txs = btc::new_tx_hashes(obj))
+            hashes.assign(new_txs->begin(), new_txs->end());
+    });
+    return hashes;
+}
+
+} // namespace
+
+// Accessor SSOT: a REAL v17 share nests its new-tx hashes in m_tx_info; the
+// production probe must surface them (the dead flat probe returned nullptr).
+TEST(BtcBroadcastGate, RealV17ShareRefsResolvedViaSsot)
+{
+    btc::Share s;
+    s.m_tx_info.m_new_transaction_hashes = {TA, TC};
+
+    const auto* refs = btc::new_tx_hashes(&s);
+    ASSERT_NE(refs, nullptr);
+    ASSERT_EQ(refs->size(), 2u);          // dead flat probe -> nullptr
+    EXPECT_EQ((*refs)[0], TA);
+    EXPECT_EQ((*refs)[1], TC);
+}
+
+// Accessor SSOT: v33 uses the same nested carrier.
+TEST(BtcBroadcastGate, RealV33ShareRefsResolvedViaSsot)
+{
+    btc::NewShare s;
+    s.m_tx_info.m_new_transaction_hashes = {TC};
+
+    const auto* refs = btc::new_tx_hashes(&s);
+    ASSERT_NE(refs, nullptr);
+    ASSERT_EQ(refs->size(), 1u);
+    EXPECT_EQ((*refs)[0], TC);
+}
+
+// Accessor SSOT: v34/v35/v36 carry no m_tx_info -> nullptr, compiled out.
+TEST(BtcBroadcastGate, SegwitAndMergedVariantsHaveNoRefs)
+{
+    btc::SegwitMiningShare v34;
+    btc::PaddingBugfixShare v35;
+    btc::MergedMiningShare v36;
+    EXPECT_EQ(btc::new_tx_hashes(&v34), nullptr);
+    EXPECT_EQ(btc::new_tx_hashes(&v35), nullptr);
+    EXPECT_EQ(btc::new_tx_hashes(&v36), nullptr);
+}
+
+// The gate end-to-end: REAL share variants + the production refs_of through
+// btc::partition_backable. A v17 share referencing a tx whose bytes we do NOT
+// hold must be withheld; the backable ones survive, in order. Pre-fix the dead
+// probe made every share vacuously backable -> skipped==0, nothing withheld.
+TEST(BtcBroadcastGate, RealShareTxInfoRefsWithheld)
+{
+    std::vector<btc::Share*> raws;   // own the heap shares for cleanup
+    auto v17 = [&](std::vector<uint256> refs) {
+        auto* raw = new btc::Share();
+        raw->m_tx_info.m_new_transaction_hashes = std::move(refs);
+        raws.push_back(raw);
+        btc::ShareType sv; sv = raw; return sv;
+    };
+
+    const std::set<uint256> held{TA, TB};   // TC bytes NOT held
+
+    std::vector<btc::ShareType> batch;
+    batch.push_back(v17({TA}));        // backable
+    batch.push_back(v17({TC}));        // references unheld TC -> withheld
+    batch.push_back(v17({TA, TB}));    // backable
+
+    const std::size_t skipped =
+        btc::partition_backable(batch, held, production_refs_of);
+
+    EXPECT_EQ(skipped, 1u);            // dead-probe regression -> 0
+    ASSERT_EQ(batch.size(), 2u);
+    EXPECT_EQ(production_refs_of(batch[0]).front(), TA);   // order preserved
+    EXPECT_EQ(production_refs_of(batch[1]).front(), TA);
+
+    for (auto* raw : raws) delete raw;
 }

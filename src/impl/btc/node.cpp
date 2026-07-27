@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "node.hpp"
 #include "known_txs_retention.hpp"      // F3 retain_template_txs + select_backable_shares
+#include "share_tx_refs.hpp"          // btc::new_tx_hashes -- uniform gate probe (#880)
 #include "coin/template_other_txs.hpp"  // deserialize_template_other_txs (GBT data[] -> MutableTransaction)
 
 #include <core/common.hpp>
@@ -787,9 +788,13 @@ std::vector<uint256> NodeImpl::send_shares(peer_ptr peer, const std::vector<uint
             shares, m_known_txs, [](ShareType& share) {
                 std::vector<uint256> hashes;
                 share.invoke([&](auto* obj) {
-                    if constexpr (requires { obj->m_new_transaction_hashes; })
-                        hashes.assign(obj->m_new_transaction_hashes.begin(),
-                                      obj->m_new_transaction_hashes.end());
+                    // #880: route through the btc::new_tx_hashes SSOT instead
+                    // of the dead flat probe -- v17/v33 nest the list in
+                    // m_tx_info, v34+ carry none. The old probe was FALSE for
+                    // every variant, so this F3 gate saw empty refs -> every
+                    // share vacuously backable -> the gate no-op'd all versions.
+                    if (const auto* new_txs = btc::new_tx_hashes(obj))
+                        hashes.assign(new_txs->begin(), new_txs->end());
                 });
                 return hashes;
             });
