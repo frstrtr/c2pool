@@ -2296,9 +2296,9 @@
                             <div class="legend-swatch" style="background:#28a745;border:2px solid #ffd700;box-shadow:0 0 3px rgba(255,215,0,0.5)"></div>
                             <span style="color:#0070dd;font-weight:600">LTC block</span>
                         </div>
-                        <div class="legend-item">
+                        <div class="legend-item merged-child-hint">
                             <div class="legend-swatch" style="background:#28a745;border:2px solid #00e5ff"></div>
-                            <span style="color:#a335ee;font-weight:600">DOGE block</span>
+                            <span style="color:#a335ee;font-weight:600"><span class="merged-child-symbol-hint">DOGE</span> block</span>
                         </div>
                         <div class="legend-item">
                             <div class="legend-swatch" style="background:linear-gradient(135deg,#ff8000,#cc6600);border:2px solid #ffaa00;box-shadow:0 0 6px rgba(255,128,0,0.5)"></div>
@@ -2636,7 +2636,7 @@
                             .attr('style', 'font-size: 0.7rem; color: #c3a634; margin-top: 2px; margin-left: 20px;');
                         mergedDiv.append('span').text('🐕 ');
                         mergedDiv.append('a')
-                            .attr('href', 'https://blockchair.com/dogecoin/address/' + encodeURIComponent(miner.mergedAddress))
+                            .attr('href', ((typeof currency_info!=="undefined" && currency_info.merged_child_address_explorer_url_prefix) || 'https://blockchair.com/dogecoin/address/') + encodeURIComponent(miner.mergedAddress))
                             .attr('target', '_blank')
                             .attr('onclick', 'event.stopPropagation()')
                             .attr('style', 'color: #c3a634; text-decoration: none;')
@@ -4386,12 +4386,18 @@
         }
         
         function getMergedExplorerUrl(symbol, address) {
-            // Block explorers for merged mining chains
-            var explorers = {
-                'tDOGE': 'https://blockchair.com/dogecoin/address/',
-                'DOGE': 'https://blockchair.com/dogecoin/address/',
-            };
-            var prefix = explorers[symbol] || '#';
+            // Merged-chain address explorer: prefer the topology-sourced prefix
+            // from currency_info (per-node truthful, never hardcoded); fall back
+            // to a static map only when the backend supplied none.
+            var ci = (typeof currency_info !== 'undefined') ? currency_info : {};
+            var prefix = ci.merged_child_address_explorer_url_prefix;
+            if (!prefix) {
+                var explorers = {
+                    'tDOGE': 'https://blockchair.com/dogecoin/address/',
+                    'DOGE': 'https://blockchair.com/dogecoin/address/',
+                };
+                prefix = explorers[symbol] || '#';
+            }
             return prefix + address;
         }
         

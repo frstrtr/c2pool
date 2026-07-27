@@ -4014,6 +4014,11 @@ nlohmann::json MiningInterface::rest_web_currency_info()
         // coins (DASH/BTC/DGB) set NO merged child -> field absent -> parent-
         // only instructions. Never advertise a merged child a coin lacks.
         result["merged_child_symbol"] = "DOGE";
+        // Companion to merged_child_symbol: the child chain's address-explorer
+        // prefix, so the dashboard links merged (DOGE) payout addresses through
+        // currency_info instead of a hardcoded blockchair URL. Absent on
+        // standalone coins -> no merged link rendered.
+        result["merged_child_address_explorer_url_prefix"] = "https://blockchair.com/dogecoin/address/";
         result["block_period"] = 150;  // 2.5 min average
         if (!m_custom_address_explorer.empty()) {
             result["address_explorer_url_prefix"] = m_custom_address_explorer;
