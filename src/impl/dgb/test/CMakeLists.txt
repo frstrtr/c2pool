@@ -17,6 +17,22 @@ if (BUILD_TESTING AND GTest_FOUND)
     include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
     gtest_add_tests(dgb_share_test "" AUTO)
 
+    # --- #905 tx-relay dead-probe regression (port of btc #880) ------------
+    # Pins coin/share_tx_relay_refs.hpp: append_share_tx_refs, the SSOT
+    # send_shares() uses to collect a share's referenced new-tx hashes for
+    # remember_tx relay. Guards against the top-level m_new_transaction_hashes
+    # probe that matched no dgb share type (always-false -> silently dead relay
+    # for every version). Links the dgb OBJECT lib like dgb_share_test (pulls
+    # share.hpp share codec). MUST appear in BOTH this registration AND the
+    # build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_share_tx_relay_refs_test share_tx_relay_refs_test.cpp)
+    target_link_libraries(dgb_share_tx_relay_refs_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_share_tx_relay_refs_test "" AUTO)
+
     # --- #82 broadcaster-gate: faithful as_block FRAMING -----------------------
     # Pins coin/block_assembly.hpp (share->block reassembly: merkle_root
     # reconstruction from the gentx hash + the share`s merkle_link, then
