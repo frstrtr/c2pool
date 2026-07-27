@@ -4009,6 +4009,11 @@ nlohmann::json MiningInterface::rest_web_currency_info()
     case Blockchain::LITECOIN:
         result["symbol"] = "LTC";
         result["name"] = "Litecoin";
+        // LTC parent merge-mines DOGE across the fleet; expose the child so
+        // the dashboard renders the merged worker-username format. Standalone
+        // coins (DASH/BTC/DGB) set NO merged child -> field absent -> parent-
+        // only instructions. Never advertise a merged child a coin lacks.
+        result["merged_child_symbol"] = "DOGE";
         result["block_period"] = 150;  // 2.5 min average
         if (!m_custom_address_explorer.empty()) {
             result["address_explorer_url_prefix"] = m_custom_address_explorer;
