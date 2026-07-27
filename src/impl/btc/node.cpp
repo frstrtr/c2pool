@@ -948,6 +948,9 @@ std::vector<uint256> NodeImpl::send_shares(peer_ptr peer, const std::vector<uint
 
 void NodeImpl::broadcast_share(const uint256& share_hash)
 {
+    if (share_hash.IsNull())
+        return;
+
     // try_to_lock per the architectural rule (node.hpp:67) — see freeze
     // analysis in handle_get_share above.  If think+clean holds the
     // exclusive lock right now, defer this broadcast: the share is still
@@ -958,13 +961,39 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
     std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::try_to_lock);
     if (!lock.owns_lock())
     {
+        const uint64_t deferred =
+            m_broadcast_deferred.fetch_add(1, std::memory_order_relaxed) + 1;
         static int defer_log = 0;
         if (defer_log++ % 50 == 0)
             LOG_INFO << "[broadcast_share] tracker busy — deferring broadcast of "
                      << share_hash.GetHex().substr(0, 16)
                      << " (next cycle will pick it up)";
+        // A long run of deferrals with ZERO successes is not contention — it
+        // is a caller holding m_tracker_mutex EXCLUSIVELY across this call on
+        // this thread, which can never grant a shared lock, so the node
+        // silently broadcasts nothing at all. Say so loudly and once.
+        if (deferred >= 20 && m_broadcast_acquired.load(std::memory_order_relaxed) == 0) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                LOG_WARNING << "[broadcast_share] " << deferred << " consecutive"
+                            << " deferrals with ZERO successful acquisitions — a"
+                               " caller is almost certainly holding the tracker"
+                               " mutex EXCLUSIVELY across this call, which can"
+                               " never grant a shared lock. NO SHARE IS BEING"
+                               " BROADCAST. Drop that lock before calling"
+                               " broadcast_share (main_btc create_share_fn does).";
+            }
+        }
         return;
     }
+    m_broadcast_acquired.fetch_add(1, std::memory_order_relaxed);
+
+    // The share may have been pruned between mint and here; get_height /
+    // get_chain on an absent hash is not a defined query, so bail rather
+    // than walk garbage (mirrors the ltc guard).
+    if (!m_chain || !m_chain->contains(share_hash))
+        return;
 
     // Walk the chain back from share_hash, collecting un-broadcast shares.
     //
@@ -989,6 +1018,12 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
 
     if (to_send.empty())
         return;
+
+    // The walk produced a non-empty batch and we hold the shared lock: the
+    // per-peer send loop (F3 gate + send_shares + F2 mark) is now entered.
+    // This is the count that stays at ZERO if a caller holds the exclusive
+    // lock across the call.
+    m_broadcast_reached_send.fetch_add(1, std::memory_order_relaxed);
 
     auto now = std::chrono::steady_clock::now();
     broadcast_and_mark(m_shared_share_hashes, m_peers, to_send, [&](peer_ptr& peer) {
