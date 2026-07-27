@@ -11,6 +11,7 @@
 #include <impl/dgb/pool_efficiency.hpp>
 #include <impl/dgb/expected_time_to_block.hpp>
 #include <impl/dgb/coin/binomial_conf_interval.hpp>
+#include <impl/dgb/coin/share_tx_relay_refs.hpp>  // SSOT: per-share new-tx-ref probe (#905)
 
 #include <algorithm>
 #include <filesystem>
@@ -694,19 +695,23 @@ void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hash
     if (shares.empty())
         return;
 
-    // Collect transactions that the peer doesn't know about
+    // Collect transactions that the peer doesn't know about. A share's
+    // referenced new-tx hashes live INSIDE m_tx_info (dgb::ShareTxInfo) on
+    // v17/v33 and are absent on v34/v35/v36. The pre-fix probe named a
+    // top-level m_new_transaction_hashes NO dgb share type declares, so it was
+    // ALWAYS false and this relay block was silently dead for every version.
+    // append_share_tx_refs is the SSOT that guards on m_tx_info (#905).
     std::set<uint256> needed_txs;
     for (auto& share : shares)
     {
         share.invoke([&](auto* obj) {
-            if constexpr (requires { obj->m_new_transaction_hashes; })
+            std::vector<uint256> refs;
+            dgb::append_share_tx_refs(obj, refs);
+            for (const auto& th : refs)
             {
-                for (const auto& th : obj->m_new_transaction_hashes)
-                {
-                    if (!peer->m_remote_txs.count(th) &&
-                        !peer->m_remembered_txs.count(th))
-                        needed_txs.insert(th);
-                }
+                if (!peer->m_remote_txs.count(th) &&
+                    !peer->m_remembered_txs.count(th))
+                    needed_txs.insert(th);
             }
         });
     }
