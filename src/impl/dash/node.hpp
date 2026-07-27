@@ -743,6 +743,31 @@ public:
         // consensus/mint state touched.
         peer->write(dash::message_getaddrs::make_raw(8));
 
+        // #882 — ORIGINATE addrme. Canonical p2p.py:109-134 sendAdvertisement():
+        // a listening node with no configured external IP asks the peer to
+        // advertise back what IT believes our address to be, carrying our listen
+        // port as the only thing the peer cannot observe for itself. Port of the
+        // ltc reference (src/impl/ltc/node.cpp:343-348; btc node.cpp:344-348,
+        // bch node.cpp:342-346, dgb node.cpp:349-353). DASH registered the
+        // handler on both generations (node.hpp:1272 Legacy / 1291 Actual) but
+        // nothing in the lane ever WROTE one, so a DASH peer could only ever
+        // learn our listen port second-hand from someone else's addrs gossip.
+        // Discovery only; no consensus/mint state touched.
+        //
+        // GUARDED, unlike the ltc/btc port. Canonical gates the whole
+        // advertisement on `if self.node.serverfactory.listen_port is not None`
+        // (p2p.py:110), and DASH has a real non-listening mode: `--connect`
+        // without `--listen` suppresses the inbound listener
+        // (src/c2pool/main_dash.cpp:566). core::Server::listen_port() reads
+        // m_acceptor->local_endpoint() unconditionally, which throws on an
+        // acceptor that was never opened — and a throw out of handle_version
+        // makes the bridge drop the connection, so an unguarded read would break
+        // --connect mode outright. listen_port_or_none() is canonical's
+        // `is not None` test; when we are not listening we advertise nothing,
+        // exactly as canonical does.
+        if (auto our_listen_port = core::Server::listen_port_or_none())
+            peer->write(dash::message_addrme::make_raw(*our_listen_port));
+
         // Canonical p2p.py:276 — one FULL have_tx as soon as the handshake
         // completes, so the peer's view of our tx pool starts correct (and its
         // dashboard stops showing us as txpool = 0). Subsequent sweeps send
