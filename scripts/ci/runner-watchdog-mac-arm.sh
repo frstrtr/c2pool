@@ -67,27 +67,60 @@ log "status=${status} consecutive_fails=${fails}/${THRESHOLD}"
 [ "$fails" -lt "$THRESHOLD" ] && exit 0
 
 log "threshold reached -> re-registering"
-TOKEN=$(gh api --method POST "repos/${REPO}/actions/runners/registration-token" --jq .token)
-[ -z "$TOKEN" ] && { log "ERROR: empty registration token"; exit 1; }
+REG_TOKEN=$(gh api --method POST "repos/${REPO}/actions/runners/registration-token" --jq .token)
+[ -z "$REG_TOKEN" ] && { log "ERROR: empty registration token"; exit 1; }
+# Removal token deregisters the stale server-side registration + wipes local
+# config so a clean re-register succeeds. Best-effort: if GitHub already
+# dropped the runner ("absent"), remove is a no-op and we fall back to
+# wiping the local config files directly.
+RM_TOKEN=$(gh api --method POST "repos/${REPO}/actions/runners/remove-token" --jq .token 2>/dev/null || true)
 
-# The launchd service must be UNINSTALLED (not merely stopped) before
-# config.sh will reconfigure: with the service still installed, both
-# `config.sh remove` and `config.sh --replace` abort ("Uninstall service
-# first" / "already configured"). So: stop -> uninstall -> --replace
-# (reuses the same name/registration, no separate remove needed) ->
-# reinstall the service -> start. All idempotent; no runner delete.
-ssh -i "$NODE_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no "$NODE_SSH" bash -s <<EOF
+# macOS runner service management is more involved than the Intel sibling's
+# original 5-liner assumed (that flow was never drop-tested). Two facts,
+# both confirmed by an actual .227 drop test 2026-07-27:
+#   (a) The runner's launchd LaunchAgent lives in the user's *GUI* (Aqua)
+#       domain. Over a non-GUI SSH session `svc.sh install/uninstall`
+#       (plain `launchctl load/unload`) fail with "Unload failed: 5:
+#       Input/output error". The agent must be managed with an explicit
+#       `launchctl bootout|bootstrap gui/$UID ...` target.
+#   (b) `config.sh --replace` does NOT bypass the local "already configured"
+#       guard; a real `config.sh remove` (or wiping .runner/.credentials)
+#       must precede a fresh `config.sh` configure.
+# Sequence: bootout+uninstall service -> unconfigure -> fresh configure ->
+# install + bootstrap+kickstart into the GUI domain. Non-destructive: no
+# runner is deleted beyond its own re-registration under the same name.
+ssh -i "$NODE_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no "$NODE_SSH" \
+  REG_TOKEN="$REG_TOKEN" RM_TOKEN="$RM_TOKEN" REPO="$REPO" \
+  RUNNER_NAME="$RUNNER_NAME" RUNNER_LABELS="$RUNNER_LABELS" RUNNER_DIR="$RUNNER_DIR" \
+  bash -s <<'EOF'
 set -e
-cd "${RUNNER_DIR}"
-./svc.sh stop || true
-./svc.sh uninstall || true
-./config.sh --unattended --replace \
+cd "$RUNNER_DIR"
+U=$(id -u)
+LABEL="actions.runner.$(echo "$REPO" | tr '/' '-').${RUNNER_NAME}"
+PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+
+# 1) stop + uninstall the LaunchAgent from the GUI domain
+launchctl bootout "gui/${U}/${LABEL}" 2>/dev/null || true
+./svc.sh uninstall 2>/dev/null || true
+
+# 2) unconfigure (deregister + wipe local config); fall back to wiping files
+if [ -n "$RM_TOKEN" ]; then
+  ./config.sh remove --token "$RM_TOKEN" || rm -f .runner .credentials .credentials_rsaparams
+else
+  rm -f .runner .credentials .credentials_rsaparams
+fi
+
+# 3) fresh register under the same name + labels
+./config.sh --unattended \
   --url "https://github.com/${REPO}" \
-  --token "${TOKEN}" \
-  --name "${RUNNER_NAME}" \
-  --labels "${RUNNER_LABELS}"
+  --token "$REG_TOKEN" \
+  --name "$RUNNER_NAME" \
+  --labels "$RUNNER_LABELS"
+
+# 4) (re)install + load the service into the GUI domain
 ./svc.sh install
-./svc.sh start
+launchctl bootstrap "gui/${U}" "$PLIST" 2>/dev/null || true
+launchctl kickstart -k "gui/${U}/${LABEL}"
 EOF
 
 log "re-registration issued; clearing fail counter"
