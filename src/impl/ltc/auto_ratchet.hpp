@@ -32,6 +32,7 @@
 #include <chrono>
 #include <cstdint>
 #include <fstream>
+#include <set>
 #include <string>
 
 namespace ltc
@@ -62,6 +63,14 @@ public:
     static constexpr int DEACTIVATION_THRESHOLD = 50;  // % below which to revert
     static constexpr int CONFIRMATION_MULTIPLIER = 2;  // confirm after 2x CHAIN_LENGTH
     static constexpr int SWITCH_THRESHOLD = 60;        // % required for format switch in validation
+    // Mode-2 self-vote guard (07-28): minimum number of DISTINCT non-self
+    // share authors whose YES-votes must back a 95% window before the ratchet
+    // may ACTIVATE. Closes the second false-activation mode — a pool mining
+    // ALONE driving its own desired_version to 95% and ratcheting itself into
+    // V36 with zero external consent. 1 = "at least one externally-originated
+    // yes-vote": the tightest bar that still permits the intended 2-node prod
+    // crossing (voidbind + G2 dest), while rejecting a 100%-self window.
+    static constexpr int MIN_DISTINCT_NONSELF_AUTHORS = 1;
 
     explicit AutoRatchet(const std::string& state_file_path = "",
                          int64_t target_version = 36)
@@ -107,13 +116,26 @@ public:
         int32_t target_shares = 0;  // shares actually IN target format
         int32_t total = 0;
 
+        // Mode-2 self-vote guard: distinct NON-SELF origins among the YES-votes
+        // in the activation window. "self" reuses node.cpp's canonical is_local
+        // test — a locally minted share carries peer_addr == NetService{"0.0.0.0",0}
+        // or the default NetService{}; a network share carries the relaying peer.
+        // peer_addr is transient reception metadata, NOT part of the share hash,
+        // so reading it here is consensus-neutral (see the ACTIVATE branch note).
+        std::set<NetService> nonself_voting_authors;
+
         auto chain_view = tracker.chain.get_chain(best_share_hash, sample);
         for (auto [hash, data] : chain_view)
         {
             ++total;
             data.share.invoke([&](auto* obj) {
-                if (static_cast<int64_t>(obj->m_desired_version) >= target_version_)
+                if (static_cast<int64_t>(obj->m_desired_version) >= target_version_) {
                     ++target_votes;
+                    const bool is_local = (obj->peer_addr == NetService{"0.0.0.0", 0} ||
+                                           obj->peer_addr == NetService{});
+                    if (!is_local)
+                        nonself_voting_authors.insert(obj->peer_addr);
+                }
                 if (static_cast<int64_t>(std::remove_pointer_t<decltype(obj)>::version) >= target_version_)
                     ++target_shares;
             });
@@ -170,12 +192,45 @@ public:
                 // Canonical: counts.get(VERSION,0) < sum(counts)*60//100
                 bool tail_ok = !(tail_target * uint32_t(100) < tail_total * uint32_t(SWITCH_THRESHOLD));
 
+                // --- Mode-2 self-vote guard (07-28) ------------------------
+                // Refuse to ACTIVATE on a self-authored window. The 07-14 guard
+                // closed mode 1 (absence counted as a vote); this closes mode 2:
+                // a pool mining ALONE can drive its own desired_version to 95%
+                // and ratchet itself into V36 with ZERO external consent (the
+                // contabo "72.25% on a ~100%-self window" incident). Require the
+                // 95% YES-votes to originate from >= MIN_DISTINCT_NONSELF_AUTHORS
+                // distinct non-self peers.
+                //
+                // CONSENSUS-NEUTRAL: reads peer_addr (transient reception
+                // metadata, never serialized into the share hash) and only gates
+                // when THIS node starts MINTING V36. The accept/validity path
+                // keys v36_active off the share's OWN version
+                // (share_check.hpp: v36_active = (share_ver >= 36)), NOT the
+                // ratchet state — so a stricter activation can only DELAY our own
+                // mint, never change the validity or work of any existing share.
+                //
+                // FAIL-SAFE: after a restart mid-VOTING, reconstructed shares may
+                // carry an empty peer_addr and transiently understate external
+                // authors — that DELAYS activation, never causes a false one.
+                const int distinct_nonself_authors = static_cast<int>(nonself_voting_authors.size());
+                const bool multi_party = distinct_nonself_authors >= MIN_DISTINCT_NONSELF_AUTHORS;
+
                 if (!tail_ok) {
                     static int tail_log = 0;
                     if (tail_log++ % 20 == 0)
                         LOG_INFO << "[AutoRatchet] VOTING: full window " << vote_pct
                                  << "% >= " << ACTIVATION_THRESHOLD << "% but oldest 10% work-weighted V"
                                  << target_version_ << " desire < " << SWITCH_THRESHOLD << "%) — waiting";
+                    // Don't transition yet
+                }
+                else if (!multi_party) {
+                    static int self_log = 0;
+                    if (self_log++ % 20 == 0)
+                        LOG_INFO << "[AutoRatchet] VOTING: full window " << vote_pct
+                                 << "% >= " << ACTIVATION_THRESHOLD << "% but only "
+                                 << distinct_nonself_authors << " distinct non-self author(s) < "
+                                 << MIN_DISTINCT_NONSELF_AUTHORS
+                                 << " — self-authored window, refusing activation (mode-2 guard)";
                     // Don't transition yet
                 }
                 else
