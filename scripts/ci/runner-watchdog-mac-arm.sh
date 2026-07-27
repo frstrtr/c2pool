@@ -70,16 +70,23 @@ log "threshold reached -> re-registering"
 TOKEN=$(gh api --method POST "repos/${REPO}/actions/runners/registration-token" --jq .token)
 [ -z "$TOKEN" ] && { log "ERROR: empty registration token"; exit 1; }
 
+# The launchd service must be UNINSTALLED (not merely stopped) before
+# config.sh will reconfigure: with the service still installed, both
+# `config.sh remove` and `config.sh --replace` abort ("Uninstall service
+# first" / "already configured"). So: stop -> uninstall -> --replace
+# (reuses the same name/registration, no separate remove needed) ->
+# reinstall the service -> start. All idempotent; no runner delete.
 ssh -i "$NODE_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no "$NODE_SSH" bash -s <<EOF
 set -e
 cd "${RUNNER_DIR}"
 ./svc.sh stop || true
-./config.sh remove --token "${TOKEN}" || true
+./svc.sh uninstall || true
 ./config.sh --unattended --replace \
   --url "https://github.com/${REPO}" \
   --token "${TOKEN}" \
   --name "${RUNNER_NAME}" \
   --labels "${RUNNER_LABELS}"
+./svc.sh install
 ./svc.sh start
 EOF
 
