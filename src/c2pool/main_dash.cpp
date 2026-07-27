@@ -1321,6 +1321,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             }
             coin_peer_mgr->set_dns_seeds(dash::coin::dash_dns_seeds(testnet));
             coin_peer_mgr->set_fixed_seeds(dash::coin::dash_fixed_seeds(testnet));
+            // HTTP peer fallback: when DNS + fixed seeds are exhausted, query
+            // known c2pool nodes via GET /api/coin_peers for peer addresses —
+            // the third and last bootstrap tier. Mirrors main_ltc.cpp:1875.
+            coin_peer_mgr->set_http_peer_seeds({{"voidbind.com", 8080}});
 
             // ── ACTIVE daemon-disjointness (connect+discover / oracle-shadow) ──
             // When a local dashd RPC is armed, feed its getpeerinfo so the
