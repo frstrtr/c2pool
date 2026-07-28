@@ -88,9 +88,12 @@ target_link_libraries(c2pool_node_enhanced INTERFACE
     nlohmann_json::nlohmann_json
 )
 
-# Inject version from git at build time
+# Inject version from git at build time. --dirty so a tag-exact but locally-
+# modified rebuild does not share a version string with the clean tag build
+# (the embedded oracle-shadow ledger keys its clean streak on this — a dirty
+# dev build must not inherit a tag-exact binary's graduation streak).
 execute_process(
-    COMMAND git describe --tags --always
+    COMMAND git describe --tags --always --dirty
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     OUTPUT_VARIABLE C2POOL_GIT_VERSION
     OUTPUT_STRIP_TRAILING_WHITESPACE

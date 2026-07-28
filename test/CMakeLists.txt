@@ -644,20 +644,23 @@ if (BUILD_TESTING AND GTest_FOUND)
     # core (links core for script_to_address in address_utils.cpp). Last S7
     # capstone; node-backed end-to-end parity deferred to a live-harness leaf.
     #
-    # CI-fold (build.yml "Build tests" allowlists this target but not the two
-    # byte-parity executables): the real-dashd CbTx byte-parity + from-wire
-    # merkle-root parity proofs are COMPILED INTO this already-built+CI-run
-    # executable (their TEST() suites are distinct: DashEmbeddedCbtxByteParity,
-    # DashMnlistdiffRootParity), so they actually run in CI. Do NOT re-add
-    # standalone add_executable/gtest_add_tests for them — CTest would register
-    # unbuilt executables (ctest "Not Run" exit 8, the Linux x86_64 red).
+    # CI-fold (build.yml "Build tests" allowlists this target but not the extra
+    # byte-parity/oracle-shadow executables): the real-dashd CbTx byte-parity +
+    # from-wire merkle-root parity proofs AND the embedded oracle-shadow
+    # validator KATs are COMPILED INTO this already-built+CI-run executable
+    # (distinct TEST() suites), so they actually run in CI. The oracle-shadow
+    # fold also avoids a new build.yml --target (push bot lacks `workflow` scope
+    # -> a standalone target would be a NOT_BUILT sentinel). Do NOT re-add
+    # standalone add_executable/gtest_add_tests for any of them — CTest would
+    # register unbuilt executables (ctest "Not Run" exit 8, the Linux x86_64 red).
     # DASH_FIXTURE_DIR is needed by the from-wire fixture loader (mnlistdiff).
     add_executable(test_dash_embedded_gbt
         test_dash_embedded_gbt.cpp
         test_dash_embedded_cbtx_byte_parity.cpp
         test_dash_mnlistdiff_root_parity.cpp
         test_dash_dkg_commitments.cpp
-        test_dash_sml_quorum_db.cpp)
+        test_dash_sml_quorum_db.cpp
+        test_dash_embedded_oracle_shadow.cpp)
     target_compile_definitions(test_dash_embedded_gbt PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_embedded_gbt PRIVATE

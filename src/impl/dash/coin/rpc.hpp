@@ -157,6 +157,11 @@ public:
     // DASH: X11, no segwit -> rules are passed through plainly; no separate algo
     // param (the DGB Scrypt divergence does NOT apply). See rpc_request.hpp.
     nlohmann::json getblocktemplate(std::vector<std::string> rules = {});
+
+    // ORACLE-SHADOW verdict: getblocktemplate{mode:proposal} of a fully-
+    // assembled block. Returns "" on ACCEPT (dashd TestBlockValidity passed) or
+    // the reject reason. Mempool-independent; never throws (RPC blip -> reason).
+    std::string propose_block_hex(const std::string& block_hex);
     nlohmann::json getnetworkinfo();
     nlohmann::json getblockchaininfo();
     nlohmann::json getmininginfo();

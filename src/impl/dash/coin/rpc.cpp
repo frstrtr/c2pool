@@ -506,6 +506,27 @@ nlohmann::json NodeRPC::getblocktemplate(std::vector<std::string> rules)
     return CallAPIMethod("getblocktemplate", {make_gbt_request(rules)});
 }
 
+std::string NodeRPC::propose_block_hex(const std::string& block_hex)
+{
+    // getblocktemplate {mode:proposal, data:<blockhex>} runs dashd's
+    // TestBlockValidity on the exact block and returns null on ACCEPT or a
+    // reject-reason string. This is the ORACLE-SHADOW authoritative VERDICT
+    // (mempool-independent). Never throws to the caller: an RPC-layer error is
+    // surfaced as a reason string so a transient RPC blip is not read as a
+    // consensus rejection.
+    try {
+        nlohmann::json req;
+        req["mode"] = "proposal";
+        req["data"] = block_hex;
+        auto res = CallAPIMethod("getblocktemplate", {req});
+        if (res.is_null()) return {};                 // ACCEPTED
+        if (res.is_string()) return res.get<std::string>();
+        return res.dump();
+    } catch (const std::exception& e) {
+        return std::string("rpc-error:") + e.what();
+    }
+}
+
 nlohmann::json NodeRPC::getnetworkinfo()
 {
     return CallAPIMethod("getnetworkinfo");
