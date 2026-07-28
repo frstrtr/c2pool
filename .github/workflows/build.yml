@@ -857,8 +857,16 @@ jobs:
         include:
           - arch: arm64
             runner: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","c2pool-mac-arm"]') || 'macos-14' }}
+          # macpro-intel-204 taken offline by operator 2026-07-28 (AFK several hours).
+          # While away, route x86_64 to the GitHub-hosted Intel image so the required
+          # macOS x86_64 check does not queue forever and block every merge. Coverage
+          # preserved: still x86_64 Intel (hosted macOS 15 vs self-hosted). macos-13 is
+          # retired; macos-15-intel is the current hosted Intel label. Default (no var)
+          # = self-hosted, the normal steady state.
+          #   ENABLE  offline mode : gh variable set    MAC_INTEL_OFFLINE --body true --repo frstrtr/c2pool
+          #   DISABLE (machine back): gh variable delete MAC_INTEL_OFFLINE            --repo frstrtr/c2pool
           - arch: x86_64
-            runner: [self-hosted, macOS, X64, c2pool-mac-intel]
+            runner: ${{ vars.MAC_INTEL_OFFLINE == 'true' && 'macos-15-intel' || fromJSON('["self-hosted","macOS","X64","c2pool-mac-intel"]') }}
     steps:
       - uses: actions/checkout@v6
 
