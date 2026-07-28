@@ -199,7 +199,18 @@ if(BUILD_TESTING)
             ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/coin_node.cpp
             ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/p2p_connection.cpp
             ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/p2p_node.cpp
-            ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/rpc.cpp)
+            ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/rpc.cpp
+            # M5 pool-node body TUs (mirror the shipping c2pool-bch target in
+            # src/c2pool/CMakeLists.txt): NodeImpl out-of-line methods + the two
+            # p2pool p2p protocol dispatchers + the stratum work source, so an
+            # embedded body test can construct the real pool-node graph and reach
+            # the Node/protocol/BCHWorkSource symbols -- enabler for the #911
+            # is_wire_advertisable guard test-coverage gap. Additive, src/impl/bch
+            # only -> per-coin isolation holds.
+            ${CMAKE_SOURCE_DIR}/src/impl/bch/node.cpp
+            ${CMAKE_SOURCE_DIR}/src/impl/bch/protocol_actual.cpp
+            ${CMAKE_SOURCE_DIR}/src/impl/bch/protocol_legacy.cpp
+            ${CMAKE_SOURCE_DIR}/src/impl/bch/stratum/work_source.cpp)
         target_include_directories(bch_${t} PRIVATE ${CMAKE_SOURCE_DIR}/src)
         target_link_libraries(bch_${t} PRIVATE
             core pool sharechain
