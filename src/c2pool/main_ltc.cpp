@@ -4938,14 +4938,7 @@ int main(int argc, char* argv[]) {
                     if (p.stale_info == 253)      stale = ltc::StaleInfo::orphan;
                     else if (p.stale_info == 254)  stale = ltc::StaleInfo::doa;
 
-                    // tracker_lock: EXCLUSIVE unique_lock(try_to_lock), acquired at
-                    // the top of this try block (rationale there — this path WRITES
-                    // the tracker via create_local_share). NOT a blocking
-                    // shared_lock, as this comment used to claim. It is held across
-                    // everything below, which is why the broadcast must be POSTED
-                    // rather than called inline: broadcast_share takes a shared
-                    // try-lock and a shared_mutex refuses that to a thread that
-                    // already holds it exclusively.
+                    // tracker_lock (exclusive unique_lock, try_to_lock) acquired at top of try block.
 
                     // Pass frozen fields from template time so ref_hash matches coinbase.
                     uint256 share_hash = ltc::create_local_share(
@@ -4986,18 +4979,38 @@ int main(int argc, char* argv[]) {
                     }
                     ++s_created;
 
-                    // Broadcast to all connected peers.
-                    //
-                    // POSTED, not called inline. We are holding tracker_lock
-                    // EXCLUSIVELY right here, and broadcast_share opens with a
-                    // shared try-lock on that same mutex — which a thread holding
-                    // the write lock can never obtain. Calling it inline took the
-                    // "tracker busy — deferring" early return on every single
-                    // share, so this node broadcast nothing it minted. Posting
-                    // runs it on the io thread after this scope has released the
-                    // lock, and keeps the m_known_txs read in send_shares on the
-                    // same thread as the unlocked remember_tx ingest that writes
-                    // that map.
+                    // Compute the GOT SHARE! prev-age WHILE we still hold the
+                    // exclusive tracker_lock: chain.get(prev_share) dereferences a
+                    // node the compute-thread clean_tracker() could otherwise prune
+                    // mid-read (kr1z1s SIGSEGV class). Log is emitted after unlock.
+                    std::string age_str;
+                    if (!prev_share.IsNull() && p2p_node->tracker().chain.contains(prev_share)) {
+                        try {
+                            uint32_t prev_ts = 0;
+                            p2p_node->tracker().chain.get(prev_share).share.invoke([&](auto* s) {
+                                prev_ts = s->m_timestamp;
+                            });
+                            if (prev_ts > 0) {
+                                double age = static_cast<double>(p.timestamp) - static_cast<double>(prev_ts);
+                                std::ostringstream os;
+                                os << std::fixed << std::setprecision(2) << age << "s";
+                                age_str = os.str();
+                            }
+                        } catch (...) {}
+                    }
+
+                    // #878/#881: DROP the exclusive tracker_lock BEFORE calling
+                    // broadcast_share / notify_local_share. Both re-acquire the
+                    // tracker mutex via std::try_to_lock (shared and unique
+                    // respectively); while THIS thread still holds it exclusively
+                    // that try_to_lock ALWAYS fails, so broadcast_share silently
+                    // deferred every local share and notify_local_share skipped
+                    // its inline attempt_verify — both were permanently dead code.
+                    // Mirrors the release-order fix in main_btc.cpp. All chain
+                    // reads/mutations above are complete at this point.
+                    tracker_lock.unlock();
+
+                    // Broadcast to all connected peers
                     try {
                         p2p_node->post_broadcast_share(share_hash);
                     } catch (const std::exception& e) {
@@ -5013,28 +5026,11 @@ int main(int argc, char* argv[]) {
                     // run_think() scoring — it directly sets the new tip.
                     p2p_node->notify_local_share(share_hash);
 
-                    {
-                        // p2pool format: GOT SHARE! addr.worker hash prev age
-                        std::string age_str;
-                        if (!prev_share.IsNull() && p2p_node->tracker().chain.contains(prev_share)) {
-                            try {
-                                uint32_t prev_ts = 0;
-                                p2p_node->tracker().chain.get(prev_share).share.invoke([&](auto* s) {
-                                    prev_ts = s->m_timestamp;
-                                });
-                                if (prev_ts > 0) {
-                                    double age = static_cast<double>(p.timestamp) - static_cast<double>(prev_ts);
-                                    std::ostringstream os;
-                                    os << std::fixed << std::setprecision(2) << age << "s";
-                                    age_str = os.str();
-                                }
-                            } catch (...) {}
-                        }
-                        LOG_INFO << "GOT SHARE! " << p.miner_address
-                                 << " " << share_hash.GetHex().substr(0, 8)
-                                 << " prev " << prev_share.GetHex().substr(0, 8)
-                                 << (age_str.empty() ? "" : " age " + age_str);
-                    }
+                    // p2pool format: GOT SHARE! addr.worker hash prev age
+                    LOG_INFO << "GOT SHARE! " << p.miner_address
+                             << " " << share_hash.GetHex().substr(0, 8)
+                             << " prev " << prev_share.GetHex().substr(0, 8)
+                             << (age_str.empty() ? "" : " age " + age_str);
                 } catch (const std::exception& e) {
                     LOG_ERROR << "create_share_fn failed (before broadcast): " << e.what();
                 }
