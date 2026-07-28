@@ -9,6 +9,11 @@
 
 #include <util/strencodings.h>   // ParseHex / HexStr
 
+#ifndef _WIN32
+#include <sys/socket.h>          // setsockopt SO_SND/RCVTIMEO (Send() deadline)
+#include <sys/time.h>            // struct timeval
+#endif
+
 namespace dash
 {
 
@@ -75,6 +80,10 @@ void NodeRPC::connect(NetService address, std::string userpass)
                     {
                         try
                         {
+                            // Bound the synchronous Send() I/O BEFORE check()
+                            // runs its first RPC, so a wedged dashd cannot hang
+                            // the caller (io thread or background rpc_pool).
+                            apply_socket_timeouts();
                             if (check())
                             {
                                 m_connected = true;
@@ -147,11 +156,59 @@ void NodeRPC::sync_reconnect()
         LOG_WARNING << "CoindRPC sync_reconnect connect failed: " << ec.message();
         return;
     }
+    apply_socket_timeouts();   // re-arm the Send() deadline on the fresh socket
     LOG_INFO << "CoindRPC reconnected (sync)";
+}
+
+void NodeRPC::close_stream()
+{
+    // Same teardown idiom as sync_reconnect()/the destructor. m_connected is
+    // cleared so the next Send() write-fails into a clean sync_reconnect().
+    beast::error_code ec;
+    m_stream.socket().shutdown(io::ip::tcp::socket::shutdown_both, ec);
+    m_stream.close();
+    m_connected = false;
+}
+
+void NodeRPC::apply_socket_timeouts()
+{
+    // Force the socket back to BLOCKING mode, then set kernel send/receive
+    // timeouts. async_connect (connect()) leaves asio's non_blocking flag set;
+    // under it a synchronous recv returns EAGAIN immediately and SO_RCVTIMEO is
+    // a no-op. In blocking mode the sync http::write/http::read inside Send()
+    // do true blocking send()/recv() which the kernel bounds by SO_SND/RCVTIMEO,
+    // returning an error after RPC_IO_TIMEOUT_SECONDS instead of hanging on a
+    // wedged dashd. (beast tcp_stream::expires_after cannot be used: it only
+    // governs ASYNC ops -- the sync path calls socket.read_some() directly.)
+    // Per-operation inactivity timeout: a large-but-steadily-arriving GBT does
+    // NOT trip it; only a genuine stall does. POSIX (SO_*TIMEO takes a timeval);
+    // guarded off Windows (no <sys/time.h>/timeval, and Winsock SO_RCVTIMEO takes
+    // a DWORD) -- the DASH deploy target is Linux, and macOS keeps the real
+    // deadline. On Windows this is a no-op (pre-PR behaviour: no deadline).
+#ifndef _WIN32
+    if (!m_stream.socket().is_open())
+        return;
+    boost::system::error_code ec;
+    m_stream.socket().non_blocking(false, ec);   // guarantee SO_*TIMEO applies
+    if (ec)
+        LOG_WARNING << "CoindRPC: could not set blocking mode: " << ec.message();
+    struct timeval tv;
+    tv.tv_sec  = RPC_IO_TIMEOUT_SECONDS;
+    tv.tv_usec = 0;
+    const int fd = m_stream.socket().native_handle();
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
 }
 
 std::string NodeRPC::Send(const std::string &request)
 {
+    // io-thread-decouple / LTC parity (impl/ltc/coin/rpc.cpp:136): serialize the
+    // whole write+read+reconnect. getwork()/submit_block_hex (io thread) and the
+    // tip-poll's getbestblockhash (background rpc_pool thread) both drive this
+    // single shared beast client; m_http_request/m_stream are not thread-safe.
+    // The socket deadline (apply_socket_timeouts) bounds how long the lock is held.
+    std::lock_guard<std::mutex> _rpc_lock(m_rpc_mutex);
     // Retry once after synchronous reconnect on write/read failure
     for (int attempt = 0; attempt < 2; ++attempt)
     {
@@ -169,6 +226,10 @@ std::string NodeRPC::Send(const std::string &request)
                 sync_reconnect();
                 continue;
             }
+            // Deadline-desync guard (see the read-fail path below): tear the
+            // socket down before giving up so a partially-written request can
+            // never be answered into a LATER Send() on a reused connection.
+            close_stream();
             return {};
         }
 
@@ -187,6 +248,17 @@ std::string NodeRPC::Send(const std::string &request)
                 sync_reconnect();
                 continue;
             }
+            // Deadline-desync guard (SO_RCVTIMEO deadline hazard): this final
+            // attempt has already WRITTEN the request into dashd but its response
+            // is unread (read timed out). jsonrpccxx reuses the constant id
+            // "curltest" and never validates response ids, so reusing this open
+            // connection would make the NEXT Send() read THIS request's late
+            // response -> permanent off-by-one desync (a GBT would parse a
+            // getbestblockhash string -> zeroed work -> a stuck "honest set-gap"
+            // outage until the connection churns). Tear the socket down so the
+            // next Send() write-fails into a clean sync_reconnect(). Already
+            // under m_rpc_mutex.
+            close_stream();
             return {};
         }
 

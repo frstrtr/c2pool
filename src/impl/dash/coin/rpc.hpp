@@ -42,6 +42,7 @@
 
 #include <functional>
 #include <iostream>
+#include <mutex>
 
 #include <core/uint256.hpp>
 #include <core/timer.hpp>
@@ -76,6 +77,17 @@ private:
     beast::tcp_stream m_stream;
     boost::asio::ip::tcp::resolver m_resolver;
     http::request<http::string_body> m_http_request;
+    // Serializes Send() (verbatim LTC parity, impl/ltc/coin/rpc.hpp:43-47).
+    // io-thread-decouple drives this ONE shared client from TWO threads: the
+    // stratum io_context thread (getwork() during a template re-source, and ARM
+    // B submit_block_hex on a won block) AND the background rpc_pool thread (the
+    // tip poll's getbestblockhash + the single-flight GBT refresh). m_http_request
+    // + m_stream are NOT thread-safe: without this lock one thread's
+    // prepare_payload() frees the Content-Length field element mid-write on the
+    // other -> UAF / interleaved HTTP frames / cross-wired responses (a garbled
+    // submitblock = lost block on the paying node). The lock also serializes the
+    // sync_reconnect() retry path, which is only ever entered from inside Send().
+    std::mutex m_rpc_mutex;
 
     std::unique_ptr<RPCAuthData> m_auth;
     jsonrpccxx::JsonRpcClient m_client;
@@ -95,6 +107,28 @@ private:
 
     std::string Send(const std::string &request) override;
     nlohmann::json CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params = {});
+
+    // io-thread-decouple: a REAL deadline on the synchronous Send() I/O so a
+    // wedged-but-connected dashd (socket open, no bytes) cannot hang the caller
+    // forever -- which on the background rpc_pool thread would wedge
+    // template_refresh_inflight_ true (permanent set-gap after the next tip
+    // change), stop the tip-poll re-arming, AND block rpc_pool->join() at
+    // shutdown (SIGKILL needed). beast's SYNCHRONOUS read_some/write_some call
+    // socket.read_some() directly and do NOT honour tcp_stream::expires_after
+    // (that timer only fires for ASYNC ops -- basic_stream.hpp), so the robust
+    // bound is a kernel SO_RCV/SNDTIMEO on the socket forced back to BLOCKING
+    // mode (async_connect leaves asio's non_blocking flag set, under which
+    // SO_*TIMEO is a no-op). apply_socket_timeouts() does both; it is called
+    // after every successful (re)connect. Linux release target.
+    static constexpr int RPC_IO_TIMEOUT_SECONDS = 12;
+    void apply_socket_timeouts();
+    // Tear down m_stream (sync_reconnect idiom). Called on a FINAL-attempt Send()
+    // failure so a half-written / unread request can never be answered into a
+    // later Send() on a reused connection -- the deadline-desync guard (the
+    // constant "curltest" id + jsonrpccxx not validating response ids makes any
+    // reused-connection off-by-one a permanent set-gap outage). Caller holds
+    // m_rpc_mutex.
+    void close_stream();
 
 public:
     NodeRPC(io::io_context* context, dash::interfaces::Node* coin, bool testnet);

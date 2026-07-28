@@ -115,6 +115,8 @@
 #include <random>
 
 #include <boost/asio.hpp>
+#include <boost/asio/thread_pool.hpp>   // io-thread-decouple: background RPC pool
+#include <boost/asio/post.hpp>
 
 #include <cstdint>
 #include <cstdlib>      // std::getenv
