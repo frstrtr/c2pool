@@ -151,6 +151,23 @@ struct DashPeerInfo
     void record_disconnected()
     {
         ++attempt_count;
+        last_attempt = std::chrono::steady_clock::now();
+        backoff_sec = std::min(backoff_sec * 2, is_protected ? 600 : 3600);
+    }
+
+    // #940: an outbound dial that never completed the socket (ECONNREFUSED /
+    // ETIMEDOUT / DNS-resolve error). Weighted MORE heavily than a post-
+    // handshake disconnect: a peer that never answered is worse evidence than
+    // one that answered and dropped. So on top of the shared attempt++/backoff
+    // this also drops the raw score directly (record_disconnected leaves score
+    // untouched), pushing the dead target down the ranking as well as gating it.
+    // Stamping last_attempt makes can_retry()'s backoff branch actually gate the
+    // next attempt — without a stamp it stays at the epoch and backoff is inert.
+    void record_dial_failed()
+    {
+        ++attempt_count;
+        last_attempt = std::chrono::steady_clock::now();
+        score -= 15;
         backoff_sec = std::min(backoff_sec * 2, is_protected ? 600 : 3600);
     }
 
@@ -427,6 +444,22 @@ public:
         auto it = m_peers.find(key);
         if (it != m_peers.end()) {
             it->second.record_disconnected();
+        }
+    }
+
+    /// #940: Notify that an OUTBOUND DIAL to a peer failed before the socket
+    /// came up (connect/DNS-resolve error — never reached the handshake, so
+    /// notify_connected/notify_disconnected never fire for it). Applies the
+    /// heavier dial-failure penalty (attempt++/backoff + score drop) so dead
+    /// top-scored seeds stop being re-selected on every 60s dial-plan refresh.
+    /// The key must match the manager's stored key (PeerEndpoint::to_string() ==
+    /// the dialed NetService::to_string()); an unknown key is a silent no-op.
+    void notify_dial_failed(const std::string& key)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_peers.find(key);
+        if (it != m_peers.end()) {
+            it->second.record_dial_failed();
         }
     }
 

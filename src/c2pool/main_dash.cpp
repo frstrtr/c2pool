@@ -1360,6 +1360,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 [mgr = coin_peer_mgr.get()](const NetService& s) {
                     mgr->notify_disconnected(s.to_string());
                 });
+            // #940: dial failures (ECONNREFUSED/ETIMEDOUT/resolve error) never
+            // reach connect/disconnect scoring — feed them explicitly so dead
+            // top-scored seeds are penalised instead of re-dialed forever.
+            coin_p2p->set_on_dial_failed(
+                [mgr = coin_peer_mgr.get()](const NetService& s) {
+                    mgr->notify_dial_failed(s.to_string());
+                });
 
             // Pinned keys: passed to get_peers_to_connect() as the "already
             // handled" set so the protected pinned node (score 999999, always
