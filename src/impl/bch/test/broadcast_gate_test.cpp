@@ -39,6 +39,33 @@
 
 #include <core/uint256.hpp>
 #include <impl/bch/known_txs_retention.hpp>
+#include <impl/bch/share.hpp>          // real bch share variants + ShareType
+#include <impl/bch/share_tx_refs.hpp>  // bch::new_tx_hashes SSOT (#905/#913)
+
+// ---------------------------------------------------------------------------
+// #880 COMPILE-TIME PIN of the send-side probe topology.
+//
+// The F3 gate is only as good as the member probe that feeds it. The historical
+// defect was a probe on a member name NO share variant declares: `if constexpr`
+// on a false `requires` is discarded silently — no warning, no error, no
+// counter — so the gate collected an empty ref list for every share, every share
+// was vacuously backable, and the gate no-op'd while every test stayed green.
+//
+// These static_asserts hold down the topology bch::new_tx_hashes depends on. If
+// a share variant ever moves or renames the list, the build breaks HERE instead
+// of the gate going quietly inert.
+// ---------------------------------------------------------------------------
+static_assert(!bch::has_flat_new_tx_hashes<bch::Share>,              "v17 must NOT expose a flat new-tx list");
+static_assert(!bch::has_flat_new_tx_hashes<bch::NewShare>,           "v33 must NOT expose a flat new-tx list");
+static_assert(!bch::has_flat_new_tx_hashes<bch::SegwitMiningShare>,  "v34 must NOT expose a flat new-tx list");
+static_assert(!bch::has_flat_new_tx_hashes<bch::PaddingBugfixShare>, "v35 must NOT expose a flat new-tx list");
+static_assert(!bch::has_flat_new_tx_hashes<bch::MergedMiningShare>,  "v36 must NOT expose a flat new-tx list");
+
+static_assert(bch::has_nested_new_tx_hashes<bch::Share>,               "v17 must nest the list in m_tx_info");
+static_assert(bch::has_nested_new_tx_hashes<bch::NewShare>,            "v33 must nest the list in m_tx_info");
+static_assert(!bch::has_nested_new_tx_hashes<bch::SegwitMiningShare>,  "v34 carries no new-tx list");
+static_assert(!bch::has_nested_new_tx_hashes<bch::PaddingBugfixShare>, "v35 carries no new-tx list");
+static_assert(!bch::has_nested_new_tx_hashes<bch::MergedMiningShare>,  "v36 carries no new-tx list");
 
 namespace {
 
@@ -78,6 +105,31 @@ std::vector<uint256> walk(const std::vector<uint256>& chain_tip_first,
         to_send.push_back(hash);
     }
     return to_send;
+}
+
+// The EXACT refs_of that src/impl/bch/node.cpp installs on partition_backable:
+// route the variant through the bch::new_tx_hashes SSOT. Kept verbatim so the
+// checks below drive the production probe rather than a stand-in.
+std::vector<uint256> production_refs_of(bch::ShareType& share)
+{
+    std::vector<uint256> hashes;
+    share.invoke([&](auto* obj) {
+        if (const auto* new_txs = bch::new_tx_hashes(obj))
+            hashes.assign(new_txs->begin(), new_txs->end());
+    });
+    return hashes;
+}
+
+// Heap-allocated real v17 share wrapped in the production variant. ShareVariants
+// is non-owning (see sharechain/share.hpp destroy()), so callers free the raws.
+bch::ShareType make_v17(std::vector<uint256> refs, std::vector<bch::Share*>& owned)
+{
+    auto* raw = new bch::Share();
+    raw->m_tx_info.m_new_transaction_hashes = std::move(refs);
+    owned.push_back(raw);
+    bch::ShareType sv;
+    sv = raw;
+    return sv;
 }
 
 } // namespace
@@ -200,6 +252,89 @@ int run_share_broadcast_gate_checks()
             check(marked.size() == 2u, "shipped ordering marks after a real send");
             check(walk(chain, marked).empty(), "shipped ordering then de-dups");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #880 REGRESSION: the F3 gate must be driven by the PRODUCTION probe.
+    //
+    // Everything above exercises partition_backable's MECHANICS through
+    // FakeShare, which declares its ref list as a TOP-LEVEL member and hands it
+    // over via a bespoke refs_of. That is precisely the shape that let the real
+    // bug hide: production probed `requires { obj->m_new_transaction_hashes; }`,
+    // which is FALSE for every BCH variant (v17/v33 nest the list inside
+    // m_tx_info, v34+ carry none), so the gate saw empty refs, every share was
+    // vacuously backable, and the gate withheld nothing — while a FakeShare KAT
+    // and its negative control both stayed green.
+    //
+    // The block below builds REAL bch share variants and drives them through the
+    // SAME bch::new_tx_hashes SSOT that node.cpp's partition_backable refs_of
+    // uses. FAILS-BEFORE: revert bch::new_tx_hashes to the flat probe (or drop
+    // the SSOT from node.cpp's refs_of) and the skip count collapses to 0.
+    // -----------------------------------------------------------------------
+    {
+        // Accessor SSOT: a REAL v17/v33 share nests its hashes in m_tx_info and
+        // the production probe must surface them. The dead flat probe returned
+        // nullptr here, which is what emptied the gate.
+        bch::Share s17;
+        s17.m_tx_info.m_new_transaction_hashes = {TA, TC};
+        const auto* refs17 = bch::new_tx_hashes(&s17);
+        check(refs17 != nullptr, "v17 refs resolve through the production SSOT");
+        check(refs17 != nullptr && refs17->size() == 2u,
+              "v17 SSOT delivers every referenced hash");
+
+        bch::NewShare s33;
+        s33.m_tx_info.m_new_transaction_hashes = {TC};
+        const auto* refs33 = bch::new_tx_hashes(&s33);
+        check(refs33 != nullptr, "v33 refs resolve through the production SSOT");
+        check(refs33 != nullptr && refs33->size() == 1u,
+              "v33 SSOT delivers every referenced hash");
+
+        // v34+ carry no list at all: nullptr, compiled out — not a silent skip.
+        bch::SegwitMiningShare  v34;
+        bch::PaddingBugfixShare v35;
+        bch::MergedMiningShare  v36;
+        check(bch::new_tx_hashes(&v34) == nullptr, "v34 carries no new-tx list");
+        check(bch::new_tx_hashes(&v35) == nullptr, "v35 carries no new-tx list");
+        check(bch::new_tx_hashes(&v36) == nullptr, "v36 carries no new-tx list");
+    }
+
+    {
+        // The gate end-to-end on REAL share variants: a v17 share referencing a
+        // tx whose bytes we do NOT hold must be withheld, and the backable ones
+        // must survive in order. This is the assertion the dead probe made
+        // impossible: pre-fix, skipped was pinned at 0 forever.
+        std::vector<bch::Share*> owned;
+        const std::set<uint256> held{TA, TB};   // TC bytes NOT held
+
+        std::vector<bch::ShareType> batch;
+        batch.push_back(make_v17({TA}, owned));       // backable
+        batch.push_back(make_v17({TC}, owned));       // unheld TC -> withheld
+        batch.push_back(make_v17({TA, TB}, owned));   // backable
+
+        const std::size_t skipped =
+            bch::partition_backable(batch, held, production_refs_of);
+
+        check(skipped == 1u,
+              "F3 gate withholds a REAL share whose tx bytes we lack "
+              "(dead-probe regression pins this at 0)");
+        check(batch.size() == 2u, "F3 gate keeps the two backable REAL shares");
+        if (batch.size() == 2u) {
+            check(production_refs_of(batch[0]).size() == 1u,
+                  "F3 gate preserves REAL batch order (S1)");
+            check(production_refs_of(batch[1]).size() == 2u,
+                  "F3 gate preserves REAL batch order (S3)");
+        }
+
+        // A wholly-unbacked REAL batch empties, so send_shares reports nothing
+        // sent and broadcast_share marks nothing.
+        std::vector<bch::ShareType> all_unbacked;
+        all_unbacked.push_back(make_v17({TC}, owned));
+        check(bch::partition_backable(all_unbacked, held, production_refs_of) == 1u,
+              "F3 gate skips a wholly-unbacked REAL batch");
+        check(all_unbacked.empty(), "F3 gate empties a wholly-unbacked REAL batch");
+
+        for (auto* raw : owned)
+            delete raw;
     }
 
     if (g_failures == 0)

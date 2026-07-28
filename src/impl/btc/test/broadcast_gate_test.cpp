@@ -41,6 +41,28 @@
 #include <impl/btc/share.hpp>          // real btc share variants + ShareType
 #include <impl/btc/share_tx_refs.hpp>  // btc::new_tx_hashes SSOT (#880)
 
+// ---------------------------------------------------------------------------
+// #880 COMPILE-TIME PIN of the send-side probe topology.
+//
+// btc/share_tx_refs.hpp declares has_flat_new_tx_hashes / has_nested_new_tx_hashes
+// specifically so the topology can be held down at compile time; without a
+// static_assert somewhere those traits are themselves inert. A runtime KAT
+// catches the flat-probe reversion, but only these catch a share variant moving
+// or renaming the list — the build breaks HERE instead of the gate going
+// quietly inert.
+// ---------------------------------------------------------------------------
+static_assert(!btc::has_flat_new_tx_hashes<btc::Share>,              "v17 must NOT expose a flat new-tx list");
+static_assert(!btc::has_flat_new_tx_hashes<btc::NewShare>,           "v33 must NOT expose a flat new-tx list");
+static_assert(!btc::has_flat_new_tx_hashes<btc::SegwitMiningShare>,  "v34 must NOT expose a flat new-tx list");
+static_assert(!btc::has_flat_new_tx_hashes<btc::PaddingBugfixShare>, "v35 must NOT expose a flat new-tx list");
+static_assert(!btc::has_flat_new_tx_hashes<btc::MergedMiningShare>,  "v36 must NOT expose a flat new-tx list");
+
+static_assert(btc::has_nested_new_tx_hashes<btc::Share>,               "v17 must nest the list in m_tx_info");
+static_assert(btc::has_nested_new_tx_hashes<btc::NewShare>,            "v33 must nest the list in m_tx_info");
+static_assert(!btc::has_nested_new_tx_hashes<btc::SegwitMiningShare>,  "v34 carries no new-tx list");
+static_assert(!btc::has_nested_new_tx_hashes<btc::PaddingBugfixShare>, "v35 carries no new-tx list");
+static_assert(!btc::has_nested_new_tx_hashes<btc::MergedMiningShare>,  "v36 carries no new-tx list");
+
 namespace {
 
 uint256 h(const char* hex) { uint256 v; v.SetHex(hex); return v; }
