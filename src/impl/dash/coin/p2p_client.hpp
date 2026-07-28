@@ -217,6 +217,13 @@ private:
     using PeerLifecycleCallback = std::function<void(const NetService&)>;
     PeerLifecycleCallback m_on_peer_connected;
     PeerLifecycleCallback m_on_peer_disconnected;
+    // #940: fired when an OUTBOUND DIAL fails before the socket comes up (the
+    // core Factory could not connect/resolve the target). Distinct from
+    // m_on_peer_disconnected, which only fires AFTER a socket was established —
+    // a dial that dies at ECONNREFUSED/ETIMEDOUT never reaches that seam. Feeds
+    // the CoinPeerManager scorer so dead targets are penalised instead of
+    // re-selected forever. Optional; unset on the legacy single-peer path.
+    PeerLifecycleCallback m_on_dial_failed;
 
     // E1 Phase-L member-set sourcing DEMUX: a filter that consumes HISTORICAL
     // mnlistdiff replies (full base=ZERO snapshots at old quorum-base / work
@@ -337,6 +344,21 @@ public:
         m_peer.reset();
     }
 
+    // #940: INetwork hook — an outbound dial failed BEFORE the socket came up
+    // (ECONNREFUSED / ETIMEDOUT / DNS-resolve error), so connected() never ran
+    // and neither did the m_on_peer_connected/disconnected seams. Feed the dead
+    // target to the scored peer manager (attempt_count++/backoff + score drop)
+    // so the dial plan rotates onto a fresh target. The 30s reconnect loop
+    // (arm_reconnect_timer) already handles the actual redial; this only reports
+    // the failure for scoring, so no dial is issued here (no retry-storm).
+    void connect_failed(const NetService& addr) override
+    {
+        LOG_DEBUG_COIND << "[" << m_chain_label << "] dial failed to "
+                        << addr.to_string() << " — feeding peer scorer";
+        if (m_on_dial_failed)
+            m_on_dial_failed(addr);
+    }
+
     /// Whether the version/verack handshake with the peer is complete.
     bool is_handshake_complete() const { return m_handshake.complete(); }
     bool is_connected() const { return m_peer != nullptr; }
@@ -368,6 +390,9 @@ public:
     /// Fired on disconnect/error with the peer endpoint — the DashCoinPeerManager
     /// scores the drop + applies exponential backoff off this.
     void set_on_peer_disconnected(PeerLifecycleCallback cb) { m_on_peer_disconnected = std::move(cb); }
+    /// #940: fired when an outbound dial fails before the socket comes up — the
+    /// DashCoinPeerManager penalises the dead target so it stops being reselected.
+    void set_on_dial_failed(PeerLifecycleCallback cb) { m_on_dial_failed = std::move(cb); }
 
     /// Send a getheaders request (E2 sync driver seam; unused by E1 run_node).
     void send_getheaders(uint32_t version, const std::vector<uint256>& locator, const uint256& stop)

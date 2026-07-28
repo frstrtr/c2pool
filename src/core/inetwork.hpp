@@ -3,6 +3,12 @@
 
 #include <memory>
 
+// Forward declaration (global namespace): the outbound dial-failure hook below
+// takes a NetService by const-ref. Only the declaration is needed here — the
+// coin-layer overriders and the Factory caller already include the full
+// core/netaddress.hpp. Keeps inetwork.hpp free of that heavy header.
+class NetService;
+
 namespace core
 {
 // Forward declaration: INetwork only needs Socket as an incomplete type for the
@@ -33,6 +39,15 @@ struct INetwork : public std::enable_shared_from_this<INetwork>
     virtual ~INetwork() = default;
     virtual void connected(std::shared_ptr<core::Socket> socket) = 0;
     virtual void disconnect() = 0;
+
+    // Outbound dial-failure hook — fired by Factory::Client when an outbound
+    // connect (or its DNS resolve) fails BEFORE connected() ever runs (the
+    // socket never came up: ECONNREFUSED / ETIMEDOUT / resolve error). Default
+    // no-op so existing nodes (LTC/DOGE/merged) are unaffected; the DASH-isolated
+    // CoinClient overrides it to feed the dead target into the CoinPeerManager
+    // scorer. Without this, dial failures never reach the scorer, so the same
+    // top-scored dead seeds are re-selected on every refresh forever (#940).
+    virtual void connect_failed(const ::NetService& /*addr*/) {}
 };
 
 } // namespace core

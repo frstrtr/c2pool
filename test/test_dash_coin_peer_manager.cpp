@@ -34,6 +34,7 @@
 #include <boost/asio.hpp>
 
 #include <filesystem>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -202,6 +203,87 @@ TEST(DashCoinPeerManager, dash_mainnet_seeds_are_canonical)
     auto fixed = dash::coin::dash_fixed_seeds(/*testnet=*/false);
     EXPECT_FALSE(fixed.empty());
     for (auto& s : fixed) EXPECT_EQ(s.port(), 9999);
+}
+
+// ── (f) #940: dial-failure feedback penalises dead targets ───────────────────
+//
+// Direct DashPeerInfo KAT: a failed dial is scored MORE heavily than a
+// post-handshake disconnect. record_disconnected() leaves score untouched and
+// only grows attempt/backoff; record_dial_failed() ALSO drops the raw score.
+TEST(DashCoinPeerManager, dial_failure_penalised_heavier_than_disconnect)
+{
+    DashPeerInfo dropped;   // answered, then dropped after handshake
+    DashPeerInfo never;     // never answered (dial failed)
+    dropped.record_disconnected();
+    never.record_dial_failed();
+
+    EXPECT_EQ(dropped.attempt_count, never.attempt_count);        // both count an attempt
+    EXPECT_EQ(dropped.score, 0);                                  // disconnect: score untouched
+    EXPECT_LT(never.score, dropped.score);                        // dial failure: score dropped
+    EXPECT_EQ(never.backoff_sec, dropped.backoff_sec);            // same backoff growth
+}
+
+// ── (g) #940 REGRESSION: dead top-scored peers must not be re-dialed forever ──
+//
+// Reproduces the contabo bootstrap failure: the same three top-scored peers are
+// re-selected on every 60s dial-plan refresh because dial failures never reach
+// the scorer. get_peers_to_connect() with an EMPTY connected set (0 handshakes,
+// exactly the observed live state) must, once dial failures are fed back via
+// notify_dial_failed(), rotate onto a FOURTH distinct target.
+//
+// A test that only asserts "3 targets selected" would PASS against the broken
+// behaviour — so the assertion is that the union of all targets ever selected
+// grows beyond the budget of 3. The negative control below proves the OLD
+// (no-feedback) path stays wedged at exactly those 3.
+TEST(DashCoinPeerManager, dial_failure_feedback_reaches_fourth_target)
+{
+    boost::asio::io_context ioc;
+
+    // Five candidates, each in a DISTINCT /16 group so the Sybil group cap does
+    // not interfere; the per-cycle budget is min(cycle=5, min(concurrent=3,
+    // max_peers-0)) = 3, matching the three IPs observed live on contabo.
+    const std::vector<std::string> hosts =
+        {"11.0.0.1", "22.0.0.1", "33.0.0.1", "44.0.0.1", "55.0.0.1"};
+
+    auto add_all = [&](DashCoinPeerManager& pm) {
+        for (auto& h : hosts) pm.add_discovered_peer(NetService{h, 9999});
+    };
+
+    // First selection is capped at the budget of 3 (the live symptom).
+    {
+        DashCoinPeerManager probe(ioc, "DASH", unique_tmp_dir("g940_probe"), make_cfg());
+        add_all(probe);
+        EXPECT_EQ(probe.get_peers_to_connect({}).size(), 3u);
+    }
+
+    // ── WITH #940 feedback: fail every selected target, watch the plan rotate ──
+    DashCoinPeerManager fixed(ioc, "DASH", unique_tmp_dir("g940_fixed"), make_cfg());
+    add_all(fixed);
+    std::set<std::string> seen_fixed;
+    for (int round = 0; round < 8; ++round) {
+        auto picks = fixed.get_peers_to_connect({});   // nothing ever connects
+        if (picks.empty()) break;
+        for (auto& ep : picks) {
+            seen_fixed.insert(ep.host());
+            fixed.notify_dial_failed(ep.to_string());  // the dial died — feed it back
+        }
+    }
+    // The rotation must have reached beyond the initial budget of 3.
+    EXPECT_GE(seen_fixed.size(), 4u)
+        << "dial-failure feedback should rotate onto fresh targets";
+
+    // ── NEGATIVE CONTROL: pre-#940 behaviour (dial failures never fed back) ──
+    DashCoinPeerManager broken(ioc, "DASH", unique_tmp_dir("g940_broken"), make_cfg());
+    add_all(broken);
+    std::set<std::string> seen_broken;
+    for (int round = 0; round < 8; ++round) {
+        auto picks = broken.get_peers_to_connect({});
+        for (auto& ep : picks) seen_broken.insert(ep.host());
+        // (no notify_dial_failed — this is the wedged path)
+    }
+    // Wedged: the SAME three top-scored peers, forever — never a fourth.
+    EXPECT_EQ(seen_broken.size(), 3u)
+        << "without feedback the dial plan must stay stuck on 3 dead peers";
 }
 
 } // namespace

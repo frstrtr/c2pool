@@ -125,7 +125,7 @@ private:
     std::optional<io::ip::tcp::resolver> m_resolver;
     std::string m_label = "Net";  // chain/protocol label for log messages
 
-	void connect_socket(boost::asio::ip::tcp::resolver::results_type endpoints)
+	void connect_socket(boost::asio::ip::tcp::resolver::results_type endpoints, NetService addr)
 	{
 		auto tcp_socket = std::make_unique<io::ip::tcp::socket>(*m_context);
 		auto socket = core::make_socket(std::move(tcp_socket), core::connection_type::outgoing, m_node);
@@ -138,13 +138,22 @@ private:
 		auto weak_node = m_node->weak_from_this();
 		bool was_managed = weak_node.lock() != nullptr;
 		io::async_connect(*socket->raw(), endpoints,
-			[this, weak_node, was_managed, socket = socket]
+			[this, weak_node, was_managed, addr, socket = socket]
 			(const auto& ec, boost::asio::ip::tcp::endpoint ep)
 			{
 				if (ec)
 				{
 					if (ec != boost::system::errc::operation_canceled)
+					{
 						LOG_TRACE << "[" << m_label << "] Connection failed: " << ec.message();
+						// #940: feed the dial failure back to the node so a scored
+						// peer manager can penalise the dead target (attempt++/
+						// backoff) instead of re-selecting it forever. Same
+						// weak_node lifetime guard as the success path below.
+						std::shared_ptr<INetwork> strong_node = weak_node.lock();
+						if (!was_managed || strong_node)
+							(strong_node ? strong_node.get() : m_node)->connect_failed(addr);
+					}
 					else
 						LOG_DEBUG_COIND << "Factory::Client::connect_socket canceled";
 					return;
@@ -187,7 +196,14 @@ private:
 				if (ec)
 				{
 					if (ec != boost::system::errc::operation_canceled)
+					{
 						LOG_TRACE << "[" << m_label << "] DNS resolve failed: " << ec.message();
+						// #940: a resolve failure is also a dial failure — report
+						// it so the target is scored (same lifetime guard).
+						std::shared_ptr<INetwork> strong_node = weak_node.lock();
+						if (!was_managed || strong_node)
+							(strong_node ? strong_node.get() : m_node)->connect_failed(addr);
+					}
 					else
 						LOG_DEBUG_OTHER << "Factory::Client::resolve canceled";
 					return;
@@ -198,7 +214,7 @@ private:
 				// on m_node->connected(socket) inside connect_socket().
 				if (was_managed && weak_node.expired()) return;
 
-				connect_socket(endpoints);
+				connect_socket(endpoints, addr);
 			}
 		);
 	}
