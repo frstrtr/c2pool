@@ -27,6 +27,7 @@
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>  // CSimplifiedMNListEntry (embedded SML seed)
 #include <impl/dash/coin/vendor/cbtx.hpp>           // parse_cbtx (read served creditPool)
 #include <impl/dash/coin/embedded_gbt.hpp>          // encode_cbtx (GBT-xcheck fallback fixture)
+#include <impl/dash/coin/arm_resolution.hpp>       // #738 resolve_embedded_arm (run-path arm decision)
 
 #include <core/stratum_work_source.hpp>
 #include <core/target_utils.hpp>
@@ -1979,6 +1980,183 @@ TEST(DashStratumCoinP2pTipInvalidate, BumpAloneServesStaleUnderRefreshExecutor)
     EXPECT_EQ(served.value("previousblockhash", ""), std::string(kPrevHashHex))
         << "bump-only under refresh_executor_ serves the STALE tip-A payee — the "
            "window invalidate_template_cache() closes";
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// #738 — RUN-PATH ARM RESOLUTION.
+//
+// Taking the embedded arm needs TWO independent conditions and, before #738, no
+// single flag satisfied both:
+//   (1) the work-source gate  — is_testnet_ || embedded_mainnet_ (pinned by the
+//       DashStratumC1MainnetGate suite above);
+//   (2) a live coin-state FEED — the CoinStateMaintainer that flips
+//       NodeCoinState::populated() is constructed ONLY inside main_dash's
+//       `if (coin_p2p)` block.
+// `--embedded-mainnet` armed (1) only, so the bundle was never fed and the arm
+// was unreachable from any documented invocation. resolve_embedded_arm() makes
+// the embedded opt-in imply its own feed.
+//
+// ★ The converse must NEVER hold. A transport flag moving the arm is the exact
+// shape of the live-hotel incident (--coin-p2p-connect activating an unguarded
+// embedded arm on a production node, real money). The two REWARD-SAFETY pins
+// below are load-bearing: a default `--run` and `--coin-p2p-connect` alone must
+// BOTH still resolve dashd-fallback.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+using dash::coin::ArmInputs;
+using dash::coin::ArmReason;
+using dash::coin::WorkArm;
+using dash::coin::resolve_embedded_arm;
+
+// argv shorthand: {testnet, embedded_mainnet, coin_p2p_connect, coin_p2p_discover}
+ArmInputs argv_bare()             { return ArmInputs{false, false, false, false}; }
+ArmInputs argv_p2p_connect()      { return ArmInputs{false, false, true,  false}; }
+ArmInputs argv_p2p_discover()     { return ArmInputs{false, false, false, true }; }
+ArmInputs argv_embedded()         { return ArmInputs{false, true,  false, false}; }
+ArmInputs argv_embedded_pinned()  { return ArmInputs{false, true,  true,  false}; }
+ArmInputs argv_testnet()          { return ArmInputs{true,  false, false, false}; }
+ArmInputs argv_testnet_connect()  { return ArmInputs{true,  false, true,  false}; }
+
+// End-to-end composition mirror: reproduce EXACTLY what run_node does with the
+// resolution — construct the coin-state feed iff coin_feed_armed (a fed
+// maintainer is what publishes a tip, i.e. flips populated()), build the work
+// source on the resolved network flag, apply the embedded opt-in — then ask the
+// real DASHWorkSource which arm it serves. This is the reachability proof: it
+// exercises the SAME predicate the production get_work() applies, not a
+// restatement of the resolver.
+dash::coin::WorkSource served_arm_for(const ArmInputs& in)
+{
+    const auto r = resolve_embedded_arm(in);
+
+    dash::coin::NodeCoinState cs;              // declared first -> destroyed last
+    if (r.coin_feed_armed)
+        seed_populated(cs);                    // the feed's published tip
+
+    auto fallback = []() -> dash::coin::DashWorkData { return rich_work(); };
+    auto submit   = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/in.testnet);
+    ws.set_embedded_mainnet(in.embedded_mainnet);
+
+    dash::stratum::WorkJobTargetInputs job_in;
+    job_in.sane_target_min.SetHex(
+        "0000000000000000000000000000000000000000000000000000000000000001");
+    job_in.sane_target_max.SetHex(
+        "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    job_in.share_info_bits_target.SetHex(
+        "0000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    return ws.get_work(job_in).source;
+}
+}  // namespace
+
+// ── REWARD-SAFETY PIN 1: a default `--run` is untouched ──────────────────────
+TEST(DashRunArmResolution, DefaultRunResolvesDashdFallback)
+{
+    const auto r = resolve_embedded_arm(argv_bare());
+    EXPECT_EQ(r.arm, WorkArm::DashdFallback);
+    EXPECT_EQ(r.reason, ArmReason::NoOptIn);
+    EXPECT_FALSE(r.embedded_arm_enabled);
+    EXPECT_FALSE(r.coin_feed_armed)   << "a bare --run must construct NO coin-P2P client";
+    EXPECT_FALSE(r.discover_implied);
+    EXPECT_EQ(served_arm_for(argv_bare()), dash::coin::WorkSource::DashdFallback);
+}
+
+// ── REWARD-SAFETY PIN 2: the hotel incident. A transport flag alone must NOT
+// flip the arm — on its own it brings up the coin-network connection and
+// NOTHING else. This is the pin that would have caught that incident. ─────────
+TEST(DashRunArmResolution, CoinP2pConnectAloneStillResolvesDashdFallback)
+{
+    const auto r = resolve_embedded_arm(argv_p2p_connect());
+    EXPECT_EQ(r.arm, WorkArm::DashdFallback);
+    EXPECT_EQ(r.reason, ArmReason::MainnetGateOff);
+    EXPECT_FALSE(r.embedded_arm_enabled)
+        << "--coin-p2p-connect must never lift the mainnet embedded gate";
+    EXPECT_TRUE(r.coin_feed_armed)    << "the transport itself still comes up";
+    EXPECT_FALSE(r.discover_implied)  << "a pinned peer must not silently add discovery";
+    EXPECT_EQ(served_arm_for(argv_p2p_connect()), dash::coin::WorkSource::DashdFallback)
+        << "a populated coin-state must STILL serve dashd without --embedded-mainnet";
+}
+
+// Same for the other transport flag.
+TEST(DashRunArmResolution, CoinP2pDiscoverAloneStillResolvesDashdFallback)
+{
+    const auto r = resolve_embedded_arm(argv_p2p_discover());
+    EXPECT_EQ(r.arm, WorkArm::DashdFallback);
+    EXPECT_EQ(r.reason, ArmReason::MainnetGateOff);
+    EXPECT_FALSE(r.embedded_arm_enabled);
+    EXPECT_TRUE(r.coin_feed_armed);
+    EXPECT_EQ(served_arm_for(argv_p2p_discover()), dash::coin::WorkSource::DashdFallback);
+}
+
+// ── THE WIRING: the embedded opt-in now arms BOTH halves ─────────────────────
+TEST(DashRunArmResolution, EmbeddedMainnetOptInArmsBothHalvesEndToEnd)
+{
+    const auto r = resolve_embedded_arm(argv_embedded());
+    EXPECT_EQ(r.arm, WorkArm::EmbeddedEligible);
+    EXPECT_EQ(r.reason, ArmReason::Armed);
+    EXPECT_TRUE(r.embedded_arm_enabled) << "half 1: the work-source gate";
+    EXPECT_TRUE(r.coin_feed_armed)
+        << "half 2 (#738): the opt-in must imply the coin-state feed that "
+           "populates NodeCoinState — without it the arm is unreachable";
+    EXPECT_TRUE(r.discover_implied)
+        << "no pinned peer given: daemonless needs seed-based discovery";
+    EXPECT_EQ(served_arm_for(argv_embedded()), dash::coin::WorkSource::Embedded);
+}
+
+// With peers named, discovery is NOT force-enabled behind the operator's back.
+TEST(DashRunArmResolution, EmbeddedMainnetWithPinnedPeerDoesNotImplyDiscovery)
+{
+    const auto r = resolve_embedded_arm(argv_embedded_pinned());
+    EXPECT_EQ(r.arm, WorkArm::EmbeddedEligible);
+    EXPECT_TRUE(r.coin_feed_armed);
+    EXPECT_FALSE(r.discover_implied);
+    EXPECT_EQ(served_arm_for(argv_embedded_pinned()), dash::coin::WorkSource::Embedded);
+}
+
+// ── NO REGRESSION on the testnet paths (unchanged by #738) ───────────────────
+TEST(DashRunArmResolution, TestnetWithoutFeedIsUnchangedFallback)
+{
+    const auto r = resolve_embedded_arm(argv_testnet());
+    EXPECT_EQ(r.arm, WorkArm::DashdFallback);
+    EXPECT_EQ(r.reason, ArmReason::NoCoinStateFeed)
+        << "the network lifts the arm gate, but nothing feeds the bundle";
+    EXPECT_TRUE(r.embedded_arm_enabled);
+    EXPECT_FALSE(r.coin_feed_armed);
+    EXPECT_EQ(served_arm_for(argv_testnet()), dash::coin::WorkSource::DashdFallback);
+}
+
+TEST(DashRunArmResolution, TestnetWithCoinP2pIsUnchangedEmbedded)
+{
+    const auto r = resolve_embedded_arm(argv_testnet_connect());
+    EXPECT_EQ(r.arm, WorkArm::EmbeddedEligible);
+    EXPECT_TRUE(r.coin_feed_armed);
+    EXPECT_FALSE(r.discover_implied);
+    EXPECT_EQ(served_arm_for(argv_testnet_connect()), dash::coin::WorkSource::Embedded);
+}
+
+// ── The one-way implication, stated as an exhaustive invariant over the whole
+// 16-point argv space: no combination WITHOUT the embedded opt-in may ever
+// enable the arm on mainnet. Any future edit to the resolver that lets a
+// transport flag leak into the arm gate reds here. ───────────────────────────
+TEST(DashRunArmResolution, NoMainnetCombinationWithoutOptInEverEnablesTheArm)
+{
+    int mainnet_cases = 0;
+    for (int bits = 0; bits < 16; ++bits) {
+        ArmInputs in{ (bits & 1) != 0, (bits & 2) != 0,
+                      (bits & 4) != 0, (bits & 8) != 0 };
+        const auto r = resolve_embedded_arm(in);
+        if (in.testnet || in.embedded_mainnet)
+            continue;                       // opt-in / testnet cases covered above
+        ++mainnet_cases;
+        EXPECT_FALSE(r.embedded_arm_enabled) << "bits=" << bits;
+        EXPECT_EQ(r.arm, WorkArm::DashdFallback) << "bits=" << bits;
+        EXPECT_FALSE(r.discover_implied) << "bits=" << bits;
+        EXPECT_EQ(served_arm_for(in), dash::coin::WorkSource::DashdFallback)
+            << "bits=" << bits;
+    }
+    EXPECT_EQ(mainnet_cases, 4) << "the un-opted-in mainnet quadrant must be exercised";
 }
 
 }  // namespace
