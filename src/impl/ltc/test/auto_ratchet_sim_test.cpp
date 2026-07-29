@@ -101,6 +101,7 @@ TEST(LTC_AutoRatchetSim, ThresholdsMatchCanonical)
     EXPECT_EQ(AutoRatchet::DEACTIVATION_THRESHOLD,  50);
     EXPECT_EQ(AutoRatchet::CONFIRMATION_MULTIPLIER,  2);
     EXPECT_EQ(AutoRatchet::SWITCH_THRESHOLD,        60);
+    EXPECT_EQ(AutoRatchet::MIN_DISTINCT_NONSELF_AUTHORS, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -235,4 +236,47 @@ TEST(LTC_AutoRatchetSim, C4_FreshNodeMintsBaselineOnBootstrap)
     auto [mint, vote] = ar.get_share_version(tracker, uint256{});
     EXPECT_EQ(mint, LTC_BASE_VERSION);
     EXPECT_EQ(vote, LTC_TARGET_VERSION);
+}
+
+// ---------------------------------------------------------------------------
+// C5 — mode-2 self-vote guard (07-28). Closes the SECOND false-activation mode
+// (the 07-14 guard closed the first, absence-as-vote): a pool mining ALONE can
+// drive its own desired_version to 95% and ratchet itself into V36 with ZERO
+// external consent (the contabo "72.25% on a ~100%-self window" incident). The
+// live guard (auto_ratchet.hpp ACTIVATE branch) additionally requires
+//   distinct_nonself_authors >= MIN_DISTINCT_NONSELF_AUTHORS
+// where a non-self author is a YES-voting share whose peer_addr is not local.
+// Inline replica (same discipline as inline_tail_ok for the work gate) so the
+// KAT pins the guard WITHOUT building an 8640-share tracker.
+// ---------------------------------------------------------------------------
+namespace {
+bool effective_activation_guarded(int votes, int total,
+                                  const uint288& w_target, const uint288& w_total,
+                                  int distinct_nonself_authors)
+{
+    return effective_activation(votes, total, w_target, w_total) &&
+           distinct_nonself_authors >= AutoRatchet::MIN_DISTINCT_NONSELF_AUTHORS;
+}
+} // namespace
+
+TEST(LTC_AutoRatchetSim, C5_SelfAuthoredWindowDoesNotActivate)
+{
+    // 100% self-authored: every YES-vote was locally minted, so the window
+    // carries ZERO distinct non-self origins. The count gate (95%) and the
+    // work gate (100%) BOTH fire, yet the ratchet must hold.
+    EXPECT_TRUE (effective_activation(100, 100, uint288(100), uint288(100)));
+    EXPECT_FALSE(effective_activation_guarded(100, 100, uint288(100), uint288(100), /*non-self*/ 0));
+}
+
+TEST(LTC_AutoRatchetSim, C5_MixedWindowActivates)
+{
+    // Mixed window at >= threshold WITH external consent: >= 1 distinct non-self
+    // origin backs the 95%/60% window, so activation is permitted. This is the
+    // intended 2-node prod crossing (voidbind + G2 dest) shape.
+    EXPECT_TRUE(effective_activation_guarded(95, 100, uint288(95), uint288(100), /*non-self*/ 1));
+    EXPECT_TRUE(effective_activation_guarded(100, 100, uint288(100), uint288(100), /*non-self*/ 3));
+
+    // Guard is orthogonal to the work gate: external consent cannot rescue a
+    // window that fails the 60%-by-work accept gate (mint<->accept coupling).
+    EXPECT_FALSE(effective_activation_guarded(95, 100, uint288(1), uint288(100), /*non-self*/ 5));
 }
