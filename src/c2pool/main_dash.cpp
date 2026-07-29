@@ -714,6 +714,18 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // ── Real, non-negotiable node identity ────────────────────────────
         mi->set_coin_label("DASH");
 
+        // --- Stats persistence: load prior graph_db on start (DASH) ---
+        // Parity with main_ltc.cpp:1968 — restores the persisted stat_log so
+        // hashrate/DOA history survives node restarts instead of resetting to
+        // empty on every bounce. Same per-net data dir + WebServer stat_log
+        // machinery already in master; display/history only, no consensus path.
+        {
+            std::string graph_db_path = (core::filesystem::config_path()
+                / net_subdir / "graph_db").string();
+            mi->set_stat_log_path(graph_db_path);
+            mi->load_stat_log();
+        }
+
         // --- Persistent found-block storage (DASH) ---
         // Parity with main_ltc.cpp:1977 — won DASH blocks survive node
         // restarts on the dashboard /recent_blocks + history cards instead of
@@ -3783,6 +3795,23 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         cache_mi->refresh_http_caches();   // initial populate
         cache_timer->expires_after(std::chrono::seconds(2));
         cache_timer->async_wait(*cache_tick);
+
+        // ── Stats persistence timer (main_ltc.cpp:7429 parity) ───────────
+        // Save the stat_log every 100 s (matches p2pool graph_db cadence) so a
+        // hard kill loses at most ~100 s of history. Reuses cache_mi/ioc; the
+        // timer self-cancels at shutdown. Display/history only.
+        auto stats_timer = std::make_shared<io::steady_timer>(ioc);
+        auto stats_tick =
+            std::make_shared<std::function<void(const boost::system::error_code&)>>();
+        *stats_tick = [stats_timer, stats_tick, cache_mi](
+                          const boost::system::error_code& ec) {
+            if (ec) return;   // cancelled at shutdown
+            cache_mi->save_stat_log();
+            stats_timer->expires_after(std::chrono::seconds(100));
+            stats_timer->async_wait(*stats_tick);
+        };
+        stats_timer->expires_after(std::chrono::seconds(100));
+        stats_timer->async_wait(*stats_tick);
     }
 
     std::cout << "[run] run-loop up (Ctrl-C to stop); won blocks relay DUAL-PATH:\n"
@@ -3811,6 +3840,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                          "unknown error";
         }
     }
+
+    // Save stats on shutdown (main_ltc.cpp:7457 parity): flush the final
+    // stat_log so the last window survives the restart. mi still valid here —
+    // run() has returned but web_server/mining-interface teardown is below.
+    if (web_server) web_server->get_mining_interface()->save_stat_log();
 
     // Stop the ZMQ hashblock subscriber (joins its thread) BEFORE the stratum
     // acceptor + work source it refreshes are torn down. Its callback only posts
