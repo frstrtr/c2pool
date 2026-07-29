@@ -881,10 +881,46 @@ jobs:
   # else macos-14; x86_64 -> macpro-intel-204 (c2pool-mac-intel). Resolves the
   # macOS x86_64 CI starvation (#42). sccache caches across self-hosted runs.
   # ════════════════════════════════════════════════════════════════════════════
+  # A paused leg is SKIPPED, never silently green — see mac-x86_64-coverage.
+  # Makes PR platform coverage VISIBLE. Dropping legs for speed is fine; a green
+  # rollup that silently means less than it did yesterday is not. This job always
+  # runs, costs nothing, and states exactly which platforms this run covered.
+  ci-platform-coverage:
+    name: PR platform coverage status
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Report platform coverage
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ vars.PR_LINUX_ONLY }}" = "true" ]; then
+            echo "::warning title=PR is LINUX-ONLY::macOS and Windows are NOT built on this PR (PR_LINUX_ONLY=true). The full architecture sweep runs at RELEASE time only. A green rollup here does NOT mean macOS/Windows compile."
+            {
+              echo "### PR platform coverage"
+              echo "- Linux x86_64 (incl. AsAN/UBSan, per-coin gates): **covered**"
+              echo "- macOS arm64 / x86_64: **NOT covered on PRs** — deferred to release.yml"
+              echo "- Windows x86_64: **NOT covered on PRs** — deferred to release.yml"
+              echo ""
+              echo "Restore full PR coverage: \`gh variable delete PR_LINUX_ONLY --repo frstrtr/c2pool\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            if [ "${{ vars.MAC_INTEL_PAUSED }}" = "true" ]; then
+              echo "::warning title=macOS x86_64 NOT COVERED::The macOS x86_64 leg is PAUSED (MAC_INTEL_PAUSED=true). This run does NOT test x86_64."
+              echo "- macOS x86_64: **PAUSED — NOT covered**" >> "$GITHUB_STEP_SUMMARY"
+            elif [ "${{ vars.MAC_INTEL_OFFLINE }}" = "true" ]; then
+              echo "::warning title=macOS x86_64 cross-built::x86_64 was CROSS-BUILT on the ARM M4. Any tests ran under Rosetta 2 — weaker evidence than native Intel silicon."
+              echo "- macOS x86_64: cross-built on ARM M4 (Rosetta)" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "- macOS x86_64: covered natively" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            echo "- Linux + Windows: covered" >> "$GITHUB_STEP_SUMMARY"
+          fi
   macos:
     name: macOS ${{ matrix.arch }}
     # dash-slice campaign: skip macOS for PRs carrying the dash-linux-only label (re-enabled at block-viable gate, ~07-01)
-    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-linux-only')) }}
+    # PR_LINUX_ONLY=true drops macOS from PR CI entirely (speed). The FULL
+    # architecture sweep — macOS arm64 + x86_64 + universal, and Windows — still
+    # runs in release.yml at tag time, so this DEFERS detection rather than
+    # losing it. See the ci-platform-coverage job for the visible statement.
+    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-linux-only')) && !(matrix.arch == 'x86_64' && vars.MAC_INTEL_PAUSED == 'true') && !(github.event_name == 'pull_request' && vars.PR_LINUX_ONLY == 'true') }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -903,8 +939,18 @@ jobs:
           # a green here is weaker evidence than a native-Intel green. See Verify.
           #   ENABLE  offline mode : gh variable set    MAC_INTEL_OFFLINE --body true --repo frstrtr/c2pool
           #   DISABLE (machine back): gh variable delete MAC_INTEL_OFFLINE            --repo frstrtr/c2pool
+          # MAC_INTEL_PAUSED=true DROPS this leg entirely — for when the Intel
+          # machine is physically away and the ARM M4 cannot cross-build it
+          # (no x86_64 Homebrew under /usr/local). This is a REAL COVERAGE GAP,
+          # not a pass: the mac-x86_64-coverage job below turns it into a
+          # visible warning so a green rollup cannot be mistaken for "x86_64 is
+          # tested". Prefer MAC_INTEL_OFFLINE (reroute to the M4) whenever the
+          # M4 has an x86_64 Homebrew; only pause when neither host can build.
+          #   PAUSE   : gh variable set    MAC_INTEL_PAUSED --body true --repo frstrtr/c2pool
+          #   RESUME  : gh variable delete MAC_INTEL_PAUSED            --repo frstrtr/c2pool
           - arch: x86_64
             runner: ${{ vars.MAC_INTEL_OFFLINE == 'true' && ((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","c2pool-mac-arm"]') || 'macos-14') || fromJSON('["self-hosted","macOS","X64","c2pool-mac-intel"]') }}
+            paused: ${{ vars.MAC_INTEL_PAUSED == 'true' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -1019,7 +1065,7 @@ jobs:
   windows:
     name: Windows x86_64
     # dash-slice campaign: skip Windows for PRs carrying the dash-linux-only label (re-enabled at block-viable gate, ~07-01)
-    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-linux-only')) }}
+    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-linux-only')) && !(github.event_name == 'pull_request' && vars.PR_LINUX_ONLY == 'true') }}
     # Internal PRs / pushes -> self-hosted c2pool-windows-217 (VM217): toolchain
     # probe run 28679257030 green (Python 3.12, Conan 2, CMake, Git, MSVC/VS 2022
     # C++ build tools all provisioned). Fork PRs fall back to GitHub-hosted
