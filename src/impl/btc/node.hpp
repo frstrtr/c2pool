@@ -377,9 +377,13 @@ public:
     /// Set the software version string announced to peers in P2P version messages.
     void set_software_version(std::string ver) { m_software_version = std::move(ver); }
 
-    /// Send a set of shares (with any needed txs) to a single peer.
-    /// Skips shares that originated from that peer.
-    void send_shares(peer_ptr peer, const std::vector<uint256>& share_hashes);
+    /// Send a set of shares (with any needed txs) to a single peer, and return
+    /// the subset actually written (F2). Shares dropped by the tx-completeness
+    /// gate, or the whole batch when the tracker lock is unavailable, are
+    /// reported as NOT sent, so the caller leaves them un-marked and retries
+    /// them on the next broadcast.
+    std::vector<uint256> send_shares(peer_ptr peer,
+                                     const std::vector<uint256>& share_hashes);
 
     /// F3: retain a freshly-minted share's TEMPLATE tx set so every referenced
     /// new-tx is forwardable (remember_tx) and the share is backable. Called
@@ -393,6 +397,19 @@ public:
 
     /// Broadcast a locally-generated (or newly-received) share to all peers.
     void broadcast_share(const uint256& share_hash);
+
+    // Broadcast lock-discipline instrumentation (mirrors the ltc SSOT). A
+    // share minted while the caller holds m_tracker_mutex EXCLUSIVELY on this
+    // thread can never take the shared try-lock in broadcast_share, so it
+    // defers forever and the whole send path -- F3 tx-completeness gate,
+    // per-peer send, mark-only-what-was-sent bookkeeping -- is unreachable
+    // dead code. These counters let broadcast_lock_discipline_test pin that
+    // the production caller (main_btc create_share_fn drops the exclusive
+    // lock with lk.unlock() BEFORE calling broadcast_share) actually REACHES
+    // the send loop, and that an exclusive-lock caller would not.
+    uint64_t broadcast_deferred_count() const { return m_broadcast_deferred.load(); }
+    uint64_t broadcast_acquired_count() const { return m_broadcast_acquired.load(); }
+    uint64_t broadcast_reached_send_count() const { return m_broadcast_reached_send.load(); }
 
     /// Re-announce our current advertised head (advertised_best_share()) to all
     /// connected peers.  Invoked when think()/clean updates the best share so a
@@ -621,6 +638,9 @@ protected:
     std::function<std::vector<std::string>()> m_local_miner_scripts_fn;
     std::string m_node_payout_script_hex;
     std::set<uint256> m_shared_share_hashes;  // de-dup set for broadcast_share
+    std::atomic<uint64_t> m_broadcast_deferred{0};
+    std::atomic<uint64_t> m_broadcast_acquired{0};
+    std::atomic<uint64_t> m_broadcast_reached_send{0};
     std::set<uint256> m_rejected_share_hashes; // shares rejected by peers — never re-broadcast
     std::set<uint256> m_downloading_shares;   // hashes currently being fetched
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "node.hpp"
 #include "known_txs_retention.hpp"      // F3 retain_template_txs + select_backable_shares
+#include "share_tx_refs.hpp"          // btc::new_tx_hashes -- uniform gate probe (#880)
 #include "coin/template_other_txs.hpp"  // deserialize_template_other_txs (GBT data[] -> MutableTransaction)
 
 #include <core/common.hpp>
@@ -727,8 +728,12 @@ void NodeImpl::register_template_txs(const uint256& share_hash,
               << m_template_recent_sets.size();
 }
 
-void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hashes)
+std::vector<uint256> NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hashes)
 {
+    // Returns the hashes of the shares actually WRITTEN to this peer (F2). The
+    // caller marks only those as broadcast, so a share skipped here — by the
+    // try_to_lock miss below or by the F3 tx-completeness gate — is re-offered
+    // on the next broadcast instead of being silently dropped forever.
     // try_to_lock per the architectural rule (node.hpp:67) — see freeze
     // analysis in handle_get_share above.  If we can't acquire NOW, skip
     // this batch.  The shares are still in our chain; the next broadcast
@@ -740,7 +745,7 @@ void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hash
         if (defer_log++ % 50 == 0)
             LOG_INFO << "[send_shares] tracker busy — skipping send to "
                      << peer->addr().to_string() << " (will retry next cycle)";
-        return;
+        return {};
     }
 
     // Collect shares that exist in our chain (skip rejected)
@@ -760,7 +765,52 @@ void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hash
     }
 
     if (shares.empty())
-        return;
+        return {};
+
+    // --- F3 tx-completeness broadcast gate --------------------------------
+    // A share whose referenced new-tx BYTES we do not hold cannot be backed by
+    // the remember_tx forward below, and canonical p2pool drops the connection
+    // on "referenced unknown transaction" (p2p.py) — which isolates us from the
+    // sharechain and orphans our shares. Shares pulled via sharereply arrive
+    // WITHOUT their tx bytes, so this is reachable in normal operation.
+    //
+    // Gate on the BYTES in m_known_txs, not on the peer's have_tx advert: that
+    // advert can be stale (the peer may have dropped the tx) and sending
+    // hash-only for a tx the peer no longer holds is exactly the disconnect.
+    // m_remote_txs is used ONLY below to choose the hash-vs-bytes encoding.
+    //
+    // CONSENSUS-NEUTRAL: this decides only WHETHER we broadcast. Share bytes,
+    // minting and payout are untouched; a skipped share stays in our chain and
+    // is re-offered once its txs arrive (send_shares reports it as unsent, so
+    // broadcast_share leaves it un-marked).
+    {
+        const size_t skipped_incomplete = partition_backable(
+            shares, m_known_txs, [](ShareType& share) {
+                std::vector<uint256> hashes;
+                share.invoke([&](auto* obj) {
+                    // #880: route through the btc::new_tx_hashes SSOT instead
+                    // of the dead flat probe -- v17/v33 nest the list in
+                    // m_tx_info, v34+ carry none. The old probe was FALSE for
+                    // every variant, so this F3 gate saw empty refs -> every
+                    // share vacuously backable -> the gate no-op'd all versions.
+                    if (const auto* new_txs = btc::new_tx_hashes(obj))
+                        hashes.assign(new_txs->begin(), new_txs->end());
+                });
+                return hashes;
+            });
+        if (skipped_incomplete > 0)
+        {
+            static int skip_log = 0;
+            if (skip_log++ % 20 == 0)
+                LOG_INFO << "[send_shares] skipped " << skipped_incomplete
+                         << " share(s) whose new-tx bytes we do not hold "
+                            "(downloaded via sharereply / evicted) to "
+                         << peer->addr().to_string()
+                         << " — avoids canonical 'unknown transaction' disconnect";
+        }
+        if (shares.empty())
+            return {};
+    }
 
     // (b) Extract each share's referenced new-tx hashes. BTC shares carry these
     // inside m_tx_info (btc::ShareTxInfo), NOT as a top-level
@@ -806,7 +856,7 @@ void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hash
         shares = std::move(kept_shares);
         per_share_refs = std::move(kept_refs);
         if (shares.empty())
-            return;
+            return {};
     }
 
     // Collect transactions the peer doesn't know about, over the surviving
@@ -824,6 +874,8 @@ void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hash
         std::vector<uint256> known_hashes;   // hashes in peer's remote set
         std::vector<coin::MutableTransaction> full_txs;  // full txs otherwise
 
+        size_t missing = 0;
+
         for (const auto& th : needed_txs)
         {
             if (peer->m_remote_txs.count(th))
@@ -835,8 +887,19 @@ void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hash
                 auto it = m_known_txs.find(th);
                 if (it != m_known_txs.end())
                     full_txs.emplace_back(it->second);
+                else
+                    ++missing;  // unreachable after the gate above — see below
             }
         }
+
+        // Defence in depth: the gate should already have removed every share
+        // with an unheld tx, so this must stay at zero. If it ever fires, the
+        // gate's view of the referenced hashes disagrees with needed_txs and
+        // the peer may drop these shares — make that loud rather than silent.
+        if (missing > 0)
+            LOG_WARNING << "[send_shares] " << missing << " referenced tx(s) not in "
+                           "m_known_txs after the completeness gate — peer may drop "
+                           "these shares (share/tx hash accounting mismatch?)";
 
         if (!known_hashes.empty() || !full_txs.empty())
         {
@@ -874,10 +937,20 @@ void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hash
 
     LOG_INFO << "[Pool] Sent " << shares.size() << " shares (+" << needed_txs.size()
              << " txs) to " << peer->addr().to_string();
+
+    // F2: report exactly which shares reached this peer.
+    std::vector<uint256> sent;
+    sent.reserve(shares.size());
+    for (auto& share : shares)
+        sent.push_back(share.hash());
+    return sent;
 }
 
 void NodeImpl::broadcast_share(const uint256& share_hash)
 {
+    if (share_hash.IsNull())
+        return;
+
     // try_to_lock per the architectural rule (node.hpp:67) — see freeze
     // analysis in handle_get_share above.  If think+clean holds the
     // exclusive lock right now, defer this broadcast: the share is still
@@ -888,15 +961,48 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
     std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::try_to_lock);
     if (!lock.owns_lock())
     {
+        const uint64_t deferred =
+            m_broadcast_deferred.fetch_add(1, std::memory_order_relaxed) + 1;
         static int defer_log = 0;
         if (defer_log++ % 50 == 0)
             LOG_INFO << "[broadcast_share] tracker busy — deferring broadcast of "
                      << share_hash.GetHex().substr(0, 16)
                      << " (next cycle will pick it up)";
+        // A long run of deferrals with ZERO successes is not contention — it
+        // is a caller holding m_tracker_mutex EXCLUSIVELY across this call on
+        // this thread, which can never grant a shared lock, so the node
+        // silently broadcasts nothing at all. Say so loudly and once.
+        if (deferred >= 20 && m_broadcast_acquired.load(std::memory_order_relaxed) == 0) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                LOG_WARNING << "[broadcast_share] " << deferred << " consecutive"
+                            << " deferrals with ZERO successful acquisitions — a"
+                               " caller is almost certainly holding the tracker"
+                               " mutex EXCLUSIVELY across this call, which can"
+                               " never grant a shared lock. NO SHARE IS BEING"
+                               " BROADCAST. Drop that lock before calling"
+                               " broadcast_share (main_btc create_share_fn does).";
+            }
+        }
         return;
     }
+    m_broadcast_acquired.fetch_add(1, std::memory_order_relaxed);
 
-    // Walk the chain back from share_hash, collecting un-broadcast shares
+    // The share may have been pruned between mint and here; get_height /
+    // get_chain on an absent hash is not a defined query, so bail rather
+    // than walk garbage (mirrors the ltc guard).
+    if (!m_chain || !m_chain->contains(share_hash))
+        return;
+
+    // Walk the chain back from share_hash, collecting un-broadcast shares.
+    //
+    // F2: do NOT mark them shared here. send_shares can abandon the whole batch
+    // — the tx-completeness gate skipped it, its tracker try_to_lock missed, or
+    // there are zero peers — and a share marked before that never gets another
+    // chance: the next walk breaks on the first marked hash, so the tip is
+    // permanently withheld from the sharechain and its PPLNS credit is lost.
+    // We mark only what actually reached >= 1 peer, below.
     std::vector<uint256> to_send;
     int32_t height = m_chain->get_height(share_hash);
     int32_t walk = std::min(height, 5);
@@ -907,18 +1013,29 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
             break;
         if (m_rejected_share_hashes.count(hash))
             continue; // skip shares previously rejected by peers
-        m_shared_share_hashes.insert(hash);
         to_send.push_back(hash);
     }
 
     if (to_send.empty())
         return;
 
+    // The walk produced a non-empty batch and we hold the shared lock: the
+    // per-peer send loop (F3 gate + send_shares + F2 mark) is now entered.
+    // This is the count that stays at ZERO if a caller holds the exclusive
+    // lock across the call.
+    m_broadcast_reached_send.fetch_add(1, std::memory_order_relaxed);
+
     auto now = std::chrono::steady_clock::now();
-    for (auto& [nonce, peer] : m_peers) {
-        send_shares(peer, to_send);
-        m_last_broadcast_to[peer->addr()] = {to_send, now};
-    }
+    broadcast_and_mark(m_shared_share_hashes, m_peers, to_send, [&](peer_ptr& peer) {
+        std::vector<uint256> sent = send_shares(peer, to_send);
+        // Record what we ACTUALLY wrote, not what we offered: a peer that drops
+        // within 10s marks this record's hashes rejected, and a rejected hash is
+        // never re-broadcast. Blaming a share we withheld would turn a transient
+        // gate skip into permanent loss.
+        if (!sent.empty())
+            m_last_broadcast_to[peer->addr()] = {sent, now};
+        return sent;
+    });
 }
 
 void NodeImpl::notify_local_share(const uint256& share_hash)
@@ -1058,6 +1175,20 @@ uint256 NodeImpl::advertised_best_share()
     return uint256::ZERO;
 }
 
+// ROOT-2 re-advert. Unlike ltc/dgb (which have a dedicated readvertise that
+// bypasses the de-dup set), this delegates to broadcast_share, so the walk still
+// breaks on the first hash already in m_shared_share_hashes.
+//
+// Interaction with the F2 marking change: marking is now a strict SUBSET of what
+// the pre-fix code marked (only hashes a peer actually accepted). The walk breaks
+// later or in the same place, never earlier, so this re-advert re-pushes a
+// superset of what it used to — monotonically better, no regression. It is
+// strictly better in the case that motivated ROOT-2: head shares minted while no
+// peer was connected are no longer marked, so a peer that handshook during the
+// empty window now receives them. It does NOT fully close ROOT-2 here — head
+// shares already accepted by some OTHER peer stay marked and the walk still
+// breaks, exactly as before. Closing that needs the ltc/dgb-style de-dup-bypass
+// readvertise; pre-existing gap, out of scope for this change.
 void NodeImpl::readvertise_best()
 {
     if (m_peers.empty())

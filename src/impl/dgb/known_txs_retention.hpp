@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 // Pure, unit-testable bookkeeping for the known-transaction pool that backs
-// share broadcast (remember_tx forwarding). Ported to the BTC variant from
+// share broadcast (remember_tx forwarding). Ported to the DGB variant from
 // src/impl/dash/known_txs_retention.hpp so the retention/eviction and
 // broadcast-gate semantics can be exercised without a live node.
 //
@@ -33,6 +33,22 @@
 //     try_to_lock missed, or there were no peers — because the de-dup set then
 //     breaks the walk forever and nothing re-pushes it.
 //
+//   readvertise_and_record() — DGB-ONLY. The marking discipline for the
+//     advertise-only ROOT-2 re-push, which is DGB's LIVE path (see below).
+//
+// DGB REACHABILITY — differs from btc/bch; read this before trusting the file.
+//   main_dgb.cpp binds NO create/mint-share fn, so dgb::NodeImpl::broadcast_share
+//   and notify_local_share have ZERO callers repo-wide: DGB never mints a local
+//   share today (tracked as #884). The live DGB path into send_shares is
+//   readvertise_best_share() (ROOT-2 re-advert, on best-change and on a timer),
+//   which re-pushes PEER-RECEIVED shares and deliberately bypasses the de-dup
+//   set. Therefore, on DGB:
+//     partition_backable()     — LIVE (send_shares, reached via readvertise)
+//     readvertise_and_record() — LIVE (readvertise_best_share)
+//     broadcast_and_mark()     — PRE-WIRED; dead until #884 binds the mint seam.
+//   Anything asserting the DGB gate through a locally-minted share broadcast is
+//   exercising a path production never takes.
+//
 // NOTE (de-dup): the same primitives now exist per-coin (btc/dgb/bch/dash) while
 // the LTC lane hoists all_txs_backable into src/core/. Once both land, these
 // per-coin headers should be collapsed onto that core hoist.
@@ -46,7 +62,7 @@
 
 #include <core/uint256.hpp>
 
-namespace btc {
+namespace dgb {
 
 // Retain the tx set of a newly-registered template in a rolling window of the
 // last `cap` DISTINCT templates, inserting its tx bytes into `known_txs`.
@@ -123,25 +139,6 @@ inline bool all_txs_backable(const std::vector<uint256>& tx_hashes,
     return true;
 }
 
-// F3 send-gate over a batch: returns the indices of shares that are backable —
-// every referenced new-tx hash is held. send_shares transmits ONLY these and
-// withholds the rest (a share we cannot fully forward would trip the peer's
-// "referenced unknown transaction" disconnect). Pure so the wiring's withhold
-// decision is unit-testable: mutating this to admit-all (push every index)
-// reddens BtcSendGate.WithholdsShareMissingTemplateTx.
-template <typename Held>
-inline std::vector<std::size_t> select_backable_shares(
-    const std::vector<std::vector<uint256>>& per_share_refs,
-    const Held& held)
-{
-    std::vector<std::size_t> out;
-    out.reserve(per_share_refs.size());
-    for (std::size_t i = 0; i < per_share_refs.size(); ++i)
-        if (all_txs_backable(per_share_refs[i], held))
-            out.push_back(i);
-    return out;
-}
-
 // Batch form of the F3 gate. Keeps in `shares` only the entries every one of
 // whose referenced new-tx hashes we hold, and returns how many were dropped.
 // `hashes_of(share)` yields that share's referenced new-tx hashes.
@@ -197,4 +194,38 @@ inline std::size_t broadcast_and_mark(MarkedSet& marked, Peers& peers,
     return actually_sent.size();
 }
 
-} // namespace btc
+// Advertise-only ROOT-2 re-push (readvertise_best_share) — DGB's LIVE marking
+// path. Offers `to_send` to every peer via `send`, which reports what it
+// ACTUALLY wrote, and records that report — never the offered batch — through
+// `record(peer, sent)`. A peer that received nothing gets NO record at all.
+// Returns the number of peers reached.
+//
+// Why the recording rule is reward-critical and not cosmetic: m_last_broadcast_to
+// is what converts a peer disconnect within 10s into m_rejected_share_hashes
+// entries, and the readvertise walk `continue`s past every rejected hash —
+// permanently. Recording the OFFERED batch would let a share the F3 completeness
+// gate merely withheld be blamed for someone else's disconnect, turning a
+// transient, self-healing skip into permanent exclusion from every future
+// re-advert. DGB re-advertises PEER-RECEIVED shares, so that is a propagation
+// loss for the whole sharechain, not only for us.
+template <typename Peers, typename SendFn, typename RecordFn>
+inline std::size_t readvertise_and_record(Peers& peers,
+                                          const std::vector<uint256>& to_send,
+                                          SendFn send,
+                                          RecordFn record)
+{
+    if (to_send.empty())
+        return 0;
+
+    std::size_t peers_reached = 0;
+    for (auto& entry : peers) {
+        const std::vector<uint256> sent = send(entry.second);
+        if (sent.empty())
+            continue;   // nothing written -> nothing a later drop may blame
+        record(entry.second, sent);
+        ++peers_reached;
+    }
+    return peers_reached;
+}
+
+} // namespace dgb

@@ -3,7 +3,11 @@
 # verified into a test executable. Gated on BUILD_TESTING + GTest like the
 # sibling coins; registered via gtest_add_tests for the CI --target allowlist.
 if (BUILD_TESTING AND GTest_FOUND)
-    add_executable(dgb_share_test share_test.cpp)
+    # Rides dgb_share_test (already in the build.yml --target allowlist) so the
+    # F1 retention + F2/F3 broadcast-gate KATs are actually compiled and run;
+    # a fresh target would need a build.yml entry and would otherwise report
+    # the silently-passing NOT_BUILT sentinel.
+    add_executable(dgb_share_test share_test.cpp known_txs_retention_test.cpp broadcast_gate_test.cpp)
     target_link_libraries(dgb_share_test PRIVATE
         GTest::gtest_main GTest::gtest
         core dgb
