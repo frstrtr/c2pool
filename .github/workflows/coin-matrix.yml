@@ -115,11 +115,11 @@ jobs:
         run: |
           find "$CONAN_HOME/p" -type f \( -name 'conan_package.tgz' -o -name 'conan_sources.tgz' \) -delete 2>/dev/null || true
 
-      - name: Conan install
+      # Conan prime: the ONLY step here that reaches out to conancenter; bounded
+      # retry+backoff warms the cache, the install below runs --no-remote.
+      - name: Conan prime (only conancenter egress)
         if: steps.presence.outputs.exists == '1'
         run: |
-          # Bounded retry: remote package downloads are the only network step
-          # left here; a transient CDN/remote hiccup must not red a good PR.
           for attempt in 1 2 3; do
             if \
             conan install . \
@@ -129,11 +129,22 @@ jobs:
               --output-folder=build_${{ matrix.coin }} \
               --settings=build_type=Release
             then exit 0; fi
-            echo "conan install failed (attempt $attempt/3); retrying in $((attempt * 15))s"
+            echo "conan prime failed (attempt $attempt/3); retrying in $((attempt * 15))s"
             sleep $((attempt * 15))
           done
-          echo "conan install failed after 3 attempts" >&2
+          echo "conan prime failed after 3 attempts" >&2
           exit 1
+
+      - name: Conan install (offline; --no-remote)
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          conan install . \
+            -pr:a=ci/conan/linux-gcc13.profile \
+            --lockfile=conan.lock \
+            --build=missing \
+            --output-folder=build_${{ matrix.coin }} \
+            --settings=build_type=Release \
+            -nr
 
       - name: Configure
         if: steps.presence.outputs.exists == '1'
