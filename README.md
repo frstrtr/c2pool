@@ -154,6 +154,56 @@ c2pool has four operating modes. The default is a full P2P pool — no flags req
 
 Legacy `--standalone` mode (minimal stratum + RPC daemon, no embedded SPV) is available for backwards compatibility.
 
+### DASH daemonless masternode-set checkpoint — trust anchor
+
+**If you run DASH with `--embedded-mainnet` and no dashd, you are trusting the
+c2pool release build for one specific piece of data. This section says exactly
+which, and why.**
+
+To build a DASH block, c2pool must know which masternode is next in the DIP-3
+payment queue. Paying the wrong one produces a coinbase the network rejects
+(`bad-cb-payee`) — a mined block thrown away. Ranking the queue needs each
+masternode's `scriptPayout` and `nLastPaidHeight`, and **neither is available
+from the DASH P2P network**: the Simplified MN List (`mnlistdiff`) omits both,
+and neither is committed in `merkleRootMNList`, so there is no header
+commitment to check them against.
+
+So c2pool ships a **release-pinned masternode set** — a trust anchor of the
+same class as Bitcoin Core's `assumeutxo` — and replays blocks forward from it
+to the current tip.
+
+**What the node verifies for itself, with no trust:**
+
+- **chain position** — the anchor names a block hash, and is rejected unless
+  c2pool's own X11-PoW + DGW-validated header chain holds exactly that hash at
+  exactly that height;
+- **integrity** — a SHA-256 digest over the anchor's contents (an integrity
+  check on the file, *not* a signature: whoever can change the source can
+  recompute the digest — it catches accidents, not malice);
+- **forward consistency** — every block replayed from the anchor re-derives
+  the projected payee and compares it against that block's real coinbase, so a
+  wrong anchor is falsified within a few blocks.
+
+**What you are trusting:** the membership and payout state of the masternode
+set *at the anchor height*. Nothing available to the node can prove it.
+
+A fully trustless alternative exists — replaying every block from DIP-3
+activation (~1.5M blocks) — and is **planned as a later opt-in verify-mode**.
+It is not implemented today.
+
+**Fail-closed by design.** If the anchor is missing, corrupt, for the wrong
+network, in the wrong chain position, further behind the tip than
+`--embedded-mn-bridge-max` (default 20000 blocks, ≈34 days), or contradicted
+by a replayed block, c2pool logs the refusal at `ERROR` and **refuses to serve
+embedded DASH templates**. It falls back to a configured dashd, or serves
+nothing. It never guesses a masternode payee.
+
+Running DASH with a dashd RPC configured does **not** use the anchor at all —
+`protx list valid true` is authoritative and is used instead.
+
+Details, provenance of the shipped anchor, and the release-time re-pinning
+procedure: [`src/impl/dash/coin/checkpoints/README.md`](src/impl/dash/coin/checkpoints/README.md).
+
 ### Startup examples
 
 ```bash

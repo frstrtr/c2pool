@@ -5,6 +5,44 @@ documented in the [postmortem archive](https://github.com/frstrtr/the/tree/maste
 
 ---
 
+## DASH daemonless masternode set is seeded from a TRUST ANCHOR
+
+**Severity**: Medium (security-model disclosure, not a defect)
+**Affects**: DASH `--embedded-mainnet` run WITHOUT a dashd RPC
+
+c2pool cannot derive the payout-bearing DASH masternode set from the P2P
+network: the Simplified MN List omits `scriptPayout` and `nLastPaidHeight`,
+and neither is committed in `merkleRootMNList`. Daemonless DASH therefore
+cold-starts from a **release-pinned masternode set compiled into the binary**
+and replays blocks forward from it.
+
+**You are trusting the release build** for the set contents at the anchor
+height. The node does independently verify the anchor's chain position against
+its own PoW-validated header chain, its SHA-256 integrity digest, and every
+replayed block's coinbase against the projected payee — a wrong anchor is
+falsified within a few blocks and fails closed — but nothing available to the
+node can prove the set itself.
+
+A fully trustless DIP-3-height replay (~1.5M block bodies) is planned as a
+later **opt-in verify-mode**; it is not implemented.
+
+Two further limitations today:
+
+- **The shipped mainnet and testnet anchors are UNPINNED.** Pinning requires
+  RPC access to a synced dashd and is a release-time step
+  (`tools/dash/gen_mn_checkpoint.py pin`). Until an anchor is pinned,
+  daemonless DASH **fails closed** — it logs at `ERROR` and refuses to serve
+  embedded templates rather than guessing a payee.
+- **A stale anchor is refused, not worked around.** An anchor more than
+  `--embedded-mn-bridge-max` blocks behind the tip (default 20000, ≈34 days)
+  is rejected. A release cut long ago will not daemonlessly mine DASH without
+  either a fresher build or `--coin-rpc-*`.
+
+Background: README section "DASH daemonless masternode-set checkpoint — trust
+anchor" and `src/impl/dash/coin/checkpoints/README.md`.
+
+---
+
 ## Remaining IO-thread tracker callbacks without shared_lock
 
 **Severity**: Medium  

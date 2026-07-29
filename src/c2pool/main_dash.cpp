@@ -81,6 +81,8 @@
 #include <impl/dash/coin/govsync_ingest.hpp>     // wire_govobject_ingest / wire_govvote_ingest (E-SUPERBLOCK)
 #include <impl/dash/coin/superblock.hpp>         // get_superblock_payments / superblock_budget (E-SUPERBLOCK)
 #include <impl/dash/coin/mn_seed.hpp>            // E2c: RPC protx-list MN-set seed (parse_protx_list_seed)
+#include <impl/dash/coin/mn_checkpoint.hpp>      // E2d: pinned MN-set checkpoint format + fail-closed parser
+#include <impl/dash/coin/mn_checkpoint_lane.hpp> // E2d: checkpoint -> forward-replay bridge -> leg-4 publish
 #include <impl/dash/node.hpp>          // dash::Node — sharechain pool-node (NodeBridge<NodeImpl,Legacy,Actual>)
 #include <impl/dash/config.hpp>        // dash::Config (PoolConfig/CoinConfig)
 #include <impl/dash/config_pool.hpp>   // dash::SharechainConfig — P2P_PORT / PREFIX / min-proto SSOT
@@ -181,6 +183,38 @@ bool parse_listen(const std::string& str, std::string& host, uint16_t& port)
     return true;
 }
 
+// ── E2d (#738): the release-pinned masternode-set trust anchor ────────────
+// Compiled INTO the binary (not loaded from disk) so a daemonless cold start
+// cannot depend on a file the operator could lose, swap, or forget to install.
+//
+// ⚠ THESE ARE TRUST ANCHORS. A node that cold-starts the payout-bearing
+// masternode set from one of them is trusting this release build for the set
+// contents at the anchor height — there is no consensus commitment to check
+// them against (the P2P Simplified MN List omits scriptPayout and
+// nLastPaidHeight). What IS verified locally: the anchor's chain position
+// against our own PoW-validated header chain, its SHA-256 integrity digest,
+// and every replayed block's coinbase against the projected payee. See
+// src/impl/dash/coin/checkpoints/README.md and the README section
+// "DASH daemonless masternode-set checkpoint".
+//
+// Re-pinned at release time by tools/dash/gen_mn_checkpoint.py — never by
+// hand: the digest line commits the contents, so a hand edit fails closed.
+const char* const kDashMnCheckpointMainnet =
+#include <impl/dash/coin/checkpoints/dash_mn_checkpoint_mainnet.inc>
+    ;
+const char* const kDashMnCheckpointTestnet =
+#include <impl/dash/coin/checkpoints/dash_mn_checkpoint_testnet.inc>
+    ;
+
+// --embedded-mn-bridge-max: how many blocks the checkpoint bridge will replay
+// before declaring the anchor STALE and refusing to arm. Held at file scope
+// rather than threaded through run_node's already-long parameter list purely
+// to keep this slice's diff off that signature; it is written once during
+// argument parsing in main(), before any thread exists, and only read
+// afterwards.
+uint32_t g_mn_bridge_max_blocks =
+    dash::coin::MnCheckpointLane::kDefaultMaxBridgeBlocks;
+
 // Report the requested sharechain peering topology at run-loop bring-up. Honest
 // about the deferred live bind: a won/seen share does NOT yet cross the wire
 // until the sharechain pool-node leaf lands.
@@ -220,7 +254,7 @@ void print_banner(const char* argv0)
         << "           [--stratum [HOST:]PORT] [--coin-p2p-connect HOST:PORT]... [--coin-p2p-discover]\n"
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
         << "           [--external-ip ADDR]\n"
-        << "           [--embedded-utxo] [--embedded-mainnet]\n"
+        << "           [--embedded-utxo] [--embedded-mainnet] [--embedded-mn-bridge-max N]\n"
         << "           [--embedded-oracle-shadow]\n"
         << "           [--oracle-graduation-blocks N] [--oracle-class-coverage K]\n"
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
@@ -2348,6 +2382,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // node_coin_state / coin_state (declared earlier) they reference.
     std::unique_ptr<dash::coin::HeaderChain> header_chain;
     std::unique_ptr<dash::coin::CoinStateMaintainer> maintainer;
+    // E2d: the daemonless MN-set bridge. Constructed for the whole embedded
+    // arm so the tip-changed driver below can pump it unconditionally, but
+    // only ARMED on the no-RPC path (an available `protx list` is strictly
+    // better than a pinned anchor, so the hotel/RPC posture is unchanged).
+    // Declared AFTER maintainer and BEFORE coin_feed_subs so teardown order is
+    // subscriptions -> lane -> maintainer -> header_chain.
+    std::unique_ptr<dash::coin::MnCheckpointLane> mn_ckpt_lane;
     std::vector<std::shared_ptr<EventDisposable>> coin_feed_subs;
     if (coin_p2p) {
         const auto dash_params = testnet
@@ -2359,6 +2400,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         header_chain->init();
 
         maintainer = std::make_unique<dash::coin::CoinStateMaintainer>(node_coin_state);
+        mn_ckpt_lane = std::make_unique<dash::coin::MnCheckpointLane>();
+        mn_ckpt_lane->set_max_bridge_blocks(g_mn_bridge_max_blocks);
+
+        // ANTI-MINT LATCH (E2d prerequisite). Without this, a cold daemonless
+        // arm can arm MN-readiness off leg 3 ALONE: with no seed the payee set
+        // starts empty, the first live block carrying a ProRegTx registers ONE
+        // masternode into it, mnstates().size() != 0 flips m_have_mn, and
+        // populated() serves a template whose "payment queue" is that single
+        // accidental masternode. That is a guessed payee — a coinbase the
+        // network rejects. Require an authoritative height-stamped snapshot
+        // (the E2c RPC seed or the E2d bridge publish) before MN-readiness can
+        // ever be true on the embedded arm.
+        maintainer->set_require_seeded_mn_set(true);
 
         // Coin address versions for the embedded coinbase-payee encoding (the
         // TipAdvance carries them so build_embedded_workdata can encode the MN
@@ -3072,9 +3126,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         header_chain->set_on_tip_changed(
             [&coin_state, &stratum_server, hc = header_chain.get(),
              addr_ver, p2sh_ver, ws = work_source.get(),
-             cp = coin_p2p.get(), sml_base, m = maintainer.get()]
+             cp = coin_p2p.get(), sml_base, m = maintainer.get(),
+             mnl = mn_ckpt_lane.get()]
             (const uint256&, uint32_t, const uint256& new_tip, uint32_t new_height,
              bool was_reorg) {
+                // E2d bridge driver. Safe + REACHABLE here: HeaderChain fires
+                // this callback with m_mutex RELEASED (add_header/add_headers
+                // copy the pending tip-change out inside the lock scope, close
+                // it, then invoke), so the lane's self-locking header-chain
+                // reads below cannot self-deadlock. The pre-existing
+                // tip_advance_from_chain(*hc, ...) call two lines down already
+                // relies on exactly that property and is proven live.
+                // No-op unless the lane was armed on the daemonless path.
+                if (mnl) mnl->pump();
                 auto ta = dash::coin::tip_advance_from_chain(
                     *hc, addr_ver, p2sh_ver);
                 if (ta) {
@@ -3272,17 +3336,129 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 seed_mn_set_from_rpc("payee-desync re-seed");
             });
         } else {
-            // Pure daemonless: no dashd RPC to seed from. The DMN set must
-            // come from a DIP3-height special-tx replay (sync block bodies
-            // from DIP3 activation, replay ProRegTx/ProUpRegTx/... through
-            // MnStateMachine::apply_block) — the flagged E2d follow-up slice.
-            // Flag loudly, don't fail: the run-loop stands up, the tip half
-            // still syncs, and get_work stays on the (unarmed) fallback.
-            std::cout << "[run] E2c MN-set seed UNAVAILABLE (embedded arm"
-                         " enabled but NO coin-RPC configured): populated()"
-                         " will wait for the DIP3 special-tx replay path"
-                         " (E2d follow-up) -- templates keep routing to the"
-                         " fallback arm\n";
+            // ── E2d (#738): PURE DAEMONLESS MN-SET SEED ────────────────────
+            // No dashd RPC, so no `protx list`. The set comes from a
+            // RELEASE-PINNED CHECKPOINT compiled into this binary, replayed
+            // forward to the tip through the SAME block-connect ingest leg 3
+            // already uses. This is the last structurally daemon-dependent
+            // input on the daemonless path.
+            //
+            // ⚠ THE CHECKPOINT IS A TRUST ANCHOR — the operator is trusting
+            // this release build for the masternode set at the anchor height.
+            // Nothing on the DASH P2P network can prove it (the Simplified MN
+            // List omits scriptPayout/nLastPaidHeight and neither is committed
+            // in merkleRootMNList). Locally verified: the anchor's chain
+            // position against our PoW-validated header chain, its SHA-256
+            // integrity digest, and every replayed block's real coinbase
+            // against the payee our anchored set projects. Full trustless
+            // DIP3-height replay stays a later opt-in verify-mode.
+            // See src/impl/dash/coin/checkpoints/README.md.
+            const char* payload = testnet ? kDashMnCheckpointTestnet
+                                          : kDashMnCheckpointMainnet;
+            const std::string net_name = testnet ? "testnet" : "mainnet";
+            auto ckpt = dash::coin::parse_mn_checkpoint(payload, net_name);
+
+            // Fail CLOSED and LOUDLY. A wrong payee is a coinbase the network
+            // rejects — direct revenue loss — so an unusable anchor must be
+            // impossible to mistake for a working one. arm() latches the lane
+            // terminally on a !ok checkpoint; populated() never flips, and
+            // get_work keeps routing to the fallback arm.
+            mn_ckpt_lane->arm(ckpt);
+            if (!ckpt.ok) {
+                std::cout << "\n"
+                          << "  ============================================\n"
+                          << "  E2d MN-set CHECKPOINT REFUSED -- FAIL CLOSED\n"
+                          << "  ============================================\n"
+                          << "  " << ckpt.error << "\n"
+                          << "  The embedded DASH arm will NOT serve templates.\n"
+                          << "  No masternode payee will be guessed.\n"
+                          << "  Configure a dashd RPC (--coin-rpc-*) or run a\n"
+                          << "  release that carries a " << net_name
+                          << " masternode-set anchor.\n"
+                          << "  ============================================\n\n";
+            } else {
+                std::cout << "[run] E2d MN-set checkpoint LOADED: "
+                          << ckpt.entries.size() << " masternodes as-of h="
+                          << ckpt.height << " ("
+                          << ckpt.blockhash.GetHex().substr(0, 16) << ")\n"
+                          << "      TRUST ANCHOR -- these masternode records are"
+                             " asserted by this release build, not derived from"
+                             " the chain.\n"
+                          << "      provenance: " << ckpt.source << "\n"
+                          << "      generated:  " << ckpt.generated << "\n"
+                          << "      digest:     " << ckpt.digest << "\n"
+                          << "      The anchor's chain position, its integrity"
+                             " digest and every replayed block's coinbase ARE"
+                             " verified locally;\n"
+                          << "      the set contents at h=" << ckpt.height
+                          << " are NOT (no consensus commitment exists). See"
+                             " src/impl/dash/coin/checkpoints/README.md.\n"
+                          << "      bridging forward to the tip (max "
+                          << g_mn_bridge_max_blocks
+                          << " blocks) before the embedded arm may serve.\n";
+            }
+
+            // Bridge seams. Each is REQUIRED: a missing one makes the lane
+            // fail closed rather than stall silently (see the null checks in
+            // MnCheckpointLane::request_window / publish).
+            //
+            // Block fetch by height — the same header-chain hash lookup +
+            // request_block path the E2b UTXO lane's window refill uses.
+            mn_ckpt_lane->set_request_block_fn(
+                [cp = coin_p2p.get(), hc = header_chain.get()](uint32_t h) {
+                    auto e = hc->get_header_by_height(h);
+                    if (e) cp->request_block(e->hash);
+                });
+            mn_ckpt_lane->set_tip_height_fn(
+                [hc = header_chain.get()]() { return hc->height(); });
+            mn_ckpt_lane->set_header_hash_at_fn(
+                [hc = header_chain.get()](uint32_t h) -> std::optional<uint256> {
+                    auto e = hc->get_header_by_height(h);
+                    if (!e) return std::nullopt;
+                    return e->hash;
+                });
+            // Publish through the EXACT leg-4 event the E2c RPC seed uses, so
+            // CoinStateMaintainer::on_mn_list_update takes the bridged set as
+            // an ordinary authoritative resync — snapshot fence set to the
+            // bridged height, apply cursor armed for the next live block.
+            mn_ckpt_lane->set_publish_fn(
+                [&coin_state](std::vector<std::pair<uint256,
+                                                    dash::coin::MNState>> set,
+                              uint32_t as_of) {
+                    dash::interfaces::MnListUpdate up;
+                    up.mnstates     = std::move(set);
+                    up.as_of_height = as_of;
+                    coin_state.mn_list_update.happened(up);
+                    std::cout << "[run] E2d MN-set BRIDGE COMPLETE: "
+                              << up.mnstates.size() << " masternodes as-of h="
+                              << as_of << " -> maintainer DMN half ARMED;"
+                                 " populated() flips once the header tip"
+                                 " syncs\n";
+                });
+
+            // Bridge driver leg: every connected block advances the private
+            // replay machine. Subscribed to the SAME Node::block_connected
+            // event as leg 3 (and as the E2b UTXO lane) — the lane only folds
+            // the exact next height it is waiting for, so live tip blocks
+            // arriving mid-bridge are ignored rather than folded onto a stale
+            // cursor.
+            //
+            // REACHABILITY (the #878/#881 caller-side-lock class): this fires
+            // from the live-feed bridge's full_block handler on the io thread
+            // with NO tracker/maintainer lock held; the lane itself takes no
+            // lock. The pump() call added to the tip-changed callback below is
+            // likewise dispatched by HeaderChain with m_mutex RELEASED, so the
+            // lane's self-locking header-chain reads are reachable, not dead.
+            coin_feed_subs.push_back(
+                coin_state.block_connected.subscribe(
+                    [mnl = mn_ckpt_lane.get()]
+                    (const dash::interfaces::BlockConnected& bc) {
+                        mnl->on_block_connected(bc.block, bc.height);
+                    }));
+
+            // Kick the lane once now in case the header chain is already past
+            // the anchor from a previous run's persisted header DB.
+            mn_ckpt_lane->pump();
         }
     }
 
@@ -3928,6 +4104,14 @@ int main(int argc, char** argv)
             oracle_grad_blocks = std::strtoull(argv[++i], nullptr, 10);
         else if (std::strcmp(argv[i], "--oracle-class-coverage") == 0 && i + 1 < argc)
             oracle_class_coverage = std::strtoull(argv[++i], nullptr, 10);
+        // E2d: how far back the pinned masternode-set anchor may be before the
+        // daemonless bridge refuses it as STALE. Raising this is an explicit
+        // operator decision to wait through a longer replay -- it never
+        // weakens a correctness check, only the "how long is too long" bound.
+        else if (std::strcmp(argv[i], "--embedded-mn-bridge-max") == 0
+                 && i + 1 < argc)
+            g_mn_bridge_max_blocks = static_cast<uint32_t>(
+                std::strtoul(argv[++i], nullptr, 10));
         else if ((std::strcmp(argv[i], "--give-author") == 0 ||
                   std::strcmp(argv[i], "--dev-donation") == 0) && i + 1 < argc)
             dev_donation = std::strtod(argv[++i], nullptr);

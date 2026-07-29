@@ -215,7 +215,12 @@ public:
     /// wrong payee).
     void on_mn_list_update(std::vector<std::pair<uint256, MNState>> mnstates,
                            uint32_t as_of_height = 0) {
-        m_have_mn = !mnstates.empty();
+        // With the anti-mint latch on, a snapshot with NO height cannot arm
+        // MN-readiness either: an unheighted set leaves the apply cursor at 0,
+        // which disables apply_block's contiguity guard — the exact condition
+        // under which a stale queue advances silently.
+        m_have_mn = !mnstates.empty()
+                    && (!m_require_seeded_mn || as_of_height != 0);
         m_mn_snapshot_height = as_of_height;
         // An authoritative (non-empty) resync clears the payee-desync latch:
         // the queue is trustworthy again from this snapshot forward.
@@ -630,7 +635,17 @@ public:
             if (m_on_mn_reseed) m_on_mn_reseed();
             return r;
         }
-        m_have_mn = !m_mn_needs_reseed && m_state.mnstates().size() != 0;
+        // ANTI-MINT (E2d): with the latch on, block-connect alone can NEVER
+        // arm MN-readiness. Absent a seed the payee set starts empty and
+        // m_mn_snapshot_height is 0; the first live block carrying a ProRegTx
+        // would otherwise register one masternode, flip size() != 0, and let
+        // populated() serve a template whose entire "payment queue" is that
+        // single accidental registration — a guessed payee, i.e. a coinbase
+        // the network rejects. Only an authoritative height-stamped snapshot
+        // (the E2c RPC seed or the E2d checkpoint bridge) may arm it.
+        m_have_mn = !m_mn_needs_reseed
+                    && m_state.mnstates().size() != 0
+                    && (!m_require_seeded_mn || m_mn_snapshot_height != 0);
         if (!m_have_mn)
             demote();
         else
@@ -658,6 +673,25 @@ public:
     void set_on_state_dirty(std::function<void()> fn) {
         m_on_state_dirty = std::move(fn);
     }
+
+    /// ANTI-MINT LATCH (E2d, #738). When enabled, MN-readiness requires an
+    /// AUTHORITATIVE, HEIGHT-STAMPED snapshot — the E2c `protx list` seed or
+    /// the E2d checkpoint bridge — and can never be armed by leg 3
+    /// (block-connect) alone.
+    ///
+    /// The hole this closes only becomes reachable once the arm can run
+    /// without a coin RPC. On a cold daemonless start the payee set is empty
+    /// and the apply cursor is 0, so apply_block's contiguity guard is
+    /// inactive; the first connected block containing a ProRegTx registers
+    /// exactly one masternode, mnstates().size() != 0 flips m_have_mn, and
+    /// with the tip half already live populated() starts serving templates
+    /// whose DIP-3 payment queue is that one accidental registration. dashd
+    /// rejects the resulting coinbase (bad-cb-payee) and the block is lost.
+    ///
+    /// Default OFF so existing construction sites are unaffected; main_dash
+    /// turns it on for the whole embedded arm.
+    void set_require_seeded_mn_set(bool on) { m_require_seeded_mn = on; }
+    bool require_seeded_mn_set() const { return m_require_seeded_mn; }
 
     /// Wire the authoritative MN re-seed sink (main_dash points this at the
     /// E2c `protx list valid true` seed fetch when a coin RPC is configured).
@@ -926,6 +960,10 @@ private:
     bool m_have_mn{false};
     bool m_have_tip{false};
     bool m_have_mn_sml{false};   // a non-empty SML has been applied (CCbTx source)
+    // E2d anti-mint latch — see set_require_seeded_mn_set(). Default FALSE so
+    // every existing construction site (the KATs, the dashd-RPC posture) keeps
+    // byte-identical behaviour; main_dash opts the embedded arm in.
+    bool m_require_seeded_mn{false};
 
     // Height the SML/quorum state is current at (0 = unknown/cold), tracked
     // off each accepted diff's cbTx.nHeight — the freshness key the #814 R1
