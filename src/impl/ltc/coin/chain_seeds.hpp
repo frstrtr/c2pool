@@ -6,6 +6,7 @@
 
 #include <core/dns_seeder.hpp>
 #include <core/netaddress.hpp>
+#include <cstdint>
 #include <vector>
 
 namespace ltc {
@@ -73,6 +74,55 @@ inline std::vector<c2pool::dns::DnsSeed> ltc_dns_seeds(bool testnet)
 inline std::vector<NetService> ltc_fixed_seeds(bool testnet)
 {
     return testnet ? ltc_testnet_fixed_seeds() : ltc_mainnet_fixed_seeds();
+}
+
+// ── Seed ladder (autosense) ──────────────────────────────────────────────
+//
+// Ordered fallback ladder for LTC (DOGE aux rides the same ladder) P2P peer
+// discovery. The node autosenses its way DOWN the ladder: it stays on the
+// highest-priority rung that yields >= min_peers within settle_ms, and only
+// escalates to the next rung on starvation. This lets an embedded node
+// cold-start with no operator-supplied addnodes while still preferring
+// explicit / DNS discovery when those are healthy.
+//
+// Additive-only: composes the ltc_dns_seeds() / ltc_fixed_seeds() helpers
+// above. No src/core change — the running node consumes this ladder through
+// the existing DnsSeeder / fixed-seed paths.
+
+enum class SeedRung {
+    ConfiguredAddnodes = 0,  ///< operator --addnode / config (highest priority)
+    DnsSeeds,                ///< ltc_dns_seeds()
+    FixedFallback,           ///< ltc_fixed_seeds()
+    EmbeddedBootstrap,       ///< own live-bootstrap seed host (starvation floor)
+};
+
+struct SeedLadderRung {
+    SeedRung rung;
+    uint32_t settle_ms;   ///< grace before autosensing starvation on this rung
+    uint32_t min_peers;   ///< peer count below which we escalate to the next rung
+};
+
+/// Autosense escalation ladder for LTC. DNS gets a full 60s resolve+dial
+/// window (matching the fixed-seed fallback note above) before we fall to the
+/// hardcoded fixed seeds; the embedded bootstrap host is only ever a floor.
+inline std::vector<SeedLadderRung> ltc_seed_ladder()
+{
+    return {
+        {SeedRung::ConfiguredAddnodes,  5000, 1},
+        {SeedRung::DnsSeeds,           60000, 3},
+        {SeedRung::FixedFallback,      30000, 2},
+        {SeedRung::EmbeddedBootstrap,      0, 1},  // floor: no further escalation
+    };
+}
+
+/// Embedded live-bootstrap seed host for the EmbeddedBootstrap rung.
+/// TODO(seed-ladder): wire the deterministic own-seed host from the
+/// live-bootstrap CI gate (must be our own seed host, NOT public mainnet).
+/// Returns empty until that gate host is pinned — the ladder degrades
+/// gracefully to FixedFallback in the meantime.
+inline std::vector<NetService> ltc_embedded_bootstrap_seeds(bool /*testnet*/)
+{
+    return {};
 }
 
 } // namespace coin
