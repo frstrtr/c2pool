@@ -21,6 +21,37 @@ concurrency:
 
 
 jobs:
+  # ------------------------------------------------------------------------
+  # PR job-selection filter. On pull_request, skip expensive jobs whose
+  # inputs did not change; on push/tag/dispatch this filter is BYPASSED and
+  # every job runs (the master rollup and release builds stay authoritative).
+  # NONE of the jobs gated here are branch-protection required checks, so a
+  # skip reports as "Skipped" (never a false-green on a required gate) and
+  # nothing needs: them, so no downstream cascade. Required coin/consensus
+  # gates are deliberately NOT filtered here (tracked in ci-steward card).
+  # ------------------------------------------------------------------------
+  changes:
+    name: PR path filter
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    outputs:
+      web: ${{ steps.filter.outputs.web }}
+      qt: ${{ steps.filter.outputs.qt }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            web:
+              - 'web-static/**'
+              - '.github/workflows/build.yml'
+            qt:
+              - 'ui/**'
+              - 'src/**'
+              - 'CMakeLists.txt'
+              - 'conanfile*'
+              - 'cmake/**'
+              - '.github/workflows/build.yml'
   # ════════════════════════════════════════════════════════════════════════════
   # Test-allowlist drift-guard (fast, no build): every per-coin test executable
   # declared in src/impl/<coin>/test/CMakeLists.txt must appear in a build.yml
@@ -653,6 +684,8 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   web-static:
     name: Web-static verify
+    needs: changes
+    if: ${{ needs.changes.outputs.web == 'true' || github.event_name != 'pull_request' }}
     # Route to self-hosted for trusted events; fork PRs fall back to
     # GitHub-hosted ubuntu-24.04 (never run untrusted fork code self-hosted).
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
@@ -764,6 +797,8 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   qt-webengine:
     name: Qt WebEngine leak gate
+    needs: changes
+    if: ${{ needs.changes.outputs.qt == 'true' || github.event_name != 'pull_request' }}
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     # Hard ceiling: orphaned QtWebEngine/Chromium helper children survive
     # the inner `timeout 180`, holding the xvfb pipe open and hanging the
