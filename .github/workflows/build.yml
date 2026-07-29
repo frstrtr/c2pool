@@ -892,8 +892,19 @@ jobs:
         include:
           - arch: arm64
             runner: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","c2pool-mac-arm"]') || 'macos-14' }}
+          # macpro-intel-204 taken offline by operator 2026-07-28 (AFK several hours).
+          # While away, cross-build the x86_64 slice on our own Apple-Silicon M4
+          # (Mac-mini-Alonso-227 / c2pool-mac-arm) via CMAKE_OSX_ARCHITECTURES, the
+          # same way release.yml lipo-ships the universal package. Keeps the work on
+          # our build factory, spends no hosted-runner minutes, keeps sccache warm.
+          # Default (no var) = self-hosted macpro-intel-204, the normal steady state.
+          # COVERAGE NOTE: while offline this leg is BUILD-ONLY unless Rosetta 2 is
+          # present on the ARM runner (x86_64 binaries execute only under Rosetta) --
+          # a green here is weaker evidence than a native-Intel green. See Verify.
+          #   ENABLE  offline mode : gh variable set    MAC_INTEL_OFFLINE --body true --repo frstrtr/c2pool
+          #   DISABLE (machine back): gh variable delete MAC_INTEL_OFFLINE            --repo frstrtr/c2pool
           - arch: x86_64
-            runner: [self-hosted, macOS, X64, c2pool-mac-intel]
+            runner: ${{ vars.MAC_INTEL_OFFLINE == 'true' && ((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","c2pool-mac-arm"]') || 'macos-14') || fromJSON('["self-hosted","macOS","X64","c2pool-mac-intel"]') }}
     steps:
       - uses: actions/checkout@v6
 
@@ -913,17 +924,59 @@ jobs:
             exit 1
           fi
 
+      - name: Resolve target toolchain (arch-aware)
+        id: tc
+        # macpro-intel-204 offline fallback: the x86_64 leg runs on the Apple
+        # Silicon M4, so it must link x86_64 deps from the SEPARATE x86_64
+        # Homebrew rooted at /usr/local -- not the arm64 /opt/homebrew. Native
+        # legs (arm64 here, or x86_64 on macpro-intel-204 when the var is unset)
+        # use whichever brew "Set up Homebrew PATH" put on PATH. Fail loudly if
+        # x86_64 brew is absent rather than silently linking arm64 into an
+        # x86_64 target (a mis-linked binary that "builds" is worse than a red).
+        run: |
+          HOST="$(uname -m)"; TARGET="${{ matrix.arch }}"
+          if [ "$TARGET" = "x86_64" ] && [ "$HOST" = "arm64" ]; then
+            if [ ! -x /usr/local/bin/brew ]; then
+              echo "::error::x86_64 Homebrew (/usr/local/bin/brew) not found on ${RUNNER_NAME:-runner}; cannot cross-build the x86_64 slice. Install x86_64 Homebrew on Mac-mini-Alonso-227, or bring macpro-intel-204 back (gh variable delete MAC_INTEL_OFFLINE)." >&2
+              exit 1
+            fi
+            echo "brew=arch -x86_64 /usr/local/bin/brew" >> "$GITHUB_OUTPUT"
+            echo "prefix=/usr/local" >> "$GITHUB_OUTPUT"
+            echo "cross=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "brew=brew" >> "$GITHUB_OUTPUT"
+            echo "prefix=$(brew --prefix)" >> "$GITHUB_OUTPUT"
+            echo "cross=0" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install dependencies
-        run: brew install cmake boost leveldb secp256k1 nlohmann-json yaml-cpp sccache
+        run: ${{ steps.tc.outputs.brew }} install cmake boost leveldb secp256k1 nlohmann-json yaml-cpp sccache
 
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+        # Drive the target arch explicitly (sibling of release.yml universal) and
+        # point find_package at the matching Homebrew prefix so the x86_64 cross
+        # leg links x86_64 libs, not arm64 ones.
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DCMAKE_PREFIX_PATH=${{ steps.tc.outputs.prefix }} -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
 
       - name: Build
         run: cmake --build build --target c2pool -j$(sysctl -n hw.ncpu)
 
       - name: Verify binary
-        run: file build/src/c2pool/c2pool && build/src/c2pool/c2pool --help 2>&1 | head -3
+        # `file` inspects the Mach-O without executing. The --help smoke actually
+        # runs the binary; for x86_64 cross-built on Apple Silicon that needs
+        # Rosetta 2. Probe for it -- run the smoke under Rosetta if present, else
+        # emit a BUILD-ONLY warning (not a failure). Native legs always smoke.
+        run: |
+          file build/src/c2pool/c2pool
+          if [ "${{ steps.tc.outputs.cross }}" = "1" ]; then
+            if arch -x86_64 /usr/bin/true 2>/dev/null; then
+              arch -x86_64 build/src/c2pool/c2pool --help 2>&1 | head -3
+            else
+              echo "::warning::x86_64 --help smoke skipped -- Rosetta 2 absent on ${RUNNER_NAME:-runner}; this leg is BUILD-ONLY while macpro-intel-204 is offline (MAC_INTEL_OFFLINE)."
+            fi
+          else
+            build/src/c2pool/c2pool --help 2>&1 | head -3
+          fi
 
       - name: Package release
         if: startsWith(github.ref, 'refs/tags/v')
