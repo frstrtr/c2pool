@@ -77,6 +77,17 @@ public:
         std::int64_t starve_secs = 30;
         std::int64_t startup_jitter_max = 30;
 
+        // Hard-starvation escape (F1). A restored node with a large stale
+        // address table keeps `candidates_exhausted` FALSE forever — the dial
+        // path always yields (dead) candidates — while ESTABLISHED never leaves
+        // zero. The exhaustion gate alone would trap such a node in Observing
+        // permanently: no tier is ever tried. If ESTABLISHED has sat at zero
+        // this long, the table is demonstrably not producing live peers, so the
+        // exhaustion signal is unreliable and we escalate regardless. Scoped to
+        // established==0 so a partially-connected node making genuine progress
+        // through a healthy book is never force-seeded.
+        std::int64_t hard_starve_secs = 300;   // 5 min
+
         // One maintenance cycle. After an injection we wait this long before
         // judging whether that tier admitted anyone (admission is async and
         // happens on the normal dial path, not here).
@@ -132,14 +143,23 @@ public:
         {
             if (m_healthy_since == 0)
                 m_healthy_since = now;
-            if (now - m_healthy_since >= m_cfg.hysteresis_hold_secs)
-                m_failed_cycles = 0;
 
             m_state = State::Healthy;
             m_starving_since = 0;
             m_tier = 0;
             m_last_attempt = 0;
-            m_cooldown_until = 0;
+
+            // F3: release backoff state only after health has HELD for the
+            // hysteresis window. A single tick blipping to target must NOT wipe
+            // an active cooldown (nor failed_cycles): an ESTABLISHED count that
+            // oscillates across the target line would otherwise trigger a fresh
+            // seed sweep every debounce+settle, defeating the backoff entirely.
+            if (now - m_healthy_since >= m_cfg.hysteresis_hold_secs)
+            {
+                m_failed_cycles = 0;
+                m_cooldown_until = 0;
+            }
+
             r.state = m_state;
             return r;
         }
@@ -171,8 +191,14 @@ public:
         }
 
         // Dual condition: only escalate to seeds when the normal dial path has
-        // genuinely run out of its own candidates.
-        if (!s.candidates_exhausted)
+        // genuinely run out of its own candidates -- UNLESS the node is hard
+        // starved (F1): zero established for hard_starve_secs means the table,
+        // however full, is not yielding live peers, so the exhaustion signal is
+        // unreliable and we must escalate anyway.
+        const bool hard_starved =
+            s.established_outbound == 0 &&
+            now - m_starving_since >= m_cfg.hard_starve_secs;
+        if (!s.candidates_exhausted && !hard_starved)
         {
             m_state = State::Observing;
             r.state = m_state;
@@ -188,9 +214,12 @@ public:
             return r;
         }
 
-        // Still starving + exhausted a full settle after an attempt => that
-        // tier did not admit anyone; advance to the next tier.
-        if (m_last_attempt != 0)
+        // Judge the previous attempt by ADMISSIONS, not by starvation alone
+        // (F2). If ESTABLISHED rose since the injection, that tier is working —
+        // keep the same tier and re-inject a fresh batch on an updated baseline
+        // (fall through). Only when the tier admitted NOBODY (zero delta) do we
+        // count it failed and advance to the next tier.
+        if (m_last_attempt != 0 && s.established_outbound <= m_established_at_attempt)
         {
             ++m_tier;
             if (m_tier >= m_tiers.size())
@@ -220,6 +249,7 @@ public:
             m_sink(seeds[i]);
 
         m_last_attempt = now;
+        m_established_at_attempt = s.established_outbound;  // F2 admissions baseline
         m_state = State::Seeding;
         r.state = m_state;
         r.injected = n;
@@ -243,7 +273,12 @@ private:
     std::int64_t backoff()
     {
         unsigned e = m_failed_cycles > 0 ? m_failed_cycles - 1 : 0;
-        if (e > 20) e = 20;  // guard the shift; ceiling clamps anyway
+        // F5: clamp the shift. 60 << 5 = 1920 > backoff_ceiling (1800), so past
+        // 5 shifts the ceiling clamp below already dominates — capping the
+        // exponent here just keeps the shift trivially in range and can never
+        // lose backoff, while making a signed-shift overflow impossible even if
+        // backoff_base_secs is later widened or failed_cycles runs unbounded.
+        if (e > 5) e = 5;
         std::int64_t b = m_cfg.backoff_base_secs * (static_cast<std::int64_t>(1) << e);
         if (b > m_cfg.backoff_ceiling_secs)
             b = m_cfg.backoff_ceiling_secs;
@@ -264,6 +299,7 @@ private:
     std::int64_t m_cooldown_until = 0;
     std::int64_t m_healthy_since = 0;
     std::int64_t m_last_attempt = 0;
+    std::size_t m_established_at_attempt = 0;  // F2: ESTABLISHED at last injection
     std::int64_t m_startup_jitter = 0;
     unsigned m_failed_cycles = 0;
 };

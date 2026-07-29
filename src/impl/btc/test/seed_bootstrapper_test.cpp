@@ -96,15 +96,45 @@ TEST(SeedBootstrapper, ObservesDuringDebounceThenSeeds)
     EXPECT_EQ(h.injected.size(), 3u);
 }
 
-TEST(SeedBootstrapper, DoesNotSeedWhileCandidatesNotExhausted)
+TEST(SeedBootstrapper, DoesNotSeedWhileConnectingThroughHealthyBook)
 {
+    // Under target but ESTABLISHED is non-zero and the normal dial path still
+    // has candidates: the node is making genuine progress through a healthy
+    // address book, so it must never seed-spam. (F1's hard-starve escape is
+    // scoped to established==0, so it does not fire here — see
+    // HardStarveEscapesStaleTableEvenWithoutExhaustion for the zero case.)
     Harness h;
     h.tier_data = {make_seeds(3)};
-    h.snap = {0, 8, false};  // starving but the normal dial path still has candidates
+    h.snap = {4, 8, false};  // connecting, dial path NOT exhausted
     auto sb = h.make(no_jitter_cfg());
 
     for (int i = 0; i < 20; ++i) { auto r = sb.tick(); h.now += 30; EXPECT_NE(r.state, State::Seeding); }
     EXPECT_TRUE(h.injected.empty());
+}
+
+TEST(SeedBootstrapper, HardStarveEscapesStaleTableEvenWithoutExhaustion)
+{
+    // F1: a restored node with a large stale address table. The dial path keeps
+    // yielding (dead) candidates, so candidates_exhausted stays FALSE forever,
+    // yet ESTABLISHED never leaves zero. The exhaustion gate alone would trap
+    // the node in Observing permanently — no tier ever tried. hard_starve_secs
+    // must break out and escalate to seeds.
+    Harness h;
+    h.tier_data = {make_seeds(3)};
+    h.snap = {0, 8, false};  // zero live peers, table NOT exhausted
+    auto sb = h.make(no_jitter_cfg());
+
+    sb.tick();                          // 1000: observing
+
+    // Below hard_starve_secs (300): debounce long past, but still observing.
+    h.now = 1000 + 299; auto r = sb.tick();
+    EXPECT_EQ(r.state, State::Observing);
+    EXPECT_TRUE(h.injected.empty());
+
+    // Past hard_starve_secs with zero established: escalate despite !exhausted.
+    h.now = 1000 + 301; r = sb.tick();
+    EXPECT_EQ(r.state, State::Seeding);
+    EXPECT_GT(r.injected, 0u);
 }
 
 TEST(SeedBootstrapper, EscalatesToNextTierAfterSettleWithoutAdmission)
@@ -122,6 +152,29 @@ TEST(SeedBootstrapper, EscalatesToNextTierAfterSettleWithoutAdmission)
     h.now = 1062; r = sb.tick();        // settle elapsed, still starving+exhausted -> tier 1
     EXPECT_EQ(r.tier, 1u);
     EXPECT_EQ(r.injected, 2u);
+}
+
+TEST(SeedBootstrapper, AdmittingTierIsNotMarkedFailed)
+{
+    // F2: target 10, established 2. Tier 0 injects; during settle the dial path
+    // admits peers (established rises to 7, still < target). The tier must NOT
+    // be recorded as failed / advanced — it is demonstrably working — and no
+    // failed_cycle may accrue.
+    Harness h;
+    h.tier_data = {make_seeds(4), make_seeds(4)};
+    h.snap = {2, 10, true};
+    auto sb = h.make(no_jitter_cfg());
+
+    sb.tick();                          // 1000: observing
+    h.now = 1031; auto r = sb.tick();   // seed tier 0
+    EXPECT_EQ(r.state, State::Seeding);
+    EXPECT_EQ(r.tier, 0u);
+
+    // Admissions during settle: established 2 -> 7 (still < 10).
+    h.snap.established_outbound = 7;
+    h.now = 1062; r = sb.tick();        // settle elapsed, but tier admitted 5
+    EXPECT_EQ(r.tier, 0u);              // NOT advanced to tier 1
+    EXPECT_EQ(sb.failed_cycles(), 0u);  // and NOT counted as a failed cycle
 }
 
 TEST(SeedBootstrapper, FullCycleExhaustionEntersCooldownAndBacksOff)
@@ -186,6 +239,39 @@ TEST(SeedBootstrapper, RecoveryDoesNotResetFailedCyclesUntilHysteresisHeld)
     // Sustained recovery past hysteresis window: now it resets.
     h.now = 1200 + 601; sb.tick();
     EXPECT_EQ(sb.failed_cycles(), 0u);
+}
+
+TEST(SeedBootstrapper, SingleHealthyTickDoesNotCancelActiveCooldown)
+{
+    // F3: enter cooldown, then blip to target for ONE tick (far shorter than
+    // hysteresis_hold). The cooldown must survive: dropping back under target
+    // immediately must NOT trigger a fresh seed sweep. On the pre-fix code the
+    // Healthy branch cleared cooldown_until unconditionally, so the very next
+    // starving tick would seed again — this pins that regression closed.
+    Harness h;
+    h.tier_data = {make_seeds(2), make_seeds(2)};
+    auto sb = h.make(no_jitter_cfg());
+
+    // Drive one full cycle into cooldown.
+    h.snap = {0, 8, true};
+    h.now = 1000; sb.tick();
+    h.now = 1031; sb.tick();
+    h.now = 1062; sb.tick();
+    h.now = 1093; auto r = sb.tick();
+    ASSERT_EQ(r.state, State::Cooldown);
+    const std::size_t injected_at_cooldown = h.injected.size();
+
+    // One healthy tick, far shorter than hysteresis_hold (600s).
+    h.snap = {8, 8, false};
+    h.now = 1100; r = sb.tick();
+    EXPECT_EQ(r.state, State::Healthy);
+
+    // Immediately back under target: cooldown (>=60s from 1093) still in force,
+    // and NOT a single fresh candidate injected.
+    h.snap = {0, 8, true};
+    h.now = 1110; r = sb.tick();
+    EXPECT_EQ(r.state, State::Cooldown);
+    EXPECT_EQ(h.injected.size(), injected_at_cooldown);
 }
 
 TEST(SeedBootstrapper, InjectionCappedRegardlessOfSeedListSize)
