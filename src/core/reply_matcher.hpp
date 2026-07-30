@@ -3,6 +3,7 @@
 
 #include <core/timer.hpp>
 
+#include <cstdint>
 #include <map>
 #include <functional>
 
@@ -70,6 +71,13 @@ struct Matcher
     request_func m_req;
     std::map<id_type, wrapper_type> m_watchers;
 
+    // Monotonic count of REAL answers matched by got_response(). A per-request
+    // timeout (the m_timeout timer above) fires an empty callback WITHOUT
+    // touching this, so consumers can distinguish forward progress (a genuine
+    // peer reply) from a request that merely gave up. Used by the BTC-family
+    // NodeP2P idle-progress eviction gate.
+    uint64_t m_progress{0};
+
     // response_func m_resp;
 
 
@@ -104,6 +112,7 @@ struct Matcher
     {
         if (m_watchers.contains(id))
         {
+            ++m_progress;   // real answer -> forward progress
             m_watchers[id](response);
             m_watchers.erase(id);
         } else

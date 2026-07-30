@@ -6,6 +6,7 @@
 #include "node_interface.hpp"
 #include "compact_blocks.hpp"
 #include "mempool.hpp"
+#include "idle_progress_gate.hpp"
 
 #include <memory>
 
@@ -52,6 +53,13 @@ private:
     static constexpr time_t IDLE_TIMEOUT_SEC = 100;
     static constexpr time_t PING_INTERVAL_SEC = 30;
 
+    // Guard-rail (integrator 2026-07-30, DGB): the idle-eviction window must be
+    // >> the per-request timeout, so a genuinely long-running request is driven
+    // by its OWN Connection::REQUEST_TIMEOUT_SEC and is never guillotined by the
+    // coarse eviction backstop.
+    static_assert(IDLE_TIMEOUT_SEC > Connection::REQUEST_TIMEOUT_SEC,
+                  "idle-eviction window must exceed the per-request timeout");
+
     btc::interfaces::Node* m_coin;
     io::io_context* m_context;
     config_t* m_config;
@@ -61,6 +69,13 @@ private:
     std::unique_ptr<core::Timer> m_reconnect_timer;
     std::unique_ptr<core::Timer> m_ping_timer;
     std::unique_ptr<core::Timer> m_timeout_timer;
+    // Idle-progress eviction: gate the stall window on FORWARD PROGRESS (a real
+    // reply-matcher answer) rather than on any inbound byte.
+    IdleProgressGate m_idle_gate;
+    // Guard-rail (integrator 2026-07-30, BCH): single-peer coins running their own
+    // block-download stall recovery disable this path so it never drops their only
+    // connection. On by default for BTC/DGB.
+    bool m_eviction_enabled{true};
     NetService m_target_addr;
     bool m_reconnect_enabled = false;
     bool m_handshake_complete = false;
@@ -136,6 +151,7 @@ public:
     {
         m_peer = std::make_unique<Connection>(m_context, socket);
         m_handshake_complete = false;
+        m_idle_gate.reset();   // fresh Connection -> fresh progress high-water mark
         LOG_INFO << "" << "[" << m_chain_label << "] Connected to " << m_target_addr.to_string();
 
         // Require version/verack progress soon after connect.
@@ -172,6 +188,7 @@ public:
         stop_ping_timer();
         stop_timeout_timer();
         m_handshake_complete = false;
+        m_idle_gate.reset();
         m_peer.reset();
     }
 
@@ -190,6 +207,11 @@ public:
 
     /// Whether the handshake with the peer is complete.
     bool is_handshake_complete() const { return m_handshake_complete; }
+
+    /// Guard-rail (integrator 2026-07-30, BCH): disable idle-progress eviction for
+    /// single-peer coins that run their own block-download stall recovery, so this
+    /// path never drops their only connection. BTC/DGB leave it enabled (default).
+    void set_idle_eviction_enabled(bool enabled) { m_eviction_enabled = enabled; }
 
     /// Send BIP 35 mempool request — ask peer to announce all mempool txs via inv.
     void send_mempool() {
@@ -222,6 +244,7 @@ public:
         stop_ping_timer();
         stop_timeout_timer();
         m_handshake_complete = false;
+        m_idle_gate.reset();
     }
 
     void error(const boost::system::error_code& ec, const NetService& service, const std::source_location where = std::source_location::current()) override
@@ -250,6 +273,10 @@ public:
         }
 
         std::visit([&](auto& msg){ handle(std::move(msg)); }, result);
+
+        // Sample the idle-progress gate AFTER dispatch: got_response() runs during
+        // dispatch, so pending/progress reflect this message before we (re)arm.
+        sample_idle_gate();
     }
 
     const std::vector<std::byte>& get_prefix() const override
@@ -471,9 +498,44 @@ private:
         if (!m_peer)
             return;
 
+        // Post-handshake liveness is governed by the idle-progress gate
+        // (sample_idle_gate) -- NOT by resetting a fixed window on every inbound
+        // byte. That reset-on-any-byte was the bug: peer chatter kept a
+        // non-progressing peer alive forever.
+        if (m_handshake_complete)
+            return;
+
         ensure_timeout_timer();
-        auto timeout = m_handshake_complete ? IDLE_TIMEOUT_SEC : CONNECT_TIMEOUT_SEC;
-        m_timeout_timer->restart(timeout);
+        m_timeout_timer->restart(CONNECT_TIMEOUT_SEC);
+    }
+
+    // Sample the idle-progress gate and arm/reset/keep/stop the eviction window.
+    // Driven from handle() (post-dispatch) and the ping tick (so a totally-silent
+    // non-progressing peer holding a pending request is still caught).
+    void sample_idle_gate()
+    {
+        if (!m_peer || !m_handshake_complete)
+            return;
+
+        const bool     pending = m_peer->has_pending();
+        const uint64_t epoch   = m_peer->progress_epoch();
+
+        // Guard-rail (integrator 2026-07-30, BCH single-peer no-op): when
+        // m_eviction_enabled is false the gate returns Stop unconditionally, so
+        // the only connection is never dropped by this path.
+        switch (m_idle_gate.evaluate(m_eviction_enabled, pending, epoch))
+        {
+            case IdleProgressGate::Action::Arm:
+            case IdleProgressGate::Action::Reset:
+                ensure_timeout_timer();
+                m_timeout_timer->restart(IDLE_TIMEOUT_SEC);
+                break;
+            case IdleProgressGate::Action::Stop:
+                stop_timeout_timer();   // synced/idle peer survives (zero pending)
+                break;
+            case IdleProgressGate::Action::KeepAsIs:
+                break;                  // chatter must NOT reset a running window
+        }
     }
 
     void timeout(const char* reason)
@@ -524,12 +586,17 @@ private:
         );
 
         m_handshake_complete = true;
-        ensure_timeout_timer();
-        m_timeout_timer->restart(IDLE_TIMEOUT_SEC);
+        m_idle_gate.reset();
+        // The idle-progress gate now owns the eviction window. Nothing is pending
+        // yet, so it stays disarmed (a synced/idle peer is never evicted); the
+        // post-dispatch sample and the ping tick below arm it once we have an
+        // outstanding request that stops making progress.
+        stop_timeout_timer();
 
         ensure_ping_timer();
         m_ping_timer->start(PING_INTERVAL_SEC, [this]() {
             send_ping();
+            sample_idle_gate();   // catch a silent, non-progressing peer
         });
 
         bool is_doge = (m_chain_label == "DOGE" || m_chain_label == "doge");
