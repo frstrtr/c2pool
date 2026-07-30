@@ -7,6 +7,7 @@
 #include <core/uint256.hpp>
 #include <core/socket.hpp>
 #include <core/reply_matcher.hpp>
+#include <cstdint>
 
 namespace btc
 {
@@ -19,6 +20,9 @@ namespace p2p
     
 class Connection
 {
+public:
+    // Per-request reply timeout. Public so the BTC-family NodeP2P idle-window
+    // static_assert can prove its 100s eviction backstop is >> this value.
     static constexpr int REQUEST_TIMEOUT_SEC = 15;
     using get_block_t = ReplyMatcher::ID<uint256>::RESPONSE<BlockType>::REQUEST<uint256>;
     using get_header_t = ReplyMatcher::ID<uint256>::RESPONSE<BlockHeaderType>::REQUEST<uint256>;
@@ -81,6 +85,27 @@ public:
             return m_socket->get_addr();
         else
             return NetService{};
+    }
+
+    // --- idle-progress eviction inputs (consumed by NodeP2P::sample_idle_gate) ---
+    // A block/header request is outstanding iff either reply matcher still has a
+    // watcher. This is the m_watchers discriminator: an evicted peer must be one
+    // we asked something of that never delivered.
+    bool has_pending() const
+    {
+        return (m_get_block  && !m_get_block->m_watchers.empty())
+            || (m_get_header && !m_get_header->m_watchers.empty());
+    }
+
+    // Monotonic count of REAL answers across both matchers. Only got_response()
+    // (a genuine peer reply) advances this; a per-request timeout does not -- so
+    // a rising epoch is FORWARD PROGRESS, not mere inbound bytes.
+    uint64_t progress_epoch() const
+    {
+        uint64_t e = 0;
+        if (m_get_block)  e += m_get_block->m_progress;
+        if (m_get_header) e += m_get_header->m_progress;
+        return e;
     }
 };
 
