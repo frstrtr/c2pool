@@ -17,6 +17,7 @@
 #include "block.hpp"
 #include "transaction.hpp"
 #include "mempool.hpp"  // compute_txid()
+#include "template_builder.hpp"  // compute_merkle_root()
 
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
@@ -238,9 +239,22 @@ inline CompactBlock BuildCompactBlock(const BlockHeaderType& header,
 /// Result of attempting to reconstruct a full block from a compact block.
 struct CompactBlockReconstructionResult {
     bool complete{false};
+    bool merkle_mismatch{false};  // reconstructed txs failed the header merkle commitment
     BlockType block;
     std::vector<uint32_t> missing_indexes;  // absolute tx indexes still needed
 };
+
+/// SHA256d merkle root over the NON-witness txids of a reconstructed tx vector.
+/// Reuses the sealed btc::coin::compute_merkle_root (template_builder.hpp) -- the
+/// SAME walk that validates mined blocks -- so a reconstruction is checked against
+/// the header commitment, NOT a second, divergent merkle path.
+inline uint256 ReconstructedMerkleRoot(const std::vector<MutableTransaction>& txs) {
+    std::vector<uint256> txids;
+    txids.reserve(txs.size());
+    for (const auto& tx : txs)
+        txids.push_back(compute_txid(tx));
+    return compute_merkle_root(txids);
+}
 
 /// Attempt to reconstruct a full block from a compact block + known transactions.
 /// @param cb        The received compact block.
@@ -308,6 +322,18 @@ inline CompactBlockReconstructionResult ReconstructBlock(
     }
 
     if (result.missing_indexes.empty()) {
+        // BIP 152 short IDs are 48-bit SipHash over wtxid; a collision can
+        // silently substitute the wrong transaction into a fully-filled slot.
+        // Before declaring the block complete, verify the reconstructed tx
+        // vector actually hashes to the header's committed merkle root (over
+        // NON-witness txids). On mismatch DISCARD and signal a getdata full-
+        // block fallback rather than deliver a forged block downstream.
+        if (ReconstructedMerkleRoot(txs) != cb.header.m_merkle_root) {
+            result.complete = false;
+            result.merkle_mismatch = true;
+            return result;   // do NOT populate result.block
+        }
+
         result.complete = true;
         static_cast<BlockHeaderType&>(result.block) = cb.header;
         result.block.m_txs = std::move(txs);
