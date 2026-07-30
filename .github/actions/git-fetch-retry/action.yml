@@ -8,7 +8,7 @@ inputs:
   retries:
     description: "Maximum attempts before the step fails."
     required: false
-    default: "5"
+    default: "3"
   initial-delay:
     description: "Seconds to wait before the first retry; doubles each attempt."
     required: false
@@ -23,7 +23,7 @@ runs:
         git config --global http.version HTTP/1.1
         git config --global http.postBuffer 524288000
         git config --global http.lowSpeedLimit 1000
-        git config --global http.lowSpeedTime 300
+        git config --global http.lowSpeedTime 20
         n=0; max="${{ inputs.retries }}"; delay="${{ inputs.initial-delay }}"
         until git fetch ${{ inputs.args }}; do
           n=$((n+1))

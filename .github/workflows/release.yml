@@ -49,6 +49,14 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Fail-fast on a stalled git HTTP transfer instead of hanging to the job
+  # timeout. Our WAN uplink stalls ~12% of codeload fetches (they neither
+  # finish nor error out); aborting a sub-1000 B/s transfer after 20s lets
+  # actions/checkout built-in 3-attempt fetch retry recover in ~1 min.
+  GIT_HTTP_LOW_SPEED_LIMIT: '1000'
+  GIT_HTTP_LOW_SPEED_TIME: '20'
+
 jobs:
   # ════════════════════════════════════════════════════════════════════════════
   # Linux x86_64 (Ubuntu 24.04, GCC 13, Conan) — one cell per coin
@@ -537,7 +545,16 @@ jobs:
       - name: Build secp256k1
         if: steps.presence.outputs.exists == '1'
         run: |
-          git clone https://github.com/bitcoin-core/secp256k1 secp256k1-src
+          # Bounded retry + shallow: survive a stalled fetch on the lossy
+          # WAN uplink (GIT_HTTP_LOW_SPEED_* aborts the stall in ~20s).
+          for ($i = 1; $i -le 3; $i++) {
+            git clone --depth 1 https://github.com/bitcoin-core/secp256k1 secp256k1-src
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($i -eq 3) { Write-Host "::error::secp256k1 clone failed after 3 attempts"; exit 1 }
+            Write-Host "::warning::secp256k1 clone attempt $i/3 stalled; retrying"
+            Remove-Item -Recurse -Force secp256k1-src -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds ($i * 5)
+          }
           cmake -B secp256k1-src/build -S secp256k1-src -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="${env:GITHUB_WORKSPACE}/secp256k1" -DSECP256K1_BUILD_TESTS=OFF -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=OFF -DSECP256K1_BUILD_BENCHMARK=OFF -DSECP256K1_BUILD_EXAMPLES=OFF
           cmake --build secp256k1-src/build --config Release
           cmake --install secp256k1-src/build --config Release
