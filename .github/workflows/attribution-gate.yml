@@ -25,10 +25,15 @@ jobs:
     name: attribution-gate
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-latest' }}
     steps:
-      - name: Checkout full history
+      - name: Checkout PR commit range (bounded fetch)
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          # Attribution scan only reads BASE_SHA..HEAD_SHA. A whole-repo
+          # unshallow (fetch-depth: 0) is the single most fragile checkout we
+          # run and reds clean PRs when a runner link drops packets. Bound the
+          # fetch to the PR own commits + merge base; the scan step keeps its
+          # git log -50 HEAD fallback if the range is unreachable.
+          fetch-depth: ${{ github.event.pull_request.commits && github.event.pull_request.commits + 1 || 50 }}
 
       - name: Scan commits + PR metadata for AI attribution
         env:
