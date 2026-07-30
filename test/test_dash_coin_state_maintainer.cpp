@@ -734,3 +734,130 @@ TEST(DashCoinStateMaintainer, StaleZeroBaseSnapshotDoesNotCorruptTipSml) {
     EXPECT_EQ(st.sml_current_hash(), raw256(0x60))
         << "post-reorg cold resync must not be blocked by the stale-guard";
 }
+
+// ========================================================================
+// PoSe validity reconciliation (SML axis -> PAYEE axis).
+//
+// A PoSe ban is CONSENSUS-driven, not transaction-driven: it never appears as
+// a special transaction, so apply_block() structurally cannot observe one. The
+// SML is the only feed that carries it. Before this wiring the two axes were
+// independent — MnStateMachine::sync_validity_from_sml() existed, was correct,
+// and had zero production callers — so the payee queue kept projecting banned
+// masternodes until a reseed.
+//
+// Live failure reproduced here (embedded mainnet, daemonless): a masternode
+// PoSe-banned at h=2513418 was still projected as the expected payee at
+// h=2513489. dashd paid the next eligible node, the coinbase cross-check
+// disagreed, bridge replay fail-closed, the masternode set was never
+// published, and every template request fell through to an unarmed dashd arm.
+// ========================================================================
+
+// The doomed masternode is seeded with the LOWEST queue key so it is the
+// unambiguous argmin: without the reconciliation it wins the payee slot.
+TEST(DashCoinStateMaintainer, PoSeBannedMnIsExcludedFromPayeeProjection) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+
+    const uint256 doomed = raw256(0x40);   // banned at h=2513418
+    const uint256 healthy = raw256(0x60);
+
+    MNState s_doomed;
+    s_doomed.isValid           = true;     // correct AT the anchor height
+    s_doomed.nRegisteredHeight = 2000000;
+    s_doomed.nLastPaidHeight   = 2511423;  // lowest -> front of the queue
+    MNState s_healthy;
+    s_healthy.isValid           = true;
+    s_healthy.nRegisteredHeight = 2000000;
+    s_healthy.nLastPaidHeight   = 2512900;
+
+    // Anchor seed at h=2513000. The ban has not happened yet, so seeding it
+    // valid is CORRECT — this is why the defect hid: the seed comes from
+    // `protx list valid true` and is right at its own height.
+    m.on_mn_list_update({{doomed, s_doomed}, {healthy, s_healthy}}, 2513000);
+
+    ASSERT_EQ(st.mnstates().find_expected_payee(), doomed)
+        << "pre-ban the doomed MN must be the argmin, or this test proves nothing";
+
+    // The SML at h=2513489 reports the ban (isValid=false). Delivered through
+    // the ordinary reception path — no manual reconciliation call.
+    CSimplifiedMNListEntry e_doomed = sml_entry(0x40);
+    e_doomed.isValid = false;
+    CSimplifiedMNListEntry e_healthy = sml_entry(0x60);
+    CSimplifiedMNListDiff d;
+    d.baseBlockHash = uint256::ZERO;
+    d.blockHash     = raw256(0xAB);
+    d.mnList = {e_doomed, e_healthy};
+    dash::coin::vendor::CCbTx cb;
+    cb.nVersion = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+    cb.nHeight  = 2513489;
+    cb.creditPoolBalance = 100'000'000LL;
+    d.cbTx.version = 3;
+    d.cbTx.type    = 5;
+    d.cbTx.extra_payload = dash::coin::encode_cbtx(cb);
+    m.on_mnlistdiff(d);
+
+    EXPECT_FALSE(st.mnstates().entries().at(doomed).isValid)
+        << "the SML's authoritative isValid must reach the payee axis";
+    EXPECT_EQ(st.mnstates().entries().at(doomed).nPoSeBanHeight, 2513489u)
+        << "ban height recorded from the SML's current height (upper bound)";
+    EXPECT_EQ(st.mnstates().find_expected_payee(), healthy)
+        << "a PoSe-banned MN must never be projected as the expected payee";
+}
+
+// Guard against this reconciliation rotting back into dead code: it asserts
+// the CALL, not the function. Removing either production call site fails here
+// even though MnStateMachine's own unit tests keep passing — which is exactly
+// how the original defect survived a green suite.
+TEST(DashCoinStateMaintainer, MnlistdiffReceptionPerformsValidityReconciliation) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+
+    const uint256 mn = raw256(0x40);
+    MNState s;
+    s.isValid           = true;
+    s.nRegisteredHeight = 2000000;
+    s.nLastPaidHeight   = 2511423;
+    m.on_mn_list_update({{mn, s}}, 2513000);
+    ASSERT_TRUE(st.mnstates().entries().at(mn).isValid);
+
+    CSimplifiedMNListEntry e = sml_entry(0x40);
+    e.isValid = false;
+    m.on_mnlistdiff(diff_with_seed(uint256::ZERO, raw256(0xCD), 2513489,
+                                   100'000'000LL, e));
+
+    EXPECT_FALSE(st.mnstates().entries().at(mn).isValid)
+        << "on_mnlistdiff must reconcile validity — no manual call may be required";
+}
+
+// Eligibility changes THROUGH the chain, so reconciliation must run on every
+// applied diff rather than once. A revival after a ban must also propagate,
+// otherwise we would under-pay a masternode that dashd has already restored.
+TEST(DashCoinStateMaintainer, ValidityReconciliationTracksRevivalOnLaterDiff) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+
+    const uint256 mn = raw256(0x40);
+    MNState s;
+    s.isValid           = true;
+    s.nRegisteredHeight = 2000000;
+    s.nLastPaidHeight   = 2511423;
+    m.on_mn_list_update({{mn, s}}, 2513000);
+
+    CSimplifiedMNListEntry banned = sml_entry(0x40);
+    banned.isValid = false;
+    m.on_mnlistdiff(diff_with_seed(uint256::ZERO, raw256(0xC1), 2513489,
+                                   100'000'000LL, banned));
+    ASSERT_FALSE(st.mnstates().entries().at(mn).isValid);
+
+    CSimplifiedMNListEntry revived = sml_entry(0x40);
+    revived.isValid = true;
+    m.on_mnlistdiff(diff_with_seed(raw256(0xC1), raw256(0xC2), 2513600,
+                                   100'000'000LL, revived));
+
+    EXPECT_TRUE(st.mnstates().entries().at(mn).isValid)
+        << "an SML revival must restore payee eligibility";
+    EXPECT_EQ(st.mnstates().entries().at(mn).nPoSeBanHeight, 0u)
+        << "revival must clear the recorded ban height";
+    EXPECT_EQ(st.mnstates().entries().at(mn).nPoSeRevivedHeight, 2513600u)
+        << "revival height feeds the queue-position key and must be recorded";
+}

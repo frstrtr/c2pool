@@ -234,10 +234,63 @@ public:
         // fetch and the first live full-block ingest were the soak's
         // 2-slot cursor lag -> bad-cb-payee at the address-group boundary).
         m_state.mnstates().load(std::move(mnstates), as_of_height);
+        // Reconcile the freshly-seeded payee axis against the SML we already
+        // hold (warm restart from SMLDb, or a seed arriving after the coin-P2P
+        // feed came up). Without this the two axes stay independent: the seed
+        // comes from `protx list valid true`, so it is correct AT its height,
+        // but any PoSe state the SML already knows about is not reflected.
+        // Idempotent and O(|SML|); a no-op when no SML is loaded yet.
+        reconcile_mn_validity("seed");
         if (!m_have_mn)
             demote();
         else
             republish();
+    }
+
+    /// Join the SML axis to the PAYEE axis: push the SML's authoritative
+    /// per-entry `isValid` into MnStateMachine so PoSe-banned masternodes are
+    /// excluded from the payment queue.
+    ///
+    /// WHY THIS EXISTS AS A CALL AND NOT AS LOGIC: MnStateMachine already
+    /// filters on `isValid` when projecting a payee, and
+    /// MnStateMachine::sync_validity_from_sml() already implements the
+    /// reconciliation correctly (both flip directions, ban/revive heights,
+    /// precedence of a precise tx-derived height over the SML approximation).
+    /// It simply had NO production caller, so the payee axis never learned
+    /// about a ban and kept projecting banned nodes until a reseed.
+    ///
+    /// That gap is not observable through apply_block(): a PoSe ban is
+    /// CONSENSUS-DRIVEN, not transaction-driven. It never appears as a special
+    /// transaction, so no amount of block folding can see it. The SML is the
+    /// only feed that carries it, which is why the join has to happen here.
+    ///
+    /// Live failure this closes (embedded mainnet, daemonless): a masternode
+    /// PoSe-banned at h=2513418 was still projected as the expected payee at
+    /// h=2513489. dashd paid the next eligible node, the coinbase cross-check
+    /// disagreed, the bridge replay fail-closed, the masternode set was never
+    /// published, per-template viability never passed, and every template
+    /// request fell through to an unarmed dashd arm. One uncalled function.
+    void reconcile_mn_validity(const char* reason) {
+        if (m_state.sml().mnList.empty())
+            return;
+        // Height the SML is current at, taken from the diff's own cbTx
+        // (authoritative off the wire). Only an upper bound for an implicit
+        // ban, which sync_validity_from_sml() accounts for — it will not
+        // overwrite a precise tx-derived height with this one.
+        if (m_sml_current_height == 0)
+            return;
+        auto r = m_state.mnstates().sync_validity_from_sml(
+            m_state.sml(), m_sml_current_height);
+        // Log only when something actually changed. A flip is rare (bans and
+        // revivals are), so a silent pass here is the expected steady state
+        // and logging every diff would bury the interesting case.
+        if (r.flipped_to_invalid || r.flipped_to_valid) {
+            LOG_INFO << "[MNS-SM] PoSe validity reconciled from SML ("
+                     << reason << ") @h=" << m_sml_current_height
+                     << ": -" << r.flipped_to_invalid << " banned, +"
+                     << r.flipped_to_valid << " revived (scanned "
+                     << r.scanned << ", matched " << r.matched << ")";
+        }
     }
 
     /// Reception path (mnlistdiff, SML axis — DAEMONLESS CCbTx source): apply a
@@ -413,6 +466,11 @@ public:
         // (NodeCoinState::make_embedded_work_inputs) compares this to the tip
         // we build on, and the next incremental diff's base must match it.
         m_state.set_sml_current_hash(diff.blockHash);
+        // Join the SML axis to the payee axis on EVERY applied diff. This has
+        // to run per-diff, not once at seed: masternode eligibility changes
+        // through the chain, so a set filtered once and reused would go stale
+        // exactly the way the unreconciled seed did.
+        reconcile_mn_validity("diff");
         LOG_INFO << "[SML] applied diff: SML +" << sml_r.added_or_updated
                  << " -" << sml_r.deleted << " => " << m_state.sml().size()
                  << " MNs; quorums +" << q_added << " -" << q_deleted
