@@ -638,7 +638,13 @@ private:
                  << " height=" << m_peer_start_height << ")";
 
         ensure_timeout_timer();
-        m_timeout_timer->restart(IDLE_TIMEOUT_SEC);
+        // Rebind the timeout reason at handshake completion: post-handshake
+        // expiries are idle timeouts, not the "handshake timeout" armed in
+        // connected(). start() re-sets m_handler, and on_activity()'s restart()
+        // reuses it — so idle expiries now log the correct reason.
+        m_timeout_timer->start(IDLE_TIMEOUT_SEC, [this]() {
+            timeout("idle timeout");
+        });
 
         ensure_ping_timer();
         m_ping_timer->start(PING_INTERVAL_SEC, [this]() {
@@ -715,6 +721,12 @@ private:
 
     ADD_P2P_HANDLER(headers)
     {
+        // CP1 parse: a complete `headers` message was framed and parsed — log
+        // the batch count + wire payload size. Fires only per successfully
+        // parsed message, so a stall upstream of parse stays silent here.
+        LOG_INFO << "[" << m_chain_label << "] CP1 parse headers: batch="
+                 << msg->m_headers.size()
+                 << " payload_bytes=" << pack(msg->m_headers).size();
         // E2a: BlockType now round-trips the wire `headers` layout (each entry
         // is an 80-byte header + CompactSize(0) tx-count), so multi-entry
         // getheaders-driven batches deserialize correctly. The new_headers event

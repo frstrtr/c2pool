@@ -409,6 +409,16 @@ public:
         }
         if (last_ptc.fired && m_on_tip_changed)
             m_on_tip_changed(last_ptc.old_tip, last_ptc.old_height, last_ptc.new_tip, last_ptc.new_height, last_ptc.was_reorg);
+        // CP2 validate: received vs accepted. accepted==0 on a non-empty batch
+        // is the Q3 silent-reject corner — with a checkpoint configured the
+        // genesis stub is not seeded, so headers served from block 1 orphan-
+        // reject invisibly. Log the first header's prev hash so orphan-vs-PoW
+        // is distinguishable.
+        LOG_INFO << "[DASH] CP2 validate add_headers: received=" << headers.size()
+                 << " accepted=" << accepted;
+        if (accepted == 0 && !headers.empty())
+            LOG_INFO << "[DASH] CP2 validate: accepted==0 first_prev_block="
+                     << headers.front().m_previous_block.GetHex();
         return accepted;
     }
 
@@ -680,7 +690,14 @@ private:
             uint8_t((h >> 24) & 0xFF), uint8_t((h >> 16) & 0xFF),
             uint8_t((h >> 8) & 0xFF), uint8_t(h & 0xFF)};
         batch.put("height", height_data);
-        if (batch.commit_sync())
+        size_t written = m_dirty_headers.size();
+        bool ok = batch.commit_sync();
+        // CP3 persist: entries written + LevelDB write status, so a flush that
+        // silently fails (headers accepted but never durable across restart)
+        // becomes visible.
+        LOG_INFO << "[EMB-DASH] CP3 persist flush_dirty: entries=" << written
+                 << " leveldb_status=" << (ok ? "OK" : "FAILED");
+        if (ok)
             m_dirty_headers.clear();
     }
 
