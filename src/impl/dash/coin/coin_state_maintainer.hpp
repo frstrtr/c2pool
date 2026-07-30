@@ -234,6 +234,24 @@ public:
         // fetch and the first live full-block ingest were the soak's
         // 2-slot cursor lag -> bad-cb-payee at the address-group boundary).
         m_state.mnstates().load(std::move(mnstates), as_of_height);
+        // Startup / reseed join (2026-07-30): the PAYEE axis was just (re)seeded
+        // -- reconcile it against an already-present SML so a warm-loaded or
+        // live-advanced SML's authoritative isValid lands on the fresh queue
+        // immediately, without waiting for the next mnlistdiff. Handles the
+        // seed-arrives-after-SML startup ordering (mirror of the on_mnlistdiff
+        // reconcile, which handles SML-arrives-after-seed). No-op when no SML has
+        // applied yet (m_have_mn_sml false) or nothing flipped. Height falls back
+        // to the seed's as_of_height when no live diff has set m_sml_current_height.
+        if (m_have_mn && m_have_mn_sml) {
+            const uint32_t vh = m_sml_current_height ? m_sml_current_height
+                                                     : as_of_height;
+            const auto vr = m_state.mnstates().sync_validity_from_sml(
+                m_state.sml(), vh);
+            if (vr.flipped_to_invalid || vr.flipped_to_valid)
+                LOG_INFO << "[SML->PAYEE] seed reconcile: -"
+                         << vr.flipped_to_invalid << " banned +"
+                         << vr.flipped_to_valid << " revived @ h=" << vh;
+        }
         if (!m_have_mn)
             demote();
         else
@@ -418,6 +436,30 @@ public:
                  << " MNs; quorums +" << q_added << " -" << q_deleted
                  << " => " << m_state.qmgr().active_count()
                  << " active; have_sml=" << (m_have_mn_sml ? "yes" : "no");
+
+        // -- PAYEE-axis validity reconcile (Bug 12/14 wiring, 2026-07-30) ------
+        // The SML just advanced and carries the AUTHORITATIVE per-MN isValid.
+        // PoSe bans are CONSENSUS-driven, not tx-driven, so apply_block() can
+        // NEVER observe them -- the PAYEE MnStateMachine keeps a phantom-eligible
+        // banned MN as isValid=true forever and find_expected_payee determinist-
+        // ically projects it (daemonless payee-desync, live-observed ~h2513489).
+        // sync_validity_from_sml() is the reconciler that fixes exactly this and
+        // was DEAD CODE (zero production callers) until this line. It reconciles
+        // the BOOLEAN off the freshly-applied SML (ban/revive heights stay SML-
+        // approximate, bounded by m_sml_current_height -- see the function's
+        // field-ownership contract) and early-continues on entries whose isValid
+        // did NOT flip, so queue POSITION for unchanged nodes is never perturbed.
+        // Guarded on a non-empty SML (an empty set is a gap, handled below).
+        if (m_have_mn_sml) {
+            const auto vr = m_state.mnstates().sync_validity_from_sml(
+                m_state.sml(), m_sml_current_height);
+            if (vr.flipped_to_invalid || vr.flipped_to_valid)
+                LOG_INFO << "[SML->PAYEE] validity reconcile: -"
+                         << vr.flipped_to_invalid << " banned +"
+                         << vr.flipped_to_valid << " revived (scanned "
+                         << vr.scanned << ", matched " << vr.matched
+                         << ") @ h=" << m_sml_current_height;
+        }
         // SML/quorum persistence (SMLDb/QuorumDb): the applied state is now
         // current AT diff.blockHash — flush it so a restart resumes from this
         // tip incrementally instead of a cold mnlistdiff(zero, tip). Only when
