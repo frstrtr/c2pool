@@ -142,16 +142,38 @@ jobs:
             --build=missing \
             --output-folder=build_${{ matrix.coin }}
 
+      # DASH cell only: build/reuse the pinned dashbls prefix and export
+      # DASHBLS_ROOT, so the configure below links the REAL BLS12-381 verifier.
+      # Without this the packaged c2pool-dash carries the fail-closed stub and
+      # can never serve a real type-6 quorum commitment in the field.
+      - name: Provision dashbls (DASH only)
+        if: steps.presence.outputs.exists == '1' && matrix.coin == 'dash'
+        uses: ./.github/actions/provision-dashbls
+
       - name: Configure
         if: steps.presence.outputs.exists == '1'
         run: |
+          # Per-coin extra flags. A case, not `[ ... ] && VAR=`, because the
+          # step runs under `bash -e` and a false test on the last line would
+          # fail the step.
+          #
           # DGB ships the -DAUX_DOGE=ON build: DGB parent + embedded DOGE aux as ONE
-          # binary, the direct parallel to c2pool-ltc carrying DOGE. Gated to the dgb
-          # cell; inert for the other coins. Merged-mining path per #603/#614/#589/#395.
+          # binary, the direct parallel to c2pool-ltc carrying DOGE. Merged-mining
+          # path per #603/#614/#589/#395.
+          #
+          # DASH ships -DC2POOL_DASH_BLS=ON: the E1 Phase-L quorum-commitment
+          # verifier linked against dash's own dashbls at the pinned tag. The
+          # option is a HARD requirement -- cmake FATAL_ERRORs when the library
+          # is missing -- so this cell cannot quietly package a BLS-dark binary.
+          EXTRA=""
+          case "${{ matrix.coin }}" in
+            dgb)  EXTRA="-DAUX_DOGE=ON" ;;
+            dash) EXTRA="-DC2POOL_DASH_BLS=ON -DDASHBLS_ROOT=$DASHBLS_ROOT" ;;
+          esac
           cmake -S . -B build_${{ matrix.coin }} \
             -DCMAKE_TOOLCHAIN_FILE=build_${{ matrix.coin }}/conan_toolchain.cmake \
             -DCMAKE_BUILD_TYPE=Release \
-            ${{ matrix.coin == 'dgb' && '-DAUX_DOGE=ON' || '' }}
+            $EXTRA
 
       # Boost header-integrity + version gate: a torn/mixed Boost tree or an
       # apt-Boost fallback fails HERE (fast, one TU), not deep in the coin
@@ -172,6 +194,12 @@ jobs:
           BIN=build_${{ matrix.coin }}/src/c2pool/c2pool-${{ matrix.coin }}
           file "$BIN"
           "$BIN" --help 2>&1 | head -5 || true
+
+      # Positive assertion on the ARTEFACT, not on the flags: the freshly built
+      # (unstripped) c2pool-dash must actually carry the dashbls backend.
+      - name: BLS link guard (pre-strip)
+        if: steps.presence.outputs.exists == '1' && matrix.coin == 'dash'
+        run: bash scripts/ci/dash_bls_linked_guard.sh build_dash/src/c2pool/c2pool-dash
 
       - name: Package
         if: steps.presence.outputs.exists == '1'
@@ -202,6 +230,26 @@ jobs:
           cp -r web-static/* "${PKG}/web-static/"
           cp explorer/explorer.py "${PKG}/explorer/"
           tar czf "${PKG}.tar.gz" "${PKG}/"
+
+      # ...and again on the STRIPPED binary that is actually inside the tarball
+      # users download. The rodata leg of the guard survives strip, so this is a
+      # true end-of-pipeline check rather than a restatement of the one above:
+      # it would catch a packaging step that copied the wrong build tree.
+      - name: BLS link guard (packaged artefact)
+        if: steps.presence.outputs.exists == '1' && matrix.coin == 'dash'
+        run: |
+          PKG="c2pool-dash-${{ steps.ver.outputs.version }}-linux-x86_64"
+          bash scripts/ci/dash_bls_linked_guard.sh "${PKG}/c2pool-dash"
+          # libdashbls.a is static, but relic's ARITH backend is gmp, which
+          # resolves to the SHARED libgmp.so.10 -- a runtime dependency the
+          # BLS-off build did not have. The generic ldd bundling loop above
+          # picks it up; assert it, in the same shape as the libsecp256k1
+          # tripwire, so a dash tarball can never ship DOA on a host without
+          # libgmp.
+          case "$(ls "${PKG}/lib/")" in
+            *libgmp.so*) echo "  ok   libgmp bundled" ;;
+            *) echo "PKG-ASSERT FAIL: libgmp not bundled in ${PKG}/lib (BLS build needs it)"; exit 1 ;;
+          esac
 
       - name: Upload package
         if: steps.presence.outputs.exists == '1'

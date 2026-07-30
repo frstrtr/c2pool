@@ -117,14 +117,25 @@ endif()
 # (dash_bls_verify) + its KAT consume it, never the shared core the Windows
 # main_ltc launcher builds ([[reference_windows_ci_conan_flake]]: Windows CI
 # builds only the LTC launcher, so DASH-only BLS code cannot break it). When the
-# option is OFF (default) or the library is not found, dash_bls_verify compiles a
-# fail-closed stub and the DKG-window serve path keeps the pre-Phase-L
-# null-commitment posture exactly — no dashbls dependency enters any build.
+# option is OFF (the default), dash_bls_verify compiles a fail-closed stub and
+# the DKG-window serve path keeps the pre-Phase-L null-commitment posture
+# exactly — no dashbls dependency enters any build. Turning the option ON and
+# NOT finding the library is an error, not a fallback (see below).
 #
 # Build the library once for the CI factory with scripts/build_dashbls.sh (builds
 # dash's OWN src/dashbls subtree at the v23.1.7 tag — byte-identical to dashd);
 # point cmake at it with -DDASHBLS_ROOT=<prefix>.
+#
+# ASKING FOR BLS IS A HARD REQUIREMENT. -DC2POOL_DASH_BLS=ON with the library
+# missing used to WARN and fall back to the stub, so the build stayed green and
+# shipped a BLS-dark binary that is indistinguishable from a real-BLS one until
+# it silently null-serves a DKG-window height in production. That failure mode is
+# now a configure-time FATAL_ERROR: OFF (the default) is the supported way to
+# build without BLS, and ON means the caller has asserted the backend must be
+# linked. Set -DC2POOL_DASH_BLS_OPTIONAL=ON to restore the old warn-and-degrade
+# behaviour for a local probe build (never in CI or release).
 option(C2POOL_DASH_BLS "Link dashbls (BLS12-381) for E1 Phase-L real quorum-commitment verify" OFF)
+option(C2POOL_DASH_BLS_OPTIONAL "Downgrade a missing dashbls under C2POOL_DASH_BLS=ON from FATAL_ERROR to a warning (local probe builds only)" OFF)
 set(C2POOL_DASH_BLS_AVAILABLE OFF)
 if(C2POOL_DASH_BLS)
     # Honour a DASHBLS_ROOT hint (the build-factory install prefix), else search
@@ -156,9 +167,22 @@ if(C2POOL_DASH_BLS)
         message(STATUS "dashbls found (E1 Phase-L BLS verify ENABLED): ${DASHBLS_LIB}")
         message(STATUS "dashbls includes: ${DASHBLS_INCLUDE_DIR}")
     else()
-        message(WARNING "C2POOL_DASH_BLS=ON but dashbls not found "
-            "(need dashbls + relic + gmp; run scripts/build_dashbls.sh and pass "
-            "-DDASHBLS_ROOT=<prefix>). Falling back to fail-closed null-serve.")
+        set(_dashbls_miss
+            "C2POOL_DASH_BLS=ON but the dashbls backend was NOT found, so "
+            "dash_bls_verify would compile the fail-closed stub and the binary "
+            "would ship BLS-dark while the build stayed green.\n"
+            "  dashbls/bls.hpp : ${DASHBLS_INCLUDE_DIR}\n"
+            "  libdashbls      : ${DASHBLS_LIB}\n"
+            "  libgmp          : ${DASHBLS_GMP_LIB}\n"
+            "Build the library with scripts/build_dashbls.sh <prefix> (needs "
+            "autoconf/automake/libtool/libgmp-dev) and re-configure with "
+            "-DDASHBLS_ROOT=<prefix>, or build with C2POOL_DASH_BLS=OFF (the "
+            "default) to keep the documented null-serve posture.")
+        if(C2POOL_DASH_BLS_OPTIONAL)
+            message(WARNING ${_dashbls_miss})
+        else()
+            message(FATAL_ERROR ${_dashbls_miss})
+        endif()
     endif()
 endif()
 
