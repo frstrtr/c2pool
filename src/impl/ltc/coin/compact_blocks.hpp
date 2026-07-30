@@ -238,9 +238,34 @@ inline CompactBlock BuildCompactBlock(const BlockHeaderType& header,
 /// Result of attempting to reconstruct a full block from a compact block.
 struct CompactBlockReconstructionResult {
     bool complete{false};
+    bool merkle_mismatch{false};  // reconstructed txs failed the header Merkle check -> DISCARD, never deliver
     BlockType block;
     std::vector<uint32_t> missing_indexes;  // absolute tx indexes still needed
 };
+
+/// Compute the SHA256d Merkle root over a block's transaction vector (txid-based).
+/// Mirrors template_builder::compute_merkle_root; kept self-contained here so this
+/// lightweight wire header need not pull the heavy template_builder include chain.
+inline uint256 ComputeTxMerkleRoot(const std::vector<MutableTransaction>& txs) {
+    if (txs.empty()) return uint256::ZERO;
+    std::vector<uint256> hashes;
+    hashes.reserve(txs.size());
+    for (const auto& tx : txs)
+        hashes.push_back(compute_txid(tx));
+    while (hashes.size() > 1) {
+        if (hashes.size() & 1u)
+            hashes.push_back(hashes.back());  // duplicate last for odd count
+        std::vector<uint256> next;
+        next.reserve(hashes.size() / 2);
+        for (size_t i = 0; i < hashes.size(); i += 2) {
+            auto sl = std::span<const uint8_t>(hashes[i].data(),     32);
+            auto sr = std::span<const uint8_t>(hashes[i + 1].data(), 32);
+            next.push_back(Hash(sl, sr));
+        }
+        hashes = std::move(next);
+    }
+    return hashes[0];
+}
 
 /// Attempt to reconstruct a full block from a compact block + known transactions.
 /// @param cb        The received compact block.
@@ -308,6 +333,16 @@ inline CompactBlockReconstructionResult ReconstructBlock(
     }
 
     if (result.missing_indexes.empty()) {
+        // BIP 152: a filled short-ID slot is NOT proof of correctness. Short IDs are
+        // 48-bit SipHash, so a collision can silently substitute the wrong tx. The
+        // header Merkle root is the ONLY backstop (Core tolerates mempool-based
+        // reconstruction only because of it) -- verify BEFORE delivery, and on
+        // mismatch DISCARD so the caller falls back to a full getdata/getblocktxn.
+        if (ComputeTxMerkleRoot(txs) != cb.header.m_merkle_root) {
+            result.complete = false;
+            result.merkle_mismatch = true;
+            return result;
+        }
         result.complete = true;
         static_cast<BlockHeaderType&>(result.block) = cb.header;
         result.block.m_txs = std::move(txs);
