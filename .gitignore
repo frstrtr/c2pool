@@ -160,7 +160,14 @@ SHA256SUMS
 CLAUDE.md
 
 external-logs/
-tools/
+# tools/ holds build artifacts (ignored) EXCEPT the DASH masternode-set
+# checkpoint generator, which is tracked release source: the checkpoints
+# README + .inc headers instruct operators to run it at release time (#955).
+tools/*
+!tools/dash/
+tools/dash/*
+!tools/dash/gen_mn_checkpoint.py
+!tools/dash/test_gen_mn_checkpoint.py
 
 # CMake out-of-source build trees (any name starting with `build-`).
 # Catches build-spv/, build-qt/, build-relwithdebinfo/, etc.
