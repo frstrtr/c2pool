@@ -17,7 +17,7 @@ on:
   push:
     branches: [master, btc-embedded, dash-spv-embedded, dgb/pool-pillars-port, windows-build, service-update]
   pull_request:
-    branches: [master, btc-embedded, dash-spv-embedded, dgb/slice4-skeleton, dgb/pool-pillars-port]
+    branches: [btc-embedded, dash-spv-embedded, dgb/slice4-skeleton, dgb/pool-pillars-port]
 
 # Concurrency: a newer run on the same ref cancels the stale in-progress
 # one, cutting concurrent load on the shared self-hosted pool (the OOM/

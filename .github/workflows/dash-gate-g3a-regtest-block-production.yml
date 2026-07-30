@@ -27,7 +27,7 @@ on:
   push:
     branches: [master, dash-spv-embedded]
   pull_request:
-    branches: [master, dash-spv-embedded]
+    branches: [dash-spv-embedded]
 
 jobs:
   g3a-regtest-block-production:

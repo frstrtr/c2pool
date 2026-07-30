@@ -18,8 +18,6 @@ on:
   workflow_call:
   push:
     branches: [master]
-  pull_request:
-    branches: [master]
 
 jobs:
   dgb-phase-b-smoke:
