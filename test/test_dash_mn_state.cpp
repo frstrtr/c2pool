@@ -1059,3 +1059,59 @@ TEST(DashMnState, SyncValidityFromSmlIdempotentAndSmlOnly) {
     EXPECT_EQ(r2.sml_only, 1u);
     EXPECT_EQ(r2.matched, 0u);
 }
+
+
+// --------------------------------------------------------------------------
+// Bug 14 selection-path guard. nPoSeBanHeight is write-only when picking a
+// payee, so a divergent persisted snapshot (isValid==true alongside a live
+// ban height -- reachable after a consensus PoSe ban that never appears as a
+// special tx) must be fail-closed OUT of BOTH selection scans, never paid on
+// the boolean alone. Pairs with the maintainer caller-guard tests
+// (MnlistdiffBanReconcilesOntoPayeeAxis / SeedReconcileAppliesAlreadyPresentSmlBan)
+// that prove sync_validity_from_sml() keeps a production caller.
+// --------------------------------------------------------------------------
+TEST(DashMnState, SelectionGuardExcludesValidButBannedSnapshot) {
+    MnStateMachine m;
+    uint256 banned = raw256_byte(0, 0x0A);
+    uint256 clean  = raw256_byte(0, 0x0B);
+
+    MNState sb; sb.isValid = true; sb.nRegisteredHeight = 2400000;
+    sb.nPoSeBanHeight = 2513418;               // live ban, yet bool left true
+    sb.scriptPayout.m_data = script_bytes(0x76, 25);
+
+    MNState sc; sc.isValid = true; sc.nRegisteredHeight = 2400001;
+    sc.nPoSeBanHeight = 0;                      // genuinely valid
+    sc.scriptPayout.m_data = script_bytes(0x77, 25);
+
+    m.load(std::vector<std::pair<uint256, MNState>>{{banned, sb}, {clean, sc}});
+
+    // find_expected_payee must skip the banned snapshot and pick the clean MN.
+    auto exp = m.find_expected_payee();
+    ASSERT_TRUE(exp.has_value());
+    EXPECT_EQ(*exp, clean);
+
+    // pick_paid_mn on the banned MN's own script must refuse it outright...
+    EXPECT_FALSE(m.pick_paid_mn(sb.scriptPayout.m_data).has_value());
+    // ...but still serve the clean MN on its script.
+    auto pk = m.pick_paid_mn(sc.scriptPayout.m_data);
+    ASSERT_TRUE(pk.has_value());
+    EXPECT_EQ(*pk, clean);
+}
+
+// The -1 / UINT32_MAX "never banned" sentinel must NOT read as a live ban --
+// the guard normalizes it exactly as the height scoring does.
+TEST(DashMnState, SelectionGuardTreatsSentinelBanHeightAsNeverBanned) {
+    MnStateMachine m;
+    uint256 h = raw256_byte(0, 0x0C);
+    MNState s; s.isValid = true; s.nRegisteredHeight = 2400000;
+    s.nPoSeBanHeight = 0xFFFFFFFFu;            // dashd protx -1 sentinel
+    s.scriptPayout.m_data = script_bytes(0x78, 25);
+    m.load(std::vector<std::pair<uint256, MNState>>{{h, s}});
+
+    auto exp = m.find_expected_payee();
+    ASSERT_TRUE(exp.has_value());
+    EXPECT_EQ(*exp, h);
+    auto pk = m.pick_paid_mn(s.scriptPayout.m_data);
+    ASSERT_TRUE(pk.has_value());
+    EXPECT_EQ(*pk, h);
+}

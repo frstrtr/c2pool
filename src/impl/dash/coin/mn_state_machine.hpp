@@ -254,6 +254,20 @@ public:
         int best_h = std::numeric_limits<int>::max();
         for (const auto& [hash, st] : m_entries) {
             if (!st.isValid) continue;
+            // Bug 14 guard: nPoSeBanHeight is write-only on the selection
+            // path, so a divergent persisted snapshot could carry
+            // isValid==true alongside a live ban height and pay a banned MN
+            // on the boolean alone. Reconciled invariant: isValid==true =>
+            // ban height clear (0, or the -1/UINT32_MAX never-banned
+            // sentinel). Fail-closed (a crash here would kill the daemonless
+            // payee projection outright, worse than a skip) with a logged
+            // warning so the invariant violation is never silent.
+            if (sane(st.nPoSeBanHeight) != 0) {
+                LOG_INFO << "[MNS] fail-closed: valid MN " << hash.GetHex().substr(0,16)
+                         << " carries live PoSe banHeight=" << st.nPoSeBanHeight
+                         << " (divergent snapshot) -- excluded from selection";
+                continue;
+            }
             if (st.scriptPayout.m_data != script) continue;
             uint32_t lastPaid = sane(st.nLastPaidHeight);
             uint32_t revived  = sane(st.nPoSeRevivedHeight);
@@ -348,6 +362,14 @@ public:
         };
         for (const auto& [hash, st] : m_entries) {
             if (!st.isValid) continue;
+            // Bug 14 guard (see pick_paid_mn): fail-closed on the write-only
+            // ban field so a divergent snapshot cannot project a banned MN.
+            if (sane_height(st.nPoSeBanHeight) != 0) {
+                LOG_INFO << "[MNS] fail-closed: valid MN " << hash.GetHex().substr(0,16)
+                         << " carries live PoSe banHeight=" << st.nPoSeBanHeight
+                         << " (divergent snapshot) -- excluded from projection";
+                continue;
+            }
             uint32_t lastPaid = sane_height(st.nLastPaidHeight);
             uint32_t revived  = sane_height(st.nPoSeRevivedHeight);
             int h = static_cast<int>(lastPaid);
