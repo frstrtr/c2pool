@@ -141,17 +141,23 @@ jobs:
         if: runner.environment != 'github-hosted'
         run: rm -rf build_ci
 
-      - name: Conan install
+      # Conan prime: the ONLY step here that reaches out to conancenter. A
+      # bounded retry+backoff absorbs a transient DNS/CDN blip and populates the
+      # local cache for any genuinely-new or cache-evicted dep. Every step below
+      # runs --no-remote (-nr) and cannot be reddened by a conancenter outage
+      # once the cache is primed.
+      - name: Conan prime (only conancenter egress)
         run: |
-          # Bounded retry: remote package downloads are the only network step
-          # left here; a transient CDN/remote hiccup must not red a good PR.
           for attempt in 1 2 3; do
             if conan install . -pr:a=ci/conan/linux-gcc13.profile --build=missing --output-folder=build_ci; then exit 0; fi
-            echo "conan install failed (attempt $attempt/3); retrying in $((attempt * 15))s"
+            echo "conan prime failed (attempt $attempt/3); retrying in $((attempt * 15))s"
             sleep $((attempt * 15))
           done
-          echo "conan install failed after 3 attempts" >&2
+          echo "conan prime failed after 3 attempts" >&2
           exit 1
+
+      - name: Conan install (offline; --no-remote)
+        run: conan install . -pr:a=ci/conan/linux-gcc13.profile --build=missing --output-folder=build_ci -nr
 
       - name: Configure
         run: cmake -S . -B build_ci -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCOIN_DGB=ON
@@ -317,17 +323,20 @@ jobs:
         if: runner.environment != 'github-hosted'
         run: rm -rf build_asan
 
-      - name: Conan install
+      # Conan prime: the ONLY step here that reaches out to conancenter; bounded
+      # retry+backoff warms the cache, the install below runs --no-remote.
+      - name: Conan prime (only conancenter egress)
         run: |
-          # Bounded retry: remote package downloads are the only network step
-          # left here; a transient CDN/remote hiccup must not red a good PR.
           for attempt in 1 2 3; do
             if conan install . --build=missing --output-folder=build_asan --settings=build_type=Release; then exit 0; fi
-            echo "conan install failed (attempt $attempt/3); retrying in $((attempt * 15))s"
+            echo "conan prime failed (attempt $attempt/3); retrying in $((attempt * 15))s"
             sleep $((attempt * 15))
           done
-          echo "conan install failed after 3 attempts" >&2
+          echo "conan prime failed after 3 attempts" >&2
           exit 1
+
+      - name: Conan install (offline; --no-remote)
+        run: conan install . --build=missing --output-folder=build_asan --settings=build_type=Release -nr
 
       - name: Configure (Release + AsAN + UBSan)
         # NOTE 1: must match the build_type passed to `conan install` (Release).
@@ -478,17 +487,20 @@ jobs:
         if: runner.environment != 'github-hosted'
         run: rm -rf build_bch
 
-      - name: Conan install
+      # Conan prime: the ONLY step here that reaches out to conancenter; bounded
+      # retry+backoff warms the cache, the install below runs --no-remote.
+      - name: Conan prime (only conancenter egress)
         run: |
-          # Bounded retry: remote package downloads are the only network step
-          # left here; a transient CDN/remote hiccup must not red a good PR.
           for attempt in 1 2 3; do
             if conan install . --build=missing --output-folder=build_bch --settings=build_type=Release; then exit 0; fi
-            echo "conan install failed (attempt $attempt/3); retrying in $((attempt * 15))s"
+            echo "conan prime failed (attempt $attempt/3); retrying in $((attempt * 15))s"
             sleep $((attempt * 15))
           done
-          echo "conan install failed after 3 attempts" >&2
+          echo "conan prime failed after 3 attempts" >&2
           exit 1
+
+      - name: Conan install (offline; --no-remote)
+        run: conan install . --build=missing --output-folder=build_bch --settings=build_type=Release -nr
 
       - name: Configure (-DCOIN_BCH=ON)
         run: cmake -S . -B build_bch -DCMAKE_TOOLCHAIN_FILE=build_bch/conan_toolchain.cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCOIN_BCH=ON
@@ -608,17 +620,20 @@ jobs:
         if: runner.environment != 'github-hosted'
         run: rm -rf build_bch_asan
 
-      - name: Conan install
+      # Conan prime: the ONLY step here that reaches out to conancenter; bounded
+      # retry+backoff warms the cache, the install below runs --no-remote.
+      - name: Conan prime (only conancenter egress)
         run: |
-          # Bounded retry: remote package downloads are the only network step
-          # left here; a transient CDN/remote hiccup must not red a good PR.
           for attempt in 1 2 3; do
             if conan install . --build=missing --output-folder=build_bch_asan --settings=build_type=Release; then exit 0; fi
-            echo "conan install failed (attempt $attempt/3); retrying in $((attempt * 15))s"
+            echo "conan prime failed (attempt $attempt/3); retrying in $((attempt * 15))s"
             sleep $((attempt * 15))
           done
-          echo "conan install failed after 3 attempts" >&2
+          echo "conan prime failed after 3 attempts" >&2
           exit 1
+
+      - name: Conan install (offline; --no-remote)
+        run: conan install . --build=missing --output-folder=build_bch_asan --settings=build_type=Release -nr
 
       - name: Configure (Release + AsAN + UBSan, -DCOIN_BCH=ON)
         run: |
@@ -1254,8 +1269,19 @@ jobs:
         if: runner.environment != 'github-hosted'
         run: rm -rf build_dgb_auxdoge
 
-      - name: Conan install
-        run: conan install . --build=missing --output-folder=build_dgb_auxdoge --settings=build_type=Release
+      # Conan prime: only conancenter egress; the install below runs --no-remote.
+      - name: Conan prime (only conancenter egress)
+        run: |
+          for attempt in 1 2 3; do
+            if conan install . --build=missing --output-folder=build_dgb_auxdoge --settings=build_type=Release; then exit 0; fi
+            echo "conan prime failed (attempt $attempt/3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          echo "conan prime failed after 3 attempts" >&2
+          exit 1
+
+      - name: Conan install (offline; --no-remote)
+        run: conan install . --build=missing --output-folder=build_dgb_auxdoge --settings=build_type=Release -nr
 
       - name: Configure (-DCOIN_DGB=ON -DAUX_DOGE=ON)
         run: cmake -S . -B build_dgb_auxdoge -DCMAKE_TOOLCHAIN_FILE=build_dgb_auxdoge/conan_toolchain.cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCOIN_DGB=ON -DAUX_DOGE=ON
