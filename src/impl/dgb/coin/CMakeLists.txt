@@ -30,6 +30,8 @@ set(dgb_coin_interface
     embedded_coinbase_value.hpp
     embedded_coin_node.hpp
     embedded_tx_select.hpp embedded_tx_select.cpp
+    chain_seeds.hpp
+    coin_peer_manager.hpp
 )
 
 add_library(dgb_coin ${dgb_coin_interface} ${dgb_coin_impl})
