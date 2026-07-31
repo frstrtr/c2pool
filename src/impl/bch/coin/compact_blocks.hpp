@@ -28,6 +28,7 @@
 #include "block.hpp"
 #include "transaction.hpp"
 #include "mempool.hpp"  // compute_txid()
+#include "merkle.hpp"   // compute_merkle_root() -- sealed consensus merkle SSOT
 
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
@@ -250,9 +251,23 @@ inline CompactBlock BuildCompactBlock(const BlockHeaderType& header,
 /// Result of attempting to reconstruct a full block from a compact block.
 struct CompactBlockReconstructionResult {
     bool complete{false};
+    bool merkle_mismatch{false};  // reconstructed txs failed the header merkle commitment
     BlockType block;
     std::vector<uint32_t> missing_indexes;  // absolute tx indexes still needed
 };
+
+/// SHA256d merkle root over the txids of a reconstructed tx vector, via the
+/// sealed bch::coin::compute_merkle_root (merkle.hpp) -- the SAME walk the GBT
+/// template builder and emit_full_block use, so a reconstruction is checked
+/// against the header commitment through ONE implementation, not a divergent
+/// second merkle path. BCH has no wtxid (no SegWit): txids ARE the merkle leaves.
+inline uint256 ReconstructedMerkleRoot(const std::vector<MutableTransaction>& txs) {
+    std::vector<uint256> txids;
+    txids.reserve(txs.size());
+    for (const auto& tx : txs)
+        txids.push_back(compute_txid(tx));
+    return compute_merkle_root(txids);
+}
 
 /// Attempt to reconstruct a full block from a compact block + known transactions.
 /// @param cb        The received compact block.
@@ -321,6 +336,17 @@ inline CompactBlockReconstructionResult ReconstructBlock(
     }
 
     if (result.missing_indexes.empty()) {
+        // BIP 152 short IDs are 48-bit SipHash over txid (BCH: wtxid == txid); a
+        // collision can silently substitute the WRONG tx into a fully-filled slot.
+        // The header merkle root is the ONLY backstop -- verify the reconstructed
+        // tx vector against it BEFORE declaring the block complete, and on mismatch
+        // DISCARD (leave result.block empty) so the caller falls back to a full
+        // getdata rather than delivering a forged block downstream.
+        if (ReconstructedMerkleRoot(txs) != cb.header.m_merkle_root) {
+            result.complete = false;
+            result.merkle_mismatch = true;
+            return result;   // do NOT populate result.block
+        }
         result.complete = true;
         static_cast<BlockHeaderType&>(result.block) = cb.header;
         result.block.m_txs = std::move(txs);
