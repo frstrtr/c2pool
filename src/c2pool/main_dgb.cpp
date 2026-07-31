@@ -54,6 +54,8 @@
 #include <impl/dgb/coin/p2p_node.hpp>
 #include <impl/dgb/coin/rpc.hpp>        // NodeRPC — external-daemon submitblock arm (#82)
 #include <impl/dgb/coin/rpc_conf.hpp>   // digibyte.conf creds resolution (rpcpassword off argv)
+#include <impl/dgb/coin/coin_peer_manager.hpp> // dgb::coin::DgbCoinPeerManager — DGB-ISOLATED scored/diverse peer discovery (--coin-p2p-discover; network-standalone gate)
+#include <impl/dgb/coin/chain_seeds.hpp>  // dgb::coin::dgb_dns_seeds / dgb_fixed_seeds — DGB mainnet/testnet seed bootstrap
 #include <impl/dgb/config_coin.hpp>     // dgb::CoinParams::MAINNET_RPC_PORT default
 
 #include <core/filesystem.hpp>
@@ -103,7 +105,8 @@ void print_banner(const char* argv0, const core::CoinParams& p)
         << "       [--coin-daemon H:P] [--coin-magic HEX] [--regtest]\n"
         << "       [--regtest-force-won-share] [--no-p2p-relay]\n"
         << "       [--redistribute SPEC] [--sharechain-port P]\n"
-        << "       [--data-dir PATH] [--dev-relax-algo-softforks]\n\n"
+        << "       [--data-dir PATH] [--dev-relax-algo-softforks]\n"
+        << "       [--coin-p2p-discover]\n\n"
         << "  --data-dir PATH  root all per-instance state here (default ~/.c2pool);\n"
         << "                   isolates co-located instances\n"
         << "Status: pool/sharechain pillars live (Phase B); run-loop up\n"
@@ -175,7 +178,8 @@ int run_node(const core::CoinParams& params, bool testnet,
              bool regtest = false, bool force_won_share = false,
              bool no_p2p_relay = false,
              const std::string& redistribute_spec = "",
-             bool dev_relax_algo_softforks = false)
+             bool dev_relax_algo_softforks = false,
+             bool coin_p2p_discover = false)
 {
     io::io_context ioc;
 
@@ -209,6 +213,36 @@ int run_node(const core::CoinParams& params, bool testnet,
             ? host + ":" + std::to_string(dgb::PoolConfig::P2P_PORT)
             : host;
         config.pool()->m_bootstrap_addrs.emplace_back(addr);
+    }
+
+    // ── DGB coin-network peer discovery (--coin-p2p-discover) ────────────────
+    // OPT-IN network-standalone arm, mirroring main_dash.cpp. When enabled it
+    // stands up a DGB-ISOLATED scored/diverse peer manager that owns its own
+    // peer table + seed bootstrap + scoring, discovering DigiByte-network peers
+    // from DNS + fixed seeds (chain_seeds.hpp) INDEPENDENT of any local
+    // digibyted — the precondition for a genuinely daemonless network witness.
+    // This is DISJOINT from the sharechain (pool P2P) bootstrap above: the DGB
+    // network default ports are 12024 (mainnet) / 12026 (testnet), distinct from
+    // PoolConfig::P2P_PORT 5024. Declared here (whole-run scope) so it outlives
+    // the io_context loop; destroyed at scope exit after ioc.run() returns.
+    // OFF by default -> the external digibyted RPC submit arm below is unchanged.
+    std::unique_ptr<dgb::coin::DgbCoinPeerManager> coin_peer_mgr;
+    if (coin_p2p_discover) {
+        const uint16_t coin_port = testnet ? 12026 : 12024;
+        dgb::coin::DgbPeerManagerConfig pm_cfg;
+        pm_cfg.valid_ports = { coin_port };
+        const std::string pm_data_dir = (core::filesystem::config_path()
+            / net_subdir / "dgb_embedded_peers").string();
+        coin_peer_mgr = std::make_unique<dgb::coin::DgbCoinPeerManager>(
+            ioc, "DGB", pm_data_dir, pm_cfg);
+        coin_peer_mgr->set_dns_seeds(dgb::coin::dgb_dns_seeds(testnet));
+        coin_peer_mgr->set_fixed_seeds(dgb::coin::dgb_fixed_seeds(testnet));
+        coin_peer_mgr->start();
+        const auto pm_stats = coin_peer_mgr->peer_stats();
+        std::cout << "[DGB] coin-network peer discovery ARMED (--coin-p2p-discover): "
+                  << "port=" << coin_port
+                  << " peers=" << pm_stats.total
+                  << " groups=" << pm_stats.unique_groups << "\n";
     }
 
     // Stratum acceptor handle, declared BEFORE the signal_set so the shutdown
@@ -1192,6 +1226,7 @@ int main(int argc, char** argv)
     // FAIL-CLOSED on mainnet (ignored when chain==main) and it does NOT extend to
     // taproot (a real consensus floor; operator-gated, not relaxed here).
     bool dev_relax_algo_softforks = false;  // --dev-relax-algo-softforks (dev boot aid)
+    bool coin_p2p_discover = false;         // --coin-p2p-discover: DGB-isolated scored/diverse coin-network peer discovery (network-standalone arm; independent of local digibyted)
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
             std::cout << "c2pool-dgb " << C2POOL_VERSION << "\n";
@@ -1241,6 +1276,7 @@ int main(int argc, char** argv)
             force_won_share = true;                 // gated below: regtest-ONLY
         if (std::strcmp(argv[i], "--no-p2p-relay") == 0) no_p2p_relay = true;
         if (std::strcmp(argv[i], "--dev-relax-algo-softforks") == 0) dev_relax_algo_softforks = true;
+        if (std::strcmp(argv[i], "--coin-p2p-discover") == 0) coin_p2p_discover = true;
         if (std::strcmp(argv[i], "--redistribute") == 0 && i + 1 < argc) {
             redistribute_spec = argv[++i];     // pplns|fee|boost|donate or hybrid "boost:70,donate:20"
         }
@@ -1267,7 +1303,8 @@ int main(int argc, char** argv)
                         coin_daemon, coin_magic, coin_genesis,
                         rpc_endpoint, rpc_conf_path,
                         regtest, force_won_share, no_p2p_relay,
-                        redistribute_spec, dev_relax_algo_softforks);
+                        redistribute_spec, dev_relax_algo_softforks,
+                        coin_p2p_discover);
 
     // --selftest, or a bare invocation: drive the live score path so the
     // binary exercises real consensus code, then exit cleanly.
