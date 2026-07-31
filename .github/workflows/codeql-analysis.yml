@@ -58,7 +58,7 @@ jobs:
           tarball="$dest/codeql-bundle-linux64.tar.gz"
           if [ ! -f "$dest/.complete" ]; then
             mkdir -p "$dest"
-            url="https://github.com/github/codeql/releases/download/$CODEQL_BUNDLE_VERSION/codeql-bundle-linux64.tar.gz"
+            url="https://github.com/github/codeql-action/releases/download/$CODEQL_BUNDLE_VERSION/codeql-bundle-linux64.tar.gz"
             echo "Fetching $url"
             curl -fL -C - --retry 8 --retry-all-errors --retry-delay 5 \
                  --connect-timeout 20 --speed-limit 1024 --speed-time 60 \
