@@ -163,4 +163,15 @@ if(C2POOL_QT_BUILD_TESTS)
     target_include_directories(c2pool-qt_test_reward_safe_launch PRIVATE src)
     add_test(NAME reward_safe_launch
              COMMAND c2pool-qt_test_reward_safe_launch)
+
+    # ── Teardown leak/crash gate (issue #852) ────────────────────────────
+    # The embedded-view host tore itself down via deregisterObject(nullptr),
+    # a null-deref inside QWebChannel. This KAT exercises the destroy fence
+    # over 100 build/destroy iterations and crashed before the fix. Needs a
+    # WebEngine backend; runs offscreen with software GL.
+    add_test(NAME embedded_leak
+             COMMAND c2pool-qt_test_embedded_leak)
+    set_tests_properties(embedded_leak PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+        TIMEOUT 90)
 endif()
