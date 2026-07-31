@@ -630,6 +630,10 @@ public:
         // take mu_ only for the fast analysis + ledger phase.
         WorkSelection sel = coin_state_.select_work(dashd_gbt_);
         const bool is_embedded = (sel.source == WorkSource::Embedded);
+        // decline-reason DIAGNOSTIC (log-only): captured on the SAME
+        // sample as is_embedded so it matches the selection decision exactly.
+        const std::string decline_reason =
+            is_embedded ? std::string() : coin_state_.classify_decline();
         DashWorkData emb, dashd;
         bool dashd_rpc_ok = false, aligned = false;
         std::optional<int64_t> base_cp;   // creditPool(N-1) from the CONNECTED block
@@ -675,7 +679,8 @@ public:
             embedded_armed_ = false;
             ledger_.note_fall_closed(next_height, classify(next_height, {}, false, reorg, false));
             LOG_INFO << "[EMB-ORACLE] h=" << next_height
-                     << " FALL-CLOSED (dashd-fallback) — recorded serve-gap";
+                     << " FALL-CLOSED (dashd-fallback) reason=" << decline_reason
+                     << " — recorded serve-gap";
             save_graduation_state();
             remember_tip(next_height, next_prev_hash);
             return;

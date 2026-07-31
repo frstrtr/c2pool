@@ -501,6 +501,49 @@ public:
         return select_dash_work(make_embedded_work_inputs(), dashd_fallback);
     }
 
+    /// DIAGNOSTIC (log-only): when select_work() falls closed to the dashd arm,
+    /// name WHICH viability clause in make_embedded_work_inputs() was the FIRST
+    /// unsatisfied one. Pure const read of the SAME members, evaluated in the
+    /// same AND-order has_state uses -- it NEVER alters arm selection or any
+    /// reward/serve path. Turns the shadow oracle's identical FALL-CLOSED lines
+    /// into a diagnosis instead of a tally. NOTE: this classifies embedded
+    /// VIABILITY only. The shadow calls select_work() directly, so the live
+    /// get_work mainnet gate (--embedded-mainnet, work_source.cpp) is NOT on
+    /// this path; a wholly-unfed bundle surfaces as "not-populated", which on a
+    /// gate-off node is how the absent mainnet opt-in manifests here.
+    std::string classify_decline() const {
+        const uint32_t next_h = m_prev_height + 1;
+        if (!m_populated)      return "not-populated";
+        if (m_prev_hash.IsNull()) return "no-tip";
+        if (m_qc_plan_fn && !m_qc_plan_fn(next_h)) return "qc-plan-underivable";
+        if (m_utxo_ready_fn && !m_utxo_ready_fn())  return "utxo-immature";
+        if (!resolve_superblock(next_h).ok)         return "superblock-refused";
+        if (!m_qc_plan_fn && m_commitment_window_fn && m_commitment_window_fn(next_h))
+            return "dkg-commitment-window";
+        if (m_require_fresh_bestcl
+            && m_best_cl_height < static_cast<int32_t>(m_prev_height) - 1)
+            return "bestcl-stale h=" + std::to_string(m_best_cl_height)
+                 + " vs tip=" + std::to_string(m_prev_height);
+        if (m_require_fresh_credit_pool
+            && m_credit_pool_height != static_cast<int32_t>(m_prev_height))
+            return "creditpool-stale h=" + std::to_string(m_credit_pool_height)
+                 + " vs tip=" + std::to_string(m_prev_height);
+        if (m_require_fresh_mn_payee
+            && m_mnstates.last_applied_height() != m_prev_height)
+            return "payee-stale h=" + std::to_string(m_mnstates.last_applied_height())
+                 + " vs tip=" + std::to_string(m_prev_height);
+        if (m_require_sml) {
+            if (!m_have_sml)       return "no-dmn-set";
+            if (!m_quorum_healthy) return "quorum-unhealthy";
+            if (m_sml_current_hash != m_prev_hash)
+                return "dmn-stale sml=" + m_sml_current_hash.GetHex().substr(0, 12)
+                     + " vs tip=" + m_prev_hash.GetHex().substr(0, 12);
+        }
+        // has_state says viable => the Phase-1 select_work sample and this read
+        // straddled a concurrent apply_block. Rare, and named honestly.
+        return "viable-race";
+    }
+
 private:
     /// Superblock disposition for a candidate next height. ok=false => refuse
     /// (fail closed). payments empty+ok => normal block; non-empty+ok => emit.
