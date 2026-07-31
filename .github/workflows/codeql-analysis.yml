@@ -53,23 +53,33 @@ jobs:
         env:
           CODEQL_BUNDLE_VERSION: codeql-bundle-v2.26.2
         run: |
-          set -euo pipefail
+          # FAIL-SOFT: a cold-cache fetch still rides the lossy uplink, so a
+          # curl-28 timeout here must NOT hard-red the job. On fetch failure we
+          # leave CODEQL_TOOLS empty and let Initialize CodeQL fall back to its
+          # own bundle download (the pre-existing behaviour) rather than skipping
+          # init entirely. Warm cache => zero egress as designed; cold-cache
+          # egress failure => degrades to baseline, never worse.
+          set -uo pipefail
           dest="$HOME/codeql-bundles/$CODEQL_BUNDLE_VERSION"
           tarball="$dest/codeql-bundle-linux64.tar.gz"
-          if [ ! -f "$dest/.complete" ]; then
+          if [ -f "$dest/.complete" ]; then
+            echo "Reusing cached bundle $tarball"
+            echo "CODEQL_TOOLS=$tarball" >> "$GITHUB_ENV"
+          else
             mkdir -p "$dest"
             url="https://github.com/github/codeql-action/releases/download/$CODEQL_BUNDLE_VERSION/codeql-bundle-linux64.tar.gz"
             echo "Fetching $url"
-            curl -fL -C - --retry 8 --retry-all-errors --retry-delay 5 \
-                 --connect-timeout 20 --speed-limit 1024 --speed-time 60 \
-                 -o "$tarball.tmp" "$url"
-            mv "$tarball.tmp" "$tarball"
-            touch "$dest/.complete"
-            echo "Staged $tarball"
-          else
-            echo "Reusing cached bundle $tarball"
+            if curl -fL -C - --retry 8 --retry-all-errors --retry-delay 5 \
+                    --connect-timeout 20 --speed-limit 1024 --speed-time 60 \
+                    -o "$tarball.tmp" "$url"; then
+              mv "$tarball.tmp" "$tarball"
+              touch "$dest/.complete"
+              echo "Staged $tarball"
+              echo "CODEQL_TOOLS=$tarball" >> "$GITHUB_ENV"
+            else
+              echo "::warning::codeql bundle prestage fetch failed over lossy uplink; leaving CODEQL_TOOLS empty so Initialize CodeQL uses its own bundle download (partial .tmp kept for -C - resume)"
+            fi
           fi
-          echo "CODEQL_TOOLS=$tarball" >> "$GITHUB_ENV"
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
