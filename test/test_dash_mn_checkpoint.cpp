@@ -40,6 +40,8 @@
 
 #include <impl/dash/coin/mn_checkpoint.hpp>       // parse_mn_checkpoint (DUT)
 #include <impl/dash/coin/mn_checkpoint_lane.hpp>  // MnCheckpointLane (DUT)
+#include <impl/dash/coin/vendor/providertx.hpp>   // CProUpServTx (revival leg)
+#include <impl/dash/coin/vendor/simplifiedmns.hpp>// CSimplifiedMNList (attestation source)
 #include <impl/dash/coin/mn_seed.hpp>             // parse_protx_list_seed (E2c cross-check)
 #include <impl/dash/coin/node_interface.hpp>
 #include <impl/dash/coin/mn_list_ingest.hpp>      // wire_mn_list_ingest (leg 4)
@@ -53,9 +55,11 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 using dash::coin::MNState;
@@ -749,4 +753,333 @@ TEST(DashMnCheckpointE2e, NegativeControlAntiMintLatchBlocksUnseededArming)
     fire_tip();
     EXPECT_TRUE(state.populated())
         << "a height-stamped authoritative snapshot must still arm normally";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 6. POST-ANCHOR PoSe BANS — the SML-attested recovery walk.
+//
+// A PoSe ban is applied by dashd from CONSENSUS (accumulated
+// MAX_PoSe_PENALTY); it never appears as a special transaction in any block.
+// MnStateMachine::apply_block walks special txs, so it is STRUCTURALLY unable
+// to observe one. A masternode banned after the anchor height therefore stays
+// isValid=true through the whole replay, holds the head of our payment queue,
+// and is projected as the payee for a block dashd paid to somebody else. The
+// bridge cross-check fires, and here that is TERMINAL — so ONE post-anchor ban
+// anywhere in the window means the daemonless arm never publishes a masternode
+// set at all, and every template keeps routing to dashd.
+//
+// The SML is the only carrier of that ban. These cases drive the recovery
+// through the PRODUCTION SEAMS ONLY: a real MnCheckpointLane, armed with the
+// real fixture checkpoint, all four existing seams wired plus a
+// fixture-SML-backed validity fn built the same way main_dash builds it, then
+// pump()/on_block_connected() with blocks whose non-payee bytes are the REAL
+// accepted testnet blocks. The lane was missed by the original suite precisely
+// because nothing entered it this way.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace {
+
+using dash::coin::MutableTransaction;
+using dash::coin::vendor::CProUpServTx;
+using dash::coin::vendor::CSimplifiedMNList;
+using dash::coin::vendor::CSimplifiedMNListEntry;
+
+// The six anchored masternodes in DIP-3 queue order at h=1519543 (ascending
+// nLastPaidHeight 1519459..1519464, which is the CompareByLastPaid key for all
+// six). The payout-address groups matter: Q1/Q4/Q5 share yVXDA…, Q2/Q3 share
+// yeRZB…, Q6 is alone on yjTpMw… — which is why a demotion from Q1 lands on Q2
+// (different script, cross-checkable) and why reaching Q6 costs five.
+const char* const kQ1 = "dc2e02ac95ce4ccc9843c38de7bdaf32f2a1d5966c054127a3f4ca4f4bbd5991";
+const char* const kQ2 = "9b653e767b978c10346d938c08dc8c5acd03c495f9d913e6fc652bfcae11a348";
+const char* const kQ3 = "91bbce94c34ebde0d099c0a2cb7635c0c31425ebabcec644f4f1a0854bfa605d";
+const char* const kQ4 = "72ee70fa75262781a17d1eb69a6c3e97328208be98b59d5530164f31e481d3aa";
+const char* const kQ5 = "c87218fb9d031f4926c22430c69b4edf1f0fb80c331c1a79e3b1b3873407c0ac";
+const char* const kQ6 = "ecebeb952f56a61abaccd7bda7f4df5eccbd5f87a91bc4a8969535df1058158e";
+
+// Take the payout script from the ANCHOR rather than hardcoding hex, so a
+// fixture regeneration cannot leave these tests quietly probing a script no
+// masternode owns any more.
+std::vector<unsigned char> payout_of(const MnCheckpoint& cp, const char* protx)
+{
+    const uint256 want = uint256S(protx);
+    for (const auto& [h, st] : cp.entries)
+        if (h == want) return st.scriptPayout.m_data;
+    ADD_FAILURE() << "the anchor carries no masternode " << protx;
+    return {};
+}
+
+// Rewrite the coinbase output paying `from` so it pays `to`. This synthesises
+// "dashd skipped our projected payee and paid a later queue slot" on top of a
+// REAL accepted block: every byte except that one output script — header,
+// CbTx payload, the rest of the outputs — stays exactly as the network
+// produced it.
+dash::coin::BlockType repay_coinbase(dash::coin::BlockType blk,
+                                     const std::vector<unsigned char>& from,
+                                     const std::vector<unsigned char>& to)
+{
+    EXPECT_FALSE(blk.m_txs.empty());
+    bool hit = false;
+    for (auto& o : blk.m_txs[0].vout) {
+        if (o.scriptPubKey.m_data == from) {
+            o.scriptPubKey.m_data = to;
+            hit = true;
+        }
+    }
+    EXPECT_TRUE(hit) << "template block does not pay the script being replaced";
+    return blk;
+}
+
+// A fixture SML plus the EXACT lambda shape main_dash wires around
+// NodeCoinState::sml(): linear scan, three-state, std::nullopt when the
+// masternode is absent. Captured BY VALUE so the hook cannot outlive its data.
+MnCheckpointLane::SmlValidityFn sml_fn(
+    const std::vector<std::pair<const char*, bool>>& entries)
+{
+    std::vector<CSimplifiedMNListEntry> v;
+    v.reserve(entries.size());
+    for (const auto& [hex, valid] : entries) {
+        CSimplifiedMNListEntry e;
+        e.proRegTxHash = uint256S(hex);
+        e.isValid      = valid;
+        v.push_back(e);
+    }
+    CSimplifiedMNList sml(std::move(v));
+    return [sml](const uint256& h) -> std::optional<bool> {
+        for (const auto& e : sml.mnList)
+            if (e.proRegTxHash == h) return e.isValid;
+        return std::nullopt;
+    };
+}
+
+// Every masternode attested VALID except the listed ones.
+std::vector<std::pair<const char*, bool>> all_valid_except(
+    std::initializer_list<const char*> banned)
+{
+    std::vector<std::pair<const char*, bool>> out;
+    for (const char* q : {kQ1, kQ2, kQ3, kQ4, kQ5, kQ6}) {
+        bool is_banned = false;
+        for (const char* b : banned) if (std::string(b) == q) is_banned = true;
+        out.emplace_back(q, !is_banned);
+    }
+    return out;
+}
+
+// A one-block bridge over the real anchor: arm, then let pump() pull and fold
+// the single block through the real request/deliver path.
+struct RecoveryRig {
+    MnCheckpoint  cp{good_checkpoint()};
+    BridgeHarness h;
+
+    void run(const dash::coin::BlockType& blk, uint32_t tip = 1519544)
+    {
+        h.headers[kAnchorHeight] = uint256S(kAnchorHash);
+        h.blocks[1519544] = blk;
+        h.tip = tip;
+        h.lane.arm(cp);
+        h.lane.pump();
+    }
+};
+
+std::vector<unsigned char> protx_payload_bytes(const CProUpServTx& p)
+{
+    auto ps = ::pack(p);
+    auto sp = ps.get_span();
+    return std::vector<unsigned char>(
+        reinterpret_cast<const unsigned char*>(sp.data()),
+        reinterpret_cast<const unsigned char*>(sp.data()) + sp.size());
+}
+
+// A ProUpServTx reviving `protx`. dashcore's revival branch — which
+// MnStateMachine mirrors — is gated on nPoSeBanHeight != 0, so this tx is a
+// NO-OP unless something recorded a ban height for that masternode first.
+MutableTransaction pro_up_serv_tx(const char* protx)
+{
+    CProUpServTx p;
+    p.nVersion  = dash::coin::vendor::ProTxVersion::BASIC_BLS;
+    p.nType     = dash::coin::vendor::MnType::REGULAR;
+    p.proTxHash = uint256S(protx);
+    p.netInfo.port_be = 0x2334;
+
+    MutableTransaction tx;
+    tx.type          = CProUpServTx::SPECIALTX_TYPE;
+    tx.extra_payload = protx_payload_bytes(p);
+    bitcoin_family::coin::TxIn in;
+    in.prevout.hash  = uint256{};
+    in.prevout.index = 0xFFFFFFFF;
+    in.sequence      = 0xFFFFFFFF;
+    tx.vin.push_back(in);
+    return tx;
+}
+
+} // namespace
+
+// CASE 1. The bug this whole change exists for. dashd banned our queue head
+// after the anchor was cut, so the block pays queue slot 2. Today that is a
+// terminal payee_desync and the arm never arms. With the SML attesting the
+// ban, the bridge COMPLETES — and the published set carries the exclusion
+// permanently, because a one-shot skip would desync again at that masternode's
+// next queue turn (~|set| blocks later).
+TEST(DashMnCheckpointSmlRecovery, PostAnchorBanAttestedBySmlCompletesTheBridge)
+{
+    RecoveryRig r;
+    auto blk = repay_coinbase(block_from_hex(kBlockHex1519544),
+                              payout_of(r.cp, kQ1), payout_of(r.cp, kQ2));
+    r.h.lane.set_sml_validity_fn(sml_fn(all_valid_except({kQ1})));
+    r.run(blk);
+
+    ASSERT_TRUE(r.h.published) << "lane status: " << r.h.lane.status();
+    EXPECT_EQ(r.h.lane.state(), MnCheckpointLane::State::Published);
+    EXPECT_EQ(r.h.lane.sml_recovered(), 1u);
+    EXPECT_NE(r.h.lane.status().find("1 SML-recovered exclusions"),
+              std::string::npos)
+        << "the recovery count must be on the published status, not only in"
+           " scrollback: " << r.h.lane.status();
+
+    std::map<uint256, MNState> out(r.h.published_set.begin(),
+                                   r.h.published_set.end());
+    const MNState& demoted = out.at(uint256S(kQ1));
+    EXPECT_FALSE(demoted.isValid) << "the exclusion must be PERMANENT";
+    EXPECT_EQ(demoted.nPoSeBanHeight, 1519544u)
+        << "a nonzero ban height is what makes the ProUpServTx revival gate"
+           " functional for this masternode";
+    EXPECT_EQ(demoted.nLastPaidHeight, 1519459u)
+        << "the demoted masternode must NOT be credited with the payment";
+    EXPECT_EQ(out.at(uint256S(kQ2)).nLastPaidHeight, 1519544u)
+        << "the accepted candidate is the one whose script the coinbase pays";
+}
+
+// CASE 2. Same desync, but the SML says the projected payee is LIVE. Then the
+// mismatch is a real desync (bad anchor, missed block, corrupt seed) and the
+// only correct answer is the old one. Attested-valid is COUNTER-evidence, and
+// this is the case that stops the walk from excusing anything it likes.
+TEST(DashMnCheckpointSmlRecovery, SmlAttestingProjectedPayeeValidStillFailsClosed)
+{
+    RecoveryRig r;
+    auto blk = repay_coinbase(block_from_hex(kBlockHex1519544),
+                              payout_of(r.cp, kQ1), payout_of(r.cp, kQ2));
+    r.h.lane.set_sml_validity_fn(sml_fn(all_valid_except({})));
+    r.run(blk);
+
+    EXPECT_EQ(r.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << r.h.lane.status();
+    EXPECT_NE(r.h.lane.status().find("PAYEE DESYNC"), std::string::npos)
+        << r.h.lane.status();
+    EXPECT_FALSE(r.h.published);
+    EXPECT_EQ(r.h.lane.sml_recovered(), 0u);
+}
+
+// CASE 3. No hook at all — the pre-change wiring. Behaviour must be exactly
+// what it was: terminal.
+TEST(DashMnCheckpointSmlRecovery, NoSmlSeamWiredKeepsTheTerminalFailClosed)
+{
+    RecoveryRig r;
+    auto blk = repay_coinbase(block_from_hex(kBlockHex1519544),
+                              payout_of(r.cp, kQ1), payout_of(r.cp, kQ2));
+    r.run(blk);   // deliberately no set_sml_validity_fn
+
+    EXPECT_EQ(r.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << r.h.lane.status();
+    EXPECT_FALSE(r.h.published);
+    EXPECT_EQ(r.h.lane.sml_recovered(), 0u);
+    EXPECT_NE(r.h.lane.status().find("no SML validity seam is wired"),
+              std::string::npos)
+        << "the operator must be told WHICH input was missing: "
+        << r.h.lane.status();
+}
+
+// CASE 3b. A hook that has no opinion. Absent-from-SML is not evidence of a
+// ban; collapsing nullopt into "banned" would turn every SML gap into a
+// licence to re-attribute payments.
+TEST(DashMnCheckpointSmlRecovery, SmlWithoutTheMasternodeIsNotEvidence)
+{
+    RecoveryRig r;
+    auto blk = repay_coinbase(block_from_hex(kBlockHex1519544),
+                              payout_of(r.cp, kQ1), payout_of(r.cp, kQ2));
+    // An SML that carries only OTHER masternodes: the projected payee is
+    // simply absent, so the hook answers std::nullopt for it.
+    r.h.lane.set_sml_validity_fn(sml_fn({{kQ3, true}, {kQ4, true}}));
+    r.run(blk);
+
+    EXPECT_EQ(r.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << r.h.lane.status();
+    EXPECT_FALSE(r.h.published);
+    EXPECT_EQ(r.h.lane.sml_recovered(), 0u);
+}
+
+// CASE 4. The demotion is licensed, but the re-projection ALSO does not match
+// the coinbase, and the next candidate down is attested live. Acceptance
+// requires an EXACT coinbase script match at some licensed step; there is
+// none, so nothing is attributed and nothing is excluded.
+TEST(DashMnCheckpointSmlRecovery, ReProjectionThatAlsoMismatchesFailsClosed)
+{
+    RecoveryRig r;
+    // Pay Q6's script. Q2 (the first demotion target) is on a different
+    // script, so the walk stalls immediately after one licensed demotion.
+    auto blk = repay_coinbase(block_from_hex(kBlockHex1519544),
+                              payout_of(r.cp, kQ1), payout_of(r.cp, kQ6));
+    r.h.lane.set_sml_validity_fn(sml_fn(all_valid_except({kQ1})));
+    r.run(blk);
+
+    EXPECT_EQ(r.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << r.h.lane.status();
+    EXPECT_NE(r.h.lane.status().find("PAYEE DESYNC"), std::string::npos)
+        << r.h.lane.status();
+    EXPECT_FALSE(r.h.published);
+    EXPECT_EQ(r.h.lane.sml_recovered(), 0u)
+        << "a refused walk must not leave a partial exclusion behind";
+}
+
+// CASE 5. The budget. The lane sizes it at 4 + replay_distance/1000, so a
+// one-block bridge allows 4. Reaching Q6 costs FIVE demotions (Q1..Q5), and
+// every one of them is attested — the walk would otherwise succeed. Past the
+// cap this stops being a repair of a few known-banned nodes and becomes a
+// wholesale override of the projection, so it fails closed instead.
+TEST(DashMnCheckpointSmlRecovery, ExclusionsPastThePerBridgeCapFailClosed)
+{
+    RecoveryRig r;
+    auto blk = repay_coinbase(block_from_hex(kBlockHex1519544),
+                              payout_of(r.cp, kQ1), payout_of(r.cp, kQ6));
+    r.h.lane.set_sml_validity_fn(
+        sml_fn(all_valid_except({kQ1, kQ2, kQ3, kQ4, kQ5})));
+    r.run(blk);
+
+    EXPECT_EQ(r.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << r.h.lane.status();
+    EXPECT_FALSE(r.h.published);
+    EXPECT_EQ(r.h.lane.sml_recovered(), 0u);
+}
+
+// CASE 6. The permanence pays off. The excluded masternode is later revived by
+// a real ProUpServTx inside the same replay window. dashcore's revival branch
+// is gated on nPoSeBanHeight != 0 — so it fires ONLY because the recovery
+// recorded a ban height. Without that (the one-shot-skip design), this
+// masternode's revivedHeight would stay at its stale anchor value of 1367840
+// and it would sit at the wrong queue position for the rest of the bridge.
+TEST(DashMnCheckpointSmlRecovery, RevivalTxLaterInWindowFiresOffTheRecoveredBan)
+{
+    RecoveryRig r;
+    auto b44 = repay_coinbase(block_from_hex(kBlockHex1519544),
+                              payout_of(r.cp, kQ1), payout_of(r.cp, kQ2));
+    auto b45 = block_from_hex(kBlockHex1519545);
+    b45.m_txs.push_back(pro_up_serv_tx(kQ1));
+
+    r.h.blocks[1519545] = b45;
+    r.h.lane.set_sml_validity_fn(sml_fn(all_valid_except({kQ1})));
+    r.run(b44, /*tip=*/1519545);
+
+    ASSERT_TRUE(r.h.published) << "lane status: " << r.h.lane.status();
+    EXPECT_EQ(r.h.published_as_of, 1519545u);
+    EXPECT_EQ(r.h.lane.sml_recovered(), 1u);
+
+    std::map<uint256, MNState> out(r.h.published_set.begin(),
+                                   r.h.published_set.end());
+    const MNState& revived = out.at(uint256S(kQ1));
+    EXPECT_TRUE(revived.isValid) << "the ProUpServTx must bring it back";
+    EXPECT_EQ(revived.nPoSeBanHeight, 0u);
+    EXPECT_EQ(revived.nPoSeRevivedHeight, 1519545u)
+        << "revivedHeight still at the anchor's 1367840 means the revival"
+           " branch never fired -- i.e. the exclusion did not record a ban"
+           " height and the queue position is now wrong";
+    // 1519545's own payee is unaffected: pass 0 projects from the PRE-block
+    // list, where kQ1 is still excluded, so queue slot 3 was paid.
+    EXPECT_EQ(out.at(uint256S(kQ3)).nLastPaidHeight, 1519545u);
 }

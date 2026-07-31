@@ -3460,6 +3460,31 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     if (!e) return std::nullopt;
                     return e->hash;
                 });
+            // SML validity attestation — the ONLY carrier of a post-anchor
+            // PoSe ban. dashd applies those from consensus, never as a special
+            // tx, so the bridge's block replay is structurally unable to see
+            // one: a masternode banned after the anchor height stays eligible
+            // in our projection, the coinbase pays somebody else, and the
+            // bridge fail-closes forever — the daemonless arm then never
+            // publishes a masternode set at all. With this seam the replay may
+            // demote a projected payee the SML ATTESTS INVALID, and only onto a
+            // candidate whose scriptPayout exactly matches this coinbase.
+            // Three-state on purpose: absent-from-SML is nullopt, never "fine".
+            // See mn_checkpoint_lane.hpp's residuals note.
+            //
+            // Same thread as everything else the lane touches: the SML is
+            // updated on the mnlistdiff ingest leg and read here from the
+            // block-connect / tip-changed callbacks, all on the single
+            // io_context thread main_dash runs. No lock is taken or needed.
+            mn_ckpt_lane->set_sml_validity_fn(
+                [&node_coin_state](const uint256& proTxHash)
+                    -> std::optional<bool> {
+                    if (!node_coin_state.have_sml()) return std::nullopt;
+                    for (const auto& e : node_coin_state.sml().mnList) {
+                        if (e.proRegTxHash == proTxHash) return e.isValid;
+                    }
+                    return std::nullopt;
+                });
             // Publish through the EXACT leg-4 event the E2c RPC seed uses, so
             // CoinStateMaintainer::on_mn_list_update takes the bridged set as
             // an ordinary authoritative resync — snapshot fence set to the

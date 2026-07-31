@@ -89,6 +89,50 @@
 /// that path is proven live. There is no exclusive lock held across any call
 /// into this lane.
 ///
+/// ─────────────────────────────────────────────────────────────────────────
+/// POST-ANCHOR PoSe BANS, AND THE TWO RESIDUALS THAT REMAIN
+/// ─────────────────────────────────────────────────────────────────────────
+/// The falsification test above has one structural blind spot. A PoSe ban is
+/// applied by dashd from CONSENSUS (accumulated MAX_PoSe_PENALTY), never as a
+/// special transaction. MnStateMachine::apply_block walks special txs, so it
+/// cannot observe one at any price. A masternode banned AFTER the anchor
+/// height therefore stays isValid=true in the replay, keeps its place at the
+/// head of our payment queue, and is projected as the payee for a block dashd
+/// paid to somebody else — payee_desync, which here is TERMINAL. One such ban
+/// anywhere in the replay window permanently prevents the daemonless arm from
+/// publishing a masternode set at all.
+///
+/// The Simplified Masternode List is the only carrier of that ban, so the lane
+/// exposes set_sml_validity_fn() and hands it to its private machine. On a
+/// payee mismatch the machine may walk down the ranked queue, but ONLY while
+/// each demoted candidate is ATTESTED INVALID by the SML and the accepted
+/// candidate's scriptPayout EXACTLY matches an output this block pays. Any
+/// step that cannot satisfy both reports payee_desync exactly as before. The
+/// walk is capped per bridge (see pump()), every event logs at WARNING, and
+/// the running count is surfaced in status() and in the publish line — a
+/// count that lives only in scrollback is half-silent, and this file exists
+/// to prevent silent degradation.
+///
+/// TWO RESIDUALS, stated honestly:
+///
+///  (a) A masternode banned AND revived entirely inside the replay window,
+///      whose CURRENT SML entry therefore reads isValid==true, still fails
+///      closed. The SML is a snapshot of NOW; it cannot attest a historical
+///      ban, and an attested-valid answer is treated as counter-evidence (it
+///      must be — that is what stops the walk from excusing a real desync).
+///      This is exactly today's behaviour for that case, not worse.
+///
+///  (b) A post-anchor ban INSIDE a shared-payoutAddress group can escape both
+///      the cross-check and this recovery, because both are SCRIPT-granular:
+///      if the banned MN and the MN dashd actually paid share one payout
+///      address, the coinbase output still matches our projected script, the
+///      mismatch never fires, and the payment is attributed to the wrong
+///      member of the group. That is a PRE-EXISTING blind spot in the
+///      projection cross-check (the same granularity the gap_detected note in
+///      mn_state_machine.hpp calls out), not something this recovery
+///      introduces — the recovery only ever runs when the cross-check already
+///      failed.
+///
 /// FENCED: src/impl/dash only. Constructed exclusively by the opt-in embedded
 /// path in main_dash.cpp; the dashd-RPC fallback never touches this file.
 
@@ -124,6 +168,12 @@ public:
     using TipHeightFn = std::function<uint32_t()>;
     /// Block hash our header chain holds at `height`, if known.
     using HeaderHashAtFn = std::function<std::optional<uint256>(uint32_t)>;
+    /// Three-state SML validity attestation for a proTxHash — nullopt when the
+    /// masternode is absent from the SML (no opinion), false when the SML
+    /// attests it PoSe-banned, true when it attests it live. See
+    /// MnStateMachine::SmlValidityFn and the residuals note in this file's
+    /// header. Wired by main_dash to NodeCoinState::sml() + have_sml().
+    using SmlValidityFn = MnStateMachine::SmlValidityFn;
 
     enum class State {
         Unarmed,      ///< no checkpoint loaded — the lane does nothing
@@ -153,6 +203,13 @@ public:
     void set_publish_fn(PublishFn fn)            { m_publish = std::move(fn); }
     void set_tip_height_fn(TipHeightFn fn)       { m_tip_height = std::move(fn); }
     void set_header_hash_at_fn(HeaderHashAtFn fn){ m_header_hash_at = std::move(fn); }
+    /// OPTIONAL. Unwired, the bridge behaves exactly as it did before this
+    /// seam existed: any payee mismatch during replay is terminal.
+    void set_sml_validity_fn(SmlValidityFn fn)
+    {
+        m_has_sml_fn = static_cast<bool>(fn);
+        m_machine.set_sml_validity_fn(std::move(fn));
+    }
 
     /// Maximum number of blocks the bridge is willing to replay. A checkpoint
     /// further behind the tip than this is treated as STALE and refused: the
@@ -197,6 +254,11 @@ public:
     uint32_t anchor_height() const { return m_anchor_height; }
     uint32_t cursor_height() const { return m_next == 0 ? 0 : m_next - 1; }
     size_t   set_size()      const { return m_machine.size(); }
+    /// Masternodes PERMANENTLY excluded during this bridge on SML-attested
+    /// PoSe bans. Non-zero is not a failure — it is the repair working — but
+    /// it IS a degradation of how much of the published set the replay
+    /// verified, so it is surfaced here, in status(), and in the publish log.
+    size_t   sml_recovered() const { return m_sml_recovered; }
     bool     failed_closed() const { return m_state == State::FailedClosed; }
     bool     published()     const { return m_state == State::Published; }
 
@@ -269,6 +331,14 @@ public:
 
         if (m_state == State::Waiting) {
             m_state = State::Bridging;
+            // Size the SML ban-recovery budget against the replay distance.
+            // A PoSe ban is a rare per-masternode event, so the count of them
+            // inside a window scales with the window, not with the set size:
+            // 4 covers a short bridge, +1 per 1000 blocks covers a long one.
+            // Past that, "recovery" stops being a repair of a few known-banned
+            // nodes and becomes a wholesale override of the projection, which
+            // is precisely what this lane must never do.
+            m_machine.set_sml_recovery_cap(4 + (tip - m_anchor_height) / 1000);
             LOG_INFO << "[MN-CKPT] bridge START: replaying h=" << m_next
                      << ".." << tip << " (" << (tip - m_next + 1)
                      << " blocks) onto the anchored set";
@@ -317,9 +387,16 @@ public:
                 + (r.gap_detected ? "GAP" : "PAYEE DESYNC") + " at h="
                 + std::to_string(height)
                 + " — the pinned masternode-set anchor does not reproduce this"
-                  " block's actual coinbase payee. The anchor is wrong or the"
-                  " replay is incomplete; refusing to publish a masternode set"
-                  " that would mint a rejected coinbase");
+                  " block's actual coinbase payee. The anchor is wrong, the"
+                  " replay is incomplete, or a post-anchor PoSe ban could not"
+                  " be attested"
+                + (m_has_sml_fn
+                       ? std::string(" by the SML (absent entry, or attested"
+                                     " VALID because the masternode was banned"
+                                     " AND revived inside the replay window)")
+                       : std::string(" — no SML validity seam is wired"))
+                + ". Refusing to publish a masternode set that would mint a"
+                  " rejected coinbase");
         }
         if (r.total_after == 0) {
             return fail_closed(
@@ -329,12 +406,13 @@ public:
 
         m_next = height + 1;
         ++m_applied;
+        m_sml_recovered += r.sml_recovered;
         m_stalled_pumps = 0;
 
         if ((m_applied % 500) == 0) {
             LOG_INFO << "[MN-CKPT] bridge progress: applied " << m_applied
                      << " blocks, cursor h=" << height << " set="
-                     << r.total_after;
+                     << r.total_after << " sml-recovered=" << m_sml_recovered;
         }
 
         if (!m_tip_height) return;
@@ -363,7 +441,9 @@ private:
         // (an ordered stream, or a test harness), and the answer can publish or
         // fail the bridge — whose status must not then be overwritten by ours.
         m_status = "bridging: cursor h=" + std::to_string(m_next) + " target h="
-                   + std::to_string(tip);
+                   + std::to_string(tip) + " ("
+                   + std::to_string(m_sml_recovered)
+                   + " SML-recovered exclusions)";
         for (uint32_t h = from; h <= end; ++h) {
             // Same reason: a synchronous answer may have finished or failed the
             // bridge mid-loop. Never keep pulling history for a lane that is no
@@ -389,14 +469,19 @@ private:
                                " publish");
         }
         m_state  = State::Published;
+        // The recovery count rides on BOTH the status string and the log
+        // line. A degradation that is only visible in scrollback is
+        // half-silent, and this lane exists to make degradation loud.
         m_status = "published " + std::to_string(out.size())
-                   + " masternodes as-of h=" + std::to_string(as_of)
+                   + " masternodes (" + std::to_string(m_sml_recovered)
+                   + " SML-recovered exclusions) as-of h=" + std::to_string(as_of)
                    + " (anchor h=" + std::to_string(m_anchor_height)
                    + " + " + std::to_string(m_applied) + " replayed blocks)";
-        LOG_INFO << "[MN-CKPT] bridge COMPLETE: " << out.size()
-                 << " masternodes as-of h=" << as_of << " (anchor h="
-                 << m_anchor_height << ", replayed " << m_applied
-                 << " blocks, tip h=" << bridged_to
+        LOG_INFO << "[MN-CKPT] bridge COMPLETE: published " << out.size()
+                 << " masternodes (" << m_sml_recovered
+                 << " SML-recovered exclusions) as-of h=" << as_of
+                 << " (anchor h=" << m_anchor_height << ", replayed "
+                 << m_applied << " blocks, tip h=" << bridged_to
                  << ") -> publishing to the maintainer";
         m_publish(std::move(out), as_of);
     }
@@ -431,6 +516,8 @@ private:
 
     uint32_t m_next{0};             // the ONLY height apply_block may fold next
     uint32_t m_applied{0};
+    size_t   m_sml_recovered{0};    // masternodes excluded on SML-attested bans
+    bool     m_has_sml_fn{false};   // an SML validity seam was wired
     uint32_t m_max_bridge{kDefaultMaxBridgeBlocks};
     uint32_t m_stalled_pumps{0};
     uint32_t m_last_pump_next{0};        // cursor at the previous pump (stall probe)
