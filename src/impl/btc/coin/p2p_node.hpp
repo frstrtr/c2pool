@@ -916,6 +916,11 @@ private:
             auto header = static_cast<BlockHeaderType>(result.block);
             m_peer->get_header(blockhash, header);
             m_coin->full_block.happened(result.block);
+        } else if (result.merkle_mismatch) {
+            LOG_WARNING << "[" << m_chain_label << "] Compact block reconstruction merkle "
+                        << "mismatch for " << blockhash.GetHex()
+                        << " — discarding, requesting full block via getdata";
+            request_full_block(blockhash);
         } else {
             LOG_INFO << "[" << m_chain_label << "] Compact block incomplete, "
                      << result.missing_indexes.size() << " txs missing — requesting via getblocktxn";
@@ -1035,6 +1040,20 @@ private:
         BlockType block;
         static_cast<BlockHeaderType&>(block) = cb.header;
         block.m_txs = std::move(txs);
+
+        // Same merkle backstop as ReconstructBlock: even with the missing txns
+        // now authoritative from blocktxn, a short-id-matched slot could carry a
+        // 48-bit collision. Verify against the header commitment before delivering;
+        // on mismatch discard and fall back to a full getdata.
+        if (ReconstructedMerkleRoot(block.m_txs) != cb.header.m_merkle_root) {
+            LOG_WARNING << "[" << m_chain_label << "] blocktxn-completed block merkle "
+                        << "mismatch for " << blockhash.GetHex()
+                        << " — discarding, requesting full block via getdata";
+            request_full_block(blockhash);
+            m_pending_cmpct.reset();
+            m_pending_missing_indexes.clear();
+            return;
+        }
 
         m_peer->get_block(blockhash, block);
         auto header = static_cast<BlockHeaderType>(block);
