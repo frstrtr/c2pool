@@ -94,11 +94,15 @@
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <functional>
+#include <limits>
 #include <map>
 #include <optional>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -160,7 +164,58 @@ public:
         // payment was NOT attributed — never guess. Caller must fail
         // closed (stop backing templates with this payee set) + re-seed.
         bool payee_desync{false};
+        // The DIP-3 payee this machine projected from the PRE-block list
+        // (pass 0). Present whenever the pre-block list was non-empty,
+        // whether or not the coinbase agreed. Surfaced so a caller can name
+        // the MN in its own diagnostics without re-deriving it — and
+        // re-deriving POST-apply gives a DIFFERENT answer, because a
+        // successful mark moves that MN to the back of the queue.
+        std::optional<uint256> projected_payee;
+        // Number of ranked candidates PERMANENTLY excluded this block by the
+        // SML-attested PoSe-ban recovery walk (see set_sml_validity_fn). 0 on
+        // every ordinary block. A nonzero value means the projected payee
+        // disagreed with the coinbase AND the SML proved the disagreement was
+        // a post-anchor consensus PoSe ban rather than a real desync.
+        size_t sml_recovered{0};
     };
+
+    /// Optional validity attestation for a proTxHash, sourced from the
+    /// Simplified Masternode List. THREE-state on purpose:
+    ///
+    ///   std::nullopt — the proTxHash is ABSENT from the SML. No opinion.
+    ///                  Never treated as evidence of anything.
+    ///   false        — the SML ATTESTS INVALID (PoSe-banned / revoked).
+    ///   true         — the SML ATTESTS VALID.
+    ///
+    /// The distinction is load-bearing. "Absent" and "attested valid" both
+    /// BLOCK a demotion; only "attested invalid" may license one. A two-state
+    /// bool would collapse "I don't know" into one of the other two answers
+    /// and, either way, let the recovery walk act on non-evidence.
+    ///
+    /// DEFAULT IS NULL. With no hook installed this class behaves EXACTLY as
+    /// it did before the hook existed — same mutations, same ApplyResult
+    /// flags, same log lines. Every pre-existing caller and KAT is untouched.
+    using SmlValidityFn = std::function<std::optional<bool>(const uint256&)>;
+
+    void set_sml_validity_fn(SmlValidityFn fn) { m_sml_validity = std::move(fn); }
+    bool has_sml_validity_fn() const { return static_cast<bool>(m_sml_validity); }
+
+    /// Cumulative budget for SML-attested exclusions over the lifetime of
+    /// this machine (i.e. per bridge). The recovery walk REPAIRS a bounded,
+    /// expected phenomenon — a handful of masternodes PoSe-banned in the
+    /// window between a pinned anchor and the tip. A replay that needs dozens
+    /// of them is not being repaired, it is being overridden, and the honest
+    /// response to that is to fail closed. The caller sizes the budget
+    /// against its replay distance; see MnCheckpointLane::pump().
+    void set_sml_recovery_cap(size_t n) { m_sml_recovery_cap = n; }
+    size_t sml_recovery_cap() const     { return m_sml_recovery_cap; }
+    size_t sml_recovered_total() const  { return m_sml_recovered_total; }
+
+    /// How deep pass 0's ranked candidate list goes. The recovery walk can
+    /// never look past this depth, which bounds both the work and the blast
+    /// radius: a genuine desync cannot be "walked off" by marching down an
+    /// unbounded queue until something happens to match.
+    static constexpr size_t kPayeeCandidates = 8;
 
     /// as_of_height: the chain height this snapshot is CURRENT AT (0 =
     /// unknown / cold). It seeds the forward-contiguous apply cursor: the
@@ -342,10 +397,22 @@ public:
                  << " scriptPayout(" << s.scriptPayout.m_data.size() << ")=" << sphex;
     }
 
-    std::optional<uint256> find_expected_payee() const
+    /// The first `k` masternodes of the DIP-3 payment queue, in dashd's
+    /// CompareByLastPaid order (ascending). ranked[0] IS find_expected_payee()
+    /// — the two share this scan so they can never disagree.
+    ///
+    /// Why a LIST and not just the winner: PoSe bans are consensus-driven and
+    /// never appear as a transaction, so apply_block cannot observe one. If
+    /// dashd banned the MN at the head of our queue after our snapshot was
+    /// taken, dashd's payee is the SECOND entry of OUR queue and the coinbase
+    /// cross-check fails. Only the SML carries that ban. Recovering needs the
+    /// runners-up, in order, computed on the SAME pre-block state dashd
+    /// projects from.
+    std::vector<uint256> rank_payee_candidates(size_t k) const
     {
-        std::optional<uint256> best_hash;
-        int best_h = 0;
+        std::vector<std::pair<int, uint256>> cands;
+        if (k == 0) return {};
+        cands.reserve(m_entries.size());
         // Defensive: dashd's protx info JSON reports "lastPaidHeight": -1
         // (and PoSeRevivedHeight: -1, PoSeBanHeight: -1) as sentinel for
         // "never paid / never revived / never banned". Snapshots dumped by
@@ -378,17 +445,33 @@ public:
             } else if (h == 0) {
                 h = static_cast<int>(st.nRegisteredHeight);
             }
-            bool better = !best_hash.has_value()
-                       || h < best_h
-                       || (h == best_h
-                           && std::memcmp(hash.data(),
-                                          best_hash->data(), 32) < 0);
-            if (better) {
-                best_h    = h;
-                best_hash = hash;
-            }
+            cands.emplace_back(h, hash);
         }
-        return best_hash;
+        // dashcore CompareByLastPaid: score ascending, ties broken by
+        // proTxHash memcmp ascending (LE-byte, NOT c2pool's CompareTo).
+        auto by_last_paid = [](const std::pair<int, uint256>& a,
+                               const std::pair<int, uint256>& b) {
+            if (a.first != b.first) return a.first < b.first;
+            return std::memcmp(a.second.data(), b.second.data(), 32) < 0;
+        };
+        if (cands.size() > k) {
+            std::partial_sort(cands.begin(), cands.begin() + k, cands.end(),
+                              by_last_paid);
+            cands.resize(k);
+        } else {
+            std::sort(cands.begin(), cands.end(), by_last_paid);
+        }
+        std::vector<uint256> out;
+        out.reserve(cands.size());
+        for (auto& c : cands) out.push_back(c.second);
+        return out;
+    }
+
+    std::optional<uint256> find_expected_payee() const
+    {
+        auto ranked = rank_payee_candidates(1);
+        if (ranked.empty()) return std::nullopt;
+        return ranked.front();
     }
 
     // Dump entire current state for persistence (mn_state_db.write_all).
@@ -586,7 +669,18 @@ public:
         // PRE-block list (oldList.GetMNPayee(pindexPrev)) BEFORE folding
         // this block's special txs; the mark lands after passes 1/2 (and
         // only if the MN survived them — newList.HasMN). Mirror exactly.
-        const std::optional<uint256> projected = find_expected_payee();
+        //
+        // We keep the top-K queue, not just the winner. ranked[0] IS what
+        // find_expected_payee() returns, so the ordinary path is unchanged;
+        // the runners-up exist only for the SML-attested PoSe-ban recovery in
+        // pass 3, and are computed HERE, from the PRE-block state, because
+        // that is the list dashd projects from.
+        const std::vector<uint256> ranked =
+            rank_payee_candidates(kPayeeCandidates);
+        const std::optional<uint256> projected =
+            ranked.empty() ? std::optional<uint256>{}
+                           : std::optional<uint256>{ranked.front()};
+        r.projected_payee = projected;
 
         // ── Pass 1: special-tx records ─────────────────────────────
         // Walk all non-coinbase txs (i=1+). The order of types within
@@ -740,34 +834,40 @@ public:
         // desynced — report payee_desync, attribute nothing, and let the
         // caller fail closed + re-seed (never guess).
         if (projected && !block.m_txs.empty()) {
+            // Exact script-equality against a coinbase output. Reused by the
+            // recovery walk below — "the accepted candidate's script matches
+            // an output the block actually pays" is the ONLY acceptance
+            // evidence, and it is never relaxed to "close enough".
+            auto paid_in_cb = [&](const std::vector<unsigned char>& script) {
+                if (script.empty()) return false;
+                for (const auto& vout : block.m_txs[0].vout) {
+                    if (vout.scriptPubKey.m_data == script) return true;
+                }
+                return false;
+            };
+            auto mark_paid = [&](std::map<uint256, MNState>::iterator it) {
+                bool was_consecutive =
+                    (it->second.nLastPaidHeight == height - 1);
+                it->second.nLastPaidHeight = height;
+                if (it->second.nType == vendor::MnType::EVO) {
+                    it->second.nConsecutivePayments =
+                        was_consecutive
+                            ? it->second.nConsecutivePayments + 1 : 1;
+                } else {
+                    it->second.nConsecutivePayments = 0;
+                }
+                ++r.paid;
+            };
+
             auto it = m_entries.find(*projected);
             // Mirrors dashcore's newList.HasMN(payee->proRegTxHash): a
             // payee whose MN was removed by THIS block's passes 1/2 is
             // silently skipped (no mark, no desync).
             if (it != m_entries.end()) {
-                const auto& script = it->second.scriptPayout.m_data;
-                bool paid_in_cb = false;
-                if (!script.empty()) {
-                    for (const auto& vout : block.m_txs[0].vout) {
-                        if (vout.scriptPubKey.m_data == script) {
-                            paid_in_cb = true;
-                            break;
-                        }
-                    }
-                }
-                if (paid_in_cb) {
-                    bool was_consecutive =
-                        (it->second.nLastPaidHeight == height - 1);
-                    it->second.nLastPaidHeight = height;
-                    if (it->second.nType == vendor::MnType::EVO) {
-                        it->second.nConsecutivePayments =
-                            was_consecutive
-                                ? it->second.nConsecutivePayments + 1 : 1;
-                    } else {
-                        it->second.nConsecutivePayments = 0;
-                    }
-                    ++r.paid;
-                } else {
+                if (paid_in_cb(it->second.scriptPayout.m_data)) {
+                    mark_paid(it);
+                } else if (!recover_from_sml_ban(ranked, height, paid_in_cb,
+                                                 mark_paid, r)) {
                     r.payee_desync = true;
                     LOG_WARNING << "[MNS-SM] PAYEE DESYNC h=" << height
                                 << ": coinbase does not pay projected MN "
@@ -783,8 +883,125 @@ public:
     }
 
 private:
+    // ─────────────────────────────────────────────────────────────────────
+    // recover_from_sml_ban — the ONLY licensed alternative to payee_desync
+    // ─────────────────────────────────────────────────────────────────────
+    //
+    // A PoSe ban is applied by dashd's CDeterministicMNManager from consensus
+    // (accumulated MAX_PoSe_PENALTY), never as a special tx. apply_block walks
+    // special txs, so it is STRUCTURALLY incapable of seeing one: an MN banned
+    // after our snapshot/anchor was taken stays isValid=true in m_entries
+    // forever and keeps its place at the head of our payment queue. dashd
+    // skipped it; the block pays the NEXT eligible masternode; our pass-3
+    // cross-check sees a mismatch and reports payee_desync. On the checkpoint
+    // bridge that is terminal, so a single post-anchor ban permanently
+    // prevents the daemonless arm from ever publishing a masternode set.
+    //
+    // The SML is the only carrier of that ban, so it is the only thing that
+    // can license a repair. This walk requires, for EVERY step:
+    //
+    //   * the demoted candidate to be ATTESTED INVALID by the hook. Absent
+    //     from the SML is not evidence. Attested valid is counter-evidence
+    //     and stops the walk immediately.
+    //   * the accepted candidate's scriptPayout to EXACTLY equal an output
+    //     the block actually pays. Never a prefix, never an address-family
+    //     guess, never "the only unexplained output".
+    //
+    // If either cannot be satisfied at any step, the walk refuses and the
+    // caller reports payee_desync EXACTLY as before. There is no partial
+    // outcome: on refusal nothing is mutated.
+    //
+    // On acceptance the demoted entries are flipped isValid=false with
+    // nPoSeBanHeight = height, PERMANENTLY. One-shot exclusion would be
+    // strictly wrong: the MN would return to the head of the queue at its
+    // next turn (~|MN set| blocks later — ~2068 on DASH mainnet) and desync
+    // the replay all over again. The nonzero ban height additionally makes
+    // pass 1's ProUpServTx revival branch (gated on nPoSeBanHeight != 0)
+    // functional for that MN, so a genuine revival inside the replay window
+    // is picked up normally.
+    //
+    // Returns true iff a payment was attributed (r.paid / r.sml_recovered
+    // updated); false means "no licensed repair" and the caller must desync.
+    template <typename PaidInCbFn, typename MarkPaidFn>
+    bool recover_from_sml_ban(const std::vector<uint256>& ranked,
+                              uint32_t height,
+                              const PaidInCbFn& paid_in_cb,
+                              const MarkPaidFn& mark_paid,
+                              ApplyResult& r)
+    {
+        if (!m_sml_validity) return false;   // null hook → pre-hook behaviour
+        if (ranked.size() < 2) return false;
+
+        std::vector<uint256> demoted;
+        std::optional<uint256> accepted;
+        for (size_t i = 0; i + 1 < ranked.size(); ++i) {
+            const std::optional<bool> att = m_sml_validity(ranked[i]);
+            // nullopt (absent from the SML) or true (attested valid): no
+            // licence to demote. Stop — this is a real desync.
+            if (!att.has_value() || *att) break;
+            demoted.push_back(ranked[i]);
+
+            auto nit = m_entries.find(ranked[i + 1]);
+            // The next candidate was removed by THIS block's passes 1/2
+            // (collateral spend / re-registration). We cannot test its script
+            // and the SML cannot attest a departed MN, so refuse rather than
+            // skip over it.
+            if (nit == m_entries.end()) break;
+            if (paid_in_cb(nit->second.scriptPayout.m_data)) {
+                accepted = ranked[i + 1];
+                break;
+            }
+            // Not paid either — the loop's next iteration must independently
+            // earn the right to demote ranked[i+1] too.
+        }
+        if (!accepted) return false;
+
+        // Budget check LAST, so a refusal here mutates nothing either.
+        if (m_sml_recovered_total + demoted.size() > m_sml_recovery_cap) {
+            LOG_WARNING << "[MNS-SM] SML BAN-RECOVERY REFUSED h=" << height
+                        << ": " << demoted.size() << " further exclusion(s) would"
+                           " exceed the per-bridge cap of " << m_sml_recovery_cap
+                        << " (already used " << m_sml_recovered_total
+                        << ") — failing closed instead of overriding the"
+                           " projection wholesale";
+            return false;
+        }
+
+        std::string demoted_hexes;
+        for (const auto& d : demoted) {
+            auto dit = m_entries.find(d);
+            if (dit != m_entries.end()) {
+                dit->second.isValid       = false;
+                dit->second.nPoSeBanHeight = height;
+            }
+            if (!demoted_hexes.empty()) demoted_hexes += ",";
+            demoted_hexes += d.GetHex().substr(0, 16);
+        }
+        auto ait = m_entries.find(*accepted);
+        if (ait != m_entries.end()) mark_paid(ait);
+
+        r.sml_recovered        = demoted.size();
+        m_sml_recovered_total += demoted.size();
+        LOG_WARNING << "[MNS-SM] SML BAN-RECOVERY h=" << height
+                    << ": projected payee(s) [" << demoted_hexes
+                    << "] attested INVALID by the SML (consensus PoSe ban, not"
+                       " tx-visible) — excluded permanently with banHeight="
+                    << height << "; payment attributed to "
+                    << accepted->GetHex().substr(0, 16)
+                    << " whose scriptPayout matches this coinbase exactly"
+                       " (bridge total " << m_sml_recovered_total << "/"
+                    << m_sml_recovery_cap << ")";
+        return true;
+    }
+
     std::map<uint256, MNState>                                          m_entries;
     std::map<bitcoin_family::coin::TxPrevOut, uint256, TxPrevOutLess>   m_collateral_index;
+
+    // Optional SML attestation hook (see set_sml_validity_fn). NULL by
+    // default: no hook, no recovery, byte-identical pre-hook behaviour.
+    SmlValidityFn m_sml_validity;
+    size_t        m_sml_recovery_cap{0};
+    size_t        m_sml_recovered_total{0};
 
     // Forward-only apply cursor: height of the last block folded by
     // apply_block (0 = none since load). See ApplyResult::skipped_out_of_order.
