@@ -126,7 +126,14 @@ void PageEmbedded::reload()
 void PageEmbedded::destroyView()
 {
     if (channel_ != nullptr) {
-        channel_->deregisterObject(nullptr);
+        // Deregister exactly the bridges buildView() registered, passing a
+        // valid pointer per object. deregisterObject(nullptr) dereferences
+        // the null object inside QWebChannel (objectName lookup) and crashes
+        // on teardown (issue #852).
+        for (QObject* bridge : cfg_.bridges) {
+            if (bridge == nullptr || bridge->objectName().isEmpty()) continue;
+            channel_->deregisterObject(bridge);
+        }
         channel_->deleteLater();
         channel_ = nullptr;
     }
