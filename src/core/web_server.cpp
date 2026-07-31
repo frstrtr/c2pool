@@ -5209,6 +5209,16 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
     }
     double sampling_signaling = sampling_total_weight > 0
         ? (sampling_v36_weight * 100.0 / sampling_total_weight) : 0;
+    // [V36-GATE] Authoritative work-weighted signaling time series: emit the
+    // ratchet gate figure on every evaluation. This is the only site where
+    // sampling_signaling is computed; it previously reached only the HTTP JSON
+    // (result["sampling_signaling"]) and was otherwise dropped, so no time
+    // series existed anywhere. Log-only: does NOT touch the >=95/>=60 predicate
+    // below or the sampling-window definition above.
+    LOG_INFO << "[V36-GATE] sampling_signaling=" << sampling_signaling
+             << "% sampling_v36_weight=" << sampling_v36_weight
+             << " sampling_total_weight=" << sampling_total_weight
+             << " window=" << sampling_window_size;
 
     // ── Transition detection ─────────────────────────────────────────────────
     // The crossing banner, the signed authority notice and the progress bar are
