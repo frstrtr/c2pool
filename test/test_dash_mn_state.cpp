@@ -1059,3 +1059,318 @@ TEST(DashMnState, SyncValidityFromSmlIdempotentAndSmlOnly) {
     EXPECT_EQ(r2.sml_only, 1u);
     EXPECT_EQ(r2.matched, 0u);
 }
+
+
+// --------------------------------------------------------------------------
+// Bug 14 selection-path guard. nPoSeBanHeight is write-only when picking a
+// payee, so a divergent persisted snapshot (isValid==true alongside a live
+// ban height -- reachable after a consensus PoSe ban that never appears as a
+// special tx) must be fail-closed OUT of BOTH selection scans, never paid on
+// the boolean alone. Pairs with the maintainer caller-guard tests
+// (MnlistdiffBanReconcilesOntoPayeeAxis / SeedReconcileAppliesAlreadyPresentSmlBan)
+// that prove sync_validity_from_sml() keeps a production caller.
+// --------------------------------------------------------------------------
+TEST(DashMnState, SelectionGuardExcludesValidButBannedSnapshot) {
+    MnStateMachine m;
+    uint256 banned = raw256_byte(0, 0x0A);
+    uint256 clean  = raw256_byte(0, 0x0B);
+
+    MNState sb; sb.isValid = true; sb.nRegisteredHeight = 2400000;
+    sb.nPoSeBanHeight = 2513418;               // live ban, yet bool left true
+    sb.scriptPayout.m_data = script_bytes(0x76, 25);
+
+    MNState sc; sc.isValid = true; sc.nRegisteredHeight = 2400001;
+    sc.nPoSeBanHeight = 0;                      // genuinely valid
+    sc.scriptPayout.m_data = script_bytes(0x77, 25);
+
+    m.load(std::vector<std::pair<uint256, MNState>>{{banned, sb}, {clean, sc}});
+
+    // find_expected_payee must skip the banned snapshot and pick the clean MN.
+    auto exp = m.find_expected_payee();
+    ASSERT_TRUE(exp.has_value());
+    EXPECT_EQ(*exp, clean);
+
+    // pick_paid_mn on the banned MN's own script must refuse it outright...
+    EXPECT_FALSE(m.pick_paid_mn(sb.scriptPayout.m_data).has_value());
+    // ...but still serve the clean MN on its script.
+    auto pk = m.pick_paid_mn(sc.scriptPayout.m_data);
+    ASSERT_TRUE(pk.has_value());
+    EXPECT_EQ(*pk, clean);
+}
+
+// The -1 / UINT32_MAX "never banned" sentinel must NOT read as a live ban --
+// the guard normalizes it exactly as the height scoring does.
+TEST(DashMnState, SelectionGuardTreatsSentinelBanHeightAsNeverBanned) {
+    MnStateMachine m;
+    uint256 h = raw256_byte(0, 0x0C);
+    MNState s; s.isValid = true; s.nRegisteredHeight = 2400000;
+    s.nPoSeBanHeight = 0xFFFFFFFFu;            // dashd protx -1 sentinel
+    s.scriptPayout.m_data = script_bytes(0x78, 25);
+    m.load(std::vector<std::pair<uint256, MNState>>{{h, s}});
+
+    auto exp = m.find_expected_payee();
+    ASSERT_TRUE(exp.has_value());
+    EXPECT_EQ(*exp, h);
+    auto pk = m.pick_paid_mn(s.scriptPayout.m_data);
+    ASSERT_TRUE(pk.has_value());
+    EXPECT_EQ(*pk, h);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Ranked payee candidates + the SML-attested PoSe-ban recovery walk.
+//
+// PoSe bans are consensus-driven and never appear as a special tx, so
+// apply_block cannot observe one at any price. A masternode banned after a
+// snapshot/anchor was taken keeps the head of our payment queue forever; the
+// block pays the NEXT eligible node and pass 3 reports payee_desync. The SML
+// is the only carrier of that ban, so it is the only thing that may license a
+// repair. These pin the mechanism at the unit boundary; the production-seam
+// coverage (a real MnCheckpointLane driven through pump()/on_block_connected)
+// lives in test_dash_mn_checkpoint.cpp.
+// ════════════════════════════════════════════════════════════════════════
+
+static MNState payee_mn(uint32_t last_paid,
+                        const std::vector<unsigned char>& script) {
+    MNState s;
+    s.isValid             = true;
+    s.nRegisteredHeight   = 2400000;
+    s.nLastPaidHeight     = last_paid;
+    s.scriptPayout.m_data = script;
+    return s;
+}
+
+// A hook answering from an explicit table; anything absent answers nullopt,
+// which is the "no opinion" state the walk must refuse to act on.
+static MnStateMachine::SmlValidityFn attest(
+    std::vector<std::pair<uint256, bool>> table) {
+    return [table](const uint256& h) -> std::optional<bool> {
+        for (const auto& [k, v] : table)
+            if (k == h) return v;
+        return std::nullopt;
+    };
+}
+
+TEST(DashMnState, RankPayeeCandidatesMirrorsCompareByLastPaid) {
+    MnStateMachine m;
+    // Two ties at 1000 to exercise the proTxHash memcmp tiebreak, then two
+    // distinct heights above them.
+    uint256 a = raw256_byte(0, 0x01), b = raw256_byte(0, 0x02);
+    uint256 c = raw256_byte(0, 0x03), d = raw256_byte(0, 0x04);
+    m.load(std::vector<std::pair<uint256, MNState>>{
+        {d, payee_mn(1002, script_bytes(0x40, 25))},
+        {b, payee_mn(1000, script_bytes(0x41, 25))},
+        {c, payee_mn(1001, script_bytes(0x42, 25))},
+        {a, payee_mn(1000, script_bytes(0x43, 25))}});
+
+    auto ranked = m.rank_payee_candidates(4);
+    ASSERT_EQ(ranked.size(), 4u);
+    EXPECT_EQ(ranked[0], a) << "tie at 1000 breaks on proTxHash memcmp ascending";
+    EXPECT_EQ(ranked[1], b);
+    EXPECT_EQ(ranked[2], c);
+    EXPECT_EQ(ranked[3], d);
+
+    // The winner is find_expected_payee() BY CONSTRUCTION -- the two share one
+    // scan, so they can never drift apart.
+    auto exp = m.find_expected_payee();
+    ASSERT_TRUE(exp.has_value());
+    EXPECT_EQ(*exp, ranked.front());
+
+    // Truncation keeps the FRONT of the queue, not an arbitrary subset.
+    auto top2 = m.rank_payee_candidates(2);
+    ASSERT_EQ(top2.size(), 2u);
+    EXPECT_EQ(top2[0], a);
+    EXPECT_EQ(top2[1], b);
+    EXPECT_TRUE(m.rank_payee_candidates(0).empty());
+}
+
+TEST(DashMnState, RankPayeeCandidatesExcludesInvalidAndBanned) {
+    MnStateMachine m;
+    uint256 a = raw256_byte(0, 0x01), b = raw256_byte(0, 0x02),
+            c = raw256_byte(0, 0x03);
+    MNState sa = payee_mn(1000, script_bytes(0x50, 25)); sa.isValid = false;
+    MNState sb = payee_mn(1001, script_bytes(0x51, 25)); sb.nPoSeBanHeight = 2500000;
+    MNState sc = payee_mn(1002, script_bytes(0x52, 25));
+    m.load(std::vector<std::pair<uint256, MNState>>{{a, sa}, {b, sb}, {c, sc}});
+
+    auto ranked = m.rank_payee_candidates(MnStateMachine::kPayeeCandidates);
+    ASSERT_EQ(ranked.size(), 1u) << "neither an invalid nor a live-banned"
+                                    " masternode may be a payee candidate";
+    EXPECT_EQ(ranked[0], c);
+}
+
+// The default posture: no hook, so a mismatch is a desync and nothing else.
+// This is the guarantee that every pre-existing caller and KAT is untouched.
+TEST(DashMnState, NullSmlHookLeavesPayeeDesyncExactlyAsBefore) {
+    MnStateMachine m;
+    uint256 a = raw256_byte(0, 0x01), b = raw256_byte(0, 0x02);
+    auto s1 = script_bytes(0x60, 25);
+    auto s2 = script_bytes(0x61, 25);
+    m.load(std::vector<std::pair<uint256, MNState>>{
+               {a, payee_mn(1000, s1)}, {b, payee_mn(1001, s2)}},
+           2400000);
+    EXPECT_FALSE(m.has_sml_validity_fn());
+
+    BlockType blk;
+    blk.m_txs.push_back(coinbase_tx({s2}));      // pays queue slot 2
+    auto r = m.apply_block(blk, 2400001);
+
+    EXPECT_TRUE(r.payee_desync);
+    EXPECT_EQ(r.paid, 0u);
+    EXPECT_EQ(r.sml_recovered, 0u);
+    ASSERT_TRUE(r.projected_payee.has_value());
+    EXPECT_EQ(*r.projected_payee, a);
+    EXPECT_TRUE(m.entries().at(a).isValid) << "no hook, no exclusion";
+    EXPECT_EQ(m.entries().at(a).nPoSeBanHeight, 0u);
+    EXPECT_EQ(m.entries().at(b).nLastPaidHeight, 1001u)
+        << "a desync attributes NOTHING";
+}
+
+TEST(DashMnState, SmlAttestedBanDemotesPermanentlyAndAttributesToTheNext) {
+    MnStateMachine m;
+    uint256 a = raw256_byte(0, 0x01), b = raw256_byte(0, 0x02);
+    auto s1 = script_bytes(0x62, 25);
+    auto s2 = script_bytes(0x63, 25);
+    m.load(std::vector<std::pair<uint256, MNState>>{
+               {a, payee_mn(1000, s1)}, {b, payee_mn(1001, s2)}},
+           2400000);
+    m.set_sml_validity_fn(attest({{a, false}, {b, true}}));
+    m.set_sml_recovery_cap(4);
+
+    BlockType blk;
+    blk.m_txs.push_back(coinbase_tx({s2}));
+    auto r = m.apply_block(blk, 2400001);
+
+    EXPECT_FALSE(r.payee_desync);
+    EXPECT_EQ(r.paid, 1u);
+    EXPECT_EQ(r.sml_recovered, 1u);
+    EXPECT_EQ(m.sml_recovered_total(), 1u);
+    EXPECT_FALSE(m.entries().at(a).isValid);
+    EXPECT_EQ(m.entries().at(a).nPoSeBanHeight, 2400001u);
+    EXPECT_EQ(m.entries().at(a).nLastPaidHeight, 1000u);
+    EXPECT_EQ(m.entries().at(b).nLastPaidHeight, 2400001u);
+}
+
+// The acceptance side is EXACT script equality, never "the only unexplained
+// output". A coinbase that pays nobody in the set must not be attributed to
+// whichever candidate happens to be next, no matter how many bans are attested.
+TEST(DashMnState, SmlAttestedBanStillNeedsAnExactCoinbaseScriptMatch) {
+    MnStateMachine m;
+    uint256 a = raw256_byte(0, 0x01), b = raw256_byte(0, 0x02);
+    auto s1 = script_bytes(0x64, 25);
+    auto s2 = script_bytes(0x65, 25);
+    m.load(std::vector<std::pair<uint256, MNState>>{
+               {a, payee_mn(1000, s1)}, {b, payee_mn(1001, s2)}},
+           2400000);
+    m.set_sml_validity_fn(attest({{a, false}, {b, false}}));
+    m.set_sml_recovery_cap(4);
+
+    BlockType blk;
+    blk.m_txs.push_back(coinbase_tx({script_bytes(0x66, 25)}));  // nobody's
+    auto r = m.apply_block(blk, 2400001);
+
+    EXPECT_TRUE(r.payee_desync);
+    EXPECT_EQ(r.sml_recovered, 0u);
+    EXPECT_TRUE(m.entries().at(a).isValid)
+        << "a refused walk must leave NO partial exclusion behind";
+    EXPECT_TRUE(m.entries().at(b).isValid);
+}
+
+// The cap discriminator. IDENTICAL input either side; the only difference is
+// the budget, so a pass/fail split here can only be the cap.
+TEST(DashMnState, SmlRecoveryCapIsTheOnlyDifferenceAtTheBoundary) {
+    uint256 a = raw256_byte(0, 0x01), b = raw256_byte(0, 0x02),
+            c = raw256_byte(0, 0x03), d = raw256_byte(0, 0x04);
+    auto shared = script_bytes(0x70, 25);   // a, b, c all pay this
+    auto lone   = script_bytes(0x71, 25);   // d alone
+
+    auto build = [&](MnStateMachine& m, size_t cap) {
+        m.load(std::vector<std::pair<uint256, MNState>>{
+                   {a, payee_mn(1000, shared)}, {b, payee_mn(1001, shared)},
+                   {c, payee_mn(1002, shared)}, {d, payee_mn(1003, lone)}},
+               2400000);
+        m.set_sml_validity_fn(attest({{a, false}, {b, false}, {c, false},
+                                      {d, true}}));
+        m.set_sml_recovery_cap(cap);
+    };
+    BlockType blk;
+    blk.m_txs.push_back(coinbase_tx({lone}));   // dashd paid queue slot 4
+
+    // Budget 2 < the 3 exclusions the walk needs: refuse, mutate nothing.
+    MnStateMachine tight;
+    build(tight, 2);
+    auto r_tight = tight.apply_block(blk, 2400001);
+    EXPECT_TRUE(r_tight.payee_desync);
+    EXPECT_EQ(r_tight.sml_recovered, 0u);
+    EXPECT_TRUE(tight.entries().at(a).isValid);
+    EXPECT_EQ(tight.entries().at(d).nLastPaidHeight, 1003u);
+
+    // Budget 3 == what it needs: accept.
+    MnStateMachine roomy;
+    build(roomy, 3);
+    auto r_roomy = roomy.apply_block(blk, 2400001);
+    EXPECT_FALSE(r_roomy.payee_desync);
+    EXPECT_EQ(r_roomy.sml_recovered, 3u);
+    EXPECT_EQ(roomy.sml_recovered_total(), 3u);
+    for (const auto& h : {a, b, c}) {
+        EXPECT_FALSE(roomy.entries().at(h).isValid) << h.GetHex();
+        EXPECT_EQ(roomy.entries().at(h).nPoSeBanHeight, 2400001u);
+    }
+    EXPECT_EQ(roomy.entries().at(d).nLastPaidHeight, 2400001u);
+}
+
+// The walk stops at the FIRST candidate the SML does not attest invalid. An
+// attested-valid runner-up is counter-evidence: the mismatch is a genuine
+// desync and must be reported as one even though a deeper candidate would
+// have matched the coinbase.
+TEST(DashMnState, SmlRecoveryStopsAtTheFirstUnattestedCandidate) {
+    MnStateMachine m;
+    uint256 a = raw256_byte(0, 0x01), b = raw256_byte(0, 0x02),
+            c = raw256_byte(0, 0x03);
+    auto s1 = script_bytes(0x72, 25);
+    auto s2 = script_bytes(0x73, 25);
+    auto s3 = script_bytes(0x74, 25);
+    m.load(std::vector<std::pair<uint256, MNState>>{
+               {a, payee_mn(1000, s1)}, {b, payee_mn(1001, s2)},
+               {c, payee_mn(1002, s3)}},
+           2400000);
+    // a is banned, b is LIVE, and the coinbase pays c.
+    m.set_sml_validity_fn(attest({{a, false}, {b, true}, {c, false}}));
+    m.set_sml_recovery_cap(8);
+
+    BlockType blk;
+    blk.m_txs.push_back(coinbase_tx({s3}));
+    auto r = m.apply_block(blk, 2400001);
+
+    EXPECT_TRUE(r.payee_desync);
+    EXPECT_EQ(r.sml_recovered, 0u);
+    EXPECT_TRUE(m.entries().at(a).isValid);
+    EXPECT_EQ(m.entries().at(c).nLastPaidHeight, 1002u);
+}
+
+// Permanence is the whole point: a one-shot skip would put the banned node
+// back at the head of the queue at its next turn and desync the replay again.
+TEST(DashMnState, SmlRecoveryExclusionSurvivesTheNextQueueTurn) {
+    MnStateMachine m;
+    uint256 a = raw256_byte(0, 0x01), b = raw256_byte(0, 0x02);
+    auto s1 = script_bytes(0x75, 25);
+    auto s2 = script_bytes(0x76, 25);
+    m.load(std::vector<std::pair<uint256, MNState>>{
+               {a, payee_mn(1000, s1)}, {b, payee_mn(1001, s2)}},
+           2400000);
+    m.set_sml_validity_fn(attest({{a, false}, {b, true}}));
+    m.set_sml_recovery_cap(4);
+
+    BlockType blk;
+    blk.m_txs.push_back(coinbase_tx({s2}));
+    ASSERT_FALSE(m.apply_block(blk, 2400001).payee_desync);
+
+    // b now has the newest lastPaidHeight, so an un-excluded `a` would be back
+    // at the head of the queue. It must not be a candidate at all.
+    EXPECT_TRUE(m.rank_payee_candidates(8).empty()
+                || m.rank_payee_candidates(8).front() != a);
+    auto r2 = m.apply_block(blk, 2400002);
+    EXPECT_EQ(r2.sml_recovered, 0u) << "no SECOND exclusion should be needed";
+    EXPECT_FALSE(r2.payee_desync);
+    EXPECT_EQ(m.sml_recovered_total(), 1u);
+    EXPECT_EQ(m.entries().at(b).nLastPaidHeight, 2400002u);
+}

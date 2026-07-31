@@ -2802,16 +2802,41 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         return maint->superblock_schedule(next_height);
                     });
                 node_coin_state.set_require_superblock_provider(embedded_superblock);
-                // NOTE deliberately NOT set: set_superblock_sync_complete_fn
-                // (R5). Until a govsync-completeness proof exists, superblock
-                // heights refuse the embedded arm even with the flag on.
+                // R5 GOVSYNC-COMPLETENESS GATE (production wiring). Model:
+                // dashcore CMasternodeSync governance-phase completion — the
+                // view is COMPLETE only when the governance set was requested
+                // from >= min_peers distinct peers, a settle floor elapsed, and
+                // no new object/vote arrived for the quiescence window (the
+                // stream quiesced). Fed from the govobj/govobjvote reception
+                // path + note_govsync_requested at the send site (below). This
+                // is the gate that lets a VERIFIED-complete superblock actually
+                // serve; a PARTIAL view (missing the higher-yes competing
+                // trigger/votes) is the confidently-wrong-winner hazard, so the
+                // default (nothing synced / under-covered / not quiesced) is
+                // FALSE => reward-safe dashd fallback.
+                maintainer->set_gov_sync_params(
+                    dash::coin::DASH_GOVSYNC_MIN_PEERS_DEFAULT,
+                    dash::coin::DASH_GOVSYNC_SETTLE_SECS_DEFAULT,
+                    dash::coin::DASH_GOVSYNC_QUIESCE_SECS_DEFAULT);
+                node_coin_state.set_superblock_sync_complete_fn(
+                    [maint = maintainer.get()]() {
+                        return maint->gov_sync_complete();
+                    });
                 if (embedded_superblock)
                     LOG_INFO << "[E-SUPERBLOCK] daemonless superblock arm ENABLED "
                                 "(--embedded-superblock); superblock heights served "
-                                "from govsync triggers when trigger-confident, else "
-                                "fail closed to dashd. Vote-verify (BLS operator) + "
-                                "completeness gate pending => currently fails "
-                                "closed until pinned.";
+                                "from govsync triggers ONLY when the governance "
+                                "view is trigger-confident AND provably complete "
+                                "(R5: >= "
+                             << dash::coin::DASH_GOVSYNC_MIN_PEERS_DEFAULT
+                             << " peers, quiesced), else fail closed to dashd. "
+                                "CO-REQUISITES still pending before this can serve "
+                                "live: multi-peer govsync + inv-driven getdata "
+                                "(the leg is inv-inert today) + BLS operator "
+                                "vote-verify + the vote-weight seam — until those "
+                                "land the completeness predicate evaluates FALSE "
+                                "(single peer / empty store) and the arm stays on "
+                                "the reward-safe fallback.";
             }
         }
 
@@ -3217,7 +3242,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // getheaders off our current locator + a mempool prime.
         coin_p2p->set_on_handshake_complete(
             [cp = coin_p2p.get(), hc = header_chain.get(), sml_base,
-             discover = coin_p2p_discover_eff]() {
+             discover = coin_p2p_discover_eff, maint = maintainer.get()]() {
                 LOG_INFO << "[EMB-DASH] handshake complete -> initial sync:"
                             " getheaders + mempool + mnlistdiff(cold)"
                          << (discover ? " + getaddr (peer crawl)" : "");
@@ -3246,6 +3271,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // The inv-driven getdata + per-object vote sync + periodic
                 // re-prime co-land with vote-verify before any enable.
                 cp->send_govsync();
+                // R5: record govsync peer coverage + (re)arm the quiescence
+                // window for the completeness determination. With the current
+                // single-peer connection model this covers ONE peer, so the
+                // default min_peers floor (>=2) keeps the completeness predicate
+                // FALSE — reward-safe until multi-peer govsync lands.
+                maint->note_govsync_requested(cp->peer_key());
             });
 
         std::cout << "[run] E2a live-feed wired: header-chain(" << hdr_db
@@ -3428,6 +3459,31 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     auto e = hc->get_header_by_height(h);
                     if (!e) return std::nullopt;
                     return e->hash;
+                });
+            // SML validity attestation — the ONLY carrier of a post-anchor
+            // PoSe ban. dashd applies those from consensus, never as a special
+            // tx, so the bridge's block replay is structurally unable to see
+            // one: a masternode banned after the anchor height stays eligible
+            // in our projection, the coinbase pays somebody else, and the
+            // bridge fail-closes forever — the daemonless arm then never
+            // publishes a masternode set at all. With this seam the replay may
+            // demote a projected payee the SML ATTESTS INVALID, and only onto a
+            // candidate whose scriptPayout exactly matches this coinbase.
+            // Three-state on purpose: absent-from-SML is nullopt, never "fine".
+            // See mn_checkpoint_lane.hpp's residuals note.
+            //
+            // Same thread as everything else the lane touches: the SML is
+            // updated on the mnlistdiff ingest leg and read here from the
+            // block-connect / tip-changed callbacks, all on the single
+            // io_context thread main_dash runs. No lock is taken or needed.
+            mn_ckpt_lane->set_sml_validity_fn(
+                [&node_coin_state](const uint256& proTxHash)
+                    -> std::optional<bool> {
+                    if (!node_coin_state.have_sml()) return std::nullopt;
+                    for (const auto& e : node_coin_state.sml().mnList) {
+                        if (e.proRegTxHash == proTxHash) return e.isValid;
+                    }
+                    return std::nullopt;
                 });
             // Publish through the EXACT leg-4 event the E2c RPC seed uses, so
             // CoinStateMaintainer::on_mn_list_update takes the bridged set as

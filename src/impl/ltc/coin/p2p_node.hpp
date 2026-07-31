@@ -828,6 +828,15 @@ private:
             m_peer->get_header(blockhash, header);
             // Fire full block event (carries MWEB data for state extraction)
             m_coin->full_block.happened(result.block);
+        } else if (result.merkle_mismatch) {
+            // Defect 1: every slot filled but the reconstructed txs fail the header
+            // Merkle root -> a short-ID collision substituted a wrong tx. Discard and
+            // pull the authoritative full block; never deliver the mismatched one.
+            LOG_WARNING << "[" << m_chain_label << "] Compact block " << blockhash.GetHex()
+                        << " reconstructed but FAILED header Merkle check — discarding, "
+                        << "requesting full block via getdata";
+            auto getdata_msg = message_getdata::make_raw({inventory_type(inventory_type::block, blockhash)});
+            m_peer->write(getdata_msg);
         } else {
             LOG_INFO << "[" << m_chain_label << "] Compact block incomplete, "
                      << result.missing_indexes.size() << " txs missing — requesting via getblocktxn";
@@ -904,12 +913,21 @@ private:
             }
         }
 
-        // Re-match from mempool (same as cmpctblock handler)
+        // Re-match from mempool (same as cmpctblock handler).
+        // Defect 2: BIP 152 v2 short IDs are keyed by WTXID; the cmpctblock pass and
+        // BuildCompactBlock both use wtxid, so this pass must too. Keying by txid here
+        // would mis-key every segwit tx and ship default-constructed empties once a
+        // mempool is wired. For non-segwit txs wtxid == txid, so this is a strict
+        // superset of the old behaviour.
         std::map<uint256, MutableTransaction> known;
-        for (const auto& [txid, tx] : m_coin->known_txs)
-            known[txid] = MutableTransaction(tx);
+        for (const auto& [txid, tx] : m_coin->known_txs) {
+            MutableTransaction mtx(tx);
+            auto packed = pack(TX_WITH_WITNESS(mtx));
+            uint256 wtxid = Hash(packed.get_span());
+            known[wtxid] = std::move(mtx);
+        }
         if (m_mempool) {
-            auto mp_txs = m_mempool->all_txs_map();
+            auto mp_txs = m_mempool->all_txs_map_wtxid();
             known.merge(mp_txs);
         }
 
@@ -947,6 +965,20 @@ private:
         BlockType block;
         static_cast<BlockHeaderType&>(block) = cb.header;
         block.m_txs = std::move(txs);
+
+        // Defect 1 backstop on the getblocktxn completion path (same invariant as
+        // ReconstructBlock): verify the header Merkle root before delivering. A
+        // collision or a malicious blocktxn response must never reach the UTXO cache.
+        if (ComputeTxMerkleRoot(block.m_txs) != cb.header.m_merkle_root) {
+            LOG_WARNING << "[" << m_chain_label << "] blocktxn-completed block "
+                        << blockhash.GetHex() << " FAILED header Merkle check — discarding, "
+                        << "requesting full block via getdata";
+            auto getdata_msg = message_getdata::make_raw({inventory_type(inventory_type::block, blockhash)});
+            m_peer->write(getdata_msg);
+            m_pending_cmpct.reset();
+            m_pending_missing_indexes.clear();
+            return;
+        }
 
         m_peer->get_block(blockhash, block);
         auto header = static_cast<BlockHeaderType>(block);

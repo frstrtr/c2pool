@@ -734,3 +734,87 @@ TEST(DashCoinStateMaintainer, StaleZeroBaseSnapshotDoesNotCorruptTipSml) {
     EXPECT_EQ(st.sml_current_hash(), raw256(0x60))
         << "post-reorg cold resync must not be blocked by the stale-guard";
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// SML -> PAYEE validity reconcile wiring (2026-07-30, daemonless payee-desync).
+//
+// A PoSe ban is CONSENSUS-driven, never a special tx, so apply_block() can
+// never observe it. The ONLY authoritative signal is the SML axis's per-entry
+// isValid, which advances on every mnlistdiff. Before this wiring the reconciler
+// MnStateMachine::sync_validity_from_sml() was DEAD CODE (zero production
+// callers), so a banned MN stayed isValid=true on the PAYEE axis forever and
+// find_expected_payee() kept projecting the phantom-eligible node -> the
+// embedded template's payee disagreed with dashd -> bridge fail-closed. These
+// two tests pin that the maintainer now actually CALLS the reconciler on both
+// the live-diff path and the seed-join path.
+// ════════════════════════════════════════════════════════════════════════
+
+// Call site 1 (on_mnlistdiff): a ban that lands AFTER the payee axis was seeded
+// valid must flip the payee entry — the exact live-observed ~h2513489 defect.
+TEST(DashCoinStateMaintainer, MnlistdiffBanReconcilesOntoPayeeAxis) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+
+    // Seed the payee axis valid (mirrors a `protx list valid true` checkpoint,
+    // which pre-filters banned nodes — so the ban can only appear post-seed).
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)), H - 2);
+    ASSERT_EQ(st.mnstates().size(), 1u);
+    ASSERT_TRUE(st.mnstates().entries().at(raw256(0x01)).isValid);
+    ASSERT_TRUE(st.mnstates().find_expected_payee().has_value());
+
+    // SML full snapshot @ H-1: same MN (proRegTxHash raw256(0x01)), still valid.
+    {
+        CSimplifiedMNListEntry e = sml_entry(0x01);   // proRegTxHash = raw256(0x01)
+        e.isValid = true;
+        m.on_mnlistdiff(diff_with_seed(uint256::ZERO, raw256(0x54), H - 1,
+                                       100'000'000LL, e));
+    }
+    EXPECT_TRUE(st.mnstates().entries().at(raw256(0x01)).isValid)
+        << "no flip while the SML agrees the MN is valid";
+
+    // Consensus PoSe ban lands as the NEXT incremental mnlistdiff: isValid=false.
+    // No special tx exists for it; the SML axis is the only place it surfaces.
+    {
+        CSimplifiedMNListEntry e = sml_entry(0x01);
+        e.isValid = false;
+        m.on_mnlistdiff(diff_with_seed(raw256(0x54), raw256(0x55), H,
+                                       100'000'001LL, e));
+    }
+
+    // The formerly-dead reconciler must have flipped the payee entry, so the
+    // banned MN is no longer projected as the expected payee.
+    EXPECT_FALSE(st.mnstates().entries().at(raw256(0x01)).isValid)
+        << "SML ban must reconcile onto the payee axis (dead-code wiring)";
+    EXPECT_FALSE(st.mnstates().find_expected_payee().has_value())
+        << "a banned MN must never be projected as expected payee";
+    // Position invariant (trap #2): the reconcile only touched the flipped
+    // entry; it never added or removed entries.
+    EXPECT_EQ(st.mnstates().size(), 1u);
+}
+
+// Call site 2 (on_mn_list_update): an SML ban already applied BEFORE the payee
+// axis is (re)seeded must be applied at seed time — the startup/reseed join,
+// robust to the seed-arrives-after-SML ordering.
+TEST(DashCoinStateMaintainer, SeedReconcileAppliesAlreadyPresentSmlBan) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+
+    // SML already carries the MN as BANNED, applied while the payee axis is
+    // still empty (so on_mnlistdiff's reconcile has nothing to flip yet).
+    {
+        CSimplifiedMNListEntry e = sml_entry(0x01);
+        e.isValid = false;
+        m.on_mnlistdiff(diff_with_seed(uint256::ZERO, raw256(0x54), H - 1,
+                                       100'000'000LL, e));
+    }
+    ASSERT_EQ(st.mnstates().size(), 0u);
+
+    // Now the payee axis is seeded valid (a checkpoint taken a moment before the
+    // ban still listed the MN valid). The seed-join reconcile must apply the
+    // SML's authoritative ban immediately, not wait for the next diff.
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)), H - 1);
+    EXPECT_FALSE(st.mnstates().entries().at(raw256(0x01)).isValid)
+        << "seed reconcile must apply the already-present SML ban at seed time";
+    EXPECT_FALSE(st.mnstates().find_expected_payee().has_value())
+        << "a banned MN must never be projected as expected payee";
+}
