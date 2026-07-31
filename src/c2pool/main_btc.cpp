@@ -1271,6 +1271,12 @@ int main(int argc, char* argv[])
                 p2p_node_raw->tracker(), job.prev_share_hash);
 
             uint256 share_hash;
+            // P1 PE anchor (nmc/pe-main-btc-host-wire): merged_addrs is the
+            // seam the embedded NMC aux backend feeds — next slices add the
+            // --merged parse -> embedded-NMC register -> aux-merkle payout.
+            // Empty here == v35 behavior byte-for-byte until the backend is
+            // wired, so this commit is a no-op at runtime.
+            std::vector<btc::MergedAddressEntry> merged_addrs;
             try {
                 share_hash = btc::create_local_share(
                     p2p_node_raw->tracker(),
@@ -1281,7 +1287,7 @@ int main(int argc, char* argv[])
                     merkle_branches,
                     payout_script,
                     /* donation */              50,         // 0.5%
-                    /* merged_addrs */          {},
+                    /* merged_addrs */          merged_addrs,
                     /* stale_info */            btc::StaleInfo::none,
                     /* segwit_active */         job.segwit_active,
                     /* witness_commitment */    job.witness_commitment_hex,
