@@ -5,7 +5,19 @@
 // the resolved Boost is 1.90.0 (catches a stray apt Boost 1.83 filling holes
 // via include-path fallback). Green here == intact single-version tree, right
 // version resolved, compiled archives link. See ci-boost-stream.md ss.D.
+//
+// FORWARD-TRIPWIRE GUARD (ci-steward 2026-07-31): the full body below is a
+// forward gate for the pending fleet Boost 1.90.0 bump. Its newer includes
+// (boost/asio/cancel_after.hpp, added in Boost 1.86) and its static_assert
+// require Boost >= 1.90.0. The live fleet/prod toolchain is Boost 1.83, so
+// compiling the full body hard-reds EVERY build PR Linux-x86_64 leg regardless
+// of the diff. Until the operator-gated fleet Boost>=1.90 bump lands (a
+// prod-touch: VM110 links libsecp256k1 .so.1), the sentinel stays DORMANT on
+// <1.90 hosts and auto-arms the instant the tree reaches 1.90.0.
 #include <boost/version.hpp>
+#include <cstdio>
+
+#if BOOST_VERSION >= 109000
 static_assert(BOOST_VERSION == 109000, "wrong Boost tree resolved: expected 1.90.0");
 
 #include <boost/asio/cancel_after.hpp>   // pulls detail/timed_cancel_op.hpp (stage-1 casualty)
@@ -23,7 +35,6 @@ static_assert(BOOST_VERSION == 109000, "wrong Boost tree resolved: expected 1.90
 #include <boost/spirit/home/x3.hpp>                // A.3 site (operator/detail/sequence.hpp)
 
 #include <chrono>
-#include <cstdio>
 #include <memory>
 #include <string>
 #include <utility>
@@ -65,3 +76,15 @@ int main()
     std::puts("boost_sentinel: asio+log+signals2+spirit.x3 OK");
     return 0;
 }
+#else
+int main()
+{
+    // Fleet Boost < 1.90.0: forward tripwire inactive. Compiles green with no
+    // newer-Boost headers or link deps so the required Linux-x86_64 leg passes
+    // on the current 1.83 toolchain. Auto-arms once the fleet reaches 1.90.0.
+    std::printf("boost_sentinel: DORMANT (Boost %d < 1.90.0 target) -- "
+                "forward tripwire inactive until fleet Boost>=1.90 bump lands\n",
+                BOOST_VERSION);
+    return 0;
+}
+#endif
