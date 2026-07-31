@@ -37,6 +37,7 @@
 #include <core/pack.hpp>
 
 #include "data/dash_quorum_members_kat.hpp"
+#include "data/dash_rotated_quorum_members_kat.hpp"   // ITEM 2 rotated (DIP-24) ground truth
 
 #include <array>
 #include <cstdint>
@@ -507,6 +508,10 @@ TEST(DashQuorumMemberSource, RequestGuardsAndPendingReap)
     h.add_block(1'520'056, raw256(0xE1));
     h.src->request(/*llmq_60_75*/ 5, rot_base);
     EXPECT_TRUE(h.sends.empty());
+    // ...and no ready set is ever produced for the rotated quorum (fail closed
+    // end-to-end: lookup() returns nullopt, so #812 verify_final_commitment
+    // null-serves and the #816 completeness gate leaves the window to dashd).
+    EXPECT_FALSE(h.src->lookup(5, rot_base).has_value());
 
     // pending reap: > kPendingCap outstanding requests evict the oldest
     // rather than growing without bound (dead-peer hygiene).
@@ -524,4 +529,53 @@ TEST(DashQuorumMemberSource, RequestGuardsAndPendingReap)
         base += 24;
     }
     EXPECT_LE(h.src->pending_count(), QuorumMemberSource::kPendingCap);
+}
+
+// ── ITEM 2: rotated (DIP-24) member sourcing — ground truth + fail-closed ────
+// The captured real llmq_60_75 vector (dashd `quorum info 5 <hash>` @testnet
+// 192.168.86.52, height 1520064) is dashd's AUTHORITATIVE ordered member set:
+// the 60-member order + operator BLS keys that the follow-up
+// ComputeQuorumMembersByQuarterRotation port must reproduce before the rotated
+// DKG window can serve real. This KAT (a) pins that vector's shape as the
+// validation target, and (b) proves the rotated path currently FAILS CLOSED
+// end-to-end — so the reward-safe dashd fallback is intact until the qrinfo
+// wire + quarter-rotation compute land (each gated on reproducing THIS vector).
+TEST(DashQuorumMemberSource, RotatedRealVectorGroundTruthAndFailClosed)
+{
+    using namespace dash::coin::testdata;
+    // (a) the captured ground truth is well-formed: 60 ordered members, each
+    // with a 64-hex proTxHash and a 96-hex (48-byte, basic scheme) operator key.
+    const auto& ms = rotated_6075_members();
+    ASSERT_EQ(ms.size(), kRot6075_MemberCount);
+    EXPECT_EQ(kRot6075_MemberCount, 60u);           // llmq_60_75 quorum size
+    for (const auto& m : ms) {
+        EXPECT_EQ(std::string(m.pro_tx_hash).size(), 64u);
+        EXPECT_EQ(std::string(m.pub_key_operator).size(), 96u);
+    }
+    EXPECT_EQ(kRot6075_LlmqType, 5);
+    EXPECT_EQ(kRot6075_CycleBaseHeight % 24, 0);    // sits on the dkgInterval boundary
+
+    // (b) the rotated compute is fail-closed at the vendor leaf: no single-
+    // snapshot member selection exists for a rotated type (quarter-rotation
+    // over qrinfo is required), so compute_quorum_members refuses.
+    QuorumMemberParams rp;
+    rp.type         = kRot6075_LlmqType;
+    rp.size         = static_cast<uint16_t>(kRot6075_MemberCount);
+    rp.use_rotation = true;                          // DIP-24
+    // (a real modifier/list would still refuse purely on use_rotation)
+    CSimplifiedMNList empty_list{std::vector<CSimplifiedMNListEntry>{}};
+    auto refused = compute_quorum_members(rp, uint256::ZERO, empty_list);
+    EXPECT_FALSE(refused.has_value())
+        << "rotated member selection must fail closed until the quarter-rotation "
+           "port reproduces the captured 60_75 order";
+
+    // (c) and end-to-end through the sourcing plumbing: a rotated request emits
+    // no wire traffic and never yields a ready set.
+    Harness h;
+    const uint256 rot_base = raw256(0xC0);
+    h.add_block(kRot6075_CycleBaseHeight, rot_base);
+    h.add_block(kRot6075_CycleBaseHeight - 8, raw256(0xC1));
+    h.src->request(kRot6075_LlmqType, rot_base);
+    EXPECT_TRUE(h.sends.empty()) << "rotated request must not source a snapshot yet";
+    EXPECT_FALSE(h.src->lookup(kRot6075_LlmqType, rot_base).has_value());
 }
