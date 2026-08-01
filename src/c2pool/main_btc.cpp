@@ -113,7 +113,11 @@ static void print_usage()
         "  --coin-rpc-auth PATH  bitcoin.conf-style file with rpcuser/rpcpassword\n"
         "                  for the submitblock backup (default ~/.bitcoin/\n"
         "                  bitcoin.conf; keeps rpcpassword off the process table).\n"
-        "                  Omit both to run daemonless (embedded P2P relay only).\n";
+        "                  Omit both to run daemonless (embedded P2P relay only).\n"
+        "  --merged SPEC   embedded merged-mined aux chain (NMC under BTC),\n"
+        "                  colon spec SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]\n"
+        "                  e.g. NMC:1:127.0.0.1:8336:nmcrpc:pass  (Namecoin)\n"
+        "                  Omit for a single SHA256d BTC parent (no aux).\n";
 }
 
 /// BTC wire-protocol magic bytes per network (pchMessageStart).
@@ -146,6 +150,7 @@ int main(int argc, char* argv[])
     std::string prefix_hex;                 // --prefix: c2pool PREFIX override (empty = compiled default)
     std::string rpc_endpoint;               // --coin-rpc HOST:PORT: submitblock backup endpoint override (no secret)
     std::string rpc_conf_path;              // --coin-rpc-auth PATH: bitcoin.conf creds (default ~/.bitcoin/bitcoin.conf)
+    std::vector<std::string> merged_chain_specs; // --merged SPEC entries (embedded NMC aux; consumed in later PE slices)
 
     for (int i = 1; i < argc; ++i)
     {
@@ -247,6 +252,15 @@ int main(int argc, char* argv[])
             // rpcuser/rpcpassword for the submitblock RPC backup. Keeps the
             // rpcpassword OFF the process table (default ~/.bitcoin/bitcoin.conf).
             rpc_conf_path = argv[++i];
+        }
+        else if (arg == "--merged" && i + 1 < argc)
+        {
+            // --merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]
+            // Register an embedded merged-mined aux chain (NMC under the BTC
+            // SHA256d parent). Collected here; the embedded-NMC backend is
+            // constructed and its aux-merkle payout fed to merged_addrs in the
+            // following PE slices. Absent == BTC v35 byte-for-byte.
+            merged_chain_specs.push_back(argv[++i]);
         }
         else
         {
@@ -1271,6 +1285,12 @@ int main(int argc, char* argv[])
                 p2p_node_raw->tracker(), job.prev_share_hash);
 
             uint256 share_hash;
+            // P1 PE anchor (nmc/pe-main-btc-host-wire): merged_addrs is the
+            // seam the embedded NMC aux backend feeds — next slices add the
+            // --merged parse -> embedded-NMC register -> aux-merkle payout.
+            // Empty here == v35 behavior byte-for-byte until the backend is
+            // wired, so this commit is a no-op at runtime.
+            std::vector<btc::MergedAddressEntry> merged_addrs;
             try {
                 share_hash = btc::create_local_share(
                     p2p_node_raw->tracker(),
@@ -1281,7 +1301,7 @@ int main(int argc, char* argv[])
                     merkle_branches,
                     payout_script,
                     /* donation */              50,         // 0.5%
-                    /* merged_addrs */          {},
+                    /* merged_addrs */          merged_addrs,
                     /* stale_info */            btc::StaleInfo::none,
                     /* segwit_active */         job.segwit_active,
                     /* witness_commitment */    job.witness_commitment_hex,

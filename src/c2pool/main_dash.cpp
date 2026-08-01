@@ -4173,6 +4173,16 @@ int main(int argc, char** argv)
                       << (nofile < 65536 ? " (< 65536; hard limit too low)" : "") << "\n";
     }
 
+    // Name the BLS backend unconditionally at startup: a stub (BLS-dark) node
+    // is otherwise indistinguishable from an armed one until a DKG-window
+    // height silently null-serves -- which is how this fleet ran BLS-dark for
+    // months without anyone noticing.
+    std::cout << "[init] DASH BLS backend: "
+              << (dash::coin::vendor::bls_backend_available()
+                      ? "REAL (dashbls linked; quorum-commitment verify armed)"
+                      : "STUB (fail-closed; commitment verify inert / BLS-dark)")
+              << "\n";
+
     bool want_help = false;
     bool want_run  = false;
     bool want_mine = false;
