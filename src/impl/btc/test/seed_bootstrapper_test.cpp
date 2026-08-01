@@ -308,6 +308,28 @@ TEST(SeedBootstrapper, StartupJitterWithinConfiguredBound)
     }
 }
 
+// Mirrors the exact tier layout NodeImpl::start_outbound_connections builds:
+// tier 0 = DNS (currently resolves nothing — async wiring is a later slice) and
+// tier 1 = fixed fallback. Confirms the empty DNS tier is skipped without
+// burning a settle interval and the fixed tier then injects candidates — i.e.
+// the node wiring degrades to the working fixed tier exactly as intended.
+TEST(SeedBootstrapper, NodeWiringDnsEmptyThenFixedInjects)
+{
+    Harness h;
+    h.tier_data = {make_seeds(0), make_seeds(4)};  // tier 0 DNS empty, tier 1 fixed
+    h.snap = {0, 8, true};                         // zero outbound, dial path exhausted
+    auto sb = h.make(no_jitter_cfg());
+
+    sb.tick();                        // observe
+    h.now = 1031; auto r = sb.tick(); // tier 0 (DNS) resolves nothing
+    EXPECT_EQ(r.tier, 0u);
+    EXPECT_EQ(r.injected, 0u);
+    h.now = 1032; r = sb.tick();      // advance immediately to fixed tier 1
+    EXPECT_EQ(r.tier, 1u);
+    EXPECT_EQ(r.injected, 4u);
+    EXPECT_EQ(h.injected.size(), 4u);
+}
+
 TEST(SeedBootstrapper, EmptyTierAdvancesWithoutBurningSettle)
 {
     Harness h;
