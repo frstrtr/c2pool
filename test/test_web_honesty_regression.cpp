@@ -1466,3 +1466,64 @@ TEST(DashboardCrossingCard, ReadsOnlyEmittedNestedFields) {
         << "the crossing card display is unconditional; it must hide when the node "
            "is plainly pre-crossing (operator design point on #921).";
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Share-difficulty trend line (operator-requested, 2026-08-01): the graph must
+// plot a REAL share-difficulty trend against network difficulty. The pre-fix
+// source had no "share_difficulty" graph series at all, and the stat-log's
+// share_diff was a hardcoded net_difficulty/65536 approximation — a flat scaled
+// copy of the chain difficulty, not the true vardiff target. These KATs pin the
+// real source in place; they FAIL on the pre-fix code (no source → 0.0).
+// ─────────────────────────────────────────────────────────────────────────
+
+// The share_difficulty graph series must carry the sharechain's published
+// min_difficulty (the p2pool share target that vardiff retargets), NOT the
+// net/65536 approximation (which would be 0 here since no chain difficulty is
+// set) and NOT an absent-source 0.
+TEST(ShareDifficultyTrend, GraphSourcesRealVardiffFromSharechainStats) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    mi.set_pool_hashrate_fn([] { return 1.5e12; });   // ~1.5 TH/s per hotel
+    mi.set_sharechain_stats_fn([] {
+        return json{{"total_shares", 4096}, {"orphan_shares", 0},
+                    {"dead_shares", 0}, {"min_difficulty", 2048.0}};
+    });
+
+    mi.update_stat_log();
+    json series = mi.rest_web_graph_data("share_difficulty", "last_hour");
+
+    ASSERT_TRUE(series.is_array());
+    ASSERT_FALSE(series.empty())
+        << "share_difficulty graph series is empty; the trend line has no data";
+    const auto& last = series.back();
+    ASSERT_TRUE(last.is_array() && last.size() >= 2);
+    EXPECT_DOUBLE_EQ(last[1].get<double>(), 2048.0)
+        << "share_difficulty must come from the sharechain's min_difficulty "
+           "(the real vardiff target), not the net/65536 approximation or a "
+           "0-stub.";
+}
+
+// When the sharechain omits min_difficulty, the trend must fall back to the
+// last real RECORDED share difficulty — never the net/65536 approximation.
+TEST(ShareDifficultyTrend, GraphFallsBackToRecordedShareDifficulty) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    mi.set_pool_hashrate_fn([] { return 1.5e12; });
+    // sharechain stats WITHOUT min_difficulty (the honest-absent case):
+    mi.set_sharechain_stats_fn([] {
+        return json{{"total_shares", 4096}, {"orphan_shares", 0},
+                    {"dead_shares", 0}};
+    });
+    // A real accepted share at difficulty 4096 (vardiff top of the 2048<->4096
+    // retarget band the hotel node was running).
+    mi.record_share_difficulty(4096.0, "miner1", "deadbeef");
+
+    mi.update_stat_log();
+    json series = mi.rest_web_graph_data("share_difficulty", "last_hour");
+
+    ASSERT_TRUE(series.is_array() && !series.empty());
+    const auto& last = series.back();
+    ASSERT_TRUE(last.is_array() && last.size() >= 2);
+    EXPECT_DOUBLE_EQ(last[1].get<double>(), 4096.0)
+        << "with no published min_difficulty the share_difficulty trend must "
+           "fall back to the last recorded real share difficulty, not a "
+           "difficulty/65536 approximation.";
+}
