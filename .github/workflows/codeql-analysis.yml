@@ -40,12 +40,55 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      - name: Stage CodeQL bundle (self-hosted, retry-hardened)
+        # The shared self-hosted pool sits behind a lossy WAN uplink, so
+        # codeql-action/init's built-in bundle download intermittently dies at
+        # "Initialize CodeQL" (BCH/BTC merkle-backstop + gate-dedup PRs).
+        # Fetch the pinned bundle ONCE per runner per version with bounded retry
+        # (same hardening shape as checkout stopgap #982), cache it on the
+        # persistent self-hosted $HOME, and feed it to init via `tools:` so init
+        # resolves locally with zero egress on every job. Pinned to
+        # codeql-action@v4's default bundle to avoid a CLI mismatch.
+        if: runner.environment != 'github-hosted'
+        env:
+          CODEQL_BUNDLE_VERSION: codeql-bundle-v2.26.2
+        run: |
+          # FAIL-SOFT: a cold-cache fetch still rides the lossy uplink, so a
+          # curl-28 timeout here must NOT hard-red the job. On fetch failure we
+          # leave CODEQL_TOOLS empty and let Initialize CodeQL fall back to its
+          # own bundle download (the pre-existing behaviour) rather than skipping
+          # init entirely. Warm cache => zero egress as designed; cold-cache
+          # egress failure => degrades to baseline, never worse.
+          set -uo pipefail
+          dest="$HOME/codeql-bundles/$CODEQL_BUNDLE_VERSION"
+          tarball="$dest/codeql-bundle-linux64.tar.gz"
+          if [ -f "$dest/.complete" ]; then
+            echo "Reusing cached bundle $tarball"
+            echo "CODEQL_TOOLS=$tarball" >> "$GITHUB_ENV"
+          else
+            mkdir -p "$dest"
+            url="https://github.com/github/codeql-action/releases/download/$CODEQL_BUNDLE_VERSION/codeql-bundle-linux64.tar.gz"
+            echo "Fetching $url"
+            if curl -fL -C - --retry 8 --retry-all-errors --retry-delay 5 \
+                    --connect-timeout 20 --speed-limit 1024 --speed-time 60 \
+                    -o "$tarball.tmp" "$url"; then
+              mv "$tarball.tmp" "$tarball"
+              touch "$dest/.complete"
+              echo "Staged $tarball"
+              echo "CODEQL_TOOLS=$tarball" >> "$GITHUB_ENV"
+            else
+              echo "::warning::codeql bundle prestage fetch failed over lossy uplink; leaving CODEQL_TOOLS empty so Initialize CodeQL uses its own bundle download (partial .tmp kept for -C - resume)"
+            fi
+          fi
+
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
           queries: security-and-quality
+          # Empty on github-hosted forks -> init falls back to default download.
+          tools: ${{ env.CODEQL_TOOLS }}
 
       - if: matrix.build-mode == 'manual'
         name: Set Conan home
