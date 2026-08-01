@@ -105,3 +105,113 @@ TEST(BtcCoinPeerManager, SeedSettersDoNotFetchOrThrow)
     EXPECT_NO_THROW(m->set_http_peer_seeds({{"voidbind.com", 8080}}));
     EXPECT_EQ(m->peer_stats().total, 0);
 }
+
+
+// ---------------------------------------------------------------------------
+// Emergency seed re-arm KATs (fail to COMPILE on master -- the entry points
+// below do not exist there; the maintenance handler is a no-op).
+//
+// The four-lane re-arm spec (docs/coin-peer-manager-rearm sections 2.1-2.4)
+// pins three MANDATORY properties. These assert each one DIRECTLY and
+// deterministically -- no wall clock, no sockets: the emergency timer is never
+// run, so the latch state and attempt counter are observed exactly as the
+// maintenance handler leaves them.
+// ---------------------------------------------------------------------------
+
+// 2.1 BACKOFF: saturating binary exponential, base floored at 60, clamped at
+// max_backoff_sec, overflow-safe for large n.
+TEST(BtcCoinPeerManager, EmergencyBackoffScheduleSaturatesWithoutOverflow)
+{
+    boost::asio::io_context ioc;
+    BtcPeerManagerConfig cfg;                 // base_backoff_sec=30, max=3600 (defaults)
+    auto m = make_mgr(ioc, cfg);
+
+    // base is FLOORED at 60 so a re-arm never beats the original 60s one-shot,
+    // even though PeerManagerConfig::base_backoff_sec defaults to 30.
+    EXPECT_EQ(m->emergency_base_sec(), 60);
+
+    // base, 2*base, 4*base, ... : 60, 120, 240, 480, 960, 1920, then clamp.
+    EXPECT_EQ(m->emergency_backoff_delay(0), 60);
+    EXPECT_EQ(m->emergency_backoff_delay(1), 120);
+    EXPECT_EQ(m->emergency_backoff_delay(2), 240);
+    EXPECT_EQ(m->emergency_backoff_delay(3), 480);
+    EXPECT_EQ(m->emergency_backoff_delay(4), 960);
+    EXPECT_EQ(m->emergency_backoff_delay(5), 1920);
+    // 60<<6 = 3840 -> clamped to the 3600 ceiling, and stays there.
+    EXPECT_EQ(m->emergency_backoff_delay(6), cfg.max_backoff_sec);
+    EXPECT_EQ(m->emergency_backoff_delay(7), cfg.max_backoff_sec);
+
+    // Overflow safety: large n must saturate at the cap -- never UB, never a
+    // negative/zero delay from a wrapped base<<n.
+    for (int n : {30, 31, 62, 63, 64, 100, 1000, 1 << 20}) {
+        const int d = m->emergency_backoff_delay(n);
+        EXPECT_EQ(d, cfg.max_backoff_sec) << "n=" << n << " must saturate at cap";
+        EXPECT_GT(d, 0) << "n=" << n << " backoff must stay positive (no overflow)";
+    }
+}
+
+// 2.2 RE-ENTRY GUARD: N consecutive starved maintenance ticks between two timer
+// firings schedule EXACTLY ONE re-arm (counter advances by 1, not N).
+TEST(BtcCoinPeerManager, EmergencyReentryGuardArmsOncePerCycle)
+{
+    boost::asio::io_context ioc;
+    BtcPeerManagerConfig cfg;
+    cfg.min_peers = 5;
+    // Own data_dir under /tmp so start()/stop() never write into config_path().
+    BtcCoinPeerManager mgr(ioc, "BTC", "/tmp/btc_rearm_kat_guard", cfg);
+    mgr.start();   // sets m_running so arm_emergency_fallbacks() is live
+
+    EXPECT_EQ(mgr.emergency_attempts(), 0);
+    EXPECT_FALSE(mgr.emergency_active());
+
+    // 25 starved ticks (connected=0 < min_peers=5). The dedicated emergency
+    // timer is never run, so the latch stays set and every tick after the first
+    // must no-op -- no timer storm.
+    for (int i = 0; i < 25; ++i)
+        mgr.on_maintenance_tick(/*connected=*/0);
+
+    EXPECT_TRUE(mgr.emergency_active())
+        << "latch must remain set between arm and fire";
+    EXPECT_EQ(mgr.emergency_attempts(), 1)
+        << "N starved ticks must schedule EXACTLY ONE re-arm (counter +1, not +N)";
+
+    mgr.stop();
+}
+
+// 2.3 STOP CONDITION / RECOVERY: a tick with connected >= min_peers zeroes the
+// attempt counter and clears the latch; the subsequent starvation re-arms from
+// BASE, not from the prior (higher) step.
+TEST(BtcCoinPeerManager, EmergencyRecoveryResetsBackoffToBase)
+{
+    boost::asio::io_context ioc;
+    BtcPeerManagerConfig cfg;
+    cfg.min_peers = 5;
+    BtcCoinPeerManager mgr(ioc, "BTC", "/tmp/btc_rearm_kat_reset", cfg);
+    mgr.start();
+
+    // Arm once under starvation -> counter advances, next arm would step up.
+    mgr.on_maintenance_tick(/*connected=*/0);
+    EXPECT_EQ(mgr.emergency_attempts(), 1);
+    EXPECT_TRUE(mgr.emergency_active());
+    // Pending: the NEXT arm (after this one fires) would use n=1 -> 120s, i.e.
+    // strictly above base -- backoff is genuinely escalating.
+    EXPECT_EQ(mgr.next_emergency_delay(), mgr.emergency_backoff_delay(1));
+    EXPECT_GT(mgr.next_emergency_delay(), mgr.emergency_base_sec());
+
+    // RECOVERY edge: a maintenance tick observing connected >= min_peers.
+    mgr.on_maintenance_tick(/*connected=*/cfg.min_peers);   // 5 >= 5
+    EXPECT_EQ(mgr.emergency_attempts(), 0)
+        << "recovery must zero the attempt counter";
+    EXPECT_FALSE(mgr.emergency_active())
+        << "recovery must clear the re-entry latch";
+
+    // The subsequent starvation re-arms from BASE, not from the ceiling: the
+    // very next arm uses n=0 -> base (60s), demonstrably below the ceiling.
+    EXPECT_EQ(mgr.next_emergency_delay(), mgr.emergency_base_sec());
+    EXPECT_LT(mgr.emergency_base_sec(), cfg.max_backoff_sec);
+    mgr.on_maintenance_tick(/*connected=*/0);
+    EXPECT_EQ(mgr.emergency_attempts(), 1)
+        << "a fresh drop after recovery re-arms exactly once from base";
+
+    mgr.stop();
+}
