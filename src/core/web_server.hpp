@@ -1487,11 +1487,18 @@ private:
     // (hashrate_hps) + rest_pplns_miner (hashrate_series).
     HashrateRing m_hashrate_ring;
 
+    // Most-recent real recorded share difficulty (vardiff target), fed by
+    // record_share_difficulty and snapshotted into the stat log to drive the
+    // share-difficulty trend line. 0 == no shares seen yet (honest-absent).
+    std::atomic<double> m_recent_share_difficulty{0.0};
+
     // Stat log for /web/log JSON endpoint (rolling 24h window)
     struct StatLogEntry {
         double time;
         double pool_hash_rate;
         double pool_stale_prop;
+        double network_difficulty{0};   // chain difficulty snapshot at sample time
+        double share_difficulty{0};     // real share (vardiff) difficulty; honest-absent 0
         nlohmann::json local_hash_rates;       // {addr: hashrate}
         nlohmann::json local_dead_hash_rates;  // {addr: dead_hashrate}
         int worker_count{0};              // unique address.worker combos
