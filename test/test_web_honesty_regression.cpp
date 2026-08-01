@@ -1376,3 +1376,93 @@ TEST_F(BestShareRoundReset, RoundTracksNewRoundIndependentlyAfterReset) {
         << "#922 regression guard: round must not degenerate back into a "
            "duplicate of all_time";
 }
+// ===========================================================================
+// #921 -- Share-Version Crossing card schema contract.
+//
+// The operator reported the crossing card "not serving": /v36_status emits a
+// NESTED shape (auto_ratchet{...} + share_chain{...}) with NOTHING at top level,
+// but renderV36Status() read only TOP-LEVEL keys (v.status, v.overall_v36_vote_pct,
+// v.sampling_signaling, v.message, v.target_version, ...). The endpoint returned
+// 200, the card rendered, nothing threw -- every field just fell through to '-'.
+// A present-but-meaningless card, invisible to every existing test (same shape
+// as the local_share_hash_rates aliasing class). These two KATs pin the contract
+// from BOTH sides so it cannot drift back.
+// ===========================================================================
+
+// Side 1 (backend): rest_v36_status() must actually EMIT, under the nested paths,
+// every field the fixed card reads. If a refactor flattens or renames the shape,
+// this fails.
+TEST(WebHonestyRegression, V36StatusEmitsEveryNestedFieldTheCrossingCardReads) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+    mi.set_cached_share_version(36);              // latched -> exercises the active path
+    json v = mi.rest_v36_status();
+
+    // The card reads exactly these nested paths (dashboard.html renderV36Status):
+    ASSERT_TRUE(v.contains("auto_ratchet")) << "/v36_status must emit auto_ratchet";
+    ASSERT_TRUE(v.contains("share_chain"))  << "/v36_status must emit share_chain";
+    const auto& ar = v["auto_ratchet"];
+    const auto& sc = v["share_chain"];
+    EXPECT_TRUE(ar.contains("state"))
+        << "card reads auto_ratchet.state for its status label";
+    EXPECT_TRUE(ar.contains("live_share_version"))
+        << "card reads auto_ratchet.live_share_version for the current-version label";
+    EXPECT_TRUE(ar.contains("v36_active"))
+        << "card reads auto_ratchet.v36_active for the live-latch line";
+    EXPECT_TRUE(sc.contains("v36_percentage"))
+        << "card reads share_chain.v36_percentage for the signalling %";
+    // The endpoint must NOT be relied on for the top-level keys the buggy card
+    // read -- their absence is exactly why the card was empty. Guard that the
+    // card is not silently re-coupled to a shape the endpoint doesn't provide.
+    for (const char* absent : {"status", "overall_v36_vote_pct", "sampling_signaling",
+                               "message", "target_version", "current_share_name"}) {
+        EXPECT_FALSE(v.contains(absent))
+            << "top-level '" << absent << "' is NOT emitted by /v36_status; the "
+               "card must not read it (this was the #921 empty-card bug)";
+    }
+}
+
+// Side 2 (frontend, static-HTML): the crossing-card render function must read the
+// nested shape and must NOT read any of the top-level keys the endpoint does not
+// emit. This is the KAT the issue asked for -- it fails if the card reads a field
+// the endpoint does not serve, the defect class that returns 200 and throws
+// nothing. Folded into this allowlisted target (not a new add_executable -> the
+// #769 Not-Run trap).
+TEST(DashboardCrossingCard, ReadsOnlyEmittedNestedFields) {
+    const auto html = read_dashboard();
+    auto start = html.find("function renderV36Status(v)");
+    ASSERT_NE(start, std::string::npos) << "renderV36Status not found";
+    // Slice to the next top-level function declaration (same 8-space indent).
+    auto end = html.find("\n        function ", start + 1);
+    ASSERT_NE(end, std::string::npos);
+    const std::string fn = html.substr(start, end - start);
+
+    // Must read the canonical nested shape the endpoint emits.
+    EXPECT_NE(fn.find("v.auto_ratchet"), std::string::npos)
+        << "renderV36Status does not read v.auto_ratchet -- /v36_status emits the "
+           "ratchet state nested there, not at top level.";
+    EXPECT_NE(fn.find("v.share_chain"), std::string::npos)
+        << "renderV36Status does not read v.share_chain -- v36_percentage lives "
+           "there, not at top level.";
+
+    // Must NOT read the top-level keys /v36_status never emits (the #921 bug).
+    for (const char* dead : {"v.status", "v.overall_v36_vote_pct", "v.sampling_signaling",
+                             "v.current_share_name", "v.current_share_type",
+                             "v.target_version_name", "v.target_version",
+                             "v.message", "v.is_transitioning"}) {
+        EXPECT_EQ(fn.find(dead), std::string::npos)
+            << "renderV36Status reads '" << dead << "', a field /v36_status does "
+               "NOT emit -- it will render as '-' and produce the empty card the "
+               "operator reported. Read the nested auto_ratchet/share_chain path.";
+    }
+
+    // The backwards label must be gone: 'ACTIVATED' must never be the no-transition
+    // fallback (a quiet pre-cross node claiming it had activated).
+    EXPECT_EQ(fn.find("no_transition"), std::string::npos)
+        << "the no_transition:'ACTIVATED' label is semantically backwards -- a "
+           "node with nothing happening would read ACTIVATED.";
+
+    // Visibility must be gated, not unconditional: a hide path must exist.
+    EXPECT_NE(fn.find("card.style.display = 'none'"), std::string::npos)
+        << "the crossing card display is unconditional; it must hide when the node "
+           "is plainly pre-crossing (operator design point on #921).";
+}
