@@ -572,15 +572,19 @@ public:
     }
 
 private:
-    // #996 helper: is the MN payee the embedded builder will need actually
-    // resolvable at the tip we build on? Mirrors embedded_gbt.hpp's build-time
-    // condition (build_embedded_workdata gates the MN PackedPayment on
-    // mn_payment > 0). Returns false ONLY when a MN payment is due but
-    // find_expected_payee() is nullopt (all entries isValid=false / empty set)
-    // or, defensively, names a payee absent from entries(). Uses the fee-free
-    // subsidy floor: mempool fees only RAISE block_value, so if the floor MN
-    // payment is <= 0 no MN output is due and an absent payee is legitimately
-    // fine -- the gate never over-refuses at a genuine no-MN-payment height.
+    // #996 helper (rescoped #1005): is the MN payee the embedded builder will
+    // need actually resolvable at the tip we build on? Mirrors embedded_gbt.hpp's
+    // build-time condition (build_embedded_workdata gates the MN PackedPayment
+    // on mn_payment > 0). Returns false ONLY when a MN payment is due AND the
+    // network HAS masternodes (entries() non-empty) but the projected payee is
+    // unresolvable -- find_expected_payee() nullopt (all present entries
+    // isValid=false / PoSe-banned) or, defensively, a winner absent from
+    // entries(). An EMPTY masternode set is NOT a failure: it means the network
+    // has no masternodes, so no MN output is owed -- returns true (serve). Uses
+    // the fee-free subsidy floor: mempool fees only RAISE block_value, so if the
+    // floor MN payment is <= 0 no MN output is due and an absent payee is
+    // legitimately fine -- the gate never over-refuses at a genuine
+    // no-MN-payment height.
     bool mn_payee_resolvable_at_tip() const {
         const uint32_t next_h = m_prev_height + 1;
         const int64_t reward = compute_dash_block_reward_post_v20(next_h);
@@ -589,8 +593,24 @@ private:
         const int64_t mn_payment_floor =
             compute_dash_mn_payment_post_v20(reward) - platform_reward;
         if (mn_payment_floor <= 0) return true;   // no MN payment due at this height
+        // #1005 rescope: the #996 fail-closed guard was scoped too broadly. A
+        // nullopt payee has TWO distinct causes and only ONE is an error:
+        //   (b) this network has NO masternode set at all (entries() empty) --
+        //       no MN output is owed, the coinbase is legitimately MN-less, so
+        //       the embedded template is correct and MUST serve; refusing here
+        //       strands testnet/regtest (E5) with the arm never engaging; or
+        //   (a) masternodes DO exist (entries() non-empty) but the projected
+        //       payee will not resolve -- every candidate ineligible/PoSe-banned,
+        //       or the winner absent from the set -- a real desync while a
+        //       payment is owed; the builder would omit a DUE MN output
+        //       (bad-cb-payee), so this MUST still refuse to the dashd fallback.
+        // The empty MN set is the network-shape signal that separates the two.
+        // Safe on mainnet: the C1 mainnet gate independently suppresses the
+        // embedded arm there, so an unsynced-mainnet empty set never reaches a
+        // real block through this relaxation (it falls back on the mainnet gate).
+        if (m_mnstates.entries().empty()) return true;   // (b) no MN set -> serve
         const auto expected = m_mnstates.find_expected_payee();
-        if (!expected) return false;              // #996: nullopt while payment due
+        if (!expected) return false;              // (a) MNs exist, none resolvable -> refuse
         return m_mnstates.entries().find(*expected) != m_mnstates.entries().end();
     }
 
