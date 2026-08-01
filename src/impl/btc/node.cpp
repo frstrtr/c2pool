@@ -1539,11 +1539,55 @@ void NodeImpl::start_outbound_connections()
         return;
     }
 
+    // SeedBootstrapper — tick-driven, rate-limited seed-candidate refill hung
+    // off the existing 30s dial-maintenance loop. It only ADDS candidates (via
+    // got_addr) and never connects; the normal dial path below does the actual
+    // dialing on the next tick. Tiers are tried in order:
+    //   tier 0 = DNS   — TODO: wire core/dns_seeder.hpp async resolution to
+    //                    feed a resolved-IP cache returned here. Until then this
+    //                    tier resolves nothing and the FSM fast-advances past it
+    //                    to the fixed tier (empty-tier advance path).
+    //   tier 1 = fixed — static NetService fallback list (sync, works today).
+    {
+        const bool testnet = m_config->m_testnet;
+        std::vector<btc::coin::SeedBootstrapper::TierFn> tiers;
+        tiers.emplace_back([]() -> std::vector<NetService> { return {}; });
+        tiers.emplace_back([testnet]() { return btc::coin::btc_fixed_seeds(testnet); });
+
+        btc::coin::SeedBootstrapper::Config sb_cfg;  // locked defaults
+        m_seed_bootstrapper = std::make_unique<btc::coin::SeedBootstrapper>(
+            sb_cfg,
+            // Snapshot: live established-outbound / target + the dial layer
+            // exhaustion flag recorded on the previous pass below.
+            [this]() {
+                return btc::coin::SeedBootstrapper::Snapshot{
+                    m_outbound_addrs.size(), m_target_outbound_peers,
+                    m_seed_candidates_exhausted};
+            },
+            // Sink: seeds only add candidates; services unknown (0), seen now.
+            [this](const NetService& a) {
+                got_addr(a, /*services=*/0, core::timestamp());
+            },
+            // Clock: unix seconds.
+            []() -> std::int64_t {
+                return static_cast<std::int64_t>(core::timestamp());
+            },
+            std::move(tiers),
+            std::random_device{}());  // per-node startup jitter decorrelation
+    }
+
     // Try to connect to peers right away
     auto try_connect_peers = [this]() {
         size_t outbound = m_outbound_addrs.size();
         if (outbound >= m_target_outbound_peers || m_connections.size() >= m_max_peers)
+        {
+            // Still drive the FSM on the healthy path so it sees the at/above-
+            // target Snapshot and releases backoff state after hysteresis; the
+            // Healthy branch injects nothing regardless of the exhaustion flag.
+            if (m_seed_bootstrapper)
+                m_seed_bootstrapper->tick();
             return;
+        }
 
         size_t needed = m_target_outbound_peers - outbound;
         auto good_peers = get_good_peers(needed + 4);  // ask for a few extra in case some are already connected
@@ -1561,6 +1605,15 @@ void NodeImpl::start_outbound_connections()
             core::Client::connect(ap.addr);
             --needed;
         }
+
+        // Dual-condition guard for seed escalation: after dialing everything we
+        // could this cycle, a non-zero remaining deficit means the normal dial
+        // path could not fill `needed` from its own good-peer set — its
+        // candidates are exhausted. Record it and drive the FSM, which escalates
+        // to seed injection only once starvation has also persisted long enough.
+        m_seed_candidates_exhausted = (needed > 0);
+        if (m_seed_bootstrapper)
+            m_seed_bootstrapper->tick();
     };
 
     // Initial burst

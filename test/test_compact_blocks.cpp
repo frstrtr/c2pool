@@ -92,6 +92,10 @@ static BlockType make_block(const std::vector<MutableTransaction>& txs) {
     block.m_bits = 0x1d00ffff;
     block.m_nonce = 42;
     block.m_txs = txs;
+    // A real block header carries the Merkle root over its own transactions.
+    // ReconstructBlock (#977) verifies this root before delivery, so the fixture
+    // must supply it rather than a null placeholder (was: m_merkle_root.SetNull()).
+    block.m_merkle_root = ComputeTxMerkleRoot(txs);
     return block;
 }
 
