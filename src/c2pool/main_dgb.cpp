@@ -237,6 +237,14 @@ int run_node(const core::CoinParams& params, bool testnet,
             ioc, "DGB", pm_data_dir, pm_cfg);
         coin_peer_mgr->set_dns_seeds(dgb::coin::dgb_dns_seeds(testnet));
         coin_peer_mgr->set_fixed_seeds(dgb::coin::dgb_fixed_seeds(testnet));
+        // Tier 3 (last-resort) bootstrap: the c2pool HTTP seed aggregator.
+        // Fires only when DNS + fixed seeds both fail to yield min_peers within
+        // 90s (schedule_http_peer_fallback), so a DGB lane that loses its DNS
+        // and fixed seeds still has a recovery path. Host mirrors the LTC lane
+        // (main_ltc.cpp:5537); coin selection is by the "dgb" JSON key inside
+        // http_fetch_coin_peers, not the host, so the shared aggregator serves
+        // DGB peers without a DGB-specific endpoint. No-op if the list is empty.
+        coin_peer_mgr->set_http_peer_seeds({{"voidbind.com", 8080}});
         coin_peer_mgr->start();
         const auto pm_stats = coin_peer_mgr->peer_stats();
         std::cout << "[DGB] coin-network peer discovery ARMED (--coin-p2p-discover): "
