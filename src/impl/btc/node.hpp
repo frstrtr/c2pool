@@ -6,6 +6,8 @@
 #include "share_tracker.hpp"
 #include "peer.hpp"
 #include "messages.hpp"
+#include "coin/seed_bootstrapper.hpp"
+#include "coin/chain_seeds.hpp"
 
 #include <pool/node.hpp>
 #include <pool/sharechain_node.hpp>
@@ -670,6 +672,14 @@ protected:
     size_t m_max_peers = 30;
     size_t m_target_outbound_peers = DEFAULT_TARGET_OUTBOUND_PEERS;
     std::unique_ptr<core::Timer> m_connect_timer;
+    // Tick-driven, rate-limited seed-candidate refill hung off the 30s dial
+    // loop (see coin/seed_bootstrapper.hpp). Constructed lazily in
+    // start_outbound_connections(); seeds only ADD candidates via got_addr,
+    // never connect. m_seed_candidates_exhausted carries the dial layer
+    // per-tick "could not fill the outbound deficit from our own good peers"
+    // signal into the pull-based Snapshot the bootstrapper reads each tick.
+    std::unique_ptr<btc::coin::SeedBootstrapper> m_seed_bootstrapper;
+    bool m_seed_candidates_exhausted = false;
     // Periodic have_tx/losing_tx delta sweep (core/tx_advertiser.hpp). Cadence
     // mirrors the canonical known-tx removal loop, node.py:298 t.start(10).
     std::unique_ptr<core::Timer> m_tx_advert_timer;
