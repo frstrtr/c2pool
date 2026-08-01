@@ -1434,7 +1434,7 @@ jobs:
           cmake --build build_dash_bls \
             --target c2pool-dash \
                      test_dash_bls_verify test_dash_quorum_members \
-                     test_dash_quorum_member_source \
+                     test_dash_quorum_member_source test_dash_govvote_bls \
             -j8
 
       # LEG 2: the artefact itself carries the dashbls backend.
@@ -1443,7 +1443,7 @@ jobs:
 
       - name: Run BLS KATs
         working-directory: build_dash_bls
-        run: ctest --output-on-failure -j8 -R 'DashBlsVerify|DashQuorumMembers|DashQuorumMemberSource'
+        run: ctest --output-on-failure -j8 -R 'DashBlsVerify|DashQuorumMembers|DashQuorumMemberSource|DashGovVoteBLS'
 
       # LEG 3: the BLS-ONLY cases actually ran. Each of these is inside
       # #ifdef C2POOL_DASH_BLS, so on a stub build they do not fail -- they
