@@ -92,6 +92,11 @@ static BlockType make_block(const std::vector<MutableTransaction>& txs) {
     block.m_bits = 0x1d00ffff;
     block.m_nonce = 42;
     block.m_txs = txs;
+    // Carry a real Merkle root so the #977 reconstruction backstop (BIP152) has
+    // something valid to verify against; SetNull() made every reconstruction
+    // mismatch and DISCARD, which is the correct production behaviour but leaves
+    // this fixture unable to exercise the happy path.
+    block.m_merkle_root = ComputeTxMerkleRoot(txs);
     return block;
 }
 
