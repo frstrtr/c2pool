@@ -41,6 +41,7 @@
 #include <impl/btc/coin/template_other_txs.hpp>    // make_template_other_txs_fn bridge (#840)
 #include <impl/btc/coin/reconstruct_won_block.hpp> // make_reconstruct_closure — faithful won-block body (#839)
 #include <impl/btc/coin/won_block_dispatch.hpp>    // make_on_block_found — dual-path won-block dispatch (#744)
+#include <impl/btc/coin/merged_spec.hpp>          // parse --merged SPEC -> AuxChainConfig (NMC PE host-wire slice 3)
 
 #include <core/coin/utxo.hpp>
 #include <core/coin/utxo_view_cache.hpp>
@@ -285,6 +286,33 @@ int main(int argc, char* argv[])
     if (!prefix_hex.empty() && network_id_hex.empty())
         std::cerr << "[BTC] warning: --prefix ignored without --network-id\n";
     btc::PoolConfig::set_network_id(network_id_hex, prefix_hex);
+
+    // ── NMC PE host-wire slice 3: parse --merged SPECs into typed configs ──
+    // #997 (slices 1-2) collected raw --merged strings into merged_chain_specs
+    // but consumed nothing. Turn each into a validated AuxChainConfig here;
+    // slice 4 builds the embedded-NMC backend from these and feeds its
+    // aux-merkle payout into the merged_addrs seam at the create_local_share
+    // call site. An invalid aux spec is logged and skipped -- it must never
+    // abort the parent BTC pool. Absent --merged this vector is empty and the
+    // host path stays v35 byte-for-byte.
+    std::vector<c2pool::merged::AuxChainConfig> merged_configs;
+    for (const auto& spec : merged_chain_specs) {
+        c2pool::merged::AuxChainConfig cfg;
+        std::string merged_err;
+        if (!btc::parse_merged_spec(spec, cfg, merged_err)) {
+            LOG_ERROR << "[NMC-MM] ignoring invalid --merged spec (" << merged_err << "): " << spec;
+            continue;
+        }
+        LOG_INFO << "[NMC-MM] aux chain configured: " << cfg.symbol
+                 << " chain_id=" << cfg.chain_id
+                 << " rpc=" << cfg.rpc_host << ":" << cfg.rpc_port
+                 << (cfg.p2p_port ? (" p2p=" + std::to_string(cfg.p2p_port))
+                                  : std::string(" p2p=off"));
+        merged_configs.push_back(std::move(cfg));
+    }
+    if (!merged_configs.empty())
+        LOG_INFO << "[NMC-MM] " << merged_configs.size()
+                 << " embedded merged-mined aux chain(s) parsed -- backend wiring pending (PE slice 4)";
 
     auto chain_params = regtest
         ? btc::coin::BTCChainParams::regtest()
