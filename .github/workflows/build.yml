@@ -945,7 +945,7 @@ jobs:
     # architecture sweep — macOS arm64 + x86_64 + universal, and Windows — still
     # runs in release.yml at tag time, so this DEFERS detection rather than
     # losing it. See the ci-platform-coverage job for the visible statement.
-    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-linux-only')) && !(matrix.arch == 'x86_64' && vars.MAC_INTEL_PAUSED == 'true') && !(github.event_name == 'pull_request' && vars.PR_LINUX_ONLY == 'true') }}
+    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-linux-only')) && !(github.event_name == 'pull_request' && vars.PR_LINUX_ONLY == 'true') }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -975,7 +975,6 @@ jobs:
           #   RESUME  : gh variable delete MAC_INTEL_PAUSED            --repo frstrtr/c2pool
           - arch: x86_64
             runner: ${{ vars.MAC_INTEL_OFFLINE == 'true' && ((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","c2pool-mac-arm"]') || 'macos-14') || fromJSON('["self-hosted","macOS","X64","c2pool-mac-intel"]') }}
-            paused: ${{ vars.MAC_INTEL_PAUSED == 'true' }}
     steps:
       - uses: actions/checkout@v6
 
