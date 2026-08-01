@@ -1290,3 +1290,89 @@ TEST(DashboardMergedGating, MergedExplorerRoutedThroughCurrencyInfo) {
         << "the merged payout-address link is a hardcoded blockchair URL; route "
            "it through currency_info.merged_child_address_explorer_url_prefix.";
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// #922 — BEST-SHARE "round" must RESET at a block-found boundary.
+//
+// Operator-reported + reproduced on the live hotel: GET /best_share returned
+// round.hash == all_time.hash and round.difficulty == all_time.difficulty for
+// a share attached to a block found hours (and hundreds of shares) earlier —
+// both rows 932.28% of target. The all_time/round SPLIT already existed in the
+// payload; the RESET was missing, so `round` only ever raised and degenerated
+// into a permanent duplicate of `all_time` the instant a block was won.
+//
+// These cases pin the reset in place. They FAIL against the pre-fix source
+// (round never cleared, round_start never written).
+class BestShareRoundReset : public ::testing::Test {
+protected:
+    // Read /best_share and pull out the round + all_time legs.
+    static void snapshot(MiningInterface& mi,
+                         double& round_diff, uint64_t& round_started,
+                         double& all_time_diff) {
+        const nlohmann::json bs = mi.rest_best_share();
+        round_diff    = bs.at("round").at("difficulty").get<double>();
+        round_started = bs.at("round").at("started").get<uint64_t>();
+        all_time_diff = bs.at("all_time").at("difficulty").get<double>();
+    }
+};
+
+// The round leg resets on block-found while all_time is preserved untouched.
+TEST_F(BestShareRoundReset, RoundResetsOnBlockFoundAllTimePreserved) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+
+    // A round's worth of shares, culminating in the record 900000-diff winner —
+    // the share that will go on to solve the block.
+    mi.record_share_difficulty(12.0,     "minerA", "aa");
+    mi.record_share_difficulty(4096.0,   "minerB", "bb");
+    mi.record_share_difficulty(900000.0, "minerC", "cc");   // block-solving share
+
+    double round_diff, all_time_diff; uint64_t round_started;
+    snapshot(mi, round_diff, round_started, all_time_diff);
+
+    // Pre-block: this is exactly the reproduced 932%-style state — round is a
+    // duplicate of all_time, and round.started was never written.
+    EXPECT_DOUBLE_EQ(round_diff, 900000.0);
+    EXPECT_DOUBLE_EQ(all_time_diff, 900000.0);
+    EXPECT_EQ(round_started, 0u)
+        << "pre-fix baseline: round_start is never written until the first reset";
+
+    // The pool wins the block that minerC's share solved.
+    mi.record_found_block(/*height=*/2511601, uint256{}, /*ts=*/0, "LTC",
+                          "minerC", "cc", /*network_difficulty=*/96540.0);
+
+    snapshot(mi, round_diff, round_started, all_time_diff);
+
+    // Acceptance #1: round.* reset on block-found.
+    EXPECT_DOUBLE_EQ(round_diff, 0.0)
+        << "#922: round best-share must reset to 0 when a block is won";
+    EXPECT_GT(round_started, 0u)
+        << "#922: round.started must be stamped to the block-found event";
+
+    // Acceptance #2: all_time.* untouched by the reset.
+    EXPECT_DOUBLE_EQ(all_time_diff, 900000.0)
+        << "#922: all_time must survive the round reset";
+}
+
+// After the reset, the round leg tracks THIS round independently — a new,
+// smaller share raises round without disturbing the preserved all_time record.
+// This is the property whose absence produced the permanent round==all_time bug.
+TEST_F(BestShareRoundReset, RoundTracksNewRoundIndependentlyAfterReset) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+
+    mi.record_share_difficulty(900000.0, "minerC", "cc");   // last round's record
+    mi.record_found_block(2511601, uint256{}, 0, "LTC", "minerC", "cc", 96540.0);
+
+    // A modest share arrives in the new round.
+    mi.record_share_difficulty(250.0, "minerD", "dd");
+
+    double round_diff, all_time_diff; uint64_t round_started;
+    snapshot(mi, round_diff, round_started, all_time_diff);
+
+    EXPECT_DOUBLE_EQ(round_diff, 250.0)
+        << "#922: round must now reflect the new round's best share, not last round's";
+    EXPECT_DOUBLE_EQ(all_time_diff, 900000.0)
+        << "#922: the all_time record must remain the last round's 900000";
+    EXPECT_NE(round_diff, all_time_diff)
+        << "#922 regression guard: round must not degenerate back into a "
+           "duplicate of all_time";
+}
