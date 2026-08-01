@@ -28,6 +28,7 @@
 #include <impl/dash/coin/vendor/cbtx.hpp>           // parse_cbtx (read served creditPool)
 #include <impl/dash/coin/embedded_gbt.hpp>          // encode_cbtx (GBT-xcheck fallback fixture)
 #include <impl/dash/coin/arm_resolution.hpp>       // #738 resolve_embedded_arm (run-path arm decision)
+#include <impl/dash/coin/mn_state_db.hpp>         // MNState (seed a resolvable MN payee for the #996 fail-closed gate)
 
 #include <core/stratum_work_source.hpp>
 #include <core/target_utils.hpp>
@@ -1677,6 +1678,28 @@ namespace {
 const char* const kEmbeddedPrevHashHex =
     "0000000000000000abcdef0123456789abcdef0123456789abcdef0123456789";
 constexpr uint32_t kEmbeddedPrevHeight = 500000u;   // embedded template -> +1
+// #996 fail-closed guard (node_coin_state.hpp::mn_payee_resolvable_at_tip):
+// the embedded arm now REFUSES to serve when a MN payment is due at the tip
+// but find_expected_payee() is nullopt (empty MN set). These C1-gate fixtures
+// predate that guard and seed only the header tip, so post-#996 the embedded
+// arm is (correctly) refused for want of a MN set -- which would MASK the
+// mainnet/testnet DISCRIMINATOR this suite actually pins. Seed ONE live MN
+// into the payee queue so the embedded arm is genuinely viable and the gate
+// under test is the net discriminator, not the (separately-covered) #996
+// payee guard (see test_dash_cb_payee / test_dash_mn_state).
+void seed_resolvable_mn(dash::coin::NodeCoinState& cs)
+{
+    dash::coin::MNState mn;
+    mn.isValid           = true;              // eligible (nPoSeBanHeight == 0)
+    mn.nRegisteredHeight = 1;                 // a positive payment-queue slot
+    mn.collateralOutpoint.hash.SetHex(std::string(64, '9'));
+    mn.collateralOutpoint.index = 0;
+    mn.scriptPayout.m_data = fixture_miner_script();   // standard P2PKH payout
+    uint256 protx;
+    protx.SetHex(std::string(64, 'a'));
+    cs.mnstates().load({{protx, mn}}, /*as_of_height=*/kEmbeddedPrevHeight);
+}
+
 void seed_populated(dash::coin::NodeCoinState& cs)
 {
     uint256 emb_prev;
@@ -1684,6 +1707,7 @@ void seed_populated(dash::coin::NodeCoinState& cs)
     cs.set_tip(kEmbeddedPrevHeight, emb_prev, /*bits_for_next=*/0x1e0ffff0u,
                /*mtp_at_tip=*/1'700'000'000u, /*addr_ver=*/76, /*p2sh_ver=*/16,
                /*curtime=*/kCurtime, /*version=*/static_cast<uint32_t>(kVersion));
+    seed_resolvable_mn(cs);   // #996: make the embedded arm genuinely viable
 }
 }  // namespace
 
@@ -1783,6 +1807,7 @@ TEST(DashStratumC1MainnetGate, EmbeddedCacheHitReValidatesCreditPoolAndReSources
     cs.set_sml_current_hash(emb_prev);
     cs.set_require_sml(true);
     cs.set_require_fresh_credit_pool(true);
+    seed_resolvable_mn(cs);   // #996: resolvable payee so the embedded arm serves
 
     const int64_t S1 = 33971546001156LL;
     const int64_t S2 = 33971612967986LL;   // advanced seed (one reward later)
