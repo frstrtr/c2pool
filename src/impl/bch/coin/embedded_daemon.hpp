@@ -64,6 +64,8 @@
 #include "block_broadcast_guard.hpp" // guarded_dual_broadcast + BlockBroadcast
 #include "abla_runtime.hpp"     // AblaRuntime (owns tracker + feed)
 #include "bchn_anchor_record.hpp" // BchnAnchorRecord (cold-start anchor)
+#include "seed_tier.hpp"        // SeedTier (Option-A embedded peer discovery ladder)
+#include "chain_seeds.hpp"      // bch_dns_seeds / bch_fixed_seeds (tier 1 + 2 data)
 
 #include <core/log.hpp>
 #include <core/events.hpp>   // EventDisposable (new_headers subscription handle)
@@ -84,7 +86,8 @@ public:
     /// daemon (owned by the binary entrypoint, same contract as coin::Node).
     EmbeddedDaemon(auto* context, config_t* config, uint32_t anchor_height,
                    bool is_regtest = false)
-        : m_config(config),
+        : m_context(context),
+          m_config(config),
           m_chain(is_regtest ? BCHChainParams::regtest()
                              : (config->m_testnet4 ? BCHChainParams::testnet4()
                                 : (config->m_testnet ? BCHChainParams::testnet()
@@ -108,6 +111,7 @@ public:
         assemble();                   // network-free seam + ABLA wiring (see below)
         wire_chain_ingest();          // new_headers --> HeaderChain (advances synced height)
         pin_cold_start_anchor();      // operator-APPROVED VM300 anchor (decisions@ 2026-06-18); floor-equivalent
+        configure_seed_tier();        // populate the tier-1/2/3 seed ladder BEFORE maybe_start_p2p consults it (no network here -- data only)
         const bool p2p_up = maybe_start_p2p(); // arm won-block P2P relay leg + connector re-request sink (gated on configured peer)
         sync_mempool_from_rpc();      // RPC-fallback: BCHN loose-mempool txs never reach embedded P2P -> fill m_pool so populated templates (nTx>1) are built
         LOG_INFO << "[EMB-BCH] embedded daemon up: embedded-primary work source,"
@@ -311,9 +315,39 @@ public:
     /// coinbase/PPLNS/WorkData-shape change).
     bool maybe_start_p2p() {
         const auto& peer = m_config->coin()->m_p2p.address;
-        if (peer.port() == 0)             // no peer configured -> RPC-only
-            return false;
-        m_node.start_p2p(peer);           // embedded BCHN P2P relay/IBD transport
+        if (peer.port() == 0) {
+            // No EXPLICIT peer configured. ADDITIVE Option-A discovery: consult
+            // the SeedTier ladder (DNS tier-1 -> fixed tier-2 -> HTTP-peer
+            // tier-3) ONLY under should_run_ladder() -- i.e. only when no
+            // explicit peer is set AND at least one tier is populated (run()
+            // populates them via configure_seed_tier(); an offline caller that
+            // never configured seeds keeps has_seeds()==false, so this stays the
+            // exact no-op RPC-only path it was before). The explicit-peer arm
+            // below ALWAYS bypasses this gate, so the reward-safe configured-peer
+            // default is bit-for-bit unchanged.
+            if (!SeedTier::should_run_ladder(peer.port(), m_seed_tier.has_seeds()))
+                return false;             // no seeds -> RPC-only, exactly as before
+            if (!m_context)
+                return false;             // no io_context to resolve on -> RPC-only
+            m_seed_tier.resolve_candidates(*m_context,
+                [this](std::vector<NetService> candidates) {
+                    if (candidates.empty()) {
+                        LOG_WARNING << "[EMB-BCH] SeedTier ladder resolved 0 "
+                                       "candidates -> staying RPC-only.";
+                        return;
+                    }
+                    // resolve_candidates() already ran build_ladder() to order +
+                    // dedup the tiers ([dns-or-fixed] then http). Dial the first
+                    // candidate; the p2p node walks the remainder on reconnect.
+                    const NetService& dial = candidates.front();
+                    start_discovered_p2p(dial);
+                    LOG_INFO << "[EMB-BCH] SeedTier ladder dial -> "
+                             << dial.to_string() << " (" << candidates.size()
+                             << " candidate(s))";
+                });
+            return true;                  // ladder armed (async dial on resolution)
+        }
+        m_node.start_p2p(peer);           // embedded BCHN P2P relay/IBD transport (EXPLICIT peer -- unchanged)
         bind_locator_provider();          // HeaderChain back-off locator for ContinueSync
         if (auto* p2p = m_node.p2p())     // self-start IBD: kick getheaders at handshake
             p2p->enable_auto_getheaders();
@@ -560,6 +594,39 @@ public:
     }
 
 private:
+    /// Populate the three converged seed tiers (idempotent). Mirrors the DGB
+    /// tier-3 wire (main_dgb.cpp): DNS (tier 1) + fixed (tier 2) from
+    /// chain_seeds.hpp, then the c2pool HTTP seed aggregator as the last-resort
+    /// tier 3. No network here -- pure data population; the ladder is only
+    /// walked (and only when no explicit peer is set) inside maybe_start_p2p().
+    void configure_seed_tier() {
+        if (m_seed_tier.has_seeds())
+            return;                        // populate once (idempotent)
+        const bool testnet = m_config->m_testnet;
+        m_seed_tier.set_dns_seeds(bch_dns_seeds(testnet));     // tier 1: DNS
+        m_seed_tier.set_fixed_seeds(bch_fixed_seeds(testnet)); // tier 2: fixed
+        // Tier 3 (last-resort) bootstrap: the c2pool HTTP seed aggregator.
+        // Fires only when the DNS + fixed tiers both resolve nothing, so a BCH
+        // lane that loses its DNS and fixed seeds still has a recovery path.
+        // Coin selection is by the "bch" JSON key inside http_fetch_coin_peers,
+        // not the host, so the shared aggregator serves BCH peers without a
+        // BCH-specific endpoint. Shaped after the DGB tier-3 wire. No-op if the
+        // list is empty.
+        m_seed_tier.set_http_peer_seeds({{"voidbind.com", 8080}});
+    }
+
+    /// Dial a discovery-resolved candidate through the SAME transport arm the
+    /// explicit-peer path uses (start_p2p + locator provider + auto-getheaders),
+    /// so a ladder-discovered peer and an explicitly-configured one bring the
+    /// won-block P2P relay leg + IBD self-start up identically.
+    void start_discovered_p2p(const NetService& dial) {
+        m_node.start_p2p(dial);
+        bind_locator_provider();
+        if (auto* p2p = m_node.p2p())
+            p2p->enable_auto_getheaders();
+    }
+
+    boost::asio::io_context* m_context; // not owned (binary entrypoint owns it); SeedTier async resolve target
     bool             m_regtest = false; // regtest 3rd-net: skip mainnet/testnet anchor + drive RPC mempool sync
     config_t*        m_config;   // not owned (binary entrypoint owns it)
     HeaderChain      m_chain;    // before m_embedded + m_abla: their refs bind here
@@ -576,6 +643,10 @@ private:
     // Built in run() once m_node.rpc() is live; binds raw ptrs to m_embedded
     // (primary) + m_node's NodeRPC (fallback), both outlive it (daemon-owned).
     std::unique_ptr<CoinNode> m_coin_node;
+    // Option-A embedded peer-discovery ladder (DNS -> fixed -> HTTP tier-3).
+    // Populated by configure_seed_tier() in run(); consulted by maybe_start_p2p()
+    // ONLY when no explicit peer is configured (should_run_ladder gate).
+    SeedTier         m_seed_tier;
 };
 
 } // namespace coin
