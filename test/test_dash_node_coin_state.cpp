@@ -379,6 +379,57 @@ TEST(DashNodeCoinState, SuperblockHeightRefusesEmbedded) {
     EXPECT_TRUE(st.make_embedded_work_inputs().viable());
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// #996: payee fail-closed gate. A populated, tip-fresh bundle whose MN set
+// resolves NO payee (every entry isValid=false — e.g. a PoSe ban the tx-walk
+// never observed) while a MN payment is due must REFUSE the embedded arm: the
+// builder (build_embedded_workdata) would emit a coinbase claiming
+// m_payment_amount with no MN output — fail-OPEN on a money path (bad-cb-payee).
+// NEGATIVE PASS: with the guard OFF (pre-#996 behaviour) the SAME bundle is
+// (wrongly) viable and would serve the defective template; with the guard ON it
+// falls back to the reward-safe dashd arm. A CONTROL with a resolvable payee at
+// the same tip stays viable, proving the gate is payee-specific, not a blanket
+// refuse.
+// ════════════════════════════════════════════════════════════════════════
+TEST(DashNodeCoinState, UnresolvablePayeeFailsClosedToDashd) {
+    NodeCoinState st;
+    // One MN, marked INVALID — find_expected_payee() skips it => nullopt.
+    MNState banned;
+    banned.isValid          = false;
+    banned.nRegisteredHeight = 2'300'000;
+    banned.scriptPayout.m_data = p2pkh_script(0x30);
+    st.mnstates().load(std::vector<std::pair<uint256, MNState>>{
+        {raw256(0x01), banned}});
+    st.set_tip(H - 1, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER);
+
+    ASSERT_TRUE(st.populated()) << "bundle is populated (MN set loaded + tip set)";
+    ASSERT_FALSE(st.mnstates().find_expected_payee().has_value())
+        << "precondition: no payee resolves from an all-invalid MN set";
+
+    // NEGATIVE PASS — reproduce the pre-#996 fail-open: guard OFF => the
+    // defective bundle is viable and would serve the MN-less embedded template.
+    st.set_require_resolvable_payee(false);
+    EXPECT_TRUE(st.make_embedded_work_inputs().viable())
+        << "pre-#996: an unresolvable payee was served (fail-open) — the defect";
+
+    // GUARD ON (default posture) => the gate fires: refuse embedded, route dashd.
+    st.set_require_resolvable_payee(true);
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable())
+        << "#996: due MN payment + unresolvable payee must refuse the embedded arm";
+    bool fb = false;
+    EXPECT_EQ(st.select_work([&]{ fb = true; return DashWorkData{}; }).source,
+              WorkSource::DashdFallback);
+    EXPECT_TRUE(fb) << "refused embedded must reach the always-on dashd fallback";
+
+    // CONTROL — a resolvable payee (valid MN) at the SAME tip stays viable with
+    // the guard ON: the gate is payee-specific, not a blanket refuse.
+    seed_single_mn(st, p2pkh_script(0x30));
+    ASSERT_TRUE(st.mnstates().find_expected_payee().has_value());
+    EXPECT_TRUE(st.make_embedded_work_inputs().viable())
+        << "#996 guard must NOT refuse when the due payee resolves";
+}
+
 // BLOCKER-1 (PR #780): is_dkg_commitment_window over REAL live-testnet heights —
 // the DKG mining windows the review pulled must be flagged, the fixture height
 // (a non-qc coinbase-only block) must not.

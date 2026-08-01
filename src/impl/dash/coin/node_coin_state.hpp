@@ -133,6 +133,15 @@ public:
     /// Default OFF preserves prior unit-test posture.
     void set_require_fresh_mn_payee(bool v) { m_require_fresh_mn_payee = v; }
 
+    /// #996 payee fail-closed gate. When enabled (default ON), viability
+    /// refuses the embedded arm at any height where a MN payment is due but
+    /// find_expected_payee() cannot be resolved to a live SML entry — the
+    /// builder would otherwise emit a coinbase claiming m_payment_amount with
+    /// no MN output (fail-OPEN, bad-cb-payee). Refusal downgrades to the
+    /// reward-safe dashd GBT fallback; it is a template-SERVE refusal (free),
+    /// never a block-SUBMIT refusal. Exposed for the negative-pass test.
+    void set_require_resolvable_payee(bool v) { m_require_resolvable_payee = v; }
+
     /// creditPool freshness gate (soak fix). dashcore CheckCreditPoolDiffForBlock
     /// rejects a block whose committed creditPoolBalance is off by a block's
     /// accrual (bad-cbtx-assetlocked-amount). When enabled, viability + the
@@ -417,6 +426,16 @@ public:
         // Resolve the superblock disposition ONCE (fail-closed unless the
         // daemonless provider is trigger-confident) and thread the schedule.
         SuperblockDisposition sb = resolve_superblock(m_prev_height + 1);
+        // #996 fail-closed: a MN payment is due at the tip we build on but the
+        // payee is unresolvable (find_expected_payee() nullopt -- every entry
+        // isValid=false or the set is empty -- or, defensively, a projected
+        // payee absent from the SML entry set). The embedded builder would omit
+        // the MN coinbase output while m_payment_amount still claims it:
+        // fail-OPEN on a money path (bad-cb-payee). Refusing downgrades to the
+        // dashd GBT fallback -- a template-SERVE refusal (free), not a
+        // block-SUBMIT refusal.
+        const bool payee_resolvable =
+            !m_require_resolvable_payee || mn_payee_resolvable_at_tip();
         e.has_state            = m_populated
                                  && qc_ok
                                  && (!m_utxo_ready_fn || m_utxo_ready_fn())
@@ -451,7 +470,15 @@ public:
                                  && (!m_require_sml
                                      || (m_have_sml
                                          && m_quorum_healthy
-                                         && m_sml_current_hash == m_prev_hash));
+                                         && m_sml_current_hash == m_prev_hash))
+                                 && payee_resolvable;
+        if (m_require_resolvable_payee && !payee_resolvable) {
+            LOG_WARNING << "[EMBED-GATE] h=" << (m_prev_height + 1)
+                        << " REFUSE embedded template: MN payment due but payee"
+                        << " unresolvable (find_expected_payee nullopt or"
+                        << " projected payee absent from SML set) -- falling back"
+                        << " to dashd GBT [#996 bad-cb-payee fail-closed].";
+        }
         e.prev_height          = m_prev_height;
         e.prev_hash            = m_prev_hash;
         e.mnstates             = &m_mnstates;
@@ -545,6 +572,28 @@ public:
     }
 
 private:
+    // #996 helper: is the MN payee the embedded builder will need actually
+    // resolvable at the tip we build on? Mirrors embedded_gbt.hpp's build-time
+    // condition (build_embedded_workdata gates the MN PackedPayment on
+    // mn_payment > 0). Returns false ONLY when a MN payment is due but
+    // find_expected_payee() is nullopt (all entries isValid=false / empty set)
+    // or, defensively, names a payee absent from entries(). Uses the fee-free
+    // subsidy floor: mempool fees only RAISE block_value, so if the floor MN
+    // payment is <= 0 no MN output is due and an absent payee is legitimately
+    // fine -- the gate never over-refuses at a genuine no-MN-payment height.
+    bool mn_payee_resolvable_at_tip() const {
+        const uint32_t next_h = m_prev_height + 1;
+        const int64_t reward = compute_dash_block_reward_post_v20(next_h);
+        const int64_t platform_reward =
+            compute_dash_platform_reward_post_v20_mn_rr(next_h, m_mn_rr_height);
+        const int64_t mn_payment_floor =
+            compute_dash_mn_payment_post_v20(reward) - platform_reward;
+        if (mn_payment_floor <= 0) return true;   // no MN payment due at this height
+        const auto expected = m_mnstates.find_expected_payee();
+        if (!expected) return false;              // #996: nullopt while payment due
+        return m_mnstates.entries().find(*expected) != m_mnstates.entries().end();
+    }
+
     /// Superblock disposition for a candidate next height. ok=false => refuse
     /// (fail closed). payments empty+ok => normal block; non-empty+ok => emit.
     struct SuperblockDisposition {
@@ -600,6 +649,10 @@ private:
     bool     m_require_fresh_bestcl{false};  // refuse embedded on a stale/absent bestCL
     bool     m_require_fresh_credit_pool{false}; // refuse embedded on a lagged credit-pool seed
     bool     m_require_fresh_mn_payee{false};    // refuse embedded on a lagged payee queue (stale cursor)
+    // #996: fail-CLOSED default -- reads only mnstates (always present), needs
+    // no external freshness wiring, and guards a money path, so unlike the
+    // freshness gates above it defaults ON.
+    bool     m_require_resolvable_payee{true};   // refuse embedded when a due MN payee is unresolvable (#996)
     int      m_mn_rr_height{DASH_MN_RR_HEIGHT_MAINNET}; // network MN_RR activation height (platform-share gate)
     uint256  m_credit_pool_current_hash;     // block hash the credit-pool seed is current at
     int32_t  m_credit_pool_height{-1};       // seed cbTx's OWN height (-1 = never seeded)
