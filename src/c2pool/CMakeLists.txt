@@ -327,6 +327,8 @@ target_link_libraries(c2pool-dash
                        # CBlockHeaderAndShortTxIDs::FillShortTxIDSelector()
     dash_bls_verify    # E1 Phase-L: real type-6 quorum-commitment BLS verify
                        # (make_commitment_bls_verifier -> set_bls_verify_fn seam).
+                       # R3: also verify_govvote_operator_sig (governance-vote BLS
+                       # operator-key verify, daemonless superblock serving).
                        # Carries the C2POOL_DASH_BLS define + dashbls libs PUBLIC
                        # when the backend was found; fail-closed stub otherwise.
     btclibs

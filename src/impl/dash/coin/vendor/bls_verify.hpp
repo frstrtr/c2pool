@@ -105,6 +105,42 @@ using MemberKeysProvider =
 std::function<bool(const CFinalCommitment&)>
 make_commitment_bls_verifier(MemberKeysProvider provider);
 
+// ── R3: governance-vote operator-key signature verify ───────────────────────
+//
+// Daemonless superblock serving (E-SUPERBLOCK) needs to VERIFY that a relayed
+// TRIGGER funding vote was really signed by the voting masternode — else the
+// GovernanceStore tally counts nothing (fail closed) and every superblock
+// height falls back to dashd. This is the SINGLE-signature analogue of the
+// aggregate quorum-commitment verify above: one sig, one operator key, no
+// aggregation.
+//
+// Contract (dashcore CGovernanceVote::CheckSignature(const CBLSPublicKey&)):
+//   CBLSSignature sig; sig.SetByteVector(vchSig, legacy);
+//   sig.VerifyInsecure(pubKeyOperator, GetSignatureHash(), legacy);
+// i.e. VerifyInsecure == scheme.Verify(pubKeyOperator_G1, digest_bytes,
+// vchSig_G2). TRIGGER funding votes are signed by the MN's OPERATOR key (NOT
+// the ECDSA voting key — that path is PROPOSAL-funding-only). `digest` is the
+// govvote_signature_hash preimage (governance_object.hpp), i.e. dashcore
+// GetSignatureHash(). `key_legacy_scheme` reflects the operator key's declared
+// wire scheme (MNState nVersion: LEGACY_BLS => true, BASIC_BLS => false).
+// IMPORTANT (pinned against a real from-wire testnet vote): the key's
+// wire-encoding and the SIGNING scheme are INDEPENDENT — a LEGACY_BLS-registered
+// MN keeps a legacy-encoded pubkey but post-V19 signs under the BASIC scheme
+// (basic-encoded sig + basic DST). The implementation therefore varies the two
+// axes independently (network sig-scheme BASIC-first for sig-encoding+DST; the
+// key's declared scheme first for the pubkey encoding). A forged/tampered sig or
+// wrong key verifies under NO combination — this only broadens which LEGITIMATE
+// encodings are accepted, never what is cryptographically valid.
+//
+// FAIL-CLOSED (reward-critical): returns false when the BLS backend is absent,
+// vch_sig is not 96 bytes, either point fails to deserialize, or the BLS verify
+// fails — so an unverified vote is NEVER tallied. Never throws.
+bool verify_govvote_operator_sig(
+    const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& pubkey_operator,
+    bool key_legacy_scheme,
+    const uint256& digest,
+    const std::vector<uint8_t>& vch_sig);
+
 } // namespace vendor
 } // namespace coin
 } // namespace dash

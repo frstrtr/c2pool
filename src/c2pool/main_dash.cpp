@@ -80,6 +80,7 @@
 #include <impl/dash/coin/mn_list_ingest.hpp>     // wire_mn_list_ingest (leg 4)
 #include <impl/dash/coin/govsync_ingest.hpp>     // wire_govobject_ingest / wire_govvote_ingest (E-SUPERBLOCK)
 #include <impl/dash/coin/superblock.hpp>         // get_superblock_payments / superblock_budget (E-SUPERBLOCK)
+#include <impl/dash/coin/vendor/bls_verify.hpp>  // R3: verify_govvote_operator_sig — governance-vote BLS operator-key verify
 #include <impl/dash/coin/mn_seed.hpp>            // E2c: RPC protx-list MN-set seed (parse_protx_list_seed)
 #include <impl/dash/coin/mn_checkpoint.hpp>      // E2d: pinned MN-set checkpoint format + fail-closed parser
 #include <impl/dash/coin/mn_checkpoint_lane.hpp> // E2d: checkpoint -> forward-replay bridge -> leg-4 publish
@@ -2756,25 +2757,30 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // it OFF, set_require_superblock_provider(false) preserves the prior
             // reward-safe behaviour EXACTLY (every superblock height falls back).
             //
-            // FAIL-CLOSED BY CONSTRUCTION until vote-verify lands, TRIPLY:
-            //   1. the funding tally counts only votes the maintainer's
-            //      vote-verifier accepts — and that verifier is UNSET here.
-            //      (Follow-up contract: BLS by the voting MN's OPERATOR key
-            //      over govvote_signature_hash — dashcore verifies TRIGGER
-            //      funding votes against pubKeyOperator, NOT the
-            //      ECDSA/keyIDVoting path, which is proposal-only. See
-            //      CoinStateMaintainer::set_vote_verifier.)
-            //   2. the weighted tally needs the vote-weight/membership seam
-            //      (GovernanceStore::set_vote_weight_fn) — also UNSET here
-            //      (the DIP-4 SML lacks collateral outpoints; needs the full
-            //      DMN view).
+            // FAIL-CLOSED BY CONSTRUCTION, in three independent layers:
+            //   1. (R3, WIRED below) the funding tally counts only votes the
+            //      maintainer's vote-verifier accepts — now the real BLS verify
+            //      by the voting MN's OPERATOR key over govvote_signature_hash
+            //      (dashcore verifies TRIGGER funding votes against
+            //      pubKeyOperator, NOT the ECDSA/keyIDVoting path, which is
+            //      proposal-only). Unverified/forged votes never count; when the
+            //      BLS backend is absent the verifier fails closed (0 counted).
+            //   2. (R3, WIRED below) the weighted tally uses the vote-weight/
+            //      membership seam (GovernanceStore::set_vote_weight_fn) —
+            //      resolved from the full DMN view (collateral outpoint ->
+            //      operator key + type), EvoNode 4x, 0 only for an MN no
+            //      longer in the DMN list at all (dashcore's UNFILTERED
+            //      GetMNByCollateral — PoSe-banned MNs still count). The
+            //      threshold itself reseeds from the weighted VALID SML count
+            //      on every diff (reseed_funding_threshold — dashcore's own
+            //      tally/denominator asymmetry).
             //   3. the R5 govsync-completeness gate
-            //      (set_superblock_sync_complete_fn) is NOT wired — the
+            //      (set_superblock_sync_complete_fn) is STILL NOT wired — the
             //      NodeCoinState guard refuses the serve path structurally,
-            //      so landing vote-verify alone can never open it.
+            //      so R3 landing here can never by itself open it.
             // The parse/selection/template-emit logic is proven by the KATs;
-            // flipping this fully live is gated on vote-verify + completeness
-            // + a funded-superblock soak.
+            // flipping this fully live is still gated on R5 completeness + the
+            // R6 desync latch + a funded-superblock soak.
             {
                 const int64_t budget_cycle = sb_cycle;
                 // Chain-strict trigger parsing + dashcore threshold inputs:
@@ -2822,21 +2828,100 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     [maint = maintainer.get()]() {
                         return maint->gov_sync_complete();
                     });
+
+                // R3 — governance-vote BLS verify + vote-weight seam. This is
+                // the piece that lets a funding tally count anything at all:
+                // both closures resolve the voting masternode by its COLLATERAL
+                // OUTPOINT in the node's live DMN view (node_coin_state
+                // .mnstates(), seeded from protx info — the DIP-4 SML alone
+                // carries neither collateral outpoints nor operator keys), via
+                // the shared gov_mn_by_collateral / gov_vote_weight_for_key
+                // parity helpers. Every step FAILS CLOSED: unknown MN,
+                // unresolvable key, wrong sig size, stale/future time, or a
+                // failed BLS verify => the vote is NOT tallied. NOTE dashcore
+                // parity (v23.1.7): the resolve is UNFILTERED
+                // (GetMNByCollateral) — a PoSe-BANNED MN's vote still verifies
+                // and still counts at full weight, in BOTH paths; only the
+                // funding THRESHOLD denominator is valid-weighted
+                // (reseed_funding_threshold, reseeded from the weighted SML
+                // count on every accepted diff — dashcore's own asymmetry).
+                // The R5 completeness gate wired ABOVE still evaluates FALSE
+                // in production (single peer / empty store), so landing
+                // vote-verify here can never by itself open the serve path.
+                {
+                    auto* ncs = &node_coin_state;
+
+                    // Vote-signature verifier — dashcore CGovernanceVote::
+                    // CheckSignature over the MN's OPERATOR key (TRIGGER funding
+                    // votes; the ECDSA voting-key path is PROPOSAL-only and NOT
+                    // used here). Plus the IsValid time bound (nTime <= now+1h).
+                    maintainer->set_vote_verifier(
+                        [ncs](const dash::coin::CoinStateMaintainer::GovVoteContext& v)
+                            -> bool {
+                            // dashcore IsValid: reject a vote timestamped more
+                            // than an hour into the future (clock-skew bound).
+                            // KNOWN NIT (documented, not fixed): dashcore uses
+                            // GetAdjustedTime() (network-adjusted); c2pool has
+                            // no peer time-offset plumbing here, so this is the
+                            // LOCAL clock. Divergence is bounded by our own
+                            // clock skew and only matters for votes inside that
+                            // skew of the +1h edge; NTP-disciplined hosts make
+                            // it negligible. Revisit if soak shows drift.
+                            if (v.time > static_cast<int64_t>(std::time(nullptr)) + 60 * 60)
+                                return false;
+                            // Resolve collateral outpoint -> DMN -> operator
+                            // key. UNFILTERED (no PoSe-ban check) — dashcore
+                            // CGovernanceVote::IsValid resolves via
+                            // GetMNByCollateral, so a banned MN's vote still
+                            // verifies in dashd and must here too (dropping a
+                            // banned MN's NO inflates our yes−no vs dashd).
+                            bitcoin_family::coin::TxPrevOut op;
+                            op.hash  = v.mn_outpoint_hash;
+                            op.index = v.mn_outpoint_index;
+                            const dash::coin::MNState* mn =
+                                dash::coin::gov_mn_by_collateral(
+                                    ncs->mnstates(), op);
+                            if (!mn) return false;           // MN not in DMN list
+                            const bool legacy =
+                                (mn->nVersion ==
+                                 dash::coin::vendor::ProTxVersion::LEGACY_BLS);
+                            return dash::coin::vendor::verify_govvote_operator_sig(
+                                mn->pubKeyOperator, legacy,
+                                v.vote_hash, v.vch_sig);
+                        });
+
+                    // Vote-weight + membership-at-tally — dashcore
+                    // CountMatchingVotes: EvoNode 4x, Regular 1x, and 0 (vote
+                    // dropped) ONLY when the outpoint is not in the DMN list
+                    // at tally time (unfiltered GetMNByCollateral — banned MNs
+                    // still count). Keyed by "<collateral-txid-hex>-<index>"
+                    // (GovOutPoint::to_key()); gov_vote_weight_for_key
+                    // reconstructs the outpoint and resolves it against the
+                    // SAME live DMN view.
+                    maintainer->gov_store().set_vote_weight_fn(
+                        [ncs](const std::string& key) -> int {
+                            return dash::coin::gov_vote_weight_for_key(
+                                ncs->mnstates(), key);
+                        });
+                }
+
+                // Reconciled log (R5 completeness gate + R3 vote-verify both wired).
                 if (embedded_superblock)
                     LOG_INFO << "[E-SUPERBLOCK] daemonless superblock arm ENABLED "
-                                "(--embedded-superblock); superblock heights served "
-                                "from govsync triggers ONLY when the governance "
-                                "view is trigger-confident AND provably complete "
-                                "(R5: >= "
+                                "(--embedded-superblock). BOTH gates WIRED: the R5 "
+                                "govsync-completeness gate (>= "
                              << dash::coin::DASH_GOVSYNC_MIN_PEERS_DEFAULT
-                             << " peers, quiesced), else fail closed to dashd. "
-                                "CO-REQUISITES still pending before this can serve "
-                                "live: multi-peer govsync + inv-driven getdata "
-                                "(the leg is inv-inert today) + BLS operator "
-                                "vote-verify + the vote-weight seam — until those "
-                                "land the completeness predicate evaluates FALSE "
-                                "(single peer / empty store) and the arm stays on "
-                                "the reward-safe fallback.";
+                             << " peers, settled, quiesced) that lets a "
+                                "trigger-confident superblock actually serve, AND the "
+                                "R3 governance-vote BLS operator verify + vote-weight "
+                                "seam ("
+                             << (dash::coin::vendor::bls_backend_available()
+                                     ? "BLS backend ON"
+                                     : "BLS backend ABSENT => votes never verify")
+                             << "). Serve stays CLOSED until the completeness "
+                                "predicate proves complete (single peer / empty store "
+                                "=> FALSE) and a funded soak clears -- R3 vote-verify "
+                                "landing here cannot by itself open it.";
             }
         }
 

@@ -171,6 +171,83 @@ bool verify_final_commitment(const CFinalCommitment& c,
 #endif // C2POOL_DASH_BLS
 }
 
+// ── R3: governance-vote operator-key single-sig verify ──────────────────────
+
+bool verify_govvote_operator_sig(
+    const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& pubkey_operator,
+    bool key_legacy_scheme, const uint256& digest,
+    const std::vector<uint8_t>& vch_sig)
+{
+#ifndef C2POOL_DASH_BLS
+    (void)pubkey_operator;
+    (void)key_legacy_scheme;
+    (void)digest;
+    (void)vch_sig;
+    return false;   // no BLS backend → fail closed (vote never tallied → dashd)
+#else
+    // dashcore CGovernanceVote::CheckSignature: a BLS signature is 96 bytes.
+    if (vch_sig.size() != CFinalCommitment::BLS_SIG_SIZE) return false;
+
+    const bls::Bytes msg(digest.data(), 32);   // GetSignatureHash() digest bytes
+
+    try {
+        // ── SIGNATURE axis: HARD-PINNED to the BASIC scheme ─────────────────
+        // dashcore v23.1.7 governance/vote.cpp CGovernanceVote::CheckSignature
+        // (const CBLSPublicKey&):
+        //     CBLSSignature sig;
+        //     sig.SetBytes(vchSig, false);                       // BASIC decode
+        //     sig.VerifyInsecure(pubKey, GetSignatureHash(), false);  // BASIC DST
+        // Both the sig wire-decode AND the verify DST are hard-pinned false
+        // (basic). SetBytes has NO legacy retry — the CheckMalleable/legacy
+        // fallback exists only in the stream Unserialize path, which this
+        // verify never takes. So post-V19 dashd REJECTS a legacy-scheme-signed
+        // governance vote outright, and so must we: a legacy-sig fallback here
+        // would accept votes dashd neither tallies nor relays — a hostile
+        // registered MN could legacy-sign a YES on a near-threshold trigger
+        // and feed it ONLY to c2pool, inflating our tally vs the network's
+        // (wrong trigger wins => wrong superblock payees => lost block).
+        // Pre-V19 heights would be legacy-scheme, but this tally only ever
+        // runs post-V19 (triggers are cycle-ephemeral and the serve floor is
+        // post-V19); if that ever changes, gate the scheme on the V19 fork
+        // height exactly as dashcore does — never fall back per-vote.
+        bls::G2Element sig;
+        try {
+            sig = bls::G2Element::FromBytes(
+                bls::Bytes(vch_sig.data(), vch_sig.size()), /*fLegacy=*/false);
+        } catch (...) {
+            return false;   // not a basic-encoded G2 point => dashd rejects too
+        }
+
+        // ── PUBKEY-encoding axis: declared scheme first, other as fallback ──
+        // Independent of the signature axis, and the fallback here is KEPT: a
+        // masternode registered under LEGACY_BLS (ProRegTx nVersion 1) keeps a
+        // legacy-ENCODED pubKeyOperator forever, and dashcore's
+        // CBLSLazyPublicKey ingest decodes it per that registration version
+        // BEFORE CheckSignature ever sees it (pubKeyOperator.Get() hands over
+        // the decoded element — the key's encoding never reaches the verify).
+        // We decode from the raw wire bytes ourselves, so we mirror that
+        // ingest: the key's declared scheme first, the other encoding as
+        // fallback. (Pinned against the real from-wire testnet vote:
+        // legacy-encoded pubkey + basic-encoded sig + basic DST verifies; a
+        // forged/tampered sig or wrong key verifies under NO pubkey encoding.)
+        for (bool pk_legacy : {key_legacy_scheme, !key_legacy_scheme}) {
+            bls::G1Element pk;
+            try {
+                pk = bls::G1Element::FromBytes(
+                    bls::Bytes(pubkey_operator.data(), pubkey_operator.size()),
+                    pk_legacy);
+            } catch (...) { continue; }
+            if (!pk.IsValid()) continue;
+
+            if (bls::BasicSchemeMPL().Verify(pk, msg, sig)) return true;
+        }
+        return false;
+    } catch (...) {
+        return false;   // any relic/dashbls throw → fail closed
+    }
+#endif // C2POOL_DASH_BLS
+}
+
 // ── seam factory ────────────────────────────────────────────────────────────
 
 std::function<bool(const CFinalCommitment&)>

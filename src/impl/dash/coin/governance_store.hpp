@@ -19,11 +19,12 @@
 /// superblock template when its WEIGHTED funding-signal absolute-yes tally
 /// reaches the network funding threshold AND every counted vote was
 /// cryptographically verified (BLS operator-key — see the vote-verifier
-/// contract in coin_state_maintainer.hpp) AND the voting MN is still in the
-/// valid set at tally time (weight seam below). An incomplete / unverified /
-/// sub-threshold view yields NO winning trigger, so the arm refuses and routes
-/// to the reward-safe dashd fallback — the mandate: NEVER guess superblock
-/// payees.
+/// contract in coin_state_maintainer.hpp) AND the voting MN still resolves by
+/// collateral in the DMN list at tally time (weight seam below — UNFILTERED
+/// by PoSe-ban, dashcore GetMNByCollateral; only the threshold DENOMINATOR is
+/// valid-weighted). An incomplete / unverified / sub-threshold view yields NO
+/// winning trigger, so the arm refuses and routes to the reward-safe dashd
+/// fallback — the mandate: NEVER guess superblock payees.
 
 #include <impl/dash/coin/governance_object.hpp>
 
@@ -69,7 +70,10 @@ inline int governance_funding_threshold(int weighted_mn_count, int min_quorum)
 /// Keyed by the voting masternode's collateral outpoint so a re-vote replaces
 /// the prior (dashcore keeps only the latest vote per (MN, signal) pair).
 struct GovFundingVote {
-    int32_t outcome{VOTE_OUTCOME_NONE};  // YES / NO / ABSTAIN
+    int32_t outcome{VOTE_OUTCOME_NONE};  // NONE / YES / NO / ABSTAIN — NONE is
+                                         // a STORED outcome (dashcore parity:
+                                         // a newer NONE replaces a stored YES,
+                                         // dropping the yes-count)
     int64_t timestamp{0};                // newer replaces older
 };
 
@@ -93,9 +97,14 @@ public:
     /// Vote-weight + membership-at-tally seam (dashcore CountMatchingVotes):
     /// given a voting MN's collateral-outpoint key ("<txid>-<index>"), return
     /// its CURRENT voting weight — DASH_VOTE_WEIGHT_REGULAR (1) for a regular
-    /// MN, DASH_VOTE_WEIGHT_EVO (4) for an EvoNode, and 0 when the outpoint is
-    /// NOT in the valid MN set at tally time (dashcore drops such votes from
-    /// the count: GetMNByCollateral == nullptr => not counted).
+    /// MN, DASH_VOTE_WEIGHT_EVO (4) for an EvoNode, and 0 ONLY when the
+    /// outpoint is not in the DMN list at all at tally time (dashcore drops
+    /// exactly those votes: GetMNByCollateral == nullptr => not counted).
+    /// GetMNByCollateral is the UNFILTERED lookup — a PoSe-BANNED MN still
+    /// resolves and its vote still counts at FULL weight in dashd; do NOT
+    /// filter by ban status here (see gov_vote_weight_for_key in
+    /// coin_state_maintainer.hpp — the threshold DENOMINATOR alone is
+    /// valid-weighted, dashcore's own asymmetry).
     ///
     /// UNSET (default) => every vote weighs 0 => no tally can reach any
     /// positive threshold => FAIL CLOSED. NOTE for the follow-up implementer:
@@ -135,16 +144,37 @@ public:
                                    int32_t outcome, int64_t timestamp) {
         auto& per_obj = m_funding_votes[parent_hash];
         auto it = per_obj.find(mn_outpoint_key);
-        if (it != per_obj.end() && it->second.timestamp >= timestamp)
-            return; // keep the newer vote (dashcore latest-wins per MN)
+        if (it != per_obj.end()) {
+            // dashcore v23.1.7 CGovernanceObject::ProcessVote replacement rule
+            // (governance/object.cpp), matched EXACTLY:
+            //   new nTime <  stored  => "Obsolete vote"            => reject
+            //   new nTime == stored  => reject ONLY when the new OUTCOME <
+            //                           the stored outcome (upstream's
+            //                           explicit "arbitrary comparison ... to
+            //                           pick the winning vote" tie-break);
+            //                           otherwise accept (replace)
+            //   new nTime >  stored  => accept (replace) — ANY valid outcome,
+            //                           including NONE (a newer NONE drops a
+            //                           stored YES from the tally)
+            // A diverging rule here means c2pool and dashd keep DIFFERENT
+            // latest-votes for the same MN => tally divergence => the wrong
+            // trigger can win locally => wrong superblock payees.
+            if (timestamp < it->second.timestamp) return;
+            if (timestamp == it->second.timestamp &&
+                outcome < it->second.outcome)
+                return;
+        }
         per_obj[mn_outpoint_key] = GovFundingVote{outcome, timestamp};
     }
 
     /// dashcore CGovernanceObject::GetAbsoluteYesCount(VOTE_SIGNAL_FUNDING) ==
     /// GetYesCount - GetNoCount, where CountMatchingVotes weighs every vote by
-    /// the voting MN's CURRENT weight (EvoNodes 4x) and counts nothing for an
-    /// MN no longer in the valid set (membership-at-tally). With the weight
-    /// seam unset every vote weighs 0 (fail closed).
+    /// the voting MN's CURRENT weight (EvoNodes 4x) and counts nothing ONLY
+    /// for an MN no longer in the DMN list at all (membership-at-tally via the
+    /// unfiltered GetMNByCollateral — PoSe-banned MNs still count). A stored
+    /// NONE/ABSTAIN outcome contributes to neither side (but a NONE that
+    /// REPLACED a YES has already removed that yes — dashcore parity). With
+    /// the weight seam unset every vote weighs 0 (fail closed).
     int absolute_yes_count(const uint256& object_hash) const {
         auto it = m_funding_votes.find(object_hash);
         if (it == m_funding_votes.end()) return 0;
