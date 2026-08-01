@@ -52,6 +52,7 @@
 #include "merkle.hpp"
 #include "header_sync.hpp"
 #include "block_download.hpp"
+#include "idle_watchdog.hpp"
 
 #include <memory>
 
@@ -149,6 +150,10 @@ private:
     // getdata(MSG_BLOCK) so the synced header stream is pulled as block bodies at
     // the peer's pace instead of stalling after header sync. See block_download.hpp.
     block_download::BlockDownloadWindow m_block_dl;
+    // Progress-gated block-download stall watchdog baseline: monotonic-since-
+    // connect tick of the last ACCEPTED block body. DISARMED (0) while at tip
+    // or before download begins. See idle_watchdog.hpp.
+    uint64_t m_last_progress_tick{idle_watchdog::DISARMED};
 
     // Callbacks for broadcaster integration
     using AddrCallback = std::function<void(const std::vector<NetService>&)>;
@@ -574,13 +579,46 @@ private:
     /// nothing is in flight or nothing has timed out.
     void expire_block_window()
     {
-        auto requeued = m_block_dl.expire(now_tick_sec(), BLOCK_DL_TIMEOUT_SEC);
-        if (requeued.empty()) return;
-        LOG_DEBUG_COIND << "[" << m_chain_label << "] IBD block-dl expire requeued "
-                        << requeued.size() << " stalled request(s) (in flight "
-                        << m_block_dl.in_flight() << ", queued "
-                        << m_block_dl.queued() << ")";
-        drain_block_window();
+        auto now = now_tick_sec();
+        auto requeued = m_block_dl.expire(now, BLOCK_DL_TIMEOUT_SEC);
+        if (!requeued.empty()) {
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] IBD block-dl expire requeued "
+                            << requeued.size() << " stalled request(s) (in flight "
+                            << m_block_dl.in_flight() << ", queued "
+                            << m_block_dl.queued() << ")";
+            drain_block_window();
+        }
+
+        // Progress-gated idle watchdog. on_activity() restarts the liveness
+        // timeout on ANY inbound message, so a peer that stalls block delivery
+        // while emitting keepalive/chatter never trips IDLE_TIMEOUT and the
+        // expiry above just requeues the same heights to the same single peer
+        // forever. Gate a stricter watchdog on FORWARD PROGRESS, armed ONLY
+        // while bodies are in flight so an at-tip node (in_flight == 0, ~10 min
+        // between BCH blocks) never churns. See idle_watchdog.hpp.
+        auto in_flight = m_block_dl.in_flight();
+        if (in_flight == 0) {
+            m_last_progress_tick = idle_watchdog::DISARMED; // disarm at tip / idle
+        } else if (idle_watchdog::should_drop_on_stall(
+                       in_flight, now, m_last_progress_tick, IDLE_TIMEOUT_SEC)) {
+            LOG_WARNING << "[" << m_chain_label << "] block-download stalled: no"
+                        << " accepted body in " << (now - m_last_progress_tick)
+                        << "s with " << in_flight << " in flight -- dropping peer"
+                        << " to reconnect";
+            m_last_progress_tick = idle_watchdog::DISARMED;
+            timeout("block-download stall (no progress)");
+        } else if (m_last_progress_tick == idle_watchdog::DISARMED) {
+            m_last_progress_tick = (now == idle_watchdog::DISARMED) ? 1 : now; // arm baseline
+        }
+    }
+
+    // Mark forward sync progress: an accepted block body advanced our chain.
+    // Arms/refreshes the progress-gated stall watchdog (expire_block_window).
+    void note_block_progress()
+    {
+        auto t = now_tick_sec();
+        // Never store DISARMED for a real progress event -- bump off the sentinel.
+        m_last_progress_tick = (t == idle_watchdog::DISARMED) ? 1 : t;
     }
 
     void on_activity()
@@ -824,10 +862,12 @@ private:
         // blackholing the height so it is never re-downloaded and the ABLA feed /
         // block-connector starve there. Route the drop through on_block_rejected
         // so the slot frees and the height is re-requested (bounded retries).
-        if (accepted)
+        if (accepted) {
             m_block_dl.on_block_received(blockhash);
-        else
+            note_block_progress(); // forward progress -> refresh stall watchdog
+        } else {
             m_block_dl.on_block_rejected(blockhash);
+        }
         drain_block_window();
     }
 
