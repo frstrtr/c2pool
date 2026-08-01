@@ -1394,6 +1394,11 @@ public:
     void record_share_difficulty(double difficulty, const std::string& miner,
                                  const std::string& share_hash = "");
     void record_merged_share_difficulty(double difficulty, const std::string& miner);
+    // A pool block was won -> the sharechain round boundary moved. Reset the
+    // round-level best-share tracker (all_time / session are left untouched).
+    // See #922: round previously only ever raised, degenerating into a
+    // permanent duplicate of all_time after the first block.
+    void reset_best_difficulty_round(uint64_t ts = 0);
 
     // Stat log entry (appended every 5 minutes, rolling 24h window for /web/log JSON)
     void update_stat_log();

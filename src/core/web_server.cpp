@@ -3366,6 +3366,14 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
             LOG_WARNING << "[THE] Failed to create checkpoint: " << e.what();
         }
     }
+
+    // #922: a pool block was found -> a new sharechain round begins. Reset the
+    // round best-share tracker so /best_share.round reflects THIS round rather
+    // than staying pinned to the last winning share forever. Reached only for
+    // genuinely new blocks -- the (hash, chain) dedup above returns early on
+    // duplicates, so twin / replayed notifications never double-reset. Tied to
+    // the block-found event, not a timer.
+    reset_best_difficulty_round(ts);
 }
 
 void MiningInterface::set_found_block_persistence(block_store_fn_t persist_fn, block_load_fn_t load_fn)
@@ -6644,6 +6652,31 @@ nlohmann::json MiningInterface::rest_web_graph_data(const std::string& source, c
 }
 
 // ──────────── Difficulty tracking and stat log helpers ────────────────────
+
+// #922: restart the round-level best-share tracker at a block-found boundary.
+// all_time.* and session.* are deliberately preserved -- only the round leg is
+// cleared and its start timestamp advanced. Shared-core by necessity: the round
+// counters live on the core MiningInterface (m_best_difficulty) and are fed by
+// the core record_share_difficulty path, so the reset must fire from the same
+// core record_found_block that every coin already calls -- there is no per-coin
+// surface that could do it without duplicating the logic in each main_<coin>.
+void MiningInterface::reset_best_difficulty_round(uint64_t ts)
+{
+    if (ts == 0) ts = static_cast<uint64_t>(std::time(nullptr));
+    std::lock_guard<std::mutex> lock(m_best_diff_mutex);
+    // Primary-chain round leg.
+    m_best_difficulty.round = 0.0;
+    m_best_difficulty.miner.clear();
+    m_best_difficulty.hash.clear();
+    m_best_difficulty.timestamp = 0;
+    m_best_difficulty.round_start = ts;
+    // Merged (aux) round leg shares the same sharechain -> same boundary. A
+    // node without merged mining leaves these at 0, so this is a no-op there.
+    m_best_difficulty.merged_round = 0.0;
+    m_best_difficulty.merged_round_miner.clear();
+    m_best_difficulty.merged_round_ts = 0;
+    m_best_difficulty.merged_round_start = ts;
+}
 
 void MiningInterface::record_share_difficulty(double difficulty, const std::string& miner,
                                               const std::string& share_hash)
