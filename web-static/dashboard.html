@@ -1806,8 +1806,8 @@
                 <div class="stat-card" id="v36_card" style="display:none;">
                     <h3><span class="icon">🔀</span> Share-Version Crossing</h3>
                     <div class="stat-value" id="v36_status_label">-</div>
-                    <div class="stat-sub">Vote: <span id="v36_vote_pct">-</span> &nbsp;·&nbsp; Work-weighted: <span id="v36_ww_pct">-</span></div>
-                    <div class="stat-detail"><span id="v36_share_label">-</span> &rarr; <span id="v36_target_label">-</span> <span id="v36_msg" style="opacity:0.7;"></span></div>
+                    <div class="stat-sub">Signalling: <span id="v36_signal_pct">-</span></div>
+                    <div class="stat-detail"><span id="v36_share_label">-</span> &rarr; <span id="v36_target_label">-</span></div>
                     <div class="stat-detail">Live latch: <span id="v36_active_label" style="font-weight:600;">-</span></div>
                 </div>
                 <!-- Per-node topology: THIS node's REAL coin set from /api/node_topology (charter #2, config-driven/auto-detected -- never a baked-in coin list) -->
@@ -2934,31 +2934,45 @@
         function renderV36Status(v) {
             var card = document.getElementById('v36_card');
             if (!card) return;
-            var labels = {
-                no_transition: 'ACTIVATED',
-                activating: 'ACTIVATING',
-                signaling_strong: 'VOTING (strong)',
-                signaling: 'VOTING',
-                propagating: 'PROPAGATING',
-                building_chain: 'BUILDING CHAIN',
-                waiting: 'WAITING'
-            };
+            // /v36_status emits a NESTED shape -- auto_ratchet{state,live_share_version,
+            // v36_active,...} + share_chain{v36_percentage,...} -- and nothing at top
+            // level (rest_v36_status, web_server.cpp). Read that one canonical shape;
+            // #921 was this card reading top-level keys the endpoint never emits, so
+            // every field fell through to '-' and the card rendered empty.
+            var ar = v.auto_ratchet || {};
+            var sc = v.share_chain || {};
+            var state = ar.state;                 // coarse latch: voting|activated|confirmed
+            var pct = sc.v36_percentage;          // work-weighted signalling %
+            var live = ar.live_share_version;
+            var active = ar.v36_active;
+            // Visibility gate (operator design point on #921): show the crossing card
+            // ONLY while a cross is genuinely underway or done. A quiet pre-crossing
+            // node (voting, 0% signalled, not latched) must not render a card at all --
+            // the old unconditional display plus a backwards 'ACTIVATED' fallback label
+            // made such a node claim it had already activated. Floor is 0: any signalling
+            // means a cross is really in progress; exactly-zero + voting + not-active
+            // is plainly pre-crossing -> hide.
+            var crossing = active === true || state === 'activated' || state === 'confirmed'
+                           || (typeof pct === 'number' && pct > 0);
+            if (!crossing) { card.style.display = 'none'; return; }
             card.style.display = '';
-            card.classList.toggle('transitioning', !!v.is_transitioning);
-            d3.select('#v36_status_label').text(labels[v.status] || v.status || '-');
-            d3.select('#v36_vote_pct').text(v.overall_v36_vote_pct != null ? v.overall_v36_vote_pct + '%' : '-');
-            d3.select('#v36_ww_pct').text(v.sampling_signaling != null ? v.sampling_signaling + '%' : '-');
-            d3.select('#v36_share_label').text(v.current_share_name || (v.current_share_type != null ? 'V' + v.current_share_type : '-'));
-            d3.select('#v36_target_label').text(v.target_version_name || (v.target_version != null ? 'V' + v.target_version : '-'));
-            d3.select('#v36_msg').text(v.message ? '\u00b7 ' + v.message : '');
-            // Authoritative live-latch ground truth (m_cached_share_version), distinct from the
-            // re-derived sampling status above -- operators see ACTIVE the instant the chain crosses,
-            // not when sampling catches up. Only rendered when the backend reports it (charter #3).
-            if (typeof v.v36_active === 'boolean') {
-                var lv = (v.live_share_version != null) ? 'V' + v.live_share_version : '-';
+            card.classList.toggle('transitioning', state === 'voting' && active !== true);
+            // Label vocabulary matches what the endpoint actually emits (auto_ratchet.state).
+            var labels = { voting: 'VOTING', activated: 'ACTIVATED', confirmed: 'CONFIRMED' };
+            d3.select('#v36_status_label').text(labels[state] || (state ? state.toUpperCase() : '-'));
+            d3.select('#v36_signal_pct').text(typeof pct === 'number' ? pct + '%' : '-');
+            // current -> target: current is the live latch version; the ratchet endpoint
+            // is V36 for every coin's cross (LTC/DOGE V35->V36, DASH V16->V36).
+            d3.select('#v36_share_label').text(live != null ? 'V' + live : '-');
+            d3.select('#v36_target_label').text('V36');
+            // Authoritative live-latch ground truth (m_cached_share_version / DASH's
+            // ratchet-derived live_share_version). Only rendered when the backend
+            // reports it (charter #3).
+            if (typeof active === 'boolean') {
+                var lv = (live != null) ? 'V' + live : '-';
                 d3.select('#v36_active_label')
-                    .text(v.v36_active ? ('ACTIVE (' + lv + ')') : ('not active (' + lv + ')'))
-                    .style('color', v.v36_active ? '#22c55e' : '#94a3b8');
+                    .text(active ? ('ACTIVE (' + lv + ')') : ('not active (' + lv + ')'))
+                    .style('color', active ? '#22c55e' : '#94a3b8');
             } else {
                 d3.select('#v36_active_label').text('-').style('color', null);
             }
