@@ -52,6 +52,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -68,6 +69,7 @@
 #include "chain_seeds.hpp"      // bch_dns_seeds / bch_fixed_seeds (tier 1 + 2 data)
 
 #include <core/log.hpp>
+#include <core/timer.hpp>    // core::Timer (dedicated emergency re-arm timer)
 #include <core/events.hpp>   // EventDisposable (new_headers subscription handle)
 #include <core/uint256.hpp> // uint256S (near-tip checkpoint seed)   // EventDisposable (new_headers subscription handle)
 
@@ -337,13 +339,26 @@ public:
                         return;
                     }
                     // resolve_candidates() already ran build_ladder() to order +
-                    // dedup the tiers ([dns-or-fixed] then http). Dial the first
-                    // candidate; the p2p node walks the remainder on reconnect.
-                    const NetService& dial = candidates.front();
+                    // dedup the tiers ([dns-or-fixed] then http). Seed the walk
+                    // cursor with the ORDERED list, dial the front, then install
+                    // the tail-walk provider so peer loss advances to the next
+                    // candidate (and re-arms when the ladder is exhausted) instead
+                    // of re-dialing the dead front forever.
+                    m_walk.rearm(candidates);
+                    bool wrapped = false;
+                    const NetService dial = m_walk.next(wrapped);
                     start_discovered_p2p(dial);
+                    if (auto* p2p = m_node.p2p()) {
+                        p2p->set_next_target_provider(
+                            [this]() { return next_discovery_target(); });
+                        // Recovery signal (spec 2.3): a connected peer resets the
+                        // emergency backoff so the next drop escalates from base.
+                        p2p->set_peer_connected_callback(
+                            [this]() { clear_emergency_state(); });
+                    }
                     LOG_INFO << "[EMB-BCH] SeedTier ladder dial -> "
                              << dial.to_string() << " (" << candidates.size()
-                             << " candidate(s))";
+                             << " candidate(s), tail-walk + emergency re-arm armed)";
                 });
             return true;                  // ladder armed (async dial on resolution)
         }
@@ -626,6 +641,72 @@ private:
             p2p->enable_auto_getheaders();
     }
 
+    /// Discovery tail-walk provider body: hand the transport the NEXT resolved
+    /// candidate on peer loss. On the tick that wraps past the last candidate the
+    /// ladder is exhausted -> kick an async re-resolve (re-entry-guarded) to
+    /// rebuild it; the wrapped candidate is returned meanwhile so the transport
+    /// keeps trying. Returns nullopt only when the walk is empty (nothing to
+    /// rotate to -> transport keeps its current target).
+    std::optional<NetService> next_discovery_target() {
+        if (m_walk.empty())
+            return std::nullopt;
+        bool wrapped = false;
+        NetService nxt = m_walk.next(wrapped);
+        // A wrap past the last candidate == starvation observed on this reconnect
+        // tick (the whole resolved ladder was walked with no live peer). Feed it
+        // to the emergency re-arm state machine; the latch there collapses many
+        // wraps into ONE backed-off re-resolve. The wrapped candidate is still
+        // returned so the transport keeps trying while the re-resolve is pending.
+        if (wrapped)
+            arm_emergency_fallbacks();
+        return nxt;
+    }
+
+    /// Emergency re-arm entry point (spec section 2.4), BCH single-peer locus: the
+    /// re-arm CYCLE is the ladder RE-RESOLVE (resolve_candidates rebuilds DNS +
+    /// fixed + HTTP tiers in one call -- BCH has no separate per-tier timers).
+    /// Idempotent under the latch (2.2): a starved tick while a re-arm is pending
+    /// is a no-op, so N starved reconnect ticks schedule EXACTLY ONE re-resolve.
+    /// Backoff (2.1): the dedicated one-shot timer fires after delay(n) =
+    /// min(60<<n, 3600)s, the saturating exponential; n increments per arm.
+    void arm_emergency_fallbacks() {
+        if (!m_context || !m_running)
+            return;
+        auto delay = m_emergency.on_starved_tick();   // 2.2 re-entry guard
+        if (!delay)
+            return;                                    // latched -> no timer storm
+        if (!m_emergency_timer)
+            m_emergency_timer = std::make_unique<core::Timer>(m_context, /*repeat=*/false);
+        LOG_INFO << "[EMB-BCH] emergency ladder re-resolve armed in " << *delay
+                 << "s (attempt " << m_emergency.attempt << ")";
+        m_emergency_timer->start(static_cast<time_t>(*delay), [this]() {
+            m_emergency.on_timer_fire();               // 2.2 release latch at TOP
+            if (!m_running)                            // 2.3 SHUTDOWN early-return
+                return;
+            // Re-arm cycle: rebuild the ladder (DNS re-resolve + fixed + HTTP
+            // tier). Tier throws are caught inside resolve_candidates' detached
+            // HTTP thread, so a bad tier cannot kill the io_context or the cycle.
+            m_seed_tier.resolve_candidates(*m_context,
+                [this](std::vector<NetService> fresh) {
+                    if (!fresh.empty())
+                        m_walk.rearm(std::move(fresh));
+                });
+        });
+    }
+
+    /// Recovery reset (spec section 2.3): a connected peer clears the backoff so
+    /// the NEXT drop starts a fresh escalation from base, not the ceiling. Cancels
+    /// any pending re-arm. Wired to NodeP2P's peer-connected callback on the
+    /// discovered path (the explicit-peer / RPC-only default never installs it).
+    void clear_emergency_state() {
+        bool was_armed = m_emergency.active || m_emergency.attempt != 0;
+        m_emergency.clear();
+        if (m_emergency_timer)
+            m_emergency_timer->stop();
+        if (was_armed)
+            LOG_INFO << "[EMB-BCH] peer recovered -> emergency re-arm state reset";
+    }
+
     boost::asio::io_context* m_context; // not owned (binary entrypoint owns it); SeedTier async resolve target
     bool             m_regtest = false; // regtest 3rd-net: skip mainnet/testnet anchor + drive RPC mempool sync
     config_t*        m_config;   // not owned (binary entrypoint owns it)
@@ -647,6 +728,19 @@ private:
     // Populated by configure_seed_tier() in run(); consulted by maybe_start_p2p()
     // ONLY when no explicit peer is configured (should_run_ladder gate).
     SeedTier         m_seed_tier;
+    // Ordered discovery candidate cursor (SSOT for the peer-loss tail walk).
+    // Drives the Option-A discovered path only; the explicit-peer / RPC-only
+    // default never touches it.
+    SeedTier::CandidateWalk m_walk;
+    // Emergency re-arm state machine (backoff counter + re-entry latch) per the
+    // fleet-canonical never-re-arm spec (the/docs/coin-peer-manager-rearm.md
+    // sections 2.1-2.4), BCH single-peer locus = the ladder re-resolve. Pure /
+    // network-free (KAT-pinned). The dedicated one-shot timer owns the backed-off
+    // re-resolve, independent of the reconnect tick; cancelled on recovery and
+    // torn down on destruction (the core::Timer dtor cancels a pending wait).
+    SeedTier::EmergencyReArm     m_emergency;
+    std::unique_ptr<core::Timer> m_emergency_timer;
+    bool             m_running = true;   // false after stop(): timer handlers early-return
 };
 
 } // namespace coin
