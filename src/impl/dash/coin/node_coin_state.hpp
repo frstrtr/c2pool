@@ -135,11 +135,15 @@ public:
 
     /// #996 payee fail-closed gate. When enabled (default ON), viability
     /// refuses the embedded arm at any height where a MN payment is due but
-    /// find_expected_payee() cannot be resolved to a live SML entry — the
+    /// the NON-empty payee queue cannot resolve it to a live SML entry — the
     /// builder would otherwise emit a coinbase claiming m_payment_amount with
-    /// no MN output (fail-OPEN, bad-cb-payee). Refusal downgrades to the
-    /// reward-safe dashd GBT fallback; it is a template-SERVE refusal (free),
-    /// never a block-SUBMIT refusal. Exposed for the negative-pass test.
+    /// no MN output (fail-OPEN, bad-cb-payee). An EMPTY queue never trips:
+    /// it means no masternode set at all (a network with none serves
+    /// normally; a mid-sync empty queue is already fail-closed by
+    /// require_sml + require_fresh_mn_payee), not a resolution failure.
+    /// Refusal downgrades to the reward-safe dashd GBT fallback; it is a
+    /// template-SERVE refusal (free), never a block-SUBMIT refusal. Exposed
+    /// for the negative-pass test.
     void set_require_resolvable_payee(bool v) { m_require_resolvable_payee = v; }
 
     /// creditPool freshness gate (soak fix). dashcore CheckCreditPoolDiffForBlock
@@ -427,10 +431,12 @@ public:
         // daemonless provider is trigger-confident) and thread the schedule.
         SuperblockDisposition sb = resolve_superblock(m_prev_height + 1);
         // #996 fail-closed: a MN payment is due at the tip we build on but the
-        // payee is unresolvable (find_expected_payee() nullopt -- every entry
-        // isValid=false or the set is empty -- or, defensively, a projected
-        // payee absent from the SML entry set). The embedded builder would omit
-        // the MN coinbase output while m_payment_amount still claims it:
+        // NON-empty payee queue resolves no payee (find_expected_payee()
+        // nullopt -- every entry isValid=false -- or, defensively, a projected
+        // payee absent from the SML entry set); an empty queue means no
+        // masternode set at all, not a resolution failure, and never trips.
+        // The embedded builder would omit the MN coinbase output while
+        // m_payment_amount still claims it:
         // fail-OPEN on a money path (bad-cb-payee). Refusing downgrades to the
         // dashd GBT fallback -- a template-SERVE refusal (free), not a
         // block-SUBMIT refusal.
@@ -475,9 +481,10 @@ public:
         if (m_require_resolvable_payee && !payee_resolvable) {
             LOG_WARNING << "[EMBED-GATE] h=" << (m_prev_height + 1)
                         << " REFUSE embedded template: MN payment due but payee"
-                        << " unresolvable (find_expected_payee nullopt or"
-                        << " projected payee absent from SML set) -- falling back"
-                        << " to dashd GBT [#996 bad-cb-payee fail-closed].";
+                        << " unresolvable from a non-empty MN set"
+                        << " (find_expected_payee nullopt or projected payee"
+                        << " absent from SML set) -- falling back to dashd GBT"
+                        << " [#996 bad-cb-payee fail-closed].";
         }
         e.prev_height          = m_prev_height;
         e.prev_hash            = m_prev_hash;
@@ -575,13 +582,22 @@ private:
     // #996 helper: is the MN payee the embedded builder will need actually
     // resolvable at the tip we build on? Mirrors embedded_gbt.hpp's build-time
     // condition (build_embedded_workdata gates the MN PackedPayment on
-    // mn_payment > 0). Returns false ONLY when a MN payment is due but
-    // find_expected_payee() is nullopt (all entries isValid=false / empty set)
-    // or, defensively, names a payee absent from entries(). Uses the fee-free
-    // subsidy floor: mempool fees only RAISE block_value, so if the floor MN
-    // payment is <= 0 no MN output is due and an absent payee is legitimately
-    // fine -- the gate never over-refuses at a genuine no-MN-payment height.
+    // mn_payment > 0). Returns false ONLY when a MN payment is due and the
+    // NON-empty payee queue resolves no payee: every entry isValid=false (an
+    // unobserved PoSe ban) or, defensively, the projection names a payee
+    // absent from entries(). An EMPTY queue is not a resolution failure -- it
+    // means no masternode set at all: either a network that legitimately has
+    // none (the builder emits no MN output and dashd expects none) or a queue
+    // not yet seeded, which the armed posture already fails closed via
+    // require_sml (have_sml + sml current at tip) and require_fresh_mn_payee
+    // (last_applied_height == prev_height). Firing on the empty set made the
+    // embedded arm permanently non-viable on no-MN-set networks. Uses the
+    // fee-free subsidy floor: mempool fees only RAISE block_value, so if the
+    // floor MN payment is <= 0 no MN output is due and an absent payee is
+    // legitimately fine -- the gate never over-refuses at a genuine
+    // no-MN-payment height.
     bool mn_payee_resolvable_at_tip() const {
+        if (m_mnstates.entries().empty()) return true;  // no MN set: nothing to resolve
         const uint32_t next_h = m_prev_height + 1;
         const int64_t reward = compute_dash_block_reward_post_v20(next_h);
         const int64_t platform_reward =
