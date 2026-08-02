@@ -430,6 +430,25 @@ TEST(DashNodeCoinState, UnresolvablePayeeFailsClosedToDashd) {
         << "#996 guard must NOT refuse when the due payee resolves";
 }
 
+// #996 rescope: an EMPTY payee queue must NOT trip the guard (default ON).
+// No-masternode-set is not a resolution failure: a network that genuinely
+// has none serves normally (the builder emits no MN output and dashd expects
+// none), and a mid-sync empty queue is already fail-closed on the armed
+// posture by require_sml + require_fresh_mn_payee. Distinguishes the
+// no-MN-set case from UnresolvablePayeeFailsClosedToDashd above, where
+// entries EXIST but none resolves -- that one must keep refusing.
+TEST(DashNodeCoinState, EmptyMnSetDoesNotTripPayeeGuard) {
+    NodeCoinState st;
+    st.set_tip(H - 1, raw256(0xAB), 0x1b104be3u, 1700000000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER);
+    ASSERT_TRUE(st.populated());
+    ASSERT_TRUE(st.mnstates().entries().empty());
+    ASSERT_FALSE(st.mnstates().find_expected_payee().has_value());
+    // Guard at its DEFAULT (ON): the empty set stays viable at a height where
+    // a MN payment WOULD be due if a masternode set existed.
+    EXPECT_TRUE(st.make_embedded_work_inputs().viable());
+}
+
 // BLOCKER-1 (PR #780): is_dkg_commitment_window over REAL live-testnet heights —
 // the DKG mining windows the review pulled must be flagged, the fixture height
 // (a non-qc coinbase-only block) must not.
