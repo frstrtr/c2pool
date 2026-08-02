@@ -49,6 +49,7 @@
 #include <impl/dash/coin/coin_state_maintainer.hpp>
 #include <impl/dash/coin/node_coin_state.hpp>
 
+#include <core/hash.hpp>
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
 
@@ -57,6 +58,7 @@
 #include <algorithm>
 #include <functional>
 #include <map>
+#include <span>
 #include <optional>
 #include <string>
 #include <utility>
@@ -1082,4 +1084,557 @@ TEST(DashMnCheckpointSmlRecovery, RevivalTxLaterInWindowFiresOffTheRecoveredBan)
     // 1519545's own payee is unaffected: pass 0 projects from the PRE-block
     // list, where kQ1 is still excluded, so queue slot 3 was paid.
     EXPECT_EQ(out.at(uint256S(kQ3)).nLastPaidHeight, 1519545u);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 7. PoSe REMOVALS — the replay must SUBTRACT, not only ADD.
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// MEASURED, mainnet, hotel dashd 23.1.7, 2026-08-02:
+//
+//     protx list valid false 2513000  -> 2068 entries   (the anchor)
+//     protx list valid false 2514874  -> 2059 entries   the chain FELL by 9
+//     the bridge's replayed set        2067 -> 2070      we CLIMBED by 3
+//
+// A block replay can only ADD: a PoSe ban is derived by dashd from consensus
+// (accumulated MAX_PoSe_PENALTY) and never appears as a special transaction,
+// so apply_block is structurally unable to see one. The SML carries it, we
+// already persist it, and MnStateMachine::reconcile_pose_from_sml() is the
+// pass that applies it — BEFORE each replayed block is folded, for the
+// ordering reasons written out at that function.
+//
+// Every positive case below has a negative twin that must go red if the
+// removal path is deleted.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace {
+
+using dash::coin::MnStateMachine;
+using dash::coin::vendor::CProRegTx;
+
+// An SML the test can REFRESH between replayed heights. The mnlistdiff feed
+// keeps running for the whole life of a multi-hour bridge, so "banned at
+// h=N, valid again at h=N+1" is a real sequence, not a contrivance. Keyed by
+// height; the newest entry at or below the queried height wins.
+struct RefreshingSml {
+    std::map<uint32_t, CSimplifiedMNList> by_height;
+
+    void set(uint32_t h, const std::vector<std::pair<const char*, bool>>& es)
+    {
+        std::vector<CSimplifiedMNListEntry> v;
+        v.reserve(es.size());
+        for (const auto& [hex, valid] : es) {
+            CSimplifiedMNListEntry e;
+            e.proRegTxHash = uint256S(hex);
+            e.isValid      = valid;
+            v.push_back(e);
+        }
+        by_height.insert_or_assign(h, CSimplifiedMNList(std::move(v)));
+    }
+    void set_hashes(uint32_t h,
+                    const std::vector<std::pair<uint256, bool>>& es)
+    {
+        std::vector<CSimplifiedMNListEntry> v;
+        v.reserve(es.size());
+        for (const auto& [hash, valid] : es) {
+            CSimplifiedMNListEntry e;
+            e.proRegTxHash = hash;
+            e.isValid      = valid;
+            v.push_back(e);
+        }
+        by_height.insert_or_assign(h, CSimplifiedMNList(std::move(v)));
+    }
+    const CSimplifiedMNList* at(uint32_t h) const
+    {
+        if (by_height.empty()) return nullptr;
+        auto it = by_height.upper_bound(h);
+        if (it == by_height.begin()) return nullptr;
+        --it;
+        return &it->second;
+    }
+};
+
+// Wire the production snapshot seam. reconcile_pose() runs while the lane's
+// cursor still points at the PREVIOUS height, so cursor_height()+1 is exactly
+// the height being reconciled.
+void wire_sml_snapshot(MnCheckpointLane& lane, const RefreshingSml& src)
+{
+    lane.set_sml_snapshot_fn([&lane, &src]() -> const CSimplifiedMNList* {
+        return src.at(lane.cursor_height() + 1);
+    });
+}
+
+uint256 synth_tx_hash(const MutableTransaction& tx)
+{
+    ::PackStream s;
+    s << tx;
+    auto sp = s.get_span();
+    uint256 h;
+    CHash256()
+        .Write(std::span<const unsigned char>(
+            reinterpret_cast<const unsigned char*>(sp.data()), sp.size()))
+        .Finalize(std::span<unsigned char>(h.data(), 32));
+    return h;
+}
+
+// A ProRegTx registering a brand-new masternode with `payout` as its
+// scriptPayout. Its proTxHash is the tx hash, so tests compute it with
+// synth_tx_hash() and can name it in the SML.
+MutableTransaction pro_reg_tx(const std::vector<unsigned char>& payout,
+                              uint32_t nonce)
+{
+    CProRegTx p;
+    p.nVersion = dash::coin::vendor::ProTxVersion::BASIC_BLS;
+    p.nType    = dash::coin::vendor::MnType::REGULAR;
+    p.collateralOutpoint.hash  = uint256{};   // "this tx's own output N"
+    p.collateralOutpoint.index = nonce;
+    p.netInfo.port_be          = 0x2334;
+    p.scriptPayout.m_data      = payout;
+
+    MutableTransaction tx;
+    tx.type = CProRegTx::SPECIALTX_TYPE;
+    {
+        auto ps = ::pack(p);
+        auto sp = ps.get_span();
+        tx.extra_payload.assign(
+            reinterpret_cast<const unsigned char*>(sp.data()),
+            reinterpret_cast<const unsigned char*>(sp.data()) + sp.size());
+    }
+    bitcoin_family::coin::TxIn in;
+    in.prevout.hash  = uint256{};
+    in.prevout.index = 0xFFFF0000u | nonce;   // never a known collateral
+    in.sequence      = 0xFFFFFFFF;
+    tx.vin.push_back(in);
+    return tx;
+}
+
+// A distinctive P2PKH-shaped script no fixture masternode owns.
+std::vector<unsigned char> synth_script(uint8_t tag)
+{
+    std::vector<unsigned char> s{0x76, 0xa9, 0x14};
+    for (int i = 0; i < 20; ++i) s.push_back(static_cast<unsigned char>(tag));
+    s.push_back(0x88);
+    s.push_back(0xac);
+    return s;
+}
+
+} // namespace
+
+// ── CASE R1 (POSITIVE). A masternode valid at the anchor and PoSe-banned
+// inside the window is REMOVED from the payee-eligible set, so it is never
+// projected. The bridge completes with NO help from the reactive demotion
+// walk — the per-hash validity seam is deliberately left unwired here, so the
+// only thing that can produce this result is the removal pass.
+TEST(DashMnCheckpointPoseRemoval, BannedMidWindowIsRemovedFromTheEligibleSet)
+{
+    RecoveryRig r;
+    RefreshingSml sml;
+    sml.set(1519544, all_valid_except({kQ1}));
+    wire_sml_snapshot(r.h.lane, sml);
+
+    // dashd skipped the banned Q1 and paid queue slot 2.
+    auto blk = repay_coinbase(block_from_hex(kBlockHex1519544),
+                              payout_of(r.cp, kQ1), payout_of(r.cp, kQ2));
+    r.run(blk);
+
+    ASSERT_TRUE(r.h.published) << "lane status: " << r.h.lane.status();
+    EXPECT_EQ(r.h.lane.pose_removed(), 1u)
+        << "the SML removal pass is what has to fire here";
+    EXPECT_EQ(r.h.lane.sml_recovered(), 0u)
+        << "the reactive demotion walk must NOT be needed once the removal"
+           " pass runs -- it is the capped second line of defence";
+    EXPECT_EQ(r.h.lane.anchor_eligible(), 6u);
+    EXPECT_EQ(r.h.lane.eligible_size(), 5u)
+        << "the payee-eligible set must FALL, which is exactly what the"
+           " measured 2068->2059 vs 2067->2070 divergence says it never did";
+
+    std::map<uint256, MNState> out(r.h.published_set.begin(),
+                                   r.h.published_set.end());
+    const MNState& banned = out.at(uint256S(kQ1));
+    EXPECT_FALSE(banned.isValid);
+    EXPECT_EQ(banned.nPoSeBanHeight, 1519544u);
+    EXPECT_EQ(banned.nLastPaidHeight, 1519459u)
+        << "a removed masternode must not be credited with the payment";
+    EXPECT_EQ(out.at(uint256S(kQ2)).nLastPaidHeight, 1519544u);
+}
+
+// ── CASE R1-TWIN (NEGATIVE). The identical scenario with the removal seam
+// unwired -- i.e. the code as it stood when the bridge fail-closed at
+// h=2514874. The replay can only ADD, the banned masternode keeps the head of
+// the queue, and the bridge refuses. If deleting the removal path did not
+// change behaviour, R1 above would be proving nothing.
+TEST(DashMnCheckpointPoseRemoval, TwinNoRemovalSeamStillFailsClosed)
+{
+    RecoveryRig r;
+    auto blk = repay_coinbase(block_from_hex(kBlockHex1519544),
+                              payout_of(r.cp, kQ1), payout_of(r.cp, kQ2));
+    r.run(blk);   // no snapshot seam, no validity seam
+
+    EXPECT_EQ(r.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << r.h.lane.status();
+    EXPECT_FALSE(r.h.published);
+    EXPECT_EQ(r.h.lane.pose_removed(), 0u);
+    EXPECT_EQ(r.h.lane.eligible_size(), 6u)
+        << "with no removal pass the eligible set can only stay flat or climb";
+}
+
+// ── CASE R2. The fail-closed message must MEASURE the divergence, not list
+// hypotheses. An operator has to be able to tell "the anchor is wrong" from
+// "the replay is incomplete" from "a PoSe ban could not be attested" out of
+// the log alone.
+TEST(DashMnCheckpointPoseRemoval, FailClosedReportsTheActualDelta)
+{
+    RecoveryRig r;
+    RefreshingSml sml;
+    // The SML attests every masternode VALID, so the removal pass has nothing
+    // to remove and the mismatch is a REAL desync.
+    sml.set(1519544, all_valid_except({}));
+    wire_sml_snapshot(r.h.lane, sml);
+    r.h.lane.set_sml_validity_fn(sml_fn(all_valid_except({})));
+
+    auto blk = repay_coinbase(block_from_hex(kBlockHex1519544),
+                              payout_of(r.cp, kQ1), payout_of(r.cp, kQ2));
+    r.run(blk);
+
+    ASSERT_EQ(r.h.lane.state(), MnCheckpointLane::State::FailedClosed);
+    const std::string s = r.h.lane.status();
+    EXPECT_NE(s.find("SET DELTA"), std::string::npos) << s;
+    EXPECT_NE(s.find("6 at the anchor"), std::string::npos)
+        << "set size before must be stated: " << s;
+    EXPECT_NE(s.find("ADDS: 0 registrations"), std::string::npos) << s;
+    EXPECT_NE(s.find("0 PoSe (SML-attested)"), std::string::npos)
+        << "the removal count must be stated even when it is zero: " << s;
+    EXPECT_NE(s.find("PROJECTED PAYEE: " + uint256S(kQ1).GetHex()),
+              std::string::npos)
+        << "the operator must be told WHICH masternode we projected: " << s;
+    EXPECT_NE(s.find("attests it VALID"), std::string::npos)
+        << "...and what the SML thinks of it: " << s;
+}
+
+// ── CASE R2-TWIN (NEGATIVE). Same shape, but the SML DOES attest the
+// projected payee invalid and no candidate below it matches the coinbase.
+// The report must say something DIFFERENT, or it is not a measurement.
+TEST(DashMnCheckpointPoseRemoval, FailClosedDistinguishesAnAttestedBan)
+{
+    RecoveryRig r;
+    // Pay a script no masternode below Q1 owns, so nothing can be repaired.
+    r.h.lane.set_sml_validity_fn(sml_fn(all_valid_except({kQ1})));
+    auto blk = repay_coinbase(block_from_hex(kBlockHex1519544),
+                              payout_of(r.cp, kQ1), synth_script(0x5a));
+    r.run(blk);
+
+    ASSERT_EQ(r.h.lane.state(), MnCheckpointLane::State::FailedClosed);
+    const std::string s = r.h.lane.status();
+    EXPECT_NE(s.find("attests it INVALID"), std::string::npos) << s;
+    EXPECT_EQ(s.find("attests it VALID"), std::string::npos)
+        << "the two verdicts must not be reported with the same words: " << s;
+    EXPECT_NE(s.find("NO SML SNAPSHOT SEAM IS WIRED"), std::string::npos)
+        << "an operator whose removal pass is not wired must be told so: " << s;
+}
+
+// ── CASE R3. Banned AND revived inside the replay window must end VALID.
+// The SML refreshes during the bridge (mnlistdiffs keep arriving for its whole
+// duration), so h=1519544 sees the ban and h=1519545 sees the revival. Only a
+// bridge-owned exclusion may be lifted this way.
+TEST(DashMnCheckpointPoseRemoval, BannedThenRevivedInsideTheWindowEndsValid)
+{
+    RecoveryRig r;
+    RefreshingSml sml;
+    sml.set(1519544, all_valid_except({kQ1}));   // banned
+    sml.set(1519545, all_valid_except({}));      // revived
+    wire_sml_snapshot(r.h.lane, sml);
+
+    auto b44 = repay_coinbase(block_from_hex(kBlockHex1519544),
+                              payout_of(r.cp, kQ1), payout_of(r.cp, kQ2));
+    r.h.blocks[1519545] = block_from_hex(kBlockHex1519545);
+    r.run(b44, /*tip=*/1519545);
+
+    ASSERT_TRUE(r.h.published) << "lane status: " << r.h.lane.status();
+    EXPECT_EQ(r.h.published_as_of, 1519545u);
+    EXPECT_EQ(r.h.lane.pose_removed(), 1u);
+    EXPECT_EQ(r.h.lane.pose_reinstated(), 1u);
+    EXPECT_EQ(r.h.lane.eligible_size(), 6u)
+        << "the set must be back to full strength once the ban is lifted";
+
+    std::map<uint256, MNState> out(r.h.published_set.begin(),
+                                   r.h.published_set.end());
+    const MNState& revived = out.at(uint256S(kQ1));
+    EXPECT_TRUE(revived.isValid) << "a ban+revive inside the window ends VALID";
+    EXPECT_EQ(revived.nPoSeBanHeight, 0u);
+    EXPECT_EQ(revived.nPoSeRevivedHeight, 1519545u);
+}
+
+// ── CASE R3-TWIN (NEGATIVE). The reinstatement is OWNERSHIP-bounded: a
+// tx-driven ban (ProUpRevTx, or the operator-key-change ProUpRegTx) is
+// consensus-exact at a known height and must NEVER be undone by an SML that
+// merely shows the masternode live at the TIP -- that only means it will be
+// revived by a ProUpServTx we have not folded yet, and lifting it early puts
+// it back in the queue ahead of dashd's. Driven at the state machine, which
+// is where the ownership rule lives.
+TEST(DashMnCheckpointPoseRemoval, TwinTxDrivenBanIsNotReinstatedBySml)
+{
+    MnStateMachine m;
+    std::vector<std::pair<uint256, MNState>> seed;
+    MNState st;
+    st.isValid           = false;          // banned by a ProUpRevTx at 1519500
+    st.nPoSeBanHeight    = 1519500;
+    st.nRegisteredHeight = 1000000;
+    st.scriptPayout.m_data = synth_script(0x11);
+    seed.emplace_back(uint256S(kQ1), st);
+    m.load(std::move(seed), 1519543);
+
+    std::vector<CSimplifiedMNListEntry> v(1);
+    v[0].proRegTxHash = uint256S(kQ1);
+    v[0].isValid      = true;              // the SML shows it live AT THE TIP
+    CSimplifiedMNList sml(std::move(v));
+
+    const auto pr = m.reconcile_pose_from_sml(sml, 1519544);
+    EXPECT_EQ(pr.reinstated, 0u)
+        << "only exclusions this bridge created may be lifted";
+    EXPECT_EQ(m.pose_reinstated_total(), 0u);
+    EXPECT_FALSE(m.entries().at(uint256S(kQ1)).isValid);
+    EXPECT_EQ(m.entries().at(uint256S(kQ1)).nPoSeBanHeight, 1519500u)
+        << "the exact tx-observed ban height must survive untouched";
+}
+
+// ── CASE R4. Set-size accounting, on a fixture modelled directly on the real
+// mainnet delta: 2068 payee-eligible masternodes at the anchor, 12 PoSe-banned
+// and 3 registered inside the window. The chain's number is 2068 -> 2059; a
+// replay that only ADDS reports 2068 -> 2071 (climbs by 3 -- the measured
+// +3). Both machines below are driven identically except for the removal pass.
+TEST(DashMnCheckpointPoseRemoval, SetSizeAccountingMatchesTheMainnetDelta)
+{
+    constexpr uint32_t kAnchor  = 2513000;
+    constexpr uint32_t kApplyAt = 2513001;
+    constexpr size_t   kAnchorEligible = 2068;
+    constexpr size_t   kBanned = 12;
+    constexpr size_t   kAdds   = 3;
+
+    auto seed_set = [&] {
+        std::vector<std::pair<uint256, MNState>> out;
+        out.reserve(kAnchorEligible);
+        for (size_t i = 0; i < kAnchorEligible; ++i) {
+            MNState st;
+            st.isValid             = true;
+            st.nRegisteredHeight   = 2000000;
+            st.nLastPaidHeight     = static_cast<uint32_t>(kAnchor - 2100 + i);
+            st.scriptPayout.m_data = synth_script(0)  ;
+            // Unique 20-byte hash160 body per masternode so no two share a
+            // payout script (a shared script would hide a wrong attribution).
+            st.scriptPayout.m_data[3] = static_cast<unsigned char>(i & 0xff);
+            st.scriptPayout.m_data[4] = static_cast<unsigned char>(i >> 8);
+            st.collateralOutpoint.hash  = uint256S(kQ1);
+            st.collateralOutpoint.index = static_cast<uint32_t>(i);
+            uint256 h = uint256S(kQ2);
+            h.data()[0] = static_cast<unsigned char>(i & 0xff);
+            h.data()[1] = static_cast<unsigned char>(i >> 8);
+            out.emplace_back(h, st);
+        }
+        return out;
+    };
+
+    // The 12 the SML attests banned: masternodes 3, 6, 9, ... — deliberately
+    // NOT the head of the queue, so the removal has to be proactive rather
+    // than something the coinbase cross-check could have stumbled into.
+    auto sml_marking_banned = [&](const std::vector<std::pair<uint256, MNState>>& set) {
+        std::vector<CSimplifiedMNListEntry> v;
+        v.reserve(set.size());
+        for (size_t i = 0; i < set.size(); ++i) {
+            CSimplifiedMNListEntry e;
+            e.proRegTxHash = set[i].first;
+            e.isValid      = !((i % 3 == 0) && (i / 3) < kBanned);
+            v.push_back(e);
+        }
+        return CSimplifiedMNList(std::move(v));
+    };
+
+    const auto anchor_set = seed_set();
+    const CSimplifiedMNList sml = sml_marking_banned(anchor_set);
+
+    // Three registrations, folded from a real accepted block body whose
+    // coinbase is rewritten to pay whichever masternode the machine projects.
+    auto make_block = [&](const std::vector<unsigned char>& pay_to) {
+        auto blk = block_from_hex(kBlockHex1519544);
+        blk.m_txs[0].vout[1].scriptPubKey.m_data = pay_to;
+        for (size_t i = 0; i < kAdds; ++i)
+            blk.m_txs.push_back(
+                pro_reg_tx(synth_script(static_cast<uint8_t>(0xd0 + i)),
+                           static_cast<uint32_t>(i)));
+        return blk;
+    };
+
+    // ── The replay AS IT WAS: additions only. ──────────────────────────────
+    MnStateMachine before;
+    before.load(anchor_set, kAnchor);
+    ASSERT_EQ(before.eligible_size(), kAnchorEligible);
+    {
+        auto proj = before.find_expected_payee();
+        ASSERT_TRUE(proj.has_value());
+        const auto r =
+            before.apply_block(make_block(before.entries().at(*proj)
+                                              .scriptPayout.m_data), kApplyAt);
+        ASSERT_FALSE(r.payee_desync);
+        EXPECT_EQ(r.registered, kAdds);
+    }
+    EXPECT_EQ(before.eligible_size(), kAnchorEligible + kAdds)
+        << "a replay that can only ADD climbs -- the measured 2067 -> 2070";
+
+    // ── The replay WITH the removal pass. ──────────────────────────────────
+    MnStateMachine after;
+    after.load(anchor_set, kAnchor);
+    const auto pr = after.reconcile_pose_from_sml(sml, kApplyAt);
+    EXPECT_EQ(pr.eligible_before, kAnchorEligible);
+    EXPECT_EQ(pr.removed, kBanned);
+    EXPECT_EQ(pr.eligible_after, kAnchorEligible - kBanned);
+    {
+        auto proj = after.find_expected_payee();
+        ASSERT_TRUE(proj.has_value());
+        const auto r =
+            after.apply_block(make_block(after.entries().at(*proj)
+                                             .scriptPayout.m_data), kApplyAt);
+        ASSERT_FALSE(r.payee_desync);
+        EXPECT_EQ(r.registered, kAdds);
+    }
+    EXPECT_EQ(after.eligible_size(), 2059u)
+        << "2068 - 12 banned + 3 registered = 2059, which is what"
+           " `protx list valid false 2514874` actually returned";
+    EXPECT_EQ(after.size(), kAnchorEligible + kAdds)
+        << "REGISTERED is unchanged by a PoSe ban -- comparing that number"
+           " against `protx list valid` is what hid this bug";
+    EXPECT_EQ(after.pose_removed_total(), kBanned);
+}
+
+// ── CASE R5. A registration and a removal in the SAME block, in the
+// documented order. reconcile runs PRE-block, so:
+//   * the masternode registered BY this block is not in the set yet and
+//     cannot be removed at its own registration height -- which is right,
+//     because it was not in dashd's H-1 list either and a ProRegTx
+//     masternode enters with zero penalty;
+//   * an existing masternode IS removed before pass 0 ranks candidates.
+// The newcomer becomes removable at H+1, the first height at which it could
+// ever be projected.
+TEST(DashMnCheckpointPoseRemoval, RegistrationAndRemovalInOneBlockApplyInOrder)
+{
+    const auto newcomer_script = synth_script(0xc7);
+    const MutableTransaction reg = pro_reg_tx(newcomer_script, 7);
+    const uint256 newcomer = synth_tx_hash(reg);
+
+    // ---- H only: the newcomer must survive its own registration height ----
+    {
+        RecoveryRig r;
+        RefreshingSml sml;
+        auto es = all_valid_except({kQ1});
+        std::vector<std::pair<uint256, bool>> hs;
+        for (auto& [hex, v] : es) hs.emplace_back(uint256S(hex), v);
+        hs.emplace_back(newcomer, false);   // the SML wants it gone TOO
+        sml.set_hashes(1519544, hs);
+        wire_sml_snapshot(r.h.lane, sml);
+
+        auto b44 = repay_coinbase(block_from_hex(kBlockHex1519544),
+                                  payout_of(r.cp, kQ1), payout_of(r.cp, kQ2));
+        b44.m_txs.push_back(reg);
+        r.run(b44);
+
+        ASSERT_TRUE(r.h.published) << r.h.lane.status();
+        EXPECT_EQ(r.h.lane.pose_removed(), 1u)
+            << "exactly ONE removal at h=1519544: the pre-existing kQ1."
+               " Removing the newcomer too would mean the reconcile ran"
+               " AFTER the block and retro-banned a masternode at its own"
+               " registration height";
+        EXPECT_EQ(r.h.lane.replay_registered(), 1u);
+
+        std::map<uint256, MNState> out(r.h.published_set.begin(),
+                                       r.h.published_set.end());
+        ASSERT_EQ(out.count(newcomer), 1u)
+            << "the ProRegTx must have registered the newcomer";
+        EXPECT_TRUE(out.at(newcomer).isValid)
+            << "a masternode cannot be PoSe-banned at the height it registers";
+        EXPECT_FALSE(out.at(uint256S(kQ1)).isValid);
+        EXPECT_EQ(r.h.lane.eligible_size(), 6u)   // 6 - 1 banned + 1 new
+            << "one out, one in";
+    }
+
+    // ---- H and H+1: at the NEXT height the newcomer is removable ----------
+    {
+        RecoveryRig r;
+        RefreshingSml sml;
+        auto es = all_valid_except({kQ1});
+        std::vector<std::pair<uint256, bool>> hs;
+        for (auto& [hex, v] : es) hs.emplace_back(uint256S(hex), v);
+        hs.emplace_back(newcomer, false);
+        sml.set_hashes(1519544, hs);
+        wire_sml_snapshot(r.h.lane, sml);
+
+        auto b44 = repay_coinbase(block_from_hex(kBlockHex1519544),
+                                  payout_of(r.cp, kQ1), payout_of(r.cp, kQ2));
+        b44.m_txs.push_back(reg);
+        r.h.blocks[1519545] = block_from_hex(kBlockHex1519545);
+        r.run(b44, /*tip=*/1519545);
+
+        ASSERT_TRUE(r.h.published) << r.h.lane.status();
+        EXPECT_EQ(r.h.lane.pose_removed(), 2u)
+            << "kQ1 at h=1519544, the newcomer at h=1519545";
+        std::map<uint256, MNState> out(r.h.published_set.begin(),
+                                       r.h.published_set.end());
+        EXPECT_FALSE(out.at(newcomer).isValid);
+        EXPECT_EQ(out.at(newcomer).nPoSeBanHeight, 1519545u)
+            << "removed at the FIRST height it could have been projected,"
+               " not at the height it registered";
+        EXPECT_EQ(r.h.lane.eligible_size(), 5u);
+    }
+}
+
+// ── CASE R6. The SML is a snapshot of NOW, so a removal can be EARLY: the ban
+// may have fallen after the block being replayed, and dashd paid the
+// masternode normally right up to it. Here block 1519544 is the REAL,
+// unmodified accepted block -- it pays kQ1, which the tip SML says is banned.
+// The repair attributes the payment (the DIP-3 queue cursor has to stay
+// dashd-identical) and KEEPS the exclusion.
+TEST(DashMnCheckpointPoseRemoval, EarlyRemovalIsRepairedByTheRealCoinbase)
+{
+    RecoveryRig r;
+    RefreshingSml sml;
+    sml.set(1519544, all_valid_except({kQ1}));
+    wire_sml_snapshot(r.h.lane, sml);
+    r.run(block_from_hex(kBlockHex1519544));   // untouched real block
+
+    ASSERT_TRUE(r.h.published) << r.h.lane.status();
+    EXPECT_EQ(r.h.lane.pose_removed(), 1u);
+    EXPECT_EQ(r.h.lane.pose_premature(), 1u)
+        << "the block pays a masternode we had already excluded -- that is"
+           " proof its ban had not taken effect yet at this height";
+
+    std::map<uint256, MNState> out(r.h.published_set.begin(),
+                                   r.h.published_set.end());
+    EXPECT_EQ(out.at(uint256S(kQ1)).nLastPaidHeight, 1519544u)
+        << "the payment must be attributed or every later projection is one"
+           " queue slot off";
+    EXPECT_FALSE(out.at(uint256S(kQ1)).isValid)
+        << "the exclusion is KEPT: it really is banned by the time we publish";
+    EXPECT_EQ(out.at(uint256S(kQ2)).nLastPaidHeight, 1519460u)
+        << "queue slot 2 must NOT have been credited";
+}
+
+// ── CASE R6-TWIN (NEGATIVE). The repair is rank-gated. An excluded masternode
+// that sorts AFTER our projection cannot explain the coinbase -- dashd would
+// have paid the projection first -- so the repair must refuse and the bridge
+// must fail closed. Without that gate, any excluded masternode whose script
+// happens to appear in a coinbase would license a re-attribution.
+TEST(DashMnCheckpointPoseRemoval, TwinExcludedButLowerRankedDoesNotRepair)
+{
+    RecoveryRig r;
+    RefreshingSml sml;
+    sml.set(1519544, all_valid_except({kQ6}));   // kQ6 is LAST in the queue
+    wire_sml_snapshot(r.h.lane, sml);
+
+    // The block pays kQ6's script; our projection is still kQ1 (untouched).
+    auto blk = repay_coinbase(block_from_hex(kBlockHex1519544),
+                              payout_of(r.cp, kQ1), payout_of(r.cp, kQ6));
+    r.run(blk);
+
+    EXPECT_EQ(r.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << r.h.lane.status();
+    EXPECT_FALSE(r.h.published);
+    EXPECT_EQ(r.h.lane.pose_removed(), 1u);
+    EXPECT_EQ(r.h.lane.pose_premature(), 0u)
+        << "a lower-ranked exclusion must never be accepted as the payee";
 }

@@ -90,48 +90,84 @@
 /// into this lane.
 ///
 /// ─────────────────────────────────────────────────────────────────────────
-/// POST-ANCHOR PoSe BANS, AND THE TWO RESIDUALS THAT REMAIN
+/// POST-ANCHOR PoSe BANS — THE REPLAY APPLIES REMOVALS, NOT ONLY ADDITIONS
 /// ─────────────────────────────────────────────────────────────────────────
-/// The falsification test above has one structural blind spot. A PoSe ban is
-/// applied by dashd from CONSENSUS (accumulated MAX_PoSe_PENALTY), never as a
-/// special transaction. MnStateMachine::apply_block walks special txs, so it
-/// cannot observe one at any price. A masternode banned AFTER the anchor
-/// height therefore stays isValid=true in the replay, keeps its place at the
-/// head of our payment queue, and is projected as the payee for a block dashd
-/// paid to somebody else — payee_desync, which here is TERMINAL. One such ban
-/// anywhere in the replay window permanently prevents the daemonless arm from
-/// publishing a masternode set at all.
+/// A PoSe ban is applied by dashd from CONSENSUS (accumulated
+/// MAX_PoSe_PENALTY), never as a special transaction. MnStateMachine::
+/// apply_block walks special txs, so a block replay is STRUCTURALLY incapable
+/// of observing one: it can only ever ADD.
 ///
-/// The Simplified Masternode List is the only carrier of that ban, so the lane
-/// exposes set_sml_validity_fn() and hands it to its private machine. On a
-/// payee mismatch the machine may walk down the ranked queue, but ONLY while
-/// each demoted candidate is ATTESTED INVALID by the SML and the accepted
-/// candidate's scriptPayout EXACTLY matches an output this block pays. Any
-/// step that cannot satisfy both reports payee_desync exactly as before. The
-/// walk is capped per bridge (see pump()), every event logs at WARNING, and
-/// the running count is surfaced in status() and in the publish line — a
-/// count that lives only in scrollback is half-silent, and this file exists
-/// to prevent silent degradation.
+/// MEASURED, mainnet, hotel dashd 23.1.7, 2026-08-02, anchor 2513000 -> tip
+/// 2514874:
 ///
-/// TWO RESIDUALS, stated honestly:
+///     protx list valid false 2513000   -> 2068 entries
+///     protx list valid false 2514874   -> 2059 entries   the chain FELL by 9
+///     this bridge's replayed set        2067 -> 2070      we CLIMBED by 3
 ///
-///  (a) A masternode banned AND revived entirely inside the replay window,
-///      whose CURRENT SML entry therefore reads isValid==true, still fails
-///      closed. The SML is a snapshot of NOW; it cannot attest a historical
-///      ban, and an attested-valid answer is treated as counter-evidence (it
-///      must be — that is what stops the walk from excusing a real desync).
-///      This is exactly today's behaviour for that case, not worse.
+/// The bridge fail-closed at h=2514874 having projected a masternode that the
+/// chain had PoSe-banned inside the window (still `registered`, no longer
+/// `valid`). Correct refusal, wrong set.
 ///
-///  (b) A post-anchor ban INSIDE a shared-payoutAddress group can escape both
-///      the cross-check and this recovery, because both are SCRIPT-granular:
-///      if the banned MN and the MN dashd actually paid share one payout
-///      address, the coinbase output still matches our projected script, the
-///      mismatch never fires, and the payment is attributed to the wrong
-///      member of the group. That is a PRE-EXISTING blind spot in the
-///      projection cross-check (the same granularity the gap_detected note in
-///      mn_state_machine.hpp calls out), not something this recovery
-///      introduces — the recovery only ever runs when the cross-check already
-///      failed.
+/// The Simplified Masternode List is the only carrier of that ban, and we
+/// already receive and persist it. There are now TWO seams onto it, and they
+/// do different jobs:
+///
+///   • set_sml_snapshot_fn() — the REMOVAL pass. Once per replayed height,
+///     BEFORE the block is folded, MnStateMachine::reconcile_pose_from_sml()
+///     drops every masternode the SML attests not-valid out of the
+///     payee-eligible set, and lifts a bridge-owned exclusion again if a
+///     refreshed SML attests it valid. This is what stops a banned masternode
+///     ever reaching the head of the queue. The ordering rationale — and why
+///     pre-block is the only correct choice when a registration and a removal
+///     land in the same block — is written out in full at that function.
+///
+///   • set_sml_validity_fn() — the per-hash attestation used by the REACTIVE
+///     demotion walk, which remains as the second line of defence for a ban
+///     the removal pass could not see (no verified SML yet, or an SML older
+///     than the ban). It may walk down the ranked queue, but ONLY while each
+///     demoted candidate is ATTESTED INVALID and the accepted candidate's
+///     scriptPayout EXACTLY matches an output this block pays. The walk is
+///     capped per bridge (see pump()).
+///
+/// Because the SML is a snapshot of NOW rather than of the replayed height, a
+/// removal can be EARLY — the ban may have fallen after the block being
+/// replayed. That is handled explicitly, not hoped away: pass 3's
+/// recover_premature_pose_exclusion() recognises "this block pays a
+/// masternode we excluded, and it outranked our projection", attributes the
+/// payment so the DIP-3 queue cursor stays dashd-identical, and KEEPS the
+/// exclusion.
+///
+/// Every count is surfaced on status(), on the publish line, and on every
+/// fail-closed message (divergence_report()): a count that lives only in
+/// scrollback is half-silent, and this file exists to prevent silent
+/// degradation.
+///
+/// ONE RESIDUAL, stated honestly:
+///
+///   A post-anchor ban INSIDE a shared-payoutAddress group can escape the
+///   coinbase cross-check, because it is SCRIPT-granular: if the banned MN
+///   and the MN dashd actually paid share one payout address, the coinbase
+///   output still matches our projected script, the mismatch never fires, and
+///   the payment is attributed to the wrong member of the group. That is a
+///   PRE-EXISTING blind spot in the projection cross-check (the same
+///   granularity the gap_detected note in mn_state_machine.hpp calls out).
+///   The removal pass narrows it — a banned member is now dropped from the
+///   group before it can be projected — but does not close it.
+///
+/// TODO (separate change, deliberately NOT half-done here): ANCHOR SELECTION
+/// ON REPEAT DESYNC. When a bridge fails closed and the operator re-arms,
+/// picking the NEWEST anchor is wrong: an anchor cut AFTER a divergence began
+/// replays cleanly over a shorter window and re-arms a queue that is already
+/// wrong, which mints a rejected coinbase. The correct policy is oldest-first
+/// on a repeat desync, with capped re-arms + backoff and the compiled-in
+/// checkpoint as the floor. It is not implementable in this file today: this
+/// build carries exactly ONE anchor per network
+/// (src/impl/dash/coin/checkpoints/dash_mn_checkpoint_{mainnet,testnet}.inc,
+/// referenced once from main_dash.cpp), there is no anchor LIST to order and
+/// no persisted desync history to count re-arms against across restarts.
+/// Prerequisites: (1) a multi-anchor checkpoint store keyed by height,
+/// (2) a persisted per-anchor desync counter, (3) an arm()/re-arm API that
+/// takes a candidate list rather than a single MnCheckpoint.
 ///
 /// FENCED: src/impl/dash only. Constructed exclusively by the opt-in embedded
 /// path in main_dash.cpp; the dashd-RPC fallback never touches this file.
@@ -139,6 +175,7 @@
 #include <impl/dash/coin/block.hpp>
 #include <impl/dash/coin/mn_checkpoint.hpp>
 #include <impl/dash/coin/mn_state_machine.hpp>
+#include <impl/dash/coin/vendor/simplifiedmns.hpp>
 
 #include <core/log.hpp>
 #include <core/uint256.hpp>
@@ -174,6 +211,17 @@ public:
     /// MnStateMachine::SmlValidityFn and the residuals note in this file's
     /// header. Wired by main_dash to NodeCoinState::sml() + have_sml().
     using SmlValidityFn = MnStateMachine::SmlValidityFn;
+    /// The WHOLE persisted Simplified Masternode List, or nullptr when this
+    /// node has none yet. This is the seam that carries PoSe REMOVALS: the
+    /// per-hash SmlValidityFn above can only answer questions about a
+    /// masternode we already suspect, whereas the removal pass has to sweep
+    /// the list. Wired by main_dash to NodeCoinState::sml() + have_sml().
+    ///
+    /// Returns a pointer, not a copy: the list is ~3000 entries and the lane
+    /// consults it once per replayed height, on the same io thread that
+    /// updates it (mnlistdiff ingest). No lock is taken or needed; the
+    /// pointer is used and discarded inside one call.
+    using SmlSnapshotFn = std::function<const vendor::CSimplifiedMNList*()>;
 
     enum class State {
         Unarmed,      ///< no checkpoint loaded — the lane does nothing
@@ -210,6 +258,10 @@ public:
         m_has_sml_fn = static_cast<bool>(fn);
         m_machine.set_sml_validity_fn(std::move(fn));
     }
+    /// OPTIONAL, but this is the seam that fixes the measured 2068->2059 vs
+    /// 2067->2070 divergence. Unwired, the replay can still only ADD.
+    void set_sml_snapshot_fn(SmlSnapshotFn fn) { m_sml_snapshot = std::move(fn); }
+    bool has_sml_snapshot_fn() const { return static_cast<bool>(m_sml_snapshot); }
 
     /// Maximum number of blocks the bridge is willing to replay. A checkpoint
     /// further behind the tip than this is treated as STALE and refused: the
@@ -239,6 +291,7 @@ public:
         m_anchor_source = cp.source;
         m_anchor_count  = cp.entries.size();
         m_machine.load(cp.entries, cp.height);
+        m_anchor_eligible = m_machine.eligible_size();
         m_next  = cp.height + 1;
         m_state = State::Waiting;
         m_status = "armed at h=" + std::to_string(cp.height) + " ("
@@ -259,6 +312,19 @@ public:
     /// it IS a degradation of how much of the published set the replay
     /// verified, so it is surfaced here, in status(), and in the publish log.
     size_t   sml_recovered() const { return m_sml_recovered; }
+    /// ── The self-describing divergence counters ───────────────────────────
+    /// A bridge that fails closed used to say "the anchor is wrong, the replay
+    /// is incomplete, or a post-anchor PoSe ban could not be attested" — three
+    /// hypotheses and no measurement. These are the measurement: an operator
+    /// can tell the three apart from the log alone, and can compare
+    /// eligible_size() directly against `protx list valid <h>` on any dashd.
+    size_t   eligible_size()      const { return m_machine.eligible_size(); }
+    size_t   anchor_eligible()    const { return m_anchor_eligible; }
+    size_t   pose_removed()       const { return m_machine.pose_removed_total(); }
+    size_t   pose_reinstated()    const { return m_machine.pose_reinstated_total(); }
+    size_t   pose_premature()     const { return m_machine.pose_premature_total(); }
+    size_t   replay_registered()  const { return m_registered; }
+    size_t   replay_spent()       const { return m_spent; }
     bool     failed_closed() const { return m_state == State::FailedClosed; }
     bool     published()     const { return m_state == State::Published; }
 
@@ -375,6 +441,27 @@ public:
         if (m_state != State::Bridging) return;
         if (height != m_next) return;
 
+        // ── PoSe REMOVAL pass, BEFORE the block is folded ─────────────────
+        // A PoSe ban is consensus-derived, never a transaction, so the block
+        // replay below can only ever ADD masternodes. Measured on mainnet
+        // 2026-08-02 over 2513000..2514874: the chain's payee-eligible set
+        // FELL 2068 -> 2059 while this replay CLIMBED 2067 -> 2070. The SML is
+        // the only carrier of the removals and we already persist it.
+        //
+        // ORDERING — pre-block, and the reasons are in
+        // MnStateMachine::reconcile_pose_from_sml() in full. In short:
+        // dashcore projects height H's payee from the list as of H-1, and
+        // validity is part of that list, so the removal must land before
+        // pass 0 ranks candidates. Pre-block is also the only ordering that
+        // keeps a removal and a registration in the SAME block correct: an MN
+        // registered by block H is not yet in the set here, so H's
+        // reconciliation cannot touch it — which is right, because it was not
+        // in dashd's H-1 list and cannot be H's payee. And pass 1's tx-driven
+        // ban (ProUpRevTx) still lands afterwards at its exact consensus
+        // height, overwriting our provisional one.
+        reconcile_pose(height);
+        if (m_state != State::Bridging) return;   // reconcile can fail closed
+
         const auto r = m_machine.apply_block(block, height);
 
         // The anchor's own falsification test. apply_block already logs the
@@ -385,18 +472,7 @@ public:
             return fail_closed(
                 std::string("bridge replay ")
                 + (r.gap_detected ? "GAP" : "PAYEE DESYNC") + " at h="
-                + std::to_string(height)
-                + " — the pinned masternode-set anchor does not reproduce this"
-                  " block's actual coinbase payee. The anchor is wrong, the"
-                  " replay is incomplete, or a post-anchor PoSe ban could not"
-                  " be attested"
-                + (m_has_sml_fn
-                       ? std::string(" by the SML (absent entry, or attested"
-                                     " VALID because the masternode was banned"
-                                     " AND revived inside the replay window)")
-                       : std::string(" — no SML validity seam is wired"))
-                + ". Refusing to publish a masternode set that would mint a"
-                  " rejected coinbase");
+                + std::to_string(height) + ". " + divergence_report(r));
         }
         if (r.total_after == 0) {
             return fail_closed(
@@ -407,12 +483,20 @@ public:
         m_next = height + 1;
         ++m_applied;
         m_sml_recovered += r.sml_recovered;
+        m_registered    += r.registered;
+        m_spent         += r.spent;
         m_stalled_pumps = 0;
 
         if ((m_applied % 500) == 0) {
             LOG_INFO << "[MN-CKPT] bridge progress: applied " << m_applied
-                     << " blocks, cursor h=" << height << " set="
-                     << r.total_after << " sml-recovered=" << m_sml_recovered;
+                     << " blocks, cursor h=" << height << " registered="
+                     << r.total_after << " eligible=" << m_machine.eligible_size()
+                     << " (anchor " << m_anchor_eligible << "; +"
+                     << m_registered << " reg, -" << m_spent << " spent, -"
+                     << m_machine.pose_removed_total() << " PoSe-removed, +"
+                     << m_machine.pose_reinstated_total() << " reinstated)"
+                     << " sml-recovered=" << m_sml_recovered
+                     << " early-exclusions=" << m_machine.pose_premature_total();
         }
 
         if (!m_tip_height) return;
@@ -422,6 +506,93 @@ public:
     }
 
 private:
+    /// Apply the SML's PoSe verdicts to the working set for `height`. Called
+    /// exactly once per replayed height, immediately before apply_block.
+    void reconcile_pose(uint32_t height)
+    {
+        if (!m_sml_snapshot) return;          // seam unwired: additions only
+        const vendor::CSimplifiedMNList* sml = m_sml_snapshot();
+        if (!sml || sml->size() == 0) {
+            // Not an error: on a cold start the mnlistdiff feed may not have
+            // produced a verified list yet. Say so at a bounded rate — a
+            // replay running with no removal source is exactly the silent
+            // degradation this lane exists to prevent, and it is the state
+            // that produced the measured 2067 -> 2070 climb.
+            if (!m_warned_no_sml) {
+                m_warned_no_sml = true;
+                LOG_WARNING << "[MN-CKPT] no verified SML available at h="
+                            << height << " — the replay can only ADD"
+                               " masternodes until one arrives. A PoSe ban"
+                               " inside the window will read as a payee"
+                               " desync.";
+            }
+            return;
+        }
+        const auto pr = m_machine.reconcile_pose_from_sml(*sml, height);
+        if (pr.removed == 0 && pr.reinstated == 0) return;
+        LOG_INFO << "[MN-CKPT] PoSe reconcile h=" << height << ": eligible "
+                 << pr.eligible_before << " -> " << pr.eligible_after
+                 << " (-" << pr.removed << " removed, +" << pr.reinstated
+                 << " reinstated; SML " << pr.scanned << " entries, "
+                 << pr.matched << " ours)";
+    }
+
+    /// The measurement that replaces three hypotheses. Every fail-closed on
+    /// the replay path carries it, so an operator can separate "the anchor is
+    /// wrong" from "the replay is incomplete" from "a PoSe ban could not be
+    /// attested" WITHOUT attaching a debugger.
+    std::string divergence_report(const MnStateMachine::ApplyResult& r) const
+    {
+        const size_t elig = m_machine.eligible_size();
+        std::string s =
+            "SET DELTA: payee-eligible " + std::to_string(m_anchor_eligible)
+            + " at the anchor -> " + std::to_string(elig) + " now"
+            + " (registered total " + std::to_string(m_machine.size()) + ")."
+            + " ADDS: " + std::to_string(m_registered) + " registrations."
+            + " REMOVALS: " + std::to_string(m_machine.pose_removed_total())
+            + " PoSe (SML-attested), " + std::to_string(m_spent)
+            + " collateral spends, "
+            + std::to_string(m_sml_recovered) + " demotion-walk exclusions."
+            + " REINSTATED: " + std::to_string(m_machine.pose_reinstated_total())
+            + ". EARLY-EXCLUSION REPAIRS: "
+            + std::to_string(m_machine.pose_premature_total()) + ".";
+
+        if (!m_sml_snapshot) {
+            s += " NO SML SNAPSHOT SEAM IS WIRED — this replay could only ADD"
+                 " masternodes, so ANY post-anchor PoSe ban lands here.";
+        } else if (m_machine.pose_removed_total() == 0) {
+            s += " The SML removal pass applied ZERO removals: either no"
+                 " masternode was banned in the window, or no verified SML"
+                 " was available to say so.";
+        }
+
+        if (r.projected_payee) {
+            s += " PROJECTED PAYEE: " + r.projected_payee->GetHex() + ";";
+            if (!m_has_sml_fn) {
+                s += " no SML validity seam is wired, so nothing can attest it.";
+            } else {
+                const auto op = m_machine.sml_opinion(*r.projected_payee);
+                s += !op ? std::string(" the SML has NO ENTRY for it (absent is"
+                                       " never treated as evidence of a ban).")
+                     : (*op ? std::string(" the SML attests it VALID — so this"
+                                          " is NOT an unobserved PoSe ban;"
+                                          " suspect the anchor or a missed"
+                                          " block (or a ban+revive entirely"
+                                          " inside the window).")
+                            : std::string(" the SML attests it INVALID, yet no"
+                                          " candidate below it matched this"
+                                          " coinbase exactly — the queue has"
+                                          " diverged by more than one ban."));
+            }
+        } else {
+            s += " No payee was projected (the pre-block eligible set was"
+                 " empty).";
+        }
+        s += " Refusing to publish a masternode set that would mint a rejected"
+             " coinbase.";
+        return s;
+    }
+
     void request_window(uint32_t tip)
     {
         if (!m_request) {
@@ -469,20 +640,34 @@ private:
                                " publish");
         }
         m_state  = State::Published;
-        // The recovery count rides on BOTH the status string and the log
-        // line. A degradation that is only visible in scrollback is
-        // half-silent, and this lane exists to make degradation loud.
+        // The full delta rides on BOTH the status string and the log line. A
+        // degradation that is only visible in scrollback is half-silent, and
+        // this lane exists to make degradation loud. `eligible` is directly
+        // comparable to dashd's `protx list valid <as_of>` — which is how the
+        // 2068->2059 vs 2067->2070 divergence was measured in the first place.
+        const std::string delta =
+            "eligible " + std::to_string(m_anchor_eligible) + " -> "
+            + std::to_string(m_machine.eligible_size()) + " (+"
+            + std::to_string(m_registered) + " reg, -" + std::to_string(m_spent)
+            + " spent, -" + std::to_string(m_machine.pose_removed_total())
+            + " PoSe-removed, +"
+            + std::to_string(m_machine.pose_reinstated_total())
+            + " reinstated, -" + std::to_string(m_sml_recovered)
+            + " SML-recovered exclusions, "
+            + std::to_string(m_machine.pose_premature_total())
+            + " early-exclusion repairs)";
         m_status = "published " + std::to_string(out.size())
                    + " masternodes (" + std::to_string(m_sml_recovered)
                    + " SML-recovered exclusions) as-of h=" + std::to_string(as_of)
                    + " (anchor h=" + std::to_string(m_anchor_height)
-                   + " + " + std::to_string(m_applied) + " replayed blocks)";
+                   + " + " + std::to_string(m_applied) + " replayed blocks) "
+                   + delta;
         LOG_INFO << "[MN-CKPT] bridge COMPLETE: published " << out.size()
                  << " masternodes (" << m_sml_recovered
                  << " SML-recovered exclusions) as-of h=" << as_of
                  << " (anchor h=" << m_anchor_height << ", replayed "
                  << m_applied << " blocks, tip h=" << bridged_to
-                 << ") -> publishing to the maintainer";
+                 << ") " << delta << " -> publishing to the maintainer";
         m_publish(std::move(out), as_of);
     }
 
@@ -505,6 +690,7 @@ private:
     PublishFn      m_publish;
     TipHeightFn    m_tip_height;
     HeaderHashAtFn m_header_hash_at;
+    SmlSnapshotFn  m_sml_snapshot;
 
     State       m_state{State::Unarmed};
     std::string m_status{"unarmed"};
@@ -517,6 +703,10 @@ private:
     uint32_t m_next{0};             // the ONLY height apply_block may fold next
     uint32_t m_applied{0};
     size_t   m_sml_recovered{0};    // masternodes excluded on SML-attested bans
+    size_t   m_anchor_eligible{0};  // payee-eligible count AT the anchor
+    size_t   m_registered{0};       // ADDS observed across the replay
+    size_t   m_spent{0};            // collateral-spend removals across the replay
+    bool     m_warned_no_sml{false};
     bool     m_has_sml_fn{false};   // an SML validity seam was wired
     uint32_t m_max_bridge{kDefaultMaxBridgeBlocks};
     uint32_t m_stalled_pumps{0};

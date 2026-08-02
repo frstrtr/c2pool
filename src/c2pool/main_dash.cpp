@@ -3570,6 +3570,27 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     }
                     return std::nullopt;
                 });
+            // SML REMOVAL pass — the whole list, not one hash at a time. The
+            // per-hash seam above can only answer a question about a
+            // masternode the projection already surfaced; a PoSe REMOVAL has
+            // to be applied before that masternode is ever projected, which
+            // means sweeping the list once per replayed height. Measured on
+            // mainnet 2026-08-02 over 2513000..2514874: the chain's
+            // payee-eligible set fell 2068 -> 2059 while a replay with no
+            // removal pass CLIMBED 2067 -> 2070, because a block replay can
+            // only ever ADD (PoSe bans are consensus-derived, never txs).
+            //
+            // Same thread as everything else the lane touches: the SML is
+            // updated on the mnlistdiff ingest leg and read here from the
+            // block-connect / tip-changed callbacks, all on the single
+            // io_context thread main_dash runs. No lock is taken or needed,
+            // and the returned pointer never escapes the call.
+            mn_ckpt_lane->set_sml_snapshot_fn(
+                [&node_coin_state]()
+                    -> const dash::coin::vendor::CSimplifiedMNList* {
+                    if (!node_coin_state.have_sml()) return nullptr;
+                    return &node_coin_state.sml();
+                });
             // Publish through the EXACT leg-4 event the E2c RPC seed uses, so
             // CoinStateMaintainer::on_mn_list_update takes the bridged set as
             // an ordinary authoritative resync — snapshot fence set to the
@@ -3608,6 +3629,18 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     (const dash::interfaces::BlockConnected& bc) {
                         mnl->on_block_connected(bc.block, bc.height);
                     }));
+
+            // KNOWN GAP, deliberately left: this branch arms the lane and
+            // sets NO maintainer->set_on_mn_reseed() callback (the RPC branch
+            // above does). If the maintainer later wipes a desynced payee
+            // queue it has nothing to ask for a fresh authoritative set, so
+            // the embedded arm stays demoted until restart. Filling that seam
+            // is real work and depends on what fills it — a re-armed bridge
+            // from a NEWER anchor is the obvious candidate and is exactly the
+            // wrong-axis trap the anchor-selection TODO in
+            // mn_checkpoint_lane.hpp describes (an anchor cut after the
+            // divergence began replays cleanly and re-arms a wrong queue).
+            // Not wired here rather than wired wrongly.
 
             // Kick the lane once now in case the header chain is already past
             // the anchor from a previous run's persisted header DB.
