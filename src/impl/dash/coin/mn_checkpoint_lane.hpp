@@ -301,6 +301,19 @@ public:
         m_anchor_source = cp.source;
         m_anchor_count  = cp.entries.size();
         m_machine.load(cp.entries, cp.height);
+        // F6: reset the one-shot fold latch and its counters. The latch is the
+        // dangerous one — a second bridge on a re-armed lane would run
+        // additions-only while sml_folded() still reported true, i.e. it would
+        // LIE about having applied removals.
+        m_sml_folded      = false;
+        m_sml_folded_at   = 0;
+        m_pose_removed    = 0;
+        m_pose_reinstated = 0;
+        m_sml_recovered   = 0;
+        m_registered      = 0;
+        m_spent           = 0;
+        m_applied         = 0;
+        m_warned_no_sml   = false;
         m_anchor_eligible = m_machine.eligible_size();
         m_next  = cp.height + 1;
         m_state = State::Waiting;
@@ -497,6 +510,11 @@ public:
         // ── WHOLESALE PoSe fold, at the ONE cursor position where it is safe.
         // Sequenced by HEIGHT, never by arrival order: see maybe_fold_sml().
         maybe_fold_sml();
+        // The fold can fail closed (oversized list). Return immediately: the
+        // tail of this function calls request_window(), which unconditionally
+        // rewrites m_status and would erase the refusal reason the operator
+        // needs.
+        if (m_state != State::Bridging) return;
         m_sml_recovered += r.sml_recovered;
         m_registered    += r.registered;
         m_spent         += r.spent;
@@ -511,7 +529,7 @@ public:
                      << m_pose_removed << " PoSe-removed, +"
                      << m_pose_reinstated << " reinstated)"
                      << " sml-recovered=" << m_sml_recovered
-                     << " early-exclusions=" << 0;
+                     << " sml-folded=" << (m_sml_folded ? "yes" : "no");
         }
 
         if (!m_tip_height) return;
@@ -607,6 +625,35 @@ private:
         if (cursor != snap.height) return;   // never early; late is benign
 
         const size_t before = m_machine.eligible_size();
+
+        // F5 SANITY BOUND. The per-mismatch walk is capped AND cross-checked
+        // against the real coinbase at every step precisely so that "recovery"
+        // can never become a wholesale override of the projection. This fold IS
+        // a wholesale override — it rewrites validity for the entire set from
+        // one message, and on_mnlistdiff does not currently re-derive
+        // sml.CalcMerkleRoot() against diff.cbTx.merkleRootMNList, so the list
+        // is trusted rather than verified. A PoSe ban is a rare per-masternode
+        // event: a diff that would retire a large fraction of the set at once
+        // is not a ban wave, it is a corrupt or hostile list. Refuse it and say
+        // so, rather than publish a set with a hole in it.
+        const size_t would_remove = count_fold_removals(*snap.list);
+        const size_t bound = std::max<size_t>(kMinFoldRemovals,
+                                             before / kMaxFoldRemovalDivisor);
+        if (before != 0 && would_remove > bound) {
+            return fail_closed(
+                "SML PoSe FOLD REFUSED at cursor h=" + std::to_string(cursor)
+                + ": the list would retire " + std::to_string(would_remove)
+                + " of " + std::to_string(before)
+                + " payee-eligible masternodes in one pass, over the 1/"
+                + std::to_string(kMaxFoldRemovalDivisor) + " sanity bound of "
+                + std::to_string(bound) + ". A PoSe ban is a rare per-node"
+                  " event; a fold this large is a corrupt or hostile SML, not a"
+                  " ban wave. NOTE: the SML is NOT root-verified against"
+                  " cbTx.merkleRootMNList on the diff ingest path, so this"
+                  " bound is the only thing standing between a bad list and a"
+                  " wholesale rewrite of the payee set.");
+        }
+
         const auto vr = m_machine.sync_validity_from_sml(*snap.list, snap.height);
         const size_t after = m_machine.eligible_size();
         m_sml_folded    = true;
@@ -620,6 +667,28 @@ private:
                  << vr.scanned << " SML entries, " << vr.matched << " ours)."
                  << " A ban BURST leaves in one pass here, which the"
                     " per-mismatch walk cannot do.";
+    }
+
+    /// How much of the payee-eligible set a single fold may retire: at most
+    /// 1/N of it. Deliberately blunt — the point is to bound the blast radius
+    /// of an unverified list, not to model ban rates.
+    static constexpr size_t kMaxFoldRemovalDivisor = 8;
+    /// Absolute floor, so the bound is never zero on a small set (which would
+    /// refuse every legitimate fold) and a handful of genuine bans always fits.
+    static constexpr size_t kMinFoldRemovals = 4;
+
+    /// Dry-run the fold's removal count without mutating anything, so the
+    /// sanity bound can refuse BEFORE any state changes.
+    size_t count_fold_removals(const vendor::CSimplifiedMNList& sml) const
+    {
+        size_t n = 0;
+        for (const auto& e : sml.mnList) {
+            if (e.isValid) continue;
+            auto it = m_machine.entries().find(e.proRegTxHash);
+            if (it == m_machine.entries().end()) continue;
+            if (it->second.isValid) ++n;
+        }
+        return n;
     }
 
     /// The measurement that replaces three hypotheses. Every fail-closed on
@@ -693,6 +762,9 @@ private:
 
     void request_window(uint32_t tip)
     {
+        // Never rewrite the status of a lane that has already finished or
+        // refused — that status is the only record of WHY.
+        if (m_state != State::Bridging) return;
         if (!m_request) {
             return fail_closed("no block-request seam wired — the bridge cannot"
                                " fetch the blocks it must replay");

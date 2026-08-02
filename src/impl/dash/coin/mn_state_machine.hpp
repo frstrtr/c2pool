@@ -218,7 +218,17 @@ public:
     /// published queue that diverges from dashd's for the rest of the run.
     /// An SML older than the height being adjudicated cannot speak to that
     /// height, so it is not evidence — nullopt, never false.
-    void set_sml_current_height(uint32_t h) { m_sml_height = h; }
+    /// Setting this ONCE opts the machine into fail-closed freshness: from
+    /// then on a height of 0 means "the SML covers NOTHING", not "covers
+    /// everything". The distinction matters because 0 is exactly what a warm
+    /// restart (F1) and an unpaired list/height (F2) produce, and in both
+    /// cases the honest answer is that we cannot date the attestation.
+    /// Callers that never call this keep the pre-gate behaviour byte for byte.
+    void set_sml_current_height(uint32_t h)
+    {
+        m_sml_height       = h;
+        m_sml_height_known = true;
+    }
     uint32_t sml_current_height() const     { return m_sml_height; }
 
     void set_sml_recovery_cap(size_t n) { m_sml_recovery_cap = n; }
@@ -683,7 +693,13 @@ public:
     /// operator actions.
     bool sml_covers(uint32_t height) const
     {
-        return m_sml_height == 0 || m_sml_height >= height;
+        // Caller never declared a height: pre-gate behaviour, unchanged.
+        if (!m_sml_height_known) return true;
+        // Declared, but zero — warm restart with no height restored, or a
+        // list/height pair that desynchronised. FAIL CLOSED: an undated
+        // attestation cannot license a permanent exclusion.
+        if (m_sml_height == 0) return false;
+        return m_sml_height >= height;
     }
 
     // Process a single block. Mutates state per dashcore's
@@ -1071,12 +1087,15 @@ private:
     {
         if (!m_sml_validity) return std::nullopt;
         if (!sml_covers(height)) {
-            LOG_WARNING << "[MNS-SM] SML STALE at h=" << height
-                        << ": the applied SML is current only at h="
-                        << m_sml_height
-                        << " and cannot attest this height — treating it as NO"
-                           " OPINION (a stale ban attestation would license a"
-                           " permanent demotion of a since-revived masternode)";
+            LOG_WARNING << "[MNS-SM] SML CANNOT DATE h=" << height
+                        << ": applied SML height="
+                        << (m_sml_height == 0 ? std::string("UNKNOWN (warm"
+                               " restart with no restored height, or a"
+                               " list/height pair that desynchronised)")
+                                              : std::to_string(m_sml_height))
+                        << " — treating it as NO OPINION (an undated or stale"
+                           " ban attestation would license a PERMANENT"
+                           " demotion of a since-revived masternode)";
             return std::nullopt;
         }
         return m_sml_validity(h);
@@ -1084,6 +1103,7 @@ private:
 
     SmlValidityFn m_sml_validity;
     uint32_t      m_sml_height{0};
+    bool          m_sml_height_known{false};
     size_t        m_sml_recovery_cap{0};
     size_t        m_sml_recovered_total{0};
 

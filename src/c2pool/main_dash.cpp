@@ -2636,6 +2636,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 node_coin_state.sml() = std::move(loaded_sml);
                 node_coin_state.set_have_sml(node_coin_state.sml().size() != 0);
                 node_coin_state.set_sml_current_hash(sml_db->get_best_hash());
+                // F1: restore the HEIGHT the warm SML is current at, not just
+                // the list. Without this m_sml_current_height stayed 0 while
+                // have_sml() was true, and every freshness check keyed on it
+                // passed vacuously — a masternode banned before the persisted
+                // tip and revived after it could be permanently demoted at a
+                // height the chain held it valid. Mirrors restore_credit_pool()
+                // immediately below, which exists for the same reason.
+                maintainer->restore_sml_height(sml_db->get_best_height());
                 *sml_base = sml_db->get_best_hash();  // handshake -> incremental
                 LOG_INFO << "[SML-DB] WARM restart: SML(" << node_coin_state.sml().size()
                          << ") + quorums(" << node_coin_state.qmgr().active_count()
@@ -3601,7 +3609,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     dash::coin::MnCheckpointLane::SmlSnapshot snap;
                     if (!node_coin_state.have_sml()) return snap;
                     snap.list   = &node_coin_state.sml();
-                    snap.height = m ? m->sml_current_height() : 0;
+                    // F2: report the height ONLY while it is paired with the
+                    // list actually held. A diff can advance the list without
+                    // advancing the height (unparseable cbTx is not a
+                    // rejection), and folding a list that describes H2 at
+                    // cursor H1 is the EARLY case. Unpaired -> no height, which
+                    // both suppresses the fold and downgrades every walk
+                    // attestation to "no opinion".
+                    snap.height = (m && m->sml_height_paired())
+                                      ? m->sml_current_height() : 0;
                     return snap;
                 });
 
