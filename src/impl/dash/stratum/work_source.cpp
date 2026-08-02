@@ -341,23 +341,49 @@ void DASHWorkSource::resource_template_now() const
         try {
             // Mainnet-gated: bypass select_work and source the reward-safe dashd
             // fallback directly; testnet/regtest picks embedded-when-viable.
-            coin::WorkSelection sel = try_embedded
-                ? coin_state_.select_work(dashd_fallback_)
-                : coin::WorkSelection{
-                      dashd_fallback_ ? dashd_fallback_() : coin::DashWorkData{},
-                      coin::WorkSource::DashdFallback };
+            coin::WorkSelection sel;
+            if (try_embedded) {
+                sel = coin_state_.select_work(dashd_fallback_);
+            } else {
+                // The mainnet gate refused BEFORE viability was ever consulted;
+                // name that, or the operator reads "dashd-fallback" and starts
+                // hunting a coin-state fault that does not exist.
+                coin::DeclineReport gated;
+                if (!embedded_arm_enabled) {
+                    // The mainnet opt-in is off, so viability was never even
+                    // consulted. Name the GATE, not the coin state -- an
+                    // operator here must flip a flag, not chase a sync fault.
+                    gated.viable    = false;
+                    gated.cause     = "mainnet-gate-off";
+                    gated.value     = "embedded_mainnet=false";
+                    gated.threshold = "--embedded-mainnet";
+                } else {
+                    // Armed but unpopulated. Ask THE clause list rather than
+                    // restating a poorer version of it here; that duplication
+                    // is precisely the drift this design exists to prevent.
+                    gated = coin_state_.describe_decline();
+                }
+                sel = coin::WorkSelection{
+                    dashd_fallback_ ? dashd_fallback_() : coin::DashWorkData{},
+                    coin::WorkSource::DashdFallback, std::move(gated) };
+            }
             // BLOCKER-3 pre-emit HARD GATE (PR #780): re-validate an EMBEDDED
             // template's CbTx against consensus invariants (both roots recomputed,
             // DKG/superblock/bestCL/credit-pool-height guards) before it can be
             // served; on any failure DISCARD it for the reward-safe dashd arm.
+            coin::DeclineReport emit_why;
             if (sel.source == coin::WorkSource::Embedded
-                && !coin_state_.embedded_template_emit_ok(sel.work)) {
-                LOG_WARNING << "[DASH-STRATUM-GBT] embedded CbTx pre-emit check "
-                               "FAILED at h=" << sel.work.m_height
-                            << " — discarding, using dashd fallback";
+                && !coin_state_.embedded_template_emit_ok(sel.work, &emit_why)) {
+                const uint32_t declined_h = sel.work.m_height;
                 sel = coin::WorkSelection{
                     dashd_fallback_ ? dashd_fallback_() : coin::DashWorkData{},
-                    coin::WorkSource::DashdFallback };
+                    coin::WorkSource::DashdFallback, emit_why };
+                // On a daemonless node the fallback arm is UNARMED and returns
+                // an empty template (m_height == 0). Keep the height the
+                // embedded arm was refusing AT -- "h=0" told the operator
+                // nothing, and it is the single most misleading field in the
+                // measured 08-03 fallback lines.
+                if (sel.work.m_height == 0) sel.work.m_height = declined_h;
             }
             // GBT-xcheck reward-safety BACKSTOP (soak): when enabled and a dashd
             // is reachable, cross-check the embedded CbTx creditPoolBalance
@@ -377,8 +403,14 @@ void DASHWorkSource::resource_template_now() const
                                 << emb_cb.creditPoolBalance << " dashd="
                                 << dref_cb.creditPoolBalance
                                 << " — serving dashd template (reward-safety backstop)";
+                    coin::DeclineReport xcheck;
+                    xcheck.viable    = false;
+                    xcheck.cause     = "gbt-xcheck-creditpool-mismatch";
+                    xcheck.value     = std::to_string(emb_cb.creditPoolBalance);
+                    xcheck.threshold = std::to_string(dref_cb.creditPoolBalance);
                     sel = coin::WorkSelection{ std::move(dref),
-                                               coin::WorkSource::DashdFallback };
+                                               coin::WorkSource::DashdFallback,
+                                               std::move(xcheck) };
                 }
             }
             // E2c observability: WHICH arm served this template + the MN payee
@@ -395,6 +427,13 @@ void DASHWorkSource::resource_template_now() const
                      << " h=" << sel.work.m_height
                      << " mn_payee=" << mn_payee;
             work_is_embedded = (sel.source == coin::WorkSource::Embedded);
+            // ── DEFECT-3: the gate must SAY WHY it refused ──────────────────
+            // sel.decline came out of the branch that chose the arm (dashd's
+            // ValidationState idiom), so this line cannot drift from the
+            // decision the way a reason recomputed here would. Rate policy:
+            // the EMBEDDED->fallback transition and any change of cause emit
+            // immediately; an unchanged cause emits on a slow heartbeat.
+            note_arm_decision(work_is_embedded, sel.decline, sel.work.m_height);
             work = std::move(sel.work);
         } catch (const std::exception& e) {
             LOG_WARNING << "[DASH-STRATUM] template sourcing threw: " << e.what();
@@ -422,6 +461,81 @@ void DASHWorkSource::resource_template_now() const
     template_cache_at_  = now;
     template_cache_is_embedded_ = work_is_embedded;
     template_last_fail_at_ = {};
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DEFECT-3 (daemonless soak 2026-08-03): the serve gate refused SILENTLY.
+//
+// Measured: the embedded arm served three templates whose MN payee was
+// byte-identical to a real dashd getblocktemplate, then flipped to
+// "arm=dashd-fallback h=0 mn_payee=(none)" and stayed there, with the tip
+// advancing normally and NO reason line of any kind. classify_decline() already
+// knew the answer but was reachable only from EmbeddedOracleShadow, which needs
+// --embedded-oracle-shadow AND a bound dashd oracle -- so on a daemonless node,
+// the only node where the question is asked, it could never run.
+//
+// This is the one place the answer is emitted, and it emits the report the
+// selecting branch RETURNED, so it cannot drift from the decision.
+// ─────────────────────────────────────────────────────────────────────────────
+void DASHWorkSource::note_arm_decision(bool served_embedded,
+                                       const coin::DeclineReport& why,
+                                       uint32_t height) const
+{
+    const auto now_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+    coin::ServeGateJournal::Decision d;
+    {
+        std::lock_guard<std::mutex> lk(serve_gate_mutex_);
+        d = serve_gate_journal_.observe(served_embedded, why.cause, now_sec);
+        last_decline_      = served_embedded ? coin::DeclineReport{} : why;
+        last_arm_embedded_ = served_embedded;
+        arm_ever_observed_ = true;
+    }
+    if (!d.emit()) return;
+
+    if (d.trigger == coin::ServeGateJournal::Trigger::Resumed) {
+        LOG_WARNING << "[EMBED-GATE] h=" << height
+                    << " arm=EMBEDDED RESUMED (was declining: "
+                    << (d.previous_cause.empty() ? "unknown" : d.previous_cause)
+                    << "; " << d.suppressed << " decline(s) suppressed)";
+        return;
+    }
+    // ONE named cause with its measured value and threshold -- never a list of
+    // maybes, and never "declined" alone.
+    LOG_WARNING << "[EMBED-GATE] h=" << height
+                << " arm=dashd-fallback DECLINED " << why.one_line()
+                << " trigger=" << coin::ServeGateJournal::trigger_name(d.trigger)
+                << " suppressed=" << d.suppressed;
+}
+
+// Operator surface (per-coin /api/node_topology no_work_reason). Publishes the
+// SAME DeclineReport the journal logged, so the page and the log cannot
+// disagree; "unknown" before the first template is sourced, never a fabricated
+// "ok".
+nlohmann::json DASHWorkSource::embedded_arm_status_json() const
+{
+    std::lock_guard<std::mutex> lk(serve_gate_mutex_);
+    nlohmann::json j;
+    if (!arm_ever_observed_) {
+        j["arm"]               = "unknown";
+        j["no_work_reason"]    = "no-template-sourced-yet";
+        j["no_work_value"]     = "n/a";
+        j["no_work_threshold"] = "n/a";
+        return j;
+    }
+    if (last_arm_embedded_) {
+        j["arm"]               = "EMBEDDED";
+        j["no_work_reason"]    = "";
+        j["no_work_value"]     = "n/a";
+        j["no_work_threshold"] = "n/a";
+        return j;
+    }
+    j["arm"]               = "dashd-fallback";
+    j["no_work_reason"]    = last_decline_.cause;
+    j["no_work_value"]     = last_decline_.value;
+    j["no_work_threshold"] = last_decline_.threshold;
+    return j;
 }
 
 std::shared_ptr<const coin::DashWorkData> DASHWorkSource::cached_work() const

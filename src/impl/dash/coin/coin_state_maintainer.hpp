@@ -1125,6 +1125,11 @@ private:
     // holder in whatever (un)published state it is in -- callers reach demote()
     // explicitly for the invalidating transitions.
     void republish() {
+        // Publish the two publish-preconditions FIRST, whichever way this
+        // goes: a refusal that says only "not-populated" cannot tell an
+        // operator whether headers are still syncing or the MN set was never
+        // seeded, and those need opposite responses.
+        m_state.set_populate_inputs(m_have_tip, m_have_mn);
         if (m_have_tip && m_have_mn)
             m_state.set_tip(m_prev_height, m_prev_hash, m_bits_for_next,
                             m_mtp_at_tip, m_address_version, m_address_p2sh_version,
@@ -1132,6 +1137,7 @@ private:
     }
 
     void demote() {
+        m_state.set_populate_inputs(m_have_tip, m_have_mn);
         if (m_state.populated())
             m_state.invalidate();
     }

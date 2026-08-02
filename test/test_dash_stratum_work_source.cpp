@@ -2185,3 +2185,128 @@ TEST(DashRunArmResolution, NoMainnetCombinationWithoutOptInEverEnablesTheArm)
 }
 
 }  // namespace
+
+// ════════════════════════════════════════════════════════════════════════
+// DEFECT-3: the RATE POLICY for the named refusal (ServeGateJournal).
+//
+// The serve gate sits on a per-template path, so the reason cannot simply be
+// logged on every observation. The policy that makes a silent gate impossible
+// without flooding it:
+//
+//   * the EMBEDDED -> fallback TRANSITION always logs, EVEN IF the cause is
+//     unchanged from an earlier decline -- that edge is the event the operator
+//     cares about, and suppressing it is exactly how the 08-03 flip went
+//     unexplained;
+//   * a CHANGE of cause always logs;
+//   * an unchanged cause logs on a slow heartbeat;
+//   * everything else is suppressed and COUNTED.
+//
+// Negative twins throughout: each "must emit" is paired with the neighbouring
+// state that must NOT emit, so a journal that simply logs everything (or
+// nothing) fails.
+// ════════════════════════════════════════════════════════════════════════
+
+#include <impl/dash/coin/serve_gate_journal.hpp>
+
+using dash::coin::ServeGateJournal;
+using Trig = dash::coin::ServeGateJournal::Trigger;
+
+TEST(DashServeGateJournal, FirstObservationEverIsAlwaysEmitted) {
+    ServeGateJournal j(300);
+    auto d = j.observe(false, "dmn-stale", 1000);
+    EXPECT_TRUE(d.emit());
+    EXPECT_EQ(d.trigger, Trig::First)
+        << "a node that has NEVER served must name its reason immediately -- "
+           "otherwise a cold node that never arms is silent forever";
+}
+
+TEST(DashServeGateJournal, EmbeddedToFallbackTransitionAlwaysEmits) {
+    ServeGateJournal j(300);
+    j.observe(false, "dmn-stale", 1000);          // first decline, emitted
+    j.observe(true,  "",          1010);          // arm resumes
+    // SAME cause as before, and well inside the heartbeat window: the ONLY
+    // thing that makes this emit is that the arm just flipped.
+    auto d = j.observe(false, "dmn-stale", 1011);
+    EXPECT_TRUE(d.emit());
+    EXPECT_EQ(d.trigger, Trig::Transition)
+        << "the EMBEDDED->fallback edge must log even when the cause is "
+           "identical to a previous decline -- this is the measured 08-03 "
+           "event and the rate limiter must never eat it";
+}
+
+TEST(DashServeGateJournal, RepeatOfSameCauseInsideHeartbeatIsSuppressed) {  // twin
+    ServeGateJournal j(300);
+    j.observe(false, "dmn-stale", 1000);
+    auto d = j.observe(false, "dmn-stale", 1001);
+    EXPECT_FALSE(d.emit())
+        << "an unchanged cause on a per-template path must NOT flood";
+    EXPECT_EQ(j.suppressed_since_emit(), 1u);
+}
+
+TEST(DashServeGateJournal, ChangeOfCauseEmitsImmediately) {
+    ServeGateJournal j(300);
+    j.observe(false, "dmn-stale", 1000);
+    auto d = j.observe(false, "creditpool-stale", 1001);
+    EXPECT_TRUE(d.emit());
+    EXPECT_EQ(d.trigger, Trig::CauseChange)
+        << "a different first-unmet condition is a different fault";
+    EXPECT_EQ(d.previous_cause, "dmn-stale");
+}
+
+TEST(DashServeGateJournal, HeartbeatEmitsOnlyAfterTheIntervalElapses) {
+    ServeGateJournal j(300);
+    j.observe(false, "dmn-stale", 1000);
+    EXPECT_FALSE(j.observe(false, "dmn-stale", 1299).emit())
+        << "one second short of the interval must stay suppressed";
+    auto d = j.observe(false, "dmn-stale", 1300);
+    EXPECT_TRUE(d.emit());
+    EXPECT_EQ(d.trigger, Trig::Heartbeat)
+        << "a stuck arm must still name itself in any 5-minute window";
+}
+
+TEST(DashServeGateJournal, SuppressedCountRidesTheNextEmittedLine) {
+    ServeGateJournal j(300);
+    j.observe(false, "dmn-stale", 1000);
+    for (int i = 1; i <= 7; ++i) j.observe(false, "dmn-stale", 1000 + i);
+    auto d = j.observe(false, "creditpool-stale", 1010);
+    ASSERT_TRUE(d.emit());
+    EXPECT_EQ(d.suppressed, 7u)
+        << "the emitted line must say how many observations it stands for; a "
+           "bare reason hides whether this is a blip or a wedge";
+    EXPECT_EQ(j.suppressed_since_emit(), 0u) << "counter resets on emit";
+}
+
+TEST(DashServeGateJournal, ResumeEmitsAndNamesWhatItReplaced) {
+    ServeGateJournal j(300);
+    j.observe(false, "dmn-stale", 1000);
+    auto d = j.observe(true, "", 1005);
+    EXPECT_TRUE(d.emit());
+    EXPECT_EQ(d.trigger, Trig::Resumed);
+    EXPECT_EQ(d.previous_cause, "dmn-stale");
+    EXPECT_TRUE(j.serving());
+    EXPECT_TRUE(j.last_cause().empty());
+}
+
+TEST(DashServeGateJournal, SteadyServingNeverEmits) {          // negative twin
+    ServeGateJournal j(300);
+    j.observe(true, "", 1000);
+    for (int i = 1; i < 50; ++i)
+        EXPECT_FALSE(j.observe(true, "", 1000 + i * 10).emit())
+            << "a healthy arm must be silent -- the journal is for refusals";
+}
+
+TEST(DashServeGateJournal, TwoTransitionsBothEmitEvenWithOneCause) {
+    // The measured 08-03 shape: serve, serve, decline, (recover), decline.
+    // Every arm flip must be visible.
+    ServeGateJournal j(300);
+    int emitted = 0;
+    const std::pair<bool, int64_t> seq[] = {
+        {true, 1000}, {true, 1005}, {false, 1010}, {false, 1011},
+        {true, 1020}, {false, 1030}, {false, 1031},
+    };
+    for (const auto& [served, t] : seq)
+        if (j.observe(served, served ? "" : "dmn-stale", t).emit()) ++emitted;
+    EXPECT_EQ(emitted, 3)
+        << "expected: first decline (transition), resume, second decline "
+           "(transition) -- three edges, none swallowed by the same-cause rule";
+}

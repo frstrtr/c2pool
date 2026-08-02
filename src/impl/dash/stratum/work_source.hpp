@@ -51,6 +51,7 @@
 #include <core/uint256.hpp>
 
 #include <impl/dash/coin/node_coin_state.hpp>   // coin::NodeCoinState, coin::DashWorkData seam
+#include <impl/dash/coin/serve_gate_journal.hpp> // coin::ServeGateJournal — decline rate policy (DEFECT-3)
 #include <impl/dash/stratum/get_work.hpp>       // dash::stratum::get_work() fused capstone
 
 #include <atomic>
@@ -401,7 +402,22 @@ public:
     void set_refresh_executor(std::function<void(std::function<void()>)> fn)
     { refresh_executor_ = std::move(fn); }
 
+    /// DEFECT-3 operator surface: WHY the embedded arm is not serving, in the
+    /// shape the per-coin /api/node_topology entry publishes (no_work_reason +
+    /// its measured value and threshold). Sourced from the SAME DeclineReport
+    /// the arm-selection branch returned, so the web page and the journal can
+    /// never disagree. `arm` is "EMBEDDED" while serving; "unknown" before the
+    /// first template has been sourced -- never a fabricated "ok".
+    nlohmann::json embedded_arm_status_json() const;
+
 private:
+    /// Record ONE arm-selection outcome and, if the rate policy says so, emit
+    /// the single named line. `why` MUST be the report the selecting branch
+    /// returned -- never one recomputed here.
+    void note_arm_decision(bool served_embedded,
+                           const coin::DeclineReport& why,
+                           uint32_t height) const;
+
     // External dependencies (non-owning references) -- see Lifetime note.
     const coin::NodeCoinState&  coin_state_;    ///< embedded work arm (populated -> Embedded)
     std::function<coin::DashWorkData()> dashd_fallback_;  ///< always-reachable dashd GBT RPC arm (never removed)
@@ -416,6 +432,25 @@ private:
     bool is_testnet_{false};
     bool embedded_mainnet_{false};   // gate-lift opt-in: daemonless embedded arm on mainnet
     bool gbt_xcheck_{false};         // reward-safety backstop: cross-check embedded creditPool vs dashd
+
+    // Slow heartbeat for an UNCHANGED decline cause. The transition and any
+    // change of cause are emitted immediately regardless; this only bounds how
+    // long a steady-state refusal can go unnamed in the journal. Long enough
+    // that a per-template path (a re-source every few seconds under load)
+    // cannot flood, short enough that any 5-minute window of the journal
+    // answers "why is the arm not serving".
+    static constexpr int64_t kDeclineHeartbeatSec = 300;
+
+    // DEFECT-3: the serve gate must NAME its refusal. `serve_gate_journal_` is
+    // the rate policy (transition / cause-change / heartbeat); `last_decline_`
+    // is the most recent DeclineReport as returned BY the arm-selection branch
+    // -- never re-derived beside it -- and is what the web surface publishes.
+    // Mutable because resource_template_now() is const.
+    mutable std::mutex              serve_gate_mutex_;
+    mutable coin::ServeGateJournal  serve_gate_journal_{kDeclineHeartbeatSec};
+    mutable coin::DeclineReport     last_decline_;
+    mutable bool                    last_arm_embedded_{false};
+    mutable bool                    arm_ever_observed_{false};
 
     // Atomic state. work_generation_ is mutable: the const template-cache
     // resolve (cached_work) bumps it when a refresh observes a moved tip.

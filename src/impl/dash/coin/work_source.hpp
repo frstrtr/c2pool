@@ -29,11 +29,60 @@
 #include <ctime>
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <utility>
 #include <vector>
 
 namespace dash {
 namespace coin {
+
+/// ONE named refusal, carried up the call chain BESIDE the decision that
+/// produced it.
+///
+/// PRIOR ART (dashcore v23.1.7, src/consensus/validation.h:69 `ValidationState`):
+/// dashd never returns a bare bool for "I cannot build this". Every refusal
+/// path calls `state.Invalid(result, reject_reason, debug_message)`, which
+/// RETURNS FALSE WHILE RECORDING WHY — the boolean and its reason are produced
+/// by the same statement and so cannot drift. That state is threaded down
+/// through `BuildNewListFromBlock` / `CalcCbTxMerkleRootQuorums` /
+/// `GetCreditPoolDiffForBlock` / `TestBlockValidity` (src/node/miner.cpp:291-341)
+/// and surfaced to the caller by `BIP22ValidationResult` (src/rpc/mining.cpp:515);
+/// the getblocktemplate PRE-conditions ("…is not connected!", "…is in initial
+/// sync and waiting for blocks…", "…is syncing with network…" — the last being
+/// dashd's OWN superblock-not-synced refusal, src/rpc/mining.cpp:727-741) throw
+/// a typed, named JSONRPCError. Either way the caller learns WHY; nothing
+/// degrades silently.
+///
+/// We adopt the IDIOM, not the file. dashd's `Result` enum is block-rejection
+/// taxonomy (BLOCK_MUTATED, BLOCK_CHAINLOCK …) with no overlap with arm
+/// viability, and dashd's refusals THROW — which on our per-template hot path
+/// would be swallowed by the caller's catch-all (work_source.cpp) and reproduce
+/// the exact silence this type exists to end. So: reason RETURNED, not thrown,
+/// and never re-derived by a parallel copy of the predicate list.
+///
+/// WHY IT MATTERS HERE, MEASURED: before this struct, `has_state` and
+/// `NodeCoinState::classify_decline()` were two independent transcriptions of
+/// the same ten-clause AND — and they HAD already drifted. classify_decline()
+/// omitted the #996 `mn_payee_resolvable_at_tip()` clause entirely, so a
+/// genuine unresolvable-payee refusal (a money path) was reported as
+/// "viable-race", a benign race. A returned reason makes that unrepresentable.
+///
+/// `value` / `threshold` are STRINGS, not numbers, for one reason: a field that
+/// was never evaluated must print the literal "n/a" and NEVER "0". Three
+/// members of the coin state use zero/negative as "never measured" —
+/// best_cl_height==0 is "no ChainLock ever observed", credit_pool_height==-1 is
+/// "never seeded", last_applied_height()==0 is "never folded". Printing those
+/// as heights reads like a measurement and is not one.
+struct DeclineReport {
+    std::string cause{"viable"};   ///< single greppable token, never a list, no spaces
+    std::string value{"n/a"};      ///< what we MEASURED ("n/a" = never evaluated)
+    std::string threshold{"n/a"};  ///< what it had to be ("n/a" = not numeric)
+    bool        viable{true};      ///< true => no refusal; cause/value/threshold unused
+
+    std::string one_line() const {
+        return "cause=" + cause + " value=" + value + " threshold=" + threshold;
+    }
+};
 
 /// The inputs build_embedded_workdata() consumes, plus a validity flag. For the
 /// embedded path to be taken, has_state must be true AND both pointers non-null
@@ -41,6 +90,10 @@ namespace coin {
 /// leave has_state=false and the selector routes to the dashd fallback.
 struct EmbeddedWorkInputs {
     bool                  has_state{false};
+    /// The reason has_state is false, produced by the SAME evaluation that set
+    /// it. Hand-built test bundles leave it viable=true; production fills it in
+    /// NodeCoinState::make_embedded_work_inputs().
+    DeclineReport         decline;
     uint32_t              prev_height{0};
     uint256               prev_hash;
     const MnStateMachine* mnstates{nullptr};
@@ -97,6 +150,12 @@ enum class WorkSource { Embedded, DashdFallback };
 struct WorkSelection {
     DashWorkData work;
     WorkSource   source{WorkSource::DashdFallback};
+    /// WHY the fallback arm was chosen, carried out of the SAME branch that
+    /// chose it (dashd's ValidationState idiom — see DeclineReport). viable on
+    /// the Embedded branch. The arm-selection call site logs THIS; it must
+    /// never re-derive a reason of its own, because a reason computed beside
+    /// the branch instead of by it can be right today and lie tomorrow.
+    DeclineReport decline;
 };
 
 /// Injectable core — the routing decision, testable without a live daemon or a
@@ -108,8 +167,18 @@ inline WorkSelection select_dash_work(
     const std::function<DashWorkData()>& dashd_fallback)
 {
     if (emb.viable())
-        return WorkSelection{embedded_builder(), WorkSource::Embedded};
-    return WorkSelection{dashd_fallback(), WorkSource::DashdFallback};
+        return WorkSelection{embedded_builder(), WorkSource::Embedded, DeclineReport{}};
+    // The two pointer members are the only part of viable() that has_state does
+    // not already cover, so name them rather than inherit a stale bundle reason.
+    DeclineReport why = emb.decline;
+    if (emb.has_state && (emb.mnstates == nullptr || emb.mempool == nullptr)) {
+        why.viable    = false;
+        why.cause     = "bundle-pointers-null";
+        why.value     = std::string(emb.mnstates ? "mnstates=ok" : "mnstates=null")
+                      + "," + (emb.mempool ? "mempool=ok" : "mempool=null");
+        why.threshold = "mnstates!=null,mempool!=null";
+    }
+    return WorkSelection{dashd_fallback(), WorkSource::DashdFallback, std::move(why)};
 }
 
 /// Production entry point: builds the embedded template from `emb` when viable,

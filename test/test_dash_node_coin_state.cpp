@@ -775,3 +775,506 @@ TEST(DashNodeCoinState, MaintainerOnMnlistdiffPopulatesSmlAndEmitsPayload) {
     EXPECT_EQ(st.sml().size(), 0u);
     EXPECT_FALSE(st.make_embedded_work_inputs().viable());
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// DEFECT-3 (daemonless soak 2026-08-03): the serve gate must NAME its refusal.
+//
+// Measured: the embedded arm served three templates whose MN payee was
+// byte-identical to a real dashd getblocktemplate, then flipped to
+// "arm=dashd-fallback h=0 mn_payee=(none)" and stayed there with the tip
+// advancing normally and NO reason line of any kind.
+//
+// The design property these KATs pin is the one the prior art has and we had
+// dropped (dashcore src/consensus/validation.h:69 ValidationState — the call
+// that returns false is the call that records why): the reason RIDES THE
+// DECISION. `make_embedded_work_inputs()` sets has_state from
+// `decline.viable`, so a bundle that is not viable ALWAYS carries a non-viable
+// report and vice versa. That equivalence is not a convention a future
+// refactor can quietly break; it is the code.
+//
+// Each positive has its negative twin: every "names cause X" test is paired
+// with the same state minus the fault, asserting the arm is viable and the
+// report says so.
+// ════════════════════════════════════════════════════════════════════════
+
+using dash::coin::DeclineReport;
+
+// A fully HEALTHY armed bundle: every optional gate enabled and satisfied.
+// Every decline test below starts here and breaks exactly ONE thing, so the
+// cause it names is unambiguous.
+static void seed_healthy_armed(NodeCoinState& st) {
+    seed_single_mn(st, p2pkh_script(0x30));
+    seed_sml(st);
+    st.set_require_sml(true);
+    st.set_sml_current_hash(raw256(0xAB));
+    st.set_require_fresh_bestcl(true);
+    st.set_best_cl(static_cast<int32_t>(H - 1), {});
+    st.set_require_fresh_credit_pool(true);
+    st.set_credit_pool(0, raw256(0xAB), static_cast<int32_t>(H - 1));
+    st.set_require_fresh_mn_payee(true);
+    st.mnstates().load(
+        std::vector<std::pair<uint256, MNState>>{}, H - 1);
+    // Re-seed the single MN AT the tip so last_applied_height == prev_height.
+    {
+        MNState s;
+        s.isValid = true;
+        s.nRegisteredHeight = 2'300'000;
+        s.nLastPaidHeight = 0;
+        s.scriptPayout.m_data = p2pkh_script(0x30);
+        st.mnstates().load(
+            std::vector<std::pair<uint256, MNState>>{{raw256(0x01), s}}, H - 1);
+    }
+    st.set_tip(H - 1, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u);
+}
+
+// ── The baseline (NEGATIVE TWIN for every decline case below) ───────────
+TEST(DashServeGateNamesRefusal, HealthyArmedBundleIsViableAndReportsSo) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    const auto e = st.make_embedded_work_inputs();
+    ASSERT_TRUE(e.has_state)
+        << "the shared baseline must be VIABLE, else every decline test below "
+           "could pass for the wrong reason";
+    EXPECT_TRUE(e.decline.viable);
+    EXPECT_EQ(st.classify_decline(), "viable-race");
+}
+
+// ── THE INVARIANT: reason rides the decision, never beside it ────────────
+// This is the property a returned reason buys over a parallel log statement.
+// If a future edit adds a clause to has_state and forgets the report (the
+// failure that let a #996 payee-unresolvable refusal masquerade as
+// "viable-race"), this goes red.
+TEST(DashServeGateNamesRefusal, HasStateAndDeclineViableAreTheSameBit) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    EXPECT_EQ(st.make_embedded_work_inputs().has_state,
+              st.make_embedded_work_inputs().decline.viable);
+
+    // …and stays the same bit across every single-fault mutation.
+    st.set_credit_pool(0, raw256(0xAB), static_cast<int32_t>(H - 5));
+    const auto stale = st.make_embedded_work_inputs();
+    EXPECT_EQ(stale.has_state, stale.decline.viable);
+    EXPECT_FALSE(stale.has_state);
+}
+
+// ── One case per condition, each naming its FIRST unmet clause ──────────
+TEST(DashServeGateNamesRefusal, CreditPoolStaleNamesValueAndThreshold) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_credit_pool(0, raw256(0xAB), static_cast<int32_t>(H - 4));
+    const DeclineReport d = st.describe_decline();
+    EXPECT_FALSE(d.viable);
+    EXPECT_EQ(d.cause, "creditpool-stale");
+    EXPECT_EQ(d.value, std::to_string(H - 4))     << "the MEASURED seed height";
+    EXPECT_EQ(d.threshold, std::to_string(H - 1)) << "the tip it had to equal";
+}
+
+TEST(DashServeGateNamesRefusal, CreditPoolFreshIsViable) {   // negative twin
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_credit_pool(0, raw256(0xAB), static_cast<int32_t>(H - 1));
+    EXPECT_TRUE(st.describe_decline().viable);
+}
+
+TEST(DashServeGateNamesRefusal, PayeeStaleNamesValueAndThreshold) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    MNState s;
+    s.isValid = true;
+    s.nRegisteredHeight = 2'300'000;
+    s.scriptPayout.m_data = p2pkh_script(0x30);
+    st.mnstates().load(
+        std::vector<std::pair<uint256, MNState>>{{raw256(0x01), s}}, H - 3);
+    const DeclineReport d = st.describe_decline();
+    EXPECT_EQ(d.cause, "payee-stale");
+    EXPECT_EQ(d.value, std::to_string(H - 3));
+    EXPECT_EQ(d.threshold, std::to_string(H - 1));
+}
+
+TEST(DashServeGateNamesRefusal, PayeeFreshIsViable) {        // negative twin
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    EXPECT_TRUE(st.describe_decline().viable);
+}
+
+TEST(DashServeGateNamesRefusal, DmnStaleNamesSmlHashAndTipHash) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_sml_current_hash(raw256(0xCD));   // SML current at a DIFFERENT block
+    const DeclineReport d = st.describe_decline();
+    EXPECT_EQ(d.cause, "dmn-stale");
+    EXPECT_EQ(d.value, raw256(0xCD).GetHex().substr(0, 12));
+    EXPECT_EQ(d.threshold, raw256(0xAB).GetHex().substr(0, 12));
+}
+
+TEST(DashServeGateNamesRefusal, DmnCurrentAtTipIsViable) {   // negative twin
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_sml_current_hash(raw256(0xAB));
+    EXPECT_TRUE(st.describe_decline().viable);
+}
+
+TEST(DashServeGateNamesRefusal, BestClStaleNamesHeightAndFloor) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_best_cl(static_cast<int32_t>(H - 50), {});
+    const DeclineReport d = st.describe_decline();
+    EXPECT_EQ(d.cause, "bestcl-stale");
+    EXPECT_EQ(d.value, std::to_string(H - 50));
+    EXPECT_EQ(d.threshold, ">=" + std::to_string(H - 2));
+}
+
+TEST(DashServeGateNamesRefusal, BestClFreshIsViable) {       // negative twin
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_best_cl(static_cast<int32_t>(H - 2), {});   // exactly at the floor
+    EXPECT_TRUE(st.describe_decline().viable);
+}
+
+TEST(DashServeGateNamesRefusal, QuorumUnhealthyIsNamed) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_quorum_healthy(false);
+    EXPECT_EQ(st.describe_decline().cause, "quorum-unhealthy");
+}
+
+TEST(DashServeGateNamesRefusal, QuorumHealthyIsViable) {     // negative twin
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_quorum_healthy(true);
+    EXPECT_TRUE(st.describe_decline().viable);
+}
+
+TEST(DashServeGateNamesRefusal, SuperblockRefusalIsNamed) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_is_superblock_fn([](uint32_t) { return true; });
+    EXPECT_EQ(st.describe_decline().cause, "superblock-refused");
+}
+
+TEST(DashServeGateNamesRefusal, NonSuperblockHeightIsViable) {  // negative twin
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_is_superblock_fn([](uint32_t) { return false; });
+    EXPECT_TRUE(st.describe_decline().viable);
+}
+
+TEST(DashServeGateNamesRefusal, DkgCommitmentWindowIsNamed) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_commitment_window_fn([](uint32_t) { return true; });
+    const DeclineReport d = st.describe_decline();
+    EXPECT_EQ(d.cause, "dkg-commitment-window");
+    EXPECT_EQ(d.value, "in-window@h=" + std::to_string(H));
+}
+
+TEST(DashServeGateNamesRefusal, OffCommitmentWindowIsViable) {  // negative twin
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_commitment_window_fn([](uint32_t) { return false; });
+    EXPECT_TRUE(st.describe_decline().viable);
+}
+
+TEST(DashServeGateNamesRefusal, UtxoImmatureIsNamed) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_utxo_ready_fn([] { return false; });
+    EXPECT_EQ(st.describe_decline().cause, "utxo-immature");
+}
+
+TEST(DashServeGateNamesRefusal, UtxoMatureIsViable) {          // negative twin
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_utxo_ready_fn([] { return true; });
+    EXPECT_TRUE(st.describe_decline().viable);
+}
+
+TEST(DashServeGateNamesRefusal, QcPlanUnderivableIsNamed) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_qc_plan_fn([](uint32_t) { return std::optional<dash::coin::QcBlockPlan>{}; });
+    EXPECT_EQ(st.describe_decline().cause, "qc-plan-underivable");
+}
+
+TEST(DashServeGateNamesRefusal, QcPlanDerivableIsViable) {     // negative twin
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_qc_plan_fn([](uint32_t) {
+        dash::coin::QcBlockPlan p;
+        p.merkle_root_quorums = uint256::ZERO;
+        return std::optional<dash::coin::QcBlockPlan>{p};
+    });
+    EXPECT_TRUE(st.describe_decline().viable);
+}
+
+TEST(DashServeGateNamesRefusal, NotPopulatedIsNamed) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.invalidate();
+    EXPECT_EQ(st.describe_decline().cause, "not-populated");
+}
+
+TEST(DashServeGateNamesRefusal, MnNeedsReseedOutranksNotPopulated) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.invalidate();
+    st.set_mn_needs_reseed(true);
+    const DeclineReport d = st.describe_decline();
+    EXPECT_EQ(d.cause, "mn-needs-reseed")
+        << "the latch is strictly more informative than the not-populated "
+           "state it causes (the smoke rig logged 639 'not-populated' declines "
+           "while the real cause was a payee desync)";
+    EXPECT_EQ(st.classify_decline(), "mn-needs-reseed")
+        << "legacy wire text must not change -- the shadow ledger keys on it";
+}
+
+TEST(DashServeGateNamesRefusal, MnReseedLatchClearIsViable) {   // negative twin
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_mn_needs_reseed(false);
+    EXPECT_TRUE(st.describe_decline().viable);
+}
+
+// A DIAGNOSTIC refinement must never CREATE a refusal. Before the single-list
+// rewrite, classify_decline() tested prev_hash.IsNull() unconditionally and so
+// could report "no-tip" for an arm that was in fact serving.
+TEST(DashServeGateNamesRefusal, DiagnosticRefinementNeverContradictsHasState) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_mn_needs_reseed(true);   // latch ON while the bundle is healthy
+    const auto e = st.make_embedded_work_inputs();
+    EXPECT_TRUE(e.has_state)
+        << "the reseed latch is diagnostic-only: it must not gate serving";
+    EXPECT_TRUE(e.decline.viable)
+        << "and it must not manufacture a decline report either";
+    EXPECT_EQ(e.decline.cause, "viable")
+        << "nor RENAME a viable report: the refinement block must be "
+           "unreachable while the arm is serving, or an operator reads a cause "
+           "for a refusal that never happened";
+    EXPECT_EQ(st.classify_decline(), "viable-race");
+}
+
+// ── THE n/a RULE: an unevaluated field must NEVER print as 0 ─────────────
+// A zero standing in for "not measured" is the same silent-refusal defect in
+// new clothes. Each of these three members uses a zero/negative as its own
+// "never measured" sentinel.
+TEST(DashServeGateNamesRefusal, NeverSeededCreditPoolPrintsNaNotZero) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    NodeCoinState fresh;                    // credit_pool_height == -1 sentinel
+    seed_single_mn(fresh, p2pkh_script(0x30));
+    fresh.set_require_fresh_credit_pool(true);
+    fresh.set_tip(H - 1, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+                  DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u);
+    const DeclineReport d = fresh.describe_decline();
+    ASSERT_EQ(d.cause, "creditpool-stale");
+    EXPECT_EQ(d.value, "n/a")
+        << "credit_pool_height==-1 means NEVER SEEDED; printing it as a height "
+           "reads like a measurement that was never taken";
+    EXPECT_NE(d.value, "-1");
+    EXPECT_NE(d.value, "0");
+}
+
+TEST(DashServeGateNamesRefusal, NeverObservedChainLockPrintsNaNotZero) {
+    NodeCoinState st;
+    seed_single_mn(st, p2pkh_script(0x30));
+    st.set_require_fresh_bestcl(true);       // best_cl_height stays 0 = never seen
+    st.set_tip(H - 1, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u);
+    const DeclineReport d = st.describe_decline();
+    ASSERT_EQ(d.cause, "bestcl-stale");
+    EXPECT_EQ(d.value, "n/a")
+        << "best_cl_height==0 means no clsig EVER observed, not 'ChainLock at "
+           "height 0'";
+    EXPECT_NE(d.value, "0");
+}
+
+TEST(DashServeGateNamesRefusal, NeverFoldedPayeeQueuePrintsNaNotZero) {
+    NodeCoinState st;
+    seed_single_mn(st, p2pkh_script(0x30));  // load() with no as_of => cursor 0
+    st.set_require_fresh_mn_payee(true);
+    st.set_tip(H - 1, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u);
+    const DeclineReport d = st.describe_decline();
+    ASSERT_EQ(d.cause, "payee-stale");
+    EXPECT_EQ(d.value, "n/a")
+        << "last_applied_height()==0 means the queue has never folded a block";
+    EXPECT_NE(d.value, "0");
+}
+
+// A MEASURED zero, by contrast, must still print as 0 -- the n/a rule must not
+// swallow real data. (Fails-without-fix guard on the rule itself.)
+TEST(DashServeGateNamesRefusal, MeasuredHeightsStillPrintNumerically) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_credit_pool(0, raw256(0xAB), 7);
+    const DeclineReport d = st.describe_decline();
+    ASSERT_EQ(d.cause, "creditpool-stale");
+    EXPECT_EQ(d.value, "7") << "7 was measured; it must not be blanked to n/a";
+}
+
+// ── one_line() is the greppable contract ────────────────────────────────
+TEST(DashServeGateNamesRefusal, OneLineCarriesCauseValueAndThreshold) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_credit_pool(0, raw256(0xAB), static_cast<int32_t>(H - 4));
+    const std::string line = st.describe_decline().one_line();
+    EXPECT_EQ(line, "cause=creditpool-stale value=" + std::to_string(H - 4)
+                        + " threshold=" + std::to_string(H - 1));
+    EXPECT_EQ(line.find(' '), line.find(" value="))
+        << "the cause token must contain no spaces -- it is grepped";
+}
+
+// ── HEADER-SYNC gate: the ONE absolute check (cross-lane asymmetry) ─────
+// HeaderChain::is_synced() existed and had ZERO callers on the DASH template
+// path (bch 13, ltc 12, nmc 12, btc 6, dgb 6, dash 0). These KATs pin why that
+// mattered: every other gate is relative to our own tip, so a node that is
+// self-consistently STALE passes all of them.
+TEST(DashServeGateNamesRefusal, UnsyncedChainIsNamedAndRefused) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    ASSERT_TRUE(st.make_embedded_work_inputs().has_state)
+        << "baseline must be viable before the sync gate is applied";
+    st.set_chain_synced_fn([] { return false; });
+    const auto e = st.make_embedded_work_inputs();
+    EXPECT_FALSE(e.has_state);
+    EXPECT_EQ(e.decline.cause, "chain-not-synced");
+    EXPECT_EQ(e.decline.threshold, "header-tip-current");
+}
+
+TEST(DashServeGateNamesRefusal, SyncedChainIsViable) {          // negative twin
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_chain_synced_fn([] { return true; });
+    EXPECT_TRUE(st.make_embedded_work_inputs().has_state);
+}
+
+TEST(DashServeGateNamesRefusal, UnsetSyncFnLeavesEveryPriorKatUnchanged) {
+    NodeCoinState st;
+    seed_healthy_armed(st);   // no set_chain_synced_fn call at all
+    EXPECT_TRUE(st.make_embedded_work_inputs().has_state)
+        << "an unwired sync predicate must not silently close the arm -- that "
+           "would break every pre-existing KAT and every testnet harness";
+}
+
+// THE POINT of the gate: a stale-but-self-consistent node passes every
+// RELATIVE freshness check. Without the absolute one it would serve.
+TEST(DashServeGateNamesRefusal, SelfConsistentStaleTipPassesEveryRelativeGate) {
+    NodeCoinState st;
+    // Same construction as the healthy baseline, but "the tip" is an ancient
+    // height. Credit pool, payee cursor and SML hash are all current AT it.
+    const uint32_t ancient = H - 500'000;
+    seed_sml(st);
+    st.set_require_sml(true);
+    st.set_sml_current_hash(raw256(0xAB));
+    st.set_require_fresh_bestcl(true);
+    st.set_best_cl(static_cast<int32_t>(ancient), {});
+    st.set_require_fresh_credit_pool(true);
+    st.set_credit_pool(0, raw256(0xAB), static_cast<int32_t>(ancient));
+    st.set_require_fresh_mn_payee(true);
+    {
+        MNState s;
+        s.isValid = true;
+        s.nRegisteredHeight = 1'000'000;
+        s.scriptPayout.m_data = p2pkh_script(0x30);
+        st.mnstates().load(
+            std::vector<std::pair<uint256, MNState>>{{raw256(0x01), s}}, ancient);
+    }
+    st.set_tip(ancient, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u);
+
+    EXPECT_TRUE(st.make_embedded_work_inputs().has_state)
+        << "THIS IS THE HAZARD: every relative gate is satisfied on a tip half "
+           "a million blocks behind, because none of them compares against "
+           "anything outside our own view";
+
+    st.set_chain_synced_fn([] { return false; });
+    const auto gated = st.make_embedded_work_inputs();
+    EXPECT_FALSE(gated.has_state)
+        << "the absolute gate is the only thing that can refuse this";
+    EXPECT_EQ(gated.decline.cause, "chain-not-synced");
+}
+
+// "not-populated" collapsed two operator situations needing opposite responses
+// (headers still syncing vs the MN set never seeded) into one word. It now
+// carries which half the maintainer is missing — and prints n/a, not 0, when
+// the maintainer has never reported.
+TEST(DashServeGateNamesRefusal, NotPopulatedNamesWhichHalfIsMissing) {
+    NodeCoinState st;
+    // A real tip is required first: with a NULL prev_hash the diagnostic
+    // refinement (correctly) relabels this to the more informative "no-tip".
+    st.set_tip(H - 1, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u);
+    st.invalidate();
+    st.set_populate_inputs(/*have_tip=*/true, /*have_mn=*/false);
+    const DeclineReport d = st.describe_decline();
+    ASSERT_EQ(d.cause, "not-populated");
+    EXPECT_EQ(d.value, "have_tip=1,have_mn=0")
+        << "'MN set never seeded' and 'headers still syncing' need opposite "
+           "operator responses; one word cannot carry both";
+    EXPECT_EQ(d.threshold, "have_tip=1,have_mn=1");
+}
+
+TEST(DashServeGateNamesRefusal, NotPopulatedOtherHalf) {          // twin
+    NodeCoinState st;
+    st.set_tip(H - 1, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u);
+    st.invalidate();
+    st.set_populate_inputs(/*have_tip=*/false, /*have_mn=*/true);
+    EXPECT_EQ(st.describe_decline().value, "have_tip=0,have_mn=1");
+}
+
+TEST(DashServeGateNamesRefusal, UnreportedPopulateInputsPrintNaNotZero) {
+    NodeCoinState st;   // maintainer has never called set_populate_inputs
+    st.set_tip(H - 1, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u);
+    st.invalidate();
+    const DeclineReport d = st.describe_decline();
+    ASSERT_EQ(d.cause, "not-populated");
+    EXPECT_EQ(d.value, "n/a")
+        << "never reported is NOT reported-false; printing have_tip=0 here "
+           "would be a measurement we never took";
+    EXPECT_EQ(d.value.find('0'), std::string::npos);
+}
+
+// The no-tip refinement, pinned so the ordering cannot silently flip.
+//
+// CAUGHT LIVE on the daemonless rig 2026-08-03: the header chain was at
+// h=2515420 and advancing every ~60 s while this refinement reported "no-tip".
+// NodeCoinState::m_prev_hash is only written by set_tip(), which the maintainer
+// calls only once it holds BOTH a tip and an MN set — so while the MN set is
+// unseeded, prev_hash stays null no matter how current the headers are. Reading
+// that null as "no tip" told the operator to chase a header-sync fault that did
+// not exist while the real blocker went unnamed: the same silent-refusal defect
+// this whole change exists to kill, reintroduced by the diagnostic meant to fix
+// it. The maintainer's report wins whenever it exists.
+TEST(DashServeGateNamesRefusal, MaintainerReportOutranksOurOwnNullPrevHash) {
+    NodeCoinState st;
+    st.set_populate_inputs(/*have_tip=*/true, /*have_mn=*/false);
+    const DeclineReport d = st.describe_decline();
+    EXPECT_EQ(d.cause, "not-populated")
+        << "have_tip=1 explains the null prev_hash; calling it 'no-tip' would "
+           "point the operator at headers when the MN set is the blocker";
+    EXPECT_EQ(d.value, "have_tip=1,have_mn=0");
+}
+
+TEST(DashServeGateNamesRefusal, MaintainerReportWinsInTheOtherDirectionToo) {
+    NodeCoinState st;
+    st.set_populate_inputs(/*have_tip=*/false, /*have_mn=*/true);
+    const DeclineReport d = st.describe_decline();
+    EXPECT_EQ(d.cause, "not-populated");
+    EXPECT_EQ(d.value, "have_tip=0,have_mn=1")
+        << "even when the maintainer agrees there is no tip, its report is the "
+           "measurement -- our null pointer is only a consequence of it";
+}
+
+TEST(DashServeGateNamesRefusal, NoTipOnlyWhenTheMaintainerNeverReported) {
+    NodeCoinState st;   // set_populate_inputs never called
+    const DeclineReport d = st.describe_decline();
+    EXPECT_EQ(d.cause, "no-tip")
+        << "with NO maintainer report, our own null prev_hash is the only "
+           "evidence there is, and it is worth naming";
+    EXPECT_EQ(d.value, "prev_hash=null,maintainer-never-reported")
+        << "and it must say that it is inferring, not measuring";
+}
