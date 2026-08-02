@@ -207,6 +207,30 @@ public:
     /// of them is not being repaired, it is being overridden, and the honest
     /// response to that is to fail closed. The caller sizes the budget
     /// against its replay distance; see MnCheckpointLane::pump().
+    /// FRESHNESS GATE for the reactive demotion walk. The height the
+    /// installed SML is CURRENT AT (0 = unknown, which keeps the pre-gate
+    /// behaviour for callers that do not track it).
+    ///
+    /// Why this is load-bearing: recover_from_sml_ban() turns an attestation
+    /// into a PERMANENT exclusion. A STALE SML can attest isValid=false for a
+    /// masternode that has since been revived; combined with a coincidental
+    /// runner-up script match, that licenses a wrong permanent demotion and a
+    /// published queue that diverges from dashd's for the rest of the run.
+    /// An SML older than the height being adjudicated cannot speak to that
+    /// height, so it is not evidence — nullopt, never false.
+    /// Setting this ONCE opts the machine into fail-closed freshness: from
+    /// then on a height of 0 means "the SML covers NOTHING", not "covers
+    /// everything". The distinction matters because 0 is exactly what a warm
+    /// restart (F1) and an unpaired list/height (F2) produce, and in both
+    /// cases the honest answer is that we cannot date the attestation.
+    /// Callers that never call this keep the pre-gate behaviour byte for byte.
+    void set_sml_current_height(uint32_t h)
+    {
+        m_sml_height       = h;
+        m_sml_height_known = true;
+    }
+    uint32_t sml_current_height() const     { return m_sml_height; }
+
     void set_sml_recovery_cap(size_t n) { m_sml_recovery_cap = n; }
     size_t sml_recovery_cap() const     { return m_sml_recovery_cap; }
     size_t sml_recovered_total() const  { return m_sml_recovered_total; }
@@ -216,6 +240,38 @@ public:
     /// radius: a genuine desync cannot be "walked off" by marching down an
     /// unbounded queue until something happens to match.
     static constexpr size_t kPayeeCandidates = 8;
+
+    /// dashcore CompareByLastPaid_GetHeight (deterministicmns.cpp:158-167),
+    /// extracted so the projection scan, the shared-payoutAddress
+    /// disambiguator and the premature-exclusion recovery can never drift
+    /// apart. Also normalises dashd's -1 "never" sentinels (stored as
+    /// UINT32_MAX by older snapshots), which cast back to int would otherwise
+    /// beat every real height.
+    static int payee_score(const MNState& st)
+    {
+        constexpr uint32_t SENTINEL = std::numeric_limits<uint32_t>::max();
+        auto sane = [](uint32_t v) -> uint32_t {
+            return (v == SENTINEL) ? 0u : v;
+        };
+        const uint32_t lastPaid = sane(st.nLastPaidHeight);
+        const uint32_t revived  = sane(st.nPoSeRevivedHeight);
+        int h = static_cast<int>(lastPaid);
+        if (revived != 0 && static_cast<int>(revived) > h) {
+            h = static_cast<int>(revived);
+        } else if (h == 0) {
+            h = static_cast<int>(st.nRegisteredHeight);
+        }
+        return h;
+    }
+
+    /// dashcore CompareByLastPaid: score ascending, ties by proTxHash memcmp
+    /// ascending (LE-byte wire order, NOT c2pool's CompareTo).
+    static bool payee_order_before(int a_score, const uint256& a,
+                                   int b_score, const uint256& b)
+    {
+        if (a_score != b_score) return a_score < b_score;
+        return std::memcmp(a.data(), b.data(), 32) < 0;
+    }
 
     /// as_of_height: the chain height this snapshot is CURRENT AT (0 =
     /// unknown / cold). It seeds the forward-contiguous apply cursor: the
@@ -324,19 +380,9 @@ public:
                 continue;
             }
             if (st.scriptPayout.m_data != script) continue;
-            uint32_t lastPaid = sane(st.nLastPaidHeight);
-            uint32_t revived  = sane(st.nPoSeRevivedHeight);
-            int h = static_cast<int>(lastPaid);
-            if (revived != 0 && static_cast<int>(revived) > h) {
-                h = static_cast<int>(revived);
-            } else if (h == 0) {
-                h = static_cast<int>(st.nRegisteredHeight);
-            }
+            const int h = payee_score(st);
             bool better = !best.has_value()
-                       || h < best_h
-                       || (h == best_h
-                           && std::memcmp(hash.data(),
-                                          best->data(), 32) < 0);
+                       || payee_order_before(h, hash, best_h, *best);
             if (better) {
                 best_h = h;
                 best   = hash;
@@ -437,22 +483,13 @@ public:
                          << " (divergent snapshot) -- excluded from projection";
                 continue;
             }
-            uint32_t lastPaid = sane_height(st.nLastPaidHeight);
-            uint32_t revived  = sane_height(st.nPoSeRevivedHeight);
-            int h = static_cast<int>(lastPaid);
-            if (revived != 0 && static_cast<int>(revived) > h) {
-                h = static_cast<int>(revived);
-            } else if (h == 0) {
-                h = static_cast<int>(st.nRegisteredHeight);
-            }
-            cands.emplace_back(h, hash);
+            cands.emplace_back(payee_score(st), hash);
         }
         // dashcore CompareByLastPaid: score ascending, ties broken by
         // proTxHash memcmp ascending (LE-byte, NOT c2pool's CompareTo).
         auto by_last_paid = [](const std::pair<int, uint256>& a,
                                const std::pair<int, uint256>& b) {
-            if (a.first != b.first) return a.first < b.first;
-            return std::memcmp(a.second.data(), b.second.data(), 32) < 0;
+            return payee_order_before(a.first, a.second, b.first, b.second);
         };
         if (cands.size() > k) {
             std::partial_sort(cands.begin(), cands.begin() + k, cands.end(),
@@ -619,6 +656,50 @@ public:
             it->second.isValid = sml_entry.isValid;
         }
         return r;
+    }
+
+    /// Masternodes that would be projected as payee: valid, with no live PoSe
+    /// ban height. This — NOT size() — is the number to compare against
+    /// dashd's `protx list valid`. size() counts REGISTERED masternodes, and
+    /// the two moving in opposite directions is precisely the defect the
+    /// bridge's wholesale sync_validity_from_sml() fold exists to fix.
+    size_t eligible_size() const
+    {
+        constexpr uint32_t SENTINEL = std::numeric_limits<uint32_t>::max();
+        size_t n = 0;
+        for (const auto& [hash, st] : m_entries) {
+            if (!st.isValid) continue;
+            const uint32_t ban =
+                (st.nPoSeBanHeight == SENTINEL) ? 0u : st.nPoSeBanHeight;
+            if (ban != 0) continue;
+            ++n;
+        }
+        return n;
+    }
+
+    /// What the installed SML hook says about a proTxHash, verbatim (nullopt
+    /// = absent from the SML / no hook). Exposed so a caller's fail-closed
+    /// diagnostic can NAME the masternode it projected and state whether the
+    /// SML considers it valid, instead of listing hypotheses.
+    std::optional<bool> sml_opinion(const uint256& h) const
+    {
+        if (!m_sml_validity) return std::nullopt;
+        return m_sml_validity(h);
+    }
+
+    /// True when the installed SML is new enough to speak about `height`.
+    /// Exposed so a caller's fail-closed diagnostic can say "the SML is
+    /// STALE" rather than "the SML had no opinion", which are different
+    /// operator actions.
+    bool sml_covers(uint32_t height) const
+    {
+        // Caller never declared a height: pre-gate behaviour, unchanged.
+        if (!m_sml_height_known) return true;
+        // Declared, but zero — warm restart with no height restored, or a
+        // list/height pair that desynchronised. FAIL CLOSED: an undated
+        // attestation cannot license a permanent exclusion.
+        if (m_sml_height == 0) return false;
+        return m_sml_height >= height;
     }
 
     // Process a single block. Mutates state per dashcore's
@@ -935,7 +1016,7 @@ private:
         std::vector<uint256> demoted;
         std::optional<uint256> accepted;
         for (size_t i = 0; i + 1 < ranked.size(); ++i) {
-            const std::optional<bool> att = m_sml_validity(ranked[i]);
+            const std::optional<bool> att = sml_attest(ranked[i], height);
             // nullopt (absent from the SML) or true (attested valid): no
             // licence to demote. Stop — this is a real desync.
             if (!att.has_value() || *att) break;
@@ -999,7 +1080,30 @@ private:
 
     // Optional SML attestation hook (see set_sml_validity_fn). NULL by
     // default: no hook, no recovery, byte-identical pre-hook behaviour.
+    /// Attestation AS USED BY THE WALK: sml_opinion() narrowed by the
+    /// freshness gate. A stale SML is downgraded to "no opinion" per entry,
+    /// which is exactly what stops it licensing a permanent demotion.
+    std::optional<bool> sml_attest(const uint256& h, uint32_t height) const
+    {
+        if (!m_sml_validity) return std::nullopt;
+        if (!sml_covers(height)) {
+            LOG_WARNING << "[MNS-SM] SML CANNOT DATE h=" << height
+                        << ": applied SML height="
+                        << (m_sml_height == 0 ? std::string("UNKNOWN (warm"
+                               " restart with no restored height, or a"
+                               " list/height pair that desynchronised)")
+                                              : std::to_string(m_sml_height))
+                        << " — treating it as NO OPINION (an undated or stale"
+                           " ban attestation would license a PERMANENT"
+                           " demotion of a since-revived masternode)";
+            return std::nullopt;
+        }
+        return m_sml_validity(h);
+    }
+
     SmlValidityFn m_sml_validity;
+    uint32_t      m_sml_height{0};
+    bool          m_sml_height_known{false};
     size_t        m_sml_recovery_cap{0};
     size_t        m_sml_recovered_total{0};
 

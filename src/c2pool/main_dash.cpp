@@ -2636,6 +2636,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 node_coin_state.sml() = std::move(loaded_sml);
                 node_coin_state.set_have_sml(node_coin_state.sml().size() != 0);
                 node_coin_state.set_sml_current_hash(sml_db->get_best_hash());
+                // F1: restore the HEIGHT the warm SML is current at, not just
+                // the list. Without this m_sml_current_height stayed 0 while
+                // have_sml() was true, and every freshness check keyed on it
+                // passed vacuously — a masternode banned before the persisted
+                // tip and revived after it could be permanently demoted at a
+                // height the chain held it valid. Mirrors restore_credit_pool()
+                // immediately below, which exists for the same reason.
+                maintainer->restore_sml_height(sml_db->get_best_height());
                 *sml_base = sml_db->get_best_hash();  // handshake -> incremental
                 LOG_INFO << "[SML-DB] WARM restart: SML(" << node_coin_state.sml().size()
                          << ") + quorums(" << node_coin_state.qmgr().active_count()
@@ -3055,8 +3063,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
             // DEMUX: route the source's HISTORICAL getmnlistd replies away from
             // the tip-SML maintainer (a base=ZERO snapshot would overwrite it).
+            // ADDITIVE, not a slot: the MN-checkpoint lane registers its own
+            // filter below for the per-height PoSe fold, and both consumers
+            // must be offered every reply (a fold point can coincide with a
+            // quorum work block, and then ONE reply answers BOTH awaits).
             if (coin_p2p) {
-                coin_p2p->set_historical_mnlistdiff_filter(
+                coin_p2p->add_historical_mnlistdiff_filter(
                     [qc_member_source]
                     (const dash::coin::vendor::CSimplifiedMNListDiff& d) {
                         return qc_member_source->on_mnlistdiff(d);
@@ -3570,6 +3582,93 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     }
                     return std::nullopt;
                 });
+            // WHOLESALE SML PoSe FOLD seam — the whole list PLUS the height
+            // it is current at. The per-hash seam above can only answer a
+            // question about a masternode the projection already surfaced,
+            // and the walk behind it adjudicates ONE exclusion per height
+            // with an exact coinbase script match required at every step.
+            // That is proven to work for ISOLATED bans (mainnet 2026-08-02:
+            // it succeeded five times during the replay) and proven NOT to
+            // work for a BURST — the same chain put THREE masternodes out of
+            // `protx list valid` inside 73 blocks (2062 -> 2059 over
+            // 2514800..2514873) and the bridge fail-closed. A wholesale fold
+            // removes all three in one pass, which is what makes a burst
+            // indistinguishable from a single ban.
+            //
+            // The HEIGHT half is mandatory, not decoration: the lane folds
+            // ONLY when its apply cursor equals this height (never earlier —
+            // an early fold can silently publish a wrong queue inside a
+            // shared-payoutAddress group), and it gates the walk's
+            // attestations so a STALE SML cannot license a permanent
+            // demotion of a since-revived masternode.
+            //
+            // Same thread as everything else the lane touches: the SML is
+            // updated on the mnlistdiff ingest leg and read here from the
+            // block-connect / tip-changed callbacks, all on the single
+            // io_context thread main_dash runs. No lock is taken or needed,
+            // and the returned pointer never escapes the call.
+            // PER-HEIGHT PoSe FOLD seams. The lane asks for the masternode
+            // list AS OF the height its replay cursor is standing on, using
+            // the SAME getmnlistd primitive quorum_member_source.hpp already
+            // uses for historical member sets. This is what makes
+            // cursor == H_sml true BY CONSTRUCTION instead of by luck: the tip
+            // SML runs ahead of a catching-up replay, so waiting for the two
+            // to coincide loses the race at exactly the heights that matter.
+            //
+            // WIRED AS A PAIR OR NOT AT ALL. The request seam and the reply
+            // demux are two halves of one round trip: a lane that can ask but
+            // never be answered would PAUSE its replay on the first fold point
+            // and never resume. So both are installed inside the same
+            // `if (coin_p2p)` — with no coin-P2P client there is no request
+            // seam either, and the lane degrades to the additions-only replay
+            // plus the per-mismatch walk and says so in status().
+            if (coin_p2p) {
+                auto* cp = coin_p2p.get();
+                mn_ckpt_lane->set_request_snapshot_fn(
+                    [cp](const uint256& block_hash) {
+                        cp->send_getmnlistd(uint256::ZERO, block_hash);
+                    });
+                // DEMUX (reward-critical): the reply comes back on the SAME
+                // mnlistdiff message the tip sync uses. Routed here it is
+                // consumed as historical and the LIVE tip SML is never
+                // touched; routed to the maintainer it would silently rewrite
+                // the tip SML to the replayed (past) height — on the money
+                // path. See historical_sml.hpp.
+                coin_p2p->add_historical_mnlistdiff_filter(
+                    [mnl = mn_ckpt_lane.get()]
+                    (const dash::coin::vendor::CSimplifiedMNListDiff& d) {
+                        return mnl->on_historical_snapshot(d);
+                    });
+            }
+            // The DIP-4 trust anchor: our own PoW-validated header's merkle
+            // root. Without it a snapshot cannot be authenticated and the lane
+            // refuses to fold at all.
+            mn_ckpt_lane->set_merkle_root_at_fn(
+                [hc = header_chain.get()](const uint256& block_hash)
+                    -> std::optional<uint256> {
+                    // The SAME lookup QuorumMemberSource's R3 anchor uses.
+                    if (auto e = hc->get_header(block_hash))
+                        return e->header.m_merkle_root;
+                    return std::nullopt;
+                });
+            mn_ckpt_lane->set_sml_snapshot_fn(
+                [&node_coin_state, m = maintainer.get()]()
+                    -> dash::coin::MnCheckpointLane::SmlSnapshot {
+                    dash::coin::MnCheckpointLane::SmlSnapshot snap;
+                    if (!node_coin_state.have_sml()) return snap;
+                    snap.list   = &node_coin_state.sml();
+                    // F2: report the height ONLY while it is paired with the
+                    // list actually held. A diff can advance the list without
+                    // advancing the height (unparseable cbTx is not a
+                    // rejection), and folding a list that describes H2 at
+                    // cursor H1 is the EARLY case. Unpaired -> no height, which
+                    // both suppresses the fold and downgrades every walk
+                    // attestation to "no opinion".
+                    snap.height = (m && m->sml_height_paired())
+                                      ? m->sml_current_height() : 0;
+                    return snap;
+                });
+
             // Publish through the EXACT leg-4 event the E2c RPC seed uses, so
             // CoinStateMaintainer::on_mn_list_update takes the bridged set as
             // an ordinary authoritative resync — snapshot fence set to the
@@ -3608,6 +3707,18 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     (const dash::interfaces::BlockConnected& bc) {
                         mnl->on_block_connected(bc.block, bc.height);
                     }));
+
+            // KNOWN GAP, deliberately left: this branch arms the lane and
+            // sets NO maintainer->set_on_mn_reseed() callback (the RPC branch
+            // above does). If the maintainer later wipes a desynced payee
+            // queue it has nothing to ask for a fresh authoritative set, so
+            // the embedded arm stays demoted until restart. Filling that seam
+            // is real work and depends on what fills it — a re-armed bridge
+            // from a NEWER anchor is the obvious candidate and is exactly the
+            // wrong-axis trap the anchor-selection TODO in
+            // mn_checkpoint_lane.hpp describes (an anchor cut after the
+            // divergence began replays cleanly and re-arms a wrong queue).
+            // Not wired here rather than wired wrongly.
 
             // Kick the lane once now in case the header chain is already past
             // the anchor from a previous run's persisted header DB.

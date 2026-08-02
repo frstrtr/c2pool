@@ -70,6 +70,7 @@
 /// Threading: all entry points run on the single coin ioc thread (same
 /// assumption as QuorumManager) — no internal locking.
 
+#include <impl/dash/coin/historical_sml.hpp>       // authenticate_historical_snapshot (shared R3)
 #include <impl/dash/coin/dkg_commitments.hpp>          // LlmqNetwork, enabled_llmqs
 #include <impl/dash/coin/utxo_adapter.hpp>             // dash_txid
 #include <impl/dash/coin/vendor/quorum_members.hpp>    // compute_quorum_members
@@ -317,48 +318,18 @@ private:
         const vendor::CSimplifiedMNListDiff& diff,
         const std::vector<Key>& keys, vendor::CCbTx& cbtx_out) const
     {
+        // Shared with the daemonless MN-set bridge — see historical_sml.hpp.
+        // Both consumers authenticate a peer-supplied historical list on the
+        // reward path and must do it identically; two copies would be two
+        // places for it to rot.
         const uint32_t expect_h =
             keys.empty() ? 0 : expected_work_height(keys.front());
-        auto fail = [&](const char* why) -> std::optional<vendor::CSimplifiedMNList> {
-            LOG_WARNING << "[QC-MEMBERS] snapshot AUTH FAILED (" << why
-                        << ") for block " << diff.blockHash.GetHex().substr(0, 16)
-                        << " — " << keys.size()
+        auto sml = authenticate_historical_snapshot(
+            diff, expect_h, m_merkle_root_of_hash, cbtx_out, "QC-MEMBERS");
+        if (!sml) {
+            LOG_WARNING << "[QC-MEMBERS] " << keys.size()
                         << " quorum(s) fail closed (null-serve)";
-            return std::nullopt;
-        };
-
-        // (a) cbTx: coinbase, special-tx type 5, parseable payload, height
-        // bound to the request (a peer cannot satisfy the await with a
-        // different — even genuine — block's snapshot).
-        if (diff.cbTx.type != 5 || diff.cbTx.extra_payload.empty())
-            return fail("cbTx not a type-5 CbTx");
-        if (!vendor::parse_cbtx(diff.cbTx.extra_payload, cbtx_out))
-            return fail("cbTx payload unparseable");
-        if (expect_h == 0 || cbtx_out.nHeight < 0
-            || static_cast<uint32_t>(cbtx_out.nHeight) != expect_h)
-            return fail("cbTx height != expected work height");
-
-        // (b) merkle proof against the verified header.
-        auto header_root = m_merkle_root_of_hash(diff.blockHash);
-        if (!header_root || header_root->IsNull())
-            return fail("work-block header not held");
-        std::vector<uint256> matches;
-        std::vector<unsigned int> match_idx;
-        const uint256 proof_root =
-            diff.cbTxMerkleTree.ExtractMatches(matches, match_idx);
-        if (proof_root.IsNull() || proof_root != *header_root)
-            return fail("cbTxMerkleTree root != header merkle root");
-        const uint256 cbtx_hash = dash_txid(diff.cbTx);
-        if (matches.size() != 1 || match_idx.size() != 1 || match_idx[0] != 0
-            || matches[0] != cbtx_hash)
-            return fail("cbTx not proven at coinbase position");
-
-        // (c) SML root commitment.
-        vendor::CSimplifiedMNList sml;
-        vendor::apply_diff(sml, diff);   // base=ZERO: apply onto empty
-        if (sml.CalcMerkleRoot() != cbtx_out.merkleRootMNList)
-            return fail("SML root != cbTx.merkleRootMNList");
-
+        }
         return sml;
     }
 

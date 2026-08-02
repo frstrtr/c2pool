@@ -29,6 +29,7 @@
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -211,6 +212,62 @@ TEST(DashSMLDiff, OpaqueQuorumTailVerbatim) {
     PackStream in0(bytes_of(ps0));
     in0 >> out0;
     EXPECT_TRUE(out0.quorum_tail.empty());
+}
+
+// ─── KAT 3b: THE DRAIN-TO-END HAZARD (folded in from the closed MN
+// diff-ladder slice). CSimplifiedMNListDiff::Unserialize DRAINS THE REST OF
+// THE STREAM as its opaque quorum tail. That is correct for a wire message,
+// where the diff IS the whole payload — but it means ANY value laid out as
+// pack(diff) ++ <trailing field> is unreadable by the obvious
+// `stream >> diff; stream >> trailing;` : the unserializer has already
+// swallowed the trailing field into quorum_tail, and it does so SILENTLY,
+// with no short-read, no throw, and a diff that round-trips fine on its own.
+//
+// Every consumer that appends anything after a packed diff must therefore
+// read it by FIXED-WIDTH SLICING from the END of the buffer, and hand only
+// the remaining prefix to the unserializer. Both directions are pinned here:
+// the correct slicing reads back exactly, and the naive read demonstrably
+// swallows the suffix — so this KAT fails if the drain semantics ever change
+// in either direction.
+TEST(DashSMLDiff, TrailingFieldAfterAPackedDiffNeedsFixedWidthSlicing) {
+    auto d = make_diff();
+    d.quorum_tail = {0xde, 0xad, 0xbe, 0xef};
+    const uint256 trailing = raw256_byte(0, 0x5A);   // e.g. a committed root
+
+    auto ps = ::pack(d);
+    std::vector<unsigned char> value = bytes_of(ps);
+    const size_t body_len = value.size();
+    value.insert(value.end(), trailing.data(), trailing.data() + 32);
+
+    // (a) CORRECT: slice the fixed-width suffix off the end first.
+    uint256 read_back;
+    std::memcpy(read_back.data(), value.data() + value.size() - 32, 32);
+    EXPECT_EQ(read_back, trailing);
+
+    std::vector<unsigned char> body(value.begin(), value.end() - 32);
+    ASSERT_EQ(body.size(), body_len);
+    PackStream sliced(body);
+    CSimplifiedMNListDiff ok;
+    ASSERT_NO_THROW(sliced >> ok);
+    EXPECT_EQ(ok.baseBlockHash, d.baseBlockHash);
+    EXPECT_EQ(ok.blockHash, d.blockHash);
+    ASSERT_EQ(ok.mnList.size(), d.mnList.size());
+    EXPECT_EQ(ok.quorum_tail, d.quorum_tail)
+        << "slicing must leave the diff's OWN opaque tail untouched";
+
+    // (b) THE TRAP: read the whole buffer as a diff. No error is raised; the
+    // trailing 32 bytes are simply gone, appended to quorum_tail.
+    PackStream naive(value);
+    CSimplifiedMNListDiff swallowed;
+    ASSERT_NO_THROW(naive >> swallowed);
+    EXPECT_EQ(swallowed.quorum_tail.size(), d.quorum_tail.size() + 32u)
+        << "if this stops holding, the drain-to-end semantics changed and"
+           " every fixed-width slicing site must be revisited";
+    ASSERT_GE(swallowed.quorum_tail.size(), 32u);
+    EXPECT_TRUE(std::equal(trailing.data(), trailing.data() + 32,
+                           swallowed.quorum_tail.end() - 32))
+        << "the trailing field was swallowed VERBATIM and silently -- there is"
+           " no short-read to detect, which is exactly why this KAT exists";
 }
 
 // ─── KAT 4: apply_diff delete + update + insert, then memcmp re-sort ────────

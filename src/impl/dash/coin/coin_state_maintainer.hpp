@@ -329,8 +329,10 @@ public:
         m_mn_snapshot_height = as_of_height;
         // An authoritative (non-empty) resync clears the payee-desync latch:
         // the queue is trustworthy again from this snapshot forward.
-        if (m_have_mn)
+        if (m_have_mn) {
             m_mn_needs_reseed = false;
+            m_state.set_mn_needs_reseed(false);
+        }
         // as_of_height also seeds the machine's forward-contiguous apply
         // cursor (E4 re-soak fix): the snapshot IS the payment queue as of
         // that block, so only as_of+1 may fold next; a later block reports
@@ -471,6 +473,16 @@ public:
         //    diff.mnList, and re-sorts by proRegTxHash (memcmp order — the
         //    Bug-A-critical ordering, already pinned by test_dash_simplifiedmns).
         auto sml_r = vendor::apply_diff(m_state.sml(), diff);
+        // F2: the list has just advanced to diff.blockHash UNCONDITIONALLY,
+        // but m_sml_current_height advances only if this diff's cbTx parses as
+        // a type-5 CCbTx with nHeight > 0 (below). An unparseable cbTx is NOT a
+        // rejection — the diff still applies — so the pair (list, height) can
+        // silently desynchronise, leaving a consumer folding a list that
+        // describes H2 at cursor H1. A peer can trigger that deliberately and
+        // choose H1. Break the pairing here and let the height branch below
+        // re-establish it; consumers that need the two to agree read
+        // sml_height_paired() and treat "unpaired" as "no height at all".
+        m_sml_height_paired = false;
 
         // 2) Quorum set (merkleRootQuorums) — tail already parsed clean above.
         auto qr = m_state.qmgr().apply(qt);
@@ -489,9 +501,13 @@ public:
                 // state is now current at (authoritative off the diff's own
                 // cbTx). Monotone by construction: incrementals ride the
                 // base-continuity guard, full snapshots the R1 guard above.
-                if (observed.nHeight > 0)
+                if (observed.nHeight > 0) {
                     m_sml_current_height =
                         static_cast<uint32_t>(observed.nHeight);
+                    // The height now describes THIS list, at this application
+                    // point. This is the only place the pair is valid.
+                    m_sml_height_paired = true;
+                }
                 if (observed.nVersion >= vendor::CCbTx::VERSION_CLSIG_AND_BALANCE) {
                     // Seed with the cbTx's OWN nHeight (authoritative off the
                     // wire) as the seed height — the independent freshness key.
@@ -630,6 +646,7 @@ public:
         // heights may legitimately be at/below the old ones — the cold
         // full-snapshot resync must not be blocked by the stale-guard.
         m_sml_current_height = 0;
+        m_sml_height_paired  = false;
         // Invalidate the credit-pool seed's freshness too (height -1 != any tip),
         // so the arm fails closed on the credit-pool axis until a fresh re-seed.
         m_state.set_credit_pool(0, uint256::ZERO, -1);
@@ -777,6 +794,7 @@ public:
             // block would register into the wiped set and republish a 1-MN
             // "queue" — a guessed payee by another name.
             m_mn_needs_reseed = true;
+            m_state.set_mn_needs_reseed(true);   // MAKE THE STATE SAY ITS NAME
             demote();
             notify_state_dirty();
             if (m_on_mn_reseed) m_on_mn_reseed();
@@ -839,6 +857,33 @@ public:
     /// turns it on for the whole embedded arm.
     void set_require_seeded_mn_set(bool on) { m_require_seeded_mn = on; }
     bool require_seeded_mn_set() const { return m_require_seeded_mn; }
+
+    /// Height the applied SML/quorum state is current AT (0 = none yet),
+    /// tracked off each accepted mnlistdiff's cbTx.nHeight. Read-only;
+    /// exposed so the daemonless MN-set bridge can (a) fold the SML's PoSe
+    /// verdicts at the ONE cursor position where a wholesale fold is valid,
+    /// and (b) refuse a demotion attested by an SML older than the height
+    /// being adjudicated. See MnCheckpointLane::maybe_fold_sml().
+    uint32_t sml_current_height() const { return m_sml_current_height; }
+
+    /// Whether m_sml_current_height actually describes the SML currently held.
+    /// FALSE after a diff advanced the list without a parseable type-5 cbTx to
+    /// advance the height with it (F2). A consumer that pairs the two — the
+    /// daemonless bridge folds a list AT a height — must treat an unpaired
+    /// height as NO height, not as a stale-but-usable one: folding a list that
+    /// describes H2 at cursor H1 is the EARLY case, off by H2-H1 blocks, whose
+    /// worst outcome is a script-invisible wrong-queue publish.
+    bool sml_height_paired() const { return m_sml_height_paired; }
+
+    /// Warm-restart restore (F1). main_dash loads a persisted SML and its
+    /// height from SMLDb; without this the height stayed 0 while have_sml()
+    /// was true, so every freshness check keyed on it silently passed. Mirrors
+    /// restore_credit_pool(), which already exists for the same reason.
+    void restore_sml_height(uint32_t h)
+    {
+        m_sml_current_height = h;
+        m_sml_height_paired  = (h != 0);
+    }
 
     /// Wire the authoritative MN re-seed sink (main_dash points this at the
     /// E2c `protx list valid true` seed fetch when a coin RPC is configured).
@@ -1130,6 +1175,10 @@ private:
     // off each accepted diff's cbTx.nHeight — the freshness key the #814 R1
     // stale-ZERO-base-snapshot guard compares against.
     uint32_t m_sml_current_height{0};
+
+    // Whether m_sml_current_height describes the SML currently held — see
+    // sml_height_paired(). Starts FALSE: a cold maintainer has no height.
+    bool m_sml_height_paired{false};
 
     // Height the last MN-set snapshot was current at (0 = none/unknown);
     // on_block_connected skips re-applying blocks at or below it.
