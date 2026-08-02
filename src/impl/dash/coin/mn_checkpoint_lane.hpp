@@ -687,9 +687,11 @@ private:
     // and leaks past the demux. The lane therefore has at most ONE request in
     // flight, enforced structurally rather than by bookkeeping:
     //
-    //   • On reaching a fold height the lane sets m_snapshot_pending and
-    //     STOPS pulling blocks (request_window() returns immediately while
-    //     paused). The replay cannot run ahead of its own fold.
+    //   • On reaching a fold height the lane sets m_snapshot_pending. pump()
+    //     then returns before it can request another window, so the replay
+    //     stops pulling blocks and cannot run ahead of its own fold. (There is
+    //     a second check inside request_window(); mutation testing shows
+    //     nothing reaches it today, so read that one as a backstop.)
     //   • It issues exactly one request and will not issue another until that
     //     one is consumed, refused, or the lane fails closed.
     //   • on_block_connected() ignores blocks while paused (the cursor cannot
