@@ -51,7 +51,7 @@ DRY_RUN=0
 REAP_COMM_RE="${REAP_COMM_RE:-^(cmake|gmake|make|cc1plus|cc1|cc|c\+\+)$}"
 # cwd/argv must match this to be a CI build tree. Defaults to the CodeQL build
 # dir from the incident; widen to '_work/.*/build' to cover all CI builds.
-REAP_PATH_RE="${REAP_PATH_RE:-_work/.*build_codeql}"
+REAP_PATH_RE="${REAP_PATH_RE:-_work/.*/build}"
 # orphan-root parent pid. Kernel reparents orphans to 1 (init); no subreaper
 # sits in the runner tree. Override only if a host installs a subreaper.
 REAP_ROOT_PPID="${REAP_ROOT_PPID:-1}"
