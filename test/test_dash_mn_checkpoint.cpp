@@ -3162,3 +3162,665 @@ TEST(DashMnCheckpointOnDemandFold, ScriptMatchIsTheOnlyLicenceToAttribute)
         << "the refusal must name the SCRIPT rule, not the attestation rule: "
         << s;
 }
+
+// 10. THE RE-SEED SEAM — the maintainer asks, and something ANSWERS
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// MEASURED DEFECT (contabo daemonless soak): CoinStateMaintainer fired
+//
+//   [EMB-DASH] MN payee queue APPLY GAP / DESYNC at h= 2513168, 2513261, 2515266
+//              -> "wiping payee set, demoting to dashd fallback,
+//                  requesting authoritative re-seed"
+//
+// three times in ONE run. h=2515266 is ABOVE the bridge's own failure height
+// (2513489), so it fires on LIVE TIP ADVANCES, not only as a replay artefact.
+// Nothing answered: set_on_mn_reseed was wired ONLY in main_dash's `if (rpc)`
+// branch, so on the daemonless arm `if (m_on_mn_reseed) m_on_mn_reseed();` was
+// a no-op and the payee set stayed wiped for the rest of the run.
+//
+// These cases pin the fill (MnCheckpointLane::rearm) and, crucially, its
+// NEGATIVE TWIN: with the wiring removed the arm must stay down, which is what
+// makes the positive case evidence rather than decoration.
+
+namespace {
+
+// main_dash's daemonless else-branch, in miniature: lane -> leg-4 event ->
+// maintainer, plus the re-seed callback the branch used to omit.
+struct ReseedRig {
+    dash::interfaces::Node                        node;
+    dash::coin::NodeCoinState                     state;
+    dash::coin::CoinStateMaintainer               maint{state};
+    std::vector<std::shared_ptr<EventDisposable>> subs;
+    BridgeHarness                                 h;
+    MnCheckpoint                                  anchor{good_checkpoint()};
+    size_t                                        reseed_calls{0};
+    std::vector<MnCheckpointLane::RearmOutcome>   outcomes;
+
+    explicit ReseedRig(bool wire_the_reseed_seam)
+    {
+        maint.set_require_seeded_mn_set(true);
+        subs.push_back(c2pool::dash::wire_mn_list_ingest(node, maint));
+        subs.push_back(c2pool::dash::wire_tip_ingest(node, maint));
+        h.lane.set_publish_fn(
+            [this](std::vector<std::pair<uint256, MNState>> set, uint32_t as_of) {
+                dash::interfaces::MnListUpdate up;
+                up.mnstates     = std::move(set);
+                up.as_of_height = as_of;
+                node.mn_list_update.happened(up);
+            });
+        h.headers[kAnchorHeight] = uint256S(kAnchorHash);
+        h.blocks[1519544] = block_from_hex(kBlockHex1519544);
+        h.blocks[1519545] = block_from_hex(kBlockHex1519545);
+        h.blocks[1519546] = block_from_hex(kBlockHex1519546);
+        h.tip = 1519546;
+
+        // THE SEAM UNDER TEST. The negative twin passes false and changes
+        // NOTHING else, so any difference in outcome is this wiring alone.
+        if (wire_the_reseed_seam) {
+            maint.set_on_mn_reseed([this] {
+                ++reseed_calls;
+                const auto out = h.lane.rearm(
+                    anchor, "maintainer wiped a desynced/gapped payee queue");
+                outcomes.push_back(out);
+                if (out == MnCheckpointLane::RearmOutcome::Armed)
+                    h.lane.pump();
+            });
+        }
+    }
+
+    void fire_tip()
+    {
+        dash::interfaces::TipAdvance ta;
+        ta.prev_height          = h.tip;
+        ta.prev_hash            = uint256S(kAnchorHash);
+        ta.bits_for_next        = 0x1d00ffff;
+        ta.mtp_at_tip           = 1751000000;
+        ta.address_version      = TESTNET_PUBKEY_VER;
+        ta.address_p2sh_version = TESTNET_P2SH_VER;
+        node.new_tip.happened(ta);
+    }
+
+    // The measured trigger: a block the maintainer's forward-contiguous apply
+    // cursor cannot reach (one height skipped) -> APPLY GAP -> wipe, latch,
+    // demote, ask for a re-seed. A real accepted body, so nothing else about
+    // the block is synthetic.
+    MnStateMachine::ApplyResult force_apply_gap()
+    {
+        return maint.on_block_connected(block_from_hex(kBlockHex1519546),
+                                        /*height=*/1519548);
+    }
+};
+
+} // namespace
+
+TEST(DashMnCheckpointReseed, DesyncAskReArmsTheBridgeAndTheArmComesBack)
+{
+    ReseedRig r(/*wire_the_reseed_seam=*/true);
+
+    // Cold start -> bridge -> published -> populated.
+    r.h.lane.arm(r.anchor);
+    r.h.lane.pump();
+    ASSERT_EQ(r.h.lane.state(), MnCheckpointLane::State::Published)
+        << r.h.lane.status();
+    r.fire_tip();
+    ASSERT_TRUE(r.state.populated());
+    ASSERT_FALSE(r.state.mn_needs_reseed());
+
+    // The measured event.
+    const auto gap = r.force_apply_gap();
+    ASSERT_TRUE(gap.gap_detected) << "the trigger itself must actually fire";
+
+    EXPECT_EQ(r.reseed_calls, 1u)
+        << "the maintainer asked for an authoritative re-seed and NOTHING"
+           " answered -- this is the measured daemonless defect";
+    ASSERT_EQ(r.outcomes.size(), 1u);
+    EXPECT_EQ(r.outcomes[0], MnCheckpointLane::RearmOutcome::Armed)
+        << r.h.lane.last_rearm_reason();
+    EXPECT_EQ(r.h.lane.rearms(), 1u);
+
+    // The re-armed bridge ran to completion on the SAME anchor...
+    EXPECT_EQ(r.h.lane.state(), MnCheckpointLane::State::Published)
+        << r.h.lane.status();
+    EXPECT_EQ(r.h.lane.anchor_height(), kAnchorHeight)
+        << "the re-arm must use the release-pinned anchor, never a newer one";
+    // ...and its publish cleared the maintainer's latch through the REAL
+    // leg-4 event, which is the only thing that can.
+    EXPECT_FALSE(r.state.mn_needs_reseed())
+        << "an authoritative resync must clear the payee-desync latch";
+    r.fire_tip();
+    EXPECT_TRUE(r.state.populated())
+        << "the embedded arm must come back up after the re-arm publishes";
+    EXPECT_NE(r.h.lane.status().find("RE-ARM 1/3"), std::string::npos)
+        << "a publish that is a RECOVERY must not read like a cold start: "
+        << r.h.lane.status();
+}
+
+// ── NEGATIVE TWIN. Byte-identical rig with the re-seed wiring REMOVED. This
+// is today's shipped daemonless behaviour, and it must be demonstrably worse:
+// nothing is invoked, the lane never re-arms, and the arm stays down forever.
+TEST(DashMnCheckpointReseed, NegativeControlNoReseedWiringLeavesTheArmDown)
+{
+    ReseedRig r(/*wire_the_reseed_seam=*/false);
+
+    r.h.lane.arm(r.anchor);
+    r.h.lane.pump();
+    ASSERT_EQ(r.h.lane.state(), MnCheckpointLane::State::Published);
+    r.fire_tip();
+    ASSERT_TRUE(r.state.populated());
+
+    const auto gap = r.force_apply_gap();
+    ASSERT_TRUE(gap.gap_detected);
+
+    EXPECT_EQ(r.reseed_calls, 0u) << "nothing may be invoked";
+    EXPECT_EQ(r.h.lane.rearms(), 0u);
+    EXPECT_EQ(r.h.lane.rearm_asks(), 0u);
+    EXPECT_TRUE(r.h.lane.last_rearm_reason().empty())
+        << "no ask was ever made, so there is no outcome to report";
+    EXPECT_TRUE(r.state.mn_needs_reseed())
+        << "the latch stays set: only an authoritative resync clears it, and"
+           " unwired there is nothing to produce one";
+    r.fire_tip();
+    EXPECT_FALSE(r.state.populated())
+        << "THE MEASURED DEFECT: the payee set stays wiped and the embedded"
+           " arm stays demoted for the rest of the run";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 11. RE-ARM RESETS EVERY FIELD arm() SETS
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// arm() assumed a virgin lane. A field it leaves dirty does not crash a
+// re-armed bridge -- it makes it publish a WRONG masternode set, or wedge with
+// no symptom. The load-bearing one is m_requested_through: left stale it makes
+// request_window() compute `from > end` and issue NO getdata at all.
+
+namespace {
+
+// A bridge that runs to Published having exercised the fold, the counters and
+// the request window -- i.e. every field arm()/rearm() must clear.
+struct DirtyBridge {
+    static constexpr uint32_t kAnchorH = 2513000;
+    static constexpr uint32_t kTip     = 2513004;
+    MnCheckpoint cp{synthetic_anchor(64, kAnchorH, uint256S(kAnchorHash))};
+    SnapshotRig  rig;
+
+    DirtyBridge()
+    {
+        std::vector<std::pair<uint256, bool>> attest;
+        for (size_t i = 0; i < cp.entries.size(); ++i)
+            attest.emplace_back(cp.entries[i].first, i >= 5);   // 5 banned
+        rig.attest = attest;
+        rig.install(kAnchorH, kTip, uint256S(kAnchorHash));
+        rig.by_height[kAnchorH] =
+            make_snapshot(uint256S(kAnchorHash), kAnchorH, attest);
+        for (uint32_t bh = kAnchorH + 1; bh <= kTip; ++bh) {
+            const size_t rank = 5 + (bh - (kAnchorH + 1));
+            rig.h.blocks[bh] =
+                block_paying(cp.entries[rank].second.scriptPayout.m_data);
+        }
+    }
+};
+
+} // namespace
+
+TEST(DashMnCheckpointReseed, ReArmResetsEveryFieldArmSets)
+{
+    DirtyBridge d;
+    d.rig.h.lane.arm(d.cp);
+    d.rig.h.lane.pump();
+    auto& lane = d.rig.h.lane;
+
+    // Establish the state is genuinely DIRTY, field by field. A reset test
+    // over an already-clean object proves nothing.
+    ASSERT_EQ(lane.state(), MnCheckpointLane::State::Published) << lane.status();
+    ASSERT_TRUE(lane.sml_folded());
+    ASSERT_NE(lane.sml_folded_at(), 0u);
+    ASSERT_NE(lane.first_fold_height(), 0u);
+    ASSERT_NE(lane.last_fold_height(), 0u);
+    ASSERT_NE(lane.folds_applied(), 0u);
+    ASSERT_TRUE(lane.anchor_fold_done());
+    ASSERT_NE(lane.pose_removed(), 0u);
+    ASSERT_NE(lane.replay_applied(), 0u);
+    ASSERT_NE(lane.cursor_height(), DirtyBridge::kAnchorH);
+    ASSERT_TRUE(lane.position_verified());
+    ASSERT_NE(lane.requested_through(), 0u);
+    ASSERT_NE(lane.sml_recovery_cap(), 0u);
+
+    const size_t anchor_elig = lane.anchor_eligible();
+
+    ASSERT_EQ(lane.rearm(d.cp, "unit test"), MnCheckpointLane::RearmOutcome::Armed)
+        << lane.last_rearm_reason();
+
+    // ── EVERY field arm() sets, back at its armed value. Grouped exactly as
+    // reset_for_arm() groups them so a new field on one side is visible here.
+    EXPECT_EQ(lane.state(), MnCheckpointLane::State::Waiting);
+    EXPECT_EQ(lane.anchor_height(), DirtyBridge::kAnchorH);
+    EXPECT_EQ(lane.cursor_height(), DirtyBridge::kAnchorH);
+    EXPECT_EQ(lane.set_size(), d.cp.entries.size());
+    EXPECT_EQ(lane.anchor_eligible(), anchor_elig);
+    EXPECT_EQ(lane.eligible_size(), anchor_elig)
+        << "the machine must be reloaded from the anchor, bans and all";
+    // #1028 fold state -- the one-shot latch is the SILENT one.
+    EXPECT_FALSE(lane.sml_folded());
+    EXPECT_EQ(lane.sml_folded_at(), 0u);
+    EXPECT_EQ(lane.first_fold_height(), 0u);
+    EXPECT_EQ(lane.last_fold_height(), 0u);
+    EXPECT_EQ(lane.folds_applied(), 0u);
+    EXPECT_FALSE(lane.anchor_fold_done());
+    EXPECT_EQ(lane.abandoned_folds(), 0u);
+    EXPECT_FALSE(lane.snapshot_pending());
+    EXPECT_EQ(lane.pose_removed(), 0u);
+    EXPECT_EQ(lane.pose_reinstated(), 0u);
+    EXPECT_EQ(lane.sml_recovered(), 0u);
+    EXPECT_EQ(lane.replay_registered(), 0u);
+    EXPECT_EQ(lane.replay_spent(), 0u);
+    EXPECT_EQ(lane.replay_applied(), 0u);
+    // The seven arm() ITSELF forgot -- latent on a virgin lane (all
+    // zero-initialised), bugs on a re-arm.
+    EXPECT_FALSE(lane.position_verified());
+    EXPECT_EQ(lane.requested_through(), 0u);
+    EXPECT_EQ(lane.stalled_pumps(), 0u);
+    EXPECT_EQ(lane.sml_recovery_cap(), 0u);
+    EXPECT_EQ(lane.sml_recovery_spent(), 0u)
+        << "MnStateMachine::load() does NOT zero the per-bridge demotion-walk"
+           " spend; carrying it in would exhaust the budget before the replay"
+           " starts";
+    // The re-arm bookkeeping must NOT be reset, or the cap can never fire.
+    EXPECT_EQ(lane.rearms(), 1u);
+    EXPECT_EQ(lane.rearm_asks(), 1u);
+
+    // BEHAVIOURAL PROOF, because several of those fields have no observable
+    // effect until the bridge runs again: the second bridge must actually
+    // fetch blocks and complete. With m_requested_through left stale this
+    // request list is EMPTY and the lane sits at its cursor forever.
+    d.rig.h.requested.clear();
+    lane.pump();
+    EXPECT_FALSE(d.rig.h.requested.empty())
+        << "a re-armed bridge that issues no getdata is wedged, not working";
+    EXPECT_EQ(lane.state(), MnCheckpointLane::State::Published) << lane.status();
+    EXPECT_EQ(lane.replay_applied(), DirtyBridge::kTip - DirtyBridge::kAnchorH);
+}
+
+// ── THE #1028 ONE-SHOT FOLD LATCH, named. A second bridge that ran
+// additions-only while sml_folded() still reported true from the first would
+// LIE about having applied PoSe removals -- and additions-only is exactly the
+// measured 2068->2059 vs 2067->2070 divergence this fold exists to fix.
+TEST(DashMnCheckpointReseed, SecondBridgeFoldsAgainRatherThanRunningAdditionsOnly)
+{
+    DirtyBridge d;
+    auto& lane = d.rig.h.lane;
+    lane.arm(d.cp);
+    lane.pump();
+    ASSERT_EQ(lane.state(), MnCheckpointLane::State::Published) << lane.status();
+    const uint32_t folds_1   = lane.folds_applied();
+    const size_t   removed_1 = lane.pose_removed();
+    const size_t   elig_1    = lane.eligible_size();
+    ASSERT_GT(folds_1, 0u);
+    ASSERT_EQ(removed_1, 5u);
+    ASSERT_EQ(elig_1, 59u);
+
+    ASSERT_EQ(lane.rearm(d.cp, "unit test"), MnCheckpointLane::RearmOutcome::Armed);
+    ASSERT_FALSE(lane.sml_folded()) << "the one-shot latch must be down again";
+    lane.pump();
+
+    ASSERT_EQ(lane.state(), MnCheckpointLane::State::Published) << lane.status();
+    EXPECT_TRUE(lane.sml_folded());
+    EXPECT_EQ(lane.folds_applied(), folds_1)
+        << "the second bridge must fold the SAME number of times, not zero";
+    EXPECT_EQ(lane.pose_removed(), removed_1)
+        << "additions-only would report 0 removals here while sml_folded()"
+           " still said yes -- the silent half of the defect";
+    EXPECT_EQ(lane.eligible_size(), elig_1)
+        << "the published set must be identical, not 64 (unfolded)";
+    EXPECT_EQ(lane.first_fold_height(), DirtyBridge::kAnchorH);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 12. THE CAP AND THE BACKOFF NAME THEMSELVES
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// An unbounded re-arm against a deterministic failure is a fail-loop with
+// extra steps, and it is WORSE than staying down because it hides the problem.
+
+TEST(DashMnCheckpointReseed, ReArmCapFiresBacksOffAndNamesItself)
+{
+    DirtyBridge d;
+    auto& lane = d.rig.h.lane;
+    lane.arm(d.cp);
+    lane.pump();
+    ASSERT_EQ(lane.state(), MnCheckpointLane::State::Published);
+
+    // #1 -- free.
+    EXPECT_EQ(lane.rearm(d.cp, "desync 1"), MnCheckpointLane::RearmOutcome::Armed);
+    EXPECT_EQ(lane.rearms(), 1u);
+
+    // Immediately again: BACKOFF. Re-replaying the identical window would fail
+    // identically, so this is deferred and does NOT burn an attempt.
+    EXPECT_EQ(lane.rearm(d.cp, "desync 1b"),
+              MnCheckpointLane::RearmOutcome::Deferred);
+    EXPECT_EQ(lane.rearms(), 1u) << "a deferral must not consume the cap";
+    EXPECT_EQ(lane.rearm_asks(), 2u);
+    EXPECT_NE(lane.last_rearm_reason().find("BACKOFF"), std::string::npos)
+        << lane.last_rearm_reason();
+
+    // Move the chain past the first backoff window (64 blocks).
+    d.rig.h.tip += MnCheckpointLane::kRearmBackoffBlocks;
+    EXPECT_EQ(lane.rearm(d.cp, "desync 2"), MnCheckpointLane::RearmOutcome::Armed);
+    EXPECT_EQ(lane.rearms(), 2u);
+
+    // The window DOUBLES: 64 is no longer enough.
+    d.rig.h.tip += MnCheckpointLane::kRearmBackoffBlocks;
+    EXPECT_EQ(lane.rearm(d.cp, "desync 2b"),
+              MnCheckpointLane::RearmOutcome::Deferred)
+        << lane.last_rearm_reason();
+    d.rig.h.tip += MnCheckpointLane::kRearmBackoffBlocks;
+    EXPECT_EQ(lane.rearm(d.cp, "desync 3"), MnCheckpointLane::RearmOutcome::Armed);
+    EXPECT_EQ(lane.rearms(), MnCheckpointLane::kMaxRearms);
+
+    // #4 -- the cap. TERMINAL, and it must SAY so, not go quiet.
+    d.rig.h.tip += 100000;
+    EXPECT_EQ(lane.rearm(d.cp, "desync 4"),
+              MnCheckpointLane::RearmOutcome::CapExhausted);
+    EXPECT_EQ(lane.rearms(), MnCheckpointLane::kMaxRearms)
+        << "the cap must not be exceeded";
+    EXPECT_TRUE(lane.rearm_blocked());
+    EXPECT_NE(lane.last_rearm_reason().find("EXHAUSTED"), std::string::npos)
+        << lane.last_rearm_reason();
+    EXPECT_NE(lane.last_rearm_reason().find("STAYING DOWN ON PURPOSE"),
+              std::string::npos)
+        << "an operator must be able to grep the terminal reason: "
+        << lane.last_rearm_reason();
+
+    // ...and it stays terminal, restating itself rather than falling silent.
+    d.rig.h.tip += 100000;
+    EXPECT_EQ(lane.rearm(d.cp, "desync 5"),
+              MnCheckpointLane::RearmOutcome::Refused);
+    EXPECT_NE(lane.last_rearm_reason().find("TERMINALLY BLOCKED"),
+              std::string::npos)
+        << lane.last_rearm_reason();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 13. THE TRAP: a re-arm must NEVER select an anchor newer than the divergence
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// An anchor cut AFTER a divergence began replays PERFECTLY CLEANLY over a
+// shorter window -- and re-arms a queue that is already wrong, which mints a
+// coinbase the network rejects. That is the exact failure this whole lane
+// exists to prevent (mn_checkpoint_lane.hpp's header warns against it by
+// name). Newest-first is not a heuristic that is sometimes worse; it is the
+// bug.
+
+TEST(DashMnCheckpointReseed, ReArmRefusesAnAnchorNewerThanTheOneInUse)
+{
+    DirtyBridge d;
+    auto& lane = d.rig.h.lane;
+    lane.arm(d.cp);
+    lane.pump();
+    ASSERT_EQ(lane.state(), MnCheckpointLane::State::Published);
+
+    // The tempting candidate: a FRESHER anchor, closer to the tip, which would
+    // bridge in fewer blocks and replay without a single mismatch.
+    const uint32_t newer_h = DirtyBridge::kAnchorH + 2;
+    uint256 newer_hash = uint256S(kAnchorHash);
+    newer_hash.data()[0] = static_cast<unsigned char>(newer_h & 0xff);
+    newer_hash.data()[1] = static_cast<unsigned char>((newer_h >> 8) & 0xff);
+    auto newer = synthetic_anchor(64, newer_h, newer_hash);
+    ASSERT_TRUE(newer.ok);
+
+    EXPECT_EQ(lane.rearm(newer, "desync"), MnCheckpointLane::RearmOutcome::Refused);
+    EXPECT_EQ(lane.rearms(), 0u) << "nothing may be re-armed from it";
+    EXPECT_EQ(lane.anchor_height(), DirtyBridge::kAnchorH)
+        << "the lane must still be pinned to the release anchor";
+    EXPECT_EQ(lane.state(), MnCheckpointLane::State::Published)
+        << "a refused candidate must not disturb the lane's state";
+    EXPECT_NE(lane.last_rearm_reason().find("REFUSING A NEWER ANCHOR"),
+              std::string::npos)
+        << lane.last_rearm_reason();
+    EXPECT_TRUE(lane.rearm_blocked())
+        << "a newer anchor is a deterministic wiring error -- retrying it"
+           " forever would be a fail-loop";
+
+    // And it stays refused: even the CORRECT anchor cannot revive a lane that
+    // was asked to do the dangerous thing. Fail closed, loudly, once.
+    EXPECT_EQ(lane.rearm(d.cp, "desync"), MnCheckpointLane::RearmOutcome::Refused);
+    EXPECT_EQ(lane.rearms(), 0u);
+}
+
+// ── The second half of the same rule, isolated: even an anchor that is NOT
+// newer than the one in use is refused when it is not strictly OLDER than the
+// earliest divergence we have evidence of. Constructed with a zero-block
+// bridge (tip == anchor), which is the only way the anchor height and the
+// divergence height can coincide.
+TEST(DashMnCheckpointReseed, ReArmRefusesAnAnchorAtOrAfterTheDivergence)
+{
+    constexpr uint32_t kAnchorH = 2513000;
+    const uint256 anchor_hash = uint256S(kAnchorHash);
+    auto cp = synthetic_anchor(10, kAnchorH, anchor_hash);
+
+    BridgeHarness h;
+    h.headers[kAnchorH] = anchor_hash;
+    h.tip = kAnchorH;                    // zero-block bridge: publishes at once
+    h.lane.arm(cp);
+    h.lane.pump();
+    ASSERT_EQ(h.lane.state(), MnCheckpointLane::State::Published)
+        << h.lane.status();
+
+    // The ask itself IS the divergence evidence, and it is dated at the tip --
+    // which here equals the anchor height. So the anchor is not strictly older
+    // than the divergence and may not be replayed as if it were.
+    EXPECT_EQ(h.lane.rearm(cp, "desync at the anchor height"),
+              MnCheckpointLane::RearmOutcome::Refused);
+    EXPECT_EQ(h.lane.first_divergence_height(), kAnchorH);
+    EXPECT_EQ(h.lane.rearms(), 0u);
+    EXPECT_NE(h.lane.last_rearm_reason().find(
+                  "REFUSING AN ANCHOR AT OR AFTER THE DIVERGENCE"),
+              std::string::npos)
+        << h.lane.last_rearm_reason();
+}
+
+// ── FOUND BY MUTATION. Every assertion above survived deleting the body of
+// MnStateMachine::reset_sml_recovery_budget(): the DirtyBridge rig folds
+// wholesale, so its walk never SPENDS budget and `sml_recovery_spent() == 0`
+// held either way. A reset nothing can falsify is not a reset.
+//
+// MnStateMachine::load() deliberately does NOT zero the spend — a mid-run
+// snapshot reload must not hand itself a fresh licence to override the
+// projection — so a re-armed bridge inherits the previous bridge's spend
+// unless rearm() clears it. Inherited, the FIRST post-anchor PoSe ban of the
+// second bridge is refused over a budget it never used, and a bridge that
+// completed once fails closed on the replay of the identical window.
+TEST(DashMnCheckpointReseed, ReArmGivesTheSecondBridgeAFreshDemotionWalkBudget)
+{
+    RecoveryRig r;
+    // The walk's own scenario: dashd banned our queue head after the anchor
+    // was cut, so the block pays queue slot 2 and the walk spends one.
+    auto blk = repay_coinbase(block_from_hex(kBlockHex1519544),
+                              payout_of(r.cp, kQ1), payout_of(r.cp, kQ2));
+    r.h.lane.set_sml_validity_fn(sml_fn(all_valid_except({kQ1})));
+    r.run(blk);
+
+    ASSERT_EQ(r.h.lane.state(), MnCheckpointLane::State::Published)
+        << r.h.lane.status();
+    ASSERT_EQ(r.h.lane.sml_recovered(), 1u) << "the walk must actually have run";
+    ASSERT_EQ(r.h.lane.sml_recovery_spent(), 1u)
+        << "...and the MACHINE must be carrying that spend, or this test is"
+           " asserting nothing";
+
+    ASSERT_EQ(r.h.lane.rearm(r.cp, "unit test"),
+              MnCheckpointLane::RearmOutcome::Armed)
+        << r.h.lane.last_rearm_reason();
+    EXPECT_EQ(r.h.lane.sml_recovery_spent(), 0u)
+        << "a re-arm is a NEW bridge; the per-bridge walk budget must start"
+           " unspent or the first ban of the replay is refused over a budget"
+           " the replay never used";
+    EXPECT_EQ(r.h.lane.sml_recovered(), 0u);
+
+    // ...and the identical window replays to the identical result.
+    r.h.lane.pump();
+    EXPECT_EQ(r.h.lane.state(), MnCheckpointLane::State::Published)
+        << r.h.lane.status();
+    EXPECT_EQ(r.h.lane.sml_recovered(), 1u);
+    EXPECT_EQ(r.h.lane.sml_recovery_spent(), 1u);
+
+    // ── ALSO FOUND BY MUTATION: m_last_pump_next. This one-block rig is the
+    // only shape in which the stale value COLLIDES with the re-armed cursor
+    // (the first bridge left it at 1519544; the re-arm sets m_next to 1519544),
+    // so unreset it makes the very first pump of a healthy bridge report
+    // "bridge stalled ... re-requesting from the cursor". Nothing breaks — and
+    // that is the point: the lane would be lying about its own state on the
+    // one output an operator reads to decide whether the peer is serving.
+}
+
+// ── ALSO FOUND BY MUTATION: m_last_pump_next, the stall probe's memory.
+// Deleting its reset left every other case green, because on_block_connected
+// zeroes m_stalled_pumps as soon as a block lands — so the false stall is
+// invisible the instant the peer answers. It is visible exactly when it
+// matters: a re-armed bridge whose peer has NOT yet answered. Unreset, the
+// very first pump of a healthy bridge reports
+//
+//     [MN-CKPT] bridge stalled at h=... — re-requesting from the cursor
+//
+// which is the lane lying about its own state on the one line an operator
+// reads to decide whether to swap the peer. Nothing breaks; the diagnosis does.
+TEST(DashMnCheckpointReseed, ReArmClearsTheStallProbeSoAHealthyBridgeIsNotStalled)
+{
+    RecoveryRig r;
+    // A one-block bridge is the shape where the stale probe value COLLIDES
+    // with the re-armed cursor: the first bridge leaves m_last_pump_next at
+    // 1519544, and the re-arm sets the cursor back to exactly 1519544.
+    r.run(block_from_hex(kBlockHex1519544));
+    ASSERT_EQ(r.h.lane.state(), MnCheckpointLane::State::Published)
+        << r.h.lane.status();
+
+    // Silence the peer, so nothing can zero the counter behind our back.
+    r.h.auto_deliver = false;
+    ASSERT_EQ(r.h.lane.rearm(r.cp, "unit test"),
+              MnCheckpointLane::RearmOutcome::Armed);
+    r.h.lane.pump();
+
+    ASSERT_EQ(r.h.lane.state(), MnCheckpointLane::State::Bridging)
+        << r.h.lane.status();
+    EXPECT_EQ(r.h.lane.stalled_pumps(), 0u)
+        << "one pump into a fresh bridge cannot be a stall; a nonzero count"
+           " here is the PREVIOUS bridge's cursor talking";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 14. RECONCILIATION WITH #1033 — the on-demand arm's per-bridge state
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// #1033 added a second, independently-budgeted repair arm. Its counters are
+// per-BRIDGE in exactly the way the demotion walk's are, so a re-arm that does
+// not clear them hands the second bridge a budget the first one already spent.
+// With an explicit cap of 1 that is not a cosmetic miscount: the re-armed
+// bridge refuses the very fold it needs and FAILS CLOSED on a window it had
+// already replayed successfully — the daemonless arm then never comes back,
+// which is the whole defect this branch exists to fix, reintroduced one layer
+// down.
+//
+// The forced cap is the point of the fixture: it makes the carried counter
+// LETHAL rather than merely wrong, so the mutation that drops the reset is
+// caught by behaviour and not only by an equality on a getter.
+TEST(DashMnCheckpointReseed, ReArmGivesTheSecondBridgeAFreshOnDemandFoldBudget)
+{
+    SnapshotRig rig;
+    const auto cp = build_ondemand_scenario(rig);
+    // Exactly enough budget for the one repair this window needs. Carried into
+    // a second bridge, it is exactly one short.
+    rig.h.lane.set_ondemand_fold_cap(1);
+
+    rig.h.lane.arm(cp);
+    rig.h.lane.pump();
+
+    ASSERT_EQ(rig.h.lane.state(), MnCheckpointLane::State::Published)
+        << rig.h.lane.status();
+    ASSERT_EQ(rig.h.lane.ondemand_folds(), 1u)
+        << "the on-demand arm must actually have fired, or this test asserts"
+           " nothing: " << rig.h.lane.status();
+    ASSERT_EQ(rig.h.lane.ondemand_excluded(), 1u);
+    ASSERT_TRUE(rig.h.lane.ondemand_evaluated());
+    const size_t elig_1 = rig.h.lane.eligible_size();
+
+    ASSERT_EQ(rig.h.lane.rearm(cp, "unit test"),
+              MnCheckpointLane::RearmOutcome::Armed)
+        << rig.h.lane.last_rearm_reason();
+
+    // ── Every #1033 per-bridge field, back at its armed value.
+    EXPECT_EQ(rig.h.lane.ondemand_folds(), 0u)
+        << "a re-arm is a NEW bridge; its on-demand budget must start unspent";
+    EXPECT_EQ(rig.h.lane.ondemand_excluded(), 0u);
+    EXPECT_EQ(rig.h.lane.ondemand_abandoned(), 0u);
+    EXPECT_FALSE(rig.h.lane.ondemand_cap_hit());
+    EXPECT_FALSE(rig.h.lane.ondemand_evaluated())
+        << "ondemand_report() must not claim a mismatch reached the arm on a"
+           " bridge where none has yet";
+    // The FORCED cap is configuration and must SURVIVE — resetting it would
+    // silently re-enable an arm the operator disabled or re-sized.
+    EXPECT_EQ(rig.h.lane.ondemand_cap(), 1u)
+        << "an explicitly set cap is wiring, not bridge state";
+
+    // ── BEHAVIOURAL PROOF. With the counter carried, this second bridge hits
+    // the cap on the fold it needs and fails closed on a window it just
+    // replayed successfully.
+    rig.h.lane.pump();
+    EXPECT_EQ(rig.h.lane.state(), MnCheckpointLane::State::Published)
+        << "the re-armed bridge must recover the SAME ban it recovered the"
+           " first time: " << rig.h.lane.status();
+    EXPECT_EQ(rig.h.lane.ondemand_folds(), 1u);
+    EXPECT_EQ(rig.h.lane.ondemand_excluded(), 1u);
+    EXPECT_FALSE(rig.h.lane.ondemand_cap_hit());
+    EXPECT_EQ(rig.h.lane.eligible_size(), elig_1)
+        << "the published set must be identical to the first bridge's";
+}
+
+// ── The preserved mismatch context (#1033's PendingPayeeAdjudication), on the
+// ONLY path where a re-arm can actually observe it set.
+//
+// FIRST ATTEMPT AT THIS WAS A NON-TEST, and mutation caught it: asserting
+// `present == false` after a bridge that PUBLISHED proves nothing, because
+// apply_block clears m_pending on every block past its guards — so the last
+// successful block had already cleared it and deleting load()'s clear left the
+// suite green. The context is only still set when the bridge stopped ON the
+// mismatch, i.e. when it FAILED CLOSED.
+//
+// That state is reachable and is not hypothetical: bridge 1 publishes, the
+// maintainer desyncs live, the re-arm replays, and THAT bridge fails closed on
+// a mismatch its budget could not repair. A later desync re-arms again — and
+// the stale `ranked` from the failed bridge describes a queue the reloaded
+// anchor no longer has. Re-adjudicating against it is the wrong-queue publish
+// this whole lane exists to prevent.
+TEST(DashMnCheckpointReseed, ReArmDropsThePreservedMismatchOfAFailedBridge)
+{
+    SnapshotRig rig;
+    const auto cp = build_ondemand_scenario(rig);
+    rig.h.lane.set_ondemand_fold_cap(0);      // no repair -> stop ON the mismatch
+
+    rig.h.lane.arm(cp);
+    rig.h.lane.pump();
+    ASSERT_EQ(rig.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << rig.h.lane.status();
+
+    // The context IS preserved here — that is what makes the assertion below
+    // able to fail.
+    const auto& before = rig.h.lane.pending_payee_adjudication();
+    ASSERT_TRUE(before.present)
+        << "a bridge that stopped on a payee mismatch must have kept the"
+           " context, or this test is asserting nothing";
+    ASSERT_EQ(before.height, kOdMismatch);
+    ASSERT_FALSE(before.ranked.empty());
+
+    ASSERT_EQ(rig.h.lane.rearm(cp, "unit test"),
+              MnCheckpointLane::RearmOutcome::Armed)
+        << rig.h.lane.last_rearm_reason();
+
+    // reset_for_arm() reaches it through MnStateMachine::load(), which #1033
+    // already made responsible for dropping it. This asserts the PATH is
+    // reached, not that a second reset exists.
+    const auto& after = rig.h.lane.pending_payee_adjudication();
+    EXPECT_FALSE(after.present)
+        << "the preserved queue belongs to a set that no longer exists";
+    EXPECT_EQ(after.height, 0u);
+    EXPECT_TRUE(after.ranked.empty());
+    EXPECT_FALSE(after.projected.has_value());
+}

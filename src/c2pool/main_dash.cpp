@@ -3708,17 +3708,62 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         mnl->on_block_connected(bc.block, bc.height);
                     }));
 
-            // KNOWN GAP, deliberately left: this branch arms the lane and
-            // sets NO maintainer->set_on_mn_reseed() callback (the RPC branch
-            // above does). If the maintainer later wipes a desynced payee
-            // queue it has nothing to ask for a fresh authoritative set, so
-            // the embedded arm stays demoted until restart. Filling that seam
-            // is real work and depends on what fills it — a re-armed bridge
-            // from a NEWER anchor is the obvious candidate and is exactly the
-            // wrong-axis trap the anchor-selection TODO in
-            // mn_checkpoint_lane.hpp describes (an anchor cut after the
-            // divergence began replays cleanly and re-arms a wrong queue).
-            // Not wired here rather than wired wrongly.
+            // ── THE RE-SEED SEAM, now WIRED (was the KNOWN GAP) ───────────
+            // CoinStateMaintainer::on_block_connected, on a payee DESYNC or an
+            // apply GAP, wipes the payee set, latches m_mn_needs_reseed,
+            // demotes to the dashd fallback and calls m_on_mn_reseed(). The RPC
+            // branch above answers it with a fresh `protx list valid`. This
+            // branch used to answer it with NOTHING — the ask went into a void.
+            //
+            // MEASURED, contabo daemonless soak: the ask fired THREE times in
+            // one run (h=2513168, 2513261, 2515266). The last is ABOVE the
+            // bridge's own failure height, i.e. it fires on LIVE TIP ADVANCES,
+            // independently of any bridge replay. Nothing answered, so the
+            // payee set stayed wiped for the rest of the run and only a restart
+            // recovered it.
+            //
+            // The answer is a bridge RE-ARM from the SAME release-pinned
+            // anchor. NOT a newer one: an anchor cut AFTER a divergence began
+            // replays cleanly over a shorter window and re-arms a queue that is
+            // already wrong, which mints a coinbase the network rejects.
+            // MnCheckpointLane::rearm() refuses a newer anchor terminally, caps
+            // the re-arms, backs off in blocks between them, and names every
+            // outcome. See its header block for the policy and for what a
+            // genuine oldest-first LADDER would still need (a multi-anchor
+            // store that does not exist in this build).
+            //
+            // ORDERING IS SAFE: m_on_mn_reseed fires AFTER the maintainer has
+            // wiped the set, latched and demoted — so the embedded arm is
+            // already down and stays down until this bridge PUBLISHES through
+            // the leg-4 event, which is the only thing that clears the latch.
+            // Same io thread, no lock held (the lane takes none). The anchor is
+            // captured BY VALUE rather than re-parsed per ask: parsing is not
+            // free and a deferred ask must stay cheap.
+            maintainer->set_on_mn_reseed(
+                [mnl = mn_ckpt_lane.get(), anchor = ckpt]() {
+                    using Lane    = dash::coin::MnCheckpointLane;
+                    const auto out = mnl->rearm(
+                        anchor,
+                        "CoinStateMaintainer wiped a desynced/gapped payee"
+                        " queue and asked for an authoritative re-seed");
+                    std::cout << "[run] E2d MN-set RE-SEED ask -> bridge re-arm "
+                              << Lane::rearm_outcome_name(out)
+                              << " (" << mnl->rearms() << "/"
+                              << mnl->rearm_cap() << " re-arms used, "
+                              << mnl->rearm_asks() << " asks) — "
+                              << mnl->last_rearm_reason() << "\n";
+                    if (out != Lane::RearmOutcome::Armed) {
+                        std::cout << "[run] the embedded DASH arm stays DEMOTED;"
+                                     " templates keep routing to the dashd"
+                                     " fallback arm (if configured). No"
+                                     " masternode payee will be guessed.\n";
+                        return;
+                    }
+                    // Drive it immediately: the header chain is already well
+                    // past the anchor, so the replay starts on this call rather
+                    // than waiting for the next tip change.
+                    mnl->pump();
+                });
 
             // Kick the lane once now in case the header chain is already past
             // the anchor from a previous run's persisted header DB.

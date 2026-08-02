@@ -179,20 +179,27 @@
 ///   The removal pass narrows it — a banned member is now dropped from the
 ///   group before it can be projected — but does not close it.
 ///
-/// TODO (separate change, deliberately NOT half-done here): ANCHOR SELECTION
-/// ON REPEAT DESYNC. When a bridge fails closed and the operator re-arms,
-/// picking the NEWEST anchor is wrong: an anchor cut AFTER a divergence began
-/// replays cleanly over a shorter window and re-arms a queue that is already
-/// wrong, which mints a rejected coinbase. The correct policy is oldest-first
-/// on a repeat desync, with capped re-arms + backoff and the compiled-in
-/// checkpoint as the floor. It is not implementable in this file today: this
-/// build carries exactly ONE anchor per network
+/// ANCHOR SELECTION ON REPEAT DESYNC — PARTLY DONE, AND THE REST IS SCOPED
+/// RATHER THAN HALF-BUILT. rearm() (below) now answers the maintainer's
+/// authoritative-re-seed ask on the daemonless arm, capped and backed off, and
+/// it enforces the half of the policy this build CAN enforce: never an anchor
+/// newer than the one in use, never one at or after the earliest observed
+/// divergence, always the release-pinned floor. Picking the NEWEST anchor is
+/// wrong — an anchor cut AFTER a divergence began replays cleanly over a
+/// shorter window and re-arms a queue that is already wrong, which mints a
+/// rejected coinbase — and that case is now REFUSED terminally rather than
+/// merely warned about.
+///
+/// STILL MISSING, and required before a genuine oldest-first LADDER exists:
+/// this build carries exactly ONE anchor per network
 /// (src/impl/dash/coin/checkpoints/dash_mn_checkpoint_{mainnet,testnet}.inc,
-/// referenced once from main_dash.cpp), there is no anchor LIST to order and
-/// no persisted desync history to count re-arms against across restarts.
-/// Prerequisites: (1) a multi-anchor checkpoint store keyed by height,
-/// (2) a persisted per-anchor desync counter, (3) an arm()/re-arm API that
-/// takes a candidate list rather than a single MnCheckpoint.
+/// referenced once from main_dash.cpp), so there is no anchor LIST to order and
+/// no persisted desync history to count re-arms against ACROSS RESTARTS (the
+/// cap here is per-process). Prerequisites, unchanged: (1) a multi-anchor
+/// checkpoint store keyed by height, (2) a persisted per-anchor desync counter,
+/// (3) an arm()/re-arm API that takes a candidate list rather than a single
+/// MnCheckpoint. Until (1) exists, "oldest-first" and "the compiled-in anchor"
+/// are the same choice, which is why re-arming from it is legitimate today.
 ///
 /// FENCED: src/impl/dash only. Constructed exclusively by the opt-in embedded
 /// path in main_dash.cpp; the dashd-RPC fallback never touches this file.
@@ -212,6 +219,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -272,6 +280,26 @@ public:
         Published,    ///< set handed to the maintainer; lane is done
         FailedClosed, ///< terminal refusal — the arm must NOT serve templates
     };
+
+    /// What rearm() did. Every value is a NAMED outcome an operator can grep;
+    /// there is no "returned false, good luck" case.
+    enum class RearmOutcome {
+        Armed,        ///< the bridge is re-armed and will replay from the anchor
+        Deferred,     ///< backoff not satisfied yet — try again on a later trigger
+        CapExhausted, ///< TERMINAL: the re-arm budget is spent, the arm stays down
+        Refused,      ///< TERMINAL: this anchor may not be used (see the log)
+    };
+
+    static const char* rearm_outcome_name(RearmOutcome o)
+    {
+        switch (o) {
+            case RearmOutcome::Armed:        return "ARMED";
+            case RearmOutcome::Deferred:     return "DEFERRED";
+            case RearmOutcome::CapExhausted: return "CAP-EXHAUSTED";
+            case RearmOutcome::Refused:      return "REFUSED";
+        }
+        return "UNKNOWN";
+    }
 
     /// ~34 days of DASH blocks at 2.5 min spacing. Chosen so a release cut
     /// within the last month bridges in minutes over the coin-P2P feed, and
@@ -354,46 +382,7 @@ public:
             LOG_ERROR << "[MN-CKPT] " << m_status;
             return;
         }
-        m_anchor_height = cp.height;
-        m_anchor_hash   = cp.blockhash;
-        m_anchor_source = cp.source;
-        m_anchor_count  = cp.entries.size();
-        m_machine.load(cp.entries, cp.height);
-        // F6: reset the one-shot fold latch and its counters. The latch is the
-        // dangerous one — a second bridge on a re-armed lane would run
-        // additions-only while sml_folded() still reported true, i.e. it would
-        // LIE about having applied removals.
-        m_sml_folded       = false;
-        m_sml_folded_at    = 0;
-        m_folds            = 0;
-        m_first_fold_height = 0;
-        m_last_fold_height = 0;
-        m_anchor_fold_done = false;
-        m_snapshot_pending = false;
-        m_snapshot_hash    = uint256();
-        m_snapshot_height  = 0;
-        m_snapshot_waits   = 0;
-        m_abandoned_folds  = 0;
-        m_abandoned.clear();
-        m_ondemand_pending  = false;
-        m_ondemand_height   = 0;
-        m_ondemand_folds    = 0;
-        m_ondemand_excluded = 0;
-        m_ondemand_cap_hit  = false;
-        m_ondemand_evaluated = false;
-        m_ondemand_abandoned = 0;
-        m_ondemand_block    = BlockType{};
-        m_ondemand_r        = MnStateMachine::ApplyResult{};
-        m_pose_removed    = 0;
-        m_pose_reinstated = 0;
-        m_sml_recovered   = 0;
-        m_registered      = 0;
-        m_spent           = 0;
-        m_applied         = 0;
-        m_warned_no_sml   = false;
-        m_anchor_eligible = m_machine.eligible_size();
-        m_next  = cp.height + 1;
-        m_state = State::Waiting;
+        reset_for_arm(cp);
         m_status = "armed at h=" + std::to_string(cp.height) + " ("
                    + std::to_string(m_anchor_count) + " masternodes), waiting"
                      " for headers to reach the anchor";
@@ -401,6 +390,239 @@ public:
                  << cp.blockhash.GetHex().substr(0, 16) << " count="
                  << m_anchor_count << " source='" << cp.source << "'";
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // RE-ARM — the answer to CoinStateMaintainer's authoritative-re-seed ask
+    // ─────────────────────────────────────────────────────────────────────
+    //
+    // WHAT WAS BROKEN. CoinStateMaintainer::on_block_connected, on a payee
+    // DESYNC or an apply GAP, wipes the payee set, latches m_mn_needs_reseed,
+    // demotes to the dashd fallback and calls m_on_mn_reseed(). On the
+    // dashd-RPC arm that callback re-runs `protx list valid`. On the DAEMONLESS
+    // arm main_dash set NO callback at all, so the ask went into a void: MEASURED
+    // on the contabo daemonless soak, three times in one run (h=2513168,
+    // 2513261, 2515266 — the last ABOVE the bridge's own failure height, i.e.
+    // on a LIVE tip advance, not a bridge-replay artefact). The payee set stayed
+    // wiped for the rest of the run and only a restart recovered it.
+    //
+    // WHAT ANSWERS IT NOW. A bridge RE-ARM: reload the anchor, replay forward to
+    // the current tip, publish through the same leg-4 event. arm() alone cannot
+    // do this — it assumes a VIRGIN lane and both terminal states are one-way —
+    // so the reset is factored into reset_for_arm(), which arm() and rearm()
+    // BOTH call. That is deliberate: two hand-maintained reset lists drift, and
+    // a field the second list forgets is a silent wrong-set bug, not a crash.
+    //
+    // ANCHOR SELECTION — THE TRAP THIS MUST NOT FALL INTO. On a REPEAT desync,
+    // picking the NEWEST anchor is WRONG: an anchor cut AFTER a divergence began
+    // replays perfectly cleanly over a shorter window and re-arms a queue that
+    // is ALREADY wrong, which mints a coinbase the network rejects — the exact
+    // failure this whole lane exists to prevent. The correct policy is
+    // OLDEST-FIRST. This build carries exactly ONE anchor per network, so:
+    //
+    //   • re-arming from the SAME compiled-in anchor is legitimate — it is the
+    //     release-pinned trust root, it is by construction not newer than any
+    //     divergence this process has observed, and it is the floor of any
+    //     future ladder.
+    //   • an anchor NEWER than the one in use, or at/after the earliest
+    //     divergence we have evidence of, is REFUSED TERMINALLY. It is a wiring
+    //     error, it is deterministic, and retrying it forever would be a
+    //     fail-loop dressed as recovery.
+    //
+    // A genuine oldest-first LADDER still needs what the TODO at the top of this
+    // file lists and this change does NOT half-build: a multi-anchor store keyed
+    // by height, a persisted per-anchor desync counter, and an arm() that takes
+    // a candidate list. Scoped, not started.
+    //
+    // CAP + BACKOFF. An unbounded re-arm against a deterministic failure is a
+    // fail-loop with extra steps — worse than staying down, because it hides the
+    // problem. Cap: kMaxRearms. Backoff: measured in BLOCKS observed at the tip
+    // seam (the lane owns no timer and must not grow one), doubling per attempt.
+    // Neither counter is reset by a successful publish: a bridge that publishes
+    // and then desyncs AGAIN is precisely the loop being bounded.
+
+    /// How many re-arms one process will attempt. THREE, because three is what
+    /// the measurement showed: the soak's live path asked three times in one
+    /// run. A fourth ask inside one process is no longer "a transient desync",
+    /// it is a standing disagreement between our replayed queue and the chain,
+    /// and the honest response is to stay down loudly.
+    static constexpr uint32_t kMaxRearms = 3;
+    /// Blocks that must pass at the tip before the SECOND re-arm; doubled for
+    /// each one after that (64, then 128). Sized off the same measurement: the
+    /// observed repeat gaps were 93 and 2005 blocks, so 64 admits both real
+    /// repeats while refusing the pathological back-to-back retry that would
+    /// replay the identical window and fail identically.
+    static constexpr uint32_t kRearmBackoffBlocks = 64;
+
+    /// Re-arm the bridge after the maintainer wiped a desynced payee queue.
+    /// `why` is the operator-facing trigger text and appears in every line.
+    RearmOutcome rearm(const MnCheckpoint& cp, const std::string& why)
+    {
+        ++m_rearm_asks;
+        // A field never evaluated prints "n/a", never "0" — 0 is a height.
+        const bool     have_tip = static_cast<bool>(m_tip_height);
+        const uint32_t at       = have_tip ? m_tip_height() : 0;
+        const std::string at_s  = have_tip ? std::to_string(at)
+                                           : std::string("n/a");
+        const std::string attempt_s = std::to_string(m_rearms + 1) + "/"
+                                      + std::to_string(kMaxRearms);
+        auto say = [&](RearmOutcome o, const std::string& detail) {
+            m_last_rearm_reason = std::string(rearm_outcome_name(o)) + ": "
+                                  + detail;
+            std::ostringstream ln;
+            ln << "[MN-CKPT] RE-ARM " << rearm_outcome_name(o)
+               << " (ask #" << m_rearm_asks << ", attempt " << attempt_s
+               << ", " << m_rearms << " already used)"
+               << " trigger='" << why << "'"
+               << " anchor h=" << (cp.ok ? std::to_string(cp.height)
+                                         : std::string("n/a"))
+               << " source='" << (cp.ok ? cp.source : std::string("n/a")) << "'"
+               << " observed tip h=" << at_s
+               << " last re-arm at h="
+               << (m_rearms == 0 ? std::string("n/a")
+                                 : (m_last_rearm_at_known
+                                        ? std::to_string(m_last_rearm_at)
+                                        : std::string("n/a")))
+               << " — " << detail;
+            if (o == RearmOutcome::Armed) LOG_INFO << ln.str();
+            else if (o == RearmOutcome::Deferred) LOG_WARNING << ln.str();
+            else LOG_ERROR << ln.str();
+            return o;
+        };
+
+        if (m_rearm_blocked) {
+            return say(RearmOutcome::Refused,
+                       "re-arming is TERMINALLY BLOCKED for this process: "
+                       + m_rearm_block_reason
+                       + ". The embedded DASH arm stays demoted to the dashd"
+                         " fallback until the operator restarts with a fixed"
+                         " anchor or a coin RPC (--coin-rpc-*).");
+        }
+        if (m_rearms >= kMaxRearms) {
+            m_rearm_blocked = true;
+            m_rearm_block_reason =
+                "the re-arm cap of " + std::to_string(kMaxRearms)
+                + " is EXHAUSTED";
+            return say(RearmOutcome::CapExhausted,
+                       "the re-arm cap of " + std::to_string(kMaxRearms)
+                       + " is EXHAUSTED. Our replayed payee queue keeps"
+                         " diverging from the chain, so re-replaying the SAME"
+                         " release-pinned anchor will keep producing the SAME"
+                         " wrong queue. STAYING DOWN ON PURPOSE — a fourth"
+                         " re-arm would be a fail-loop that hides this. The"
+                         " embedded DASH arm will NOT serve templates;"
+                         " templates keep routing to the dashd fallback arm (if"
+                         " configured). Fix: upgrade to a release carrying a"
+                         " fresher masternode-set anchor, or run with a coin"
+                         " RPC (--coin-rpc-*) so the authoritative protx seed"
+                         " is used.");
+        }
+        if (!cp.ok) {
+            m_rearm_blocked      = true;
+            m_rearm_block_reason = "the candidate anchor does not parse ("
+                                   + cp.error + ")";
+            return say(RearmOutcome::Refused,
+                       "the candidate anchor does not parse: " + cp.error
+                       + ". Nothing to re-arm from.");
+        }
+
+        // ── THE ANCHOR-SELECTION GUARD (never newest-first) ───────────────
+        // Record the earliest height at which we have evidence of divergence.
+        // Every re-seed ask IS such evidence: the maintainer only calls back
+        // after apply_block reported a payee desync or an apply gap.
+        if (have_tip && (m_first_divergence == 0 || at < m_first_divergence))
+            m_first_divergence = at;
+
+        if (m_anchor_height != 0 && cp.height > m_anchor_height) {
+            m_rearm_blocked = true;
+            m_rearm_block_reason =
+                "the candidate anchor h=" + std::to_string(cp.height)
+                + " is NEWER than the anchor already in use h="
+                + std::to_string(m_anchor_height);
+            return say(RearmOutcome::Refused,
+                       "REFUSING A NEWER ANCHOR. Candidate h="
+                       + std::to_string(cp.height) + " is newer than the anchor"
+                         " already in use h=" + std::to_string(m_anchor_height)
+                       + ". On a REPEAT desync an anchor cut AFTER the"
+                         " divergence began replays cleanly over a shorter"
+                         " window and re-arms a queue that is ALREADY wrong —"
+                         " which mints a coinbase the network rejects. Policy"
+                         " is oldest-first with the compiled-in checkpoint as"
+                         " the floor; this build carries one anchor per network"
+                         " and there is no older one to fall back to.");
+        }
+        if (m_first_divergence != 0 && cp.height >= m_first_divergence) {
+            m_rearm_blocked = true;
+            m_rearm_block_reason =
+                "the candidate anchor h=" + std::to_string(cp.height)
+                + " is at or after the earliest observed divergence h="
+                + std::to_string(m_first_divergence);
+            return say(RearmOutcome::Refused,
+                       "REFUSING AN ANCHOR AT OR AFTER THE DIVERGENCE."
+                       " Candidate h=" + std::to_string(cp.height)
+                       + " is not strictly older than the earliest divergence"
+                         " we have evidence of (h="
+                       + std::to_string(m_first_divergence)
+                       + "). Such an anchor replays cleanly BECAUSE it already"
+                         " contains the divergence — it would re-arm a wrong"
+                         " queue and mint a rejected coinbase.");
+        }
+
+        // ── BACKOFF ──────────────────────────────────────────────────────
+        if (m_rearms > 0) {
+            const uint32_t need = kRearmBackoffBlocks << (m_rearms - 1);
+            if (!have_tip || !m_last_rearm_at_known) {
+                return say(RearmOutcome::Deferred,
+                           "cannot evaluate the " + std::to_string(need)
+                           + "-block backoff: no tip-height seam is wired, so"
+                             " the lane cannot tell how far the chain has moved"
+                             " since the last re-arm. Deferring rather than"
+                             " guessing.");
+            }
+            if (at < m_last_rearm_at + need) {
+                return say(RearmOutcome::Deferred,
+                           "BACKOFF: only "
+                           + std::to_string(at - m_last_rearm_at)
+                           + " blocks since the last re-arm at h="
+                           + std::to_string(m_last_rearm_at) + ", need "
+                           + std::to_string(need)
+                           + ". Re-replaying the same window immediately would"
+                             " fail identically. The arm stays down until the"
+                             " chain has moved on; this attempt is NOT counted"
+                             " against the cap.");
+            }
+        }
+
+        ++m_rearms;
+        m_last_rearm_at       = at;
+        m_last_rearm_at_known = have_tip;
+        reset_for_arm(cp);
+        m_status = "RE-ARMED " + std::to_string(m_rearms) + "/"
+                   + std::to_string(kMaxRearms) + " at h="
+                   + std::to_string(cp.height) + " ("
+                   + std::to_string(m_anchor_count) + " masternodes) after "
+                   + why + "; replaying forward to the tip";
+        return say(RearmOutcome::Armed,
+                   "re-armed from the release-pinned anchor (the trust root, and"
+                   " by construction not newer than any observed divergence);"
+                   " replaying anchor+1..tip. Until this bridge PUBLISHES the"
+                   " embedded arm stays demoted and templates keep routing to"
+                   " the dashd fallback.");
+    }
+
+    /// How many re-arms have actually been spent against the cap.
+    uint32_t rearms() const           { return m_rearms; }
+    /// How many times a re-seed was ASKED for, including deferrals and
+    /// refusals. Deliberately distinct from rearms(): "asked 9 times, re-armed
+    /// 3" and "asked 3 times, re-armed 3" are different diagnoses.
+    uint32_t rearm_asks() const       { return m_rearm_asks; }
+    uint32_t rearm_cap() const        { return kMaxRearms; }
+    bool     rearm_blocked() const    { return m_rearm_blocked; }
+    /// The last named outcome, verbatim. Empty until the first ask — which is
+    /// itself the answer to "was a re-seed ever asked for".
+    const std::string& last_rearm_reason() const { return m_last_rearm_reason; }
+    /// The earliest height at which a re-seed ask gave us evidence of
+    /// divergence; 0 = no such evidence (never a valid height here).
+    uint32_t first_divergence_height() const { return m_first_divergence; }
 
     State              state()  const { return m_state; }
     const std::string& status() const { return m_status; }
@@ -440,10 +662,43 @@ public:
     size_t   ondemand_cap()       const { return m_ondemand_cap; }
     bool     ondemand_cap_hit()   const { return m_ondemand_cap_hit; }
     bool     ondemand_evaluated() const { return m_ondemand_evaluated; }
+    /// On-demand asks that were never answered. #1033 kept this SEPARATE from
+    /// m_abandoned_folds on purpose (reusing that one made the report claim
+    /// "the replay carried on degraded" when it had not); it is surfaced here
+    /// for the same reason the fold counters are — and so a re-arm can be
+    /// proven to clear it.
+    size_t   ondemand_abandoned() const { return m_ondemand_abandoned; }
+    /// #1033's preserved mismatch context, read through the lane. A re-arm
+    /// reloads the anchor via MnStateMachine::load(), which already drops
+    /// this — exposing it is how that path is PROVEN to be reached rather
+    /// than assumed.
+    const MnStateMachine::PendingPayeeAdjudication&
+    pending_payee_adjudication() const
+    {
+        return m_machine.pending_payee_adjudication();
+    }
     size_t   replay_registered()  const { return m_registered; }
     size_t   replay_spent()       const { return m_spent; }
     bool     failed_closed() const { return m_state == State::FailedClosed; }
     bool     published()     const { return m_state == State::Published; }
+    /// ── The RE-ARM RESET witnesses ────────────────────────────────────────
+    /// Exposed so a test can assert that rearm() actually cleared them, not
+    /// merely that the lane "looked armed". Each of these was set by a
+    /// COMPLETED bridge and, before reset_for_arm() existed, survived arm():
+    /// m_requested_through is the load-bearing one — left stale it makes
+    /// request_window() compute `from > end` and issue NO getdata at all, so a
+    /// re-armed bridge would sit at its cursor forever with no symptom.
+    bool     position_verified()  const { return m_position_verified; }
+    uint32_t requested_through()  const { return m_requested_through; }
+    uint32_t stalled_pumps()      const { return m_stalled_pumps; }
+    size_t   sml_recovery_cap()   const { return m_sml_recovery_cap; }
+    /// The machine's SPENT per-bridge demotion-walk budget. MnStateMachine::
+    /// load() does not zero it, so a re-armed bridge would otherwise inherit
+    /// the previous bridge's spend and fail closed on its first PoSe ban.
+    size_t   sml_recovery_spent() const { return m_machine.sml_recovered_total(); }
+    uint32_t last_fold_height()   const { return m_last_fold_height; }
+    bool     anchor_fold_done()   const { return m_anchor_fold_done; }
+    size_t   replay_applied()     const { return m_applied; }
 
     /// Drive the bridge: verify the anchor's chain position once the header
     /// chain reaches it, enforce the staleness bound, request the next window
@@ -1471,6 +1726,15 @@ public:
             m_status += " — NO per-height fold was ever applied; this set is"
                         " the additions-only replay plus the walk";
         }
+        // A publish that is the OUTPUT OF A RE-ARM must not read like a clean
+        // cold start. It is a recovery from a payee desync, and how much of the
+        // per-process budget it consumed is the operator's warning that the
+        // next desync may be the last one this process can answer.
+        if (m_rearms != 0) {
+            m_status += " [RE-ARM " + std::to_string(m_rearms) + "/"
+                        + std::to_string(kMaxRearms) + " — this set is a"
+                          " recovery from a payee desync, not a cold start]";
+        }
         LOG_INFO << "[MN-CKPT] bridge COMPLETE: published " << out.size()
                  << " masternodes (" << m_sml_recovered
                  << " SML-recovered exclusions) as-of h=" << as_of
@@ -1491,6 +1755,141 @@ public:
         LOG_ERROR << "[MN-CKPT] the embedded DASH template arm will NOT serve;"
                      " templates keep routing to the dashd fallback arm (if"
                      " configured). No masternode payee will be guessed.";
+        // Say which generation of the bridge this was, and whether any budget
+        // to try again remains. "FAIL-CLOSED" on its own does not distinguish
+        // "first attempt, three re-arms left" from "last attempt, nothing left".
+        LOG_ERROR << "[MN-CKPT] RE-ARM POSTURE: "
+                  << (m_rearms == 0 ? std::string("this was the ORIGINAL arm")
+                                    : ("this was RE-ARM " + std::to_string(m_rearms)
+                                       + "/" + std::to_string(kMaxRearms)))
+                  << "; re-seed asks so far: " << m_rearm_asks << "; "
+                  << (m_rearm_blocked
+                          ? ("further re-arms are TERMINALLY BLOCKED ("
+                             + m_rearm_block_reason + ")")
+                          : ("re-arms remaining: "
+                             + std::to_string(kMaxRearms - m_rearms)
+                             + " — a further payee desync from the maintainer"
+                               " will trigger one"))
+                  << ". Last re-arm outcome: "
+                  << (m_last_rearm_reason.empty()
+                          ? std::string("n/a (no re-seed has ever been asked"
+                                        " for)")
+                          : m_last_rearm_reason);
+    }
+
+    /// EVERY field an arm starts from, in ONE place.
+    ///
+    /// arm() and rearm() both call this. That is the whole point: a second,
+    /// hand-maintained reset list inside rearm() would drift from this one, and
+    /// a field it forgot would not crash — it would publish a WRONG masternode
+    /// set. "rearm() resets everything arm() sets" is therefore true by
+    /// construction rather than by review.
+    ///
+    /// It also resets seven fields the old arm() did NOT, all of which are
+    /// harmless on a virgin lane (they are zero-initialised, so this is a no-op
+    /// at startup) and all of which are bugs on a re-arm:
+    ///
+    ///   m_requested_through     — stale => request_window() computes from>end
+    ///                             and issues NO getdata; the bridge wedges.
+    ///   m_last_pump_next        — stale => the stall probe fires (or fails to)
+    ///                             against the PREVIOUS bridge's cursor.
+    ///   m_stalled_pumps         — stale => a fresh bridge inherits a stall
+    ///                             count it did not earn.
+    ///   m_rerequest_from_cursor — stale => one spurious full-window re-request.
+    ///   m_position_verified     — stale => a DIFFERENT anchor would skip the
+    ///                             chain-position check entirely.
+    ///   m_last_wait_log         — stale => the "waiting for headers" line is
+    ///                             suppressed for the whole next decade of
+    ///                             heights.
+    ///   m_sml_recovery_cap      — stale => status()/divergence_report() quote
+    ///                             the previous bridge's budget.
+    ///
+    /// The machine's SPENT walk budget is zeroed too (see
+    /// MnStateMachine::reset_sml_recovery_budget) — load() deliberately does
+    /// not, and a re-arm is a new bridge.
+    ///
+    /// HONEST NOTE ON COVERAGE. Mutation testing kills the deletion of every
+    /// line in this function EXCEPT two, and they are stated rather than
+    /// papered over: m_rerequest_from_cursor (unreset: at most one spurious
+    /// duplicate getdata pass, which apply_block skips) and m_last_wait_log
+    /// (unreset: one INFO line's rate limiter is off for the next 10000
+    /// heights). Neither has a reward-path or diagnostic effect worth a test;
+    /// both are reset anyway, because leaving a field dirty on purpose is how
+    /// the next one gets missed.
+    ///
+    /// NOT reset here, on purpose: the re-arm bookkeeping (m_rearms,
+    /// m_rearm_asks, m_last_rearm_at, m_first_divergence, m_rearm_blocked,
+    /// m_last_rearm_reason). It MUST survive a re-arm or the cap can never
+    /// fire. Nor the configured seams / m_max_bridge / m_fold_interval /
+    /// m_has_sml_fn, which are wiring, not bridge state.
+    void reset_for_arm(const MnCheckpoint& cp)
+    {
+        m_anchor_height = cp.height;
+        m_anchor_hash   = cp.blockhash;
+        m_anchor_source = cp.source;
+        m_anchor_count  = cp.entries.size();
+        m_machine.load(cp.entries, cp.height);
+        m_machine.reset_sml_recovery_budget();
+        // F6: reset the one-shot fold latch and its counters. The latch is the
+        // dangerous one — a second bridge on a re-armed lane would run
+        // additions-only while sml_folded() still reported true, i.e. it would
+        // LIE about having applied removals.
+        m_sml_folded       = false;
+        m_sml_folded_at    = 0;
+        m_folds            = 0;
+        m_first_fold_height = 0;
+        m_last_fold_height = 0;
+        m_anchor_fold_done = false;
+        m_snapshot_pending = false;
+        m_snapshot_hash    = uint256();
+        m_snapshot_height  = 0;
+        m_snapshot_waits   = 0;
+        m_abandoned_folds  = 0;
+        m_abandoned.clear();
+        // ── #1033 ON-DEMAND fold state. Every field the on-demand arm carries
+        // across a bridge, reset for the next one. The one-shot-ish latches
+        // are the dangerous half again: m_ondemand_cap_hit unreset makes a
+        // fresh bridge report a budget it never spent, and m_ondemand_evaluated
+        // unreset makes ondemand_report() claim a mismatch reached the arm on a
+        // bridge where none did — a report that lies in the SAFE-looking
+        // direction is still a report an operator will act on.
+        m_ondemand_pending   = false;
+        m_ondemand_height    = 0;
+        m_ondemand_folds     = 0;
+        m_ondemand_excluded  = 0;
+        m_ondemand_cap_hit   = false;
+        m_ondemand_evaluated = false;
+        m_ondemand_abandoned = 0;
+        m_ondemand_block     = BlockType{};
+        m_ondemand_r         = MnStateMachine::ApplyResult{};
+        // The SIZED cap, which #1033's arm() did not reset. pump() recomputes
+        // it at the Waiting->Bridging edge (kOnDemandFoldBase + replay/250),
+        // exactly like m_sml_recovery_cap — so between a re-arm and the first
+        // pump, status() and ondemand_report() would otherwise quote the
+        // PREVIOUS bridge's budget. Restored to the declared default, never to
+        // 0: a 0 cap has its own meaning ("the on-demand arm is disabled"),
+        // and manufacturing that state here would be a different lie.
+        // m_ondemand_cap_forced is CONFIG (set_ondemand_fold_cap) and survives,
+        // which is why the reset is guarded the same way pump()'s sizing is.
+        if (!m_ondemand_cap_forced) m_ondemand_cap = kOnDemandFoldBase;
+        m_pose_removed    = 0;
+        m_pose_reinstated = 0;
+        m_sml_recovered   = 0;
+        m_registered      = 0;
+        m_spent           = 0;
+        m_applied         = 0;
+        m_warned_no_sml   = false;
+        // The seven arm() used to forget.
+        m_sml_recovery_cap      = 0;
+        m_stalled_pumps         = 0;
+        m_last_pump_next        = 0;
+        m_requested_through     = 0;
+        m_rerequest_from_cursor = false;
+        m_last_wait_log         = 0;
+        m_position_verified     = false;
+        m_anchor_eligible = m_machine.eligible_size();
+        m_next  = cp.height + 1;
+        m_state = State::Waiting;
     }
 
     MnStateMachine m_machine;
@@ -1559,6 +1958,18 @@ public:
     bool     m_rerequest_from_cursor{false};
     uint32_t m_last_wait_log{0};
     bool     m_position_verified{false};
+
+    // ── RE-ARM bookkeeping. Survives reset_for_arm() by design: if a re-arm
+    // cleared its own counters the cap could never fire and the "recovery"
+    // would be an unbounded fail-loop.
+    uint32_t    m_rearms{0};              // spent against kMaxRearms
+    uint32_t    m_rearm_asks{0};          // asks, including deferred/refused
+    uint32_t    m_last_rearm_at{0};       // tip height at the last re-arm
+    bool        m_last_rearm_at_known{false};
+    uint32_t    m_first_divergence{0};    // earliest divergence evidence
+    bool        m_rearm_blocked{false};   // terminal: no further re-arms
+    std::string m_rearm_block_reason;
+    std::string m_last_rearm_reason;
 };
 
 } // namespace coin
