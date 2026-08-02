@@ -497,20 +497,6 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_superblock PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
     gtest_add_tests(test_dash_superblock "" AUTO)
 
-    # R3 — governance-vote BLS operator-key verify KAT. Links dash_bls_verify
-    # (the ONLY test that does): the real from-wire DELETE-signal vote verifies
-    # against the real MN operator key; tamper/wrong-key/wrong-digest/wrong-size
-    # reject; the synthetic end-to-end pins the fail-closed threshold ladder.
-    add_executable(test_dash_govvote_bls test_dash_govvote_bls.cpp)
-    target_link_libraries(test_dash_govvote_bls PRIVATE
-        GTest::gtest_main GTest::gtest
-        dash_bls_verify
-        dash_x11 core
-        nlohmann_json::nlohmann_json
-        ${Boost_LIBRARIES}
-    )
-    target_link_libraries(test_dash_govvote_bls PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)
-    gtest_add_tests(test_dash_govvote_bls "" AUTO)
 
     # DASH external-dashd RPC creds-resolution KAT (launcher slice 4): dash.conf
     # rpcuser/rpcpassword/rpcport parse + --coin-rpc endpoint override + armed()
@@ -646,6 +632,28 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_dash_quorum_member_source PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_quorum_member_source "" AUTO)
+    # R3 — governance-vote BLS operator-key verify KAT. Links dash_bls_verify
+    # (the ONLY test that does): the real from-wire DELETE-signal vote verifies
+    # against the real MN operator key; tamper/wrong-key/wrong-digest/wrong-size
+    # reject; the synthetic end-to-end pins the fail-closed threshold ladder.
+    # BLS-backend-gated like the three tests above: the crypto path needs the
+    # dashbls backend, so it is declared inside C2POOL_DASH_BLS and built in the
+    # linux-dash-bls leg. gtest_discover_tests PRE_TEST (not AUTO) discovers the
+    # DashGovVoteBLS.* cases from the built binary at test time, so they are
+    # never phantom-registered into the default-OFF build_ci leg -- the #818
+    # drift that reddened Linux x86_64 (cases registered at configure time by
+    # source-scan while the binary is never built, so ctest cannot find it).
+    add_executable(test_dash_govvote_bls test_dash_govvote_bls.cpp)
+    target_link_libraries(test_dash_govvote_bls PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_bls_verify
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_govvote_bls PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)
+    gtest_discover_tests(test_dash_govvote_bls DISCOVERY_MODE PRE_TEST)
+
     endif()  # C2POOL_DASH_BLS: the BLS-crypto KATs need the dashbls backend (built in the linux-dash-bls job); skipped in the default OFF build
 
     # DASH masternode state-machine (S7 leaf): vendored ProTx wire
