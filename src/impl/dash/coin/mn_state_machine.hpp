@@ -179,6 +179,42 @@ public:
         size_t sml_recovered{0};
     };
 
+    /// ─────────────────────────────────────────────────────────────────────
+    /// WHAT A MISMATCH LEAVES BEHIND, SO IT CAN BE RE-ASKED
+    /// ─────────────────────────────────────────────────────────────────────
+    /// When pass 3 reports payee_desync it has already refused to attribute
+    /// anything — no state was guessed. But the block's own passes 1/2 DID
+    /// run, and `ranked` was computed from the PRE-block list, which no longer
+    /// exists once those passes have run. So a caller that later obtains a
+    /// BETTER-DATED masternode list cannot simply re-apply the block: the
+    /// forward-only cursor refuses it, and re-deriving `ranked` post-apply
+    /// gives a different queue.
+    ///
+    /// This is the exact context needed to re-adjudicate ONLY pass 3 against a
+    /// list we did not have when the block arrived. It is written on every
+    /// payee_desync and cleared the moment another block is applied, so it can
+    /// only ever describe the height the cursor is standing on.
+    struct PendingPayeeAdjudication {
+        bool                   present{false};
+        uint32_t               height{0};
+        std::vector<uint256>   ranked;      ///< PRE-block DIP-3 queue, in order
+        std::optional<uint256> projected;   ///< ranked.front()
+    };
+    const PendingPayeeAdjudication& pending_payee_adjudication() const
+    {
+        return m_pending;
+    }
+
+    /// Outcome of readjudicate_payee(). `refusal` is a sentence, not a code:
+    /// it lands verbatim in the lane's fail-closed line, which is the only
+    /// record an operator gets.
+    struct ReadjudicateResult {
+        bool                   recovered{false};
+        size_t                 excluded{0};   ///< queue heads permanently retired
+        std::optional<uint256> accepted;      ///< who the payment was attributed to
+        std::string            refusal;
+    };
+
     /// Optional validity attestation for a proTxHash, sourced from the
     /// Simplified Masternode List. THREE-state on purpose:
     ///
@@ -287,6 +323,10 @@ public:
         m_entries.clear();
         m_collateral_index.clear();
         m_last_applied_height = as_of_height;
+        // A pending mismatch describes a queue that no longer exists once the
+        // set is reloaded. Leaving it would let a re-armed lane re-adjudicate
+        // an old height against a new set.
+        m_pending = PendingPayeeAdjudication{};
         for (auto& [h, st] : entries) {
             m_collateral_index[st.collateralOutpoint] = h;
             m_entries.emplace(h, std::move(st));
@@ -300,7 +340,8 @@ public:
 
     size_t size() const { return m_entries.size(); }
 
-    const std::map<uint256, MNState>& entries() const { return m_entries; }
+    using Entries = std::map<uint256, MNState>;
+    const Entries& entries() const { return m_entries; }
 
     std::optional<uint256> find_by_collateral(
         const bitcoin_family::coin::TxPrevOut& outpoint) const
@@ -702,6 +743,139 @@ public:
         return m_sml_height >= height;
     }
 
+    /// ─────────────────────────────────────────────────────────────────────
+    /// readjudicate_payee — the ON-DEMAND arm of the PoSe repair
+    /// ─────────────────────────────────────────────────────────────────────
+    ///
+    /// THE DEFECT THIS CLOSES, measured on mainnet (contabo daemonless soak,
+    /// anchor 2513000):
+    ///
+    ///     h=2513000  protx list valid 2068  projected payee PRESENT   <- fold
+    ///     h=2513400                   2068  PRESENT
+    ///     h=2513488                   2066  ABSENT   <- PoSe-banned in here
+    ///     h=2513489                   2066  ABSENT   <- we projected it anyway
+    ///     next scheduled fold point   2513500        <- ELEVEN BLOCKS LATE
+    ///
+    /// The fold MECHANISM was right; its GRANULARITY was wrong. A ban landing
+    /// strictly INSIDE a fold interval is invisible to fold points, and the
+    /// reactive walk that does fire at the mismatch was consulting a list up
+    /// to `fold_interval - 1` blocks stale.
+    ///
+    /// Shrinking the interval is the wrong fix twice over: it pays a network
+    /// round trip continuously, AND it still leaves a window. Asking AT the
+    /// mismatch pays a round trip only when a mismatch actually happens, and
+    /// leaves NO window — the list is dated at the very height being judged.
+    ///
+    /// CONTRACT. `sml` MUST be dated exactly at `height` and MUST already have
+    /// been DIP-4 client-verified by the caller (historical_sml.hpp). This
+    /// function does not authenticate; it adjudicates. `height` must be the
+    /// height of the pending mismatch AND the current apply cursor — both are
+    /// checked, and a mismatch on either is a refusal, never an attempt.
+    ///
+    /// WHY A LIST DATED AT `height` IS THE RIGHT JUDGE. dashd chooses block
+    /// H's payee from the list as of H-1, so a masternode banned exactly AT H
+    /// would still have been paid at H. We only get here because the projected
+    /// masternode was NOT paid, so any ban this list attests for it either
+    /// predates H (the case we are repairing) or is simultaneous with H — and
+    /// in the simultaneous case the masternode is genuinely out from H onward,
+    /// so retiring it with banHeight=H is exactly right for every later block.
+    ///
+    /// The ACCEPTANCE evidence is unchanged and unrelaxed: the accepted
+    /// candidate's scriptPayout must EXACTLY equal an output this block pays.
+    /// A better-dated list buys a better attestation; it never buys a guess.
+    ///
+    /// NO BUDGET IS SPENT. The budgeted walk (recover_from_sml_ban) is bounded
+    /// because it acts on the LIVE TIP list — an approximation, dated
+    /// elsewhere, that could in principle license a wrong permanent demotion.
+    /// This walk acts on a list whose merkle root is committed in the coinbase
+    /// of the very block being adjudicated, so the bound that matters is on
+    /// the number of ROUND TRIPS, which is the caller's on-demand fold cap.
+    /// Charging both would make one legitimate ban cost two budgets.
+    ReadjudicateResult readjudicate_payee(const dash::coin::BlockType& block,
+                                          uint32_t height,
+                                          const vendor::CSimplifiedMNList& sml)
+    {
+        ReadjudicateResult out;
+        if (!m_pending.present) {
+            out.refusal = "there is no pending payee mismatch to re-adjudicate";
+            return out;
+        }
+        if (m_pending.height != height) {
+            out.refusal = "the pending mismatch is at h="
+                        + std::to_string(m_pending.height) + ", not h="
+                        + std::to_string(height);
+            return out;
+        }
+        // BACKSTOP, not enforcement. The lane pauses its replay while the
+        // request is outstanding, so nothing can move the cursor between the
+        // mismatch and this call — and mutation testing agrees: deleting this
+        // guard produces no red today. It is kept because the load-bearing
+        // pause lives in ANOTHER file, and a future caller that reaches here
+        // by a third route must not adjudicate a height it is not standing on.
+        if (m_last_applied_height != height) {
+            out.refusal = "the apply cursor has moved to h="
+                        + std::to_string(m_last_applied_height)
+                        + " since the mismatch at h=" + std::to_string(height)
+                        + " — refusing to adjudicate a height we are no longer"
+                          " standing on";
+            return out;
+        }
+        if (block.m_txs.empty()) {
+            out.refusal = "the block carries no coinbase to cross-check against";
+            return out;
+        }
+
+        // The attestation source for THIS walk is the passed list and nothing
+        // else. m_sml_validity (the live tip list) is deliberately not
+        // consulted: mixing a tip-dated opinion into a height-exact
+        // adjudication would reintroduce the staleness this exists to remove.
+        std::map<uint256, bool> attested;
+        for (const auto& e : sml.mnList) attested[e.proRegTxHash] = e.isValid;
+        auto attest = [&attested](const uint256& h) -> std::optional<bool> {
+            auto it = attested.find(h);
+            if (it == attested.end()) return std::nullopt;
+            return it->second;
+        };
+        auto paid_in_cb = [&block](const std::vector<unsigned char>& script) {
+            if (script.empty()) return false;
+            for (const auto& vout : block.m_txs[0].vout)
+                if (vout.scriptPubKey.m_data == script) return true;
+            return false;
+        };
+
+        const WalkOutcome w =
+            walk_to_paid_candidate(m_pending.ranked, attest, paid_in_cb);
+        if (!w.accepted) {
+            out.refusal = std::string("the masternode list dated exactly at h=")
+                        + std::to_string(height) + " does not license a repair: "
+                        + (w.refusal ? w.refusal : "no candidate accepted");
+            return out;
+        }
+
+        const std::string demoted_hexes =
+            commit_walk_outcome(w, height,
+                                [this, height](Entries::iterator it) {
+                                    mark_paid_entry(it, height);
+                                });
+        out.recovered = true;
+        out.excluded  = w.demoted.size();
+        out.accepted  = w.accepted;
+        LOG_WARNING << "[MNS-SM] ON-DEMAND PoSe RE-ADJUDICATION h=" << height
+                    << ": projected payee(s) [" << demoted_hexes
+                    << "] attested INVALID by the masternode list dated EXACTLY"
+                       " at h=" << height << " (DIP-4 client-verified against"
+                       " this block's own coinbase commitment) — excluded"
+                       " permanently with banHeight=" << height
+                    << "; payment attributed to "
+                    << out.accepted->GetHex().substr(0, 16)
+                    << " whose scriptPayout matches this coinbase exactly. No"
+                       " demotion-walk budget was spent: this list is not an"
+                       " approximation of the height it judges, it IS that"
+                       " height.";
+        m_pending = PendingPayeeAdjudication{};
+        return out;
+    }
+
     // Process a single block. Mutates state per dashcore's
     // RebuildListFromBlock algorithm. Returns counts for logging.
     ApplyResult apply_block(const dash::coin::BlockType& block,
@@ -762,6 +936,13 @@ public:
             ranked.empty() ? std::optional<uint256>{}
                            : std::optional<uint256>{ranked.front()};
         r.projected_payee = projected;
+
+        // Past the guards, so this block WILL be applied: any pending
+        // re-adjudication belongs to an earlier height and is now unusable
+        // (its `ranked` was computed on a list this block is about to change).
+        // Dropping it here is what makes pending_payee_adjudication() mean
+        // "the cursor is standing on an unresolved mismatch" and nothing else.
+        m_pending = PendingPayeeAdjudication{};
 
         // ── Pass 1: special-tx records ─────────────────────────────
         // Walk all non-coinbase txs (i=1+). The order of types within
@@ -926,17 +1107,8 @@ public:
                 }
                 return false;
             };
-            auto mark_paid = [&](std::map<uint256, MNState>::iterator it) {
-                bool was_consecutive =
-                    (it->second.nLastPaidHeight == height - 1);
-                it->second.nLastPaidHeight = height;
-                if (it->second.nType == vendor::MnType::EVO) {
-                    it->second.nConsecutivePayments =
-                        was_consecutive
-                            ? it->second.nConsecutivePayments + 1 : 1;
-                } else {
-                    it->second.nConsecutivePayments = 0;
-                }
+            auto mark_paid = [&](Entries::iterator it) {
+                mark_paid_entry(it, height);
                 ++r.paid;
             };
 
@@ -950,6 +1122,14 @@ public:
                 } else if (!recover_from_sml_ban(ranked, height, paid_in_cb,
                                                  mark_paid, r)) {
                     r.payee_desync = true;
+                    // Keep the PRE-block queue alive so a caller that goes and
+                    // fetches a masternode list dated exactly at this height
+                    // can re-adjudicate ONLY this decision, without re-applying
+                    // a block the forward-only cursor would refuse.
+                    m_pending.present   = true;
+                    m_pending.height    = height;
+                    m_pending.ranked    = ranked;
+                    m_pending.projected = projected;
                     LOG_WARNING << "[MNS-SM] PAYEE DESYNC h=" << height
                                 << ": coinbase does not pay projected MN "
                                 << projected->GetHex().substr(0, 16)
@@ -1003,6 +1183,109 @@ private:
     //
     // Returns true iff a payment was attributed (r.paid / r.sml_recovered
     // updated); false means "no licensed repair" and the caller must desync.
+    /// The WALK ITSELF, with no opinion about where the attestations came
+    /// from. Two callers need identical stepping rules and identical refusal
+    /// semantics — the budgeted tip-SML walk below, and the on-demand
+    /// re-adjudication against a list dated exactly at the height. Two copies
+    /// of these rules would be two places for the acceptance evidence to rot.
+    ///
+    /// Mutates NOTHING. `refusal` names the FIRST rule that stopped it, so a
+    /// caller's fail-closed line can say which one rather than listing them.
+    struct WalkOutcome {
+        std::vector<uint256>   demoted;
+        std::optional<uint256> accepted;
+        const char*            refusal{nullptr};
+    };
+
+    template <typename AttestFn, typename PaidInCbFn>
+    WalkOutcome walk_to_paid_candidate(const std::vector<uint256>& ranked,
+                                       const AttestFn& attest,
+                                       const PaidInCbFn& paid_in_cb) const
+    {
+        WalkOutcome w;
+        if (ranked.size() < 2) {
+            w.refusal = "fewer than two payee candidates were ranked, so there"
+                        " is no runner-up to attribute the payment to";
+            return w;
+        }
+        for (size_t i = 0; i + 1 < ranked.size(); ++i) {
+            const std::optional<bool> att = attest(ranked[i]);
+            // nullopt (absent from the list) or true (attested valid): no
+            // licence to demote. Stop — this is a real desync.
+            if (!att.has_value()) {
+                w.refusal = "the list has NO ENTRY for the projected candidate,"
+                            " and absent is never evidence of a ban";
+                break;
+            }
+            if (*att) {
+                w.refusal = "the list attests the projected candidate VALID —"
+                            " that is counter-evidence, not a missed ban";
+                break;
+            }
+            w.demoted.push_back(ranked[i]);
+
+            auto nit = m_entries.find(ranked[i + 1]);
+            // The next candidate was removed by THIS block's passes 1/2
+            // (collateral spend / re-registration). We cannot test its script
+            // and the list cannot attest a departed MN, so refuse rather than
+            // skip over it.
+            if (nit == m_entries.end()) {
+                w.refusal = "the next ranked candidate was removed by this"
+                            " block's own special txs / collateral spends, so"
+                            " its script cannot be cross-checked";
+                break;
+            }
+            if (paid_in_cb(nit->second.scriptPayout.m_data)) {
+                w.accepted = ranked[i + 1];
+                w.refusal  = nullptr;
+                break;
+            }
+            // Not paid either — the loop's next iteration must independently
+            // earn the right to demote ranked[i+1] too.
+        }
+        if (!w.accepted && !w.refusal) {
+            w.refusal = "no candidate in the ranked queue has a scriptPayout"
+                        " this coinbase pays exactly";
+        }
+        return w;
+    }
+
+    /// Commit an accepted WalkOutcome: PERMANENT exclusions with a nonzero ban
+    /// height (so the ProUpServTx revival branch stays functional), then the
+    /// attribution. Returns the demoted hashes for the log line.
+    template <typename MarkPaidFn>
+    std::string commit_walk_outcome(const WalkOutcome& w, uint32_t height,
+                                    const MarkPaidFn& mark_paid)
+    {
+        std::string demoted_hexes;
+        for (const auto& d : w.demoted) {
+            auto dit = m_entries.find(d);
+            if (dit != m_entries.end()) {
+                dit->second.isValid        = false;
+                dit->second.nPoSeBanHeight = height;
+            }
+            if (!demoted_hexes.empty()) demoted_hexes += ",";
+            demoted_hexes += d.GetHex().substr(0, 16);
+        }
+        auto ait = m_entries.find(*w.accepted);
+        if (ait != m_entries.end()) mark_paid(ait);
+        return demoted_hexes;
+    }
+
+    /// dashcore's payee mark (nLastPaidHeight + the EVO consecutive-payment
+    /// counter), shared by every path that attributes a payment.
+    void mark_paid_entry(Entries::iterator it, uint32_t height)
+    {
+        const bool was_consecutive = (it->second.nLastPaidHeight == height - 1);
+        it->second.nLastPaidHeight = height;
+        if (it->second.nType == vendor::MnType::EVO) {
+            it->second.nConsecutivePayments =
+                was_consecutive ? it->second.nConsecutivePayments + 1 : 1;
+        } else {
+            it->second.nConsecutivePayments = 0;
+        }
+    }
+
     template <typename PaidInCbFn, typename MarkPaidFn>
     bool recover_from_sml_ban(const std::vector<uint256>& ranked,
                               uint32_t height,
@@ -1011,31 +1294,13 @@ private:
                               ApplyResult& r)
     {
         if (!m_sml_validity) return false;   // null hook → pre-hook behaviour
-        if (ranked.size() < 2) return false;
 
-        std::vector<uint256> demoted;
-        std::optional<uint256> accepted;
-        for (size_t i = 0; i + 1 < ranked.size(); ++i) {
-            const std::optional<bool> att = sml_attest(ranked[i], height);
-            // nullopt (absent from the SML) or true (attested valid): no
-            // licence to demote. Stop — this is a real desync.
-            if (!att.has_value() || *att) break;
-            demoted.push_back(ranked[i]);
-
-            auto nit = m_entries.find(ranked[i + 1]);
-            // The next candidate was removed by THIS block's passes 1/2
-            // (collateral spend / re-registration). We cannot test its script
-            // and the SML cannot attest a departed MN, so refuse rather than
-            // skip over it.
-            if (nit == m_entries.end()) break;
-            if (paid_in_cb(nit->second.scriptPayout.m_data)) {
-                accepted = ranked[i + 1];
-                break;
-            }
-            // Not paid either — the loop's next iteration must independently
-            // earn the right to demote ranked[i+1] too.
-        }
-        if (!accepted) return false;
+        const WalkOutcome w = walk_to_paid_candidate(
+            ranked,
+            [this, height](const uint256& h) { return sml_attest(h, height); },
+            paid_in_cb);
+        if (!w.accepted) return false;
+        const std::vector<uint256>& demoted = w.demoted;
 
         // Budget check LAST, so a refusal here mutates nothing either.
         if (m_sml_recovered_total + demoted.size() > m_sml_recovery_cap) {
@@ -1048,18 +1313,9 @@ private:
             return false;
         }
 
-        std::string demoted_hexes;
-        for (const auto& d : demoted) {
-            auto dit = m_entries.find(d);
-            if (dit != m_entries.end()) {
-                dit->second.isValid       = false;
-                dit->second.nPoSeBanHeight = height;
-            }
-            if (!demoted_hexes.empty()) demoted_hexes += ",";
-            demoted_hexes += d.GetHex().substr(0, 16);
-        }
-        auto ait = m_entries.find(*accepted);
-        if (ait != m_entries.end()) mark_paid(ait);
+        const std::string demoted_hexes =
+            commit_walk_outcome(w, height, mark_paid);
+        const std::optional<uint256>& accepted = w.accepted;
 
         r.sml_recovered        = demoted.size();
         m_sml_recovered_total += demoted.size();
@@ -1075,8 +1331,13 @@ private:
         return true;
     }
 
-    std::map<uint256, MNState>                                          m_entries;
+    Entries                                                             m_entries;
     std::map<bitcoin_family::coin::TxPrevOut, uint256, TxPrevOutLess>   m_collateral_index;
+
+    // The unresolved mismatch the cursor is standing on, if any. Written by
+    // pass 3, cleared by the next apply_block and by a successful
+    // readjudicate_payee(). See PendingPayeeAdjudication.
+    PendingPayeeAdjudication m_pending;
 
     // Optional SML attestation hook (see set_sml_validity_fn). NULL by
     // default: no hook, no recovery, byte-identical pre-hook behaviour.
