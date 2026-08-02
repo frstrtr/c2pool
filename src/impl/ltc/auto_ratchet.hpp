@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <fstream>
 #include <set>
+#include <sstream>
 #include <string>
 
 namespace ltc
@@ -54,6 +55,48 @@ inline const char* ratchet_state_str(RatchetState s)
     }
     return "UNKNOWN";
 }
+
+// ---------------------------------------------------------------------------
+// OBSERVABILITY ONLY (no consensus surface).
+//
+// VOTING -> ACTIVATED has FOUR conditions. Until 08-02 a node stuck in VOTING
+// logged only `state=VOTING` and, for two of the four, nothing at all: the two
+// refusal lines lived INSIDE the `full_window && vote_pct >= 95` branch, so a
+// window that was merely under-filled or under-voted produced total silence.
+// A live LTC prod node sat like that for >10h while the dashboard showed 95.31%,
+// and answering "why" required reading this source.
+//
+// RatchetBlocker names the FIRST unmet condition in evaluation order so the log
+// is greppable and unambiguous — exactly one name, never a list of maybes.
+// ---------------------------------------------------------------------------
+enum class RatchetBlocker : uint8_t
+{
+    NONE           = 0,  // all four conditions met — activation proceeds
+    WINDOW_FILL    = 1,  // (1) total < chain_length
+    VOTE_PCT       = 2,  // (2) vote_pct < ACTIVATION_THRESHOLD
+    TAIL_WORK      = 3,  // (3) oldest 10% carries < SWITCH_THRESHOLD% of WORK signalling
+    SELF_VOTE_ONLY = 4   // (4) distinct non-self YES-vote authors < MIN_DISTINCT_NONSELF_AUTHORS
+};
+
+inline const char* ratchet_blocker_str(RatchetBlocker b)
+{
+    switch (b) {
+    case RatchetBlocker::NONE:           return "none";
+    case RatchetBlocker::WINDOW_FILL:    return "window-fill";
+    case RatchetBlocker::VOTE_PCT:       return "vote-pct";
+    case RatchetBlocker::TAIL_WORK:      return "tail-work";
+    case RatchetBlocker::SELF_VOTE_ONLY: return "self-vote-only";
+    }
+    return "unknown";
+}
+
+// Tri-state for condition (3). The work-weighted tail guard is EXPENSIVE (it
+// walks the oldest 10% of the window and tallies uint288 work weights) and the
+// live path only measures it once conditions (1) and (2) already hold. When an
+// earlier condition blocks, the tail is NOT_MEASURED and must be reported as
+// `n/a` — a zero that silently means "not measured" is precisely the trap this
+// whole change exists to remove.
+enum class RatchetTail : uint8_t { NOT_MEASURED = 0, FAIL = 1, PASS = 2 };
 
 class AutoRatchet
 {
@@ -82,6 +125,34 @@ public:
 
     RatchetState state() const { return state_; }
     int64_t target_version() const { return target_version_; }
+
+    /// OBSERVABILITY ONLY — pure, side-effect-free, no consensus surface.
+    ///
+    /// Names the FIRST unmet VOTING->ACTIVATED condition in the SAME order the
+    /// live state machine evaluates them:
+    ///   1. window-fill     total >= chain_length
+    ///   2. vote-pct        vote_pct >= ACTIVATION_THRESHOLD (95)
+    ///   3. tail-work       oldest 10% of the window carries >= SWITCH_THRESHOLD
+    ///                      (60) percent of WORK signalling the target (WEIGHT,
+    ///                      not head-count)
+    ///   4. self-vote-only  distinct_nonself_authors >= MIN_DISTINCT_NONSELF_AUTHORS
+    ///
+    /// Returns NONE when all four hold. `tail` is a tri-state: NOT_MEASURED is
+    /// treated as blocking on (3), which is unreachable from the live caller
+    /// (it always measures the tail once (1) and (2) hold) but keeps this
+    /// function total, so it can never report "activate" off an unmeasured tail.
+    static RatchetBlocker first_unmet(bool full_window,
+                                      int vote_pct,
+                                      RatchetTail tail,
+                                      int distinct_nonself_authors)
+    {
+        if (!full_window)                             return RatchetBlocker::WINDOW_FILL;
+        if (vote_pct < ACTIVATION_THRESHOLD)          return RatchetBlocker::VOTE_PCT;
+        if (tail != RatchetTail::PASS)                return RatchetBlocker::TAIL_WORK;
+        if (distinct_nonself_authors < MIN_DISTINCT_NONSELF_AUTHORS)
+            return RatchetBlocker::SELF_VOTE_ONLY;
+        return RatchetBlocker::NONE;
+    }
 
     /// Determine which share version to produce based on network state.
     /// Returns (share_version, desired_version_to_vote).
@@ -124,10 +195,16 @@ public:
         // so reading it here is consensus-neutral (see the ACTIVATE branch note).
         std::set<NetService> nonself_voting_authors;
 
+        // OBSERVABILITY: depth (distance from the tip, 0 = tip) of the SHALLOWEST
+        // — i.e. newest — share in the sample that does NOT signal the target.
+        // Feeds the tail-guard ETA below. -1 = no such share in the sample.
+        int32_t newest_nonsignal_depth = -1;
+
         auto chain_view = tracker.chain.get_chain(best_share_hash, sample);
         for (auto [hash, data] : chain_view)
         {
             ++total;
+            const int32_t depth = total - 1;
             data.share.invoke([&](auto* obj) {
                 if (static_cast<int64_t>(obj->m_desired_version) >= target_version_) {
                     ++target_votes;
@@ -135,6 +212,9 @@ public:
                                            obj->peer_addr == NetService{});
                     if (!is_local)
                         nonself_voting_authors.insert(obj->peer_addr);
+                }
+                else if (newest_nonsignal_depth < 0) {
+                    newest_nonsignal_depth = depth;   // get_chain walks tip -> parents
                 }
                 if (static_cast<int64_t>(std::remove_pointer_t<decltype(obj)>::version) >= target_version_)
                     ++target_shares;
@@ -157,6 +237,15 @@ public:
 
         if (state_ == RatchetState::VOTING)
         {
+            // OBSERVABILITY scratch — carried out of the (possibly skipped)
+            // measurement branch so the single explain-line below always has
+            // the numbers that justify whatever it names.
+            RatchetTail tail_state = RatchetTail::NOT_MEASURED;
+            int tail_pct = -1;          // -1 => not measured => printed as n/a
+            int32_t eta_shares = -1;    // -1 => not computable => omitted
+            const int distinct_nonself_authors_obs =
+                static_cast<int>(nonself_voting_authors.size());
+
             if (full_window && vote_pct >= ACTIVATION_THRESHOLD)
             {
                 // Tail guard: oldest 10% of window must have >= 60% signaling
@@ -215,23 +304,54 @@ public:
                 const int distinct_nonself_authors = static_cast<int>(nonself_voting_authors.size());
                 const bool multi_party = distinct_nonself_authors >= MIN_DISTINCT_NONSELF_AUTHORS;
 
+                // --- OBSERVABILITY ONLY from here to the `if (!tail_ok)` ------
+                tail_state = tail_ok ? RatchetTail::PASS : RatchetTail::FAIL;
+                // Largest p in [0,100] with tail_target*100 >= tail_total*p, i.e.
+                // the floor'd work-weighted signalling percentage of the tail.
+                // uint288 has no division, and this only runs once conditions (1)
+                // and (2) already hold, so a 101-step descent is free. Measured
+                // whether the guard passes or fails — `n/a` is reserved for the
+                // case where the tail was genuinely never looked at.
+                tail_pct = 0;
+                if (!tail_total.IsNull()) {
+                    for (int p = 100; p >= 0; --p) {
+                        if (!(tail_target * uint32_t(100) < tail_total * uint32_t(p))) {
+                            tail_pct = p;
+                            break;
+                        }
+                    }
+                }
                 if (!tail_ok) {
-                    static int tail_log = 0;
-                    if (tail_log++ % 20 == 0)
-                        LOG_INFO << "[AutoRatchet] VOTING: full window " << vote_pct
-                                 << "% >= " << ACTIVATION_THRESHOLD << "% but oldest 10% work-weighted V"
-                                 << target_version_ << " desire < " << SWITCH_THRESHOLD << "%) — waiting";
-                    // Don't transition yet
+                    // ETA: how many further shares until the tail window has
+                    // rolled entirely past today's non-signalling shares.
+                    //
+                    // The tail is always depths [tail_start, tail_start+tail_size)
+                    // from the tip. A share now at depth d sits at depth d+k after
+                    // k new shares, so it has LEFT the tail once
+                    // k >= tail_start + tail_size - d. Every share currently
+                    // shallower than the tail will still pass through it, so the
+                    // binding one is the SHALLOWEST non-signalling share, at depth
+                    // newest_nonsignal_depth. Hence:
+                    //
+                    //     eta_shares = (tail_start + tail_size) - newest_nonsignal_depth
+                    //
+                    // ASSUMPTION, stated in the log as `<=`: every share minted
+                    // from here on signals the target. It is therefore an UPPER
+                    // bound — the 60%-by-work gate can clear earlier, since it
+                    // needs 60%, not 100%. If the sample holds no non-signalling
+                    // share at all the number is not derivable and we print none
+                    // rather than a guess.
+                    const int32_t tail_end = static_cast<int32_t>(tail_start + tail_size);
+                    if (newest_nonsignal_depth >= 0 && newest_nonsignal_depth < tail_end)
+                        eta_shares = tail_end - newest_nonsignal_depth;
+                }
+                // --- end observability ---------------------------------------
+
+                if (!tail_ok) {
+                    // Don't transition yet — explained by the single line below.
                 }
                 else if (!multi_party) {
-                    static int self_log = 0;
-                    if (self_log++ % 20 == 0)
-                        LOG_INFO << "[AutoRatchet] VOTING: full window " << vote_pct
-                                 << "% >= " << ACTIVATION_THRESHOLD << "% but only "
-                                 << distinct_nonself_authors << " distinct non-self author(s) < "
-                                 << MIN_DISTINCT_NONSELF_AUTHORS
-                                 << " — self-authored window, refusing activation (mode-2 guard)";
-                    // Don't transition yet
+                    // Don't transition yet — explained by the single line below.
                 }
                 else
                 {
@@ -260,6 +380,20 @@ public:
                 }
                 save();
                 } // else (tail guard passed)
+            }
+
+            // OBSERVABILITY ONLY — one greppable line per evaluation naming the
+            // FIRST unmet condition, with the measurement AND the threshold that
+            // justifies it. Rate-limited: on CHANGE of blocked-by, plus a
+            // heartbeat every VOTING_EXPLAIN_HEARTBEAT evaluations. Emits
+            // nothing once nothing blocks (the ACTIVATED transition above speaks
+            // for itself).
+            if (state_ == RatchetState::VOTING)
+            {
+                const RatchetBlocker blocker = first_unmet(
+                    full_window, vote_pct, tail_state, distinct_nonself_authors_obs);
+                log_voting_block(blocker, total, chain_length, vote_pct, tail_pct,
+                                 distinct_nonself_authors_obs, eta_shares);
             }
         }
         else if (state_ == RatchetState::ACTIVATED)
@@ -341,6 +475,12 @@ public:
     // count-based -- a flat-count tail guard would let a 95%-by-count activation
     // outrun the 60%-by-work accept gate and wedge the crossing.
 
+public:
+    // Heartbeat period for the VOTING explain-line, in evaluations. The ratchet
+    // is evaluated once per share, so this bounds the line to roughly one per
+    // 60 shares (~15 min at LTC's 15s share period) when nothing is changing.
+    static constexpr int VOTING_EXPLAIN_HEARTBEAT = 60;
+
 private:
     std::string state_file_;
     int64_t target_version_;
@@ -350,6 +490,64 @@ private:
     int64_t confirmed_at_ = 0;
     int32_t confirm_count_ = 0;
     int32_t last_seen_height_ = 0;
+
+    // OBSERVABILITY ONLY — VOTING explain-line rate limiter. Per-instance, not
+    // a function-local static: a function-local static in this header-inline
+    // method is shared across every AutoRatchet in the process.
+    RatchetBlocker last_blocker_ = RatchetBlocker::NONE;
+    bool blocker_logged_once_ = false;
+    int evals_since_block_log_ = 0;
+
+    /// OBSERVABILITY ONLY. Emits at most one line naming exactly ONE blocking
+    /// condition, always carrying the measured value AND its threshold.
+    void log_voting_block(RatchetBlocker blocker,
+                          int32_t total, uint32_t chain_length,
+                          int vote_pct, int tail_pct,
+                          int distinct_nonself_authors,
+                          int32_t eta_shares)
+    {
+        if (blocker == RatchetBlocker::NONE) {
+            // Nothing blocks: reset the limiter so the next block re-announces.
+            last_blocker_ = RatchetBlocker::NONE;
+            blocker_logged_once_ = false;
+            evals_since_block_log_ = 0;
+            return;
+        }
+
+        const bool changed = (!blocker_logged_once_ || blocker != last_blocker_);
+        if (!changed && ++evals_since_block_log_ < VOTING_EXPLAIN_HEARTBEAT)
+            return;
+        last_blocker_ = blocker;
+        blocker_logged_once_ = true;
+        evals_since_block_log_ = 0;
+
+        std::ostringstream line;
+        line << "[AutoRatchet] VOTING blocked-by=" << ratchet_blocker_str(blocker)
+             << " window=" << total << "/" << chain_length
+             << " vote=" << vote_pct << "% (need " << ACTIVATION_THRESHOLD << ")"
+             << " tail10%work=";
+        if (tail_pct < 0) line << "n/a";              // NOT measured — never "0"
+        else              line << tail_pct << "%";
+        line << " (need " << SWITCH_THRESHOLD << ")"
+             << " nonself_authors=" << distinct_nonself_authors
+             << " (need " << MIN_DISTINCT_NONSELF_AUTHORS << ")";
+
+        // ETA is emitted ONLY for the tail guard, and only when derivable.
+        if (blocker == RatchetBlocker::TAIL_WORK && eta_shares > 0) {
+            const uint32_t period = PoolConfig::share_period();
+            line << " eta_shares<=" << eta_shares;
+            if (period > 0) {
+                const double hours =
+                    (static_cast<double>(eta_shares) * static_cast<double>(period)) / 3600.0;
+                std::ostringstream h;
+                h.setf(std::ios::fixed, std::ios::floatfield);
+                h.precision(1);
+                h << hours;
+                line << " eta<=" << h.str() << "h";
+            }
+        }
+        LOG_INFO << line.str();
+    }
 
     static int64_t now_seconds()
     {
