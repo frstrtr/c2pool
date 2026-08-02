@@ -524,6 +524,7 @@ jobs:
                     bch_abla_block_feed_gap_test bch_header_sync_test \
                     bch_header_sync_progress_test bch_block_download_test \
                     bch_idle_watchdog_kat_test \
+                    bch_seed_tier_kat_test \
                     bch_genesis_conformance_test bch_abla_growth_soak_test \
                     bch_coinbase_kat_segwit_predicate_test \
                     bch_coinbase_kat_bytevector_test \
@@ -664,6 +665,7 @@ jobs:
                     bch_abla_block_feed_gap_test bch_header_sync_test \
                     bch_header_sync_progress_test bch_block_download_test \
                     bch_idle_watchdog_kat_test \
+                    bch_seed_tier_kat_test \
                     bch_genesis_conformance_test bch_abla_growth_soak_test \
                     bch_coinbase_kat_segwit_predicate_test \
                     bch_coinbase_kat_bytevector_test \
