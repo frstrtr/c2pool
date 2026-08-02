@@ -31,7 +31,58 @@
             }
             
             function values(o){ res = []; for(var x in o) res.push(o[x]); return res; }
-            
+
+            // ---- progress-bar label placement -------------------------------
+            // DEFECT this fixes: every bar label is a <span> INSIDE the filled
+            // <div>, anchored `right:6px`. At 0% the fill has zero width, so that
+            // anchor sits on the track's LEFT edge and the (white-space:nowrap)
+            // label is laid out entirely at NEGATIVE x — drawn outside the canvas
+            // to the left, and clipped away completely where the track is
+            // overflow:hidden. Same thing, less severely, at any fill narrower
+            // than the label.
+            //
+            // RULE: choose inside vs outside from the label's RENDERED width
+            // against the filled width, not from a hardcoded percentage — the
+            // labels vary from "0.0%" to "95.3% chain / 60.1% window", so one
+            // fixed cutover cannot be right for both. Inside (white on the fill)
+            // whenever the fill can hold the label plus padding; otherwise on the
+            // track just right of the fill, in a dark colour that reads against
+            // the #ddd track. The outside position is CLAMPED to the track, so
+            // the label can never leave the canvas at either end.
+            //
+            // `pct` is passed rather than measured because the fill carries
+            // `transition: width 0.5s` — a getBoundingClientRect() taken right
+            // after the width is assigned still reports the OLD width.
+            var BAR_LABEL_PAD = 6;   // px gap from the fill's inner right edge
+            var BAR_LABEL_GAP = 6;   // px gap between the fill and an outside label
+            function placeBarLabel(fillId, labelId, pct) {
+                var fill = document.getElementById(fillId);
+                var label = document.getElementById(labelId);
+                if (!fill || !label) return;
+                var track = fill.parentNode;
+                var trackW = track.clientWidth;
+                if (!trackW || !label.textContent) return;
+                var p = Math.max(0, Math.min(100, pct || 0));
+                var fillW = trackW * p / 100;
+                var labelW = label.getBoundingClientRect().width;
+                if (labelW + 2 * BAR_LABEL_PAD <= fillW) {
+                    label.style.left = 'auto';
+                    label.style.right = BAR_LABEL_PAD + 'px';
+                    label.style.color = '#fff';
+                    label.style.textShadow = '0 1px 2px rgba(0,0,0,0.5)';
+                } else {
+                    // `left` is relative to the fill, whose left edge IS the
+                    // track's left edge, so these are track coordinates.
+                    var maxLeft = trackW - labelW - BAR_LABEL_PAD;
+                    var leftInTrack = Math.max(BAR_LABEL_PAD,
+                                               Math.min(fillW + BAR_LABEL_GAP, maxLeft));
+                    label.style.right = 'auto';
+                    label.style.left = leftInTrack + 'px';
+                    label.style.color = '#555';
+                    label.style.textShadow = 'none';
+                }
+            }
+
             d3.json('../local_stats', function(local_stats) {
                 d3.select('#peers_in').text(local_stats.peers.incoming);
                 d3.select('#peers_out').text(local_stats.peers.outgoing);
@@ -78,6 +129,7 @@
                         d3.select('#index-chain-maturity').style('display', 'block');
                         d3.select('#index-chain-bar').style('width', vs.chain_maturity + '%');
                         d3.select('#index-chain-bar-label').text(d3.format('.1f')(vs.chain_maturity) + '%');
+                        placeBarLabel('index-chain-bar', 'index-chain-bar-label', vs.chain_maturity);
                         d3.select('#index-chain-progress-text').text(
                             vs.chain_height + ' / ' + vs.chain_length_required + 
                             ' (' + d3.format('.1f')(vs.chain_maturity) + '%) \u2014 need ' +
@@ -89,6 +141,7 @@
                         d3.select('#index-propagation').style('display', 'block');
                         d3.select('#index-propagation-bar').style('width', vs.propagation_pct + '%');
                         d3.select('#index-propagation-bar-label').text(d3.format('.1f')(vs.overall_v36_vote_pct) + '% V36');
+                        placeBarLabel('index-propagation-bar', 'index-propagation-bar-label', vs.propagation_pct);
                         var etaMin = Math.round(vs.time_to_window_seconds / 60);
                         var etaH = Math.floor(etaMin / 60); var etaM = etaMin % 60;
                         var etaStr = etaH > 0 ? etaH + 'h ' + etaM + 'm' : etaM + 'm';
@@ -102,21 +155,18 @@
                     var sigPct = vs.sampling_signaling;
                     var barPct = vs.overall_v36_vote_pct > sigPct ? vs.overall_v36_vote_pct : sigPct;
                     d3.select('#version-signaling-bar').style('width', Math.min(100, barPct) + '%');
-                    var idxSigLabel = barPct >= 15 ? d3.format('.1f')(barPct) + '%' : '';
+                    // Text is unchanged: the two-number form only when the chain
+                    // and window figures actually differ and the bar is wide
+                    // enough to be worth it, the plain percentage otherwise.
+                    var idxSigLabel = d3.format('.1f')(barPct) + '%';
                     if (vs.overall_v36_vote_pct > sigPct + 0.1 && barPct >= 20) {
                         idxSigLabel = d3.format('.1f')(vs.overall_v36_vote_pct) + '% chain / ' + d3.format('.1f')(sigPct) + '% window';
                     }
                     d3.select('#index-signaling-bar-label').text(idxSigLabel);
-                    if (barPct < 15) {
-                        d3.select('#index-signaling-bar-label')
-                            .style('right', 'auto').style('left', 'calc(100% + 6px)')
-                            .style('color', '#555').style('text-shadow', 'none')
-                            .text(d3.format('.1f')(barPct) + '%');
-                    } else {
-                        d3.select('#index-signaling-bar-label')
-                            .style('left', null).style('right', '6px')
-                            .style('color', '#fff').style('text-shadow', '0 1px 2px rgba(0,0,0,0.5)');
-                    }
+                    // Placement now comes from the measured label width (see
+                    // placeBarLabel), replacing the hardcoded 15% cutover which
+                    // still let the wider two-number label overhang the fill.
+                    placeBarLabel('version-signaling-bar', 'index-signaling-bar-label', barPct);
                     var samplingStr;
                     if (vs.chain_ready) {
                         if (vs.overall_v36_vote_pct > sigPct + 0.1) {
@@ -526,7 +576,11 @@
             </div>
             <div id="index-chain-maturity" style="display:none; margin-top:8px;">
                 <div style="font-size:0.85em; color:#555;">Chain Maturity: <span id="index-chain-progress-text">-</span></div>
-                <div style="background:#ddd; height:20px; border-radius:10px; margin-top:4px; overflow:hidden; position:relative;">
+                <!-- overflow:visible (was hidden) so a low-fill label placed on
+                     the track to the right of the fill is not clipped away; the
+                     fill carries its own border-radius, so nothing needed the
+                     clip. Matches the other two tracks below. -->
+                <div style="background:#ddd; height:20px; border-radius:10px; margin-top:4px; overflow:visible; position:relative;">
                     <div id="index-chain-bar" style="height:100%; background:linear-gradient(90deg, #FFC107, #FF9800); width:0%; transition:width 0.5s; position:relative; border-radius:10px;"><span id="index-chain-bar-label" style="position:absolute; right:6px; top:50%; transform:translateY(-50%); font-size:0.72em; font-weight:700; color:#fff; text-shadow:0 1px 2px rgba(0,0,0,0.5); white-space:nowrap;"></span></div>
                 </div>
             </div>

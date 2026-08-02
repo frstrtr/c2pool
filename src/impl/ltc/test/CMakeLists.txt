@@ -12,7 +12,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     # cannot grant a shared lock to a thread already holding it exclusively — and
     # that without that lock the walk runs and the per-peer send loop is entered.
     # Same folding rule: into the existing allowlisted target.
-    add_executable(share_test share_test.cpp f11_donation_invariance_test.cpp emergency_decay_overflow_test.cpp wirecompat_runtime_test.cpp desired_version_tally_test.cpp auto_ratchet_sim_test.cpp auto_ratchet_tail_guard_test.cpp chain_walk_window_test.cpp doge_template_underfill_test.cpp broadcast_tx_completeness_test.cpp broadcast_lock_discipline_test.cpp compact_block_merkle_test.cpp)
+    #
+    # auto_ratchet_blocked_by_test.cpp: the VOTING explain-line — asserts the
+    # ratchet names the FIRST unmet of its four activation conditions, with the
+    # measurement that justifies it, and that an all-pass window logs no blocked
+    # line and actually activates. Same folding rule: into the existing
+    # allowlisted target.
+    add_executable(share_test share_test.cpp f11_donation_invariance_test.cpp emergency_decay_overflow_test.cpp wirecompat_runtime_test.cpp desired_version_tally_test.cpp auto_ratchet_sim_test.cpp auto_ratchet_tail_guard_test.cpp auto_ratchet_blocked_by_test.cpp chain_walk_window_test.cpp doge_template_underfill_test.cpp broadcast_tx_completeness_test.cpp broadcast_lock_discipline_test.cpp compact_block_merkle_test.cpp)
     target_link_libraries(share_test PRIVATE
         GTest::gtest_main GTest::gtest
         core ltc

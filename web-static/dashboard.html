@@ -2408,7 +2408,55 @@
         }
         
         function values(o) { var res = []; for(var x in o) res.push(o[x]); return res; }
-        
+
+        // ---- progress-bar label placement -----------------------------------
+        // DEFECT this fixes: every `.bar-label` is a <span> INSIDE the filled
+        // `.signaling-bar`, anchored `right:6px` by CSS. At 0% the fill has zero
+        // width, so that anchor sits on the track's LEFT edge and the
+        // (white-space:nowrap) label is laid out entirely at NEGATIVE x — drawn
+        // outside the canvas to the left. Only the sampling-window bar had any
+        // mitigation, and it was a hardcoded 15% cutover that the wider
+        // two-number label ("95.3% chain / 60.1% window") still overflowed.
+        //
+        // RULE: choose inside vs outside from the label's RENDERED width against
+        // the filled width. Inside (`.bar-label`, white on the fill) whenever the
+        // fill can hold the label plus padding; otherwise `.bar-label-outside`
+        // on the track just right of the fill, CLAMPED to the track so the label
+        // can never leave the canvas at either end.
+        //
+        // `pct` is passed rather than measured because `.signaling-bar` carries
+        // `transition: width 0.5s` — a getBoundingClientRect() taken right after
+        // the width is assigned still reports the OLD width.
+        var BAR_LABEL_PAD = 6;   // px gap from the fill's inner right edge
+        var BAR_LABEL_GAP = 6;   // px gap between the fill and an outside label
+        function placeBarLabel(fillId, labelId, pct) {
+            var fill = document.getElementById(fillId);
+            var label = document.getElementById(labelId);
+            if (!fill || !label) return;
+            var track = fill.parentNode;
+            var trackW = track.clientWidth;
+            if (!trackW || !label.textContent) return;
+            var p = Math.max(0, Math.min(100, pct || 0));
+            var fillW = trackW * p / 100;
+            var labelW = label.getBoundingClientRect().width;
+            if (labelW + 2 * BAR_LABEL_PAD <= fillW) {
+                label.className = 'bar-label';
+                label.style.left = '';
+                label.style.right = '';
+            } else {
+                // `left` is relative to the fill, whose left edge IS the track's
+                // left edge, so these are track coordinates. The inline value
+                // overrides `.bar-label-outside`'s `left: calc(100% + 6px)`,
+                // which is unclamped and runs off the right end near 100%.
+                var maxLeft = trackW - labelW - BAR_LABEL_PAD;
+                var leftInTrack = Math.max(BAR_LABEL_PAD,
+                                           Math.min(fillW + BAR_LABEL_GAP, maxLeft));
+                label.className = 'bar-label-outside';
+                label.style.right = 'auto';
+                label.style.left = leftInTrack + 'px';
+            }
+        }
+
         function populateActiveMiners(local_stats, global_stats) {
             d3.select('#active_miners_loading').style('display', 'none');
             
@@ -3239,6 +3287,7 @@
                         d3.select('#chain-maturity-section').style('display', 'block');
                         d3.select('#chain-maturity-bar').style('width', vs.chain_maturity + '%');
                         d3.select('#chain-maturity-bar-label').text(d3.format('.1f')(vs.chain_maturity) + '%');
+                        placeBarLabel('chain-maturity-bar', 'chain-maturity-bar-label', vs.chain_maturity);
                         d3.select('#chain-maturity-text').text(
                             vs.chain_height + ' / ' + vs.chain_length_required + 
                             ' (' + d3.format('.1f')(vs.chain_maturity) + '%) \u2014 need ' + 
@@ -3252,6 +3301,7 @@
                         d3.select('#propagation-section').style('display', 'block');
                         d3.select('#propagation-bar').style('width', vs.propagation_pct + '%');
                         d3.select('#propagation-bar-label').text(d3.format('.1f')(vs.overall_v36_vote_pct) + '% V36');
+                        placeBarLabel('propagation-bar', 'propagation-bar-label', vs.propagation_pct);
                         var etaMin = Math.round(vs.time_to_window_seconds / 60);
                         var etaH = Math.floor(etaMin / 60);
                         var etaM = etaMin % 60;
@@ -3291,6 +3341,7 @@
                             var countdownPct = confirmWindow > 0 ? Math.min(100, sharesSince * 100 / confirmWindow) : 0;
                             d3.select('#countdown-bar').style('width', countdownPct + '%');
                             d3.select('#countdown-bar-label').text(d3.format('.1f')(countdownPct) + '%');
+                            placeBarLabel('countdown-bar', 'countdown-bar-label', countdownPct);
                             // ETA calculation
                             var sharesRemaining = Math.max(0, confirmWindow - sharesSince);
                             var etaSec = sharesRemaining * 10; // ~10 sec per share
@@ -3309,6 +3360,7 @@
                             var fillPct = Math.min(100, v36FormatPct);
                             d3.select('#confirmation-bar').style('width', fillPct + '%');
                             d3.select('#confirmation-bar-label').text(d3.format('.1f')(v36FormatPct) + '% V36');
+                            placeBarLabel('confirmation-bar', 'confirmation-bar-label', fillPct);
                             if (v36FormatPct >= 95) {
                                 d3.select('#confirmation-bar').style('background', 'linear-gradient(90deg, #4CAF50, #00E676)');
                             } else {
@@ -3333,12 +3385,11 @@
                         if (vs.overall_v36_vote_pct > sigPct + 0.1) {
                             sigLabel = d3.format('.1f')(vs.overall_v36_vote_pct) + '% chain / ' + d3.format('.1f')(sigPct) + '% window';
                         }
-                        var sigLabelEl = d3.select('#signaling-bar-label');
-                        if (barPct >= 15) {
-                            sigLabelEl.attr('class', 'bar-label').text(sigLabel);
-                        } else {
-                            sigLabelEl.attr('class', 'bar-label-outside').text(sigLabel);
-                        }
+                        // Text unchanged; placement now comes from the measured
+                        // label width (see placeBarLabel), replacing the hardcoded
+                        // 15% cutover that the wider two-number label overflowed.
+                        d3.select('#signaling-bar-label').text(sigLabel);
+                        placeBarLabel('signaling-bar', 'signaling-bar-label', Math.min(100, barPct));
                         if (vs.chain_ready) {
                             var samplingText;
                             if (vs.overall_v36_vote_pct > sigPct + 0.1) {
