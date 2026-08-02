@@ -1511,3 +1511,12 @@ jobs:
 
   # Releases are built and published manually (not via CI).
   # See installer/ for packaging scripts (DMG, ZIP, Inno Setup).
+      - name: Upload the real-BLS binary
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c2pool-dash-real-bls-linux-x86_64
+          path: build_dash_bls/src/c2pool/c2pool-dash
+          retention-days: 7
+          if-no-files-found: error
+
