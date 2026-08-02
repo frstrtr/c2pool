@@ -449,6 +449,20 @@ public:
                      << " blocks) onto the anchored set";
         }
 
+        // F4: the anchor height is itself a valid fold cursor -- and the ONLY
+        // dispatch that can ever observe it. The post-apply fold in
+        // on_block_connected first runs at cursor == anchor+1, and the publish()
+        // fold runs at the final cursor, so an SML current EXACTLY at the anchor
+        // (cursor == H_sml == anchor -- the canonical NON-early position: the
+        // loaded snapshot IS the state after connecting H_sml) is otherwise
+        // silently forfeited, leaving the first replayed blocks unprotected.
+        // Dispatch once here at bridge start; maybe_fold_sml()'s own
+        // cursor == snap.height guard makes this a no-op unless H_sml == anchor,
+        // so it can never fold early. (One-shot latch: it will not re-run once
+        // the post-apply site takes over for cursor > anchor.)
+        maybe_fold_sml();
+        if (m_state != State::Bridging) return;   // the fold can fail closed
+
         // Cursor already at (or past) the tip: the bridge is complete.
         if (m_next > tip) { publish(tip); return; }
 
