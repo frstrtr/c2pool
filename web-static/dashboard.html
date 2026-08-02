@@ -3000,11 +3000,44 @@
                     sync = c.synced
                         ? ' &nbsp;&middot;&nbsp; <span style="color:#3c3;">synced</span>'
                         : ' &nbsp;&middot;&nbsp; <span style="color:#e90;">syncing</span>';
+                // Header-sync progress (integrator 08-02): current/target (percent),
+                // sourced from the lane header chain. Rendered only when the lane feeds
+                // real header heights -- honest-absent otherwise, never a guessed 0.
+                var hsync = '';
+                if (c.header_height != null && c.target_height != null) {
+                    var pct = (c.sync_percent != null)
+                        ? c.sync_percent
+                        : (c.target_height > 0 ? (100 * c.header_height / c.target_height) : 0);
+                    hsync = ' &nbsp;&middot;&nbsp; <span style="opacity:0.8;">hdr ' +
+                            c.header_height + '/' + c.target_height +
+                            ' (' + Number(pct).toFixed(1) + '%)</span>';
+                }
+                // NO-WORK REASON (integrator 08-02, permanent lane item): when no template
+                // is being served the dashboard must say WHICH state it is -- syncing
+                // (self-resolving) / armed-but-declining (viability gate refused, WHY) /
+                // faulted -- instead of rendering blank like a dead node. classify_decline()'s
+                // reason string is surfaced VERBATIM, categorised by the same live signals
+                // (synced flag + peer count). Honest-absent when the lane feeds no reason.
+                var nowork = '';
+                if (c.no_work_reason != null && c.no_work_reason !== '') {
+                    var r = String(c.no_work_reason);
+                    var cat, col;
+                    if (c.synced === false) {
+                        cat = 'syncing'; col = '#e90';         // pre-sync, expected
+                    } else if (peers === 0 || r.indexOf('rpc') !== -1
+                               || r.indexOf('dead') !== -1 || r.indexOf('crash') !== -1) {
+                        cat = 'faulted'; col = '#e33';         // no peers / RPC dead / crashed
+                    } else {
+                        cat = 'armed, declining'; col = '#e90'; // viability gate refused
+                    }
+                    nowork = '<div style="opacity:0.85;font-size:0.9em;color:' + col +
+                             ';">no work: ' + cat + ' &mdash; ' + r + '</div>';
+                }
                 var tip = (c.height != null && c.height > 0)
                     ? ' &nbsp;&middot;&nbsp; tip ' + c.height : '';
                 return '<div><strong>' + c.coin + '</strong>' + tagStr +
                        ' &nbsp;&middot;&nbsp; ' + peers + ' peer' + (peers === 1 ? '' : 's') +
-                       sync + tip + '</div>';
+                       sync + hsync + tip + nowork + '</div>';
             }).join('');
             document.getElementById('node_topology_coins').innerHTML = rows;
             d3.select('#node_topology_symbol').text(t.node_symbol ? '(' + t.node_symbol + ')' : '');
