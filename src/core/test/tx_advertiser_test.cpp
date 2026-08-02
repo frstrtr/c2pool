@@ -192,27 +192,24 @@ TEST(TxAdvertiser, EvictionEmitsLosingTx)
     EXPECT_EQ(st.m_advertised, hashes(6, 10));
 }
 
-// p2p.py:261-274 (transitioned): additions go out BEFORE retractions. With the
-// one-message-per-sweep bound this becomes "adds this sweep, retractions the
-// next" — the ordering canonical guarantees is preserved across sweeps.
+// p2p.py:261-274 (transitioned): additions go out BEFORE retractions, and the
+// #863 write queue lets both go in ONE sweep -- have_tx then losing_tx, ordered.
 TEST(TxAdvertiser, MixedDeltaSendsHaveBeforeLosing)
 {
     TxAdvertState st;
     Wire w0;
     sweep(st, hashes(1, 5), w0);
 
+    // One sweep that both adds {6..9} and drops {1..3}: two ordered messages.
     Wire a;
-    sweep(st, hashes(4, 9), a); // drop 1..3, add 6..9
-    ASSERT_EQ(a.msgs.size(), 1u);
+    sweep(st, hashes(4, 9), a);
+    ASSERT_EQ(a.msgs.size(), 2u);
     EXPECT_EQ(a.msgs[0].kind, Wire::Kind::have);
+    EXPECT_EQ(a.msgs[1].kind, Wire::Kind::losing);
     EXPECT_EQ(std::set<uint256>(a.msgs[0].hashes.begin(), a.msgs[0].hashes.end()), hashes(6, 9));
+    EXPECT_EQ(std::set<uint256>(a.msgs[1].hashes.begin(), a.msgs[1].hashes.end()), hashes(1, 3));
 
-    Wire b;
-    sweep(st, hashes(4, 9), b);
-    ASSERT_EQ(b.msgs.size(), 1u);
-    EXPECT_EQ(b.msgs[0].kind, Wire::Kind::losing);
-    EXPECT_EQ(std::set<uint256>(b.msgs[0].hashes.begin(), b.msgs[0].hashes.end()), hashes(1, 3));
-
+    // Fully drained -> next sweep says nothing.
     Wire c;
     sweep(st, hashes(4, 9), c);
     EXPECT_TRUE(c.msgs.empty());
@@ -234,7 +231,7 @@ TEST(TxAdvertiser, NothingAdvertisedTwiceAndReLearnReAdvertises)
             sweep(st, pool, w);
             if (w.msgs.empty())
                 return;
-            ASSERT_EQ(w.msgs.size(), 1u);
+            ASSERT_LE(w.msgs.size(), 2u); // have and/or losing in one sweep
             for (const auto& h : w.all(Wire::Kind::have))
                 ever_advertised.push_back(h);
         }
@@ -256,10 +253,10 @@ TEST(TxAdvertiser, NothingAdvertisedTwiceAndReLearnReAdvertises)
     EXPECT_EQ(st.m_advertised, hashes(1, 6));
 }
 
-// Write-safety bound: a sweep emits AT MOST ONE message. core::Socket::write has
-// no outbound queue (socket.cpp:110-137), so a chunk burst would overlap composed
-// async_writes and interleave bytes mid-message -> bad checksum -> the canonical
-// peer drops us. Over-budget hashes are NOT committed; they resurface next sweep.
+// Budget bound: an ADDS-ONLY sweep emits exactly one have_tx of `budget` hashes;
+// over-budget hashes are NOT committed and resurface next sweep. (Since #863 the
+// two-part drain may emit have_tx AND losing_tx in one sweep -- covered by
+// SameSweepDrainsHaveThenLosingInOrder -- but with no retractions, just one here.)
 TEST(TxAdvertiser, OneMessagePerSweepAndCommitsOnlyWhatWasEmitted)
 {
     constexpr size_t budget = 4;
@@ -307,9 +304,10 @@ TEST(TxAdvertiser, RemainderIsAdvertisedOnSubsequentSweeps)
     EXPECT_EQ(st.m_advertised, pool);
 }
 
-// Retractions are budgeted the same way, and additions always drain FIRST
-// (canonical have-before-losing, p2p.py:264-267) — so a sweep never emits a
-// have_tx and a losing_tx back to back.
+// Retractions are budgeted like additions, and within a sweep additions drain
+// FIRST (canonical have-before-losing, p2p.py:261-274). With the two-part drain
+// a sweep emits have_tx AND losing_tx together, each capped at the budget; the
+// losing_tx remainder carries to the following sweeps.
 TEST(TxAdvertiser, LosingTxIsBudgetedAndDrainsAfterHaveTx)
 {
     constexpr size_t budget = 4;
@@ -319,34 +317,31 @@ TEST(TxAdvertiser, LosingTxIsBudgetedAndDrainsAfterHaveTx)
     for (int i = 0; i < 3; ++i) { Wire w; sweep(st, hashes(1, 9), w, budget); }
     ASSERT_EQ(st.m_advertised, hashes(1, 9));
 
-    // Now the pool drops to {1..2} AND gains {20..21}: adds go first.
+    // Pool drops to {1,2} AND gains {20,21}: 2 adds, 7 retractions ({3..9}).
     std::set<uint256> next = hashes(1, 2);
     next.insert(H(20));
     next.insert(H(21));
 
+    // Sweep 1: both adds, PLUS the first `budget` retractions -- have before losing.
     Wire a;
     sweep(st, next, a, budget);
-    ASSERT_EQ(a.msgs.size(), 1u);
+    ASSERT_EQ(a.msgs.size(), 2u);
     EXPECT_EQ(a.msgs[0].kind, Wire::Kind::have);
     EXPECT_EQ(std::set<uint256>(a.msgs[0].hashes.begin(), a.msgs[0].hashes.end()),
               (std::set<uint256>{H(20), H(21)}));
+    EXPECT_EQ(a.msgs[1].kind, Wire::Kind::losing);
+    EXPECT_EQ(a.msgs[1].hashes.size(), budget);
 
-    // Only once additions are exhausted do retractions start, one message each.
+    // Sweep 2: no adds left, the remaining 3 retractions.
     Wire b;
     sweep(st, next, b, budget);
     ASSERT_EQ(b.msgs.size(), 1u);
     EXPECT_EQ(b.msgs[0].kind, Wire::Kind::losing);
-    EXPECT_EQ(b.msgs[0].hashes.size(), budget);
+    EXPECT_EQ(b.msgs[0].hashes.size(), 3u); // 7 retractions total: 4 + 3
 
     Wire c;
     sweep(st, next, c, budget);
-    ASSERT_EQ(c.msgs.size(), 1u);
-    EXPECT_EQ(c.msgs[0].kind, Wire::Kind::losing);
-    EXPECT_EQ(c.msgs[0].hashes.size(), 3u); // 7 retractions total: 4 + 3
-
-    Wire d;
-    sweep(st, next, d, budget);
-    EXPECT_TRUE(d.msgs.empty());
+    EXPECT_TRUE(c.msgs.empty());
     EXPECT_EQ(st.m_advertised, next);
 }
 
