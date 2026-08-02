@@ -1,0 +1,14 @@
+[Unit]
+Description=c2pool CI — reap orphaned (ppid=1) build trees left by a dead Runner.Worker
+Documentation=https://github.com/frstrtr/c2pool/blob/master/scripts/ci/runner-orphan-reaper-linux.sh
+
+[Service]
+Type=oneshot
+# Optional inline alert transport; if unset, kills are logged to the journal
+# and appended to the spool for ci-steward's heartbeat to forward to decisions@.
+Environment=REAP_ALERT_MAILTO=
+ExecStart=%h/.local/bin/runner-orphan-reaper-linux.sh
+Nice=10
+
+[Install]
+WantedBy=default.target

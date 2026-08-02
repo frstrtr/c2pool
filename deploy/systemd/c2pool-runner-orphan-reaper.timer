@@ -1,0 +1,11 @@
+[Unit]
+Description=c2pool CI — periodic orphaned-build-tree reap (~10 min)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
