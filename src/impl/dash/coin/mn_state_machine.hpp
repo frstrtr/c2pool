@@ -270,6 +270,17 @@ public:
     void set_sml_recovery_cap(size_t n) { m_sml_recovery_cap = n; }
     size_t sml_recovery_cap() const     { return m_sml_recovery_cap; }
     size_t sml_recovered_total() const  { return m_sml_recovered_total; }
+    /// Zero the SPENT half of the per-bridge demotion-walk budget.
+    ///
+    /// load() deliberately does NOT do this — it reloads the ENTRIES, and a
+    /// caller that reloads a snapshot mid-run must not thereby hand itself a
+    /// fresh licence to override the projection. But a bridge that is RE-ARMED
+    /// from its anchor is a NEW bridge: the budget is documented as
+    /// "per-bridge", and carrying the previous bridge's spend into it would
+    /// start the replay with the walk already exhausted — silently converting
+    /// the first post-anchor PoSe ban into a terminal fail-close. Only
+    /// MnCheckpointLane::rearm() calls this, on exactly that boundary.
+    void reset_sml_recovery_budget() { m_sml_recovered_total = 0; }
 
     /// How deep pass 0's ranked candidate list goes. The recovery walk can
     /// never look past this depth, which bounds both the work and the blast
