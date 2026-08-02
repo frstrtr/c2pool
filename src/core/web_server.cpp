@@ -165,13 +165,31 @@ void MiningInterface::setup_methods()
 
     // Explorer JSON-RPC adapter — allows Python explorer to talk to c2pool
     // as if it were a standard Bitcoin/Litecoin daemon.
+    // Daemonless coin-chain queries take precedence over the explorer
+    // callbacks when a coin backend installed one (DASH answers these three
+    // from its own PoW-validated header chain). The hook returns a refusal
+    // object naming the blocking condition when it cannot answer; forward it
+    // verbatim rather than flattening it to a zero or an empty string.
     Add("getblockchaininfo", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        if (has_coin_chain_query_fn())
+            return call_coin_chain_query("getblockchaininfo", params, primary_chain_key());
         if (has_explorer_chaininfo_fn())
             return call_explorer_chaininfo(primary_chain_key());
         return nlohmann::json{{"error", "explorer not enabled"}};
     }));
 
+    Add("getbestblockhash", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        if (has_coin_chain_query_fn())
+            return call_coin_chain_query("getbestblockhash", params, primary_chain_key());
+        return nlohmann::json{
+            {"error", "getbestblockhash unavailable: no coin chain-query backend "
+                      "is installed for this node (threshold: a coin backend must "
+                      "call set_coin_chain_query_fn)"}};
+    }));
+
     Add("getblockhash", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        if (has_coin_chain_query_fn())
+            return call_coin_chain_query("getblockhash", params, primary_chain_key());
         if (!has_explorer_blockhash_fn() || params.empty())
             return nullptr;
         uint32_t h = params[0].get<uint32_t>();

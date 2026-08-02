@@ -746,7 +746,31 @@ void HttpSession::process_request()
 
                     std::string ep = target.substr(14);
 
-                    if (ep == "getblockchaininfo" && mining_interface_->has_explorer_chaininfo_fn()) {
+                    // Daemonless coin-chain query hook first: when a coin
+                    // backend can answer from its own validated state (DASH's
+                    // header chain), its answer — including a refusal that
+                    // names the blocking condition — is served verbatim.
+                    if ((ep == "getblockchaininfo" || ep == "getbestblockhash" || ep == "getblockhash")
+                        && mining_interface_->has_coin_chain_query_fn()) {
+                        rest_result = [&]() -> nlohmann::json {
+                            nlohmann::json qp = nlohmann::json::array();
+                            if (ep == "getblockhash") {
+                                std::string height_str = getQueryParam("height");
+                                if (height_str.empty())
+                                    return nlohmann::json{
+                                        {"error", "getblockhash withheld: missing height "
+                                                  "parameter (threshold: ?height=<n> required)"}};
+                                try { qp.push_back(static_cast<uint32_t>(std::stoul(height_str))); }
+                                catch (...) {
+                                    return nlohmann::json{
+                                        {"error", "getblockhash withheld: height parameter '"
+                                                  + height_str + "' is not a number "
+                                                  "(threshold: decimal height)"}};
+                                }
+                            }
+                            return mining_interface_->call_coin_chain_query(ep, qp, chain);
+                        }();
+                    } else if (ep == "getblockchaininfo" && mining_interface_->has_explorer_chaininfo_fn()) {
                         rest_result = mining_interface_->call_explorer_chaininfo(chain);
                     } else if (ep == "getblockhash" && mining_interface_->has_explorer_blockhash_fn()) {
                         std::string height_str = getQueryParam("height");

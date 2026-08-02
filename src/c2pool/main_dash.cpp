@@ -69,6 +69,7 @@
 #include <impl/dash/coin/quorum_member_source.hpp>  // E1 Phase-L: daemonless member-set sourcing (the provider)
 #include <impl/dash/coin/utxo_lane.hpp>    // dash::coin::UtxoLane — embedded UTXO/fee lane (E2b, #738)
 #include <impl/dash/coin/header_chain.hpp>       // dash::coin::HeaderChain — SPV header/tip authority (E2a)
+#include <impl/dash/coin/chain_rpc.hpp>          // dash::coin::chain_rpc — daemonless getbestblockhash/getblockhash/getblockchaininfo
 #include <impl/dash/coin/coin_state_maintainer.hpp>  // dash::coin::CoinStateMaintainer — populate ordering gate (E2a)
 #include <impl/dash/coin/sml_quorum_db.hpp>      // dash::coin::SMLDb / QuorumDb — SML+quorum persistence (incremental restart)
 #include <impl/dash/coin/credit_pool_db.hpp>     // dash::coin::CreditPoolDb — credit-pool tip persistence (E2 restart resume)
@@ -2411,6 +2412,34 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             / net_subdir / "dash_headers").string();
         header_chain = std::make_unique<dash::coin::HeaderChain>(dash_params, hdr_db);
         header_chain->init();
+
+        // ── Daemonless chain queries ──────────────────────────────────────
+        // getbestblockhash / getblockhash / getblockchaininfo are answered
+        // from the header chain we just opened — a PoW(X11)+DGW-validated,
+        // height-indexed, on-disk chain — instead of from dashd. These three
+        // and no more: the remaining six daemon RPCs (getblock, getpeerinfo,
+        // getrawmempool, getnetworkinfo, getmininginfo, protx) need block
+        // bodies, peer tables, a mempool or the masternode set, which a header
+        // chain does not own. See impl/dash/coin/chain_rpc.hpp.
+        //
+        // Refusals are forwarded verbatim: a query the chain cannot answer
+        // (no tip, stale tip, height below the fast-start anchor) returns the
+        // named condition with its measured value and threshold, never a zero.
+        if (web_server) {
+            web_server->get_mining_interface()->set_coin_chain_query_fn(
+                [hc = header_chain.get()](const std::string& method,
+                                          const nlohmann::json& params,
+                                          const std::string& chain) -> nlohmann::json {
+                    if (chain != "dash")
+                        return nlohmann::json{
+                            {"error", "chain '" + chain + "' is not served by this "
+                                      "node (owned chain: dash)"}};
+                    return dash::coin::chain_rpc::chain_query(*hc, method, params);
+                });
+            std::cout << "[run] daemonless chain queries ARMED "
+                         "(getbestblockhash/getblockhash/getblockchaininfo "
+                         "answered from the header chain)\n";
+        }
 
         maintainer = std::make_unique<dash::coin::CoinStateMaintainer>(node_coin_state);
         mn_ckpt_lane = std::make_unique<dash::coin::MnCheckpointLane>();
