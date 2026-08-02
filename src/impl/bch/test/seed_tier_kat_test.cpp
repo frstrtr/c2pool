@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
-// bch::coin::SeedTier KAT -- pins the two PURE, network-free primitives the
-// Option-A embedded peer-discovery ladder relies on:
+// bch::coin::SeedTier KAT -- pins the four PURE, network-free primitives the
+// Option-A embedded peer-discovery ladder relies on. Sections 1-2 are the
+// tier-assembly cases; sections 3-4 are the peer-loss walk + re-arm cases,
+// added on top without altering or removing any earlier assertion:
 //
 //   1) should_run_ladder(explicit_peer_port, has_seeds) -- the reward-safe
 //      gate. The ladder is consulted ONLY when NO explicit peer is configured
@@ -9,17 +11,17 @@
 //      (port != 0) ALWAYS bypasses it, so the configured-peer / RPC-only
 //      default is untouched.
 //
-//   3) CandidateWalk -- the peer-loss tail-walk + re-arm cursor. On master a
-//      single dial of candidates.front() re-dialed the dead front forever;
-//      the walk MUST advance front -> tail on each peer loss and raise its
-//      wrap signal (re-arm) once the ladder is exhausted. This KAT pins that
-//      rotation contract; a front-forever transport fails the tail asserts.
-//
 //   2) build_ladder(dns_resolved, fixed, http_resolved) -- ordered, deduped
 //      tier assembly. DNS is the primary tier; fixed SUBSTITUTES for it only
 //      when DNS resolved nothing; the HTTP-peer (tier-3) list is appended AFTER
 //      the primary tier. Dedup preserves FIRST occurrence, so the order is
 //      [DNS or fixed] then [http].
+//
+//   3) CandidateWalk -- the peer-loss tail-walk + re-arm cursor. Before this
+//      change a single dial of candidates.front() re-dialed the dead front
+//      forever; the walk MUST advance front -> tail on each peer loss and raise
+//      its wrap signal (re-arm) once the ladder is exhausted. This KAT pins that
+//      rotation contract; a front-forever transport fails the tail asserts.
 //
 //   4) EmergencyReArm -- the fleet-canonical never-re-arm fix (the/docs/
 //      coin-peer-manager-rearm.md sections 2.1-2.4), BCH single-peer locus.
@@ -132,9 +134,9 @@ int main()
 
     // ---- 3) CandidateWalk: tail-walk on peer loss, wrap -> re-arm -------
     {
-        // Ordered ladder: front, then tail tiers (fixed / http). On master the
-        // transport re-dialed candidates.front() forever, so a permanently-dead
-        // front seed NEVER reached the tail. The walk MUST visit the tail.
+        // Ordered ladder: front, then tail tiers (fixed / http). Before the
+        // walk the transport re-dialed candidates.front() forever, so a
+        // permanently-dead front seed NEVER reached the tail. It must now.
         SeedTier::CandidateWalk w;
         w.rearm({ ns("1.1.1.1", 8333),    // front (modelled permanently dead)
                   ns("2.2.2.2", 8333),    // tail / fixed tier
@@ -192,8 +194,8 @@ int main()
 
     // ---- 4) EmergencyReArm: the three MANDATORY re-arm properties -------
     // Fleet-canonical never-re-arm spec (coin-peer-manager-rearm.md 2.1-2.4),
-    // BCH single-peer locus. On master these entry points do not exist, so this
-    // section fails to COMPILE there -- the required red.
+    // BCH single-peer locus. These entry points did not exist before this
+    // change -- the section fails to COMPILE without them, which is the red.
     using ER = SeedTier::EmergencyReArm;
 
     // 4.1 BACKOFF (spec 2.1): delay(n) = min(base<<n, max); saturating shift,

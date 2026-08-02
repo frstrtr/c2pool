@@ -103,6 +103,22 @@ public:
     EmbeddedDaemon(const EmbeddedDaemon&) = delete;
     EmbeddedDaemon& operator=(const EmbeddedDaemon&) = delete;
 
+    /// SHUTDOWN (re-arm spec 2.3): the daemon is a stack object owned by the
+    /// binary entrypoint, so teardown IS destruction. Clear the running flag and
+    /// cancel the emergency re-arm timer so a pending backed-off ladder
+    /// re-resolve cannot fire against a half-destroyed daemon. Without this the
+    /// m_running guards in arm_emergency_fallbacks() / the timer handler are
+    /// dead code -- the flag would never become false.
+    ~EmbeddedDaemon() { stop(); }
+
+    /// Idempotent shutdown: stop arming new emergency re-arms and cancel any
+    /// pending one. Safe to call more than once and safe to call before run().
+    void stop() {
+        m_running = false;
+        if (m_emergency_timer)
+            m_emergency_timer->stop();
+    }
+
     /// Bring the daemon up: start the node front-end (external RPC fallback +
     /// P2P relay) and close the ABLA size loop. After this, full_block events
     /// flow node --> feed --> tracker --> EmbeddedCoinNode dynamic budget, and
@@ -740,7 +756,7 @@ private:
     // torn down on destruction (the core::Timer dtor cancels a pending wait).
     SeedTier::EmergencyReArm     m_emergency;
     std::unique_ptr<core::Timer> m_emergency_timer;
-    bool             m_running = true;   // false after stop(): timer handlers early-return
+    bool             m_running = true;   // cleared by stop()/~EmbeddedDaemon: timer handlers early-return
 };
 
 } // namespace coin
