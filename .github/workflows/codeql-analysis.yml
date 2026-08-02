@@ -28,6 +28,15 @@ env:
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
+    # Hard cap: the analyze job had no timeout-minutes, so a wedged
+    # CodeQL tracer build (uncapped, not the orphan-reap class of #1027/
+    # #1031) ran ~2h to a silent death (#1001) instead of a fast red.
+    # Honest p95 of the 25 most-recent SUCCESSFUL runs is 59.2 min (max
+    # legit 59.2); the only longer sample was the 600 min runaway this
+    # cap targets. 90 min sits above p95 with cold-cache headroom and
+    # well under the ~2h death point, converting the hang to a
+    # deterministic red without touching any legitimate run.
+    timeout-minutes: 90
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     permissions:
       security-events: write
