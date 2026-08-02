@@ -1527,3 +1527,84 @@ TEST(ShareDifficultyTrend, GraphFallsBackToRecordedShareDifficulty) {
            "fall back to the last recorded real share difficulty, not a "
            "difficulty/65536 approximation.";
 }
+
+
+// ===========================================================================
+// PRE-SYNC / NO-WORK-REASON surface (integrator 08-02, PERMANENT lane item).
+//
+// Measured gap: nothing in web_server.cpp / dashboard.html referenced sync
+// state or a no-work reason, so a node healthily SYNCING and a node FAULTED
+// rendered identically -- "nothing happening". The truth existed only in a
+// log line (stratum_server.cpp: "header sync in progress") and in the log-only
+// classify_decline() (dash node_coin_state.hpp). These KATs pin the web-owned
+// contract from both sides: the render must surface header-sync progress + the
+// no-work reason, categorised, and the hook payload must pass those fields
+// through verbatim so each lane can feed classify_decline()/header heights.
+// ===========================================================================
+
+// Side 1 (backend): the per-coin node_topology hook is a verbatim passthrough
+// (rest_node_topology returns the hook JSON as-is). A lane feeding a no-work
+// reason + header-sync heights must have them survive to the API untouched --
+// the contract the front-end reads.
+TEST(WebHonestyRegression, NodeTopologyHookPassesNoWorkReasonAndHeaderSyncVerbatim) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+    mi.set_node_topology_fn([] {
+        return json{{"node_symbol", "DASH"}, {"auto_detected", false},
+            {"coins", json::array({
+                json{{"coin", "DASH"}, {"primary", true}, {"peers", 8},
+                     {"synced", false},
+                     {"header_height", 2515029}, {"target_height", 2515025},
+                     {"sync_percent", 100.0},
+                     {"no_work_reason", "superblock-refused"}}})}};
+    });
+    json t = mi.rest_node_topology();
+    ASSERT_TRUE(t.contains("coins") && t["coins"].is_array() && !t["coins"].empty());
+    const auto& c = t["coins"][0];
+    EXPECT_EQ(c.value("no_work_reason", std::string{}), "superblock-refused")
+        << "the lane no-work reason (classify_decline output) must survive the "
+           "topology hook verbatim -- it is the money-relevant field.";
+    EXPECT_EQ(c.value("header_height", 0), 2515029)
+        << "header-sync current height must pass through for the progress line";
+    EXPECT_EQ(c.value("target_height", 0), 2515025)
+        << "header-sync target height must pass through for the progress line";
+}
+
+// Side 2 (frontend, static-HTML): renderNodeTopology must READ the header-sync
+// heights and the no-work reason, and must categorise the reason so a syncing
+// node is legibly different from a faulted or a declining one. Fails-without-fix:
+// if the render drops back to the peers/synced-only shape, a syncing node and a
+// dead node collapse to identical output -- the exact defect this item exists to
+// kill. Folded into this allowlisted target (no new add_executable -> #769 trap).
+TEST(DashboardNoWorkReason, RendersHeaderSyncAndCategorisedReason) {
+    const auto html = read_dashboard();
+    auto start = html.find("function renderNodeTopology(t)");
+    ASSERT_NE(start, std::string::npos) << "renderNodeTopology not found";
+    auto end = html.find("\n        function ", start + 1);
+    ASSERT_NE(end, std::string::npos);
+    const std::string fn = html.substr(start, end - start);
+
+    // Header-sync progress: must read current AND target height.
+    EXPECT_NE(fn.find("c.header_height"), std::string::npos)
+        << "render must read c.header_height for the sync-progress line";
+    EXPECT_NE(fn.find("c.target_height"), std::string::npos)
+        << "render must read c.target_height for the sync-progress line";
+
+    // The no-work reason must be read and surfaced.
+    EXPECT_NE(fn.find("c.no_work_reason"), std::string::npos)
+        << "render must read c.no_work_reason -- without it a node serving no "
+           "work renders blank, indistinguishable from a dead node (the gap "
+           "this permanent item exists to close).";
+
+    // The three states must each be legibly named -- collapsing them was the bug.
+    for (const char* cat : {"syncing", "faulted", "armed, declining"}) {
+        EXPECT_NE(fn.find(cat), std::string::npos)
+            << "render must name the  << cat <<  state; the whole point is "
+               "that syncing / faulted / declining are NOT identical on screen.";
+    }
+
+    // Honest-absent: the reason line is guarded on the field being present, so a
+    // lane that feeds no reason stays silent rather than claiming a false state.
+    EXPECT_NE(fn.find("c.no_work_reason != null"), std::string::npos)
+        << "the no-work line must be gated on the reason being present "
+           "(honest-absent), not rendered unconditionally.";
+}
