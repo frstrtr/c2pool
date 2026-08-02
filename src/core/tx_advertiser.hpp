@@ -39,7 +39,13 @@
 // txs to turn into a burst of outbound adverts.
 //
 // ── Write-safety: ONE MESSAGE PER PEER, AND NEVER TWO IN FLIGHT ─────────────
-// This is a HARD constraint imposed by c2pool's socket layer, not by canonical.
+// SUPERSEDED by #863 (outbound write queue in core::Socket): overlapping
+// composed writes can no longer interleave, so the one-message-per-sweep rule
+// below is NO LONGER a write-safety requirement. run_tx_advert now drains
+// have_tx THEN losing_tx in one sweep over that queue. The text below is kept as
+// the historical rationale for the shape.
+//
+// This WAS a HARD constraint imposed by c2pool's socket layer, not by canonical.
 //
 // core::Socket::write (core/socket.cpp:110-137) starts a composed
 // boost::asio::async_write IMMEDIATELY — there is NO outbound queue. Asio's
@@ -79,8 +85,8 @@
 // the halves BACK-TO-BACK — exactly the overlapping-write pattern our socket
 // layer cannot survive. Spreading across sweeps is the queue-free equivalent.
 //
-// FOLLOW-UP (deliberately NOT done here): the proper fix is an outbound write
-// queue in core::Socket, which would make both guards unnecessary and would also
+// DONE (#863): the proper fix was an outbound write queue in core::Socket, now
+// on master. It makes the one-message-per-sweep guard unnecessary and also
 // cure the PRE-EXISTING violation in the share-broadcast path
 // (dash/node.cpp:1290/1301/1307 issues three back-to-back writes) for every
 // coin. That is a core change needing its own review.
@@ -197,13 +203,14 @@ inline void commit_tx_advert(TxAdvertState& state, const TxAdvertPlan& emitted)
 
 // Drive one advert sweep for one peer.
 //
-// Emits AT MOST ONE message (see the write-safety section in the header
-// comment): the first `max_per_message` outstanding have_tx hashes if there are
-// any, otherwise the first `max_per_message` outstanding losing_tx hashes.
-// Additions therefore always precede retractions across sweeps, preserving
-// canonical's have-before-losing ordering (p2p.py:264-267). Whatever is left
-// over is recomputed from scratch by the next sweep, so nothing is lost and
-// nothing is sent twice.
+// Emits an ordered two-part drain in a SINGLE sweep: up to `max_per_message`
+// outstanding have_tx hashes, THEN up to `max_per_message` outstanding losing_tx
+// hashes -- additions always precede retractions, matching canonical's
+// have-before-losing ordering (p2p.py:261-274). Both messages are submitted to
+// the peer's #863 outbound write queue (core/socket.hpp), which serialises them
+// FIFO so they cannot interleave on the wire. Whatever is left over (either part
+// truncated by `max_per_message`) is recomputed from scratch by the next sweep,
+// so nothing is lost and nothing is sent twice
 //
 // Emits NOTHING if this peer was advertised to less than `min_interval` ago —
 // one message per sweep is not one message in flight, and initiating a second
@@ -217,8 +224,8 @@ inline void commit_tx_advert(TxAdvertState& state, const TxAdvertPlan& emitted)
 // Returns the subset that was ACTUALLY emitted (and committed).
 //
 // send_have / send_losing are invoked as f(const std::vector<uint256>&) at most
-// once each, and at most one of the two per call. They MUST NOT throw; the state
-// is only committed after the sender returns.
+// once each -- and, when both fire in a sweep, send_have STRICTLY before
+// send_losing. They MUST NOT throw; state is committed only after both return.
 template <typename HashSet, typename SendHave, typename SendLosing>
 inline TxAdvertPlan run_tx_advert(
     TxAdvertState& state, const HashSet& current,
@@ -254,6 +261,15 @@ inline TxAdvertPlan run_tx_advert(
         return {};
 
     TxAdvertPlan emitted;
+
+    // Ordered two-part drain (canonical p2p.py:261-274, transitioned): within a
+    // SINGLE sweep, additions are enqueued BEFORE retractions. Both messages are
+    // submitted to the peer's #863 outbound write queue (core/socket.hpp), which
+    // drains FIFO with at most one composed async_write in flight, so back-to-back
+    // have_tx then losing_tx can no longer interleave on the wire -- the hazard
+    // the old one-message-per-sweep rule guarded against before #863 landed. This
+    // is what kills the GAP 2 losing_tx starvation: a busy pool that keeps m_have
+    // non-empty no longer defers a pending losing_tx to a later sweep.
     if (!outstanding.m_have.empty())
     {
         const auto n = static_cast<std::ptrdiff_t>(
@@ -262,7 +278,7 @@ inline TxAdvertPlan run_tx_advert(
                               std::next(outstanding.m_have.begin(), n));
         send_have(emitted.m_have);
     }
-    else if (!outstanding.m_losing.empty())
+    if (!outstanding.m_losing.empty())
     {
         const auto n = static_cast<std::ptrdiff_t>(
             std::min(max_per_message, outstanding.m_losing.size()));
@@ -270,7 +286,7 @@ inline TxAdvertPlan run_tx_advert(
                                 std::next(outstanding.m_losing.begin(), n));
         send_losing(emitted.m_losing);
     }
-    else
+    if (emitted.empty())
     {
         // initial && nothing outstanding: the unconditional p2p.py:276 advert.
         send_have(std::vector<uint256>{});
