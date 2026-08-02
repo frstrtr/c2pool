@@ -11,7 +11,7 @@ Script: `scripts/ci/runner-orphan-reaper-linux.sh` (self-documenting header).
 ## Why ppid=1 is the signal
 A legit compiler always has a live `Runner.Worker` ancestor. When the Worker
 dies, the kernel reparents its orphans to pid 1 — so `ppid=1` + build-comm +
-under `_work/.../build_codeql` = orphaned, by construction. This is safe on
+under `_work/.../build` (incl. build_codeql) = orphaned, by construction. This is safe on
 **multi-runner hosts** (VM905 = 8 runners): a busy sibling runner's compilers
 are children of *its* live Worker, never `ppid=1`, so they are never touched.
 An age floor (>15 min) is layered on as belt-and-suspenders. The script also
@@ -37,8 +37,9 @@ never touch a tree under a live Runner.Worker).
     journalctl --user -u c2pool-runner-orphan-reaper.service -n 50
 
 ## Tunables (env; defaults match the .198 incident)
-- `REAP_PATH_RE`    build-tree path regex. Default `_work/.*build_codeql`;
-                    widen to `_work/.*/build` to cover all CI builds.
+- `REAP_PATH_RE`    build-tree path regex. Default `_work/.*/build` (covers
+                    both build_codeql and the coin-matrix build dir). Narrow to
+                    `_work/.*build_codeql` for CodeQL-only hosts.
 - `REAP_COMM_RE`    toolchain leader `comm` set.
 - `REAP_MIN_AGE`    age floor, seconds (default 900).
 - `REAP_ROOT_PPID`  orphan-root parent pid (default 1; change only if the host
