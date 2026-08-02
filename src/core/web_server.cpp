@@ -6650,9 +6650,13 @@ nlohmann::json MiningInterface::rest_web_graph_data(const std::string& source, c
             result.push_back({entry.time, entry.memory_usage, bin_width, 0});
         }
         else if (source == "network_difficulty") {
-            double nd = 0;
-            // Use network difficulty from snapshot if available
-            result.push_back({entry.time, entry.pool_hash_rate > 0 ? m_network_difficulty.load() : 0.0, bin_width, 0});
+            // Per-entry historical snapshot (fixes the flat-line bug where every
+            // point back-filled the current atomic). 0 = honest-absent.
+            result.push_back({entry.time, entry.network_difficulty, bin_width, 0});
+        }
+        else if (source == "share_difficulty") {
+            // Real share (vardiff) difficulty trend; honest-absent 0.
+            result.push_back({entry.time, entry.share_difficulty, bin_width, 0});
         }
         else {
             result.push_back({entry.time, 0.0, bin_width, 0});
@@ -6695,6 +6699,12 @@ void MiningInterface::record_share_difficulty(double difficulty, const std::stri
     // tracking below; the ring has its own internal lock.
     m_hashrate_ring.record(miner, difficulty,
         static_cast<int64_t>(std::time(nullptr)));
+
+    // Snapshot the latest real share difficulty for the share-difficulty trend
+    // line (fallback for coins whose sharechain stats omit min_difficulty).
+    // This is the true vardiff target, not an approximation.
+    if (difficulty > 0)
+        m_recent_share_difficulty.store(difficulty, std::memory_order_relaxed);
 
     std::lock_guard<std::mutex> lock(m_best_diff_mutex);
     auto now_ts = static_cast<uint64_t>(std::time(nullptr));
@@ -6911,6 +6921,26 @@ void MiningInterface::update_stat_log()
     double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
     entry.attempts_to_block = net_diff * 4294967296.0;
 
+    // Historize the chain difficulty at THIS sample time so the graph plots a
+    // real trend instead of back-filling the current atomic across every point
+    // (the flat-line bug). 0 until the first work update populates it.
+    entry.network_difficulty = net_diff;
+
+    // Real share (vardiff) difficulty for the share-vs-network trend line.
+    // Priority: the sharechain published min_difficulty (the p2pool share
+    // target that vardiff retargets), then the last recorded real share diff,
+    // else honest-absent 0. Never the net/65536 approximation.
+    double real_share_diff = 0.0;
+    if (m_sharechain_stats_fn) {
+        auto scd = m_sharechain_stats_fn();
+        if (scd.contains("min_difficulty") && scd["min_difficulty"].is_number()
+            && scd["min_difficulty"].get<double>() > 0.0)
+            real_share_diff = scd["min_difficulty"].get<double>();
+    }
+    if (real_share_diff <= 0.0)
+        real_share_diff = m_recent_share_difficulty.load(std::memory_order_relaxed);
+    entry.share_difficulty = real_share_diff;
+
     // Block value
     entry.block_value = 0.0;
     {
@@ -7002,7 +7032,8 @@ void MiningInterface::save_stat_log()
                     {"pe", e.peers}, {"dv", e.desired_versions},
                     {"as", e.attempts_to_share}, {"ab", e.attempts_to_block},
                     {"bv", e.block_value}, {"mu", e.memory_usage},
-                    {"wl", e.work_latency}, {"tr", e.traffic}
+                    {"wl", e.work_latency}, {"tr", e.traffic},
+                    {"nd", e.network_difficulty}, {"sd", e.share_difficulty}
                 };
                 f << one.dump();
             }
@@ -7055,6 +7086,8 @@ void MiningInterface::load_stat_log()
             e.memory_usage = j.value("mu", 0.0);
             e.work_latency = j.value("wl", 0.0);
             e.traffic = j.value("tr", nlohmann::json::object());
+            e.network_difficulty = j.value("nd", 0.0);
+            e.share_difficulty = j.value("sd", 0.0);
             m_stat_log.push_back(std::move(e));
         }
         LOG_INFO << "[StatLog] Loaded " << m_stat_log.size() << " entries from " << m_stat_log_path;

@@ -27,6 +27,8 @@
 #include <impl/btc/coin/header_chain.hpp>
 #include <impl/btc/coin/mempool.hpp>
 #include <impl/btc/coin/node.hpp>
+#include <impl/btc/coin/coin_peer_manager.hpp> // btc::coin::BtcCoinPeerManager -- BTC-ISOLATED scored/diverse coin-network peer discovery (--coin-p2p-discover)
+#include <impl/btc/coin/chain_seeds.hpp>        // btc::coin::btc_dns_seeds / btc_fixed_seeds
 #include <impl/btc/coin/node_interface.hpp>
 #include <impl/btc/coin/transaction.hpp>
 #include <impl/btc/config.hpp>
@@ -114,6 +116,8 @@ static void print_usage()
         "                  for the submitblock backup (default ~/.bitcoin/\n"
         "                  bitcoin.conf; keeps rpcpassword off the process table).\n"
         "                  Omit both to run daemonless (embedded P2P relay only).\n"
+        "  --coin-p2p-discover  arm BTC-isolated coin-network peer discovery\n"
+        "                  (scored/group-diverse; DNS+fixed+HTTP-seed fallback).\n"
         "  --merged SPEC   embedded merged-mined aux chain (NMC under BTC),\n"
         "                  colon spec SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]\n"
         "                  e.g. NMC:1:127.0.0.1:8336:nmcrpc:pass  (Namecoin)\n"
@@ -139,6 +143,7 @@ int main(int argc, char* argv[])
     bool        testnet       = false;
     bool        testnet4      = false;
     bool        regtest       = false;
+    bool        coin_p2p_discover = false;  // --coin-p2p-discover: BTC-isolated scored/diverse coin-network peer discovery (network-standalone arm; independent of external bitcoind)
     std::string bitcoind_host;
     uint16_t    bitcoind_port = 0;
     std::string p2pool_host;
@@ -182,6 +187,10 @@ int main(int argc, char* argv[])
         else if (arg == "--regtest")
         {
             regtest = true;
+        }
+        else if (arg == "--coin-p2p-discover")
+        {
+            coin_p2p_discover = true;
         }
         else if (arg == "--bitcoind" && i + 1 < argc)
         {
@@ -637,6 +646,44 @@ int main(int argc, char* argv[])
     // advertise NODE_BLOOM (regtest: -peerbloomfilters=1) or the request is
     // skipped (logged) to avoid a disconnect; normal inv relay still applies.
     coin_node.enable_mempool_request();
+
+    // ── BTC coin-network peer discovery (--coin-p2p-discover) ────────────────
+    // BTC-ISOLATED, self-contained peer manager (per-coin isolation fence; a
+    // faithful copy of the sibling coin CoinPeerManager under src/impl/btc).
+    // OFF by default -> the external bitcoind P2P arm above is unchanged.
+    // Declared at main scope so it outlives ioc.run(); destroyed at main exit.
+    std::unique_ptr<btc::coin::BtcCoinPeerManager> coin_peer_mgr;
+    if (coin_p2p_discover) {
+        // BTC network default ports: 8333 mainnet / 18333 testnet3 /
+        // 48333 testnet4 / 18444 regtest. Distinct from the stratum/P2P pool port.
+        const uint16_t coin_port = regtest ? 18444
+                                 : (testnet4 ? 48333
+                                 : (testnet  ? 18333 : 8333));
+        btc::coin::BtcPeerManagerConfig pm_cfg;
+        pm_cfg.valid_ports = { coin_port };
+        const std::string pm_data_dir = (net_dir / "btc_embedded_peers").string();
+        coin_peer_mgr = std::make_unique<btc::coin::BtcCoinPeerManager>(
+            ioc, "BTC", pm_data_dir, pm_cfg);
+        // testnet4 currently reuses the testnet3 seed set (btc_*_seeds take a
+        // single bool); the port above is still testnet4-correct. Refine when a
+        // testnet4-specific seed accessor is wired.
+        coin_peer_mgr->set_dns_seeds(btc::coin::btc_dns_seeds(testnet));
+        coin_peer_mgr->set_fixed_seeds(btc::coin::btc_fixed_seeds(testnet));
+        // Tier 3 (last-resort) HTTP bootstrap: the shared c2pool seed aggregator.
+        // Fires only when DNS + fixed seeds both fail to yield min_peers within
+        // 90s (schedule_http_peer_fallback). Coin selection is by the "btc" JSON
+        // key inside http_fetch_coin_peers, not the host, so the shared
+        // aggregator serves BTC peers without a BTC-specific endpoint. No-op if
+        // the list is empty. KNOWN LIMITATION (inherited, not introduced here):
+        // this fallback is one-shot and does not re-arm (see dgb-rearm-0801).
+        coin_peer_mgr->set_http_peer_seeds({{"voidbind.com", 8080}});
+        coin_peer_mgr->start();
+        const auto pm_stats = coin_peer_mgr->peer_stats();
+        LOG_INFO << "[BTC] coin-network peer discovery ARMED (--coin-p2p-discover): "
+                 << "port=" << coin_port
+                 << " peers=" << pm_stats.total
+                 << " groups=" << pm_stats.unique_groups;
+    }
 
     // Drive initial header sync. Per BTC protocol, NodeP2P's verack handler
     // sends sendheaders/sendcmpct/feefilter but NOT getheaders — header sync

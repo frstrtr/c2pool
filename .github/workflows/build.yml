@@ -947,7 +947,7 @@ jobs:
     # architecture sweep — macOS arm64 + x86_64 + universal, and Windows — still
     # runs in release.yml at tag time, so this DEFERS detection rather than
     # losing it. See the ci-platform-coverage job for the visible statement.
-    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-linux-only')) && !(matrix.arch == 'x86_64' && vars.MAC_INTEL_PAUSED == 'true') && !(github.event_name == 'pull_request' && vars.PR_LINUX_ONLY == 'true') }}
+    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-linux-only')) && !(github.event_name == 'pull_request' && vars.PR_LINUX_ONLY == 'true') }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -977,7 +977,6 @@ jobs:
           #   RESUME  : gh variable delete MAC_INTEL_PAUSED            --repo frstrtr/c2pool
           - arch: x86_64
             runner: ${{ vars.MAC_INTEL_OFFLINE == 'true' && ((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","c2pool-mac-arm"]') || 'macos-14') || fromJSON('["self-hosted","macOS","X64","c2pool-mac-intel"]') }}
-            paused: ${{ vars.MAC_INTEL_PAUSED == 'true' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -1437,7 +1436,7 @@ jobs:
           cmake --build build_dash_bls \
             --target c2pool-dash \
                      test_dash_bls_verify test_dash_quorum_members \
-                     test_dash_quorum_member_source \
+                     test_dash_quorum_member_source test_dash_govvote_bls \
             -j8
 
       # LEG 2: the artefact itself carries the dashbls backend.
@@ -1446,7 +1445,7 @@ jobs:
 
       - name: Run BLS KATs
         working-directory: build_dash_bls
-        run: ctest --output-on-failure -j8 -R 'DashBlsVerify|DashQuorumMembers|DashQuorumMemberSource'
+        run: ctest --output-on-failure -j8 -R 'DashBlsVerify|DashQuorumMembers|DashQuorumMemberSource|DashGovVoteBLS'
 
       # LEG 3: the BLS-ONLY cases actually ran. Each of these is inside
       # #ifdef C2POOL_DASH_BLS, so on a stub build they do not fail -- they
@@ -1483,6 +1482,16 @@ jobs:
             echo "::error::BLS-only KATs did not run -- the build is BLS-dark despite C2POOL_DASH_BLS=ON"
             exit 1
           fi
+
+      - name: Upload real-BLS binary (deployable candidate)
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: c2pool-dash-linux-x64-realbls
+          path: build_dash_bls/src/c2pool/c2pool-dash
+          retention-days: 3
+          overwrite: true
+          if-no-files-found: error
 
       - name: Upload build artifacts on failure
         if: failure()
