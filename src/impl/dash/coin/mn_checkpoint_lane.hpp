@@ -131,6 +131,18 @@
 ///     reactive walk's attestations (a stale list must not license a permanent
 ///     demotion of a since-revived masternode).
 ///
+///     A fold point is COARSE (kDefaultFoldInterval blocks), so a ban landing
+///     strictly BETWEEN two of them is invisible to it. That gap is closed by
+///     the ON-DEMAND fold below, not by shrinking the interval.
+///
+///   • THE ON-DEMAND FOLD — the same request machinery, fired BY A PAYEE
+///     MISMATCH rather than by a fold point. Measured on mainnet: the bridge
+///     fail-closed at h=2513489 having projected a masternode PoSe-banned at
+///     h<=2513488, with the next scheduled fold point ELEVEN BLOCKS LATER at
+///     2513500. The mismatch itself is the perfect trigger — it fires exactly
+///     when, and only when, the queue is wrong. See the ON-DEMAND PoSe FOLD
+///     block below for the cap and the safety argument.
+///
 ///   • set_sml_validity_fn() — the per-hash attestation used by the REACTIVE
 ///     per-mismatch demotion walk, which remains the second line of defence
 ///     for a ban the fold could not cover (no verified SML, or an SML whose
@@ -304,8 +316,20 @@ public:
         m_merkle_root_at = std::move(fn);
     }
     /// How many blocks between fold points. Coarse on purpose: a fold is a
-    /// network round trip and the per-mismatch walk covers the gaps.
+    /// network round trip, and a ban that lands BETWEEN two fold points is
+    /// caught by the ON-DEMAND fold at the mismatch it causes (see the
+    /// ON-DEMAND PoSe FOLD block below), not by shrinking this.
     void set_fold_interval(uint32_t n) { m_fold_interval = n ? n : 1; }
+
+    /// Override the per-bridge on-demand fold cap. Unset, the cap is sized
+    /// against the replay distance at bridge start (see pump()). ZERO disables
+    /// the on-demand path entirely, which restores the pre-change behaviour
+    /// exactly: a payee mismatch between fold points is terminal.
+    void set_ondemand_fold_cap(size_t n)
+    {
+        m_ondemand_cap       = n;
+        m_ondemand_cap_forced = true;
+    }
 
     /// Maximum number of blocks the bridge is willing to replay. A checkpoint
     /// further behind the tip than this is treated as STALE and refused: the
@@ -351,6 +375,15 @@ public:
         m_snapshot_waits   = 0;
         m_abandoned_folds  = 0;
         m_abandoned.clear();
+        m_ondemand_pending  = false;
+        m_ondemand_height   = 0;
+        m_ondemand_folds    = 0;
+        m_ondemand_excluded = 0;
+        m_ondemand_cap_hit  = false;
+        m_ondemand_evaluated = false;
+        m_ondemand_abandoned = 0;
+        m_ondemand_block    = BlockType{};
+        m_ondemand_r        = MnStateMachine::ApplyResult{};
         m_pose_removed    = 0;
         m_pose_reinstated = 0;
         m_sml_recovered   = 0;
@@ -396,6 +429,17 @@ public:
     /// tip, so "did we fold before the first block" is a different question
     /// from "where did we fold last".
     uint32_t first_fold_height()  const { return m_first_fold_height; }
+    /// ── On-demand fold accounting ─────────────────────────────────────────
+    /// How many folds were triggered BY A PAYEE MISMATCH rather than by a
+    /// fold point, how many queue heads they retired, the per-bridge cap, and
+    /// whether that cap was ever hit. `ondemand_evaluated()` is false when no
+    /// mismatch ever occurred — in which case every other number here is
+    /// "never evaluated", NOT "evaluated and zero", and the reports say n/a.
+    size_t   ondemand_folds()     const { return m_ondemand_folds; }
+    size_t   ondemand_excluded()  const { return m_ondemand_excluded; }
+    size_t   ondemand_cap()       const { return m_ondemand_cap; }
+    bool     ondemand_cap_hit()   const { return m_ondemand_cap_hit; }
+    bool     ondemand_evaluated() const { return m_ondemand_evaluated; }
     size_t   replay_registered()  const { return m_registered; }
     size_t   replay_spent()       const { return m_spent; }
     bool     failed_closed() const { return m_state == State::FailedClosed; }
@@ -493,6 +537,35 @@ public:
             // refuse, and the fold already removes the need.
             m_sml_recovery_cap = 4 + (tip - m_anchor_height) / 1000;
             m_machine.set_sml_recovery_cap(m_sml_recovery_cap);
+            // ── THE ON-DEMAND FOLD CAP ───────────────────────────────────
+            // Bounds ROUND TRIPS, not trust: every on-demand fold is DIP-4
+            // client-verified against the coinbase of the very block it
+            // judges, so an extra one costs correctness nothing. What it
+            // costs is one getmnlistd and one paused replay, and a bridge
+            // that mismatches on EVERY block is not experiencing bans — it
+            // has a wrong anchor or a broken replay, and must stop rather
+            // than hammer a peer for thousands of lists.
+            //
+            // SIZING, from the measurement. One on-demand fold repairs an
+            // entire BURST at once (the wholesale pass retires every
+            // masternode the list attests banned, not just the queue head),
+            // so the cost is one round trip per DISTINCT ban EVENT that
+            // reaches the queue head between two fold points. Mainnet
+            // 2026-08-02: 9 masternodes left `protx list valid` across 1874
+            // blocks — about one ban event per 200 blocks, and only a
+            // fraction of those hit the queue head before the next scheduled
+            // fold. kOnDemandFoldPerBlocks = 250 tracks that rate with
+            // headroom; kOnDemandFoldBase = 8 covers a SHORT bridge, where
+            // the ratio term contributes nothing but a burst can still land.
+            //
+            // At the default 20000-block bridge bound that is 8 + 80 = 88
+            // round trips worst case, which is negligible against the 20000
+            // getdata the same bridge already issues — while a runaway
+            // stops after 88 instead of after 20000.
+            if (!m_ondemand_cap_forced) {
+                m_ondemand_cap = kOnDemandFoldBase
+                               + (tip - m_anchor_height) / kOnDemandFoldPerBlocks;
+            }
             LOG_INFO << "[MN-CKPT] bridge START: replaying h=" << m_next
                      << ".." << tip << " (" << (tip - m_next + 1)
                      << " blocks) onto the anchored set";
@@ -578,6 +651,16 @@ public:
         // detail; here it is TERMINAL (unlike the maintainer's path, which can
         // ask for an RPC re-seed — daemonless has nothing to re-seed from, and
         // guessing is exactly what must never happen).
+        if (r.payee_desync && !r.gap_detected) {
+            // ── ON-DEMAND FOLD. The mismatch IS the trigger: ask for the
+            // masternode list dated exactly at this height and re-adjudicate.
+            // Returns true when the request was issued (the replay is now
+            // PAUSED and the reply resumes it) or when the reply arrived
+            // inline and has already resolved or failed the bridge. False
+            // means the path was unavailable, and the ONLY other answer is
+            // the one this lane has always given.
+            if (begin_ondemand_fold(block, height, r)) return;
+        }
         if (r.gap_detected || r.payee_desync) {
             return fail_closed(
                 std::string("bridge replay ")
@@ -714,6 +797,16 @@ public:
     /// Blocks between fold points.
     static constexpr uint32_t kDefaultFoldInterval = 500;
 
+    /// ── The ON-DEMAND fold cap, per bridge ────────────────────────────────
+    /// cap = kOnDemandFoldBase + replay_blocks / kOnDemandFoldPerBlocks.
+    /// The reasoning is written out at the sizing site in pump(); the short
+    /// version is that this bounds ROUND TRIPS (each fold is DIP-4 verified,
+    /// so more of them costs correctness nothing) and that one fold repairs a
+    /// whole burst, so the rate that matters is DISTINCT BAN EVENTS — measured
+    /// at roughly one per 200 blocks on mainnet 2026-08-02.
+    static constexpr size_t   kOnDemandFoldBase      = 8;
+    static constexpr uint32_t kOnDemandFoldPerBlocks = 250;
+
     /// The next height at or after `cursor` at which we want a snapshot, or
     /// nullopt when none remains before `tip`. Always includes the tip so the
     /// published set is current, and the anchor so the first replayed block is
@@ -730,7 +823,7 @@ public:
 
     /// Ask for the list as of `height`, and pause the replay until it lands.
     /// Returns true when a request was issued (caller must stop pulling).
-    bool begin_fold(uint32_t height)
+    bool begin_fold(uint32_t height, bool on_demand = false)
     {
         if (!m_request_snapshot || !m_merkle_root_at || !m_header_hash_at)
             return false;
@@ -740,11 +833,110 @@ public:
         m_snapshot_hash    = *hash;
         m_snapshot_height  = height;
         m_snapshot_waits   = 0;
-        LOG_INFO << "[MN-CKPT] PoSe fold: requesting the masternode list AS OF"
+        LOG_INFO << "[MN-CKPT] "
+                 << (on_demand ? "ON-DEMAND PoSe fold (triggered by the payee"
+                                 " mismatch itself, not by a fold point)"
+                               : "PoSe fold")
+                 << ": requesting the masternode list AS OF"
                     " h=" << height << " (" << hash->GetHex().substr(0, 16)
                  << ") — replay PAUSED until it lands, so the cursor cannot"
                     " run past the height the list describes";
         m_request_snapshot(*hash);
+        return true;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ON-DEMAND PoSe FOLD — fire AT the mismatch, not at a fold point
+    // ─────────────────────────────────────────────────────────────────────
+    //
+    // MEASURED (contabo daemonless soak vs hotel dashd, mainnet, anchor
+    // 2513000, fold interval 500):
+    //
+    //     h=2513000  protx list valid 2068  projected payee PRESENT  <- folded
+    //     h=2513400                   2068  PRESENT
+    //     h=2513488                   2066  ABSENT  <- PoSe-banned in this range
+    //     h=2513489                   2066  ABSENT  <- projected anyway -> DEAD
+    //     next fold point   h=2513500                <- ELEVEN BLOCKS TOO LATE
+    //
+    // The chain paid 4cad8728bb473c80…; we projected e8626fcd57f6394d…, which
+    // the chain had already banned. THREE separate builds fail-closed at that
+    // identical height — one of them carrying no fold code at all. So the fold
+    // MECHANISM is right and only its GRANULARITY was wrong: a ban landing
+    // strictly inside a fold interval is invisible to fold points.
+    //
+    // WHY NOT JUST SHRINK THE INTERVAL. A finer interval pays a network round
+    // trip CONTINUOUSLY (every interval, ban or no ban) and STILL leaves a
+    // window — it only makes the window smaller. Firing at the mismatch pays a
+    // round trip only when a mismatch actually occurs, and leaves NO window at
+    // all, because the list we ask for is dated at the very height that failed.
+    //
+    // SAFETY IS THE #1028 ARGUMENT, UNCHANGED:
+    //   * the list is DIP-4 client-verified against the block's own coinbase
+    //     commitment (historical_sml.hpp), before it is believed;
+    //   * cursor == H holds BY CONSTRUCTION — we name the height being
+    //     adjudicated, ask for hash_at(H) from our OWN PoW-validated header
+    //     chain, and authenticate that the reply's cbTx nHeight IS H;
+    //   * the replay PAUSES while the request is outstanding, because exactly
+    //     one getmnlistd may be in flight (a duplicate reply is
+    //     indistinguishable from the first). Same m_snapshot_pending latch as
+    //     the interval fold, so there is one pause mechanism, not two;
+    //   * the reply comes back through the SAME HistoricalMnListDiffDemux —
+    //     no second filter slot, no second route to the live tip SML;
+    //   * every failure lands on TODAY'S behaviour: fail closed, never a
+    //     guessed payee.
+    //
+    // Returns TRUE when the mismatch has been TAKEN OVER by this path — either
+    // a request is outstanding (replay paused) or an inline reply has already
+    // resolved or failed the bridge. FALSE means the caller must fail closed
+    // exactly as it did before this path existed.
+    bool begin_ondemand_fold(const BlockType& block, uint32_t height,
+                             const MnStateMachine::ApplyResult& r)
+    {
+        // Nothing to re-adjudicate: the machine refused for a reason a better
+        // list cannot change (e.g. the pre-block queue was empty).
+        if (!m_machine.pending_payee_adjudication().present) return false;
+        if (m_machine.pending_payee_adjudication().height != height) return false;
+        // The seams are wired as a pair or not at all (main_dash), but a lane
+        // driven without them must degrade, not wedge.
+        if (!m_request_snapshot || !m_merkle_root_at || !m_header_hash_at)
+            return false;
+        // ONE outstanding getmnlistd. UNREACHABLE today and mutation testing
+        // says so — deleting it produces no red, because on_block_connected
+        // returns early while paused, so no block can be applied to mismatch
+        // while a request is in flight. Kept as a backstop: the constraint is
+        // hard (a second in-flight ask draws a reply that matches no await and
+        // leaks past the demux), and it is checked where it would be spent.
+        if (m_snapshot_pending) return false;
+
+        // From here on the cap has been EVALUATED, so its counters mean
+        // "measured", not "never looked".
+        m_ondemand_evaluated = true;
+        if (m_ondemand_folds >= m_ondemand_cap) {
+            m_ondemand_cap_hit = true;
+            LOG_WARNING << "[MN-CKPT] ON-DEMAND PoSe FOLD REFUSED at h="
+                        << height << ": " << m_ondemand_folds
+                        << " on-demand folds already used of a per-bridge cap of "
+                        << m_ondemand_cap << " (cap = " << kOnDemandFoldBase
+                        << " + replay_blocks/" << kOnDemandFoldPerBlocks
+                        << "). A bridge that needs more than this is not"
+                           " experiencing PoSe bans — it has a wrong anchor or a"
+                           " broken replay — so it stops here rather than asking"
+                           " a peer for a masternode list per block.";
+            return false;
+        }
+
+        // Stash everything the re-adjudication needs. The block is copied
+        // because the reply is asynchronous in production and the caller's
+        // buffer will be long gone; this costs one block copy per MISMATCH,
+        // not per block.
+        m_ondemand_block  = block;
+        m_ondemand_height = height;
+        m_ondemand_r      = r;
+        m_ondemand_pending = true;
+        if (!begin_fold(height, /*on_demand=*/true)) {
+            m_ondemand_pending = false;
+            return false;
+        }
         return true;
     }
 
@@ -764,6 +956,29 @@ public:
             return false;
         }
         if (m_snapshot_waits < kFoldGiveUpPumps) return false;
+
+        // An ON-DEMAND fold cannot be abandoned "degraded": the replay is
+        // parked on an UNRESOLVED payee mismatch, so resuming would mean
+        // carrying on with a queue we already know disagrees with the chain.
+        // The honest end is the one this lane always had.
+        if (m_ondemand_pending) {
+            remember_abandoned(m_snapshot_hash);
+            m_snapshot_pending = false;
+            m_ondemand_pending = false;
+            // Counted SEPARATELY from m_abandoned_folds on purpose: that
+            // counter's whole meaning is "the replay carried on degraded over
+            // that interval", and this replay did not carry on at all.
+            ++m_ondemand_abandoned;
+            fail_closed(
+                "bridge replay PAYEE DESYNC at h="
+                + std::to_string(m_ondemand_height)
+                + ": the ON-DEMAND masternode-list request for that exact"
+                  " height went unanswered across "
+                + std::to_string(m_snapshot_waits)
+                + " drives, so the mismatch was never adjudicated. "
+                + divergence_report(m_ondemand_r));
+            return false;   // the caller must NOT resume
+        }
 
         // GIVE UP on this fold point rather than wedge the whole bridge. The
         // cursor is still exactly at m_snapshot_height, so nothing is
@@ -811,18 +1026,26 @@ public:
 
         m_snapshot_pending = false;
         const uint32_t h = m_snapshot_height;
+        const bool on_demand = m_ondemand_pending;
 
         vendor::CCbTx cbtx;
         auto sml = authenticate_historical_snapshot(
             diff, h, m_merkle_root_at, cbtx, "MN-CKPT");
         if (!sml) {
+            m_ondemand_pending = false;
             fail_closed(
                 "the masternode list served for h=" + std::to_string(h)
                 + " failed DIP-4 client verification (see the AUTH FAILED line"
                   " above). Refusing to fold an unauthenticated list into the"
-                  " payee set — that list decides who gets paid.");
+                  " payee set — that list decides who gets paid."
+                + (on_demand
+                       ? " This was an ON-DEMAND fold, so the payee mismatch"
+                         " at that height also stands unresolved."
+                       : ""));
             return true;   // consumed: it matched our await
         }
+
+        if (on_demand) { finish_ondemand_fold(*sml, h); return true; }
 
         apply_fold(*sml, h);
         if (m_state != State::Bridging) return true;
@@ -860,6 +1083,76 @@ private:
     {
         return std::find(m_abandoned.begin(), m_abandoned.end(), h)
                != m_abandoned.end();
+    }
+
+    /// Resolve an ON-DEMAND fold: an AUTHENTICATED list dated exactly at the
+    /// height whose payee mismatched. Two steps, in this order and for two
+    /// different reasons:
+    ///
+    ///   1. WHOLESALE FOLD. Every masternode the list attests banned leaves
+    ///      the payee-eligible set in one pass, so a ban BURST inside the fold
+    ///      interval costs the same as a single ban. Same apply_fold() the
+    ///      interval folds use — same F5 sanity bound, same counters, same log
+    ///      line — and legitimate here for the same reason: the cursor is
+    ///      exactly at the height the list describes.
+    ///
+    ///   2. RE-ADJUDICATE THIS BLOCK'S PAYEE. The fold repairs the queue for
+    ///      every LATER block, but block `height` itself still has an
+    ///      unattributed payment; leaving it unattributed would desync the
+    ///      very next block. The re-adjudication demands the same unrelaxed
+    ///      evidence the walk always did — the accepted candidate's
+    ///      scriptPayout must EXACTLY equal an output this block pays.
+    ///
+    /// Any refusal at either step is TERMINAL, exactly as a payee mismatch has
+    /// always been on this lane.
+    void finish_ondemand_fold(const vendor::CSimplifiedMNList& sml,
+                              uint32_t height)
+    {
+        m_ondemand_pending = false;
+        ++m_ondemand_folds;
+
+        apply_fold(sml, height);
+        if (m_state != State::Bridging) return;   // F5 refused; already closed
+
+        const auto rr =
+            m_machine.readjudicate_payee(m_ondemand_block, height, sml);
+        if (!rr.recovered) {
+            return fail_closed(
+                "bridge replay PAYEE DESYNC at h=" + std::to_string(height)
+                + " SURVIVED the ON-DEMAND PoSe fold: " + rr.refusal
+                + ". The masternode list dated EXACTLY at that height was"
+                  " fetched and DIP-4 client-verified, so staleness is ruled"
+                  " out — this is a real divergence, not a missed ban. "
+                + divergence_report(m_ondemand_r));
+        }
+        m_ondemand_excluded += rr.excluded;
+        // The one post-apply check the desync branch jumped over. Structurally
+        // unreachable — a payee mismatch requires a non-empty projection — but
+        // "publishing a set that cannot back a payee" is exactly what this lane
+        // exists to prevent, so it is not left to an argument.
+        if (m_ondemand_r.total_after == 0) {
+            return fail_closed(
+                "bridge replay emptied the masternode set at h="
+                + std::to_string(height) + " — cannot back a payee");
+        }
+
+        // The bookkeeping the ordinary post-apply path would have done. It was
+        // skipped when apply_block reported the mismatch, and the block IS
+        // applied — only its attribution was withheld until now.
+        m_next = height + 1;
+        ++m_applied;
+        m_sml_recovered += m_ondemand_r.sml_recovered;
+        m_registered    += m_ondemand_r.registered;
+        m_spent         += m_ondemand_r.spent;
+        m_stalled_pumps = 0;
+        m_ondemand_r    = MnStateMachine::ApplyResult{};
+        m_ondemand_block = BlockType{};
+
+        // Resume: the cursor is exactly at `height`, so the next block is +1.
+        if (!m_tip_height) return;
+        const uint32_t tip = m_tip_height();
+        if (m_next > tip) { publish(tip); return; }
+        request_window(tip);
     }
 
     /// Apply an AUTHENTICATED list dated exactly at `height`, with the cursor
@@ -939,6 +1232,61 @@ public:
         return n;
     }
 
+    /// The ON-DEMAND fold's own line, in every report and on the published
+    /// status. It NAMES ITS CAP: measured value, threshold, and the formula
+    /// that produced the threshold.
+    ///
+    /// A field that was never evaluated prints `n/a`, never `0` — "no mismatch
+    /// ever happened" and "mismatches happened and no fold was needed" are
+    /// different facts, and a bare 0 says the second while meaning the first.
+    std::string ondemand_report() const
+    {
+        if (!m_request_snapshot || !m_merkle_root_at || !m_header_hash_at) {
+            return "ON-DEMAND PoSe folds: n/a (the per-height snapshot seam is"
+                   " not wired, so a mismatch can never be re-adjudicated"
+                   " against a list dated at its own height).";
+        }
+        const std::string cap_source =
+            m_ondemand_cap_forced
+                ? std::string("cap set explicitly")
+                : ("cap = " + std::to_string(kOnDemandFoldBase)
+                   + " + replay_blocks/"
+                   + std::to_string(kOnDemandFoldPerBlocks));
+        if (m_ondemand_cap == 0) {
+            return "ON-DEMAND PoSe folds: DISABLED (cap 0, " + cap_source
+                 + ") — a payee mismatch between fold points is terminal, which"
+                   " is the pre-on-demand behaviour."
+                 + (m_ondemand_evaluated
+                        ? " One was refused on that basis."
+                        : " None was ever attempted.");
+        }
+        if (!m_ondemand_evaluated) {
+            return "ON-DEMAND PoSe folds: n/a — no payee mismatch ever reached"
+                   " the on-demand path, so its cap ("
+                   + std::to_string(m_ondemand_cap) + ", " + cap_source
+                   + ") was never tested.";
+        }
+        std::string s = "ON-DEMAND PoSe folds: " + std::to_string(m_ondemand_folds)
+            + "/" + std::to_string(m_ondemand_cap) + " used (" + cap_source
+            + "), " + std::to_string(m_ondemand_excluded)
+            + " queue-head exclusion(s) licensed by a list dated EXACTLY at the"
+              " height it judged.";
+        if (m_ondemand_cap_hit) {
+            s += " THE CAP IS EXHAUSTED: " + std::to_string(m_ondemand_folds)
+                 + " of " + std::to_string(m_ondemand_cap)
+                 + " — a further mismatch was REFUSED rather than asking a peer"
+                   " for another list. A bridge that needs more than this is not"
+                   " experiencing PoSe bans; suspect the anchor or the replay.";
+        }
+        if (m_ondemand_abandoned != 0) {
+            s += " " + std::to_string(m_ondemand_abandoned)
+                 + " on-demand request(s) went UNANSWERED — the replay did NOT"
+                   " carry on degraded, it failed closed, because it was parked"
+                   " on a payee mismatch it had not adjudicated.";
+        }
+        return s;
+    }
+
     /// The measurement that replaces three hypotheses. Every fail-closed on
     /// the replay path carries it, so an operator can separate "the anchor is
     /// wrong" from "the replay is incomplete" from "a PoSe ban could not be
@@ -980,6 +1328,7 @@ public:
                    " replay carried on degraded over those intervals, with the"
                    " per-mismatch walk alone.";
         }
+        s += " " + ondemand_report();
         if (m_snapshot_pending) {
             s += " A masternode-list request for h="
                  + std::to_string(m_snapshot_height) + " is OUTSTANDING and the"
@@ -1105,7 +1454,8 @@ public:
                    + " (anchor h=" + std::to_string(m_anchor_height)
                    + " + " + std::to_string(m_applied) + " replayed blocks) "
                    + delta
-                   + " PoSe folds: " + std::to_string(m_folds);
+                   + " PoSe folds: " + std::to_string(m_folds)
+                   + " (" + ondemand_report() + ")";
         // A DEGRADED publish must say so. Publishing a set that was assembled
         // without the fold points it asked for looks identical, from outside,
         // to a clean bridge — and that silence is the defect: the operator has
@@ -1180,6 +1530,21 @@ public:
     uint32_t m_snapshot_waits{0};     // pumps spent waiting on the current one
     uint32_t m_abandoned_folds{0};
     std::vector<uint256> m_abandoned; // requests we gave up on but still claim
+    // ── ON-DEMAND fold state. m_ondemand_pending rides ALONGSIDE
+    // m_snapshot_pending rather than replacing it: there is one pause
+    // mechanism and one outstanding request, and this only says which of the
+    // two dispatch reasons owns the reply.
+    bool      m_ondemand_pending{false};
+    BlockType m_ondemand_block;         // the mismatching block, kept to re-judge
+    uint32_t  m_ondemand_height{0};
+    MnStateMachine::ApplyResult m_ondemand_r;  // its counters + projected payee
+    size_t    m_ondemand_folds{0};
+    size_t    m_ondemand_excluded{0};
+    size_t    m_ondemand_cap{kOnDemandFoldBase};
+    bool      m_ondemand_cap_forced{false};    // set_ondemand_fold_cap() wins
+    bool      m_ondemand_cap_hit{false};
+    bool      m_ondemand_evaluated{false};     // a mismatch ever reached it
+    size_t    m_ondemand_abandoned{0};         // on-demand asks never answered
     RequestSnapshotFn m_request_snapshot;
     MerkleRootAtFn    m_merkle_root_at;
     size_t   m_sml_recovery_cap{0}; // budget handed to the machine, mirrored

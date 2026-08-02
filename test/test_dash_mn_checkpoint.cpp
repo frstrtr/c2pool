@@ -2690,3 +2690,475 @@ TEST(DashMnCheckpointPoseFold, SnapshotWithNoExpectedHeightIsRefused)
         << "a null header merkle root is not an anchor, it is the absence of"
            " one -- accepting it lets a peer authenticate against nothing";
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 9. ON-DEMAND PoSe FOLD — fire AT the payee mismatch, not at a fold point
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// THE MEASUREMENT this section is built from. contabo daemonless soak against
+// mainnet, anchor 2513000, fold interval 500; the chain asked directly (hotel
+// dashd 23.1.7 with addressindex, 2026-08-02):
+//
+//     h=2513000  protx list valid 2068  projected payee e8626fcd57f6394d…
+//                                       PRESENT   <- our anchor fold, correct
+//     h=2513400                   2068  PRESENT
+//     h=2513488                   2066  ABSENT    <- PoSe-banned in this range
+//     h=2513489                   2066  ABSENT    <- projected anyway -> DEAD
+//     next fold point   h=2513500                 <- ELEVEN BLOCKS TOO LATE
+//
+// The chain paid 4cad8728bb473c80fa9862c8d87ff8be7096c29d9eee1f43dd714b53ce…
+// THREE separate builds fail-closed at that identical height, one of them
+// carrying no fold code at all. So the fold MECHANISM was right and only its
+// GRANULARITY was wrong: a ban that lands strictly BETWEEN two fold points is
+// invisible to fold points, and the reactive walk that DOES fire at the
+// mismatch was consulting a list up to fold_interval-1 blocks stale.
+//
+// Shrinking the interval is the wrong fix twice over — it pays a round trip
+// continuously AND still leaves a window. The mismatch itself is the perfect
+// trigger: it fires exactly when, and only when, the queue is wrong.
+//
+// Every fixture below uses the REAL heights, and the fixture arithmetic is
+// static_asserted to sit strictly inside a fold interval, so none of these
+// cases can be quietly rescued by a scheduled fold.
+namespace {
+
+constexpr uint32_t kOdAnchor   = 2513000;   // a fold point (the anchor)
+constexpr uint32_t kOdTip      = 2513005;
+constexpr uint32_t kOdMismatch = 2513003;   // the banned masternode's turn
+constexpr size_t   kOdBannedRank = 2;       // banned STRICTLY inside the window
+constexpr size_t   kOdSetSize    = 64;
+
+// The fixture is only honest if the failing height is unreachable by any
+// scheduled fold. Proven here rather than asserted at runtime, because at
+// runtime m_last_fold_height has already moved.
+static_assert(kOdMismatch > kOdAnchor && kOdMismatch < kOdTip,
+              "the mismatch must be neither the anchor fold nor the final fold");
+static_assert(kOdMismatch - kOdAnchor
+                  < MnCheckpointLane::kDefaultFoldInterval,
+              "the mismatch must land STRICTLY INSIDE one fold interval — that"
+              " is the whole defect");
+
+// Install the measured shape into `rig` and return the anchor.
+//
+//   * the list AS OF THE ANCHOR attests every masternode VALID — the ban has
+//     not happened yet, exactly as `protx list valid 2513000` showed;
+//   * every LATER height attests rank kOdBannedRank banned — the ban lands
+//     inside the interval;
+//   * the coinbases pay ranks 0, 1, then SKIP the banned rank and pay 3, 4, 5,
+//     which is precisely what an accepted block does when dashd has banned our
+//     queue head and we have not noticed.
+MnCheckpoint build_ondemand_scenario(SnapshotRig& rig,
+                                     std::initializer_list<size_t> pays
+                                         = {0, 1, 3, 4, 5},
+                                     std::initializer_list<size_t> banned
+                                         = {kOdBannedRank})
+{
+    const uint256 anchor_hash = uint256S(kAnchorHash);
+    MnCheckpoint cp = synthetic_anchor(kOdSetSize, kOdAnchor, anchor_hash);
+
+    std::vector<std::pair<uint256, bool>> all_valid, with_bans;
+    for (size_t i = 0; i < cp.entries.size(); ++i) {
+        all_valid.emplace_back(cp.entries[i].first, true);
+        bool is_banned = false;
+        for (size_t b : banned) if (b == i) is_banned = true;
+        with_bans.emplace_back(cp.entries[i].first, !is_banned);
+    }
+
+    rig.attest = with_bans;                       // the default for any height
+    rig.install(kOdAnchor, kOdTip, anchor_hash);
+    rig.by_height[kOdAnchor] = make_snapshot(anchor_hash, kOdAnchor, all_valid);
+
+    uint32_t bh = kOdAnchor + 1;
+    for (size_t rank : pays) {
+        rig.h.blocks[bh] =
+            block_paying(cp.entries[rank].second.scriptPayout.m_data);
+        ++bh;
+    }
+    return cp;
+}
+
+const MNState& published_rank(const BridgeHarness& h, const MnCheckpoint& cp,
+                              size_t rank)
+{
+    static MNState missing;
+    for (const auto& [hash, st] : h.published_set)
+        if (hash == cp.entries[rank].first) return st;
+    ADD_FAILURE() << "rank " << rank << " is absent from the published set";
+    return missing;
+}
+
+} // namespace
+
+// ── CASE 1 (THE LOAD-BEARING ONE). A masternode valid at the anchor, PoSe-
+// banned strictly BETWEEN two fold points, and a payee mismatch at a height
+// inside that interval. Today's fold points cannot see it; the on-demand fold
+// must, and the bridge must COMPLETE.
+TEST(DashMnCheckpointOnDemandFold, BanBetweenFoldPointsIsRepairedAtTheMismatch)
+{
+    SnapshotRig rig;
+    const auto cp = build_ondemand_scenario(rig);
+
+    rig.h.lane.arm(cp);
+    rig.h.lane.pump();
+
+    ASSERT_TRUE(rig.h.published) << "status: " << rig.h.lane.status();
+    EXPECT_EQ(rig.h.lane.state(), MnCheckpointLane::State::Published);
+    EXPECT_EQ(rig.h.published_as_of, kOdTip);
+
+    // The anchor fold RAN and correctly removed NOTHING: at h=2513000 the
+    // masternode was still valid. That is what makes this a between-fold-point
+    // ban rather than an anchor that was simply stale.
+    EXPECT_EQ(rig.h.lane.first_fold_height(), kOdAnchor);
+
+    // The repair came from the ON-DEMAND path, not from a fold point and not
+    // from the budgeted walk.
+    EXPECT_EQ(rig.h.lane.ondemand_folds(), 1u)
+        << "status: " << rig.h.lane.status();
+    EXPECT_EQ(rig.h.lane.ondemand_excluded(), 1u);
+    EXPECT_TRUE(rig.h.lane.ondemand_evaluated());
+    EXPECT_FALSE(rig.h.lane.ondemand_cap_hit());
+    // The cap here is the AUTO-SIZED one, and it names its own formula on the
+    // published status — so an operator reading a live node sees the threshold
+    // and how it was derived, not just the count.
+    EXPECT_EQ(rig.h.lane.ondemand_cap(),
+              MnCheckpointLane::kOnDemandFoldBase
+                  + (kOdTip - kOdAnchor)
+                        / MnCheckpointLane::kOnDemandFoldPerBlocks);
+    EXPECT_NE(rig.h.lane.status().find("ON-DEMAND PoSe folds: 1/8 used"
+                                       " (cap = 8 + replay_blocks/250)"),
+              std::string::npos)
+        << "status: " << rig.h.lane.status();
+    EXPECT_EQ(rig.h.lane.sml_recovered(), 0u)
+        << "the tip-SML demotion walk must not have been needed, and must not"
+           " have spent any of its per-bridge budget";
+
+    // The set FELL by exactly one, which is the direction an additions-only
+    // replay structurally cannot move in.
+    EXPECT_EQ(rig.h.lane.eligible_size(), kOdSetSize - 1);
+    EXPECT_EQ(rig.h.lane.pose_removed(), 1u)
+        << "the on-demand fold is WHOLESALE: the banned masternode leaves the"
+           " eligible set, not just this one block's projection";
+
+    // The exclusion is PERMANENT and dated at the height that proved it — a
+    // one-shot skip would put it back at the head of the queue at its next
+    // turn and desync the replay all over again.
+    const MNState& banned = published_rank(rig.h, cp, kOdBannedRank);
+    EXPECT_FALSE(banned.isValid);
+    EXPECT_EQ(banned.nPoSeBanHeight, kOdMismatch);
+    EXPECT_EQ(banned.nLastPaidHeight, kOdAnchor - 2100 + kOdBannedRank)
+        << "the banned masternode must NOT be credited with the payment";
+    // ...and the payment went to the candidate whose scriptPayout this
+    // coinbase actually pays, byte for byte.
+    EXPECT_EQ(published_rank(rig.h, cp, 3).nLastPaidHeight, kOdMismatch);
+    // The replay carried on correctly afterwards, which is the real proof the
+    // queue was repaired and not merely patched for one block.
+    EXPECT_EQ(published_rank(rig.h, cp, 4).nLastPaidHeight, kOdMismatch + 1);
+    EXPECT_EQ(published_rank(rig.h, cp, 5).nLastPaidHeight, kOdMismatch + 2);
+}
+
+// ── CASE 1-TWIN (NEGATIVE). THE SAME FIXTURE with the on-demand path removed
+// — cap 0 disables it at its entry point — must fail closed exactly as this
+// lane always did. Without this the case above is unfalsifiable: it would pass
+// just as happily if the fixture never mismatched at all.
+TEST(DashMnCheckpointOnDemandFold, TwinWithTheOnDemandPathRemovedFailsClosed)
+{
+    SnapshotRig rig;
+    const auto cp = build_ondemand_scenario(rig);
+    rig.h.lane.set_ondemand_fold_cap(0);       // the ONLY difference
+
+    rig.h.lane.arm(cp);
+    rig.h.lane.pump();
+
+    EXPECT_EQ(rig.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << "status: " << rig.h.lane.status();
+    EXPECT_FALSE(rig.h.published)
+        << "a masternode set assembled over an unresolved payee mismatch would"
+           " mint a rejected coinbase";
+    EXPECT_NE(rig.h.lane.status().find("PAYEE DESYNC at h="
+                                       + std::to_string(kOdMismatch)),
+              std::string::npos)
+        << "the twin must fail at the SAME height the positive case repairs: "
+        << rig.h.lane.status();
+    EXPECT_EQ(rig.h.lane.ondemand_folds(), 0u);
+    EXPECT_NE(rig.h.lane.status().find("ON-DEMAND PoSe folds: DISABLED (cap 0"),
+              std::string::npos)
+        << "a disabled path must name itself as disabled: " << rig.h.lane.status();
+    EXPECT_EQ(rig.h.lane.eligible_size(), kOdSetSize)
+        << "with no on-demand fold the set can only ever CLIMB — the measured"
+           " 2067->2070-while-the-chain-fell shape";
+}
+
+// ── The reward-critical one. A historical reply must never reach the LIVE tip
+// SML: the maintainer adopts any base==ZERO diff wholesale, so an on-demand
+// reply routed to it would silently rewrite the tip list to a past state on
+// the money path. The on-demand fold adds NO second filter slot — it goes
+// through the same HistoricalMnListDiffDemux #1028 installed.
+TEST(DashMnCheckpointOnDemandFold, OnDemandReplyNeverMutatesTheLiveTipSml)
+{
+    DemuxRig d;
+    const auto cp = build_ondemand_scenario(d.rig);
+    d.wire(/*register_lane_filter=*/true);   // MUST come after install()
+
+    ASSERT_FALSE(d.tip_state.have_sml())
+        << "the hazard window is a COLD tip SML; the fixture must start there";
+    const size_t  size_before = d.tip_state.sml().mnList.size();
+    const uint256 root_before = d.tip_state.sml().CalcMerkleRoot();
+
+    d.rig.h.lane.arm(cp);
+    d.rig.h.lane.pump();
+
+    ASSERT_TRUE(d.rig.h.published) << d.rig.h.lane.status();
+    ASSERT_EQ(d.rig.h.lane.ondemand_folds(), 1u)
+        << "the on-demand reply must actually have been exercised, or this"
+           " proves nothing: " << d.rig.h.lane.status();
+
+    EXPECT_EQ(d.tip_feeds, 0u)
+        << "a historical reply reached the tip-SML maintainer";
+    EXPECT_FALSE(d.tip_state.have_sml())
+        << "the live tip SML was CREATED from an on-demand historical reply";
+    EXPECT_EQ(d.tip_state.sml().mnList.size(), size_before);
+    EXPECT_EQ(d.tip_state.sml().CalcMerkleRoot(), root_before)
+        << "the live tip SML is not byte-identical after the on-demand reply";
+}
+
+// ── ONE OUTSTANDING getmnlistd. Replies are matched by block hash, so a second
+// in-flight request draws a reply that matches no await and leaks past the
+// demux. The replay must therefore PAUSE on its own on-demand request and must
+// not race it — and, unlike an interval fold, it must NOT resume degraded when
+// the reply never comes, because the mismatch it is parked on is unresolved.
+TEST(DashMnCheckpointOnDemandFold, ReplayPausesOnItsOwnOnDemandRequest)
+{
+    SnapshotRig rig;
+    const auto cp = build_ondemand_scenario(rig);
+    // Answer the ANCHOR fold; HOLD the on-demand one, so the pause is on the
+    // request this case is about.
+    rig.h.lane.set_request_snapshot_fn([&rig](const uint256& bh) {
+        rig.requested.push_back(bh);
+        auto hi = rig.height_of.find(bh);
+        if (hi == rig.height_of.end()) return;
+        if (hi->second != kOdAnchor) return;             // held
+        rig.h.lane.on_historical_snapshot(
+            rig.snapshot_for(hi->second, bh).diff);
+    });
+
+    rig.h.lane.arm(cp);
+    rig.h.lane.pump();
+
+    ASSERT_TRUE(rig.h.lane.snapshot_pending()) << rig.h.lane.status();
+    ASSERT_EQ(rig.requested.size(), 2u)
+        << "one anchor fold + one on-demand fold, and nothing else";
+    EXPECT_EQ(rig.h.lane.cursor_height(), kOdMismatch - 1)
+        << "the cursor must NOT have advanced over the mismatching block";
+
+    // A block delivered while paused must be dropped, not folded: the cursor
+    // cannot be allowed past the height the pending list describes.
+    rig.h.lane.on_block_connected(rig.h.blocks[kOdMismatch + 1],
+                                  kOdMismatch + 1);
+    EXPECT_EQ(rig.h.lane.cursor_height(), kOdMismatch - 1);
+
+    // Further drives must not issue a SECOND request...
+    rig.h.lane.pump();
+    rig.h.lane.pump();
+    EXPECT_EQ(rig.requested.size(), 2u)
+        << "a duplicate getmnlistd draws a reply that matches no await";
+    // ...until the re-ask, which is deliberately the SAME block hash, so a
+    // reply to either ask is indistinguishable and both are ours.
+    rig.h.lane.pump();
+    ASSERT_EQ(rig.requested.size(), 3u) << "the re-ask must happen";
+    EXPECT_EQ(rig.requested[2], rig.requested[1])
+        << "the re-ask must name the SAME block, or two replies are in flight";
+
+    // And when it is never answered: FAIL CLOSED. Resuming "degraded" is what
+    // an abandoned INTERVAL fold does, and it would be wrong here — the replay
+    // is parked on a payee mismatch it has not adjudicated.
+    for (int i = 0; i < 9; ++i) rig.h.lane.pump();
+    EXPECT_EQ(rig.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << "status: " << rig.h.lane.status();
+    EXPECT_FALSE(rig.h.published);
+    EXPECT_NE(rig.h.lane.status().find("went unanswered"), std::string::npos)
+        << rig.h.lane.status();
+    EXPECT_EQ(rig.h.lane.abandoned_folds(), 0u)
+        << "an unanswered ON-DEMAND ask is not an abandoned fold POINT — that"
+           " counter means 'the replay carried on degraded', and it did not";
+    EXPECT_NE(rig.h.lane.status().find("did NOT carry on degraded"),
+              std::string::npos)
+        << rig.h.lane.status();
+}
+
+// ── THE CAP FIRES AND NAMES ITSELF. Two mismatches whose bans appear in
+// DIFFERENT lists (so the first wholesale fold cannot pre-empt the second),
+// run twice on the identical fixture: once with a cap of 1 (refused, terminal)
+// and once with a cap of 2 (repaired, published). The positive control is what
+// proves the CAP refused rather than the fixture being unrepairable.
+namespace {
+
+// rank 2 banned by the h=kOdMismatch list only; rank 5 banned by every OTHER
+// height's list. The coinbases skip both.
+MnCheckpoint build_two_mismatch_scenario(SnapshotRig& rig)
+{
+    const uint256 anchor_hash = uint256S(kAnchorHash);
+    MnCheckpoint cp = synthetic_anchor(kOdSetSize, kOdAnchor, anchor_hash);
+
+    std::vector<std::pair<uint256, bool>> all_valid, ban2, ban2and5;
+    for (size_t i = 0; i < cp.entries.size(); ++i) {
+        all_valid.emplace_back(cp.entries[i].first, true);
+        ban2.emplace_back(cp.entries[i].first, i != 2);
+        ban2and5.emplace_back(cp.entries[i].first, i != 2 && i != 5);
+    }
+    rig.attest = ban2and5;
+    rig.install(kOdAnchor, kOdTip, anchor_hash);
+    rig.by_height[kOdAnchor]   = make_snapshot(anchor_hash, kOdAnchor, all_valid);
+    rig.by_height[kOdMismatch] =
+        make_snapshot(rig.h.headers[kOdMismatch], kOdMismatch, ban2);
+
+    const size_t pays[] = {0, 1, 3, 4, 6};   // rank 2 and rank 5 both skipped
+    for (uint32_t bh = kOdAnchor + 1; bh <= kOdTip; ++bh)
+        rig.h.blocks[bh] =
+            block_paying(cp.entries[pays[bh - kOdAnchor - 1]]
+                             .second.scriptPayout.m_data);
+    return cp;
+}
+
+} // namespace
+
+TEST(DashMnCheckpointOnDemandFold, CapRefusesTheSecondFoldAndSaysItsOwnName)
+{
+    SnapshotRig rig;
+    const auto cp = build_two_mismatch_scenario(rig);
+    rig.h.lane.set_ondemand_fold_cap(1);
+
+    rig.h.lane.arm(cp);
+    rig.h.lane.pump();
+
+    EXPECT_EQ(rig.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << "status: " << rig.h.lane.status();
+    EXPECT_EQ(rig.h.lane.ondemand_folds(), 1u) << rig.h.lane.status();
+    EXPECT_EQ(rig.h.lane.ondemand_cap(), 1u);
+    EXPECT_TRUE(rig.h.lane.ondemand_cap_hit());
+
+    // The cap must SAY ITS OWN NAME: measured value, threshold, and the
+    // formula that produced the threshold.
+    const std::string s = rig.h.lane.status();
+    EXPECT_NE(s.find("ON-DEMAND PoSe folds: 1/1"), std::string::npos) << s;
+    EXPECT_NE(s.find("THE CAP IS EXHAUSTED"), std::string::npos) << s;
+    EXPECT_NE(s.find("cap set explicitly"), std::string::npos)
+        << "a cap that was overridden must not quote the auto-sizing formula"
+           " it did not use: " << s;
+}
+
+TEST(DashMnCheckpointOnDemandFold, TheSameTwoMismatchesFitUnderACapOfTwo)
+{
+    SnapshotRig rig;
+    const auto cp = build_two_mismatch_scenario(rig);
+    rig.h.lane.set_ondemand_fold_cap(2);
+
+    rig.h.lane.arm(cp);
+    rig.h.lane.pump();
+
+    ASSERT_TRUE(rig.h.published) << "status: " << rig.h.lane.status();
+    EXPECT_EQ(rig.h.lane.ondemand_folds(), 2u);
+    EXPECT_EQ(rig.h.lane.ondemand_excluded(), 2u);
+    EXPECT_FALSE(rig.h.lane.ondemand_cap_hit());
+    EXPECT_EQ(rig.h.lane.eligible_size(), kOdSetSize - 2)
+        << "both bans left the eligible set";
+    EXPECT_EQ(published_rank(rig.h, cp, 6).nLastPaidHeight, kOdTip);
+}
+
+// ── A FIELD THAT WAS NEVER EVALUATED PRINTS n/a, NEVER 0. "No mismatch ever
+// happened" and "mismatches happened and needed no fold" are different facts,
+// and a bare 0 asserts the second while meaning the first.
+TEST(DashMnCheckpointOnDemandFold, NeverEvaluatedReportsNotApplicableNotZero)
+{
+    SnapshotRig rig;
+    // A clean replay: every coinbase pays exactly what we project.
+    const auto cp = build_ondemand_scenario(rig, {0, 1, 2, 3, 4}, {});
+
+    rig.h.lane.arm(cp);
+    rig.h.lane.pump();
+
+    ASSERT_TRUE(rig.h.published) << rig.h.lane.status();
+    EXPECT_FALSE(rig.h.lane.ondemand_evaluated());
+    const std::string s = rig.h.lane.status();
+    EXPECT_NE(s.find("ON-DEMAND PoSe folds: n/a"), std::string::npos) << s;
+    EXPECT_EQ(s.find("ON-DEMAND PoSe folds: 0"), std::string::npos)
+        << "a never-evaluated counter must not print as a measured zero: " << s;
+}
+
+TEST(DashMnCheckpointOnDemandFold, UnwiredSnapshotSeamIsReportedAsNotApplicable)
+{
+    // The bridge harness with NO per-height snapshot seam at all: the
+    // pre-#1028 shape, where a mismatch is simply terminal.
+    RecoveryRig r;
+    auto blk = repay_coinbase(block_from_hex(kBlockHex1519544),
+                              payout_of(r.cp, kQ1), payout_of(r.cp, kQ2));
+    r.run(blk);
+
+    ASSERT_EQ(r.h.lane.state(), MnCheckpointLane::State::FailedClosed);
+    const std::string s = r.h.lane.status();
+    EXPECT_NE(s.find("ON-DEMAND PoSe folds: n/a (the per-height snapshot seam"
+                     " is not wired"), std::string::npos)
+        << "an unwired seam must be named as unwired, not reported as zero"
+           " folds used: " << s;
+}
+
+// ── A better-dated list buys a better ATTESTATION; it never buys a guess. If
+// the list dated exactly at the failing height says the projected masternode
+// is still VALID, the mismatch is a real divergence (wrong anchor, missed
+// block) and the answer is the one it always was.
+TEST(DashMnCheckpointOnDemandFold, ListAttestingTheProjectedPayeeValidStillFails)
+{
+    SnapshotRig rig;
+    // The coinbases skip rank 2, but NO list ever attests rank 2 banned.
+    const auto cp = build_ondemand_scenario(rig, {0, 1, 3, 4, 5}, {});
+
+    rig.h.lane.arm(cp);
+    rig.h.lane.pump();
+
+    EXPECT_EQ(rig.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << "status: " << rig.h.lane.status();
+    EXPECT_FALSE(rig.h.published);
+    EXPECT_EQ(rig.h.lane.ondemand_folds(), 1u)
+        << "the fold must have been FETCHED and believed — it is the"
+           " adjudication that refused, not the request";
+    const std::string s = rig.h.lane.status();
+    EXPECT_NE(s.find("SURVIVED the ON-DEMAND PoSe fold"), std::string::npos) << s;
+    EXPECT_NE(s.find("attests the projected candidate VALID"), std::string::npos)
+        << "the refusal must name WHICH rule stopped the walk: " << s;
+}
+
+// ── THE ACCEPTANCE RULE, ISOLATED. A better-dated list may license a
+// DEMOTION; only the coinbase may license an ATTRIBUTION. Here every candidate
+// in the ranked window is attested banned — so the walk never stops on
+// attestation — and the block pays a masternode far outside that window. The
+// walk must run out and REFUSE, not attribute the payment to the first
+// runner-up it reaches.
+//
+// ADDED AFTER A MUTATION FOUND NOTHING: relaxing paid_in_cb() inside
+// readjudicate_payee() to "any non-empty script matches" left the whole suite
+// green, because every other on-demand case stops on the ATTESTATION rule
+// before it ever reaches the script comparison. This is the case that reaches
+// it.
+TEST(DashMnCheckpointOnDemandFold, ScriptMatchIsTheOnlyLicenceToAttribute)
+{
+    SnapshotRig rig;
+    // Ranks 2..8 (the whole ranked window bar the last slot) attested banned,
+    // and the coinbase pays rank 40 — inside the set, outside the queue window.
+    const auto cp = build_ondemand_scenario(
+        rig, /*pays=*/{0, 1, 40, 41, 42}, /*banned=*/{2, 3, 4, 5, 6, 7, 8});
+
+    rig.h.lane.arm(cp);
+    rig.h.lane.pump();
+
+    EXPECT_EQ(rig.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << "status: " << rig.h.lane.status();
+    EXPECT_FALSE(rig.h.published);
+    const std::string s = rig.h.lane.status();
+    EXPECT_NE(s.find("PAYEE DESYNC at h=" + std::to_string(kOdMismatch)),
+              std::string::npos)
+        << "the refusal must be at the height whose coinbase could not be"
+           " matched: " << s;
+    EXPECT_NE(s.find("no candidate in the ranked queue has a scriptPayout this"
+                     " coinbase pays exactly"), std::string::npos)
+        << "the refusal must name the SCRIPT rule, not the attestation rule: "
+        << s;
+}
