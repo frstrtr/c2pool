@@ -31,9 +31,14 @@ jobs:
           # Attribution scan only reads BASE_SHA..HEAD_SHA. A whole-repo
           # unshallow (fetch-depth: 0) is the single most fragile checkout we
           # run and reds clean PRs when a runner link drops packets. Bound the
-          # fetch to the PR own commits + merge base; the scan step keeps its
-          # git log -50 HEAD fallback if the range is unreachable.
-          fetch-depth: ${{ github.event.pull_request.commits && github.event.pull_request.commits + 1 || 50 }}
+          # fetch to the PR own commits. GitHub Actions expressions have NO
+          # arithmetic operators (commits + 1 is a compile-time startup
+          # failure), so we deepen by one commit below to reach the merge base;
+          # the scan step keeps its git log -50 HEAD fallback if unreachable.
+          fetch-depth: ${{ github.event.pull_request.commits || 50 }}
+
+      - name: Deepen one commit to reach the PR merge base
+        run: git fetch --deepen=1 || true
 
       - name: Scan commits + PR metadata for AI attribution
         env:
