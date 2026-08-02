@@ -44,6 +44,7 @@
 #include <impl/btc/coin/reconstruct_won_block.hpp> // make_reconstruct_closure — faithful won-block body (#839)
 #include <impl/btc/coin/won_block_dispatch.hpp>    // make_on_block_found — dual-path won-block dispatch (#744)
 #include <impl/btc/coin/merged_spec.hpp>          // parse --merged SPEC -> AuxChainConfig (NMC PE host-wire slice 3)
+#include <impl/btc/coin/merged_backend.hpp>       // build aux backends + merged_addr payout seam (NMC PE host-wire slice 4)
 
 #include <core/coin/utxo.hpp>
 #include <core/coin/utxo_view_cache.hpp>
@@ -375,6 +376,17 @@ int main(int argc, char* argv[])
     constexpr uint32_t BTC_KEEP_DEPTH = core::coin::LTC_MIN_BLOCKS_TO_KEEP;
 
     io::io_context ioc;
+
+    // ── NMC PE host-wire slice 4: construct aux backends from merged_configs ──
+    // One AuxChainRPC (external-daemon fallback) per parsed aux chain. The
+    // embedded-NMC SPV backend registers as primary alongside these in a later
+    // slice (PA/PB); construction is inert so an offline aux daemon never blocks
+    // BTC startup. Held for the whole run; the manager wiring lands with PC.
+    auto aux_backends = btc::build_aux_backends(ioc, merged_configs);
+    if (!aux_backends.empty())
+        LOG_INFO << "[NMC-MM] " << aux_backends.size()
+                 << " aux chain backend(s) constructed (RPC fallback path);"
+                    " embedded-NMC primary + template wiring pending (PE later slices)";
 
     // ── Graceful shutdown via boost::asio::signal_set ─────────────────────
     //
@@ -1295,7 +1307,7 @@ int main(int argc, char* argv[])
     //     what the coinbase OP_RETURN claims
     //   - calls tracker.add(share) — attempt_verify runs later in think()
     work_source->set_create_share_fn(
-        [p2p_node_raw, auto_ratchet, &template_capture](const std::vector<unsigned char>& full_coinbase,
+        [p2p_node_raw, auto_ratchet, &template_capture, &merged_configs](const std::vector<unsigned char>& full_coinbase,
                        const std::vector<uint8_t>&        header_80b,
                        const core::stratum::JobSnapshot&  job,
                        const std::vector<unsigned char>& payout_script)
@@ -1365,7 +1377,14 @@ int main(int argc, char* argv[])
             // --merged parse -> embedded-NMC register -> aux-merkle payout.
             // Empty here == v35 behavior byte-for-byte until the backend is
             // wired, so this commit is a no-op at runtime.
-            std::vector<btc::MergedAddressEntry> merged_addrs;
+            // NMC PE host-wire slice 4: commit one aux payout entry per parsed
+            // --merged chain. Empty absent --merged (v35 byte-for-byte). Until
+            // PC freezes per-share PPLNS aux scripts into the template, this
+            // feeds the parent payout_script under each aux chain_id — the
+            // --merged path is wire-only and not yet consensus-consistent with
+            // the frozen ref, so it stays behind that opt-in flag.
+            std::vector<btc::MergedAddressEntry> merged_addrs =
+                btc::merged_addr_entries(merged_configs, payout_script);
             try {
                 share_hash = btc::create_local_share(
                     p2p_node_raw->tracker(),
