@@ -571,6 +571,9 @@ private:
         if (m_peer_manager.needs_emergency_refresh(
                 static_cast<int>(connected.size()))) {
             LOG_WARNING << "[" << m_symbol << "] Emergency peer refresh triggered, connected=" << connected.size();
+            m_peer_manager.arm_emergency_fallbacks();
+        } else {
+            m_peer_manager.clear_emergency_state();
         }
 
         // Periodic status log (every 12 maintenance cycles = 60s)

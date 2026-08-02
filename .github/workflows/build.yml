@@ -183,7 +183,7 @@ jobs:
       - name: Build tests
         run: |
           cmake --build build_ci \
-            --target test_hardening test_share_messages test_coin_broadcaster \
+            --target coin_peer_rearm_kat test_hardening test_share_messages test_coin_broadcaster \
                     test_redistribute_address test_redistribute test_auto_ratchet \
                     test_stratum_extensions test_stratum_hotel_interim test_btc_underfill_guard test_dgb_underfill_guard \
                     core_test sharechain_test share_test btc_share_test \
@@ -372,6 +372,7 @@ jobs:
         run: |
           cmake --build build_asan \
             --target c2pool \
+                    coin_peer_rearm_kat \
                     boost_sentinel \
                     test_hardening test_share_messages \
                     test_redistribute_address test_redistribute test_auto_ratchet \

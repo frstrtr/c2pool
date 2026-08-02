@@ -215,6 +215,7 @@ public:
         , m_maintenance_timer(ioc)
         , m_fixed_seed_timer(ioc)
         , m_http_seed_timer(ioc)
+        , m_emergency_timer(ioc)
     {
     }
 
@@ -306,6 +307,7 @@ public:
         m_maintenance_timer.cancel();
         m_fixed_seed_timer.cancel();
         m_http_seed_timer.cancel();
+        m_emergency_timer.cancel();
         save_peers();
     }
 
@@ -427,6 +429,72 @@ public:
         if (m_config.disable_discovery) return false;
         return connected_count < m_config.min_peers;
     }
+
+    /// Saturating exponential backoff for emergency re-arm attempt n (0-based).
+    /// delay(n) = min(base << n, cap). Shift is loop-guarded — never overflows.
+    /// See docs/coin-peer-manager-rearm.md sec 2.1.
+    static int emergency_backoff_delay(int n, int base_sec, int max_sec)
+    {
+        if (base_sec < 1) base_sec = 1;
+        long d = base_sec;
+        for (int i = 0; i < n && d < max_sec; ++i) d <<= 1;
+        if (d > max_sec) d = max_sec;
+        return static_cast<int>(d);
+    }
+
+    /// Emergency re-arm. Called by the maintenance loop when connected < min_peers.
+    /// Idempotent under m_emergency_active (re-entry guard: no timer storm). On
+    /// fire: re-resolve DNS + re-load fixed seeds + re-fetch HTTP peers. Backoff
+    /// escalates per attempt, saturating at max_backoff_sec; never permanently
+    /// gives up while starved+running. See docs/coin-peer-manager-rearm.md.
+    void arm_emergency_fallbacks()
+    {
+        if (m_config.disable_discovery || !m_running) return;
+        if (m_emergency_active) return;                 // re-entry guard
+        m_emergency_active = true;
+
+        // Floor at 60s so we never re-arm faster than the original one-shot tiers.
+        int base = std::max(m_config.base_backoff_sec, 60);
+        int delay = emergency_backoff_delay(m_emergency_attempts, base,
+                                            m_config.max_backoff_sec);
+        ++m_emergency_attempts;
+
+        LOG_WARNING << "[" << m_symbol << "] Emergency peer re-arm scheduled in "
+                    << delay << "s (attempt " << m_emergency_attempts << ")";
+
+        m_emergency_timer.expires_after(std::chrono::seconds(delay));
+        m_emergency_timer.async_wait([this](const boost::system::error_code& ec) {
+            m_emergency_active = false;                 // release guard once we act
+            if (ec || !m_running) return;
+            try { bootstrap_from_dns_seeds(); }
+            catch (const std::exception& e) {
+                LOG_WARNING << "[" << m_symbol
+                    << "] Emergency DNS re-resolve error: " << e.what(); }
+            try { load_fixed_seeds(); }
+            catch (const std::exception& e) {
+                LOG_WARNING << "[" << m_symbol
+                    << "] Emergency fixed-seed load error: " << e.what(); }
+            do_http_peer_fetch(/*force=*/true);
+        });
+    }
+
+    /// Recovery (connected >= min_peers): reset the backoff attempt counter so
+    /// the next starvation re-arms from base. Idempotent; safe every tick.
+    void clear_emergency_state()
+    {
+        if (m_emergency_attempts == 0) return;
+        LOG_INFO << "[" << m_symbol
+                 << "] Peer count recovered; resetting emergency re-arm backoff";
+        m_emergency_attempts = 0;
+        // An in-flight emergency timer (if any) no-ops on fire via the guard;
+        // we do not cancel here to avoid racing the handler thread.
+    }
+
+    /// Test accessor: consecutive emergency re-arm attempts since last recovery.
+    int emergency_attempts() const { return m_emergency_attempts; }
+
+    /// Test seam: force the running flag without a full start()/network path.
+    void test_set_running(bool r) { m_running = r; }
 
     const PeerManagerConfig& config() const { return m_config; }
 
@@ -919,7 +987,17 @@ private:
         m_http_seed_timer.expires_after(std::chrono::seconds(90));
         m_http_seed_timer.async_wait([this](const boost::system::error_code& ec) {
             if (ec || !m_running) return;
+            do_http_peer_fetch(/*force=*/false);
+        });
+    }
 
+    /// Shared HTTP peer-fetch body — used by the initial 90s fallback and by
+    /// the emergency re-arm cycle. force=false skips when tried peers >= min.
+    void do_http_peer_fetch(bool force)
+    {
+        if (m_http_peer_seeds.empty()) return;
+
+        if (!force) {
             // Only fetch if we still have very few tried peers
             int tried = 0;
             {
@@ -932,6 +1010,7 @@ private:
                     << "] Skipping HTTP peer fetch: " << tried << " tried peers";
                 return;
             }
+        }
 
             LOG_INFO << "[" << m_symbol << "] Fetching peers from "
                      << m_http_peer_seeds.size() << " c2pool seed nodes...";
@@ -967,7 +1046,6 @@ private:
                     });
                 }
             }).detach();
-        });
     }
 
     /// Parse HTTP response and add peers from /api/coin_peers.
@@ -1064,6 +1142,9 @@ private:
     std::vector<NetService> m_fixed_seeds;
     std::vector<std::pair<std::string, uint16_t>> m_http_peer_seeds;
     boost::asio::steady_timer m_http_seed_timer;
+    boost::asio::steady_timer m_emergency_timer;
+    bool m_emergency_active{false};
+    int  m_emergency_attempts{0};
 
     mutable std::mutex m_mutex;
     std::map<std::string, PeerInfo> m_peers;        // key = "host:port"

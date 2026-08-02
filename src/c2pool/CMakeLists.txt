@@ -359,6 +359,13 @@ target_link_libraries(test_ltc_node core ltc)
 target_link_libraries(test_ltc_node c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage ltc_coin pool)  # OBJECT-lib SCC direct-naming (#22/#39)
 target_link_libraries(test_ltc_node nlohmann_json::nlohmann_json)
 
+# ── KAT: emergency fallback re-arm (docs/coin-peer-manager-rearm.md) ──
+add_executable(coin_peer_rearm_kat coin_peer_rearm_kat.cpp)
+target_link_libraries(coin_peer_rearm_kat core ltc)
+target_link_libraries(coin_peer_rearm_kat c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage ltc_coin pool)
+target_link_libraries(coin_peer_rearm_kat nlohmann_json::nlohmann_json)
+add_test(NAME coin_peer_rearm_kat COMMAND coin_peer_rearm_kat)
+
 # Legacy applications have been archived to ../../archive/
 # - c2pool_legacy.cpp (original c2pool.cpp)
 # - c2pool_node_legacy.cpp (original c2pool_node.cpp)
