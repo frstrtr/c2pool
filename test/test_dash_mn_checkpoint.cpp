@@ -1235,46 +1235,6 @@ void wire_sml_snapshot(MnCheckpointLane& lane, const SmlSource& src)
 // WHOLESALE fold removes all three in one pass before any of them is
 // projected, and the bridge completes.
 //
-// The fold lands at cursor == H_sml = 1519544 (after that block is folded),
-// and the burst bites at 1519545 — the first height the three could be
-// projected. That is the ordering rule doing exactly its job.
-TEST(DashMnCheckpointPoseFold, BanBurstSurvivesWholesaleFold)
-{
-    RecoveryRig r;
-    SmlSource sml;
-    sml.set(1519544, all_valid_except({kQ1, kQ2, kQ3}));
-    wire_sml_snapshot(r.h.lane, sml);
-    r.h.lane.set_sml_validity_fn(sml_fn(all_valid_except({kQ1, kQ2, kQ3})));
-
-    // 1519544 is the REAL accepted block and pays kQ1 — untouched, so the
-    // pre-fold replay of it must succeed on its own.
-    // 1519545 really pays the kQ2/kQ3 (yeRZB) group; with kQ1..kQ3 all gone the
-    // queue head is kQ4, so re-point that coinbase at kQ4's script.
-    auto b45 = repay_coinbase(block_from_hex(kBlockHex1519545),
-                              payout_of(r.cp, kQ2), payout_of(r.cp, kQ4));
-    r.h.blocks[1519545] = b45;
-    r.run(block_from_hex(kBlockHex1519544), /*tip=*/1519545);
-
-    ASSERT_TRUE(r.h.published) << "lane status: " << r.h.lane.status();
-    EXPECT_TRUE(r.h.lane.sml_folded());
-    EXPECT_EQ(r.h.lane.sml_folded_at(), 1519544u)
-        << "the fold must land at cursor == the height the SML is current at";
-    EXPECT_EQ(r.h.lane.pose_removed(), 3u)
-        << "all three leave in ONE pass -- that is what makes a burst"
-           " indistinguishable from a single ban";
-    EXPECT_EQ(r.h.lane.sml_recovered(), 0u)
-        << "the per-mismatch walk must not have been needed, and must not"
-           " have spent ANY of its per-bridge budget -- budget exhaustion is"
-           " what actually kills a bridge on a burst (see"
-           " TwinBanBurstExhaustsTheWalkBudgetAndIsTerminal)";
-    EXPECT_EQ(r.h.lane.eligible_size(), 3u);
-
-    std::map<uint256, MNState> out(r.h.published_set.begin(),
-                                   r.h.published_set.end());
-    for (const char* q : {kQ1, kQ2, kQ3})
-        EXPECT_FALSE(out.at(uint256S(q)).isValid) << q;
-    EXPECT_EQ(out.at(uint256S(kQ4)).nLastPaidHeight, 1519545u);
-}
 
 // ── CASE B1-TWIN (NEGATIVE) + THE CORRECTED MECHANISM.
 //
@@ -1433,96 +1393,8 @@ TEST(DashMnCheckpointPoseFold, SameBurstWithAmpleBudgetIsHandledByTheWalk)
 // ── CASE B2. ORDERING: the fold NEVER runs early. cursor < H_sml must leave
 // the set untouched.
 //
-// Why early is the dangerous direction: a masternode banned at h_ban <= H_sml
-// would be removed at heights where the chain still held it valid and paid it.
-// Inside a shared-payoutAddress group that divergence is SCRIPT-INVISIBLE, so
-// the coinbase cross-check passes and the bridge publishes a WRONG queue
-// silently. An early fold also perturbs queue POSITION, because
-// sync_validity_from_sml bumps nPoSeRevivedHeight -- a CompareByLastPaid key.
-TEST(DashMnCheckpointPoseFold, FoldNeverRunsBeforeTheCursorReachesTheSmlHeight)
-{
-    RecoveryRig r;
-    SmlSource sml;
-    // The SML is current at a height the bridge never reaches.
-    sml.set(1519600, all_valid_except({kQ1}));
-    wire_sml_snapshot(r.h.lane, sml);
-    r.h.lane.set_sml_validity_fn(sml_fn(all_valid_except({kQ1})));
 
-    // The real block pays kQ1, which is still eligible at this height. An
-    // early fold would have removed it, projected kQ2, and desynced.
-    r.run(block_from_hex(kBlockHex1519544));
 
-    ASSERT_TRUE(r.h.published) << r.h.lane.status();
-    EXPECT_FALSE(r.h.lane.sml_folded())
-        << "cursor 1519544 != SML height 1519600 -- the fold must NOT run";
-    EXPECT_EQ(r.h.lane.pose_removed(), 0u);
-    EXPECT_EQ(r.h.lane.eligible_size(), 6u);
-
-    std::map<uint256, MNState> out(r.h.published_set.begin(),
-                                   r.h.published_set.end());
-    EXPECT_TRUE(out.at(uint256S(kQ1)).isValid)
-        << "the chain still held it valid here and actually paid it";
-    EXPECT_EQ(out.at(uint256S(kQ1)).nLastPaidHeight, 1519544u);
-    EXPECT_EQ(out.at(uint256S(kQ1)).nPoSeRevivedHeight, 1367840u)
-        << "an early fold would also have moved its CompareByLastPaid key";
-}
-
-// ── CASE B2-TWIN (POSITIVE CONTROL for B2). Move the SML's height onto the
-// cursor and the very same wiring folds. Without this, B2 could be passing
-// because the seam does nothing at all.
-TEST(DashMnCheckpointPoseFold, TwinSameWiringFoldsOnceTheHeightsMeet)
-{
-    RecoveryRig r;
-    SmlSource sml;
-    sml.set(1519544, all_valid_except({kQ1}));
-    wire_sml_snapshot(r.h.lane, sml);
-    r.run(block_from_hex(kBlockHex1519544));
-
-    ASSERT_TRUE(r.h.published) << r.h.lane.status();
-    EXPECT_TRUE(r.h.lane.sml_folded());
-    EXPECT_EQ(r.h.lane.sml_folded_at(), 1519544u);
-    EXPECT_EQ(r.h.lane.pose_removed(), 1u);
-    EXPECT_EQ(r.h.lane.eligible_size(), 5u);
-    // The fold runs AFTER apply_block(1519544), so that block's own payee was
-    // still projected from the pre-fold set -- kQ1 was paid, exactly as the
-    // chain did. That is the "late is benign" half of the ordering rule.
-    std::map<uint256, MNState> out(r.h.published_set.begin(),
-                                   r.h.published_set.end());
-    EXPECT_EQ(out.at(uint256S(kQ1)).nLastPaidHeight, 1519544u);
-    EXPECT_FALSE(out.at(uint256S(kQ1)).isValid);
-}
-
-// ── CASE B3. A masternode banned AND revived inside the window ends VALID.
-// sync_validity_from_sml owns the (isValid, banHeight, revivedHeight) triple,
-// so a fold against an SML that shows it live leaves it live.
-TEST(DashMnCheckpointPoseFold, BannedThenRevivedInsideTheWindowEndsValid)
-{
-    RecoveryRig r;
-    SmlSource sml;
-    sml.set(1519545, all_valid_except({}));   // live again by the fold height
-    wire_sml_snapshot(r.h.lane, sml);
-    r.h.lane.set_sml_validity_fn(sml_fn(all_valid_except({kQ1})));
-
-    // 1519544 is repaid to kQ2, i.e. dashd skipped kQ1 while it was banned.
-    // The walk carries that single mismatch; the fold at 1519545 then confirms
-    // kQ1 is live again and lifts the exclusion the walk recorded.
-    auto b44 = repay_coinbase(block_from_hex(kBlockHex1519544),
-                              payout_of(r.cp, kQ1), payout_of(r.cp, kQ2));
-    r.h.blocks[1519545] = block_from_hex(kBlockHex1519545);
-    r.run(b44, /*tip=*/1519545);
-
-    ASSERT_TRUE(r.h.published) << r.h.lane.status();
-    EXPECT_EQ(r.h.lane.sml_recovered(), 1u) << "the walk handled the mismatch";
-    EXPECT_TRUE(r.h.lane.sml_folded());
-    EXPECT_EQ(r.h.lane.pose_reinstated(), 1u)
-        << "the fold must be able to REVIVE, not only remove";
-
-    std::map<uint256, MNState> out(r.h.published_set.begin(),
-                                   r.h.published_set.end());
-    const MNState& revived = out.at(uint256S(kQ1));
-    EXPECT_TRUE(revived.isValid) << "ban+revive inside the window ends VALID";
-    EXPECT_EQ(revived.nPoSeBanHeight, 0u);
-}
 
 // ── CASE B4. FRESHNESS GATE. A STALE SML must not license a PERMANENT
 // demotion: it can attest isValid=false for a masternode that has since been
@@ -1728,7 +1600,7 @@ TEST(DashMnCheckpointPoseFold, FailClosedDistinguishesAnAttestedBan)
     EXPECT_NE(s.find("attests it INVALID"), std::string::npos) << s;
     EXPECT_EQ(s.find("attests it VALID"), std::string::npos)
         << "the two verdicts must not be reported with the same words: " << s;
-    EXPECT_NE(s.find("NO SML SNAPSHOT SEAM IS WIRED"), std::string::npos)
+    EXPECT_NE(s.find("NO PER-HEIGHT SNAPSHOT SEAM IS WIRED"), std::string::npos)
         << "an operator whose fold seam is unwired must be told so: " << s;
 }
 
@@ -1738,7 +1610,8 @@ TEST(DashMnCheckpointPoseFold, FailClosedDistinguishesAnAttestedBan)
 //
 // The fold is dispatched AFTER apply_block and AFTER the terminal fail-close
 // (on_block_connected: refresh_sml_height -> apply_block -> fail_closed ->
-// maybe_fold_sml). So a fold at cursor == H_sml can only influence heights
+// the PER-HEIGHT PoSe FOLD block). So a fold at cursor == H_sml can only
+// influence heights
 // STRICTLY GREATER than H_sml. A failure AT H_sml, or at any height below it,
 // is decided before the fold ever runs.
 //
@@ -1787,211 +1660,475 @@ MnCheckpoint synthetic_anchor(size_t n, uint32_t height, const uint256& hash)
     return cp;
 }
 
+// ── Build an AUTHENTICATABLE historical snapshot: a full mnlistdiff whose
+// embedded type-5 cbTx commits to the SML root at a named height, with a
+// single-transaction merkle proof placing that cbTx at the coinbase position.
+// The harness's merkle-root lookup returns the cbTx hash for the block, which
+// is what a one-tx block's hashMerkleRoot IS -- so this passes exactly the same
+// DIP-4 checks a real reply must pass, and mutating any field breaks it.
+struct HistoricalSnapshot {
+    dash::coin::vendor::CSimplifiedMNListDiff diff;
+    uint256 merkle_root;      // what the header must carry for this to verify
+};
+
+HistoricalSnapshot make_snapshot(const uint256& block_hash, uint32_t height,
+                                 const std::vector<std::pair<uint256, bool>>& entries)
+{
+    HistoricalSnapshot out;
+    out.diff.baseBlockHash = uint256();          // full snapshot
+    out.diff.blockHash     = block_hash;
+    for (const auto& [h, valid] : entries) {
+        CSimplifiedMNListEntry e;
+        e.proRegTxHash = h;
+        e.isValid      = valid;
+        out.diff.mnList.push_back(e);
+    }
+    // The root the SML rebuilt from this diff will hash to.
+    CSimplifiedMNList rebuilt;
+    dash::coin::vendor::apply_diff(rebuilt, out.diff);
+
+    dash::coin::vendor::CCbTx cb;
+    cb.nVersion         = dash::coin::vendor::CCbTx::VERSION_MERKLE_ROOT_QUORUMS;
+    cb.nHeight          = static_cast<int32_t>(height);
+    cb.merkleRootMNList = rebuilt.CalcMerkleRoot();
+
+    out.diff.cbTx.type = 5;
+    {
+        auto ps = ::pack(cb);
+        auto sp = ps.get_span();
+        out.diff.cbTx.extra_payload.assign(
+            reinterpret_cast<const unsigned char*>(sp.data()),
+            reinterpret_cast<const unsigned char*>(sp.data()) + sp.size());
+    }
+    bitcoin_family::coin::TxIn in;
+    in.prevout.hash  = uint256{};
+    in.prevout.index = 0xFFFFFFFF;
+    in.sequence      = 0xFFFFFFFF;
+    out.diff.cbTx.vin.push_back(in);
+
+    // One-tx block: the merkle root IS the coinbase txid.
+    const uint256 cbtx_hash = dash::coin::dash_txid(out.diff.cbTx);
+    out.diff.cbTxMerkleTree.nTransactions = 1;
+    out.diff.cbTxMerkleTree.vHash         = {cbtx_hash};
+    out.diff.cbTxMerkleTree.vBitsBytes    = {0x01};
+    out.merkle_root = cbtx_hash;
+    return out;
+}
+
+// Drive a lane whose historical-snapshot requests are answered inline from a
+// per-height table, exactly as the coin-P2P demux would deliver them.
+struct SnapshotRig {
+    BridgeHarness h;
+    std::map<uint32_t, HistoricalSnapshot> by_height;   // explicit overrides
+    std::map<uint256, uint32_t>            height_of;   // block hash -> height
+    std::vector<uint256>                   requested;
+    // Default answer for any height with no override: a real peer can serve
+    // the list as of ANY block, so the rig must too.
+    std::vector<std::pair<uint256, bool>>  attest;
+    bool answer{true};
+
+    HistoricalSnapshot& snapshot_for(uint32_t height, const uint256& bh)
+    {
+        auto it = by_height.find(height);
+        if (it != by_height.end()) return it->second;
+        return by_height.emplace(height, make_snapshot(bh, height, attest))
+                        .first->second;
+    }
+
+    void install(uint32_t anchor_h, uint32_t tip_h, const uint256& anchor_hash)
+    {
+        h.headers[anchor_h] = anchor_hash;
+        for (uint32_t x = anchor_h; x <= tip_h + 1; ++x) {
+            uint256 bh = uint256S(kAnchorHash);
+            bh.data()[0] = static_cast<unsigned char>(x & 0xff);
+            bh.data()[1] = static_cast<unsigned char>((x >> 8) & 0xff);
+            if (x != anchor_h) h.headers[x] = bh;
+            height_of[h.headers[x]] = x;
+        }
+        h.tip = tip_h;
+        h.lane.set_merkle_root_at_fn(
+            [this](const uint256& bh) -> std::optional<uint256> {
+                auto hi = height_of.find(bh);
+                if (hi == height_of.end()) return std::nullopt;
+                auto si = by_height.find(hi->second);
+                if (si == by_height.end()) return std::nullopt;
+                return si->second.merkle_root;
+            });
+        h.lane.set_request_snapshot_fn([this](const uint256& bh) {
+            requested.push_back(bh);
+            if (!answer) return;
+            auto hi = height_of.find(bh);
+            if (hi == height_of.end()) return;
+            h.lane.on_historical_snapshot(snapshot_for(hi->second, bh).diff);
+        });
+    }
+};
+
 } // namespace
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 8. PER-HEIGHT FOLD — cursor == H_sml BY CONSTRUCTION
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── THE REGRESSION GUARD FOR THE WHOLE DESIGN. Previously RED: with a
+// tip-tracking SML the fold could never reach a failing height, because H_sml
+// always ran ahead of the replay cursor. The lane now asks for the list AS OF
+// the height it is standing on, so the tip's position is irrelevant.
 TEST(DashMnCheckpointPoseFold, FoldMissesTheWindowWhenTheSmlTracksTheMovingTip)
 {
     constexpr uint32_t kAnchorH = 2513000;
     constexpr uint32_t kTip     = 2513004;
     const uint256 anchor_hash = uint256S(kAnchorHash);
+    // 64 masternodes: a realistically sized set, so a 5-wide burst is a
+    // plausible ban wave rather than half the network (which the F5 sanity
+    // bound would correctly refuse).
+    const auto cp = synthetic_anchor(64, kAnchorH, anchor_hash);
 
-    const auto cp = synthetic_anchor(10, kAnchorH, anchor_hash);
-
-    // Five masternodes banned at consecutive queue-head positions. Sized to
-    // exceed the per-bridge walk budget (4 + distance/1000 == 4 here), which
-    // is the mainnet shape: a burst arriving against a budget that cannot
-    // absorb it.
+    // Five banned at consecutive queue-head positions: over the walk's budget.
     std::vector<std::pair<uint256, bool>> attest;
     for (size_t i = 0; i < cp.entries.size(); ++i)
         attest.emplace_back(cp.entries[i].first, i >= 5);
 
-    SmlSource sml;
-    sml.set_hashes(kTip, attest);
+    SnapshotRig rig;
+    rig.attest = attest;
+    rig.install(kAnchorH, kTip, anchor_hash);
+    // The list AS OF the anchor already carries the bans.
+    rig.by_height[kAnchorH] = make_snapshot(anchor_hash, kAnchorH, attest);
 
-    BridgeHarness h;
-    h.headers[kAnchorH] = anchor_hash;
-    h.tip = kTip;
+    // Successive blocks pay successive eligible masternodes, as the chain
+    // does: ranks 0..4 are banned, so the queue runs 5, 6, 7, 8.
+    for (uint32_t bh = kAnchorH + 1; bh <= kTip; ++bh) {
+        const size_t rank = 5 + (bh - (kAnchorH + 1));
+        rig.h.blocks[bh] = block_paying(cp.entries[rank].second.scriptPayout.m_data);
+    }
 
-    // Every block pays the first masternode the chain still holds eligible.
-    for (uint32_t bh = kAnchorH + 1; bh <= kTip; ++bh)
-        h.blocks[bh] = block_paying(cp.entries[5].second.scriptPayout.m_data);
+    rig.h.lane.arm(cp);
+    rig.h.lane.pump();
 
-    // THE PRODUCTION ARRANGEMENT: the SML tracks the header tip. main_dash
-    // issues getmnlistd on every tip change, so H_sml is at or ahead of the
-    // tip while the replay cursor is still catching up. Re-point the snapshot
-    // at the harness tip on every delivery to model that.
-    h.lane.set_request_block_fn([&h, &sml](uint32_t bh) {
-        h.requested.push_back(bh);
-        sml.height = h.tip;                // <- tip-tracking, not hand-placed
-        auto it = h.blocks.find(bh);
-        if (it == h.blocks.end()) return;
-        h.lane.on_block_connected(it->second, bh);
-    });
-    wire_sml_snapshot(h.lane, sml);
-    h.lane.set_sml_validity_fn([&sml](const uint256& x) -> std::optional<bool> {
-        for (const auto& e : sml.list.mnList)
-            if (e.proRegTxHash == x) return e.isValid;
-        return std::nullopt;
-    });
-
-    h.lane.arm(cp);
-    h.lane.pump();
-
-    // What the PR claims: the wholesale fold makes a ban burst survivable.
-    EXPECT_TRUE(h.lane.sml_folded())
-        << "the fold never ran: cursor never equalled H_sml=" << sml.height
-        << " before the bridge was decided. Folded_at="
-        << h.lane.sml_folded_at() << ", cursor=" << h.lane.cursor_height();
-    EXPECT_NE(h.lane.state(), MnCheckpointLane::State::FailedClosed)
-        << "the bridge still fails closed on a burst when the SML tracks the"
-           " tip -- i.e. in production. status: " << h.lane.status();
-    EXPECT_TRUE(h.published)
-        << "removals never reached the payee-eligible set before the failing"
-           " height; eligible=" << h.lane.eligible_size()
-        << " pose_removed=" << h.lane.pose_removed();
+    EXPECT_TRUE(rig.h.lane.sml_folded())
+        << "status: " << rig.h.lane.status();
+    EXPECT_EQ(rig.h.lane.first_fold_height(), kAnchorH)
+        << "the first fold must land before the first replayed block";
+    EXPECT_EQ(rig.h.lane.pose_removed(), 5u)
+        << "all five leave in ONE pass, before any of them is projected";
+    EXPECT_EQ(rig.h.lane.sml_recovered(), 0u)
+        << "the walk must not have been needed, and must not have spent budget";
+    EXPECT_NE(rig.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << rig.h.lane.status();
+    EXPECT_TRUE(rig.h.published) << rig.h.lane.status();
+    EXPECT_EQ(rig.h.lane.eligible_size(), 59u)
+        << "64 - 5 banned: the set FELL, which the tip-SML fold never managed";
 }
 
-// ── The anchor fold position. The post-apply dispatch site's FIRST call is at
-// cursor == anchor+1, so an SML current exactly AT the anchor height is never
-// tested against the cursor and a legitimate, perfectly safe fold position is
-// silently forfeited. (publish() also calls maybe_fold_sml, but only after the
-// whole replay — far too late to protect the first blocks.)
-//
-// This is the test that turns the earlier "0 red" mutation row into
-// information: it is RED as shipped and GREEN with a fold dispatched before
-// apply_block, because only that placement ever observes cursor == anchor.
+// ── The anchor fold position, previously forfeited. Resolved: pump() folds at
+// the anchor before pulling the first block, so block anchor+1 is projected
+// from an already-correct eligible set.
 TEST(DashMnCheckpointPoseFold, FoldFiresAtTheAnchorWhenTheSmlIsCurrentAtTheAnchorHeight)
 {
     constexpr uint32_t kAnchorH = 2513000;
     const uint256 anchor_hash = uint256S(kAnchorHash);
     const auto cp = synthetic_anchor(10, kAnchorH, anchor_hash);
 
-    // The SML is current exactly AT the anchor and retires the queue head.
     std::vector<std::pair<uint256, bool>> attest;
     for (size_t i = 0; i < cp.entries.size(); ++i)
         attest.emplace_back(cp.entries[i].first, i != 0);
 
-    SmlSource sml;
-    sml.set_hashes(kAnchorH, attest);
-
-    BridgeHarness h;
-    h.headers[kAnchorH] = anchor_hash;
-    h.tip = kAnchorH + 1;
+    SnapshotRig rig;
+    rig.attest = attest;
+    rig.install(kAnchorH, kAnchorH + 1, anchor_hash);
+    rig.by_height[kAnchorH] = make_snapshot(anchor_hash, kAnchorH, attest);
     // The chain skipped the banned head and paid queue slot 1.
-    h.blocks[kAnchorH + 1] =
+    rig.h.blocks[kAnchorH + 1] =
         block_paying(cp.entries[1].second.scriptPayout.m_data);
 
-    wire_sml_snapshot(h.lane, sml);
-    h.lane.arm(cp);
-    h.lane.pump();
+    rig.h.lane.arm(cp);
+    rig.h.lane.pump();
 
-    EXPECT_TRUE(h.lane.sml_folded())
-        << "an SML current AT the anchor is a valid, non-EARLY fold position"
-           " (cursor == H_sml == anchor) and must be taken before the first"
-           " replayed block is projected";
-    EXPECT_EQ(h.lane.sml_folded_at(), kAnchorH);
-    EXPECT_TRUE(h.published) << h.lane.status();
+    EXPECT_TRUE(rig.h.lane.sml_folded());
+    EXPECT_EQ(rig.h.lane.first_fold_height(), kAnchorH)
+        << "cursor == anchor is a valid fold point and must be taken";
+    EXPECT_EQ(rig.h.lane.sml_recovered(), 0u)
+        << "folding at the anchor means the walk is never even consulted";
+    EXPECT_TRUE(rig.h.published) << rig.h.lane.status();
 }
 
-// ── F5. The fold is a wholesale override of the payee set from one unverified
-// message. A list that would retire a large fraction of the set in one pass is
-// a corrupt or hostile SML, not a ban wave, and must be refused.
-TEST(DashMnCheckpointPoseFold, OversizedFoldIsRefusedRatherThanApplied)
+// ── REWARD-CRITICAL. A historical reply must never mutate the LIVE tip SML.
+// A full snapshot at an old block would overwrite the tip list with a past
+// state -- silently corrupting the very thing templates are validated against,
+// on the money path. The lane consumes its own replies (returns true) so the
+// demux can route them away; the tip SML must be byte-identical afterwards.
+// The tip half is a REAL NodeCoinState + CoinStateMaintainer, fed through the
+// REAL HistoricalMnListDiffDemux, so the assertion is about production code and
+// not about a local copy the lane could never have reached. Its negative twin
+// (NoDemuxTheSameReplyDoesCorruptTheLiveTipSml, below) removes only the filter
+// registration and proves the tip SML is corrupted -- which is what makes this
+// a test that CAN fail.
+//
+// COLD START IS THE HAZARD WINDOW, and it is exactly when the bridge runs. The
+// maintainer has an R1 guard that rejects a ZERO-base snapshot dated at or
+// below its current height -- but only `if (!have_at.IsNull())`. At cold start
+// have_at IS null (that is the resync the guard must not block), so the guard
+// is BYPASSED and a historical snapshot is adopted wholesale as the tip SML.
+namespace {
+
+// One lane + one live tip SML, wired the way main_dash wires them: the lane's
+// getmnlistd reply comes back on the SAME mnlistdiff message the tip sync
+// uses, and the demux is the only thing that keeps them apart.
+struct DemuxRig {
+    SnapshotRig                         rig;
+    dash::coin::NodeCoinState           tip_state;
+    dash::coin::CoinStateMaintainer     tip_maint{tip_state};
+    dash::coin::HistoricalMnListDiffDemux demux;
+    size_t tip_feeds{0};
+
+    // `register_lane_filter=false` is the negative twin: identical wiring with
+    // the demux registration removed.
+    void wire(bool register_lane_filter)
+    {
+        if (register_lane_filter) {
+            demux.add_filter(
+                [this](const dash::coin::vendor::CSimplifiedMNListDiff& d) {
+                    return rig.h.lane.on_historical_snapshot(d);
+                });
+        }
+        rig.h.lane.set_request_snapshot_fn([this](const uint256& bh) {
+            rig.requested.push_back(bh);
+            if (!rig.answer) return;
+            auto hi = rig.height_of.find(bh);
+            if (hi == rig.height_of.end()) return;
+            deliver(rig.snapshot_for(hi->second, bh).diff);
+        });
+    }
+
+    // The production routing: p2p_client hands every mnlistdiff to the demux,
+    // and only an unclaimed one reaches the maintainer.
+    bool deliver(const dash::coin::vendor::CSimplifiedMNListDiff& d)
+    {
+        return demux.dispatch(
+            d, [this](const dash::coin::vendor::CSimplifiedMNListDiff& x) {
+                ++tip_feeds;
+                tip_maint.on_mnlistdiff(x);
+            });
+    }
+};
+
+// The anchor-fold scenario both twins run. install() writes the lane's
+// request-snapshot seam, so wire() MUST come after it or the demux is bypassed
+// and both twins would report "no corruption" for the wrong reason.
+void arm_demux_rig(DemuxRig& d, uint32_t anchor_h, const uint256& anchor_hash,
+                   const MnCheckpoint& cp, bool register_lane_filter)
+{
+    std::vector<std::pair<uint256, bool>> attest;
+    for (size_t i = 0; i < cp.entries.size(); ++i)
+        attest.emplace_back(cp.entries[i].first, i != 0);
+    d.rig.attest = attest;
+    d.rig.install(anchor_h, anchor_h + 1, anchor_hash);
+    d.wire(register_lane_filter);
+    d.rig.by_height[anchor_h] = make_snapshot(anchor_hash, anchor_h, attest);
+    d.rig.h.blocks[anchor_h + 1] =
+        block_paying(cp.entries[1].second.scriptPayout.m_data);
+}
+
+} // namespace
+
+TEST(DashMnCheckpointPoseFold, HistoricalReplyNeverMutatesTheLiveTipSml)
 {
     constexpr uint32_t kAnchorH = 2513000;
     const uint256 anchor_hash = uint256S(kAnchorHash);
-    const auto cp = synthetic_anchor(16, kAnchorH, anchor_hash);
+    const auto cp = synthetic_anchor(10, kAnchorH, anchor_hash);
 
-    // Retire half the set at once — far over the 1/8 bound.
+    DemuxRig d;
+    arm_demux_rig(d, kAnchorH, anchor_hash, cp, /*register_lane_filter=*/true);
+
+    // COLD tip SML -- the R1 height guard is bypassed here, so the demux is
+    // genuinely the only thing standing between the historical reply and the
+    // live list.
+    ASSERT_FALSE(d.tip_state.have_sml())
+        << "the hazard window is a COLD tip SML; the fixture must start there";
+    const size_t tip_size_before = d.tip_state.sml().mnList.size();
+    const uint256 tip_root_before = d.tip_state.sml().CalcMerkleRoot();
+
+    d.rig.h.lane.arm(cp);
+    d.rig.h.lane.pump();
+    ASSERT_TRUE(d.rig.h.lane.sml_folded()) << d.rig.h.lane.status();
+
+    EXPECT_EQ(d.tip_feeds, 0u)
+        << "a historical reply reached the tip-SML maintainer";
+    EXPECT_FALSE(d.tip_state.have_sml())
+        << "the live tip SML was CREATED from a historical reply";
+    EXPECT_EQ(d.tip_state.sml().mnList.size(), tip_size_before);
+    EXPECT_EQ(d.tip_state.sml().CalcMerkleRoot(), tip_root_before)
+        << "the live tip SML is not byte-identical after the historical reply"
+           " -- this is the reward-critical corruption the demux exists to"
+           " prevent";
+
+    // Re-offering the same reply with nothing outstanding must NOT be claimed:
+    // over-claiming would swallow a legitimate tip diff, which is the same
+    // corruption with the sign flipped.
+    EXPECT_FALSE(d.rig.h.lane.on_historical_snapshot(
+                     d.rig.by_height[kAnchorH].diff))
+        << "a reply with no outstanding request must not be claimed";
+}
+
+// ── THE NEGATIVE TWIN. Identical wiring with ONE line removed -- the demux
+// registration -- and the corruption appears. Without this, the test above is
+// unfalsifiable: it would pass just as happily if nothing were connected.
+TEST(DashMnCheckpointPoseFold, NoDemuxTheSameReplyDoesCorruptTheLiveTipSml)
+{
+    constexpr uint32_t kAnchorH = 2513000;
+    const uint256 anchor_hash = uint256S(kAnchorHash);
+    const auto cp = synthetic_anchor(10, kAnchorH, anchor_hash);
+
+    DemuxRig d;
+    // The ONLY difference from the test above.
+    arm_demux_rig(d, kAnchorH, anchor_hash, cp, /*register_lane_filter=*/false);
+
+    ASSERT_FALSE(d.tip_state.have_sml());
+
+    d.rig.h.lane.arm(cp);
+    d.rig.h.lane.pump();
+
+    EXPECT_EQ(d.tip_feeds, 1u)
+        << "with no filter registered the historical reply MUST reach the tip"
+           " feed -- if it does not, the positive test above proves nothing";
+    EXPECT_TRUE(d.tip_state.have_sml())
+        << "the live tip SML was overwritten by a snapshot dated at h="
+        << kAnchorH << " -- exactly the silent past-state rewrite on the money"
+           " path that the demux prevents";
+    EXPECT_EQ(d.tip_state.sml().mnList.size(), cp.entries.size())
+        << "and it is the HISTORICAL list, entry for entry";
+}
+
+// ── The demux must not be a black hole either: a genuine TIP diff that no
+// consumer claims has to reach the maintainer. A demux that swallowed
+// everything would stall the live SML instead of corrupting it -- a different
+// failure, equally silent.
+TEST(DashMnCheckpointPoseFold, UnclaimedTipDiffStillReachesTheMaintainer)
+{
+    constexpr uint32_t kAnchorH = 2513000;
+    const uint256 anchor_hash = uint256S(kAnchorHash);
+    const auto cp = synthetic_anchor(10, kAnchorH, anchor_hash);
+
+    DemuxRig d;
+    arm_demux_rig(d, kAnchorH, anchor_hash, cp, /*register_lane_filter=*/true);
+    d.rig.h.lane.arm(cp);
+    d.rig.h.lane.pump();
+    ASSERT_TRUE(d.rig.h.lane.sml_folded());
+    ASSERT_EQ(d.tip_feeds, 0u);
+
+    // A snapshot at a DIFFERENT block: nobody is awaiting it, so it is a tip
+    // diff and must fall through.
+    uint256 other = uint256S(kAnchorHash);
+    other.data()[31] ^= 0xff;
     std::vector<std::pair<uint256, bool>> attest;
     for (size_t i = 0; i < cp.entries.size(); ++i)
-        attest.emplace_back(cp.entries[i].first, i >= 8);
+        attest.emplace_back(cp.entries[i].first, true);
+    const auto tip_diff = make_snapshot(other, kAnchorH + 900, attest);
 
-    // H_sml one block ABOVE the anchor, and that block pays the (still
-    // eligible) queue head, so the replay reaches the fold's dispatch point
-    // cleanly and the refusal under test is the BOUND, not a payee desync.
-    SmlSource sml;
-    sml.set_hashes(kAnchorH + 1, attest);
-
-    BridgeHarness h;
-    h.headers[kAnchorH] = anchor_hash;
-    h.tip = kAnchorH + 2;
-    h.blocks[kAnchorH + 1] =
-        block_paying(cp.entries[0].second.scriptPayout.m_data);
-    h.blocks[kAnchorH + 2] =
-        block_paying(cp.entries[8].second.scriptPayout.m_data);
-
-    wire_sml_snapshot(h.lane, sml);
-    h.lane.arm(cp);
-    h.lane.pump();
-
-    EXPECT_EQ(h.lane.state(), MnCheckpointLane::State::FailedClosed)
-        << h.lane.status();
-    EXPECT_FALSE(h.lane.sml_folded());
-    EXPECT_NE(h.lane.status().find("SML PoSe FOLD REFUSED"), std::string::npos)
-        << h.lane.status();
-    EXPECT_NE(h.lane.status().find("NOT root-verified"), std::string::npos)
-        << "the operator must be told the list is trusted, not verified: "
-        << h.lane.status();
+    EXPECT_FALSE(d.deliver(tip_diff.diff))
+        << "an unclaimed diff must not be reported as consumed";
+    EXPECT_EQ(d.tip_feeds, 1u)
+        << "the live SML would stall forever if the demux ate tip diffs";
 }
 
-// ── F1. An UNDATED SML must not license a permanent demotion. This is the warm
-// restart shape: the persisted list is loaded and have_sml() goes true, but no
-// height was restored, so every attestation is undateable.
-TEST(DashMnCheckpointPoseFold, UndatedSmlHeightCannotLicenseADemotion)
+// ── NON-SHORT-CIRCUITING. Two historical consumers may legitimately await the
+// SAME block hash (a bridge fold point can land on a quorum work block). One
+// reply answers both awaits; a short-circuiting chain would deliver it to the
+// first filter only and leave the second waiting forever on a message that
+// already arrived and was swallowed.
+TEST(DashMnCheckpointPoseFold, DemuxOffersOneReplyToEveryHistoricalConsumer)
 {
-    MnStateMachine m;
-    auto cp = good_checkpoint();
-    m.load(cp.entries, 1519543);
-    m.set_sml_recovery_cap(8);
-    m.set_sml_validity_fn(
-        [](const uint256& x) -> std::optional<bool> {
-            return x == uint256S(kQ1) ? std::optional<bool>{false}
-                                      : std::optional<bool>{true};
-        });
-    m.set_sml_current_height(0);          // warm SML present, height unknown
-    EXPECT_FALSE(m.sml_covers(1519544))
-        << "height 0 must mean 'covers NOTHING', not 'covers everything' --"
-           " the latter made the whole freshness gate vacuous on warm restart";
+    dash::coin::HistoricalMnListDiffDemux demux;
+    std::vector<std::pair<uint256, bool>> attest;
+    attest.emplace_back(uint256S(kQ1), true);
+    const uint256 hash = uint256S(kAnchorHash);
+    const auto snap = make_snapshot(hash, 2513000, attest);
 
-    auto blk = repay_coinbase(block_from_hex(kBlockHex1519544),
-                              payout_of(cp, kQ1), payout_of(cp, kQ2));
-    const auto r = m.apply_block(blk, 1519544);
+    int first = 0, second = 0;
+    demux.add_filter([&](const dash::coin::vendor::CSimplifiedMNListDiff& d) {
+        ++first;  return d.blockHash == hash;
+    });
+    demux.add_filter([&](const dash::coin::vendor::CSimplifiedMNListDiff& d) {
+        ++second; return d.blockHash == hash;
+    });
+    ASSERT_EQ(demux.filter_count(), 2u);
 
-    EXPECT_TRUE(r.payee_desync);
-    EXPECT_EQ(r.sml_recovered, 0u);
-    EXPECT_TRUE(m.entries().at(uint256S(kQ1)).isValid)
-        << "an undated attestation must never flip isValid permanently";
+    size_t tip = 0;
+    const bool consumed = demux.dispatch(
+        snap.diff,
+        [&](const dash::coin::vendor::CSimplifiedMNListDiff&) { ++tip; });
+
+    EXPECT_TRUE(consumed);
+    EXPECT_EQ(tip, 0u);
+    EXPECT_EQ(first, 1);
+    EXPECT_EQ(second, 1)
+        << "the second consumer was never offered the reply -- it would wait"
+           " forever on a message that had already arrived";
 }
 
-// ── F1-TWIN. A caller that never declares a height at all keeps the pre-gate
-// behaviour byte for byte. Without this, the fail-closed reading of 0 would
-// silently disable the walk for every existing caller.
-TEST(DashMnCheckpointPoseFold, TwinUndeclaredHeightKeepsPreGateBehaviour)
+// ── One outstanding request at a time, enforced structurally. While a fold is
+// in flight the replay pulls nothing and folds nothing, so it can neither race
+// its own request nor advance past the height the pending list describes --
+// which is what makes EARLY unreachable rather than merely unlikely.
+TEST(DashMnCheckpointPoseFold, ReplayPausesWhileAFoldRequestIsOutstanding)
 {
-    MnStateMachine m;
-    auto cp = good_checkpoint();
-    m.load(cp.entries, 1519543);
-    m.set_sml_recovery_cap(8);
-    m.set_sml_validity_fn(
-        [](const uint256& x) -> std::optional<bool> {
-            return x == uint256S(kQ1) ? std::optional<bool>{false}
-                                      : std::optional<bool>{true};
-        });
-    // deliberately NO set_sml_current_height()
-    EXPECT_TRUE(m.sml_covers(1519544));
+    constexpr uint32_t kAnchorH = 2513000;
+    constexpr uint32_t kTip     = 2513004;
+    const uint256 anchor_hash = uint256S(kAnchorHash);
+    const auto cp = synthetic_anchor(10, kAnchorH, anchor_hash);
 
-    auto blk = repay_coinbase(block_from_hex(kBlockHex1519544),
-                              payout_of(cp, kQ1), payout_of(cp, kQ2));
-    const auto r = m.apply_block(blk, 1519544);
-    EXPECT_FALSE(r.payee_desync);
-    EXPECT_EQ(r.sml_recovered, 1u);
+    std::vector<std::pair<uint256, bool>> attest;
+    for (size_t i = 0; i < cp.entries.size(); ++i)
+        attest.emplace_back(cp.entries[i].first, i != 0);
+
+    SnapshotRig rig;
+    rig.attest = attest;
+    rig.install(kAnchorH, kTip, anchor_hash);
+    rig.by_height[kAnchorH] = make_snapshot(anchor_hash, kAnchorH, attest);
+    rig.answer = false;                       // hold the reply
+    for (uint32_t bh = kAnchorH + 1; bh <= kTip; ++bh) {
+        const size_t rank = 1 + (bh - (kAnchorH + 1));
+        rig.h.blocks[bh] = block_paying(cp.entries[rank].second.scriptPayout.m_data);
+    }
+
+    // Materialise the anchor reply up front so the test can hand it over
+    // manually after the pause.
+    (void)rig.snapshot_for(kAnchorH, anchor_hash);
+
+    rig.h.lane.arm(cp);
+    rig.h.lane.pump();
+
+    EXPECT_TRUE(rig.h.lane.snapshot_pending());
+    EXPECT_EQ(rig.requested.size(), 1u) << "exactly one request in flight";
+    EXPECT_TRUE(rig.h.requested.empty())
+        << "no block bodies may be pulled while a fold is outstanding --"
+           " otherwise the cursor could pass the height the list describes";
+
+    // Further pumps must not issue a second request.
+    rig.h.lane.pump();
+    rig.h.lane.pump();
+    EXPECT_EQ(rig.requested.size(), 1u)
+        << "a duplicate getmnlistd draws a second reply that matches no await"
+           " and leaks past the demux";
+
+    // Delivering a block while paused must be ignored, not folded.
+    rig.h.lane.on_block_connected(rig.h.blocks[kAnchorH + 1], kAnchorH + 1);
+    EXPECT_EQ(rig.h.lane.cursor_height(), kAnchorH)
+        << "the cursor must not advance past a pending fold height";
+
+    // Now answer: the replay resumes from exactly where it paused.
+    rig.answer = true;
+    rig.h.lane.on_historical_snapshot(rig.by_height[kAnchorH].diff);
+    EXPECT_FALSE(rig.h.lane.snapshot_pending());
+    EXPECT_TRUE(rig.h.lane.sml_folded());
+    EXPECT_TRUE(rig.h.published) << rig.h.lane.status();
 }
 
-// ── F6. arm() must clear the one-shot fold latch. A re-armed lane that still
-// reported sml_folded()==true would run additions-only while claiming removals
-// had been applied -- a silent lie in the operator-facing state.
-TEST(DashMnCheckpointPoseFold, ArmResetsTheFoldLatchAndCounters)
+// ── An unauthenticated list must never reach the payee set. The snapshot is
+// the root of trust for who gets paid; a lying peer that can fold arbitrary
+// validity can mint a rejected coinbase. Mutating the committed root must
+// break verification.
+TEST(DashMnCheckpointPoseFold, UnauthenticatedSnapshotFailsClosed)
 {
     constexpr uint32_t kAnchorH = 2513000;
     const uint256 anchor_hash = uint256S(kAnchorHash);
@@ -2001,28 +2138,555 @@ TEST(DashMnCheckpointPoseFold, ArmResetsTheFoldLatchAndCounters)
     for (size_t i = 0; i < cp.entries.size(); ++i)
         attest.emplace_back(cp.entries[i].first, i != 0);
 
-    // H_sml at anchor+1 so the fold is actually reachable from the post-apply
-    // dispatch site (see FoldFiresAtTheAnchor... for why anchor itself is not).
-    SmlSource sml;
-    sml.set_hashes(kAnchorH + 1, attest);
-
-    BridgeHarness h;
-    h.headers[kAnchorH] = anchor_hash;
-    h.tip = kAnchorH + 2;
-    h.blocks[kAnchorH + 1] =
-        block_paying(cp.entries[0].second.scriptPayout.m_data);
-    h.blocks[kAnchorH + 2] =
+    SnapshotRig rig;
+    rig.attest = attest;
+    rig.install(kAnchorH, kAnchorH + 1, anchor_hash);
+    auto snap = make_snapshot(anchor_hash, kAnchorH, attest);
+    // Tamper: add a masternode AFTER the cbTx committed to the root. The
+    // rebuilt SML no longer hashes to cbTx.merkleRootMNList.
+    {
+        CSimplifiedMNListEntry rogue;
+        rogue.proRegTxHash = uint256S(kQ6);
+        rogue.isValid      = false;
+        snap.diff.mnList.push_back(rogue);
+    }
+    rig.by_height[kAnchorH] = snap;
+    rig.h.blocks[kAnchorH + 1] =
         block_paying(cp.entries[1].second.scriptPayout.m_data);
-    wire_sml_snapshot(h.lane, sml);
-    h.lane.arm(cp);
-    h.lane.pump();
-    ASSERT_TRUE(h.lane.sml_folded()) << h.lane.status();
 
-    h.lane.arm(cp);   // re-arm
-    EXPECT_FALSE(h.lane.sml_folded())
-        << "a re-armed lane must not claim a fold it has not performed";
-    EXPECT_EQ(h.lane.sml_folded_at(), 0u);
-    EXPECT_EQ(h.lane.pose_removed(), 0u);
-    EXPECT_EQ(h.lane.pose_reinstated(), 0u);
-    EXPECT_EQ(h.lane.sml_recovered(), 0u);
+    rig.h.lane.arm(cp);
+    rig.h.lane.pump();
+
+    EXPECT_EQ(rig.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << rig.h.lane.status();
+    EXPECT_FALSE(rig.h.lane.sml_folded());
+    EXPECT_FALSE(rig.h.published);
+    EXPECT_NE(rig.h.lane.status().find("DIP-4 client verification"),
+              std::string::npos)
+        << rig.h.lane.status();
+}
+
+// ── A peer answering with a DIFFERENT block's genuine snapshot must be
+// refused: the height is bound to the request.
+TEST(DashMnCheckpointPoseFold, SnapshotForTheWrongHeightIsRefused)
+{
+    constexpr uint32_t kAnchorH = 2513000;
+    const uint256 anchor_hash = uint256S(kAnchorHash);
+    const auto cp = synthetic_anchor(10, kAnchorH, anchor_hash);
+
+    std::vector<std::pair<uint256, bool>> attest;
+    for (size_t i = 0; i < cp.entries.size(); ++i)
+        attest.emplace_back(cp.entries[i].first, i != 0);
+
+    SnapshotRig rig;
+    rig.attest = attest;
+    rig.install(kAnchorH, kAnchorH + 1, anchor_hash);
+    // A perfectly well-formed snapshot -- for the WRONG height.
+    rig.by_height[kAnchorH] = make_snapshot(anchor_hash, kAnchorH + 99, attest);
+    rig.h.blocks[kAnchorH + 1] =
+        block_paying(cp.entries[1].second.scriptPayout.m_data);
+
+    rig.h.lane.arm(cp);
+    rig.h.lane.pump();
+
+    EXPECT_EQ(rig.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << rig.h.lane.status();
+    EXPECT_FALSE(rig.h.lane.sml_folded());
+}
+
+// ── The status-clobber defect class. A fail_closed() raised inside the fold
+// path had its status immediately overwritten by request_window(), destroying
+// the only record of WHY the lane refused. Silent refusal is the defect.
+TEST(DashMnCheckpointPoseFold, RefusalReasonSurvivesAndIsNotOverwritten)
+{
+    constexpr uint32_t kAnchorH = 2513000;
+    const uint256 anchor_hash = uint256S(kAnchorHash);
+    const auto cp = synthetic_anchor(16, kAnchorH, anchor_hash);
+
+    // Retire half the set at once: over the 1/8 sanity bound.
+    std::vector<std::pair<uint256, bool>> attest;
+    for (size_t i = 0; i < cp.entries.size(); ++i)
+        attest.emplace_back(cp.entries[i].first, i >= 8);
+
+    SnapshotRig rig;
+    rig.attest = attest;
+    rig.install(kAnchorH, kAnchorH + 2, anchor_hash);
+    rig.by_height[kAnchorH] = make_snapshot(anchor_hash, kAnchorH, attest);
+    for (uint32_t bh = kAnchorH + 1; bh <= kAnchorH + 2; ++bh)
+        rig.h.blocks[bh] = block_paying(cp.entries[8].second.scriptPayout.m_data);
+
+    rig.h.lane.arm(cp);
+    rig.h.lane.pump();
+
+    ASSERT_EQ(rig.h.lane.state(), MnCheckpointLane::State::FailedClosed);
+    EXPECT_NE(rig.h.lane.status().find("SML PoSe FOLD REFUSED"),
+              std::string::npos)
+        << "the refusal reason must survive the tail of the call that raised"
+           " it -- a lane that refuses silently is the defect: "
+        << rig.h.lane.status();
+    EXPECT_EQ(rig.h.lane.status().find("bridging: cursor"), std::string::npos)
+        << "request_window() overwrote the refusal with a progress line";
+}
+
+namespace {
+
+// ── AN INDEPENDENT MODEL OF WHAT dashd WOULD HAVE PAID.
+//
+// A replay window of any length cannot have its payees written by hand: every
+// payment moves its masternode to the tail of the DIP-3 queue, so the payee at
+// h+1 depends on every payment before it. Guessing produces a PAYEE DESYNC
+// that looks like a bug in the lane and is not.
+//
+// So the expected coinbase is generated from a SEPARATE MnStateMachine, driven
+// forward one height at a time, with the bans applied to it at the height the
+// chain applied them. That machine is the ORACLE (dashd's side); the lane is
+// the DUT. They share the CompareByLastPaid scan, which is the point: the
+// question under test is whether the lane's per-height FOLD makes its eligible
+// set agree with the oracle's, not whether the sort is right.
+//
+// `ban_at` == 0 means no bans anywhere.
+std::map<uint32_t, dash::coin::BlockType> simulate_chain(
+    const MnCheckpoint& cp, uint32_t anchor_h, uint32_t tip_h,
+    uint32_t ban_at, const std::vector<std::pair<uint256, bool>>& post_ban)
+{
+    MnStateMachine oracle;
+    oracle.load(cp.entries, anchor_h);
+    std::map<uint32_t, dash::coin::BlockType> out;
+    for (uint32_t h = anchor_h + 1; h <= tip_h; ++h) {
+        if (ban_at != 0 && h == ban_at) {
+            std::vector<CSimplifiedMNListEntry> v;
+            for (const auto& [hash, valid] : post_ban) {
+                CSimplifiedMNListEntry e;
+                e.proRegTxHash = hash;
+                e.isValid      = valid;
+                v.push_back(e);
+            }
+            oracle.sync_validity_from_sml(CSimplifiedMNList(std::move(v)), h - 1);
+        }
+        const auto ranked = oracle.rank_payee_candidates(1);
+        EXPECT_FALSE(ranked.empty()) << "oracle queue empty at h=" << h;
+        if (ranked.empty()) break;
+        const auto& st = oracle.entries().at(ranked[0]);
+        auto blk = block_paying(st.scriptPayout.m_data);
+        oracle.apply_block(blk, h);
+        out[h] = std::move(blk);
+    }
+    return out;
+}
+
+} // namespace
+
+// ── A PAUSED replay is a STOPPED replay. If the peer never answers the fold
+// request, the bridge must not wait forever with no symptom other than "the
+// arm never armed" -- that is the silent-refusal defect class. It re-asks,
+// then abandons THAT fold point and carries on degraded, and says so.
+TEST(DashMnCheckpointPoseFold, UnansweredFoldReAsksThenAbandonsRatherThanWedging)
+{
+    constexpr uint32_t kAnchorH = 2513000;
+    constexpr uint32_t kTip     = 2513003;
+    const uint256 anchor_hash = uint256S(kAnchorHash);
+    const auto cp = synthetic_anchor(10, kAnchorH, anchor_hash);
+
+    std::vector<std::pair<uint256, bool>> attest;
+    for (size_t i = 0; i < cp.entries.size(); ++i)
+        attest.emplace_back(cp.entries[i].first, true);   // no bans at all
+
+    SnapshotRig rig;
+    rig.attest = attest;
+    rig.install(kAnchorH, kTip, anchor_hash);
+    rig.answer = false;                       // the peer never replies
+    rig.h.blocks = simulate_chain(cp, kAnchorH, kTip, 0, {});
+
+    rig.h.lane.arm(cp);
+    rig.h.lane.pump();
+    ASSERT_TRUE(rig.h.lane.snapshot_pending());
+    ASSERT_EQ(rig.requested.size(), 1u);
+
+    // Re-ask, once, at the retry threshold -- and to the SAME block, so there
+    // is still only one thing outstanding.
+    for (uint32_t i = 0; i < MnCheckpointLane::kFoldRetryPumps; ++i)
+        rig.h.lane.pump();
+    EXPECT_EQ(rig.requested.size(), 2u) << "the request was never re-asked";
+    EXPECT_EQ(rig.requested[0], rig.requested[1])
+        << "a re-ask must name the SAME block: a different one would put two"
+           " distinguishable-only-by-luck replies in flight";
+
+    // Then give up and RESUME. The bridge completes degraded rather than
+    // hanging. (Two fold points go unanswered here -- the anchor and the tip --
+    // because the peer answers nothing at all; each is abandoned on its own
+    // budget, which is the point: one dead fold point does not poison the
+    // next.) The loop is BOUNDED so a genuine wedge fails the test instead of
+    // hanging the suite.
+    const uint32_t kBound = 4 * (MnCheckpointLane::kFoldGiveUpPumps + 2);
+    for (uint32_t i = 0; i < kBound && !rig.h.published; ++i)
+        rig.h.lane.pump();
+
+    EXPECT_FALSE(rig.h.lane.snapshot_pending());
+    EXPECT_GE(rig.h.lane.abandoned_folds(), 1u);
+    EXPECT_FALSE(rig.h.lane.sml_folded())
+        << "nothing was ever answered, so nothing may claim to have folded";
+    EXPECT_TRUE(rig.h.published)
+        << "the bridge WEDGED on an unanswered fold request: " << rig.h.lane.status();
+    EXPECT_NE(rig.h.lane.status().find("ABANDONED"), std::string::npos)
+        << "degradation must be stated, not swallowed: " << rig.h.lane.status();
+}
+
+// ── The late reply to an ABANDONED request is still a base=ZERO snapshot at an
+// OLD block. Releasing the claim when we gave up waiting would let it fall
+// through to the live tip SML -- the same reward-critical rewrite, arriving by
+// the back door. It stays claimed and is dropped.
+TEST(DashMnCheckpointPoseFold, LateReplyToAnAbandonedFoldIsStillClaimedAndDropped)
+{
+    constexpr uint32_t kAnchorH = 2513000;
+    constexpr uint32_t kTip     = 2513002;
+    const uint256 anchor_hash = uint256S(kAnchorHash);
+    const auto cp = synthetic_anchor(10, kAnchorH, anchor_hash);
+
+    std::vector<std::pair<uint256, bool>> attest;
+    for (size_t i = 0; i < cp.entries.size(); ++i)
+        attest.emplace_back(cp.entries[i].first, true);
+
+    DemuxRig d;
+    d.rig.attest = attest;
+    d.rig.install(kAnchorH, kTip, anchor_hash);
+    d.wire(/*register_lane_filter=*/true);    // AFTER install: it owns the seam
+    d.rig.answer = false;
+    d.rig.h.blocks = simulate_chain(cp, kAnchorH, kTip, 0, {});
+    const auto late = make_snapshot(anchor_hash, kAnchorH, attest);
+
+    d.rig.h.lane.arm(cp);
+    for (uint32_t i = 0; i <= MnCheckpointLane::kFoldGiveUpPumps + 1
+                         && d.rig.h.lane.abandoned_folds() == 0; ++i)
+        d.rig.h.lane.pump();
+    ASSERT_EQ(d.rig.h.lane.abandoned_folds(), 1u) << d.rig.h.lane.status();
+    ASSERT_EQ(d.tip_feeds, 0u);
+
+    // The peer finally answers, long after we stopped waiting.
+    const bool consumed = d.deliver(late.diff);
+
+    EXPECT_TRUE(consumed)
+        << "an abandoned request's reply must STILL be claimed";
+    EXPECT_EQ(d.tip_feeds, 0u)
+        << "the late reply reached the live tip SML -- releasing the claim on"
+           " abandonment reopens the exact corruption the demux prevents";
+    EXPECT_FALSE(d.tip_state.have_sml());
+    EXPECT_FALSE(d.rig.h.lane.sml_folded())
+        << "and it must not be folded either: the cursor has moved on, so the"
+           " list is now dated BEFORE the cursor";
+}
+
+// ── THE MEASURED SHAPE, END TO END. The mainnet 2026-08-02 incident: three
+// masternodes leaving `protx list valid` inside 73 blocks while the bridge
+// replayed. The walk's budget cannot carry it (4 + distance/1000, already
+// partly spent) and the tip-tracking fold could never reach those heights.
+// The per-height fold must replay the whole window and SURVIVE.
+TEST(DashMnCheckpointPoseFold, ThreeBanBurstInsideTheWindowReplaysEndToEnd)
+{
+    constexpr uint32_t kAnchorH = 2514800;
+    constexpr uint32_t kBurstAt = 2514873;
+    constexpr uint32_t kTip     = 2515025;
+    const uint256 anchor_hash = uint256S(kAnchorHash);
+    // 64 masternodes so a 3-wide burst is well inside the F5 sanity bound.
+    const auto cp = synthetic_anchor(64, kAnchorH, anchor_hash);
+
+    // BEFORE the burst everyone is valid; from kBurstAt the queue head three
+    // are banned, exactly as the chain showed (2062 -> 2059, never revived).
+    std::vector<std::pair<uint256, bool>> all_valid, post_burst;
+    for (size_t i = 0; i < cp.entries.size(); ++i) {
+        all_valid.emplace_back(cp.entries[i].first, true);
+        post_burst.emplace_back(cp.entries[i].first, i >= 3);
+    }
+
+    SnapshotRig rig;
+    rig.attest = all_valid;                    // default answer for any height
+    rig.install(kAnchorH, kTip, anchor_hash);
+    // Fold interval small enough that a fold point lands inside the burst
+    // window -- the coarse-graining knob, exercised rather than assumed.
+    rig.h.lane.set_fold_interval(50);
+
+    // Every height from the burst onward serves the post-burst list.
+    for (uint32_t h = kBurstAt; h <= kTip; ++h) {
+        auto it = rig.height_of.begin();
+        for (; it != rig.height_of.end(); ++it) if (it->second == h) break;
+        ASSERT_NE(it, rig.height_of.end());
+        rig.by_height[h] = make_snapshot(it->first, h, post_burst);
+    }
+
+    // What dashd would actually have paid, burst included.
+    rig.h.blocks = simulate_chain(cp, kAnchorH, kTip, kBurstAt, post_burst);
+
+    // The walk's budget for this distance, as the lane sizes it: 4 + 225/1000
+    // = 4. The burst is carried by folds, so the budget must be untouched.
+    rig.h.lane.arm(cp);
+    rig.h.lane.pump();
+
+    EXPECT_NE(rig.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << rig.h.lane.status();
+    EXPECT_TRUE(rig.h.published) << rig.h.lane.status();
+    EXPECT_EQ(rig.h.published_as_of, kTip);
+    EXPECT_EQ(rig.h.lane.pose_removed(), 3u)
+        << "the three banned masternodes must have LEFT the eligible set: "
+        << rig.h.lane.status();
+    EXPECT_EQ(rig.h.lane.eligible_size(), 61u)
+        << "64 - 3: the set FELL across the window, which is the measured"
+           " direction the additions-only replay got backwards";
+    EXPECT_EQ(rig.h.lane.sml_recovered(), 0u)
+        << "a fold spends NO walk budget -- that is why a burst costs nothing";
+    EXPECT_GT(rig.h.lane.folds_applied(), 1u)
+        << "the interval folds must actually have fired, not just the anchor"
+           " and the tip";
+}
+
+// ── The FOLD-POINT SCHEDULE itself. Coarse-graining is a correctness claim
+// (round trips are bounded) and a completeness claim (the anchor and the tip
+// are always fold points), so it is pinned rather than left to inspection.
+TEST(DashMnCheckpointPoseFold, FoldPointsAreCoarseGrainedButAlwaysCoverTheEnds)
+{
+    constexpr uint32_t kAnchorH = 2500000;
+    constexpr uint32_t kTip     = 2502000;
+    const uint256 anchor_hash = uint256S(kAnchorHash);
+    const auto cp = synthetic_anchor(10, kAnchorH, anchor_hash);
+
+    std::vector<std::pair<uint256, bool>> attest;
+    for (size_t i = 0; i < cp.entries.size(); ++i)
+        attest.emplace_back(cp.entries[i].first, true);
+
+    SnapshotRig rig;
+    rig.attest = attest;
+    rig.install(kAnchorH, kTip, anchor_hash);
+    rig.h.lane.set_fold_interval(500);
+    rig.h.blocks = simulate_chain(cp, kAnchorH, kTip, 0, {});
+
+    rig.h.lane.arm(cp);
+    rig.h.lane.pump();
+
+    ASSERT_TRUE(rig.h.published) << rig.h.lane.status();
+    // anchor + 500/1000/1500/2000(==tip) = 5. One per height would be 2001.
+    EXPECT_EQ(rig.requested.size(), 5u)
+        << "the fold schedule is not coarse-grained -- a round trip per height"
+           " is not a bridge, it is a denial of service on the peer";
+    EXPECT_EQ(rig.h.lane.first_fold_height(), kAnchorH)
+        << "the anchor is always a fold point";
+    EXPECT_EQ(rig.h.lane.sml_folded_at(), kTip)
+        << "the tip is always a fold point, so the PUBLISHED set is current";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 9. MAKE THE LATCH SAY ITS OWN NAME (folded in from the closed MN
+//    diff-ladder slice -- the observability half only; no ladder).
+//
+// The maintainer's payee-desync latch is what a daemonless node hits when the
+// bridge's projection and the chain disagree, and on a daemonless node it is
+// PERMANENT: only an authoritative re-seed clears it and there is no daemon to
+// re-seed from. It was log-only. The smoke rig reported 639 consecutive
+// "not-populated" declines while the actual cause -- a payee desync at
+// h=2514874 -- appeared nowhere a human reading the classification would look.
+// A state that refuses without naming itself is the defect.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace {
+
+std::vector<unsigned char> latch_pkh_script(uint8_t seed)
+{
+    std::vector<unsigned char> s{0x76, 0xa9, 0x14};
+    for (int i = 0; i < 20; ++i) s.push_back(static_cast<unsigned char>(seed + i));
+    s.push_back(0x88); s.push_back(0xac);
+    return s;
+}
+
+uint256 latch_seq256(uint8_t base)
+{
+    uint256 h;
+    for (int i = 0; i < 32; ++i) h.data()[i] = static_cast<uint8_t>(base + i);
+    return h;
+}
+
+void latch_bind(dash::coin::BlockType& b)
+{
+    std::vector<uint256> ids;
+    for (const auto& tx : b.m_txs) ids.push_back(dash::coin::dash_txid(tx));
+    b.m_merkle_root = dash::coin::compute_merkle_root(ids);
+}
+
+dash::coin::MutableTransaction latch_coinbase_paying(
+    const std::vector<unsigned char>& script)
+{
+    dash::coin::MutableTransaction tx;
+    tx.version = 1; tx.type = 0; tx.locktime = 1;
+    dash::coin::TxIn in;
+    in.prevout.hash  = latch_seq256(0x90);
+    in.prevout.index = 0;
+    in.sequence      = 0xffffffffu;
+    tx.vin.push_back(in);
+    dash::coin::TxOut o;
+    o.value = 500000000;
+    o.scriptPubKey.m_data = script;
+    tx.vout.push_back(o);
+    return tx;
+}
+
+constexpr uint32_t kLatchTipH   = 2514874;
+constexpr uint8_t  kLatchAddrV  = 76;
+constexpr uint8_t  kLatchP2shV  = 16;
+
+} // namespace
+
+TEST(DashMnPayeeLatch, ClassifyDeclineNamesTheLatch)
+{
+    dash::coin::NodeCoinState st;
+    EXPECT_NE(st.classify_decline(), "mn-needs-reseed");
+    st.set_mn_needs_reseed(true);
+    EXPECT_EQ(st.classify_decline(), "mn-needs-reseed")
+        << "the latch must be NAMED, not hidden behind 'not-populated'";
+    st.set_mn_needs_reseed(false);
+    EXPECT_NE(st.classify_decline(), "mn-needs-reseed")
+        << "and it must clear -- a latch that never clears is a different bug";
+}
+
+// The real maintainer, driven into the real desync, must publish the latch.
+// Without the mirror this reports "not-populated" -- true, useless, and the
+// reason the incident took 639 declines to diagnose.
+TEST(DashMnPayeeLatch, RealPayeeDesyncPublishesTheLatchToTheClassifier)
+{
+    dash::coin::NodeCoinState st;
+    dash::coin::CoinStateMaintainer m{st};
+    m.set_require_seeded_mn_set(true);          // the embedded-arm posture
+
+    MNState mn;
+    mn.isValid            = true;
+    mn.nRegisteredHeight  = 2300000;
+    mn.nLastPaidHeight    = 0;
+    mn.scriptPayout.m_data = latch_pkh_script(0x30);
+    m.on_mn_list_update({{latch_seq256(0x01), mn}}, kLatchTipH - 1);
+    m.on_new_tip(kLatchTipH - 1, latch_seq256(0x50), 0x1d00ffff, 1700000000,
+                 kLatchAddrV, kLatchP2shV, 1700000100, 4);
+    ASSERT_TRUE(m.live());
+    ASSERT_FALSE(st.mn_needs_reseed());
+
+    // A coinbase paying somebody OTHER than the projected masternode.
+    dash::coin::BlockType blk;
+    blk.m_txs.push_back(latch_coinbase_paying(latch_pkh_script(0x77)));
+    latch_bind(blk);
+    const auto r = m.on_block_connected(blk, kLatchTipH);
+
+    ASSERT_TRUE(r.payee_desync);
+    EXPECT_FALSE(m.live());
+    EXPECT_TRUE(st.mn_needs_reseed());
+    EXPECT_EQ(st.classify_decline(), "mn-needs-reseed")
+        << "the arm refused and did not say why -- that silence IS the defect";
+}
+
+// The clearing half, driven the same way: an authoritative resync must open
+// the latch AND the classifier must stop naming it. A latch that says its name
+// forever is as useless as one that never does.
+TEST(DashMnPayeeLatch, AuthoritativeResyncClearsTheLatchAndTheClassification)
+{
+    dash::coin::NodeCoinState st;
+    dash::coin::CoinStateMaintainer m{st};
+    m.set_require_seeded_mn_set(true);
+
+    MNState mn;
+    mn.isValid            = true;
+    mn.nRegisteredHeight  = 2300000;
+    mn.nLastPaidHeight    = 0;
+    mn.scriptPayout.m_data = latch_pkh_script(0x30);
+    m.on_mn_list_update({{latch_seq256(0x01), mn}}, kLatchTipH - 1);
+    m.on_new_tip(kLatchTipH - 1, latch_seq256(0x50), 0x1d00ffff, 1700000000,
+                 kLatchAddrV, kLatchP2shV, 1700000100, 4);
+    dash::coin::BlockType blk;
+    blk.m_txs.push_back(latch_coinbase_paying(latch_pkh_script(0x77)));
+    latch_bind(blk);
+    ASSERT_TRUE(m.on_block_connected(blk, kLatchTipH).payee_desync);
+    ASSERT_EQ(st.classify_decline(), "mn-needs-reseed");
+
+    // The bridge's publish is exactly this event.
+    m.on_mn_list_update({{latch_seq256(0x01), mn}}, kLatchTipH);
+
+    EXPECT_FALSE(st.mn_needs_reseed());
+    EXPECT_NE(st.classify_decline(), "mn-needs-reseed");
+}
+
+// ── GAP CLOSED BY MUTATION TESTING. Two branches of the DIP-4 authentication
+// had NO test: deleting either produced a fully green run.
+//
+//   * the cbTxMerkleTree proof against the PoW-verified header (step b) --
+//     without it a peer may serve any list with any cbTx it likes, since the
+//     cbTx would no longer have to be the one the block actually committed to;
+//   * the `expected_height == 0` refusal -- "the caller does not know what it
+//     asked about" must fail closed, not authenticate against nothing.
+//
+// Both are on the reward path. A check nothing can falsify is not a check.
+TEST(DashMnCheckpointPoseFold, SnapshotWithAForgedMerkleProofIsRefused)
+{
+    constexpr uint32_t kAnchorH = 2513000;
+    const uint256 anchor_hash = uint256S(kAnchorHash);
+    const auto cp = synthetic_anchor(10, kAnchorH, anchor_hash);
+
+    std::vector<std::pair<uint256, bool>> attest;
+    for (size_t i = 0; i < cp.entries.size(); ++i)
+        attest.emplace_back(cp.entries[i].first, i != 0);
+
+    SnapshotRig rig;
+    rig.attest = attest;
+    rig.install(kAnchorH, kAnchorH + 1, anchor_hash);
+    auto snap = make_snapshot(anchor_hash, kAnchorH, attest);
+    // The reply is INTERNALLY consistent -- its cbTx, its SML and its own
+    // merkle proof all agree with each other. What it cannot match is OUR
+    // PoW-validated header for that block. That is exactly the shape a lying
+    // peer can produce for free, and step (b) is the only thing that catches
+    // it: tampering the proof itself would also trip the coinbase-position
+    // check and would not isolate this branch. (Found by mutation: deleting
+    // step (b) left the whole suite green until this case existed.)
+    snap.merkle_root.data()[0] ^= 0xff;   // == what our header chain reports
+    rig.by_height[kAnchorH] = snap;
+    rig.h.blocks[kAnchorH + 1] =
+        block_paying(cp.entries[1].second.scriptPayout.m_data);
+
+    rig.h.lane.arm(cp);
+    rig.h.lane.pump();
+
+    EXPECT_EQ(rig.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << rig.h.lane.status();
+    EXPECT_FALSE(rig.h.lane.sml_folded());
+    EXPECT_FALSE(rig.h.published);
+}
+
+TEST(DashMnCheckpointPoseFold, SnapshotWithNoExpectedHeightIsRefused)
+{
+    const uint256 hash = uint256S(kAnchorHash);
+    std::vector<std::pair<uint256, bool>> attest;
+    attest.emplace_back(uint256S(kQ1), true);
+    const auto snap = make_snapshot(hash, 2513000, attest);
+
+    auto root_ok = [&](const uint256&) -> std::optional<uint256> {
+        return snap.merkle_root;
+    };
+    dash::coin::vendor::CCbTx cbtx;
+
+    // A caller that knows the height authenticates.
+    EXPECT_TRUE(dash::coin::authenticate_historical_snapshot(
+        snap.diff, 2513000, root_ok, cbtx, "KAT").has_value());
+
+    // A caller that does NOT must fail closed rather than accept anything.
+    EXPECT_FALSE(dash::coin::authenticate_historical_snapshot(
+        snap.diff, 0, root_ok, cbtx, "KAT").has_value())
+        << "expected_height == 0 means 'we do not know what we asked about' --"
+           " authenticating against nothing is not authentication";
+
+    // ...and a caller whose header chain does not hold the block must too.
+    auto root_absent = [](const uint256&) -> std::optional<uint256> {
+        return std::nullopt;
+    };
+    EXPECT_FALSE(dash::coin::authenticate_historical_snapshot(
+        snap.diff, 2513000, root_absent, cbtx, "KAT").has_value())
+        << "without our own PoW-verified header there is no trust anchor";
+
+    // A held-but-NULL root is the same absence wearing a different hat: it
+    // would compare equal to a proof root the peer can trivially make null.
+    auto root_null = [](const uint256&) -> std::optional<uint256> {
+        return uint256();
+    };
+    EXPECT_FALSE(dash::coin::authenticate_historical_snapshot(
+        snap.diff, 2513000, root_null, cbtx, "KAT").has_value())
+        << "a null header merkle root is not an anchor, it is the absence of"
+           " one -- accepting it lets a peer authenticate against nothing";
 }

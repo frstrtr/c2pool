@@ -3063,8 +3063,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
             // DEMUX: route the source's HISTORICAL getmnlistd replies away from
             // the tip-SML maintainer (a base=ZERO snapshot would overwrite it).
+            // ADDITIVE, not a slot: the MN-checkpoint lane registers its own
+            // filter below for the per-height PoSe fold, and both consumers
+            // must be offered every reply (a fold point can coincide with a
+            // quorum work block, and then ONE reply answers BOTH awaits).
             if (coin_p2p) {
-                coin_p2p->set_historical_mnlistdiff_filter(
+                coin_p2p->add_historical_mnlistdiff_filter(
                     [qc_member_source]
                     (const dash::coin::vendor::CSimplifiedMNListDiff& d) {
                         return qc_member_source->on_mnlistdiff(d);
@@ -3603,6 +3607,50 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // block-connect / tip-changed callbacks, all on the single
             // io_context thread main_dash runs. No lock is taken or needed,
             // and the returned pointer never escapes the call.
+            // PER-HEIGHT PoSe FOLD seams. The lane asks for the masternode
+            // list AS OF the height its replay cursor is standing on, using
+            // the SAME getmnlistd primitive quorum_member_source.hpp already
+            // uses for historical member sets. This is what makes
+            // cursor == H_sml true BY CONSTRUCTION instead of by luck: the tip
+            // SML runs ahead of a catching-up replay, so waiting for the two
+            // to coincide loses the race at exactly the heights that matter.
+            //
+            // WIRED AS A PAIR OR NOT AT ALL. The request seam and the reply
+            // demux are two halves of one round trip: a lane that can ask but
+            // never be answered would PAUSE its replay on the first fold point
+            // and never resume. So both are installed inside the same
+            // `if (coin_p2p)` — with no coin-P2P client there is no request
+            // seam either, and the lane degrades to the additions-only replay
+            // plus the per-mismatch walk and says so in status().
+            if (coin_p2p) {
+                auto* cp = coin_p2p.get();
+                mn_ckpt_lane->set_request_snapshot_fn(
+                    [cp](const uint256& block_hash) {
+                        cp->send_getmnlistd(uint256::ZERO, block_hash);
+                    });
+                // DEMUX (reward-critical): the reply comes back on the SAME
+                // mnlistdiff message the tip sync uses. Routed here it is
+                // consumed as historical and the LIVE tip SML is never
+                // touched; routed to the maintainer it would silently rewrite
+                // the tip SML to the replayed (past) height — on the money
+                // path. See historical_sml.hpp.
+                coin_p2p->add_historical_mnlistdiff_filter(
+                    [mnl = mn_ckpt_lane.get()]
+                    (const dash::coin::vendor::CSimplifiedMNListDiff& d) {
+                        return mnl->on_historical_snapshot(d);
+                    });
+            }
+            // The DIP-4 trust anchor: our own PoW-validated header's merkle
+            // root. Without it a snapshot cannot be authenticated and the lane
+            // refuses to fold at all.
+            mn_ckpt_lane->set_merkle_root_at_fn(
+                [hc = header_chain.get()](const uint256& block_hash)
+                    -> std::optional<uint256> {
+                    // The SAME lookup QuorumMemberSource's R3 anchor uses.
+                    if (auto e = hc->get_header(block_hash))
+                        return e->header.m_merkle_root;
+                    return std::nullopt;
+                });
             mn_ckpt_lane->set_sml_snapshot_fn(
                 [&node_coin_state, m = maintainer.get()]()
                     -> dash::coin::MnCheckpointLane::SmlSnapshot {

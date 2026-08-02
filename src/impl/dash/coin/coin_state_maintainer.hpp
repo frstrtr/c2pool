@@ -329,8 +329,10 @@ public:
         m_mn_snapshot_height = as_of_height;
         // An authoritative (non-empty) resync clears the payee-desync latch:
         // the queue is trustworthy again from this snapshot forward.
-        if (m_have_mn)
+        if (m_have_mn) {
             m_mn_needs_reseed = false;
+            m_state.set_mn_needs_reseed(false);
+        }
         // as_of_height also seeds the machine's forward-contiguous apply
         // cursor (E4 re-soak fix): the snapshot IS the payment queue as of
         // that block, so only as_of+1 may fold next; a later block reports
@@ -792,6 +794,7 @@ public:
             // block would register into the wiped set and republish a 1-MN
             // "queue" — a guessed payee by another name.
             m_mn_needs_reseed = true;
+            m_state.set_mn_needs_reseed(true);   // MAKE THE STATE SAY ITS NAME
             demote();
             notify_state_dirty();
             if (m_on_mn_reseed) m_on_mn_reseed();

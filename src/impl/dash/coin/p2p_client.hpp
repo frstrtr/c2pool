@@ -45,6 +45,7 @@
 
 #include <impl/dash/crypto/hash_x11.hpp>   // block identity on Dash = X11(header)
 #include <impl/dash/coin/governance_object.hpp> // govobject_hash / govvote_signature_hash (dashcore-exact digests)
+#include <impl/dash/coin/historical_sml.hpp>    // HistoricalMnListDiffDemux (reward-critical tip/historical split)
 
 #include <algorithm>
 #include <memory>
@@ -225,15 +226,16 @@ private:
     // re-selected forever. Optional; unset on the legacy single-peer path.
     PeerLifecycleCallback m_on_dial_failed;
 
-    // E1 Phase-L member-set sourcing DEMUX: a filter that consumes HISTORICAL
-    // mnlistdiff replies (full base=ZERO snapshots at old quorum-base / work
-    // blocks, requested by QuorumMemberSource) BEFORE they reach the tip-SML
-    // maintainer — which treats any ZERO-base diff as a full snapshot and would
-    // overwrite the tip SML to that historical block. Returns true iff it
-    // consumed the diff; then new_mnlistdiff is NOT fired. Unset => no demux.
-    using MnListDiffFilter =
-        std::function<bool(const vendor::CSimplifiedMNListDiff&)>;
-    MnListDiffFilter m_historical_mnlistdiff_filter;
+    // HISTORICAL mnlistdiff DEMUX: consumes full base=ZERO snapshots at OLD
+    // blocks — requested by QuorumMemberSource (quorum work blocks) and by
+    // MnCheckpointLane (per-height PoSe fold points) — BEFORE they reach the
+    // tip-SML maintainer, which treats any ZERO-base diff as a full snapshot
+    // and would overwrite the LIVE tip SML to that historical block. See
+    // historical_sml.hpp for the chain semantics (non-short-circuiting: two
+    // consumers may legitimately await the same block hash). No filters
+    // registered => every diff falls through to the tip feed, as before.
+    using MnListDiffFilter = HistoricalMnListDiffDemux::Filter;
+    HistoricalMnListDiffDemux m_historical_mnlistdiff_demux;
 
 public:
     CoinClient(io::io_context* context, dash::interfaces::Node* coin, config_t* config,
@@ -388,8 +390,17 @@ public:
     /// Fired once per session when the version/verack handshake completes —
     /// the hook E2 uses to kick the initial getheaders/mnlistdiff sync.
     void set_on_handshake_complete(HandshakeCallback cb) { m_on_handshake_complete = std::move(cb); }
-    /// Install the Phase-L historical-mnlistdiff demux (QuorumMemberSource).
-    void set_historical_mnlistdiff_filter(MnListDiffFilter f) { m_historical_mnlistdiff_filter = std::move(f); }
+    /// Register ONE historical-mnlistdiff consumer. Additive, not a slot: the
+    /// Phase-L member source and the MN-checkpoint lane both source historical
+    /// snapshots off this client and both must be offered every reply.
+    void add_historical_mnlistdiff_filter(MnListDiffFilter f)
+    {
+        m_historical_mnlistdiff_demux.add_filter(std::move(f));
+    }
+    size_t historical_mnlistdiff_filter_count() const
+    {
+        return m_historical_mnlistdiff_demux.filter_count();
+    }
     /// Fired on socket connect (before handshake) with the peer endpoint — the
     /// DashCoinPeerManager scores the connect + tracks anchors off this.
     void set_on_peer_connected(PeerLifecycleCallback cb) { m_on_peer_connected = std::move(cb); }
@@ -819,16 +830,21 @@ private:
                  << " +" << msg->m_diff.mnList.size() << "mn -"
                  << msg->m_diff.deletedMNs.size() << "del qtail="
                  << msg->m_diff.quorum_tail.size() << "B";
-        // Phase-L DEMUX: a HISTORICAL member-sourcing reply is consumed here and
-        // must NOT reach the tip-SML maintainer (base=ZERO would overwrite the
-        // tip SML to the old block). Only tip-sync diffs fall through.
-        if (m_historical_mnlistdiff_filter
-            && m_historical_mnlistdiff_filter(msg->m_diff)) {
-            LOG_INFO << "[" << m_chain_label << "] mnlistdiff consumed by "
-                        "member-set sourcing (historical; tip SML untouched)";
-            return;
+        // DEMUX: a HISTORICAL reply (member sourcing, or the MN-checkpoint
+        // lane's per-height PoSe fold) is consumed here and must NOT reach the
+        // tip-SML maintainer — base=ZERO would overwrite the LIVE tip SML to
+        // the old block. Only tip-sync diffs fall through. The tip feed is
+        // passed IN so it is structurally impossible to fire it on a consumed
+        // reply (see HistoricalMnListDiffDemux::dispatch).
+        const bool consumed = m_historical_mnlistdiff_demux.dispatch(
+            msg->m_diff,
+            [this](const vendor::CSimplifiedMNListDiff& d) {
+                m_coin->new_mnlistdiff.happened(d);
+            });
+        if (consumed) {
+            LOG_INFO << "[" << m_chain_label << "] mnlistdiff consumed as "
+                        "HISTORICAL (tip SML untouched)";
         }
-        m_coin->new_mnlistdiff.happened(msg->m_diff);
     }
 
     // ── E-SUPERBLOCK: governance objects + votes (daemonless superblock) ──
