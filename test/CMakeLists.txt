@@ -691,6 +691,11 @@ if (BUILD_TESTING AND GTest_FOUND)
     # -> a standalone target would be a NOT_BUILT sentinel). Do NOT re-add
     # standalone add_executable/gtest_add_tests for any of them — CTest would
     # register unbuilt executables (ctest "Not Run" exit 8, the Linux x86_64 red).
+    # test_dash_mn_diff_ladder.cpp (MN diff-ladder storage + recovery KAT) is
+    # folded here for exactly that reason: this executable is already in the
+    # build.yml --target allowlist, so its DashMnDiffLadder* suites are BUILT
+    # and RUN, whereas a fresh standalone target would register as a NOT_BUILT
+    # sentinel that reports green while never executing a line.
     # DASH_FIXTURE_DIR is needed by the from-wire fixture loader (mnlistdiff).
     add_executable(test_dash_embedded_gbt
         test_dash_embedded_gbt.cpp
@@ -698,6 +703,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_mnlistdiff_root_parity.cpp
         test_dash_dkg_commitments.cpp
         test_dash_sml_quorum_db.cpp
+        test_dash_mn_diff_ladder.cpp
         test_dash_embedded_oracle_shadow.cpp)
     target_compile_definitions(test_dash_embedded_gbt PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")

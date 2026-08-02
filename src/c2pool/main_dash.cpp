@@ -216,6 +216,17 @@ const char* const kDashMnCheckpointTestnet =
 uint32_t g_mn_bridge_max_blocks =
     dash::coin::MnCheckpointLane::kDefaultMaxBridgeBlocks;
 
+// --embedded-mn-ladder-reseed: ⚠ DEFAULT OFF. Arms the MN diff-ladder RE-ARM
+// (DASH_MN_DIFF_LADDER_RECOVERY.md). The ladder itself ('D'/'A' keyspaces in
+// dash_sml_db) is written unconditionally — retaining the diffs we already
+// receive, parse and validate costs nothing and cannot change behaviour. What
+// this flag gates is whether a payee desync is allowed to attempt the local
+// root-verified replay instead of latching permanently. It is OFF because the
+// RECOVERY SEMANTICS (not the storage) are still under review; flipping the
+// default is a deliberate one-line change, not a side effect of this slice.
+// Same file-scope rationale as g_mn_bridge_max_blocks above.
+bool g_mn_ladder_reseed = false;
+
 // Report the requested sharechain peering topology at run-loop bring-up. Honest
 // about the deferred live bind: a won/seen share does NOT yet cross the wire
 // until the sharechain pool-node leaf lands.
@@ -256,6 +267,7 @@ void print_banner(const char* argv0)
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
         << "           [--external-ip ADDR]\n"
         << "           [--embedded-utxo] [--embedded-mainnet] [--embedded-mn-bridge-max N]\n"
+        << "           [--embedded-mn-ladder-reseed]\n"
         << "           [--embedded-oracle-shadow]\n"
         << "           [--oracle-graduation-blocks N] [--oracle-class-coverage K]\n"
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
@@ -290,6 +302,13 @@ void print_banner(const char* argv0)
         << "        are transport only and NEVER move the arm. Even when armed, every\n"
         << "        per-template gate (SML fresh at tip, non-superblock, credit-pool seed\n"
         << "        height, bestCL, MN-payee cursor, DKG plan) fails closed to dashd.\n"
+        << "        --embedded-mn-ladder-reseed (DEFAULT OFF) lets a masternode\n"
+        << "        payee DESYNC attempt a LOCAL root-verified replay of the retained\n"
+        << "        mnlistdiff ladder instead of latching until an authoritative\n"
+        << "        `protx` re-seed a daemonless node cannot obtain. The ladder is\n"
+        << "        recorded either way; this flag only gates the RE-ARM. Every\n"
+        << "        replay failure (missing anchor, a gap at any height, any root\n"
+        << "        mismatch) leaves the latch SET — i.e. exactly today's behaviour.\n"
         << "        --coin-p2p-magic HEX overrides the embedded coin-P2P wire magic\n"
         << "        (default mainnet bf0c6bbd / testnet cee2caff; regtest fcc1b7dc).\n"
         << "        --regtest-force-won-block (regtest E5 harness, fail-closed) drives\n"
@@ -2691,14 +2710,63 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
             // Persist-on-apply: after each accepted mnlistdiff the maintainer
             // fires this with the block the SML/quorum state is now current at.
+            // MN DIFF-LADDER: the accepted diff rides along so write_sml can
+            // append 'D'@h (+ 'A' on an anchor boundary) and prune the window
+            // in the SAME WriteBatch as the 'S'/'B' rewrite — one atomic
+            // commit point, so the ladder can never disagree with the tip state.
             maintainer->set_on_sml_persist(
                 [&node_coin_state, sml_db, quorum_db, hc = header_chain.get()]
-                (const uint256& cur_hash) {
+                (const uint256& cur_hash,
+                 const dash::coin::vendor::CSimplifiedMNListDiff& accepted) {
                     uint32_t h = 0;
                     if (auto e = hc->get_header(cur_hash)) h = e->height;
-                    sml_db->write_sml(node_coin_state.sml(), cur_hash, h);
+                    sml_db->write_sml(node_coin_state.sml(), cur_hash, h,
+                                      &accepted);
                     quorum_db->write_quorums(node_coin_state.qmgr(), cur_hash, h);
                 });
+
+            // ── MN DIFF-LADDER RE-SEED SEAM (default OFF) ────────────────
+            // Wired ALWAYS so the outcome is observable; ARMED only by
+            // --embedded-mn-ladder-reseed. With the flag off the maintainer
+            // never calls it and a payee desync latches exactly as before.
+            maintainer->set_mn_ladder_reseed_fn(
+                [&node_coin_state, sml_db](uint32_t target_h) -> bool {
+                    auto rep = sml_db->replay_from_ladder(target_h);
+                    if (!rep.ok()) {
+                        LOG_WARNING << "[MN-LADDER] REFUSED target h=" << target_h
+                                    << " reason=" << rep.reason()
+                                    << " anchor_h=" << rep.anchor_height
+                                    << " replayed=" << rep.replayed
+                                    << " — latch stays set, cold"
+                                       " mnlistdiff(zero,tip) fallback";
+                        return false;
+                    }
+                    LOG_WARNING << "[MN-LADDER] REPLAY OK target h=" << target_h
+                                << " reason=" << rep.reason()
+                                << " anchor_h=" << rep.anchor_height
+                                << " MNs=" << rep.sml.size()
+                                << " root=" << rep.root.GetHex().substr(0, 16);
+                    // Install the REBUILT (not merely retained) SML: the state
+                    // we re-arm on is the one we just recomputed and
+                    // root-verified at every replayed height.
+                    node_coin_state.sml() = std::move(rep.sml);
+                    node_coin_state.set_have_sml(
+                        node_coin_state.sml().size() != 0);
+                    node_coin_state.set_sml_current_hash(rep.block_hash);
+                    return true;
+                });
+            maintainer->set_mn_ladder_reseed_enabled(g_mn_ladder_reseed);
+
+            // Ladder depth banner (startup): one line a human can read to see
+            // how far back a local re-seed could reach, and with which
+            // PENDING-REVIEW sizing constants.
+            {
+                const auto ls = sml_db->ladder_stats();
+                LOG_INFO << "[MN-LADDER] depth: " << ls.banner()
+                         << " reseed=" << (g_mn_ladder_reseed
+                                               ? "ARMED (--embedded-mn-ladder-reseed)"
+                                               : "OFF (default)");
+            }
             // E2 credit-pool persist: written per accepted mnlistdiff with the SAME
             // (blockHash, height) the SML persist uses, so the CreditPoolDb tip
             // tracks the SML tip and the restart sentinel (cp_hash == sml_hash)
@@ -4297,6 +4365,11 @@ int main(int argc, char** argv)
                  && i + 1 < argc)
             g_mn_bridge_max_blocks = static_cast<uint32_t>(
                 std::strtoul(argv[++i], nullptr, 10));
+        // MN diff-ladder RE-ARM opt-in (⚠ DEFAULT OFF). Without it a payee
+        // desync latches exactly as it does today; the ladder is still written
+        // and its depth still reported.
+        else if (std::strcmp(argv[i], "--embedded-mn-ladder-reseed") == 0)
+            g_mn_ladder_reseed = true;
         else if ((std::strcmp(argv[i], "--give-author") == 0 ||
                   std::strcmp(argv[i], "--dev-donation") == 0) && i + 1 < argc)
             dev_donation = std::strtod(argv[++i], nullptr);

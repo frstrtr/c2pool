@@ -313,6 +313,13 @@ public:
     void set_quorum_healthy(bool v) { m_quorum_healthy = v; }
     bool quorum_healthy() const { return m_quorum_healthy; }
 
+    /// DIAGNOSTIC MIRROR of the maintainer's payee-desync latch, so
+    /// classify_decline() can report "mn-needs-reseed" instead of the far less
+    /// useful "not-populated". Purely observational: nothing on the serve or
+    /// reward path reads it.
+    void set_mn_needs_reseed(bool v) { m_mn_needs_reseed = v; }
+    bool mn_needs_reseed() const { return m_mn_needs_reseed; }
+
     /// BLOCKER-3 pre-emit HARD GATE. Before the embedded arm's template is
     /// served/mined, re-validate the BUILT CbTx against consensus invariants;
     /// any failure => the caller must fall back to the reward-safe dashd path.
@@ -547,6 +554,14 @@ public:
     /// gate-off node is how the absent mainnet opt-in manifests here.
     std::string classify_decline() const {
         const uint32_t next_h = m_prev_height + 1;
+        // MN PAYEE-DESYNC LATCH — checked FIRST because it is a strictly more
+        // informative cause of the not-populated state that follows it. Before
+        // this line the latch was log-only: the smoke rig reported 639
+        // consecutive "not-populated" declines while the actual cause (a payee
+        // desync at h=2514874 that can only be cleared by an authoritative
+        // re-seed a daemonless node cannot obtain) appeared nowhere a human
+        // reading the decline classification would look.
+        if (m_mn_needs_reseed) return "mn-needs-reseed";
         if (!m_populated)      return "not-populated";
         if (m_prev_hash.IsNull()) return "no-tip";
         if (m_qc_plan_fn && !m_qc_plan_fn(next_h)) return "qc-plan-underivable";
@@ -673,6 +688,10 @@ private:
     uint256  m_credit_pool_current_hash;     // block hash the credit-pool seed is current at
     int32_t  m_credit_pool_height{-1};       // seed cbTx's OWN height (-1 = never seeded)
     bool     m_quorum_healthy{true};         // last diff's quorum tail parsed OK
+    // Mirror of CoinStateMaintainer's payee-desync latch, published here purely
+    // so classify_decline() can NAME it. Never consulted by any serve/reward
+    // path — the latch itself lives (and gates) in the maintainer.
+    bool     m_mn_needs_reseed{false};
     uint32_t m_prev_height{0};
     uint256  m_prev_hash;
     uint32_t m_bits_for_next{0};

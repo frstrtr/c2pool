@@ -329,8 +329,10 @@ public:
         m_mn_snapshot_height = as_of_height;
         // An authoritative (non-empty) resync clears the payee-desync latch:
         // the queue is trustworthy again from this snapshot forward.
-        if (m_have_mn)
+        if (m_have_mn) {
             m_mn_needs_reseed = false;
+            m_state.set_mn_needs_reseed(false);
+        }
         // as_of_height also seeds the machine's forward-contiguous apply
         // cursor (E4 re-soak fix): the snapshot IS the payment queue as of
         // that block, so only as_of+1 may fold next; a later block reports
@@ -572,7 +574,7 @@ public:
         // persistable tip). main_dash points this at SMLDb::write_sml +
         // QuorumDb::write_quorums; unset (KAT posture) makes it a no-op.
         if (m_have_mn_sml && m_on_sml_persist)
-            m_on_sml_persist(diff.blockHash);
+            m_on_sml_persist(diff.blockHash, diff);
         // E2: persist the credit-pool tip alongside the SML tip (same blockHash +
         // height), so the CreditPoolDb sentinel (cp_hash == sml_hash) holds and a
         // warm restart restores the pool to exactly the SML's resume point. Only
@@ -777,8 +779,16 @@ public:
             // block would register into the wiped set and republish a 1-MN
             // "queue" — a guessed payee by another name.
             m_mn_needs_reseed = true;
+            m_state.set_mn_needs_reseed(true);   // make the state SAY ITS NAME
             demote();
             notify_state_dirty();
+            // MN DIFF-LADDER (DASH_MN_DIFF_LADDER_RECOVERY.md): before falling
+            // back to the authoritative-re-seed sink — which on a DAEMONLESS
+            // node does not exist, making this latch permanent — try the LOCAL
+            // root-verified replay of the retained anchor + diffs. DEFAULT OFF;
+            // every failure path (and the disabled path) leaves the latch SET,
+            // i.e. exactly today's behaviour.
+            try_mn_ladder_reseed(height);
             if (m_on_mn_reseed) m_on_mn_reseed();
             return r;
         }
@@ -867,9 +877,39 @@ public:
     /// state is now current at, so a restart resumes incrementally from that
     /// tip. Optional (unset in KATs = no-op; persistence is a restart
     /// optimisation, never a correctness prerequisite for the running arm).
-    void set_on_sml_persist(std::function<void(const uint256&)> fn) {
+    void set_on_sml_persist(
+        std::function<void(const uint256&,
+                           const vendor::CSimplifiedMNListDiff&)> fn) {
         m_on_sml_persist = std::move(fn);
     }
+
+    /// Wire the MN DIFF-LADDER re-seed seam (main_dash points this at
+    /// SMLDb::replay_from_ladder + install-rebuilt-SML). Called with the height
+    /// the payee desync fired at; returns true iff a root-verified local replay
+    /// rebuilt the SML from the retained anchor + diffs. Optional (unset = the
+    /// ladder path is simply unavailable and the latch behaves as today).
+    void set_mn_ladder_reseed_fn(std::function<bool(uint32_t)> fn) {
+        m_mn_ladder_reseed_fn = std::move(fn);
+    }
+
+    /// ⚠ THE RE-ARM GATE — DEFAULT OFF (`--embedded-mn-ladder-reseed`).
+    ///
+    /// OFF (default): the ladder is written on every accepted diff and the
+    /// replay is exercised by the KATs, but a payee desync latches EXACTLY as
+    /// it does on master. Nothing about the served template changes.
+    ///
+    /// ON: a desync first attempts the local root-verified replay. On success
+    /// the payee latch is cleared. Note what that does and does NOT do: the
+    /// P2P Simplified MN List omits scriptPayout and nLastPaidHeight (see
+    /// mn_checkpoint.hpp's trust-anchor preamble), so a ladder replay CANNOT
+    /// reconstruct the payout-bearing queue. Clearing the latch is therefore
+    /// NECESSARY-BUT-NOT-SUFFICIENT: m_have_mn additionally requires a
+    /// non-empty payee set AND a height-stamped snapshot, both zeroed by the
+    /// desync wipe. There is no new way to serve a template.
+    void set_mn_ladder_reseed_enabled(bool on) {
+        m_mn_ladder_reseed_enabled = on;
+    }
+    bool mn_ladder_reseed_enabled() const { return m_mn_ladder_reseed_enabled; }
 
     /// Wire the SML/quorum store WIPE sink (main_dash points this at
     /// SMLDb::clear + QuorumDb::clear). Invoked on the reorg / H-1 heal path
@@ -906,6 +946,53 @@ public:
 private:
     void notify_state_dirty() {
         if (m_on_state_dirty) m_on_state_dirty();
+    }
+
+    // MN DIFF-LADDER re-seed attempt. Returns true iff the payee latch was
+    // cleared. EVERY early return leaves the latch SET (today's behaviour) and
+    // NAMES ITS REASON in the log — a gate that can silently refuse is the
+    // defect, not the refusal.
+    bool try_mn_ladder_reseed(uint32_t target_h) {
+        if (!m_mn_ladder_reseed_enabled) {
+            LOG_WARNING << "[MN-LADDER] re-seed DISABLED at h=" << target_h
+                        << " (reason=flag-off; enable with"
+                           " --embedded-mn-ladder-reseed) — latch STAYS SET;"
+                           " recovery still requires an authoritative re-seed"
+                           " (protx list / checkpoint bridge)";
+            return false;
+        }
+        if (!m_mn_ladder_reseed_fn) {
+            LOG_WARNING << "[MN-LADDER] re-seed UNAVAILABLE at h=" << target_h
+                        << " (reason=no-ladder-source-wired) — latch STAYS SET";
+            return false;
+        }
+        // ANTI-MINT interlock (E2d, #738). Clearing the payee latch is only
+        // safe while the seeded-MN requirement is ACTIVE: that requirement is
+        // what still makes it impossible for block-connect alone to arm
+        // MN-readiness off an incidental ProRegTx. Without it, clearing the
+        // latch would reopen exactly the hole the latch was added to close.
+        if (!m_require_seeded_mn) {
+            LOG_WARNING << "[MN-LADDER] re-seed REFUSED at h=" << target_h
+                        << " (reason=anti-mint-interlock: require_seeded_mn is"
+                           " OFF) — latch STAYS SET";
+            return false;
+        }
+        if (!m_mn_ladder_reseed_fn(target_h)) {
+            // The source logs the specific outcome (anchor-missing /
+            // anchor-root-mismatch / diff-gap-at-h / diff-root-mismatch-at-h).
+            LOG_WARNING << "[MN-LADDER] replay FAILED at target h=" << target_h
+                        << " — latch STAYS SET, cold mnlistdiff(zero,tip)"
+                           " fallback (see the [MN-LADDER] outcome line above)";
+            return false;
+        }
+        m_mn_needs_reseed = false;
+        m_state.set_mn_needs_reseed(false);
+        LOG_WARNING << "[MN-LADDER] payee latch CLEARED by verified local"
+                       " replay at h=" << target_h
+                    << " — NOTE: the SML carries no scriptPayout /"
+                       " nLastPaidHeight, so MN-readiness still needs a"
+                       " payout-bearing snapshot before any template is served";
+        return true;
     }
 
     // Block identity hash (Dash: X11 of the 80-byte header). Marks the credit-pool
@@ -1110,7 +1197,15 @@ private:
     std::function<void()> m_on_state_dirty;  // SML/bestCL/reorg -> re-issue work
     std::function<void()> m_on_mn_reseed;    // payee desync -> authoritative protx re-seed
     std::function<void()> m_on_full_resync;  // H-1 heal -> reset sml_base + full re-sync
-    std::function<void(const uint256&)> m_on_sml_persist;  // accepted diff -> SMLDb/QuorumDb write
+    std::function<void(const uint256&,
+                       const vendor::CSimplifiedMNListDiff&)> m_on_sml_persist;  // accepted diff -> SMLDb/QuorumDb write (+ MN diff-ladder append)
+    // MN DIFF-LADDER re-seed seam (DASH_MN_DIFF_LADDER_RECOVERY.md). Takes the
+    // desync height, returns true iff a verified local replay rebuilt the SML.
+    // main_dash points it at SMLDb::replay_from_ladder; unset = no-op.
+    std::function<bool(uint32_t)> m_mn_ladder_reseed_fn;
+    // ⚠ DEFAULT OFF (--embedded-mn-ladder-reseed). With this false the ladder is
+    // still WRITTEN, but a payee desync latches EXACTLY as it does today.
+    bool m_mn_ladder_reseed_enabled{false};
     std::function<void()> m_on_sml_clear;    // reorg/heal -> SMLDb/QuorumDb wipe (extended to CreditPoolDb)
     // E2: independent DIP-0027 credit-pool accrual, advanced per ingested block
     // (on_block_connected) and re-anchored per accepted mnlistdiff. Verified
