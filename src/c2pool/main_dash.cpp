@@ -3570,15 +3570,25 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     }
                     return std::nullopt;
                 });
-            // SML REMOVAL pass — the whole list, not one hash at a time. The
-            // per-hash seam above can only answer a question about a
-            // masternode the projection already surfaced; a PoSe REMOVAL has
-            // to be applied before that masternode is ever projected, which
-            // means sweeping the list once per replayed height. Measured on
-            // mainnet 2026-08-02 over 2513000..2514874: the chain's
-            // payee-eligible set fell 2068 -> 2059 while a replay with no
-            // removal pass CLIMBED 2067 -> 2070, because a block replay can
-            // only ever ADD (PoSe bans are consensus-derived, never txs).
+            // WHOLESALE SML PoSe FOLD seam — the whole list PLUS the height
+            // it is current at. The per-hash seam above can only answer a
+            // question about a masternode the projection already surfaced,
+            // and the walk behind it adjudicates ONE exclusion per height
+            // with an exact coinbase script match required at every step.
+            // That is proven to work for ISOLATED bans (mainnet 2026-08-02:
+            // it succeeded five times during the replay) and proven NOT to
+            // work for a BURST — the same chain put THREE masternodes out of
+            // `protx list valid` inside 73 blocks (2062 -> 2059 over
+            // 2514800..2514873) and the bridge fail-closed. A wholesale fold
+            // removes all three in one pass, which is what makes a burst
+            // indistinguishable from a single ban.
+            //
+            // The HEIGHT half is mandatory, not decoration: the lane folds
+            // ONLY when its apply cursor equals this height (never earlier —
+            // an early fold can silently publish a wrong queue inside a
+            // shared-payoutAddress group), and it gates the walk's
+            // attestations so a STALE SML cannot license a permanent
+            // demotion of a since-revived masternode.
             //
             // Same thread as everything else the lane touches: the SML is
             // updated on the mnlistdiff ingest leg and read here from the
@@ -3586,11 +3596,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // io_context thread main_dash runs. No lock is taken or needed,
             // and the returned pointer never escapes the call.
             mn_ckpt_lane->set_sml_snapshot_fn(
-                [&node_coin_state]()
-                    -> const dash::coin::vendor::CSimplifiedMNList* {
-                    if (!node_coin_state.have_sml()) return nullptr;
-                    return &node_coin_state.sml();
+                [&node_coin_state, m = maintainer.get()]()
+                    -> dash::coin::MnCheckpointLane::SmlSnapshot {
+                    dash::coin::MnCheckpointLane::SmlSnapshot snap;
+                    if (!node_coin_state.have_sml()) return snap;
+                    snap.list   = &node_coin_state.sml();
+                    snap.height = m ? m->sml_current_height() : 0;
+                    return snap;
                 });
+
             // Publish through the EXACT leg-4 event the E2c RPC seed uses, so
             // CoinStateMaintainer::on_mn_list_update takes the bridged set as
             // an ordinary authoritative resync — snapshot fence set to the

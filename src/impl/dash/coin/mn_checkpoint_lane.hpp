@@ -112,30 +112,35 @@
 /// already receive and persist it. There are now TWO seams onto it, and they
 /// do different jobs:
 ///
-///   • set_sml_snapshot_fn() — the REMOVAL pass. Once per replayed height,
-///     BEFORE the block is folded, MnStateMachine::reconcile_pose_from_sml()
-///     drops every masternode the SML attests not-valid out of the
-///     payee-eligible set, and lifts a bridge-owned exclusion again if a
-///     refreshed SML attests it valid. This is what stops a banned masternode
-///     ever reaching the head of the queue. The ordering rationale — and why
-///     pre-block is the only correct choice when a registration and a removal
-///     land in the same block — is written out in full at that function.
+///   • set_sml_snapshot_fn() — the WHOLESALE REMOVAL fold. Supplies the whole
+///     list PLUS the height it is current at. At exactly ONE cursor position
+///     — apply cursor == that height — the lane folds
+///     MnStateMachine::sync_validity_from_sml() over the working set, so every
+///     masternode the SML attests not-valid leaves the payee-eligible set in a
+///     single pass. That single-pass property is the point: it makes a BURST
+///     of bans indistinguishable from one ban. The ordering rule, and why
+///     violating it EARLY is dangerous while LATE is benign, is written out in
+///     full at maybe_fold_sml(). The same seam supplies the freshness height
+///     that gates the walk below.
 ///
 ///   • set_sml_validity_fn() — the per-hash attestation used by the REACTIVE
-///     demotion walk, which remains as the second line of defence for a ban
-///     the removal pass could not see (no verified SML yet, or an SML older
-///     than the ban). It may walk down the ranked queue, but ONLY while each
-///     demoted candidate is ATTESTED INVALID and the accepted candidate's
+///     per-mismatch demotion walk, which remains the second line of defence
+///     for a ban the fold could not cover (no verified SML, or an SML whose
+///     height the cursor never lands on). It may walk down the ranked queue,
+///     but ONLY while each demoted candidate is ATTESTED INVALID by an SML
+///     FRESH ENOUGH to speak about that height and the accepted candidate's
 ///     scriptPayout EXACTLY matches an output this block pays. The walk is
-///     capped per bridge (see pump()).
+///     capped per bridge (see pump()) and adjudicates ONE exclusion per
+///     height, which is exactly why it cannot carry a burst.
 ///
-/// Because the SML is a snapshot of NOW rather than of the replayed height, a
-/// removal can be EARLY — the ban may have fallen after the block being
-/// replayed. That is handled explicitly, not hoped away: pass 3's
-/// recover_premature_pose_exclusion() recognises "this block pays a
-/// masternode we excluded, and it outranked our projection", attributes the
-/// payment so the DIP-3 queue cursor stays dashd-identical, and KEEPS the
-/// exclusion.
+/// MEASURED CAUSE OF THE h=2514874 FAIL-CLOSE — it was a BURST, not missing
+/// machinery. The walk RAN AND WORKED five times during that replay (bridge
+/// total 1/6 … 5/6). The chain then shows three masternodes
+/// (824da5790b93de99…, 91c8c62b1245a1f5…, a459ade702cbe47a…) leaving `protx
+/// list valid` together inside 73 blocks: valid 2062 at h=2514800, 2059 at
+/// h=2514873, and still absent at h=2515025 (never revived, so the SML held
+/// isValid=false correctly). Three consecutive banned queue-head candidates
+/// defeat a walk that must land an exact coinbase script match at each step.
 ///
 /// Every count is surfaced on status(), on the publish line, and on every
 /// fail-closed message (divergence_report()): a count that lives only in
@@ -211,17 +216,21 @@ public:
     /// MnStateMachine::SmlValidityFn and the residuals note in this file's
     /// header. Wired by main_dash to NodeCoinState::sml() + have_sml().
     using SmlValidityFn = MnStateMachine::SmlValidityFn;
-    /// The WHOLE persisted Simplified Masternode List, or nullptr when this
-    /// node has none yet. This is the seam that carries PoSe REMOVALS: the
-    /// per-hash SmlValidityFn above can only answer questions about a
-    /// masternode we already suspect, whereas the removal pass has to sweep
-    /// the list. Wired by main_dash to NodeCoinState::sml() + have_sml().
+    /// The WHOLE persisted Simplified Masternode List TOGETHER WITH THE
+    /// HEIGHT IT IS CURRENT AT. Both halves are mandatory: the list carries
+    /// the PoSe REMOVALS, and the height is what makes them safe to apply
+    /// (see maybe_fold_sml() — a wholesale fold is only valid at ONE cursor
+    /// position) and what gates the reactive walk's attestations for
+    /// staleness. `list == nullptr` means this node has no verified SML yet.
     ///
-    /// Returns a pointer, not a copy: the list is ~3000 entries and the lane
-    /// consults it once per replayed height, on the same io thread that
-    /// updates it (mnlistdiff ingest). No lock is taken or needed; the
-    /// pointer is used and discarded inside one call.
-    using SmlSnapshotFn = std::function<const vendor::CSimplifiedMNList*()>;
+    /// Returns a pointer, not a copy: the list is ~3000 entries and is read on
+    /// the same io thread that updates it (mnlistdiff ingest). No lock is
+    /// taken or needed; the pointer is used and discarded inside one call.
+    struct SmlSnapshot {
+        const vendor::CSimplifiedMNList* list{nullptr};
+        uint32_t                         height{0};
+    };
+    using SmlSnapshotFn = std::function<SmlSnapshot()>;
 
     enum class State {
         Unarmed,      ///< no checkpoint loaded — the lane does nothing
@@ -259,7 +268,8 @@ public:
         m_machine.set_sml_validity_fn(std::move(fn));
     }
     /// OPTIONAL, but this is the seam that fixes the measured 2068->2059 vs
-    /// 2067->2070 divergence. Unwired, the replay can still only ADD.
+    /// 2067->2070 divergence. Unwired, the replay can still only ADD, and the
+    /// reactive walk runs with no freshness gate (its pre-existing behaviour).
     void set_sml_snapshot_fn(SmlSnapshotFn fn) { m_sml_snapshot = std::move(fn); }
     bool has_sml_snapshot_fn() const { return static_cast<bool>(m_sml_snapshot); }
 
@@ -320,9 +330,10 @@ public:
     /// eligible_size() directly against `protx list valid <h>` on any dashd.
     size_t   eligible_size()      const { return m_machine.eligible_size(); }
     size_t   anchor_eligible()    const { return m_anchor_eligible; }
-    size_t   pose_removed()       const { return m_machine.pose_removed_total(); }
-    size_t   pose_reinstated()    const { return m_machine.pose_reinstated_total(); }
-    size_t   pose_premature()     const { return m_machine.pose_premature_total(); }
+    size_t   pose_removed()       const { return m_pose_removed; }
+    size_t   pose_reinstated()    const { return m_pose_reinstated; }
+    bool     sml_folded()         const { return m_sml_folded; }
+    uint32_t sml_folded_at()      const { return m_sml_folded_at; }
     size_t   replay_registered()  const { return m_registered; }
     size_t   replay_spent()       const { return m_spent; }
     bool     failed_closed() const { return m_state == State::FailedClosed; }
@@ -397,14 +408,29 @@ public:
 
         if (m_state == State::Waiting) {
             m_state = State::Bridging;
-            // Size the SML ban-recovery budget against the replay distance.
-            // A PoSe ban is a rare per-masternode event, so the count of them
-            // inside a window scales with the window, not with the set size:
-            // 4 covers a short bridge, +1 per 1000 blocks covers a long one.
-            // Past that, "recovery" stops being a repair of a few known-banned
-            // nodes and becomes a wholesale override of the projection, which
-            // is precisely what this lane must never do.
-            m_machine.set_sml_recovery_cap(4 + (tip - m_anchor_height) / 1000);
+            // Size the per-mismatch demotion-walk budget against the replay
+            // distance. A PoSe ban is a rare per-masternode event, so the
+            // count inside a window scales with the window, not with the set
+            // size: 4 covers a short bridge, +1 per 1000 blocks covers a long
+            // one. Past that, "recovery" stops being a repair of a few
+            // known-banned nodes and becomes a wholesale override of the
+            // projection, which is precisely what this walk must never do.
+            //
+            // MEASURED SHAPE MISMATCH — this cap is sized for ISOLATED bans
+            // and a legitimate ban BURST can exhaust it. On mainnet
+            // 2026-08-02 the walk reached 5/6 legitimately, and the chain put
+            // THREE masternodes out inside 73 blocks; two such bursts in one
+            // ~2000-block window is 6 exclusions, i.e. the whole budget, and a
+            // third masternode in either burst overruns it. Exhaustion is
+            // TERMINAL. That is a real limitation of the walk, and it is a
+            // second reason the wholesale fold (maybe_fold_sml) is the right
+            // mechanism: a fold is ONE pass over the list and spends NO budget
+            // at all, so a burst costs it nothing. The cap is deliberately
+            // left as-is rather than widened — widening it would license
+            // exactly the wholesale-override-by-inference this walk exists to
+            // refuse, and the fold already removes the need.
+            m_sml_recovery_cap = 4 + (tip - m_anchor_height) / 1000;
+            m_machine.set_sml_recovery_cap(m_sml_recovery_cap);
             LOG_INFO << "[MN-CKPT] bridge START: replaying h=" << m_next
                      << ".." << tip << " (" << (tip - m_next + 1)
                      << " blocks) onto the anchored set";
@@ -441,26 +467,12 @@ public:
         if (m_state != State::Bridging) return;
         if (height != m_next) return;
 
-        // ── PoSe REMOVAL pass, BEFORE the block is folded ─────────────────
-        // A PoSe ban is consensus-derived, never a transaction, so the block
-        // replay below can only ever ADD masternodes. Measured on mainnet
-        // 2026-08-02 over 2513000..2514874: the chain's payee-eligible set
-        // FELL 2068 -> 2059 while this replay CLIMBED 2067 -> 2070. The SML is
-        // the only carrier of the removals and we already persist it.
-        //
-        // ORDERING — pre-block, and the reasons are in
-        // MnStateMachine::reconcile_pose_from_sml() in full. In short:
-        // dashcore projects height H's payee from the list as of H-1, and
-        // validity is part of that list, so the removal must land before
-        // pass 0 ranks candidates. Pre-block is also the only ordering that
-        // keeps a removal and a registration in the SAME block correct: an MN
-        // registered by block H is not yet in the set here, so H's
-        // reconciliation cannot touch it — which is right, because it was not
-        // in dashd's H-1 list and cannot be H's payee. And pass 1's tx-driven
-        // ban (ProUpRevTx) still lands afterwards at its exact consensus
-        // height, overwriting our provisional one.
-        reconcile_pose(height);
-        if (m_state != State::Bridging) return;   // reconcile can fail closed
+        // Publish the SML's own height into the machine BEFORE it adjudicates
+        // anything, so the reactive demotion walk's attestations are gated on
+        // freshness (MnStateMachine::sml_attest). A stale SML attesting a
+        // since-revived masternode "invalid" would otherwise license a
+        // PERMANENT demotion.
+        refresh_sml_height();
 
         const auto r = m_machine.apply_block(block, height);
 
@@ -482,6 +494,9 @@ public:
 
         m_next = height + 1;
         ++m_applied;
+        // ── WHOLESALE PoSe fold, at the ONE cursor position where it is safe.
+        // Sequenced by HEIGHT, never by arrival order: see maybe_fold_sml().
+        maybe_fold_sml();
         m_sml_recovered += r.sml_recovered;
         m_registered    += r.registered;
         m_spent         += r.spent;
@@ -493,10 +508,10 @@ public:
                      << r.total_after << " eligible=" << m_machine.eligible_size()
                      << " (anchor " << m_anchor_eligible << "; +"
                      << m_registered << " reg, -" << m_spent << " spent, -"
-                     << m_machine.pose_removed_total() << " PoSe-removed, +"
-                     << m_machine.pose_reinstated_total() << " reinstated)"
+                     << m_pose_removed << " PoSe-removed, +"
+                     << m_pose_reinstated << " reinstated)"
                      << " sml-recovered=" << m_sml_recovered
-                     << " early-exclusions=" << m_machine.pose_premature_total();
+                     << " early-exclusions=" << 0;
         }
 
         if (!m_tip_height) return;
@@ -506,35 +521,105 @@ public:
     }
 
 private:
-    /// Apply the SML's PoSe verdicts to the working set for `height`. Called
-    /// exactly once per replayed height, immediately before apply_block.
-    void reconcile_pose(uint32_t height)
+    /// Push the SML's current height into the machine so the reactive
+    /// demotion walk can refuse a STALE attestation. Cheap; called on every
+    /// folded block because the mnlistdiff feed advances underneath us.
+    void refresh_sml_height()
     {
-        if (!m_sml_snapshot) return;          // seam unwired: additions only
-        const vendor::CSimplifiedMNList* sml = m_sml_snapshot();
-        if (!sml || sml->size() == 0) {
-            // Not an error: on a cold start the mnlistdiff feed may not have
-            // produced a verified list yet. Say so at a bounded rate — a
-            // replay running with no removal source is exactly the silent
-            // degradation this lane exists to prevent, and it is the state
-            // that produced the measured 2067 -> 2070 climb.
+        if (!m_sml_snapshot) return;
+        const SmlSnapshot snap = m_sml_snapshot();
+        m_machine.set_sml_current_height(snap.list ? snap.height : 0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // maybe_fold_sml — the WHOLESALE PoSe removal, at the ONE safe cursor
+    // ─────────────────────────────────────────────────────────────────────
+    //
+    // WHY IT IS NEEDED. The reactive walk (recover_from_sml_ban) adjudicates
+    // ONE queue-head exclusion per height, and each success must re-attribute
+    // the payment to the next candidate "whose scriptPayout matches this
+    // coinbase exactly". That works for ISOLATED bans and is proven to: on
+    // mainnet 2026-08-02 it ran and succeeded five times during the replay
+    // (bridge total 1/6 … 5/6). It cannot work for a BURST. The chain shows
+    // what actually broke:
+    //
+    //     h=2514800   valid 2062, our projected MN PRESENT
+    //     h=2514873   valid 2059, our projected MN ABSENT
+    //                 -> THREE masternodes banned inside 73 blocks
+    //     h=2515025   valid 2063, still ABSENT (never revived)
+    //
+    // Three consecutive banned queue-head candidates defeat a walk that has
+    // to land an exact coinbase script match at every step. The wholesale
+    // fold fixes it precisely BECAUSE it makes a burst indistinguishable from
+    // a single ban: all three leave the eligible set in one pass, before any
+    // of them is ever projected.
+    //
+    // ── THE ORDERING RULE, AND WHY VIOLATING IT IS ASYMMETRIC ────────────
+    //
+    // The SML is a snapshot of the state AFTER connecting H_sml. A wholesale
+    // fold is valid at EXACTLY ONE cursor position: apply cursor == H_sml —
+    // after apply_block(H_sml), before apply_block(H_sml+1). Sequenced by
+    // HEIGHT, never by arrival order.
+    //
+    //   EARLY (cursor < H_sml) is DANGEROUS, and this is the whole reason the
+    //   fold is gated rather than run per-height. A masternode banned at
+    //   h_ban <= H_sml would be removed at heights where the chain still held
+    //   it valid and actually paid it. The mild outcome is a spurious terminal
+    //   fail-close. The severe one is silent: inside a shared-payoutAddress
+    //   group the divergence is SCRIPT-INVISIBLE (see the residual note in
+    //   this file's header), the coinbase cross-check still passes, and the
+    //   bridge PUBLISHES A WRONG QUEUE — the exact bad-cb-payee this lane
+    //   exists to prevent. An early fold also perturbs queue POSITION for
+    //   nodes it touches, because sync_validity_from_sml bumps
+    //   nPoSeRevivedHeight, which is a CompareByLastPaid sort key.
+    //
+    //   LATE (cursor > H_sml) is BENIGN: it is today's behaviour, and the
+    //   reactive walk still catches a ban when it reaches the queue head.
+    //
+    // So the fold NEVER runs early. If the cursor passes H_sml without an SML
+    // present, it simply does not happen and the walk carries the window
+    // alone — degraded, and said so out loud.
+    //
+    // TWO DISPATCH POINTS, ONE RULE. This is called after each successful
+    // apply_block (catching cursor == H_sml mid-replay, which is what lets a
+    // burst at H_sml+1 be survived) and once more from publish() (catching
+    // H_sml == tip, and the zero-block bridge). Both test the same equality
+    // and the fold is one-shot, so they cannot double-apply.
+    void maybe_fold_sml()
+    {
+        if (m_sml_folded) return;
+        if (!m_sml_snapshot) return;
+        const SmlSnapshot snap = m_sml_snapshot();
+        if (!snap.list || snap.list->size() == 0) {
             if (!m_warned_no_sml) {
                 m_warned_no_sml = true;
-                LOG_WARNING << "[MN-CKPT] no verified SML available at h="
-                            << height << " — the replay can only ADD"
-                               " masternodes until one arrives. A PoSe ban"
-                               " inside the window will read as a payee"
-                               " desync.";
+                LOG_WARNING << "[MN-CKPT] no verified SML available at cursor h="
+                            << cursor_height()
+                            << " — the replay can only ADD masternodes until"
+                               " one arrives, and a PoSe ban inside the window"
+                               " must then be carried by the per-mismatch walk"
+                               " alone (which a multi-masternode ban BURST can"
+                               " defeat).";
             }
             return;
         }
-        const auto pr = m_machine.reconcile_pose_from_sml(*sml, height);
-        if (pr.removed == 0 && pr.reinstated == 0) return;
-        LOG_INFO << "[MN-CKPT] PoSe reconcile h=" << height << ": eligible "
-                 << pr.eligible_before << " -> " << pr.eligible_after
-                 << " (-" << pr.removed << " removed, +" << pr.reinstated
-                 << " reinstated; SML " << pr.scanned << " entries, "
-                 << pr.matched << " ours)";
+        const uint32_t cursor = cursor_height();
+        if (cursor != snap.height) return;   // never early; late is benign
+
+        const size_t before = m_machine.eligible_size();
+        const auto vr = m_machine.sync_validity_from_sml(*snap.list, snap.height);
+        const size_t after = m_machine.eligible_size();
+        m_sml_folded    = true;
+        m_sml_folded_at = snap.height;
+        m_pose_removed    = vr.flipped_to_invalid;
+        m_pose_reinstated = vr.flipped_to_valid;
+        LOG_INFO << "[MN-CKPT] SML PoSe FOLD at cursor h=" << cursor
+                 << " (== the height the SML is current at): payee-eligible "
+                 << before << " -> " << after << " (-" << vr.flipped_to_invalid
+                 << " banned, +" << vr.flipped_to_valid << " revived; scanned "
+                 << vr.scanned << " SML entries, " << vr.matched << " ours)."
+                 << " A ban BURST leaves in one pass here, which the"
+                    " per-mismatch walk cannot do.";
     }
 
     /// The measurement that replaces three hypotheses. Every fail-closed on
@@ -549,21 +634,34 @@ private:
             + " at the anchor -> " + std::to_string(elig) + " now"
             + " (registered total " + std::to_string(m_machine.size()) + ")."
             + " ADDS: " + std::to_string(m_registered) + " registrations."
-            + " REMOVALS: " + std::to_string(m_machine.pose_removed_total())
+            + " REMOVALS: " + std::to_string(m_pose_removed)
             + " PoSe (SML-attested), " + std::to_string(m_spent)
             + " collateral spends, "
             + std::to_string(m_sml_recovered) + " demotion-walk exclusions."
-            + " REINSTATED: " + std::to_string(m_machine.pose_reinstated_total())
-            + ". EARLY-EXCLUSION REPAIRS: "
-            + std::to_string(m_machine.pose_premature_total()) + ".";
+            + " REINSTATED: " + std::to_string(m_pose_reinstated)
+            + ".";
 
         if (!m_sml_snapshot) {
             s += " NO SML SNAPSHOT SEAM IS WIRED — this replay could only ADD"
                  " masternodes, so ANY post-anchor PoSe ban lands here.";
-        } else if (m_machine.pose_removed_total() == 0) {
-            s += " The SML removal pass applied ZERO removals: either no"
-                 " masternode was banned in the window, or no verified SML"
-                 " was available to say so.";
+        } else if (!m_sml_folded) {
+            s += " The WHOLESALE SML fold has NOT run (it applies only at"
+                 " cursor == the height the SML is current at, and never"
+                 " earlier — an early fold can publish a wrong queue"
+                 " silently). Every ban in this window is therefore being"
+                 " carried by the per-mismatch walk alone, which a BURST of"
+                 " masternodes banned close together defeats: it adjudicates"
+                 " one exclusion per height and must land an exact coinbase"
+                 " script match at each step.";
+        } else {
+            s += " The wholesale SML fold ran at h="
+                 + std::to_string(m_sml_folded_at) + ".";
+        }
+        if (m_sml_recovered >= m_sml_recovery_cap && m_sml_recovery_cap != 0) {
+            s += " The per-bridge demotion-walk BUDGET is EXHAUSTED ("
+                 + std::to_string(m_sml_recovered) + "/"
+                 + std::to_string(m_sml_recovery_cap)
+                 + "): further exclusions are refused by design.";
         }
 
         if (r.projected_payee) {
@@ -631,6 +729,13 @@ private:
             return fail_closed("no publish seam wired — the bridged masternode"
                                " set has nowhere to go");
         }
+        // Last chance for the wholesale PoSe fold: this is the cursor ==
+        // H_sml case when the SML is current at the bridge target (and the
+        // only chance at all for a zero-block bridge). Same one-shot equality
+        // gate as the mid-replay call — it cannot double-apply and it cannot
+        // fire early.
+        maybe_fold_sml();
+
         const uint32_t as_of = m_next - 1;
         std::vector<std::pair<uint256, MNState>> out;
         out.reserve(m_machine.entries().size());
@@ -649,13 +754,11 @@ private:
             "eligible " + std::to_string(m_anchor_eligible) + " -> "
             + std::to_string(m_machine.eligible_size()) + " (+"
             + std::to_string(m_registered) + " reg, -" + std::to_string(m_spent)
-            + " spent, -" + std::to_string(m_machine.pose_removed_total())
+            + " spent, -" + std::to_string(m_pose_removed)
             + " PoSe-removed, +"
-            + std::to_string(m_machine.pose_reinstated_total())
+            + std::to_string(m_pose_reinstated)
             + " reinstated, -" + std::to_string(m_sml_recovered)
-            + " SML-recovered exclusions, "
-            + std::to_string(m_machine.pose_premature_total())
-            + " early-exclusion repairs)";
+            + " SML-recovered exclusions)";
         m_status = "published " + std::to_string(out.size())
                    + " masternodes (" + std::to_string(m_sml_recovered)
                    + " SML-recovered exclusions) as-of h=" + std::to_string(as_of)
@@ -704,6 +807,11 @@ private:
     uint32_t m_applied{0};
     size_t   m_sml_recovered{0};    // masternodes excluded on SML-attested bans
     size_t   m_anchor_eligible{0};  // payee-eligible count AT the anchor
+    size_t   m_pose_removed{0};     // masternodes the wholesale fold banned
+    size_t   m_pose_reinstated{0};  // masternodes the wholesale fold revived
+    bool     m_sml_folded{false};   // the one-shot wholesale fold has run
+    uint32_t m_sml_folded_at{0};    // ...at this height (== the SML's height)
+    size_t   m_sml_recovery_cap{0}; // budget handed to the machine, mirrored
     size_t   m_registered{0};       // ADDS observed across the replay
     size_t   m_spent{0};            // collateral-spend removals across the replay
     bool     m_warned_no_sml{false};

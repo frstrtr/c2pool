@@ -840,6 +840,14 @@ public:
     void set_require_seeded_mn_set(bool on) { m_require_seeded_mn = on; }
     bool require_seeded_mn_set() const { return m_require_seeded_mn; }
 
+    /// Height the applied SML/quorum state is current AT (0 = none yet),
+    /// tracked off each accepted mnlistdiff's cbTx.nHeight. Read-only;
+    /// exposed so the daemonless MN-set bridge can (a) fold the SML's PoSe
+    /// verdicts at the ONE cursor position where a wholesale fold is valid,
+    /// and (b) refuse a demotion attested by an SML older than the height
+    /// being adjudicated. See MnCheckpointLane::maybe_fold_sml().
+    uint32_t sml_current_height() const { return m_sml_current_height; }
+
     /// Wire the authoritative MN re-seed sink (main_dash points this at the
     /// E2c `protx list valid true` seed fetch when a coin RPC is configured).
     /// Invoked from on_block_connected's payee-desync fail-closed path AFTER

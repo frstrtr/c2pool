@@ -101,7 +101,6 @@
 #include <limits>
 #include <map>
 #include <optional>
-#include <set>
 #include <span>
 #include <string>
 #include <utility>
@@ -178,12 +177,6 @@ public:
         // disagreed with the coinbase AND the SML proved the disagreement was
         // a post-anchor consensus PoSe ban rather than a real desync.
         size_t sml_recovered{0};
-        // The coinbase paid a masternode that reconcile_pose_from_sml() had
-        // already excluded — proof that its PoSe ban had NOT yet taken effect
-        // at this height. The payment was attributed to it (the queue cursor
-        // must match dashd's) and the exclusion was KEPT. See
-        // recover_premature_pose_exclusion().
-        size_t pose_premature{0};
     };
 
     /// Optional validity attestation for a proTxHash, sourced from the
@@ -214,6 +207,20 @@ public:
     /// of them is not being repaired, it is being overridden, and the honest
     /// response to that is to fail closed. The caller sizes the budget
     /// against its replay distance; see MnCheckpointLane::pump().
+    /// FRESHNESS GATE for the reactive demotion walk. The height the
+    /// installed SML is CURRENT AT (0 = unknown, which keeps the pre-gate
+    /// behaviour for callers that do not track it).
+    ///
+    /// Why this is load-bearing: recover_from_sml_ban() turns an attestation
+    /// into a PERMANENT exclusion. A STALE SML can attest isValid=false for a
+    /// masternode that has since been revived; combined with a coincidental
+    /// runner-up script match, that licenses a wrong permanent demotion and a
+    /// published queue that diverges from dashd's for the rest of the run.
+    /// An SML older than the height being adjudicated cannot speak to that
+    /// height, so it is not evidence — nullopt, never false.
+    void set_sml_current_height(uint32_t h) { m_sml_height = h; }
+    uint32_t sml_current_height() const     { return m_sml_height; }
+
     void set_sml_recovery_cap(size_t n) { m_sml_recovery_cap = n; }
     size_t sml_recovery_cap() const     { return m_sml_recovery_cap; }
     size_t sml_recovered_total() const  { return m_sml_recovered_total; }
@@ -269,10 +276,6 @@ public:
     {
         m_entries.clear();
         m_collateral_index.clear();
-        // Bridge-owned PoSe exclusions name entries in the OLD set; carrying
-        // them across a reseed would let a later SML refresh "reinstate" a
-        // masternode this machine never excluded.
-        m_pose_excluded.clear();
         m_last_applied_height = as_of_height;
         for (auto& [h, st] : entries) {
             m_collateral_index[st.collateralOutpoint] = h;
@@ -645,148 +648,11 @@ public:
         return r;
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // reconcile_pose_from_sml — REMOVALS, not only additions
-    // ─────────────────────────────────────────────────────────────────────
-    //
-    // THE MEASURED DEFECT (mainnet, hotel dashd 23.1.7, 2026-08-02):
-    //
-    //     protx list valid false 2513000  -> 2068 entries (anchor)
-    //     protx list valid false 2514874  -> 2059 entries (tip)
-    //     the chain's payee-eligible set over that window  FELL  by 9
-    //     the checkpoint bridge's replayed set             CLIMBED by 3
-    //
-    // A forward replay of block special transactions can only ever ADD. A
-    // PoSe ban is NOT a transaction: dashd's CDeterministicMNManager derives
-    // it from consensus once an MN crosses MAX_PoSe_PENALTY. So the replay
-    // sees every ProRegTx and no ban at all, and the two sets diverge the
-    // moment any masternode is banned inside the window — near-certain over
-    // ~1900 mainnet blocks. The bridge then projects a banned masternode as
-    // payee and fails closed (correct refusal, wrong set).
-    //
-    // The Simplified Masternode List is the ONLY carrier of that ban, and we
-    // already receive and persist it. This is the pass that applies it: an
-    // entry the SML attests not-valid is REMOVED from the payee-eligible set,
-    // not merely skipped when it happens to be projected.
-    //
-    // ── WHY THIS RUNS *BEFORE* apply_block, NOT AFTER ────────────────────
-    //
-    // dashcore's BuildNewListFromBlock projects the payee for height H from
-    // the list as it stood after connecting H-1 (oldList.GetMNPayee), and
-    // per-MN VALIDITY is part of that list. So the reconciliation for H must
-    // land on the PRE-block set, before pass 0 ranks candidates — reconciling
-    // after apply_block(H) would leave H itself projected from stale validity
-    // (exactly today's bug) and only fix H+1.
-    //
-    // Pre-block ordering is ALSO what makes a removal and a registration in
-    // the SAME block safe, and it is the only ordering that is:
-    //
-    //   • A masternode REGISTERED by block H did not exist in dashd's H-1
-    //     list, so it cannot be H's payee and must not be touched by H's
-    //     reconciliation. Running pre-block gives that for free: it is not
-    //     yet in m_entries, so the SML entry for it is a no-op here. It
-    //     becomes reconcilable from H+1 — the first height at which it could
-    //     ever be projected.
-    //   • Post-block ordering would do the opposite and retro-ban a
-    //     masternode at its OWN registration height, which cannot happen in
-    //     consensus (a ProRegTx masternode enters valid, with zero penalty).
-    //   • A tx-driven ban in block H (ProUpRevTx / operator-key-change
-    //     ProUpRegTx) is applied by pass 1 AFTER this pass, at its exact
-    //     consensus height, and overwrites the provisional ban height this
-    //     pass would have written. Precision wins where it exists.
-    //
-    // ── THE SNAPSHOT HAZARD, AND WHY IT IS SELF-CORRECTING ───────────────
-    //
-    // The SML is a snapshot of NOW, not of H. Applying it at H < now removes
-    // a masternode EARLY when its ban actually fell between H and now — and
-    // if dashd paid it at H, our projection now disagrees with a real
-    // coinbase. That is a genuine hazard and it is handled, not hoped away:
-    // recover_premature_pose_exclusion() (pass 3) recognises the exact
-    // signature — the block pays a masternode WE excluded, which outranks our
-    // projection — attributes the payment to it so the queue cursor stays
-    // dashd-identical, and KEEPS the exclusion (it really is banned by now).
-    //
-    // ── OWNERSHIP: WHAT THIS PASS MAY AND MAY NOT UNDO ───────────────────
-    //
-    // Removals recorded here are BRIDGE-OWNED (m_pose_excluded) and only
-    // those may be reinstated when a later SML refresh attests the masternode
-    // valid again — the mnlistdiff feed keeps updating for the whole life of
-    // a multi-hour bridge, so a ban-then-revive inside the window is
-    // observable and must end VALID. A tx-driven ban is NOT bridge-owned and
-    // is never undone here: it is consensus-exact at a known height, and an
-    // SML that shows the masternode live at the TIP means it was revived by a
-    // ProUpServTx we have not folded yet. Undoing it early would put it back
-    // in the queue ahead of dashd's.
-    //
-    // COST: O(|SML|) map lookups per call (~3000 on DASH mainnet, tens of
-    // microseconds). The caller runs it once per replayed height; a 20k-block
-    // bridge pays a few seconds total against a replay that takes minutes.
-    struct PoseReconcileResult {
-        size_t scanned{0};          // SML entries iterated
-        size_t matched{0};          // also present in m_entries
-        size_t removed{0};          // payee-eligible -> excluded THIS pass
-        size_t reinstated{0};       // bridge-owned exclusion lifted THIS pass
-        size_t eligible_before{0};
-        size_t eligible_after{0};
-    };
-
-    PoseReconcileResult reconcile_pose_from_sml(
-        const vendor::CSimplifiedMNList& sml, uint32_t height)
-    {
-        PoseReconcileResult r;
-        r.eligible_before = eligible_size();
-        for (const auto& e : sml.mnList) {
-            ++r.scanned;
-            auto it = m_entries.find(e.proRegTxHash);
-            if (it == m_entries.end()) continue;   // not ours (yet) — no-op
-            ++r.matched;
-            MNState& st = it->second;
-
-            if (!e.isValid) {
-                // Already ineligible (tx-driven ban, or excluded by an
-                // earlier pass): nothing to do, and DO NOT claim ownership of
-                // a ban we did not create.
-                if (!st.isValid) continue;
-                st.isValid = false;
-                // Only stamp a provisional height where none exists — an
-                // exact tx-observed ban height must never be clobbered by our
-                // upper bound.
-                if (st.nPoSeBanHeight == 0) st.nPoSeBanHeight = height;
-                m_pose_excluded.insert(e.proRegTxHash);
-                ++r.removed;
-                ++m_pose_removed_total;
-                LOG_INFO << "[MNS-SM] PoSe REMOVAL h=" << height << ": "
-                         << e.proRegTxHash.GetHex().substr(0, 16)
-                         << " attested INVALID by the SML — dropped from the"
-                            " payee-eligible set (bridge-owned exclusion "
-                         << m_pose_removed_total << ")";
-                continue;
-            }
-
-            // SML attests VALID. Only lift exclusions this pass created.
-            auto owned = m_pose_excluded.find(e.proRegTxHash);
-            if (owned == m_pose_excluded.end()) continue;
-            m_pose_excluded.erase(owned);
-            if (st.isValid) continue;   // a ProUpServTx already revived it
-            st.isValid          = true;
-            st.nPoSeBanHeight   = 0;
-            if (height > st.nPoSeRevivedHeight) st.nPoSeRevivedHeight = height;
-            ++r.reinstated;
-            ++m_pose_reinstated_total;
-            LOG_WARNING << "[MNS-SM] PoSe REINSTATE h=" << height << ": "
-                        << e.proRegTxHash.GetHex().substr(0, 16)
-                        << " attested VALID again by a refreshed SML —"
-                           " bridge-owned exclusion lifted";
-        }
-        r.eligible_after = eligible_size();
-        return r;
-    }
-
     /// Masternodes that would be projected as payee: valid, with no live PoSe
     /// ban height. This — NOT size() — is the number to compare against
     /// dashd's `protx list valid`. size() counts REGISTERED masternodes, and
-    /// the two moving in opposite directions is precisely the defect
-    /// reconcile_pose_from_sml() exists to fix.
+    /// the two moving in opposite directions is precisely the defect the
+    /// bridge's wholesale sync_validity_from_sml() fold exists to fix.
     size_t eligible_size() const
     {
         constexpr uint32_t SENTINEL = std::numeric_limits<uint32_t>::max();
@@ -801,11 +667,6 @@ public:
         return n;
     }
 
-    size_t pose_removed_total() const    { return m_pose_removed_total; }
-    size_t pose_reinstated_total() const { return m_pose_reinstated_total; }
-    size_t pose_premature_total() const  { return m_pose_premature_total; }
-    size_t pose_excluded_count() const   { return m_pose_excluded.size(); }
-
     /// What the installed SML hook says about a proTxHash, verbatim (nullopt
     /// = absent from the SML / no hook). Exposed so a caller's fail-closed
     /// diagnostic can NAME the masternode it projected and state whether the
@@ -814,6 +675,15 @@ public:
     {
         if (!m_sml_validity) return std::nullopt;
         return m_sml_validity(h);
+    }
+
+    /// True when the installed SML is new enough to speak about `height`.
+    /// Exposed so a caller's fail-closed diagnostic can say "the SML is
+    /// STALE" rather than "the SML had no opinion", which are different
+    /// operator actions.
+    bool sml_covers(uint32_t height) const
+    {
+        return m_sml_height == 0 || m_sml_height >= height;
     }
 
     // Process a single block. Mutates state per dashcore's
@@ -1061,9 +931,6 @@ public:
             if (it != m_entries.end()) {
                 if (paid_in_cb(it->second.scriptPayout.m_data)) {
                     mark_paid(it);
-                } else if (recover_premature_pose_exclusion(
-                               *projected, height, paid_in_cb, mark_paid, r)) {
-                    // handled: our SML removal was ahead of the real ban
                 } else if (!recover_from_sml_ban(ranked, height, paid_in_cb,
                                                  mark_paid, r)) {
                     r.payee_desync = true;
@@ -1081,81 +948,6 @@ public:
     }
 
 private:
-    // ─────────────────────────────────────────────────────────────────────
-    // recover_premature_pose_exclusion — the SML is a snapshot of NOW
-    // ─────────────────────────────────────────────────────────────────────
-    //
-    // reconcile_pose_from_sml() removes a masternode the SML attests banned
-    // AT THE TIP. During a replay of past blocks that removal can be EARLY:
-    // the ban may have fallen anywhere between the replayed height and the
-    // tip, and dashd paid the masternode normally right up to it.
-    //
-    // That case has an unmistakable signature, and it is the only one this
-    // accepts:
-    //
-    //   * the block pays, EXACTLY, the scriptPayout of a masternode THIS
-    //     BRIDGE excluded (m_pose_excluded — never a tx-driven ban, never an
-    //     arbitrary set member), and
-    //   * that masternode outranks our projected payee under dashcore's
-    //     CompareByLastPaid. If it sorted AFTER the projection, dashd would
-    //     have paid the projection first, so the coinbase is not explained by
-    //     a premature exclusion and this must not fire.
-    //
-    // On acceptance the payment is attributed to it — the DIP-3 queue cursor
-    // has to stay bit-identical to dashd's or every later projection is off
-    // by a slot — and the exclusion is KEPT: the masternode is genuinely
-    // banned by the time the bridge publishes, and marking it paid pushes it
-    // to the back of the queue anyway.
-    //
-    // No budget cap, deliberately: this is self-limiting. Each excluded
-    // masternode can be paid at most once per full queue rotation (~|set|
-    // blocks, ~2068 on mainnet — longer than a typical bridge), and every
-    // acceptance requires an exact coinbase script match plus a rank
-    // comparison. The count is surfaced (pose_premature_total) so the
-    // operator sees it, which is the point of the whole diagnostic contract.
-    template <typename PaidInCbFn, typename MarkPaidFn>
-    bool recover_premature_pose_exclusion(const uint256& projected,
-                                          uint32_t height,
-                                          const PaidInCbFn& paid_in_cb,
-                                          const MarkPaidFn& mark_paid,
-                                          ApplyResult& r)
-    {
-        if (m_pose_excluded.empty()) return false;
-        auto pit = m_entries.find(projected);
-        if (pit == m_entries.end()) return false;
-        const int projected_score = payee_score(pit->second);
-
-        std::optional<uint256> best;
-        int best_score = 0;
-        for (const auto& h : m_pose_excluded) {
-            auto it = m_entries.find(h);
-            if (it == m_entries.end()) continue;
-            if (!paid_in_cb(it->second.scriptPayout.m_data)) continue;
-            const int score = payee_score(it->second);
-            // Must have been AHEAD of what we projected, or dashd would not
-            // have paid it at this height.
-            if (!payee_order_before(score, h, projected_score, projected))
-                continue;
-            if (!best || payee_order_before(score, h, best_score, *best)) {
-                best_score = score;
-                best       = h;
-            }
-        }
-        if (!best) return false;
-
-        auto bit = m_entries.find(*best);
-        mark_paid(bit);
-        ++r.pose_premature;
-        ++m_pose_premature_total;
-        LOG_WARNING << "[MNS-SM] PoSe EXCLUSION WAS EARLY h=" << height
-                    << ": this block pays " << best->GetHex().substr(0, 16)
-                    << ", which the SML attests banned AT THE TIP but which"
-                       " was still eligible here — payment attributed (queue"
-                       " cursor stays dashd-exact), exclusion KEPT (bridge"
-                       " total " << m_pose_premature_total << ")";
-        return true;
-    }
-
     // ─────────────────────────────────────────────────────────────────────
     // recover_from_sml_ban — the ONLY licensed alternative to payee_desync
     // ─────────────────────────────────────────────────────────────────────
@@ -1208,7 +1000,7 @@ private:
         std::vector<uint256> demoted;
         std::optional<uint256> accepted;
         for (size_t i = 0; i + 1 < ranked.size(); ++i) {
-            const std::optional<bool> att = m_sml_validity(ranked[i]);
+            const std::optional<bool> att = sml_attest(ranked[i], height);
             // nullopt (absent from the SML) or true (attested valid): no
             // licence to demote. Stop — this is a real desync.
             if (!att.has_value() || *att) break;
@@ -1272,18 +1064,28 @@ private:
 
     // Optional SML attestation hook (see set_sml_validity_fn). NULL by
     // default: no hook, no recovery, byte-identical pre-hook behaviour.
+    /// Attestation AS USED BY THE WALK: sml_opinion() narrowed by the
+    /// freshness gate. A stale SML is downgraded to "no opinion" per entry,
+    /// which is exactly what stops it licensing a permanent demotion.
+    std::optional<bool> sml_attest(const uint256& h, uint32_t height) const
+    {
+        if (!m_sml_validity) return std::nullopt;
+        if (!sml_covers(height)) {
+            LOG_WARNING << "[MNS-SM] SML STALE at h=" << height
+                        << ": the applied SML is current only at h="
+                        << m_sml_height
+                        << " and cannot attest this height — treating it as NO"
+                           " OPINION (a stale ban attestation would license a"
+                           " permanent demotion of a since-revived masternode)";
+            return std::nullopt;
+        }
+        return m_sml_validity(h);
+    }
+
     SmlValidityFn m_sml_validity;
+    uint32_t      m_sml_height{0};
     size_t        m_sml_recovery_cap{0};
     size_t        m_sml_recovered_total{0};
-
-    // Masternodes removed from the payee-eligible set by
-    // reconcile_pose_from_sml(). BRIDGE-OWNED: only these may be reinstated
-    // by a later SML refresh, and only these are candidates for the
-    // premature-exclusion recovery. A tx-driven ban never lands here.
-    std::set<uint256> m_pose_excluded;
-    size_t            m_pose_removed_total{0};
-    size_t            m_pose_reinstated_total{0};
-    size_t            m_pose_premature_total{0};
 
     // Forward-only apply cursor: height of the last block folded by
     // apply_block (0 = none since load). See ApplyResult::skipped_out_of_order.
