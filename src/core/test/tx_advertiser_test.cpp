@@ -350,6 +350,48 @@ TEST(TxAdvertiser, LosingTxIsBudgetedAndDrainsAfterHaveTx)
     EXPECT_EQ(st.m_advertised, next);
 }
 
+// GAP 2 — end-to-end ordering: within ONE sweep the drain enqueues have_tx
+// THEN losing_tx (canonical p2p.py:261-274, transitioned). Both messages land
+// on the peer's #863 outbound write queue (core/socket.hpp:78), which drains
+// FIFO with at most one composed async_write in flight (proven separately by
+// socket_write_queue_test.cpp), so SUBMISSION order is WIRE order. End-to-end
+// ordering is therefore the composition of two proven halves: run_tx_advert
+// submits have-before-losing (asserted here, driving the REAL run_tx_advert and
+// a REAL TxAdvertState; the send fns are recorder lambdas, NOT the live socket),
+// and the #863 queue preserves that order on the wire.
+//
+// Without the two-part drain this test REDS: the old one-message-per-sweep code
+// emits only the have_tx this sweep and defers every losing_tx to a later one,
+// so a busy pool that keeps additions flowing starves losing_tx (GAP 2).
+TEST(TxAdvertiser, SameSweepDrainsHaveThenLosingInOrder)
+{
+    TxAdvertState st;
+
+    // Advertise {1..5} to quiescence.
+    { Wire w0; sweep(st, hashes(1, 5), w0); }
+    ASSERT_EQ(st.m_advertised, hashes(1, 5));
+
+    // ONE sweep that BOTH drops {1,2,3} and adds {6,7,8,9}.
+    Wire w;
+    auto plan = sweep(st, hashes(4, 9), w);
+
+    // Both kinds go out in this single sweep, have STRICTLY before losing.
+    ASSERT_EQ(w.msgs.size(), 2u);
+    EXPECT_EQ(w.msgs[0].kind, Wire::Kind::have);
+    EXPECT_EQ(w.msgs[1].kind, Wire::Kind::losing);
+    EXPECT_EQ(std::set<uint256>(w.msgs[0].hashes.begin(), w.msgs[0].hashes.end()), hashes(6, 9));
+    EXPECT_EQ(std::set<uint256>(w.msgs[1].hashes.begin(), w.msgs[1].hashes.end()), hashes(1, 3));
+
+    // Both parts committed in the SAME sweep — no losing_tx deferral.
+    EXPECT_EQ(plan.m_have, w.msgs[0].hashes);
+    EXPECT_EQ(plan.m_losing, w.msgs[1].hashes);
+    EXPECT_EQ(st.m_advertised, hashes(4, 9));
+
+    // Nothing left to say next sweep.
+    Wire w2;
+    EXPECT_TRUE(sweep(st, hashes(4, 9), w2).empty());
+}
+
 // Fail closed on a zero budget: nothing can be emitted, so nothing may be
 // committed. Committing under a zero budget would mark hashes advertised that
 // never reached the wire -> they would never resurface in a later diff.
