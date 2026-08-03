@@ -70,6 +70,8 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <atomic>
+#include <algorithm>
 #include <functional>
 #include <optional>
 #include <string>
@@ -518,7 +520,20 @@ int run_node(const core::CoinParams& params, bool testnet,
         };
     }
 
-    p2p_node.tracker().m_on_block_found = dgb::coin::make_on_block_found(
+    // ── D-DGB dashboard: #82 dual-path broadcaster telemetry ──────────────
+    // Lock-free counters bumped by BOTH won-block arms so a dual-path
+    // REGRESSION (an arm silently unwired — the #82 root cause — or bound but
+    // never firing) is observable from /api/node_topology, not only gtest.
+    // shared_ptr so it outlives both run-loop continuations and the web hook.
+    struct DgbBroadcasterTelemetry {
+        std::atomic<uint64_t> p2p_dispatches{0};  // ARM A: m_on_block_found fired
+        std::atomic<uint64_t> rpc_submits{0};     // ARM B: submitblock-RPC arm reached
+        std::atomic<bool>     rpc_last_ok{false}; // last submit_block_hex() result
+        std::atomic<bool>     rpc_ever{false};    // ARM B ever invoked
+    };
+    auto bcast_telem = std::make_shared<DgbBroadcasterTelemetry>();
+
+    auto dgb_on_block_found = dgb::coin::make_on_block_found(
         /*reconstruct=*/std::move(faithful_reconstruct),
         /*p2p_relay=*/[&ioc, &coin_p2p, no_p2p_relay](const std::vector<unsigned char>& block_bytes) {
             // #82 PRIMARY arm: relay the won block over the embedded coin-daemon
@@ -544,6 +559,14 @@ int run_node(const core::CoinParams& params, bool testnet,
             });
         },
         /*seam=*/&coin_node);                     // external-digibyted submitblock fallback
+
+    // ARM A dispatch counter — wrap the closure so every won-block dispatch is
+    // counted before it runs; a stalled P2P-relay arm shows dispatches==0.
+    p2p_node.tracker().m_on_block_found =
+        [dgb_on_block_found, bcast_telem](const uint256& share_hash) {
+            bcast_telem->p2p_dispatches.fetch_add(1, std::memory_order_relaxed);
+            dgb_on_block_found(share_hash);
+        };
 
     // ── #82 dual-path won-block CLOSER: miner-facing Stratum standup ───────
     //
@@ -662,7 +685,7 @@ int run_node(const core::CoinParams& params, bool testnet,
     // p2p_node (the sharechain arm shares it). rpc.cpp:387 submit_block_hex is
     // REAL, not a stub.
     auto stratum_submit_fn =
-        [&coin_node](const std::vector<unsigned char>& block_bytes,
+        [&coin_node, bcast_telem](const std::vector<unsigned char>& block_bytes,
                      uint32_t height) -> bool {
             const std::string block_hex = HexStr(block_bytes);
             std::cout << "[DGB-STRATUM-BLOCK] won block height=" << height
@@ -677,6 +700,10 @@ int run_node(const core::CoinParams& params, bool testnet,
             // INDEPENDENTLY of this Stratum submitblock fallback.
             const bool ok =
                 coin_node.submit_block_hex(block_hex, /*ignore_failure=*/false);
+            // ARM B telemetry — dashboard-visible submitblock-RPC arm state.
+            bcast_telem->rpc_submits.fetch_add(1, std::memory_order_relaxed);
+            bcast_telem->rpc_ever.store(true, std::memory_order_relaxed);
+            bcast_telem->rpc_last_ok.store(ok, std::memory_order_relaxed);
             if (!ok)
                 std::cout << "[DGB-STRATUM-BLOCK] submitblock arm reached NO sink "
                              "(no embedded backend / no digibyted RPC wired yet) "
@@ -1212,6 +1239,92 @@ int run_node(const core::CoinParams& params, bool testnet,
 #endif
         mi->set_io_context(&ioc);
         web_server->set_stratum_port(stratum_port);
+
+        // ── D-DGB dashboard data hooks (extend the #1051 WebServer seam) ──
+        // Isolation: every source is a main_dgb-scope handle; NO src/core edit.
+        // (1) embedded DGB daemon peers — the coin-network peer set discovery
+        //     tracks (null unless --coin-p2p-discover). Rendered at /api/coin_peers.
+        mi->set_coin_peers_fn([&coin_peer_mgr]() {
+            nlohmann::json r = nlohmann::json::object();
+            nlohmann::json dgb_arr = nlohmann::json::array();
+            if (coin_peer_mgr) {
+                for (const auto& pe : coin_peer_mgr->get_tried_peers(25))
+                    dgb_arr.push_back(pe.to_string());
+            }
+            r["dgb"] = dgb_arr;
+            return r;
+        });
+
+        // (2) embedded DGB daemon synced height + peer count — /api/spv_progress.
+        mi->set_spv_progress_fn([&embedded_coin, &coin_peer_mgr]() {
+            nlohmann::json r = nlohmann::json::object();
+            r["dgb_height"] = embedded_coin.getblockchaininfo().value("blocks", 0);
+            r["dgb_synced"] = embedded_coin.is_synced();
+            r["dgb_peers"]  = coin_peer_mgr ? coin_peer_mgr->connected_count() : 0;
+            return r;
+        });
+
+        // (3) node topology — the DGB coin row (peers/synced/tip) PLUS the #82
+        //     dual-path broadcaster arm state, so a dual-path regression is
+        //     observable from the dashboard, not only from gtest.
+        mi->set_node_topology_fn([&embedded_coin, &coin_node, &coin_p2p,
+                                  &coin_peer_mgr, bcast_telem, no_p2p_relay]() {
+            nlohmann::json dgb_e = nlohmann::json::object();
+            dgb_e["coin"]     = "DGB";
+            dgb_e["primary"]  = true;
+            dgb_e["embedded"] = true;
+            dgb_e["has_rpc"]  = coin_node.has_rpc();
+            dgb_e["peers"]    = coin_peer_mgr ? coin_peer_mgr->connected_count() : 0;
+            dgb_e["synced"]   = embedded_coin.is_synced();
+            dgb_e["height"]   = embedded_coin.getblockchaininfo().value("blocks", 0);
+            nlohmann::json coins = nlohmann::json::array();
+            coins.push_back(dgb_e);
+
+            // #82 dual-path broadcaster — BOTH arms: armed-state + dispatch count.
+            nlohmann::json p2p = nlohmann::json::object();
+            p2p["bound"]      = (coin_p2p != nullptr);  // embedded P2P relay sink present
+            p2p["suppressed"] = no_p2p_relay;           // --no-p2p-relay isolation toggle
+            p2p["dispatches"] = bcast_telem->p2p_dispatches.load(std::memory_order_relaxed);
+            nlohmann::json rpc = nlohmann::json::object();
+            rpc["armed"]      = coin_node.has_rpc();    // digibyted submitblock sink present
+            rpc["submits"]    = bcast_telem->rpc_submits.load(std::memory_order_relaxed);
+            rpc["ever"]       = bcast_telem->rpc_ever.load(std::memory_order_relaxed);
+            rpc["last_ok"]    = bcast_telem->rpc_last_ok.load(std::memory_order_relaxed);
+            nlohmann::json bc = nlohmann::json::object();
+            bc["p2p_arm"]     = p2p;
+            bc["rpc_arm"]     = rpc;
+
+            nlohmann::json r = nlohmann::json::object();
+            r["node_symbol"]  = "DGB";
+            r["coins"]        = coins;
+            r["broadcaster"]  = bc;
+            return r;
+        });
+
+        // (4) scrypt pool stats — sharechain length feeds getinfo poolshares.
+        mi->set_sharechain_stats_fn([&p2p_node]() {
+            nlohmann::json r = nlohmann::json::object();
+            r["total_shares"] =
+                static_cast<uint64_t>(p2p_node.tracker().chain.size());
+            return r;
+        });
+
+        // (5) pool hashrate — attempts/s over the target-lookbehind window off
+        //     the verified best share (SSOT: node.cpp L4 pool-hashrate line).
+        //     Guards to 0 when the window cannot form (no best / height<=2).
+        mi->set_pool_hashrate_fn([&p2p_node, work_source]() -> double {
+            auto best_fn = work_source->get_best_share_hash_fn();
+            if (!best_fn) return 0.0;
+            uint256 best = best_fn();
+            auto& tr = p2p_node.tracker();
+            if (best.IsNull() || !tr.chain.contains(best)) return 0.0;
+            int32_t height = static_cast<int32_t>(tr.chain.get_height(best));
+            if (height <= 2 || tr.m_params == nullptr) return 0.0;
+            int32_t dist = std::min<int32_t>(
+                height - 1, static_cast<int32_t>(tr.m_params->target_lookbehind));
+            auto aps = tr.get_pool_attempts_per_second(best, dist, /*use_min_work=*/false);
+            return static_cast<double>(aps.GetLow64());
+        });
 
         // graph_db stats persistence — survives restarts (LTC-parity site 2/3).
         // DGB-namespaced sub-dir isolates the per-coin stat log under config_path().
