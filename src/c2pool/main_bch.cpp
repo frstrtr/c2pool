@@ -623,7 +623,8 @@ static std::vector<std::byte> bch_magic_bytes(bool testnet, bool testnet4, bool 
 int run_pool(const std::string& peer_host, uint16_t peer_port, bool testnet,
              bool testnet4, bool regtest, uint32_t anchor_height,
              const std::string& stratum_addr, uint16_t stratum_port,
-             const std::string& rpc_conf)
+             const std::string& rpc_conf,
+             const std::string& http_addr, uint16_t http_port)
 {
     boost::asio::io_context ioc;
 
@@ -672,11 +673,16 @@ int run_pool(const std::string& peer_host, uint16_t peer_port, bool testnet,
         std::cout << ", stratum " << stratum_addr << ":" << stratum_port;
     else
         std::cout << ", stratum DISABLED (no --stratum)";
+    if (http_port)
+        std::cout << ", http " << http_addr << ":" << http_port;
+    else
+        std::cout << ", http DISABLED (no --http)";
     std::cout << "\n";
 
     try {
         bch::standup_pool_run(ioc, config, anchor_height,
-                              stratum_addr, stratum_port, testnet || testnet4 || regtest, regtest);
+                              stratum_addr, stratum_port, testnet || testnet4 || regtest, regtest,
+                              http_addr, http_port);
     } catch (const std::exception& e) {
         std::cout << "[pool] FATAL: " << e.what() << "\n";
         return 1;
@@ -697,6 +703,8 @@ int main(int argc, char** argv)
     bool regtest = false;
     std::string stratum_addr = "0.0.0.0";
     uint16_t stratum_port = 0;        // 0 disables stratum; --stratum sets it
+    std::string http_addr = "0.0.0.0";
+    uint16_t http_port = 0;           // 0 disables dashboard; --http sets it (H-STATS.944)
     uint32_t anchor_height = 0;       // cold-start ABLA floor anchor
     uint16_t leg_c_p2p_port = 18444;  // BCHN regtest P2P default
     std::string rpc_conf;
@@ -738,6 +746,16 @@ int main(int argc, char** argv)
                 stratum_port = static_cast<uint16_t>(std::stoul(sp.substr(c + 1)));
             } else {
                 stratum_port = static_cast<uint16_t>(std::stoul(sp));
+            }
+        }
+        if (std::strcmp(argv[i], "--http") == 0 && i + 1 < argc) {   // H-STATS.944 dashboard bind
+            std::string hp = argv[++i];
+            const auto c = hp.rfind(char(58));  // ASCII colon
+            if (c != std::string::npos) {
+                http_addr = hp.substr(0, c);
+                http_port = static_cast<uint16_t>(std::stoul(hp.substr(c + 1)));
+            } else {
+                http_port = static_cast<uint16_t>(std::stoul(hp));
             }
         }
         if (std::strcmp(argv[i], "--leg-c-capture") == 0) want_leg_c = true;
@@ -784,7 +802,8 @@ int main(int argc, char** argv)
     }
 
     if (want_pool)
-        return run_pool(host, port, testnet, testnet4, regtest, anchor_height, stratum_addr, stratum_port, rpc_conf);
+        return run_pool(host, port, testnet, testnet4, regtest, anchor_height, stratum_addr, stratum_port, rpc_conf,
+                        http_addr, http_port);
 
     if (want_with_peer_verify)
         return run_with_peer_verify(host, port, testnet, max_seconds);
