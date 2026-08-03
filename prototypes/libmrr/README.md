@@ -10,6 +10,19 @@ only — no live risk, no production wiring. Landing is held for the merge-tap.
   SHA-256 `Hash()`, `Validate()` over the §1.1 structural invariants, and the
   `RetargetParams` / `EpochObservables` data types that pair with it. Geometry is
   static; no retarget behavior yet.
+- **m2 Drop 1 — Roundabout buffer: complete.** `mrr.Buffer` (`buffer.go`): the
+  bin-clock ring that ingests scored shares into the live PPLNS-style window.
+  `Ingest(id, bin, weight)` reports `Accepted`/`Duplicate`/`Expired` (never a
+  silent drop); the monotone bin-clock advances when a share sits ahead of the
+  head and evicts exactly the bins that leave the window. Dedup is keyed on
+  share identity across the whole window; expiry is `bin <= head - window`. The
+  canonical `Digest()` is order-independent (commutative) over the accepted live
+  set. KAT-2 golden vectors (`mrr/testdata/kat2_buffer_vectors.json`, two
+  scenarios: `w6_roundabout_core`, `w16_sliding_window`) pin per-step
+  disposition, head, live sum, live count, and digest. This is the front stage
+  of the m1 settlement state machine (dedup / expiry / bin-clock-convergence
+  invariants). **Not** in this drop: self-carry compaction (Drop 2) and the
+  finality-gated owed/overlay ledger (Drop 3).
 - Phases 1 (query-side decay) and 2 (pure `retarget()` + EMA + observables +
   offline simulator) are next, per the blueprint. Phase 3 (live adaptive
   dimensioning) is **v38-fenced** — hard stop.
@@ -50,8 +63,12 @@ go test ./... -count=1
 Regenerate the golden vectors on a reference build and review the diff:
 
 ```
-go run ./cmd/genkat > mrr/testdata/kat1_vectors.json
+go run ./cmd/genkat  > mrr/testdata/kat1_vectors.json          # KAT-1: Geometry
+go run ./cmd/genkat2 > mrr/testdata/kat2_buffer_vectors.json   # KAT-2: Buffer
 ```
+
+`genkat2` asserts every hand-derived per-step disposition/sum/count/head before
+it emits a vector, so a wrong implementation cannot mint a golden.
 
 ## Open items (flagged, non-blocking)
 
