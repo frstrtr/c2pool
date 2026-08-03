@@ -2365,6 +2365,17 @@ nlohmann::json MiningInterface::rest_current_payouts()
     nlohmann::json result = nlohmann::json::object();
     bool is_ltc = (m_blockchain == Blockchain::LITECOIN);
 
+    // #939: authoritative direct source, when a coin wires one (DASH has no
+    // coinbase-builder PPLNS cache feeding this endpoint, so it returned {} on
+    // a node with a full window and live balances). Only trust a non-empty
+    // object -- an empty/absent feed falls through to the cache + fallback
+    // below rather than masking them.
+    if (m_current_payouts_fn) {
+        auto direct = m_current_payouts_fn();
+        if (direct.is_object() && !direct.empty())
+            return direct;
+    }
+
     // Script-to-address resolver — picks chain-specific version bytes so
     // Dash payouts render as 'X...' not Bitcoin '1...'.
     auto resolve_addr = [this, is_ltc](const std::vector<unsigned char>& s) -> std::string {
@@ -2411,7 +2422,12 @@ nlohmann::json MiningInterface::rest_current_payouts()
             // p2pool returns coins (not satoshis)
             result[addr] = static_cast<double>(amount) / 1e8;
         }
-        return result;
+        // Only short-circuit when we actually surfaced real payouts. If the
+        // cache held ONLY the zero-address burn placeholder (PPLNS-empty
+        // fallback state), result is empty here -- do NOT report {} as final;
+        // fall through to the PayoutManager source below (#939).
+        if (!result.empty())
+            return result;
     }
 
     // Fallback: PayoutManager (for modes without coinbase builder)
@@ -2426,7 +2442,7 @@ nlohmann::json MiningInterface::rest_current_payouts()
         if (subsidy > 0) {
             auto outputs = pm->calculate_pplns_outputs(subsidy);
             for (const auto& [script, amount] : outputs) {
-                std::string addr = core::script_to_address(script, is_ltc, m_testnet);
+                std::string addr = resolve_addr(script);
                 if (addr.empty() && script.size() > 33 && script.back() == 0xac) {
                     size_t pk_len = script[0];
                     if (pk_len + 1 == script.size() - 1) {
@@ -2437,7 +2453,7 @@ nlohmann::json MiningInterface::rest_current_payouts()
                         p2pkh.insert(p2pkh.end(), rip, rip + 20);
                         p2pkh.push_back(0x88);
                         p2pkh.push_back(0xac);
-                        addr = core::script_to_address(p2pkh, is_ltc, m_testnet);
+                        addr = resolve_addr(p2pkh);
                     }
                 }
                 if (addr.empty()) {

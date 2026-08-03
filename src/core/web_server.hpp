@@ -362,6 +362,13 @@ public:
         const uint256& best_hash, const uint256& block_target,
         uint64_t subsidy, const std::vector<unsigned char>& donation_script)>;
     void set_pplns_fn(pplns_fn_t fn) { m_pplns_fn = thread_safe_wrap(std::move(fn)); }
+    // Direct current-payouts source (#939). Coins whose payout set is NOT
+    // derivable from the web coinbase-builder PPLNS cache (e.g. DASH, which
+    // wires no set_payout_manager feed) inject it here; when set and non-empty
+    // it is the authoritative source for /current_payouts. Unset -> unchanged
+    // (cache, then PayoutManager fallback). Contract owned by the web layer;
+    // the per-coin feed is wired by that coin's node (cross-steward).
+    void set_current_payouts_fn(std::function<nlohmann::json()> fn) { m_current_payouts_fn = thread_safe_wrap(std::move(fn)); }
 
     // Hook: computes the p2pool ref_hash for a given coinbase scriptSig.
     // Returns (ref_hash, last_txout_nonce) pair.  The ref_hash depends on
@@ -1055,6 +1062,7 @@ private:
 
     // Sharechain stats callback
     sharechain_stats_fn_t m_sharechain_stats_fn;
+    std::function<nlohmann::json()> m_current_payouts_fn;  // #939 direct source seam
     spv_progress_fn_t m_spv_progress_fn;
     coin_peers_fn_t m_coin_peers_fn;
     node_topology_fn_t m_node_topology_fn;  // D0.3 per-coin stats provider (optional)
