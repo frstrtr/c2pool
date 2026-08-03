@@ -8,9 +8,22 @@ neither is committed in merkleRootMNList). It cold-starts instead from a
 release-pinned checkpoint compiled into the binary. This tool produces and
 re-validates that checkpoint file.
 
-  pin    -- fetch `protx list valid true <height>` from a dashd (or an offline
-            capture), convert it to the checkpoint payload, and OVERWRITE the
-            target .inc in place. Prints a provenance block for the release notes.
+  pin    -- fetch `protx list registered true <height>` from a dashd (or an
+            offline capture), convert it to the checkpoint payload, and OVERWRITE
+            the target .inc in place. Prints a provenance block for the release
+            notes.
+
+            REGISTERED, NOT `valid`. `protx list valid` filters every
+            PoSe-banned masternode OUT, which makes "banned at anchor height"
+            byte-identical to "does not exist": absence. The bridge's forward
+            replay can only ADD (ProRegTx is its sole insertion path), so a
+            ProUpServTx that later REVIVES a banned-at-anchor masternode finds
+            no entry, is dropped as an unknown MN, and that masternode can never
+            re-enter the DIP-3 payment queue -- leaving every later payee
+            projection one queue slot ahead of dashd's. The registered set
+            carries those masternodes WITH their PoSeBanHeight, so the runtime
+            holds them PRESENT but INELIGIBLE (mn_checkpoint.hpp derives
+            isValid as poseBanHeight == 0) and the revive path works as written.
   verify -- re-derive the digest of an existing .inc and confirm every structural
             rule the runtime parser enforces (mn_checkpoint.hpp).
 
@@ -366,7 +379,7 @@ def cmd_pin(args):
         with open(args.protx_json) as f:
             protx_list = json.load(f)
         height, blockhash = args.height, args.blockhash.lower()
-        source = args.source or ("offline capture (%s): protx list valid true %d"
+        source = args.source or ("offline capture (%s): protx list registered true %d"
                                  % (os.path.basename(args.protx_json), height))
     else:
         if not args.rpc_url:
@@ -381,14 +394,14 @@ def cmd_pin(args):
             before = rpc_call(args.rpc_url, args.rpc_user, args.rpc_password, "getblockcount", [])
             height = args.height if args.height is not None else before
             protx_list = rpc_call(args.rpc_url, args.rpc_user, args.rpc_password,
-                                  "protx", ["list", "valid", True, height])
+                                  "protx", ["list", "registered", True, height])
             after = rpc_call(args.rpc_url, args.rpc_user, args.rpc_password, "getblockcount", [])
             if args.height is not None or after == before:
                 break
             sys.stderr.write("gen_mn_checkpoint: tip moved %d->%d during fetch, refetching\n"
                              % (before, after))
         blockhash = rpc_call(args.rpc_url, args.rpc_user, args.rpc_password, "getblockhash", [height]).lower()
-        source = args.source or ("dashd %s RPC: protx list valid true %d" % (network, height))
+        source = args.source or ("dashd %s RPC: protx list registered true %d" % (network, height))
 
     if not is_hex_n(blockhash, 64):
         die("blockhash %r is not 64 hex" % blockhash)
@@ -398,6 +411,23 @@ def cmd_pin(args):
     mn_lines = records_from_protx(protx_list, pubkey_ver, p2sh_ver)
     if not mn_lines:
         die("protx list produced 0 masternodes -- refusing to write an empty anchor")
+
+    # SEED COMPLETENESS, stated out loud. Field 9 of an `mn` record (1-based,
+    # after the "mn" keyword) is poseBanHeight; the runtime derives isValid
+    # from it. An anchor with ZERO banned entries cannot reinstate anything,
+    # because a ProUpServTx revive needs an entry to revive -- so say so here,
+    # at the one moment a human is looking, rather than letting the bridge
+    # later report "REINSTATED: 0" and be read as "none were needed".
+    banned = sum(1 for l in mn_lines if l.split()[9] != "0")
+    if banned == 0:
+        sys.stderr.write(
+            "gen_mn_checkpoint: WARNING -- this anchor carries ZERO PoSe-banned"
+            " masternodes.\n  A real DIP-3 set at any mainnet height has banned"
+            " members, so this is the fingerprint of a\n  `protx list valid`"
+            " capture. A valid-filtered anchor makes 'banned' and 'does not"
+            " exist'\n  the same observation, and no ProUpServTx revive inside"
+            " the bridge window can be\n  honoured. Re-capture with"
+            " `protx list registered true <height>`.\n")
 
     generated = args.generated or _iso_now()
     header = [MAGIC, "network " + network, "height %d" % height, "blockhash " + blockhash,
@@ -412,7 +442,8 @@ def cmd_pin(args):
         parse_checkpoint(unwrap_inc(f.read()), expected_network=network)
 
     if not args.quiet:
-        _print_provenance(out_path, network, height, blockhash, len(mn_lines), digest, generated)
+        _print_provenance(out_path, network, height, blockhash, len(mn_lines), digest,
+                          generated, banned)
 
 
 def cmd_verify(args):
@@ -422,8 +453,11 @@ def cmd_verify(args):
         cp = parse_checkpoint(payload, expected_network=args.network)
     except ValueError as ex:
         die("REFUSED: %s\n  (%s)" % (ex, args.file))
+    banned = sum(1 for f in cp["_entries"] if f[8] != "0")
     print("OK  %s" % args.file)
-    print("    network=%s height=%s count=%d" % (cp["network"], cp["height"], len(cp["_entries"])))
+    print("    network=%s height=%s count=%d (%d payee-eligible, %d PoSe-banned)"
+          % (cp["network"], cp["height"], len(cp["_entries"]),
+             len(cp["_entries"]) - banned, banned))
     print("    blockhash=%s" % cp["blockhash"])
     print("    digest=%s (recomputed, matches)" % cp["digest"])
 
@@ -440,7 +474,8 @@ def _iso_now():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _print_provenance(path, network, height, blockhash, count, digest, generated):
+def _print_provenance(path, network, height, blockhash, count, digest, generated,
+                      banned=0):
     bar = "=" * 74
     print(bar)
     print("PROVENANCE -- paste into the release notes")
@@ -449,7 +484,9 @@ def _print_provenance(path, network, height, blockhash, count, digest, generated
     print("  network    %s" % network)
     print("  height     %d" % height)
     print("  blockhash  %s" % blockhash)
-    print("  count      %d masternodes" % count)
+    print("  count      %d registered masternodes" % count)
+    print("             %d payee-eligible, %d PoSe-banned (present but INELIGIBLE)"
+          % (count - banned, banned))
     print("  digest     %s" % digest)
     print("  generated  %s" % generated)
     print(bar)
@@ -466,7 +503,8 @@ def main(argv=None):
     pp.add_argument("--rpc-url")
     pp.add_argument("--rpc-user")
     pp.add_argument("--rpc-password")
-    pp.add_argument("--protx-json", help="offline: a captured `protx list valid true` JSON array")
+    pp.add_argument("--protx-json",
+                    help="offline: a captured `protx list registered true` JSON array")
     pp.add_argument("--height", type=int, help="anchor height (required with --protx-json)")
     pp.add_argument("--blockhash", help="anchor blockhash (required with --protx-json)")
     pp.add_argument("--source", help="override the provenance 'source' line")

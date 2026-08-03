@@ -9,7 +9,8 @@
 /// ─────────────────────────────────────────────────────────────────────────
 /// NodeCoinState::populated() needs BOTH a header tip AND a payout-bearing
 /// masternode set. E2a gave the tip half daemonlessly. The MN half had
-/// exactly one source — dashd RPC `protx list valid true` (E2c, mn_seed.hpp)
+/// exactly one source — dashd RPC `protx list registered true` (E2c,
+/// mn_seed.hpp)
 /// — because the P2P Simplified MN List omits scriptPayout/nLastPaidHeight.
 /// With no RPC the arm printed "seed UNAVAILABLE" and every template kept
 /// routing to the dashd fallback. That was the last structurally
@@ -644,6 +645,62 @@ public:
     size_t   anchor_eligible()    const { return m_anchor_eligible; }
     size_t   pose_removed()       const { return m_pose_removed; }
     size_t   pose_reinstated()    const { return m_pose_reinstated; }
+    /// Present-but-ineligible (PoSe-banned) masternodes carried BY the anchor.
+    /// Zero on a `valid`-filtered anchor, which is exactly the state in which
+    /// no reinstatement can happen at all — see reinstatement_report().
+    size_t   anchor_ineligible()  const { return m_anchor_ineligible; }
+    /// ProUpServTx PoSe revives the replay APPLIED.
+    size_t   tx_revived()         const { return m_tx_revived; }
+    /// ProUpServTx revives the replay DROPPED because the named proTxHash was
+    /// not in the set. NON-ZERO IS A DEFECT: dashd has put a masternode back
+    /// in the DIP-3 payment queue and this replay could not, so every later
+    /// projection is one queue slot ahead of the chain's.
+    size_t   revive_dropped()     const { return m_revive_dropped; }
+
+    /// Why "REINSTATED: 0" is not automatically good news.
+    ///
+    /// Reinstatement has two sources — the wholesale SML fold flipping an
+    /// entry back to valid, and an explicit ProUpServTx revive — and BOTH
+    /// require the masternode to be IN the set. An anchor built from
+    /// `protx list valid` filters every PoSe-banned masternode out, so it
+    /// carries no revivable entry at all and its zero means "impossible
+    /// here", not "none needed". This sentence says which one it is.
+    std::string reinstatement_report() const
+    {
+        if (m_anchor_ineligible == 0) {
+            std::string s =
+                "REINSTATEMENT: NOT MEASURABLE on this anchor — it carries "
+                + std::to_string(m_anchor_count)
+                + " masternodes and ZERO of them PoSe-banned. A real DIP-3 set"
+                  " at any mainnet height has banned members, so a zero here"
+                  " is the fingerprint of a `protx list valid`-filtered"
+                  " source: a banned masternode is ABSENT rather than present-"
+                  "and-ineligible, and a ProUpServTx revive has no entry to"
+                  " revive. Any 'reinstated 0' below is an absence of"
+                  " measurement, NOT a measurement.";
+            if (m_revive_dropped != 0) {
+                s += " CONFIRMED: " + std::to_string(m_revive_dropped)
+                   + " ProUpServTx revive(s) were DROPPED as unknown"
+                     " masternodes during this replay.";
+            }
+            return s;
+        }
+        std::string s =
+            "REINSTATEMENT: measurable — the anchor carries "
+            + std::to_string(m_anchor_ineligible)
+            + " present-but-INELIGIBLE (PoSe-banned) masternode(s) out of "
+            + std::to_string(m_anchor_count) + ". Reinstated so far: "
+            + std::to_string(m_pose_reinstated) + " by the wholesale SML fold, "
+            + std::to_string(m_tx_revived) + " by explicit ProUpServTx revive.";
+        if (m_revive_dropped != 0) {
+            s += " " + std::to_string(m_revive_dropped)
+               + " ProUpServTx revive(s) were still DROPPED as unknown"
+                 " masternodes — the set is INCOMPLETE beyond the PoSe-ban"
+                 " axis and every later projection is that many queue slots"
+                 " ahead of the chain's.";
+        }
+        return s;
+    }
     bool     sml_folded()         const { return m_sml_folded; }
     uint32_t sml_folded_at()      const { return m_sml_folded_at; }
     /// The FIRST fold's height. Distinct from sml_folded_at(), which tracks the
@@ -941,12 +998,16 @@ public:
                 m_sml_recovered += r.sml_recovered;
                 m_registered    += r.registered;
                 m_spent         += r.spent;
+                m_tx_revived    += r.revived;
+                m_revive_dropped += r.revive_dropped_unknown;
                 return;
             }
         }
         m_sml_recovered += r.sml_recovered;
         m_registered    += r.registered;
         m_spent         += r.spent;
+        m_tx_revived    += r.revived;
+        m_revive_dropped += r.revive_dropped_unknown;
         m_stalled_pumps = 0;
 
         if ((m_applied % 500) == 0) {
@@ -956,7 +1017,11 @@ public:
                      << " (anchor " << m_anchor_eligible << "; +"
                      << m_registered << " reg, -" << m_spent << " spent, -"
                      << m_pose_removed << " PoSe-removed, +"
-                     << m_pose_reinstated << " reinstated)"
+                     << (m_pose_reinstated + m_tx_revived) << " reinstated ["
+                     << m_pose_reinstated << " SML-fold, " << m_tx_revived
+                     << " ProUpServTx], " << m_revive_dropped
+                     << " revive(s) DROPPED unknown)"
+                     << " anchor-ineligible=" << m_anchor_ineligible
                      << " sml-recovered=" << m_sml_recovered
                      << " sml-folded=" << (m_sml_folded ? "yes" : "no");
         }
@@ -1399,6 +1464,8 @@ private:
         m_sml_recovered += m_ondemand_r.sml_recovered;
         m_registered    += m_ondemand_r.registered;
         m_spent         += m_ondemand_r.spent;
+        m_tx_revived    += m_ondemand_r.revived;
+        m_revive_dropped += m_ondemand_r.revive_dropped_unknown;
         m_stalled_pumps = 0;
         m_ondemand_r    = MnStateMachine::ApplyResult{};
         m_ondemand_block = BlockType{};
@@ -1559,7 +1626,10 @@ public:
             + " collateral spends, "
             + std::to_string(m_sml_recovered) + " demotion-walk exclusions."
             + " REINSTATED: " + std::to_string(m_pose_reinstated)
-            + ".";
+            + " by SML fold, " + std::to_string(m_tx_revived)
+            + " by ProUpServTx revive, " + std::to_string(m_revive_dropped)
+            + " revive(s) DROPPED as unknown masternodes."
+            + " " + reinstatement_report();
 
         if (!m_request_snapshot || !m_merkle_root_at) {
             s += " NO PER-HEIGHT SNAPSHOT SEAM IS WIRED (getmnlistd + header"
@@ -1700,9 +1770,9 @@ public:
             + std::to_string(m_registered) + " reg, -" + std::to_string(m_spent)
             + " spent, -" + std::to_string(m_pose_removed)
             + " PoSe-removed, +"
-            + std::to_string(m_pose_reinstated)
+            + std::to_string(m_pose_reinstated + m_tx_revived)
             + " reinstated, -" + std::to_string(m_sml_recovered)
-            + " SML-recovered exclusions)";
+            + " SML-recovered exclusions) " + reinstatement_report();
         m_status = "published " + std::to_string(out.size())
                    + " masternodes (" + std::to_string(m_sml_recovered)
                    + " SML-recovered exclusions) as-of h=" + std::to_string(as_of)
@@ -1874,6 +1944,8 @@ public:
         if (!m_ondemand_cap_forced) m_ondemand_cap = kOnDemandFoldBase;
         m_pose_removed    = 0;
         m_pose_reinstated = 0;
+        m_tx_revived      = 0;
+        m_revive_dropped  = 0;
         m_sml_recovered   = 0;
         m_registered      = 0;
         m_spent           = 0;
@@ -1887,7 +1959,8 @@ public:
         m_rerequest_from_cursor = false;
         m_last_wait_log         = 0;
         m_position_verified     = false;
-        m_anchor_eligible = m_machine.eligible_size();
+        m_anchor_eligible   = m_machine.eligible_size();
+        m_anchor_ineligible = m_machine.ineligible_size();
         m_next  = cp.height + 1;
         m_state = State::Waiting;
     }
@@ -1912,8 +1985,15 @@ public:
     uint32_t m_applied{0};
     size_t   m_sml_recovered{0};    // masternodes excluded on SML-attested bans
     size_t   m_anchor_eligible{0};  // payee-eligible count AT the anchor
+    // Present-but-INELIGIBLE (PoSe-banned) count AT the anchor. ZERO means
+    // the anchor was built from a `valid`-filtered source and therefore
+    // CANNOT reinstate anything — which is what makes a "REINSTATED: 0" on
+    // such an anchor an absence of measurement rather than a measurement.
+    size_t   m_anchor_ineligible{0};
     size_t   m_pose_removed{0};     // masternodes the wholesale fold banned
     size_t   m_pose_reinstated{0};  // masternodes the wholesale fold revived
+    size_t   m_tx_revived{0};       // ProUpServTx PoSe revives APPLIED
+    size_t   m_revive_dropped{0};   // ProUpServTx revives DROPPED: unknown MN
     bool     m_sml_folded{false};   // at least one per-height fold has run
     uint32_t m_sml_folded_at{0};    // ...most recently at this height
     uint32_t m_folds{0};            // how many per-height folds were applied

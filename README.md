@@ -201,7 +201,16 @@ embedded DASH templates**. It falls back to a configured dashd, or serves
 nothing. It never guesses a masternode payee.
 
 Running DASH with a dashd RPC configured does **not** use the anchor at all —
-`protx list valid true` is authoritative and is used instead.
+`protx list registered true` is authoritative and is used instead.
+
+Both the anchor and the RPC seed carry the **registered** masternode set, not
+the valid one: `protx list valid` filters PoSe-banned masternodes out entirely,
+which makes "banned" and "does not exist" the same observation. Because the
+replay's only insertion path is `ProRegTx`, a `ProUpServTx` that later revives
+such a masternode would have no entry to revive, and it could never re-enter the
+DIP-3 payment queue — leaving every later payee projection one queue slot ahead
+of the chain's. Carrying banned masternodes as **present but ineligible**
+(eligibility is derived from `poseBanHeight`) keeps the revive path working.
 
 Details, provenance of the shipped anchor, and the release-time re-pinning
 procedure: [`src/impl/dash/coin/checkpoints/README.md`](src/impl/dash/coin/checkpoints/README.md).

@@ -15,6 +15,12 @@ is byte-identical to the RPC (mn_seed.hpp) seed. No network access.
   3. closed   -- every defect class (digest tamper, count/network mismatch,
                  undecodable payee, unpinned) refuses the WHOLE checkpoint.
   4. roundtrip-- pin a synthetic set, verify accepts it, a one-byte edit refuses.
+  5. seedset  -- `pin --rpc-url` asks dashd for the REGISTERED set, and a
+                 PoSe-banned masternode survives into the anchor as a
+                 present-but-INELIGIBLE record (poseBanHeight carried, not
+                 dropped). `protx list valid` would delete it, which makes
+                 "banned" and "does not exist" the same observation and leaves
+                 a later ProUpServTx revive with nothing to revive.
 
 Run from the repo root:  python3 tools/dash/test_gen_mn_checkpoint.py
 """
@@ -151,7 +157,64 @@ def main():
     check("synthetic pin verifies", not refused(st))
     check("flip one payload byte -> refused", refused(st.replace("height 12345", "height 12346")))
 
-    for p in (out, jsrc, sj, so):
+    print("[5] seed set: the anchor is the REGISTERED set, banned entries survive")
+    calls = []
+    real_rpc = g.rpc_call
+
+    def fake_rpc(url, user, password, method, params):
+        calls.append((method, list(params)))
+        if method == "getblockchaininfo":
+            return {"chain": "test"}
+        if method == "getblockcount":
+            return 12345
+        if method == "getblockhash":
+            return "cd" * 32
+        if method == "protx":
+            # dashd answers `list registered true <h>` with banned masternodes
+            # INCLUDED, each carrying its PoSeBanHeight. `list valid true`
+            # would return only the first of these two.
+            return [
+                {"type": "Regular", "proTxHash": "33" * 32,
+                 "collateralHash": "44" * 32, "collateralIndex": 0,
+                 "operatorReward": 0,
+                 "state": {"version": 2, "registeredHeight": 100,
+                           "lastPaidHeight": 200, "PoSeRevivedHeight": -1,
+                           "PoSeBanHeight": -1, "revocationReason": 0,
+                           "payoutAddress": "yVXDAM73Tg6A44Bm3qduXsMCYxzuqBCT48"}},
+                {"type": "Regular", "proTxHash": "55" * 32,
+                 "collateralHash": "66" * 32, "collateralIndex": 1,
+                 "operatorReward": 0,
+                 "state": {"version": 2, "registeredHeight": 101,
+                           "lastPaidHeight": 201, "PoSeRevivedHeight": -1,
+                           "PoSeBanHeight": 11000, "revocationReason": 0,
+                           "payoutAddress": "yVXDAM73Tg6A44Bm3qduXsMCYxzuqBCT48"}},
+            ]
+        raise AssertionError("unexpected RPC %s" % method)
+
+    with tempfile.NamedTemporaryFile("w", suffix=".inc", delete=False) as tf:
+        ro = tf.name
+    g.rpc_call = fake_rpc
+    try:
+        g.main(["pin", "--network", "testnet", "--rpc-url", "http://kat",
+                "--generated", "2026-01-01T00:00:00Z", "--output", ro, "--quiet"])
+    finally:
+        g.rpc_call = real_rpc
+
+    protx_calls = [c for c in calls if c[0] == "protx"]
+    check("pin asks dashd for `protx list registered true <h>`",
+          protx_calls == [("protx", ["list", "registered", True, 12345])])
+
+    pinned = g.parse_checkpoint(g.unwrap_inc(open(ro).read()),
+                                expected_network="testnet")
+    rows = pinned["_entries"]
+    banned_rows = [f for f in rows if f[8] != "0"]
+    check("both registered masternodes are in the anchor", len(rows) == 2)
+    check("the PoSe-banned one SURVIVED with its ban height (poseBanHeight 11000)",
+          len(banned_rows) == 1 and banned_rows[0][8] == "11000")
+    check("the banned entry still carries a scriptPayout (needed after a revive)",
+          len(banned_rows) == 1 and banned_rows[0][12] not in ("-", ""))
+
+    for p in (out, jsrc, sj, so, ro):
         os.unlink(p)
 
     print()

@@ -182,13 +182,27 @@ public:
     nlohmann::json getblockheader(uint256 header, bool verbose = true);
     // verbosity: 0 for hex-encoded data, 1 for a json object, and 2 for json object with transaction data
     nlohmann::json getblock(uint256 blockhash, int verbosity = 1);
-    // E2c (#738): `protx list valid true` -- the full valid deterministic-MN
-    // set at the current tip in the DETAILED shape (state.payoutAddress +
-    // lastPaidHeight + registeredHeight + PoSe heights). This is the
-    // payout-bearing MN-set SEED source for the embedded arm; the P2P
-    // Simplified MN List omits scriptPayout/lastPaidHeight so it can never
-    // back this. See coin/mn_seed.hpp (parse_protx_list_seed).
-    nlohmann::json protx_list_valid_detailed();
+    // E2c (#738): `protx list registered true` -- the full REGISTERED
+    // deterministic-MN set at the current tip in the DETAILED shape
+    // (state.payoutAddress + lastPaidHeight + registeredHeight + PoSe
+    // heights). This is the payout-bearing MN-set SEED source for the
+    // embedded arm; the P2P Simplified MN List omits
+    // scriptPayout/lastPaidHeight so it can never back this. See
+    // coin/mn_seed.hpp (parse_protx_list_seed).
+    //
+    // REGISTERED, not `valid`: `valid` FILTERS OUT every PoSe-banned
+    // masternode, which makes "banned at seed time" byte-identical to "does
+    // not exist" in the seeded set. A ProUpServTx that later REVIVES such a
+    // masternode then hits the unknown-MN branch of
+    // MnStateMachine::apply_block and is dropped — the masternode can never
+    // re-enter the payment queue, and its queue slot silently shifts every
+    // later projection by one. `registered` carries the banned masternodes
+    // WITH their PoSeBanHeight, so they are PRESENT but INELIGIBLE
+    // (MNState::isValid is derived as banHeight == 0) and the revive path
+    // works as written. Eligibility is then COMPUTED, never implied by
+    // absence. `eligible_size()` — not `size()` — is the number comparable
+    // to `protx list valid`.
+    nlohmann::json protx_list_registered_detailed();
 };
 
 struct RPCAuthData

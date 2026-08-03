@@ -29,7 +29,7 @@ So there are exactly three ways to obtain a payout-bearing masternode set:
 
 | source | trust | cost |
 |---|---|---|
-| dashd RPC `protx list valid true` | trust your own dashd | requires running dashd — the thing daemonless mode removes |
+| dashd RPC `protx list registered true` | trust your own dashd | requires running dashd — the thing daemonless mode removes |
 | replay every block from DIP-3 activation | **none** | ~1.5M block bodies downloaded and replayed |
 | **pinned checkpoint + forward replay** | trust the release build for the set at one height | seconds to minutes |
 
@@ -59,6 +59,33 @@ Trusted, and not checkable by any means available to the node:
 
 * **The membership and per-masternode payout state of the set at the
   anchor height.** Nothing on the DASH P2P network can prove it.
+
+## The anchor is the REGISTERED set, not the valid set
+
+An anchor is generated with `protx list registered true <height>`, which
+includes PoSe-banned masternodes, each carrying its `poseBanHeight`. The
+runtime derives eligibility (`MNState::isValid`) as `poseBanHeight == 0`, so a
+banned masternode is **present but ineligible** — never absent.
+
+This is load-bearing, not tidiness. `protx list valid` filters banned
+masternodes out, and in a valid-filtered anchor "PoSe-banned at the anchor
+height" and "does not exist" are the *same observation*: absence. The forward
+replay has exactly one insertion path (`ProRegTx`), and a masternode that
+registered years ago will never emit another one. So when the chain **revives**
+such a masternode with a `ProUpServTx` inside the replay window, the bridge
+finds no entry, drops the revive as an unknown masternode, and that masternode
+can never re-enter the DIP-3 payment queue. Our queue head becomes permanently
+the *next* entry — every later payee projection is one slot ahead of dashd's,
+which is a served `bad-cb-payee`.
+
+Measured on mainnet: proTx `7afbd798…` was PoSe-banned at height 2511957 and
+revived by a `ProUpServTx` in block 2513357. It is absent from a `valid`-based
+2513000 anchor. At height 2515416 dashd's payee queue head *is* `7afbd798…`,
+and a valid-filtered anchor cannot contain it.
+
+`count` therefore counts REGISTERED masternodes. The number comparable to
+`protx list valid <height>` is the runtime's `eligible_size()`, which the
+generator and `verify` both print alongside the count.
 
 ## Fail-closed behaviour
 
@@ -90,6 +117,10 @@ tools/dash/gen_mn_checkpoint.py pin --network mainnet \
     --rpc-url http://127.0.0.1:9998 --rpc-user USER --rpc-password PASS
 ```
 
+`pin` prints a **WARNING** if the produced anchor carries zero PoSe-banned
+masternodes: on mainnet that is the fingerprint of a `valid`-filtered capture,
+and such an anchor can never reinstate a revived masternode.
+
 This overwrites `dash_mn_checkpoint_mainnet.inc` in place and prints a
 provenance block. **Paste that block into the release notes** — the anchor's
 height, block hash, masternode count and digest belong where a user can read
@@ -103,7 +134,9 @@ The generator:
   wrong, which is a served `bad-cb-payee`);
 * refuses to pin if `getblockchaininfo.chain` disagrees with `--network`;
 * converts `payoutAddress` to `scriptPayout` once, at release time, where a
-  bad address is a visible failure rather than a silent runtime degradation;
+  bad address is a visible failure rather than a silent runtime degradation
+  (this applies to PoSe-banned entries too — they need a payout script for the
+  block after their revive);
 * sorts by `proTxHash` so re-pin diffs are readable and two pins of the same
   set produce identical bytes.
 
@@ -119,7 +152,7 @@ An offline capture works too, for pinning from a machine that cannot reach a
 dashd:
 
 ```sh
-dash-cli protx list valid true 2510000 > protx.json     # on the dashd box
+dash-cli protx list registered true 2510000 > protx.json   # on the dashd box
 tools/dash/gen_mn_checkpoint.py pin --network mainnet \
     --protx-json protx.json --height 2510000 --blockhash <hash of 2510000>
 ```
@@ -155,12 +188,17 @@ depend on a file the operator could lose, swap, or forget to install.
 
 | file | state |
 |---|---|
-| `dash_mn_checkpoint_mainnet.inc` | **UNPINNED** — no anchor; daemonless DASH mainnet fails closed |
+| `dash_mn_checkpoint_mainnet.inc` | **PINNED** at height 2513000 — 2974 registered masternodes (2068 payee-eligible, 906 PoSe-banned) |
 | `dash_mn_checkpoint_testnet.inc` | **UNPINNED** — no anchor; daemonless DASH testnet fails closed |
 
 Pinning requires RPC access to a synced dashd on the corresponding network,
 which is a release-time step, not a build-time one. Until then the mechanism
 is present and refuses to serve, which is the intended safe default.
+
+The mainnet anchor's 2068 payee-eligible records are byte-identical to the
+previous `valid`-based pin at the same height; the re-pin is purely additive
+(the 906 present-but-ineligible records) and does not move a single eligible
+masternode's payout state.
 
 The format, the parser, the bridge and the fail-closed paths are exercised
 against **real captured testnet data** —
