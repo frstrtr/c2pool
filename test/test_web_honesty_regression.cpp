@@ -1041,6 +1041,35 @@ TEST(WebGaugeParity, MinDifficultyPropagatesThroughP2poolShapeWhenKnown) {
     EXPECT_DOUBLE_EQ(p["min_difficulty"].get<double>(), 8.75);
 }
 
+// (#945) The "Best Share" card claims a RECORD share; it must never present the
+// sharechain window AVERAGE as that record. Pre-fix, rest_best_share()
+// substituted average_difficulty into the all-time/session/round difficulty
+// whenever no local record had been seen -- so a freshly-started node showed the
+// window average under a "Best Share / record" label. Fails-without-fix: the
+// substitution set all three difficulties to 1024.0 (make_stats' average).
+TEST(WebGaugeParity, BestShareRecordIsRealNotSharechainAverage) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    // Live sharechain with a fat average, but NO recorded best share yet.
+    mi.set_sharechain_stats_fn([] { return make_stats(1000, 0, 0, 3.5); });
+
+    json b = mi.rest_best_share();
+
+    // has_best_share is the honest flag the card gates on.
+    ASSERT_TRUE(b.contains("has_best_share"));
+    EXPECT_FALSE(b["has_best_share"].get<bool>())
+        << "no record share was ever recorded; has_best_share must be false";
+
+    for (const char* scope : {"all_time", "session", "round"}) {
+        ASSERT_TRUE(b.contains(scope)) << scope << " entry missing";
+        const double d = b[scope].value("difficulty", -1.0);
+        EXPECT_DOUBLE_EQ(d, 0.0)
+            << scope << " best-share difficulty must read 0 (honest-absent), "
+               "not the sharechain average";
+        EXPECT_NE(d, 1024.0)
+            << scope << " must not be re-sourced from average_difficulty";
+    }
+}
+
 // (c) aps IS the non-stale rate; the gross rate is that grossed UP.
 TEST(WebGaugeParity, StaleRelationshipMatchesP2poolNotItsInverse) {
     MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
@@ -1607,4 +1636,22 @@ TEST(DashboardNoWorkReason, RendersHeaderSyncAndCategorisedReason) {
     EXPECT_NE(fn.find("c.no_work_reason != null"), std::string::npos)
         << "the no-work line must be gated on the reason being present "
            "(honest-absent), not rendered unconditionally.";
+}
+
+// (#945, frontend) renderBestShare must gate the record on has_best_share and
+// must not present a value when absent. Pre-fix it unconditionally wrote
+// bs.round.difficulty / bs.all_time.pct_of_block, so when the backend fell back
+// to the sharechain average the card rendered that average as a record.
+// Fails-without-fix: the pre-fix function never references has_best_share.
+TEST(DashboardBestShare, RecordGatesOnHasBestNotAverage) {
+    const auto html = read_dashboard();
+    auto start = html.find("function renderBestShare(bs)");
+    ASSERT_NE(start, std::string::npos) << "renderBestShare not found";
+    auto end = html.find("\n        function ", start + 1);
+    ASSERT_NE(end, std::string::npos);
+    const std::string fn = html.substr(start, end - start);
+
+    EXPECT_NE(fn.find("has_best_share"), std::string::npos)
+        << "renderBestShare must gate the record on bs.has_best_share; without "
+           "it a syncing node renders the sharechain average as a 'Best Share'.";
 }

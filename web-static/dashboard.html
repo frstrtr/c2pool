@@ -3095,10 +3095,23 @@
 
         function renderBestShare(bs) {
             if (!bs || !bs.round) return;
-            d3.select('#best_share_round_pct_fancy').html(format_pct_fancy(bs.round.pct_of_block));
-            d3.select('#best_share_round_diff').text(format_difficulty(bs.round.difficulty));
+            // #945: gate the "Best Share" record on has_best_share. A false flag
+            // (or a 0 difficulty) means no record share has been seen yet -- do
+            // NOT render the value as a record. Pre-fix the backend substituted
+            // the sharechain AVERAGE here, so this card silently showed a window
+            // average under a "Best Share / \u{1F3C6} record" label.
+            var hasBest = (bs.has_best_share !== false) &&
+                          bs.round && bs.round.difficulty > 0;
+            if (hasBest) {
+                d3.select('#best_share_round_pct_fancy').html(format_pct_fancy(bs.round.pct_of_block));
+                d3.select('#best_share_round_diff').text(format_difficulty(bs.round.difficulty));
+                d3.select('#best_share_alltime_pct_fancy').html(format_pct_fancy(bs.all_time.pct_of_block));
+            } else {
+                d3.select('#best_share_round_pct_fancy').html('\u2014');
+                d3.select('#best_share_round_diff').text('no record yet');
+                d3.select('#best_share_alltime_pct_fancy').html('\u2014');
+            }
             d3.select('#best_share_net_diff').text(format_difficulty(bs.network_difficulty));
-            d3.select('#best_share_alltime_pct_fancy').html(format_pct_fancy(bs.all_time.pct_of_block));
             // Record-share hash (the exact hash that got closest to a block).
             var recHash = (bs.round && bs.round.hash) ? bs.round.hash
                         : ((bs.all_time && bs.all_time.hash) ? bs.all_time.hash : '');
