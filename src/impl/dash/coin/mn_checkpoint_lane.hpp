@@ -360,6 +360,17 @@ public:
         m_ondemand_cap_forced = true;
     }
 
+    /// Override the per-bridge ban-state probe cap. Unset, it is sized against
+    /// the replay distance at bridge start (see pump()). ZERO disables the
+    /// probe entirely, which restores the pre-change behaviour exactly: a
+    /// ProUpServTx whose revive turns on an unmeasured ban is applied as a
+    /// plain service update — and, unlike before, COUNTED as unmeasured.
+    void set_revive_probe_cap(size_t n)
+    {
+        m_revive_probe_cap        = n;
+        m_revive_probe_cap_forced = true;
+    }
+
     /// Maximum number of blocks the bridge is willing to replay. A checkpoint
     /// further behind the tip than this is treated as STALE and refused: the
     /// replay would take longer than an operator would tolerate, and a
@@ -657,6 +668,67 @@ public:
     /// projection is one queue slot ahead of the chain's.
     size_t   revive_dropped()     const { return m_revive_dropped; }
 
+    /// ── BAN-STATE PROBE accounting ────────────────────────────────────────
+    /// A ProUpServTx revives only a masternode that IS PoSe-banned, and a PoSe
+    /// ban is consensus-computed — never a transaction. A replay therefore
+    /// cannot decide the revive from the block; it decides it from whatever
+    /// masternode list it last folded. These count the times the replay had to
+    /// go and MEASURE that, and the times it could not.
+    ///
+    ///   probes            — folds fired by an ambiguous ProUpServTx, dated at
+    ///                       the block BEFORE it (the list dashcore reads).
+    ///   revive_unmeasured — ProUpServTx applied with the ban state at their
+    ///                       own height still unknown. NON-ZERO IS A BLIND
+    ///                       SPOT: if the chain had those banned, dashd set a
+    ///                       revive height and this replay did not.
+    ///   revive_declined_measured — ProUpServTx a dated list proved were NOT
+    ///                       revives. This is the zero that IS a measurement.
+    size_t   revive_probes()      const { return m_revive_probes; }
+    size_t   revive_unmeasured()  const { return m_revive_unmeasured; }
+    size_t   revive_declined()    const { return m_revive_declined; }
+    size_t   revive_probe_cap()   const { return m_revive_probe_cap; }
+    bool     revive_probe_cap_hit() const { return m_revive_probe_cap_hit; }
+
+    /// The ban-state probe's own line, in every report and on the published
+    /// status. Same discipline as ondemand_report(): a field that was never
+    /// evaluated prints n/a, never 0.
+    std::string revive_probe_report() const
+    {
+        if (m_revive_unmeasured != 0) {
+            return "BAN-STATE PROBE: " + std::to_string(m_revive_unmeasured)
+                 + " ProUpServTx were applied WITHOUT a masternode list dated"
+                   " at their own pre-block height, so their revive outcome is"
+                   " UNKNOWN. A PoSe ban that starts AND ends between two folds"
+                   " never appears in any fold's input, so for these heights"
+                   " 'no reinstatement' is an ABSENCE OF MEASUREMENT. If the"
+                   " chain had them banned it set nPoSeRevivedHeight and this"
+                   " replay did not, and each one puts that masternode ~one"
+                   " queue length ahead of the chain in every later projection."
+                 + (m_revive_probe_cap_hit
+                        ? " THE PROBE CAP IS EXHAUSTED ("
+                          + std::to_string(m_revive_probes) + "/"
+                          + std::to_string(m_revive_probe_cap)
+                          + "): further ambiguity was left unmeasured rather"
+                            " than asking a peer for another list."
+                        : " The per-height snapshot seam was unavailable, so"
+                          " no probe could be issued at all.");
+        }
+        if (m_revive_probes == 0 && m_revive_declined == 0) {
+            return "BAN-STATE PROBE: n/a — no ProUpServTx in this replay"
+                   " landed on a masternode whose ban state was both"
+                   " undecided and load-bearing, so the probe path was never"
+                   " exercised.";
+        }
+        return "BAN-STATE PROBE: " + std::to_string(m_revive_probes)
+             + "/" + std::to_string(m_revive_probe_cap)
+             + " used; every ProUpServTx whose revive turned on an unmeasured"
+               " ban was adjudicated against a list dated EXACTLY at the block"
+               " before it. " + std::to_string(m_revive_declined)
+             + " were attested NOT banned (dashcore revives nothing there"
+               " either, so that zero is a measurement); the rest became"
+               " ordinary revives counted above. 0 left unmeasured.";
+    }
+
     /// Why "REINSTATED: 0" is not automatically good news.
     ///
     /// Reinstatement has two sources — the wholesale SML fold flipping an
@@ -683,6 +755,7 @@ public:
                    + " ProUpServTx revive(s) were DROPPED as unknown"
                      " masternodes during this replay.";
             }
+            s += " " + revive_probe_report();
             return s;
         }
         std::string s =
@@ -699,6 +772,12 @@ public:
                  " axis and every later projection is that many queue slots"
                  " ahead of the chain's.";
         }
+        // The second way "reinstated 0" lies. The first (above) is a
+        // `valid`-filtered anchor with nothing revivable in it. This one is a
+        // COMPLETE anchor whose fold sampling cannot see a ban that begins and
+        // ends inside one interval — the wholesale fold's own "+0 revived"
+        // then reports an interval it structurally could not observe.
+        s += " " + revive_probe_report();
         return s;
     }
     bool     sml_folded()         const { return m_sml_folded; }
@@ -878,6 +957,11 @@ public:
                 m_ondemand_cap = kOnDemandFoldBase
                                + (tip - m_anchor_height) / kOnDemandFoldPerBlocks;
             }
+            if (!m_revive_probe_cap_forced) {
+                m_revive_probe_cap =
+                    kReviveProbeBase
+                    + (tip - m_anchor_height) / kReviveProbePerBlocks;
+            }
             LOG_INFO << "[MN-CKPT] bridge START: replaying h=" << m_next
                      << ".." << tip << " (" << (tip - m_next + 1)
                      << " blocks) onto the anchored set";
@@ -957,6 +1041,14 @@ public:
         // PERMANENT demotion.
         refresh_sml_height();
 
+        // ── BAN-STATE PROBE. Fire BEFORE the apply, because the question is
+        // about the PRE-block list and the cursor is standing exactly on
+        // height-1 right now — the one position at which a fold for height-1
+        // is valid by the same construction every other fold here relies on.
+        // Returns true when a request is outstanding (replay PAUSED; the reply
+        // resumes it and re-delivers this very block).
+        if (begin_revive_probe(block, height)) return;
+
         const auto r = m_machine.apply_block(block, height);
 
         // The anchor's own falsification test. apply_block already logs the
@@ -1008,6 +1100,8 @@ public:
         m_spent         += r.spent;
         m_tx_revived    += r.revived;
         m_revive_dropped += r.revive_dropped_unknown;
+        m_revive_unmeasured += r.revive_unmeasured;
+        m_revive_declined   += r.revive_declined_measured;
         m_stalled_pumps = 0;
 
         if ((m_applied % 500) == 0) {
@@ -1127,6 +1221,20 @@ public:
     static constexpr size_t   kOnDemandFoldBase      = 8;
     static constexpr uint32_t kOnDemandFoldPerBlocks = 250;
 
+    /// ── The BAN-STATE PROBE cap, per bridge ───────────────────────────────
+    /// cap = kReviveProbeBase + replay_blocks / kReviveProbePerBlocks.
+    /// Sized from the SAME mainnet window the defect was traced in: 22
+    /// ProUpServTx across 2530 blocks (~1 per 115), of which 7 landed on a
+    /// masternode the replay believed valid and therefore needed a probe
+    /// (~1 per 360). kReviveProbePerBlocks = 100 tracks that with better than
+    /// 3x headroom; the base covers a short bridge where the ratio term is 0
+    /// but a ProUpServTx can still land. Exhausting it does NOT fail the
+    /// bridge — it leaves the ambiguity UNMEASURED and says so, because a
+    /// bridge that has run out of probe budget is still more useful than one
+    /// that hammers a peer, and the blind spot is now nameable either way.
+    static constexpr size_t   kReviveProbeBase      = 8;
+    static constexpr uint32_t kReviveProbePerBlocks = 100;
+
     /// The next height at or after `cursor` at which we want a snapshot, or
     /// nullopt when none remains before `tip`. Always includes the tip so the
     /// published set is current, and the anchor so the first replayed block is
@@ -1141,9 +1249,129 @@ public:
         return std::nullopt;
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // THE BAN-STATE PROBE — measure the gate, never guess it
+    // ─────────────────────────────────────────────────────────────────────
+    //
+    // dashcore revives on a ProUpServTx if and only if the masternode
+    // IsBanned() in the PRE-BLOCK list (specialtxman.cpp:361-370). We mirror
+    // that gate against OUR belief about who is banned — and that belief is a
+    // sample, taken at fold points. A ban that starts and ends between two
+    // samples never enters our belief at all, so the gate reads false, the
+    // revive is dropped on the floor, and nPoSeRevivedHeight stays at the
+    // masternode's stale last payment. From there payee_score() sorts it ~one
+    // full queue length ahead of where dashd sorts it.
+    //
+    // MEASURED (mainnet, anchor 2513000, fold interval 500, replay to 2515511;
+    // dashd 23.1.7 asked directly for the pre-block state of every ProUpServTx
+    // in the window):
+    //
+    //   22 ProUpServTx in 2513001..2515530
+    //   20 of them landed on a masternode dashd HAD banned  -> dashd revived
+    //   15 of those 20 this replay also believed banned      -> applied
+    //    5 it did not (banned AND revived between two folds) -> MISSED
+    //    2 landed on a masternode that was NOT banned        -> no revive,
+    //      and dashd set no revive height either
+    //
+    // The 5 missed ones, scored our way, reach the head of our queue at
+    // 2515511 / ~2516175 / ~2516176 / ~2516332 / ~2517466. The replay
+    // fail-closed at 2515511 projecting the first of them, 80b4892b…, which
+    // dashd will not pay until ~2516627.
+    //
+    // WHY NOT JUST SET revivedHeight ON EVERY ProUpServTx. Because of the 2.
+    // d07e1f49… sent a service update at 2515068 with ban height -1 and PoSe
+    // penalty 0; dashd left its revive height at 2501164 and its score at its
+    // last payment, 2513500. Setting 2515068 there moves it 1568 blocks DOWN
+    // the queue and fails at ~2515558 instead — a guess that trades one
+    // divergence for another 47 blocks later. 3da232a3… shows the same shape
+    // one block wide: two ProUpServTx in consecutive blocks, only the FIRST a
+    // revive. The transaction does not carry the answer.
+    //
+    // WHY NOT SHRINK THE FOLD INTERVAL. It cannot work, at any interval. A
+    // ban+revive pair fits between any two fixed samples — 80b4892b…'s was
+    // FOUR blocks wide — so a finer cadence only shrinks the window while
+    // paying a round trip continuously, ban or no ban. At interval 1 it is no
+    // longer a replay, it is a list fetch per block, which is the daemon
+    // dependency this whole lane exists to remove.
+    //
+    // WHY EVENT-TRIGGERED SAMPLING IS EXACTLY ENOUGH. The set of heights at
+    // which an unobserved ban can permanently move a masternode's queue
+    // position is EXACTLY the set of heights carrying a ProUpServTx for a
+    // masternode we hold and believe valid: nowhere else does the ban state
+    // feed a field that outlives the ban. So the replay fires a fold at those
+    // heights and only those. On the measured window that is 7 probes across
+    // 2530 blocks — ~0.3% — against 5 permanent divergences removed. An
+    // unobserved ban still costs eligibility WHILE it lasts, but that is
+    // transient and already carried by the on-demand fold at the mismatch it
+    // causes.
+    //
+    // The probe is the ORDINARY fold: same request, same DIP-4 client
+    // verification, same one-in-flight pause, same cursor==H-by-construction
+    // invariant (the cursor sits on height-1 when the probe is issued). It
+    // needs no new trust and no new reply route.
+    bool begin_revive_probe(const BlockType& block, uint32_t height)
+    {
+        if (height == 0) return false;
+        // LATCH. A probe that was abandoned, or answered by a list that did
+        // not move the gate, must not re-fire when the block is re-delivered:
+        // that is a livelock, not a retry.
+        if (m_revive_probe_at == height - 1) return false;
+        const auto cands = m_machine.unmeasured_revive_candidates(block, height);
+        if (cands.empty()) return false;
+
+        if (m_revive_probes >= m_revive_probe_cap) {
+            m_revive_probe_cap_hit = true;
+            LOG_WARNING
+                << "[MN-CKPT] BAN-STATE PROBE REFUSED at h=" << height
+                << ": " << m_revive_probes << "/" << m_revive_probe_cap
+                << " probes already spent. " << cands.size()
+                << " ProUpServTx here will be applied with the pre-block ban"
+                   " state UNMEASURED. This is reported, not swallowed — see"
+                   " the BAN-STATE PROBE line.";
+            return false;
+        }
+        // THE LATCH IS SET BEFORE THE REQUEST, and that ordering is
+        // load-bearing rather than tidy. m_request_snapshot may be answered
+        // INLINE — an ordered stream, or a same-thread demux — in which case
+        // on_historical_snapshot() clears m_snapshot_pending, folds, and
+        // resumes the replay, re-delivering THIS block into
+        // on_block_connected() before begin_fold() has even returned. With the
+        // latch set afterwards that re-entry sees an unlatched lane and asks
+        // again, recursively: mutation-tested, and it does not terminate on
+        // its own. Setting it first makes the re-entry a no-op.
+        const uint32_t probe_at      = height - 1;
+        const uint32_t latch_before  = m_revive_probe_at;
+        const size_t   probes_before = m_revive_probes;
+        m_revive_probe_at = probe_at;
+        ++m_revive_probes;
+        // THIS block was already requested and has just been dropped on the
+        // floor. request_window() asks only for heights above
+        // m_requested_through, so without this the resume would ask for
+        // height+1 — which on_block_connected ignores (height != m_next) — and
+        // the bridge would sit on the stall probe until the next tip change.
+        // The probe is the one path that pauses on a block it has ALREADY
+        // consumed, so it is the one path that has to say so.
+        m_rerequest_from_cursor = true;
+        if (!begin_fold(probe_at, /*on_demand=*/false,
+                        "BAN-STATE PROBE (a ProUpServTx at h="
+                        + std::to_string(height)
+                        + " whose revive turns on a ban this set never"
+                          " measured)")) {
+            // No snapshot seam, or the header for height-1 is not held.
+            // Nothing was asked, so nothing was spent: put the budget and the
+            // latch back exactly as they were. The ambiguity survives and
+            // apply_block will COUNT it.
+            m_revive_probe_at = latch_before;
+            m_revive_probes   = probes_before;
+            return false;
+        }
+        return true;
+    }
+
     /// Ask for the list as of `height`, and pause the replay until it lands.
     /// Returns true when a request was issued (caller must stop pulling).
-    bool begin_fold(uint32_t height, bool on_demand = false)
+    bool begin_fold(uint32_t height, bool on_demand = false,
+                    const std::string& why = std::string())
     {
         if (!m_request_snapshot || !m_merkle_root_at || !m_header_hash_at)
             return false;
@@ -1154,9 +1382,13 @@ public:
         m_snapshot_height  = height;
         m_snapshot_waits   = 0;
         LOG_INFO << "[MN-CKPT] "
-                 << (on_demand ? "ON-DEMAND PoSe fold (triggered by the payee"
-                                 " mismatch itself, not by a fold point)"
-                               : "PoSe fold")
+                 << (!why.empty()
+                         ? why
+                         : (on_demand
+                                ? std::string("ON-DEMAND PoSe fold (triggered"
+                                              " by the payee mismatch itself,"
+                                              " not by a fold point)")
+                                : std::string("PoSe fold")))
                  << ": requesting the masternode list AS OF"
                     " h=" << height << " (" << hash->GetHex().substr(0, 16)
                  << ") — replay PAUSED until it lands, so the cursor cannot"
@@ -1521,6 +1753,27 @@ private:
         // downgrade every walk attestation to "no opinion" until the next
         // block's refresh_sml_height() undid it. The two lists are dated
         // independently because they ARE independent.
+        // WHICH ZERO. "+0 revived" here means one specific thing: no
+        // masternode this set was holding as banned is attested VALID by THIS
+        // list. It does NOT mean no reinstatement happened since the last
+        // fold, and it never could — a PoSe ban that starts AND ends inside a
+        // fold interval is absent from BOTH folds' inputs, so no cadence of
+        // folds can observe it. Those heights are covered by the ban-state
+        // probe instead, and the count of ones it could not reach is the only
+        // honest answer to "did we miss a reinstatement". Saying so at the
+        // fold is the point: this is the line an operator reads as
+        // reassurance.
+        const std::string zero_note =
+            vr.flipped_to_valid != 0
+                ? std::string()
+                : (" The +0 revived is scoped to THIS list: it says no"
+                   " masternode this set held as banned is attested valid at h="
+                   + std::to_string(height) + ", NOT that no reinstatement"
+                     " happened since the last fold — a ban that starts and"
+                     " ends inside a fold interval appears in no fold's input."
+                     " Those are measured by the ban-state probe: "
+                   + std::to_string(m_revive_probes) + " taken, "
+                   + std::to_string(m_revive_unmeasured) + " left unmeasured.");
         LOG_INFO << "[MN-CKPT] PoSe FOLD at h=" << height
                  << " (cursor == the height the list describes, by"
                     " construction): payee-eligible " << before << " -> "
@@ -1528,7 +1781,7 @@ private:
                  << vr.flipped_to_valid << " revived; scanned " << vr.scanned
                  << " entries, " << vr.matched << " ours). List was DIP-4"
                     " client-verified against the block's own coinbase"
-                    " commitment.";
+                    " commitment." << zero_note;
     }
 
 public:
@@ -1654,6 +1907,7 @@ public:
                    " per-mismatch walk alone.";
         }
         s += " " + ondemand_report();
+        s += " " + revive_probe_report();
         if (m_snapshot_pending) {
             s += " A masternode-list request for h="
                  + std::to_string(m_snapshot_height) + " is OUTSTANDING and the"
@@ -1780,7 +2034,8 @@ public:
                    + " + " + std::to_string(m_applied) + " replayed blocks) "
                    + delta
                    + " PoSe folds: " + std::to_string(m_folds)
-                   + " (" + ondemand_report() + ")";
+                   + " (" + ondemand_report() + " "
+                   + revive_probe_report() + ")";
         // A DEGRADED publish must say so. Publishing a set that was assembled
         // without the fold points it asked for looks identical, from outside,
         // to a clean bridge — and that silence is the defect: the operator has
@@ -1942,6 +2197,16 @@ public:
         // m_ondemand_cap_forced is CONFIG (set_ondemand_fold_cap) and survives,
         // which is why the reset is guarded the same way pump()'s sizing is.
         if (!m_ondemand_cap_forced) m_ondemand_cap = kOnDemandFoldBase;
+        // Same argument for the probe budget, plus one more: the latch. A
+        // re-armed bridge replays the SAME heights from the SAME anchor, so a
+        // latch left standing would suppress the very probe the second attempt
+        // exists to take.
+        m_revive_probes        = 0;
+        m_revive_probe_at      = 0;
+        m_revive_unmeasured    = 0;
+        m_revive_declined      = 0;
+        m_revive_probe_cap_hit = false;
+        if (!m_revive_probe_cap_forced) m_revive_probe_cap = kReviveProbeBase;
         m_pose_removed    = 0;
         m_pose_reinstated = 0;
         m_tx_revived      = 0;
@@ -2024,6 +2289,19 @@ public:
     bool      m_ondemand_cap_hit{false};
     bool      m_ondemand_evaluated{false};     // a mismatch ever reached it
     size_t    m_ondemand_abandoned{0};         // on-demand asks never answered
+    // ── BAN-STATE PROBE state. Rides the SAME m_snapshot_pending pause and
+    // the SAME reply route as a scheduled fold — it IS a scheduled fold, just
+    // scheduled by a ProUpServTx instead of by a counter. m_revive_probe_at is
+    // the anti-livelock latch: the probed height, so a re-delivered block
+    // cannot re-ask for a list that has already been asked for and consumed,
+    // refused or abandoned.
+    size_t    m_revive_probes{0};
+    uint32_t  m_revive_probe_at{0};
+    size_t    m_revive_unmeasured{0};
+    size_t    m_revive_declined{0};
+    size_t    m_revive_probe_cap{kReviveProbeBase};
+    bool      m_revive_probe_cap_forced{false};
+    bool      m_revive_probe_cap_hit{false};
     RequestSnapshotFn m_request_snapshot;
     MerkleRootAtFn    m_merkle_root_at;
     size_t   m_sml_recovery_cap{0}; // budget handed to the machine, mirrored
