@@ -1330,8 +1330,17 @@ int run_node(const core::CoinParams& params, bool testnet,
         // DGB-namespaced sub-dir isolates the per-coin stat log under config_path().
         {
             std::string net_label = testnet ? "testnet" : "mainnet";
-            std::string graph_db_path = (core::filesystem::config_path()
-                / net_label / "dgb" / "graph_db").string();
+            // #1061 parity: the stat-log parent dir must exist before the first
+            // save_stat_log() tmp-write+rename, otherwise the ofstream silently
+            // fails and rename() throws every 100s — nothing survives a restart
+            // while the build stays green. net_label ("testnet"/"mainnet") is a
+            // DIFFERENT subtree from net_dir ("digibyte_testnet"/"digibyte", L195),
+            // so the L198 create_directories does not cover this path.
+            const std::filesystem::path graph_db_dir =
+                core::filesystem::config_path() / net_label / "dgb";
+            std::error_code stat_mkdir_ec;
+            std::filesystem::create_directories(graph_db_dir, stat_mkdir_ec);  // best effort
+            std::string graph_db_path = (graph_db_dir / "graph_db").string();
             mi->set_stat_log_path(graph_db_path);
             mi->load_stat_log();
             std::cout << "[DGB] graph_db stats persistence -> " << graph_db_path << std::endl;
