@@ -4936,17 +4936,16 @@ nlohmann::json MiningInterface::rest_best_share()
         std::lock_guard<std::mutex> lock(m_best_diff_mutex);
         auto now_ts = static_cast<uint64_t>(std::time(nullptr));
 
-        // If no local best share, use sharechain average difficulty as baseline
+        // Honest-absent: until a real record share is seen, best-share
+        // difficulty reads 0. We deliberately do NOT substitute the sharechain
+        // AVERAGE here (#945) -- an average is not a record, yet the card labels
+        // this a "Best Share" / "record", so the average masqueraded as the
+        // all-time/round best. The window average legitimately surfaces on its
+        // own below as median_pct; has_best_share lets the card render
+        // honest-absent instead of a fake average-as-record value.
         double best_all = m_best_difficulty.all_time;
         double best_sess = m_best_difficulty.session;
         double best_round = m_best_difficulty.round;
-        if (best_all == 0.0 && m_sharechain_stats_fn) {
-            auto sc = m_sharechain_stats_fn();
-            double avg = sc.value("average_difficulty", 0.0);
-            best_all = avg;
-            best_sess = avg;
-            best_round = avg;
-        }
 
         auto make_entry = [&](double diff, const std::string& miner, uint64_t ts,
                               const std::string& hash) {
@@ -4972,6 +4971,11 @@ nlohmann::json MiningInterface::rest_best_share()
             m_best_difficulty.hash);
         round["started"] = m_best_difficulty.round_start;
         result["round"] = round;
+
+        // A real record was recorded iff the all-time best difficulty is > 0.
+        // The card gates on this so it never presents a 0 (or, pre-#945, a
+        // sharechain average) as a "best share" record.
+        result["has_best_share"] = (best_all > 0.0);
     }
 
     // ── Merged (aux) chain best share stats - symbol from the real aux chain, never hardcoded ──
