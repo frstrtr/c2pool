@@ -1,0 +1,67 @@
+name: runner-drop-detector
+
+# Flags self-hosted "steps=0" job drops automatically, so a bad runner
+# surfaces as "runner dropped it" instead of a red PR queue. A steps=0
+# completed job means the runner accepted the job but never ran its body
+# (job-setup failure / session-conflict / cgroup mem-pin), which is a
+# runner-health signal, not a code failure. Runs on a gh-hosted runner on
+# purpose: a detector must not depend on the fleet it monitors.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      window_minutes:
+        description: "Look-back window in minutes"
+        default: "120"
+
+permissions:
+  actions: read
+  issues: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Scan recent jobs for steps=0 drops
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          WINDOW_MIN: ${{ github.event.inputs.window_minutes || '120' }}
+        run: |
+          set -euo pipefail
+          since=$(date -u -d "-${WINDOW_MIN} min" +%Y-%m-%dT%H:%M:%SZ)
+          echo "Scanning jobs since $since (window ${WINDOW_MIN}m)"
+          : > drops.tsv
+          # Recent runs in window, then their jobs; flag completed, non-skipped, steps=0.
+          for rid in $(gh api "repos/$REPO/actions/runs?per_page=60&created=>$since" \
+                --jq '.workflow_runs[].id'); do
+            gh api "repos/$REPO/actions/runs/$rid/jobs?per_page=100" --jq \
+              ".jobs[] | select((.runner_name!=null) and (.runner_name!=\"\") and .status==\"completed\" and .conclusion!=\"skipped\" and (.steps|length)==0) | [(.runner_name // \"<none>\"), .conclusion, (.html_url), .name] | @tsv" \
+              2>/dev/null || true
+          done >> drops.tsv
+          n=$(wc -l < drops.tsv | tr -d ' ')
+          echo "steps0_drops=$n"
+          if [ "$n" -eq 0 ]; then
+            echo "No steps=0 drops in window. Runner fleet clean."
+            exit 0
+          fi
+          echo "::group::Drops by runner"; cut -f1 drops.tsv | sort | uniq -c | sort -rn; echo "::endgroup::"
+          body="Automated detector found ${n} completed job(s) with steps=0 (runner accepted but never ran the body) in the last ${WINDOW_MIN} min.\n\nBy runner:\n"
+          body+=$(cut -f1 drops.tsv | sort | uniq -c | sort -rn | sed 's/^/    /')
+          body+="\n\nJobs:\n"
+          while IFS=$'\t' read -r runner concl url name; do
+            echo "::error title=steps=0 drop on ${runner}::${name} (${concl}) ${url}"
+            body+="- ${runner}: ${name} (${concl}) ${url}\n"
+          done < drops.tsv
+          title="runner steps=0 drops detected"
+          existing=$(gh issue list --repo "$REPO" --state open --search "$title in:title" --json number --jq ".[0].number" 2>/dev/null || true)
+          if [ -n "$existing" ]; then
+            printf "%b" "$body" | gh issue comment "$existing" --repo "$REPO" --body-file -
+          else
+            printf "%b" "$body" | gh issue create --repo "$REPO" --title "$title" --label "ci" --body-file - || \
+            printf "%b" "$body" | gh issue create --repo "$REPO" --title "$title" --body-file -
+          fi
+          # Surface as a red check so the drop is impossible to miss.
+          exit 1
