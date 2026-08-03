@@ -748,3 +748,347 @@ TEST(DashDkgCommitments, EmbeddedWorkdataCarriesQcTxsFirstAndOverrideRoot)
     ASSERT_TRUE(vendor::parse_cbtx(w0.m_coinbase_payload, cb0));
     EXPECT_EQ(cb0.merkleRootQuorums, uint256::ZERO);
 }
+
+// ── COLD-START HOLE: classified + bounded refusal (mainnet 2026-08-03) ─────
+//
+// THE INCIDENT, replayed as a KAT. Daemonless mainnet node, binary
+// 0.2.4-237-gdf160971, uptime 75 min, ONE qfcommit seen on the wire since
+// start (type=4). At next_height 2515381 the type-1 (LLMQ_50_60) mandatory
+// slot's commitment had been relayed BEFORE the process connected, so it was
+// not in the MineableCommitmentCache; with no attested-null evidence source
+// the WHOLE height failed closed and — the fallback arm being unarmed on a
+// daemonless node — the stratum surface served an empty h=0 template for 11
+// minutes / 14 serves (heights 2515381..2515384), self-healing at 2515385
+// when another miner mined the commitment.
+//
+// PRIOR ART (dashpay/dash v21.1.0, verified): that commitment CANNOT be
+// pulled. AddMineableCommitment announces it ONCE by inv at DKG finalize and
+// GetMineableCommitmentByHash serves it BY COMMITMENT HASH only — there is
+// no (llmqType, quorumHash)-keyed request, and mnlistdiff/qrinfo carry MINED
+// commitments only. dashd has the same hole and mines NULL through it; we
+// must not (block 1520106). So these KATs pin the two things we DO owe:
+//   1. the gate still fails closed on EVERY unsatisfiable shape (no
+//      weakening — each case below asserts nullopt), and
+//   2. the refusal NAMES which of the five distinct causes fired, carries
+//      the measured signer count (n/a, never 0, when nothing is held), and
+//      BOUNDS the wait with the DKG mining window.
+namespace {
+
+// The incident's real coordinates.
+constexpr uint32_t kIncidentHeight    = 2'515'381u;
+constexpr uint32_t kIncidentCycleBase = 2'515'368u;   // 2515381 - 2515381%24
+
+// Mainnet at kIncidentHeight has TWO interval-24 windows open (types 1 and
+// 4). Pin type 4 as already-mined so the type-1 slot is the whole story —
+// exactly the shape the incident logged (first gap = type 1, qi 0).
+QuorumManager qmgr_with_type4_mined()
+{
+    vendor::QuorumTail tail;
+    tail.newQuorums.push_back(
+        real_commitment(kLlmq100_67, *fake_hash_at(kIncidentCycleBase), 0, 0x44));
+    QuorumManager q;
+    q.apply(tail);
+    EXPECT_TRUE(q.find(4, *fake_hash_at(kIncidentCycleBase)).has_value());
+    return q;
+}
+
+std::optional<QcBlockPlan> incident_plan(const QuorumManager& qmgr,
+                                         const MineableCommitmentCache* cache,
+                                         RequiredQcSlot* gap)
+{
+    return build_daemonless_qc_plan(
+        LlmqNetwork::Mainnet, kIncidentHeight, qmgr, fake_hash_at,
+        [](const uint256&) -> std::optional<uint32_t> { return std::nullopt; },
+        cache, /*null_evidence=*/nullptr, gap);
+}
+
+} // namespace
+
+TEST(DashDkgColdStart, WindowBoundIsTheRefusalsUpperBound)
+{
+    // The measured bound the incident log now prints: LLMQ_50_60 window is
+    // [cycleStart+10, cycleStart+18] = [2515378, 2515386].
+    auto wb = qc_window_bound(kLlmq50_60, kIncidentHeight);
+    EXPECT_EQ(wb.cycle_start, kIncidentCycleBase);
+    EXPECT_EQ(wb.first_height, 2'515'378u);
+    EXPECT_EQ(wb.last_height, 2'515'386u);
+    EXPECT_EQ(wb.heights_remaining, 6u);   // 2515381..2515386 inclusive
+
+    // NEGATIVE TWIN: past the window the slot is not required at all, so the
+    // bound must collapse to zero rather than keep counting down forever.
+    auto after = qc_window_bound(kLlmq50_60, 2'515'387u);
+    EXPECT_EQ(after.heights_remaining, 0u);
+    EXPECT_FALSE(is_mining_phase(kLlmq50_60, 2'515'387u));
+    EXPECT_TRUE(is_mining_phase(kLlmq50_60, kIncidentHeight));
+
+    // And the window the bound reports is the one the slot actually lives in:
+    // every height in [first,last] is a mining phase, the flanks are not.
+    for (uint32_t h = wb.first_height; h <= wb.last_height; ++h)
+        EXPECT_TRUE(is_mining_phase(kLlmq50_60, h)) << "h=" << h;
+    EXPECT_FALSE(is_mining_phase(kLlmq50_60, wb.first_height - 1));
+    EXPECT_FALSE(is_mining_phase(kLlmq50_60, wb.last_height + 1));
+}
+
+TEST(DashDkgColdStart, IncidentReplayFailsClosedNamingTheColdStartCause)
+{
+    auto qmgr = qmgr_with_type4_mined();
+
+    // Only the type-1 slot is outstanding — the incident's exact shape.
+    auto slots = compute_required_qc_slots(
+        LlmqNetwork::Mainnet, kIncidentHeight, fake_hash_at,
+        [&qmgr](uint8_t t, const uint256& qh) {
+            return qmgr.find(t, qh).has_value();
+        });
+    ASSERT_TRUE(slots.has_value());
+    ASSERT_EQ(slots->size(), 1u);
+    EXPECT_EQ((*slots)[0].params.type, 1);
+    EXPECT_EQ((*slots)[0].quorum_index, 0);
+    EXPECT_EQ((*slots)[0].quorum_hash, *fake_hash_at(kIncidentCycleBase));
+    // A slot handed back in the mandatory set is NOT a gap — its diagnosis
+    // fields must read unevaluated, never a fabricated cause or a zero.
+    EXPECT_EQ((*slots)[0].gap, QcSlotGap::Unevaluated);
+    EXPECT_EQ((*slots)[0].cached_signers, -1);
+
+    // THE COLD START: the commitment predates the process, so the cache is
+    // empty for it. FAIL CLOSED — unchanged behaviour — but now named.
+    MineableCommitmentCache cache;
+    RequiredQcSlot gap{};
+    EXPECT_FALSE(incident_plan(qmgr, &cache, &gap).has_value())
+        << "a mandatory slot with no commitment must fail the WHOLE height";
+    EXPECT_EQ(gap.params.type, 1);
+    EXPECT_EQ(gap.quorum_index, 0);
+    EXPECT_EQ(gap.gap, QcSlotGap::NoCommitmentCached);
+    EXPECT_STREQ(qc_slot_gap_name(gap.gap), "no-commitment-cached");
+    // n/a, NOT 0: nothing was held, so no signer count was ever measured.
+    EXPECT_EQ(gap.cached_signers, -1);
+    EXPECT_EQ(cache.cached_signers(1, *fake_hash_at(kIncidentCycleBase)), -1);
+    EXPECT_FALSE(cache.has_commitment(1, *fake_hash_at(kIncidentCycleBase)));
+
+    // No cache wired at all reads the same way (nothing is held either way).
+    RequiredQcSlot gap_nocache{};
+    EXPECT_FALSE(incident_plan(qmgr, nullptr, &gap_nocache).has_value());
+    EXPECT_EQ(gap_nocache.gap, QcSlotGap::NoCommitmentCached);
+    EXPECT_EQ(gap_nocache.cached_signers, -1);
+}
+
+TEST(DashDkgColdStart, BackFilledCommitmentServesAndItsRemovalFailsClosed)
+{
+    // THE POSITIVE: whatever fills the cache for a slot whose commitment
+    // predates startup — today only live relay; no P2P back-fill exists —
+    // the height must serve the moment it is BLS-verifiable, with dashd's
+    // real commitment in the plan rather than a null.
+    auto qmgr = qmgr_with_type4_mined();
+    const uint256 qh = *fake_hash_at(kIncidentCycleBase);
+    auto real = real_commitment(kLlmq50_60, qh, /*quorumIndex=*/0, 0x11);
+
+    MineableCommitmentCache cache;
+    ASSERT_TRUE(cache.ingest(LlmqNetwork::Mainnet, real));
+    cache.set_bls_verify_fn([](const CFinalCommitment&) { return true; });
+    cache.set_members_ready_fn([](uint8_t, const uint256&) { return true; });
+
+    RequiredQcSlot gap{};
+    auto plan = incident_plan(qmgr, &cache, &gap);
+    ASSERT_TRUE(plan.has_value()) << "a verifiable commitment must SERVE";
+    ASSERT_EQ(plan->commitments.size(), 1u);
+    EXPECT_EQ(plan->commitments[0].llmqType, 1);
+    EXPECT_EQ(plan->commitments[0].quorumHash, qh);
+    // A REAL commitment, not the null dashd would have mined here.
+    EXPECT_EQ(plan->commitments[0].CountSigners(), 50);
+    EXPECT_GT(plan->commitments[0].CountSigners(), 0);
+    // Measured, not guessed.
+    EXPECT_EQ(cache.cached_signers(1, qh), 50);
+
+    // THE NEGATIVE TWIN — the back-fill removed: same qmgr, same height,
+    // same verifier, cache emptied. Must fail closed.
+    cache.clear();
+    RequiredQcSlot gap2{};
+    EXPECT_FALSE(incident_plan(qmgr, &cache, &gap2).has_value())
+        << "without the commitment the WHOLE height must fail closed";
+    EXPECT_EQ(gap2.gap, QcSlotGap::NoCommitmentCached);
+    EXPECT_EQ(gap2.cached_signers, -1);
+}
+
+TEST(DashDkgColdStart, EveryUnsatisfiableShapeFailsClosedWithItsOwnName)
+{
+    auto qmgr = qmgr_with_type4_mined();
+    const uint256 qh = *fake_hash_at(kIncidentCycleBase);
+    auto real = real_commitment(kLlmq50_60, qh, 0, 0x11);
+
+    // (1) cached, but NO BLS verifier installed => bls-verifier-absent.
+    {
+        MineableCommitmentCache cache;
+        ASSERT_TRUE(cache.ingest(LlmqNetwork::Mainnet, real));
+        EXPECT_FALSE(cache.has_bls_verifier());
+        RequiredQcSlot gap{};
+        EXPECT_FALSE(incident_plan(qmgr, &cache, &gap).has_value());
+        EXPECT_EQ(gap.gap, QcSlotGap::VerifierAbsent);
+        EXPECT_STREQ(qc_slot_gap_name(gap.gap), "bls-verifier-absent");
+        // The signer count IS measured here — something is held.
+        EXPECT_EQ(gap.cached_signers, 50);
+        // No member probe installed => the readiness axis is n/a, not "no".
+        EXPECT_FALSE(cache.members_ready(1, qh).has_value());
+    }
+
+    // (2) cached + verifier, member set still in flight => member-set-unsourced.
+    {
+        MineableCommitmentCache cache;
+        ASSERT_TRUE(cache.ingest(LlmqNetwork::Mainnet, real));
+        cache.set_bls_verify_fn([](const CFinalCommitment&) { return false; });
+        cache.set_members_ready_fn([](uint8_t, const uint256&) { return false; });
+        RequiredQcSlot gap{};
+        EXPECT_FALSE(incident_plan(qmgr, &cache, &gap).has_value());
+        EXPECT_EQ(gap.gap, QcSlotGap::MemberSetUnsourced);
+        ASSERT_TRUE(cache.members_ready(1, qh).has_value());
+        EXPECT_FALSE(*cache.members_ready(1, qh));
+    }
+
+    // (3) cached + verifier + members READY, signature rejected => the
+    //     hostile/corrupt-peer case, which must read differently from (2).
+    {
+        MineableCommitmentCache cache;
+        ASSERT_TRUE(cache.ingest(LlmqNetwork::Mainnet, real));
+        cache.set_bls_verify_fn([](const CFinalCommitment&) { return false; });
+        cache.set_members_ready_fn([](uint8_t, const uint256&) { return true; });
+        RequiredQcSlot gap{};
+        EXPECT_FALSE(incident_plan(qmgr, &cache, &gap).has_value());
+        EXPECT_EQ(gap.gap, QcSlotGap::BlsVerifyFailed);
+        EXPECT_STREQ(qc_slot_gap_name(gap.gap), "bls-verify-failed");
+    }
+
+    // (4) verified, but the relayed copy carries a flipped quorumIndex —
+    //     serving it is bad-qc-invalid, so the slot stays unsatisfiable and
+    //     must NOT be reported as a relay gap.
+    {
+        MineableCommitmentCache cache;
+        auto flipped = real;
+        flipped.quorumIndex = 7;    // slot's index is 0
+        ASSERT_TRUE(cache.ingest(LlmqNetwork::Mainnet, flipped));
+        cache.set_bls_verify_fn([](const CFinalCommitment&) { return true; });
+        cache.set_members_ready_fn([](uint8_t, const uint256&) { return true; });
+        RequiredQcSlot gap{};
+        EXPECT_FALSE(incident_plan(qmgr, &cache, &gap).has_value());
+        EXPECT_EQ(gap.gap, QcSlotGap::QuorumIndexMismatch);
+        EXPECT_STREQ(qc_slot_gap_name(gap.gap), "quorum-index-mismatch");
+    }
+
+    // (5) THE ONE SERVING SHAPE, for contrast: all four defects absent.
+    {
+        MineableCommitmentCache cache;
+        ASSERT_TRUE(cache.ingest(LlmqNetwork::Mainnet, real));
+        cache.set_bls_verify_fn([](const CFinalCommitment&) { return true; });
+        cache.set_members_ready_fn([](uint8_t, const uint256&) { return true; });
+        RequiredQcSlot gap{};
+        EXPECT_TRUE(incident_plan(qmgr, &cache, &gap).has_value());
+        EXPECT_TRUE(cache.verified_for(1, qh).has_value());
+        // A served height leaves the gap code UNTOUCHED. There is no "none"
+        // code to assert here on purpose: success is reported by the plan
+        // existing, never by a status word that could read as "fine" when it
+        // was in fact never measured.
+        EXPECT_EQ(gap.gap, QcSlotGap::Unevaluated);
+        EXPECT_STREQ(qc_slot_gap_name(gap.gap), "n/a");
+    }
+}
+
+TEST(DashDkgColdStart, DiagnosisNeverInfluencesTheServeDecision)
+{
+    // The gate must key off verified_for ALONE. A members_ready probe that
+    // lies in either direction changes the NAME on the refusal and nothing
+    // else — belt-and-braces against the diagnosis seam becoming a bypass.
+    auto qmgr = qmgr_with_type4_mined();
+    const uint256 qh = *fake_hash_at(kIncidentCycleBase);
+    auto real = real_commitment(kLlmq50_60, qh, 0, 0x11);
+
+    // Probe says "ready" while the verifier rejects: still fails closed.
+    MineableCommitmentCache lying_ready;
+    ASSERT_TRUE(lying_ready.ingest(LlmqNetwork::Mainnet, real));
+    lying_ready.set_bls_verify_fn([](const CFinalCommitment&) { return false; });
+    lying_ready.set_members_ready_fn([](uint8_t, const uint256&) { return true; });
+    EXPECT_FALSE(incident_plan(qmgr, &lying_ready, nullptr).has_value());
+
+    // Probe says "not ready" while the verifier accepts: still SERVES (the
+    // probe is observability, it can never withhold a valid commitment).
+    MineableCommitmentCache lying_unready;
+    ASSERT_TRUE(lying_unready.ingest(LlmqNetwork::Mainnet, real));
+    lying_unready.set_bls_verify_fn([](const CFinalCommitment&) { return true; });
+    lying_unready.set_members_ready_fn([](uint8_t, const uint256&) { return false; });
+    EXPECT_TRUE(incident_plan(qmgr, &lying_unready, nullptr).has_value());
+}
+
+TEST(DashDkgColdStart, EveryAdmissionRejectionHasItsOwnName)
+{
+    // A relayed qfcommit that structural admission drops must SAY SO. Before
+    // this, ingest returned bare false and only the accept path logged — so a
+    // later "no-commitment-cached" refusal could not be told apart from "the
+    // commitment never reached us on the wire". Opposite diagnoses.
+    using Adm = MineableCommitmentCache::Admission;
+    const uint256 qh = h256(0x55);
+    auto good = real_commitment(kLlmq50_60, qh, 0, 0x11);
+
+    MineableCommitmentCache cache;
+    // POSITIVE: the good one is accepted and says so.
+    EXPECT_EQ(cache.ingest_ex(LlmqNetwork::Mainnet, good), Adm::Accepted);
+    EXPECT_STREQ(MineableCommitmentCache::admission_name(Adm::Accepted),
+                 "accepted");
+    EXPECT_EQ(cache.cached_signers(1, qh), 50);
+
+    // NEGATIVE TWINS: one per rejection branch, each named distinctly.
+    {
+        auto bad = good; bad.llmqType = 99;
+        MineableCommitmentCache c2;
+        EXPECT_EQ(c2.ingest_ex(LlmqNetwork::Mainnet, bad), Adm::UnknownType);
+    }
+    {
+        auto bad = good;
+        bad.nVersion = CFinalCommitment::LEGACY_BLS_NON_INDEXED_QUORUM_VERSION;
+        MineableCommitmentCache c2;
+        EXPECT_EQ(c2.ingest_ex(LlmqNetwork::Mainnet, bad), Adm::WrongVersion);
+    }
+    {
+        auto bad = good; bad.signers.assign(10, true);
+        MineableCommitmentCache c2;
+        EXPECT_EQ(c2.ingest_ex(LlmqNetwork::Mainnet, bad),
+                  Adm::BitsetSizeMismatch);
+    }
+    {
+        auto bad = good;
+        bad.validMembers.assign(50, false);
+        for (int i = 0; i < 35; ++i) bad.validMembers[static_cast<size_t>(i)] = true;
+        MineableCommitmentCache c2;
+        EXPECT_EQ(c2.ingest_ex(LlmqNetwork::Mainnet, bad),
+                  Adm::ValidMembersBelowMin);
+    }
+    {
+        auto bad = good;
+        bad.signers.assign(50, false);
+        for (int i = 0; i < 35; ++i) bad.signers[static_cast<size_t>(i)] = true;
+        MineableCommitmentCache c2;
+        EXPECT_EQ(c2.ingest_ex(LlmqNetwork::Mainnet, bad), Adm::SignersBelowMin);
+    }
+    {
+        auto bad = good; bad.membersSig.fill(0);
+        MineableCommitmentCache c2;
+        EXPECT_EQ(c2.ingest_ex(LlmqNetwork::Mainnet, bad),
+                  Adm::NullCryptoFields);
+    }
+    // Keep-best-by-CountSigners: a re-relay of the SAME commitment is not a
+    // defect and must not read like one.
+    EXPECT_EQ(cache.ingest_ex(LlmqNetwork::Mainnet, good),
+              Adm::NotBetterThanCached);
+    EXPECT_EQ(cache.size(), 1u);
+
+    // Every name is distinct — a shared string would re-collapse the causes.
+    const Adm all[] = {Adm::Accepted, Adm::UnknownType, Adm::WrongVersion,
+                       Adm::BitsetSizeMismatch, Adm::ValidMembersBelowMin,
+                       Adm::SignersBelowMin, Adm::NullCryptoFields,
+                       Adm::NotBetterThanCached};
+    std::vector<std::string> names;
+    for (auto a : all) names.emplace_back(MineableCommitmentCache::admission_name(a));
+    std::sort(names.begin(), names.end());
+    EXPECT_EQ(std::adjacent_find(names.begin(), names.end()), names.end())
+        << "two admission outcomes share a name";
+
+    // And the legacy bool wrapper still means exactly "accepted".
+    MineableCommitmentCache c3;
+    EXPECT_TRUE(c3.ingest(LlmqNetwork::Mainnet, good));
+    EXPECT_FALSE(c3.ingest(LlmqNetwork::Mainnet, good));
+}

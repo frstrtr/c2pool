@@ -363,7 +363,21 @@ void DASHWorkSource::resource_template_now() const
             // is reachable, cross-check the embedded CbTx creditPoolBalance
             // against dashd getblocktemplate; on a same-height mismatch serve
             // dashd's template. Catches ANY seed bug the daemonless self-checks
-            // miss. Opt-in (--embedded-mainnet-with-dashd), not pure-daemonless.
+            // miss.
+            //
+            // WIRING (corrected 2026-08-03 — the previous claim that this is
+            // "opt-in via --embedded-mainnet-with-dashd" was stale; no such
+            // flag exists). main_dash sets gbt_xcheck_ whenever the embedded
+            // arm is enabled (testnet or --embedded-mainnet) AND a dashd RPC
+            // arm is actually ARMED. The arm-check matters: dashd_fallback_()
+            // is invoked HERE on every embedded template, and an UNARMED arm
+            // returns the empty set-gap default after printing "fallback arm
+            // UNARMED ... serving empty set-gap template" — which made every
+            // healthy daemonless serve read as a fallback. The empty payload
+            // fails parse_cbtx below so the mismatch branch is skipped and
+            // EMBEDDED is served either way; the defect was purely in what the
+            // log said, and it stole the one line that should mean a REAL
+            // fallback.
             if (sel.source == coin::WorkSource::Embedded && gbt_xcheck_ && dashd_fallback_) {
                 coin::DashWorkData dref = dashd_fallback_();
                 coin::vendor::CCbTx emb_cb, dref_cb;

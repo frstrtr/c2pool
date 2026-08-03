@@ -1797,12 +1797,30 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // to real dashd (both merkle roots reproduced from the mnlistdiff wire); the
     // SML+quorum freshness + superblock viability gates keep it fail-safe.
     work_source->set_embedded_mainnet(embedded_mainnet);
-    // Reward-safety backstop: when a dashd fallback is configured, cross-check
-    // the embedded creditPool against dashd's GBT before serving (catches any
-    // seed bug the daemonless self-checks miss). Enabled alongside the embedded
-    // arm; pure-daemonless deployments (no dashd) leave it off and rely on the
-    // independent seed-height gate.
-    work_source->set_gbt_xcheck(testnet || embedded_mainnet);
+    // Reward-safety backstop: when a dashd fallback is ARMED, cross-check the
+    // embedded creditPool against dashd's GBT before serving (catches any seed
+    // pool bug the daemonless self-checks miss).
+    //
+    // THE `&& rpc`, added 2026-08-03 — it is not a tightening, it makes the
+    // code do what this comment always claimed. The cross-check invokes the
+    // dashd_fallback lambda on EVERY embedded template. On a daemonless node
+    // that lambda is unarmed, so it printed
+    //   "[DASH-STRATUM-GBT] fallback arm UNARMED ... serving empty set-gap
+    //    template"
+    // immediately before every SUCCESSFUL EMBEDDED serve: the empty payload
+    // then failed parse_cbtx, the mismatch branch was skipped, and EMBEDDED
+    // was served correctly. Harmless to correctness, but it made a healthy
+    // daemonless log read as if the node fell back on every single template
+    // — and it stole the ONE line that should mean a real fallback. With the
+    // arm-check the line now fires only when the fallback is genuinely
+    // consulted, i.e. during an actual embedded outage.
+    const bool xcheck_wanted = (testnet || embedded_mainnet);
+    work_source->set_gbt_xcheck(xcheck_wanted && static_cast<bool>(rpc));
+    if (xcheck_wanted && !rpc) {
+        std::cout << "[DASH-STRATUM-GBT] GBT cross-check DISABLED: dashd RPC "
+                     "arm UNARMED (pure-daemonless) -- the embedded arm relies "
+                     "on the independent seed-height + pre-emit gates\n";
+    }
 
     // ── Mint slice 3/3: run-loop share minting wiring ─────────────────────
     // ShareAccept -> build_mint_share -> tracker insert -> peer broadcast.
@@ -3090,6 +3108,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             "sourced; fail-closed to null-serve otherwise)";
             }
 
+            // REFUSAL-DIAGNOSIS seam (observability only, never gates a serve):
+            // lets [QC-COMPLETENESS] tell "the member-set fetch is still in
+            // flight" apart from "the BLS signature genuinely did not verify".
+            // Reads the SAME cache the MemberKeysProvider above already reads
+            // from the template thread — no new sharing, no new lock domain.
+            qc_cache->set_members_ready_fn(
+                [qc_member_source](uint8_t t, const uint256& qh) {
+                    return qc_member_source->lookup(t, qh).has_value();
+                });
+
             // DEMUX: route the source's HISTORICAL getmnlistd replies away from
             // the tip-SML maintainer (a base=ZERO snapshot would overwrite it).
             // ADDITIVE, not a slot: the MN-checkpoint lane registers its own
@@ -3108,7 +3136,27 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 coin_state.new_qfcommit.subscribe(
                     [qc_cache, qc_net, qc_member_source]
                     (const dash::coin::vendor::CFinalCommitment& c) {
-                        if (qc_cache->ingest(qc_net, c)) {
+                        // SAY WHY on the reject path too. A relayed qfcommit
+                        // that structural admission drops used to leave NO
+                        // trace, so a later "no-commitment-cached" refusal was
+                        // indistinguishable from "the commitment never reached
+                        // us" — opposite diagnoses (our bug vs a relay hole).
+                        using Adm =
+                            dash::coin::MineableCommitmentCache::Admission;
+                        const auto adm = qc_cache->ingest_ex(qc_net, c);
+                        if (adm != Adm::Accepted) {
+                            LOG_INFO << "[QC-MINEABLE] REJECTED relayed"
+                                        " commitment type="
+                                     << static_cast<int>(c.llmqType)
+                                     << " quorum="
+                                     << c.quorumHash.GetHex().substr(0, 16)
+                                     << "... signers=" << c.CountSigners()
+                                     << " reason="
+                                     << dash::coin::MineableCommitmentCache
+                                            ::admission_name(adm)
+                                     << " cache=" << qc_cache->size();
+                        }
+                        if (adm == Adm::Accepted) {
                             LOG_INFO << "[QC-MINEABLE] cached commitment type="
                                      << static_cast<int>(c.llmqType)
                                      << " quorum="
@@ -3127,11 +3175,28 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // dashd fallback. Log the first gap once per height so the soak
             // can attribute the fallback (the hot path re-derives the plan
             // on every template build — do not log unthrottled).
-            auto qc_gap_logged_h = std::make_shared<uint32_t>(0u);
+            //
+            // BOUNDING THE REFUSAL (mainnet 2026-08-03, h=2515381 type=1 qi=0,
+            // 11 min / 14 serves dark): the commitment for a mandatory slot is
+            // announced ONCE by inv relay at DKG finalize and is only servable
+            // on getdata BY COMMITMENT HASH — a commitment relayed before this
+            // process connected CANNOT be pulled back (see the COLD-START HOLE
+            // note in dkg_commitments.hpp; verified against dashpay/dash
+            // v21.1.0). So the refusal is not a bug to route around, it is a
+            // wait — and a wait must say how long. Each refusal now names the
+            // CLASSIFIED cause, the measured commitment state, and the DKG
+            // mining window that bounds it. `qc_first_plan_h` is the first
+            // height this process ever planned; a slot whose commitment must
+            // have been relayed before that provably predates our wire
+            // presence (before we have that datum the field prints n/a).
+            auto qc_gap_logged_h  = std::make_shared<uint32_t>(0u);
+            auto qc_first_plan_h  = std::make_shared<uint32_t>(0u);
+            auto qc_cold_note_done = std::make_shared<bool>(false);
             node_coin_state.set_qc_plan_fn(
                 [&node_coin_state, hc = header_chain.get(), qc_net, qc_cache,
-                 qc_gap_logged_h]
+                 qc_gap_logged_h, qc_first_plan_h, qc_cold_note_done]
                 (uint32_t next_h) -> std::optional<dash::coin::QcBlockPlan> {
+                    if (*qc_first_plan_h == 0u) *qc_first_plan_h = next_h;
                     dash::coin::RequiredQcSlot gap{};
                     auto plan = dash::coin::build_daemonless_qc_plan(
                         qc_net, next_h, node_coin_state.qmgr(),
@@ -3150,15 +3215,77 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     if (!plan && !gap.quorum_hash.IsNull()
                         && *qc_gap_logged_h != next_h) {
                         *qc_gap_logged_h = next_h;
+                        const auto wb =
+                            dash::coin::qc_window_bound(gap.params, next_h);
+                        // "Could we ever have seen this commitment?" — the
+                        // relay happens by the window's first height at the
+                        // latest, so a window that opened before our first
+                        // planned height provably predates our wire presence.
+                        std::string predates = "n/a";
+                        if (*qc_first_plan_h != 0u && *qc_first_plan_h != next_h)
+                            predates = (wb.first_height < *qc_first_plan_h)
+                                ? "yes" : "no";
+                        std::string signers = "n/a";
+                        if (gap.cached_signers >= 0)
+                            signers = std::to_string(gap.cached_signers);
+                        // Only meaningful once a commitment is actually held —
+                        // with nothing cached the member set was never sought,
+                        // so the honest value is n/a, not "no".
+                        std::string members_ready = "n/a";
+                        if (qc_cache->has_commitment(gap.params.type,
+                                                     gap.quorum_hash)) {
+                            if (auto mr = qc_cache->members_ready(
+                                    gap.params.type, gap.quorum_hash))
+                                members_ready = *mr ? "yes" : "no";
+                        }
                         LOG_INFO << "[QC-COMPLETENESS] h=" << next_h
                                  << " mandatory slot type="
                                  << static_cast<int>(gap.params.type)
                                  << " qi=" << gap.quorum_index
                                  << " quorum="
                                  << gap.quorum_hash.GetHex().substr(0, 16)
-                                 << "... has no verified real commitment and no"
-                                    " failed-DKG evidence -> WHOLE height"
-                                    " fails closed (arm=dashd-fallback)";
+                                 << "... reason="
+                                 << dash::coin::qc_slot_gap_name(gap.gap)
+                                 << " cached_signers=" << signers
+                                 << "/" << gap.params.min_size << "(min)"
+                                 << " cache=" << qc_cache->size()
+                                 << " bls_verifier="
+                                 << (qc_cache->has_bls_verifier() ? "yes" : "no")
+                                 << " member_set_ready=" << members_ready
+                                 << " window=[" << wb.first_height << ","
+                                 << wb.last_height << "]"
+                                 << " remaining=" << wb.heights_remaining
+                                 << " first_planned_h=" << *qc_first_plan_h
+                                 << " predates_our_wire=" << predates
+                                 << " -> WHOLE height fails closed"
+                                    " (arm=dashd-fallback)";
+                        // ONE explainer per process, on the first cold-start
+                        // shaped gap: the operator must not have to re-derive
+                        // "why can't it just ask a peer?" from the source.
+                        if (gap.gap == dash::coin::QcSlotGap::NoCommitmentCached
+                            && !*qc_cold_note_done) {
+                            *qc_cold_note_done = true;
+                            LOG_INFO
+                                << "[QC-COMPLETENESS] NOTE: a mineable quorum"
+                                   " commitment is announced ONCE by inv relay"
+                                   " at DKG finalize and is served on getdata BY"
+                                   " COMMITMENT HASH only (dashcore"
+                                   " llmq/blockprocessor.cpp"
+                                   " AddMineableCommitment /"
+                                   " GetMineableCommitmentByHash) — there is NO"
+                                   " P2P request that pulls one for a"
+                                   " (type,quorumHash) we did not witness live,"
+                                   " and mnlistdiff/qrinfo carry MINED"
+                                   " commitments only. dashd's own miner mines"
+                                   " the NULL commitment here"
+                                   " (GetMineableCommitments \"null commitment"
+                                   " required\" arm); c2pool refuses instead"
+                                   " because null-serving a SUCCEEDED DKG"
+                                   " diverged merkleRootQuorums at block"
+                                   " 1520106. The refusal clears when any miner"
+                                   " mines the commitment or when the window"
+                                   " above closes — whichever comes first.";
+                        }
                     }
                     return plan;
                 });

@@ -127,6 +127,42 @@
 /// whose mandatory set includes a rotated slot therefore falls back
 /// unless every rotated slot has attested-null evidence.
 ///
+/// COLD-START HOLE — WHY THERE IS NO BACK-FILL (prior art, settled against
+/// dashpay/dash v21.1.0, 2026-08-03; mainnet incident h=2515381 type=1 qi=0):
+///
+/// A mandatory slot's commitment is NOT in any block yet — `has_mined` is
+/// false by construction, so it lives only in every full node's in-memory
+/// `minableCommitments` map. Upstream, that map is filled from exactly two
+/// places (llmq/blockprocessor.cpp):
+///   * `ProcessMessage`/`ProcessCommitment` on a relayed `qfcommit`, and
+///   * `UndoBlock` (re-mineable after a reorg),
+/// and `AddMineableCommitment` announces it ONCE — `RelayInv(CInv(
+/// MSG_QUORUM_FINAL_COMMITMENT, ::SerializeHash(fqc)))` — at DKG finalize
+/// (dkgsessionhandler.cpp HandleDKGRound tail). It is served on getdata BY
+/// COMMITMENT HASH only (`GetMineableCommitmentByHash`). There is NO
+/// request keyed by (llmqType, quorumHash), and the hash is a digest of the
+/// full commitment (signers bitset + BLS sigs), so it is not derivable from
+/// anything a cold node holds. The light-client messages do not close it
+/// either: `mnlistdiff.newQuorums` and `qrinfo.lastCommitmentPerIndex` both
+/// carry MINED commitments only — i.e. exactly the ones for which the slot
+/// no longer exists.
+///
+/// So a commitment relayed before this process connected CANNOT be pulled.
+/// Dash Core does not solve this; it has the identical hole and resolves it
+/// by MINING NULL: `GetMineableCommitments` is documented "Will return a
+/// null commitment if no mineable commitment is known and none was mined
+/// yet" and takes the `// null commitment required` arm whenever
+/// `minableCommitmentsByQuorum` has no entry for the quorum. c2pool
+/// deliberately does NOT copy that arm — see HEIGHT COMPLETENESS above: at
+/// block 1520106 null-serving a SUCCEEDED DKG diverged merkleRootQuorums.
+/// The refusal is therefore correct and stays; what this module owes the
+/// operator is a refusal that NAMES which of the several distinct causes
+/// fired and BOUNDS the wait (QcSlotGap + qc_window_bound below). The wait
+/// ends when any other miner mines the commitment (the slot then reads
+/// already-mined off the mnlistdiff-fed QuorumManager) or when the DKG
+/// mining window closes — both are bounded by cycleStart +
+/// dkgMiningWindowEnd, which is why the incident self-healed in 4 blocks.
+///
 /// MAINTENANCE: the params table + enabled sets + V19 floors below are
 /// copied VERBATIM from dashcore llmq/params.h + chainparams.cpp @
 /// cfad414. RE-DIFF on every vendored-dashcore pin bump (same rule as
@@ -220,11 +256,74 @@ inline bool is_mining_phase(const LlmqParamsView& p, uint32_t height)
 
 // ── Mandatory-slot computation ─────────────────────────────────────────────
 
+/// WHY one mandatory slot could not be satisfied. The pre-fix gate collapsed
+/// every one of these into "no verified real commitment", which is the same
+/// sentence for a cold-start relay hole (wait, bounded), a missing verifier
+/// (build defect), an unsourced member set (in flight), a failed signature
+/// (hostile/corrupt peer) and an index-flipped copy (relay DoS) — five
+/// different operator responses. `Unevaluated` is the honest value for a
+/// field/branch never reached, and prints `n/a`, never a fabricated 0.
+/// There is deliberately NO `None` value: nothing in this module can produce
+/// one. `diagnose()` is defined only AFTER verified_for has already failed
+/// (it re-runs no BLS math, so it cannot observe success), and a satisfied
+/// slot is reported by the plan existing, not by a gap code. A `None` here
+/// would be a value no code path can ever set — the kind of field that
+/// silently reads as "fine" when it simply was not measured.
+enum class QcSlotGap : uint8_t {
+    Unevaluated = 0,       // no gap was recorded on this path
+    NoCommitmentCached,    // nothing admitted for (llmqType, quorumHash)
+    VerifierAbsent,        // cached, but no BLS verifier is installed
+    MemberSetUnsourced,    // cached + verifier, member set not ready yet
+    BlsVerifyFailed,       // cached + members ready, signature check FAILED
+    QuorumIndexMismatch,   // verified, but quorumIndex != this slot's index
+};
+
+inline const char* qc_slot_gap_name(QcSlotGap g)
+{
+    switch (g) {
+        case QcSlotGap::Unevaluated:        return "n/a";
+        case QcSlotGap::NoCommitmentCached: return "no-commitment-cached";
+        case QcSlotGap::VerifierAbsent:     return "bls-verifier-absent";
+        case QcSlotGap::MemberSetUnsourced: return "member-set-unsourced";
+        case QcSlotGap::BlsVerifyFailed:    return "bls-verify-failed";
+        case QcSlotGap::QuorumIndexMismatch:return "quorum-index-mismatch";
+    }
+    return "n/a";
+}
+
 struct RequiredQcSlot {
     LlmqParamsView params;
     int16_t        quorum_index{0};
     uint256        quorum_hash;      // base block hash at cycleStart+index
+    // Observability only — never consulted by the serve decision. Populated
+    // ONLY on the fail-closed path (`first_gap`); slots returned in the
+    // mandatory-set vector leave them at their unevaluated defaults.
+    QcSlotGap      gap{QcSlotGap::Unevaluated};
+    int32_t        cached_signers{-1};   // -1 == not evaluated -> prints n/a
 };
+
+/// The bound on a refusal: the DKG mining window this slot belongs to. A
+/// mandatory slot cannot outlive its window — at cycleStart+miningWindowEnd
+/// the slot stops being required (dashcore IsMiningPhase), and in practice it
+/// disappears earlier, the moment any miner mines the commitment. So the
+/// worst-case outage IS `heights_remaining`, and it is printable.
+struct QcWindowBound {
+    uint32_t cycle_start{0};
+    uint32_t first_height{0};       // cycleStart + dkgMiningWindowStart
+    uint32_t last_height{0};        // cycleStart + dkgMiningWindowEnd (incl.)
+    uint32_t heights_remaining{0};  // incl. next_height; 0 once past the window
+};
+
+inline QcWindowBound qc_window_bound(const LlmqParamsView& p, uint32_t next_height)
+{
+    QcWindowBound b;
+    b.cycle_start  = next_height - (next_height % p.dkg_interval);
+    b.first_height = b.cycle_start + p.mining_window_start;
+    b.last_height  = b.cycle_start + p.mining_window_end;
+    b.heights_remaining = (next_height <= b.last_height)
+        ? (b.last_height - next_height + 1u) : 0u;
+    return b;
+}
 
 /// dashcore GetNumCommitmentsRequired, computed daemonlessly.
 ///
@@ -319,50 +418,135 @@ inline MutableTransaction build_qc_tx(uint32_t height,
 class MineableCommitmentCache {
 public:
     using BlsVerifyFn = std::function<bool(const vendor::CFinalCommitment&)>;
+    /// OBSERVABILITY ONLY (never gates a serve): is the deterministic member
+    /// set for (llmqType, quorumHash) already sourced? Lets a refusal
+    /// distinguish "the member-set fetch is still in flight" (wait) from "the
+    /// signature genuinely did not verify" (hostile or corrupt peer). Unset =>
+    /// the distinction is UNEVALUATED and prints n/a — it is never guessed.
+    using MembersReadyFn = std::function<bool(uint8_t, const uint256&)>;
 
     void set_bls_verify_fn(BlsVerifyFn fn) { m_bls_verify = std::move(fn); }
     bool has_bls_verifier() const { return static_cast<bool>(m_bls_verify); }
+    void set_members_ready_fn(MembersReadyFn fn) { m_members_ready = std::move(fn); }
+    bool has_members_ready_fn() const { return static_cast<bool>(m_members_ready); }
+
+    /// Member-set readiness for the slot, or std::nullopt when no probe is
+    /// installed — the caller MUST print n/a for nullopt, never a guessed bool.
+    std::optional<bool> members_ready(uint8_t llmq_type,
+                                      const uint256& quorum_hash) const
+    {
+        if (!m_members_ready) return std::nullopt;
+        return m_members_ready(llmq_type, quorum_hash);
+    }
+
+    /// Is ANY commitment admitted for this slot key (regardless of verify)?
+    bool has_commitment(uint8_t llmq_type, const uint256& quorum_hash) const
+    {
+        return m_cache.count(Key{llmq_type, quorum_hash}) != 0;
+    }
+
+    /// CountSigners of the admitted commitment, or -1 when none is held
+    /// (-1 prints n/a; a real 0 is impossible past the minSize admission).
+    int32_t cached_signers(uint8_t llmq_type, const uint256& quorum_hash) const
+    {
+        auto it = m_cache.find(Key{llmq_type, quorum_hash});
+        if (it == m_cache.end()) return -1;
+        return static_cast<int32_t>(it->second.CountSigners());
+    }
+
+    /// Classify why `verified_for` withheld this slot. Callers MUST have just
+    /// had verified_for fail — this re-runs NO BLS math (the hot path already
+    /// paid for it), it only reads the cheap state that discriminates the
+    /// causes, so it is safe on the per-template plan path.
+    QcSlotGap diagnose(uint8_t llmq_type, const uint256& quorum_hash) const
+    {
+        if (!has_commitment(llmq_type, quorum_hash))
+            return QcSlotGap::NoCommitmentCached;
+        if (!m_bls_verify) return QcSlotGap::VerifierAbsent;
+        if (m_members_ready && !m_members_ready(llmq_type, quorum_hash))
+            return QcSlotGap::MemberSetUnsourced;
+        return QcSlotGap::BlsVerifyFailed;
+    }
+
+    /// Why a relayed commitment was (not) admitted. A rejected qfcommit used
+    /// to vanish without a trace — `ingest` returned bare false and the only
+    /// log line was on the ACCEPT path, so an operator staring at a
+    /// no-commitment-cached refusal could not tell "never arrived on the
+    /// wire" from "arrived and was dropped here", which are opposite
+    /// diagnoses. Every rejection now has a name.
+    enum class Admission : uint8_t {
+        Accepted = 0,
+        UnknownType,          // llmqType not enabled on this network
+        WrongVersion,         // not the post-V19 basic-scheme variant
+        BitsetSizeMismatch,   // signers/validMembers not params.size
+        ValidMembersBelowMin, // CountValidMembers < params.minSize
+        SignersBelowMin,      // CountSigners < params.minSize
+        NullCryptoFields,     // zero pubkey / vvec / quorumSig / membersSig
+        NotBetterThanCached,  // keep-best-by-CountSigners, same as dashd
+    };
+
+    static const char* admission_name(Admission a)
+    {
+        switch (a) {
+            case Admission::Accepted:             return "accepted";
+            case Admission::UnknownType:          return "unknown-llmq-type";
+            case Admission::WrongVersion:         return "wrong-version";
+            case Admission::BitsetSizeMismatch:   return "bitset-size-mismatch";
+            case Admission::ValidMembersBelowMin: return "valid-members-below-minsize";
+            case Admission::SignersBelowMin:      return "signers-below-minsize";
+            case Admission::NullCryptoFields:     return "null-crypto-fields";
+            case Admission::NotBetterThanCached:  return "not-better-than-cached";
+        }
+        return "n/a";
+    }
 
     /// Structural admission of a relayed commitment. Returns true when the
     /// commitment was cached (new, or better than the cached one).
     bool ingest(LlmqNetwork net, const vendor::CFinalCommitment& c)
     {
+        return ingest_ex(net, c) == Admission::Accepted;
+    }
+
+    /// Same admission, but SAYING WHY on every rejection.
+    Admission ingest_ex(LlmqNetwork net, const vendor::CFinalCommitment& c)
+    {
         const LlmqParamsView* p = nullptr;
         for (const auto& e : enabled_llmqs(net))
             if (e.type == c.llmqType) { p = &e; break; }
-        if (p == nullptr) return false;
+        if (p == nullptr) return Admission::UnknownType;
         // Version must be the post-V19 basic-scheme variant for the type's
         // rotation flag (dashcore CFinalCommitment::Verify version check).
         const uint16_t expected = p->use_rotation
             ? vendor::CFinalCommitment::BASIC_BLS_INDEXED_QUORUM_VERSION
             : vendor::CFinalCommitment::BASIC_BLS_NON_INDEXED_QUORUM_VERSION;
-        if (c.nVersion != expected) return false;
+        if (c.nVersion != expected) return Admission::WrongVersion;
         // VerifySizes.
         if (c.signers.size() != p->size || c.validMembers.size() != p->size)
-            return false;
+            return Admission::BitsetSizeMismatch;
         // A REAL commitment: dashcore CFinalCommitment::Verify enforces the
         // count FLOOR at minSize, NOT threshold (VerifySizes/quorum count check:
         // CountValidMembers() >= minSize and CountSigners() >= minSize). A
         // colluding >=threshold-but-<minSize commitment passes the BLS math yet
         // is bad-qc-invalid to every dashd — admitting it (and, once member
         // sourcing lands, serving it) loses the block. Enforce minSize.
-        if (c.CountValidMembers() < p->min_size) return false;
-        if (c.CountSigners() < p->min_size) return false;
+        if (c.CountValidMembers() < p->min_size)
+            return Admission::ValidMembersBelowMin;
+        if (c.CountSigners() < p->min_size) return Admission::SignersBelowMin;
         auto all_zero = [](const auto& arr) {
             for (auto b : arr) if (b != 0) return false;
             return true;
         };
         if (all_zero(c.quorumPublicKey) || c.quorumVvecHash.IsNull()
             || all_zero(c.quorumSig) || all_zero(c.membersSig))
-            return false;
+            return Admission::NullCryptoFields;
 
         const Key k{c.llmqType, c.quorumHash};
         auto it = m_cache.find(k);
         if (it != m_cache.end()
             && it->second.CountSigners() >= c.CountSigners())
-            return false;   // already hold an equal-or-better one
+            return Admission::NotBetterThanCached;   // hold an equal-or-better one
         m_cache[k] = c;
-        return true;
+        return Admission::Accepted;
     }
 
     /// The mineable commitment for a slot — ONLY once BLS-verified. The
@@ -392,6 +576,7 @@ private:
     };
     std::map<Key, vendor::CFinalCommitment> m_cache;
     BlsVerifyFn m_bls_verify;   // unset until Phase L lands a BLS12-381 lib
+    MembersReadyFn m_members_ready;   // observability only; unset => n/a
 };
 
 // ── Daemonless provider (the piece main_dash wires in) ─────────────────────
@@ -413,7 +598,10 @@ using DkgNullEvidenceFn =
 /// attested-null (null_evidence): std::nullopt => at least one mandatory
 /// slot is unsatisfiable (or the slot set itself cannot be derived) and the
 /// embedded arm must fail closed for the WHOLE height. `first_gap`, when
-/// non-null, receives the first unsatisfiable slot (observability only).
+/// non-null, receives the first unsatisfiable slot INCLUDING its classified
+/// `gap` reason and the measured `cached_signers` (observability only — it
+/// is left untouched when the slot set itself was underivable, so a null
+/// `quorum_hash` still discriminates that case).
 inline std::optional<std::vector<vendor::CFinalCommitment>>
 daemonless_qc_commitments(
     LlmqNetwork net, uint32_t next_height,
@@ -429,6 +617,10 @@ daemonless_qc_commitments(
     std::vector<vendor::CFinalCommitment> out;
     out.reserve(slots->size());
     for (const auto& s : *slots) {
+        // Recorded ONLY if this slot ends up being the fail-closed gap; it
+        // never influences the serve decision.
+        QcSlotGap gap_reason = cache != nullptr ? QcSlotGap::Unevaluated
+                                                : QcSlotGap::NoCommitmentCached;
         if (cache != nullptr) {
             if (auto real = cache->verified_for(s.params.type, s.quorum_hash)) {
                 // quorumIndex is OUTSIDE BuildCommitmentHash (confirmed vs
@@ -444,6 +636,9 @@ daemonless_qc_commitments(
                     out.push_back(std::move(*real));
                     continue;
                 }
+                gap_reason = QcSlotGap::QuorumIndexMismatch;
+            } else {
+                gap_reason = cache->diagnose(s.params.type, s.quorum_hash);
             }
         }
         // No verified real commitment for this mandatory slot. Null is
@@ -454,7 +649,12 @@ daemonless_qc_commitments(
                                                 s.quorum_index));
             continue;
         }
-        if (first_gap != nullptr) *first_gap = s;
+        if (first_gap != nullptr) {
+            *first_gap = s;
+            first_gap->gap = gap_reason;
+            first_gap->cached_signers = cache != nullptr
+                ? cache->cached_signers(s.params.type, s.quorum_hash) : -1;
+        }
         return std::nullopt;
     }
     return out;
