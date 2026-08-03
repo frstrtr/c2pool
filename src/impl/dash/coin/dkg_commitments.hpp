@@ -163,11 +163,17 @@
 /// mining window closes — both are bounded by cycleStart +
 /// dkgMiningWindowEnd, which is why the incident self-healed in 4 blocks.
 ///
-/// MAINTENANCE: the params table + enabled sets + V19 floors below are
-/// copied VERBATIM from dashcore llmq/params.h + chainparams.cpp @
-/// cfad414. RE-DIFF on every vendored-dashcore pin bump (same rule as
-/// dkg_window.hpp) — a params change silently mis-shapes the mandatory
-/// set at window heights.
+/// MAINTENANCE: the params table + V19 floors below are copied VERBATIM
+/// from dashcore llmq/params.h + chainparams.cpp @ cfad414. The ENABLED
+/// SETS are NOT a copy of anything — they are DERIVED (see enabled_llmqs
+/// below) by evaluating dashd's runtime IsQuorumTypeEnabled predicate at
+/// our serve floor, because that predicate, not the chainparams AddLLMQ
+/// list, is what ProcessBlock requires. RE-DERIVE on every
+/// vendored-dashcore pin bump (same rule as dkg_window.hpp) — a params
+/// OR predicate change silently mis-shapes the mandatory set at window
+/// heights, and a type we require that the chain does not mine fails
+/// every window height closed forever. LlmqTypeReconciler
+/// (llmq_type_reconciler.hpp) is the runtime backstop for exactly that.
 
 #include <impl/dash/coin/quorum_manager.hpp>
 #include <impl/dash/coin/quorum_root.hpp>
@@ -218,14 +224,75 @@ inline constexpr LlmqParamsView kLlmq400_85 {3, 400, 350, 340, 576, 20, 48, 4,  
 inline constexpr LlmqParamsView kLlmq100_67 {4, 100, 80,  67,  24,  10, 18, 24, false};
 inline constexpr LlmqParamsView kLlmq25_67  {6, 25,  22,  17,  24,  10, 18, 24, false};
 
-/// Enabled LLMQ types per network, IN dashd's AddLLMQ ORDER (chainparams.cpp:
-/// mainnet 269-273, testnet 459-464). The order matters for byte parity: the
-/// miner emits qc txs in GetEnabledQuorumParams enumeration order
-/// (node/miner.cpp CreateNewBlock), which is AddLLMQ insertion order.
+/// Enabled LLMQ types per network, in dashd's enumeration order.
+///
+/// ⚠ THE ENABLED SET IS *NOT* THE chainparams AddLLMQ LIST. That was the bug
+/// this table shipped with (mainnet, fixed 2026-08-03; see LLMQ_50_60 below).
+/// dashd's consensus requirement is driven by
+/// `GetEnabledQuorumParams(chainman, pindexPrev)` (llmq/options.cpp), which
+/// FILTERS the chainparams list through
+/// `ChainstateManager::IsQuorumTypeEnabled` (validation.cpp) — a RUNTIME,
+/// HEIGHT- AND NETWORK-dependent predicate. `CQuorumBlockProcessor::ProcessBlock`
+/// iterates that filtered list, so a chainparams type the predicate rejects is
+/// NOT required (and must NOT be emitted: bad-qc-not-allowed). The filter
+/// preserves chainparams order, so the byte-parity ordering argument is
+/// unchanged: the miner emits qc txs in this enumeration order
+/// (node/miner.cpp CreateNewBlock).
+///
+/// The predicate, verbatim (dashpay/dash v23.1.7 validation.cpp
+/// ChainstateManager::IsQuorumTypeEnabled), for the types we carry:
+///
+///   LLMQ_50_60  : !fDIP0024IsActive || !fHaveDIP0024Quorums
+///                 || network == testnet || network == devnet
+///   LLMQ_60_75  : fDIP0024IsActive
+///   LLMQ_400_60 : true
+///   LLMQ_400_85 : true
+///   LLMQ_100_67 : DeploymentActiveAfter(DIP0020)
+///   LLMQ_25_67  : height >= 847000        (testnet-only type)
+///
+/// where fDIP0024IsActive = DeploymentActiveAfter(pindexPrev, DIP0024) and
+/// fHaveDIP0024Quorums = pindexPrev->nHeight >= consensus.DIP0024QuorumsHeight.
+///
+/// Evaluated at (and only at) the heights this table is ever consulted — i.e.
+/// at or above qc_serve_floor(), which is V19Height on both networks
+/// (compute_required_qc_slots refuses below it):
+///
+///   MAINNET, floor 1899072 (chainparams.cpp: DIP0020Height 1516032,
+///   DIP0024Height 1737792, DIP0024QuorumsHeight 1738698, V19Height 1899072).
+///     * LLMQ_50_60 is DISABLED: at every height >= 1738698 both DIP0024 legs
+///       are true and mainnet is neither testnet nor devnet, so the predicate
+///       returns false — PERMANENTLY, 160374 blocks BELOW our serve floor.
+///       Requiring it emitted a mandatory type-1 slot that can never be
+///       satisfied (has_mined is false forever, no commitment is ever
+///       relayed), failing the WHOLE height closed at every height in the
+///       interval-24 window [10,18] — a structural 9-in-24 outage.
+///       CORROBORATED against a live Dash Core 23.1.7 mainnet node at height
+///       2515629: `quorum list` returns exactly the four keys below, in this
+///       order, and `quorum info 1 <hash>` returns "quorum not found" where
+///       type 4 on the same hash returns a full quorum. (Note `quorum info`
+///       says "invalid LLMQ type" only for types absent from CHAINPARAMS —
+///       type 1 IS in mainnet chainparams; it is the runtime predicate that
+///       disables it. Absence from `quorum list` is the enabled-set evidence,
+///       because quorum_list enumerates GetEnabledQuorumTypes.)
+///     * The other four are all enabled at/above the floor. => 4 types.
+///
+///   TESTNET, floor 850100 (DIP0020Height 414100, DIP0024Height 769700,
+///   DIP0024QuorumsHeight 770730, V19Height 850100).
+///     * LLMQ_50_60 STAYS. The predicate's third disjunct
+///       (`NetworkIDString() == TESTNET`) is unconditional and height-
+///       independent, so LLMQ_50_60 is enabled on testnet FOREVER — it is
+///       also testnet's llmqTypeChainLocks and llmqTypeMnhf. Removing it here
+///       would be a NEW defect, symmetric-looking and wrong.
+///     * LLMQ_25_67 is enabled from height 847000 < 850100. => 6 types.
+///
+/// RE-DERIVE THIS on every vendored-dashcore pin bump, from the PREDICATE, not
+/// from the AddLLMQ list. `LlmqTypeReconciler` (llmq_type_reconciler.hpp) is
+/// the runtime backstop that names a type we require here but that the chain
+/// never actually mines — and the reverse.
 inline const std::vector<LlmqParamsView>& enabled_llmqs(LlmqNetwork net)
 {
     static const std::vector<LlmqParamsView> kMainnet{
-        kLlmq50_60, kLlmq60_75, kLlmq400_60, kLlmq400_85, kLlmq100_67};
+        kLlmq60_75, kLlmq400_60, kLlmq400_85, kLlmq100_67};
     static const std::vector<LlmqParamsView> kTestnet{
         kLlmq50_60, kLlmq60_75, kLlmq400_60, kLlmq400_85, kLlmq100_67,
         kLlmq25_67};

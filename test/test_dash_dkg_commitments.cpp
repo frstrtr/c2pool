@@ -25,6 +25,7 @@
 
 #include <impl/dash/coin/dkg_commitments.hpp>
 #include <impl/dash/coin/dkg_window.hpp>
+#include <impl/dash/coin/llmq_type_reconciler.hpp>
 #include <impl/dash/coin/quorum_manager.hpp>
 #include <impl/dash/coin/quorum_root.hpp>
 #include <impl/dash/coin/vendor/llmq_commitment.hpp>
@@ -40,6 +41,7 @@
 #include <fstream>
 #include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <vector>
@@ -79,11 +81,14 @@ TEST(DashDkgCommitments, MainnetInterval24WindowYieldsOneSlotPerType)
     auto slots = compute_required_qc_slots(
         LlmqNetwork::Mainnet, h, fake_hash_at, never_mined);
     ASSERT_TRUE(slots.has_value());
-    // Interval-24 mainnet types in AddLLMQ order: LLMQ_50_60 (1), LLMQ_100_67
-    // (4). 288/576-interval types are at phase 12, outside their windows.
-    ASSERT_EQ(slots->size(), 2u);
-    EXPECT_EQ((*slots)[0].params.type, 1);
-    EXPECT_EQ((*slots)[1].params.type, 4);
+    // The ONLY interval-24 type enabled on mainnet is LLMQ_100_67 (4).
+    // LLMQ_50_60 (1) is in mainnet chainparams but dashd's runtime
+    // IsQuorumTypeEnabled disables it at every height >= DIP0024QuorumsHeight
+    // (1738698) — far below this serve floor — so it is NOT required and
+    // must NOT appear here. 288/576-interval types are at phase 12, outside
+    // their windows.
+    ASSERT_EQ(slots->size(), 1u);
+    EXPECT_EQ((*slots)[0].params.type, 4);
     for (const auto& s : *slots) {
         EXPECT_EQ(s.quorum_index, 0);
         EXPECT_EQ(s.quorum_hash, *fake_hash_at(1'900'800u));
@@ -95,33 +100,41 @@ TEST(DashDkgCommitments, RotatedWindowFansOutPerQuorumIndexInAddLlmqOrder)
     // 1900800 is 0 mod 24/288/576, so at phase 42: LLMQ_60_75's window start
     // ([42,50], 32 rotated slots), LLMQ_400_85's window ([20,48], 1 slot),
     // AND the last interval-24 window height (42 % 24 == 18) — the slot list
-    // interleaves per AddLLMQ order: [50_60, 60_75 x32, 400_85, 100_67].
+    // interleaves per enabled-set order: [60_75 x32, 400_85, 100_67].
+    // LLMQ_50_60 is runtime-disabled on mainnet and contributes nothing.
     const uint32_t h = 1'900'800u + 42;
     auto slots = compute_required_qc_slots(
         LlmqNetwork::Mainnet, h, fake_hash_at, never_mined);
     ASSERT_TRUE(slots.has_value());
-    ASSERT_EQ(slots->size(), 1u + 32u + 1u + 1u);
-    EXPECT_EQ((*slots)[0].params.type, 1);
+    ASSERT_EQ(slots->size(), 32u + 1u + 1u);
     for (int i = 0; i < 32; ++i) {
-        const auto& s = (*slots)[1 + static_cast<size_t>(i)];
+        const auto& s = (*slots)[static_cast<size_t>(i)];
         EXPECT_EQ(s.params.type, 5);
         EXPECT_EQ(s.quorum_index, i);
         // Rotated base blocks: cycleStart + quorumIndex — DISTINCT hashes.
         EXPECT_EQ(s.quorum_hash, *fake_hash_at(1'900'800u + static_cast<uint32_t>(i)));
     }
-    EXPECT_EQ((*slots)[33].params.type, 3);
+    EXPECT_EQ((*slots)[32].params.type, 3);
     EXPECT_EQ(slots->back().params.type, 4);
 }
 
 TEST(DashDkgCommitments, AlreadyMinedCommitmentSuppressesItsSlot)
 {
     const uint32_t h = 1'900'800u + 12;
-    auto mined_type1 = [](uint8_t t, const uint256&) { return t == 1; };
+    // Mainnet's only interval-24 type is 4; mining it empties the set.
+    auto mined_type4 = [](uint8_t t, const uint256&) { return t == 4; };
     auto slots = compute_required_qc_slots(
-        LlmqNetwork::Mainnet, h, fake_hash_at, mined_type1);
+        LlmqNetwork::Mainnet, h, fake_hash_at, mined_type4);
     ASSERT_TRUE(slots.has_value());
-    ASSERT_EQ(slots->size(), 1u);
-    EXPECT_EQ((*slots)[0].params.type, 4);
+    EXPECT_TRUE(slots->empty());
+    // Testnet at the same phase keeps types 1 and 6 outstanding — the
+    // suppression is per (type, quorumHash), not blanket.
+    auto tslots = compute_required_qc_slots(
+        LlmqNetwork::Testnet, h, fake_hash_at, mined_type4);
+    ASSERT_TRUE(tslots.has_value());
+    ASSERT_EQ(tslots->size(), 2u);
+    EXPECT_EQ((*tslots)[0].params.type, 1);
+    EXPECT_EQ((*tslots)[1].params.type, 6);
 }
 
 TEST(DashDkgCommitments, NonWindowHeightYieldsEmptySet)
@@ -423,6 +436,11 @@ TEST(DashDkgCommitments, WithBlockFoldReplacesRotatedSameIndexAndSkipsNulls)
 
 TEST(DashDkgCommitments, MineableCacheStructuralAdmissionAndBlsGate)
 {
+    // NETWORK: testnet. LLMQ_50_60 (type 1) is enabled on testnet FOREVER
+    // (dashd IsQuorumTypeEnabled has an unconditional `network == testnet`
+    // disjunct) and is DISABLED on mainnet from DIP0024QuorumsHeight. This
+    // test is about admission mechanics at the 50/40/30 size/minSize/threshold
+    // shape, so it runs where that shape is real.
     MineableCommitmentCache cache;
     const uint256 qh = h256(0x55);
     auto good = real_commitment(kLlmq50_60, qh, 0, 0x11);
@@ -431,17 +449,17 @@ TEST(DashDkgCommitments, MineableCacheStructuralAdmissionAndBlsGate)
     // null crypto fields.
     {
         auto bad = good; bad.nVersion = CFinalCommitment::LEGACY_BLS_NON_INDEXED_QUORUM_VERSION;
-        EXPECT_FALSE(cache.ingest(LlmqNetwork::Mainnet, bad));
+        EXPECT_FALSE(cache.ingest(LlmqNetwork::Testnet, bad));
     }
     {
         auto bad = good; bad.signers.assign(10, true);
-        EXPECT_FALSE(cache.ingest(LlmqNetwork::Mainnet, bad));
+        EXPECT_FALSE(cache.ingest(LlmqNetwork::Testnet, bad));
     }
     {
         auto bad = good;
         bad.signers.assign(50, false);
         for (int i = 0; i < 29; ++i) bad.signers[static_cast<size_t>(i)] = true;  // below threshold (30)
-        EXPECT_FALSE(cache.ingest(LlmqNetwork::Mainnet, bad));
+        EXPECT_FALSE(cache.ingest(LlmqNetwork::Testnet, bad));
     }
     {
         // must-fix: >= threshold (30) but < minSize (40) — cryptographically
@@ -450,20 +468,20 @@ TEST(DashDkgCommitments, MineableCacheStructuralAdmissionAndBlsGate)
         auto bad = good;
         bad.signers.assign(50, false);
         for (int i = 0; i < 35; ++i) bad.signers[static_cast<size_t>(i)] = true;
-        EXPECT_FALSE(cache.ingest(LlmqNetwork::Mainnet, bad))
+        EXPECT_FALSE(cache.ingest(LlmqNetwork::Testnet, bad))
             << "admitted a >=threshold but <minSize commitment (block-losing)";
         auto bad2 = good;
         bad2.validMembers.assign(50, false);
         for (int i = 0; i < 35; ++i) bad2.validMembers[static_cast<size_t>(i)] = true;
-        EXPECT_FALSE(cache.ingest(LlmqNetwork::Mainnet, bad2));
+        EXPECT_FALSE(cache.ingest(LlmqNetwork::Testnet, bad2));
     }
     {
         auto bad = good; bad.quorumSig.fill(0);
-        EXPECT_FALSE(cache.ingest(LlmqNetwork::Mainnet, bad));
+        EXPECT_FALSE(cache.ingest(LlmqNetwork::Testnet, bad));
     }
     EXPECT_EQ(cache.size(), 0u);
 
-    ASSERT_TRUE(cache.ingest(LlmqNetwork::Mainnet, good));
+    ASSERT_TRUE(cache.ingest(LlmqNetwork::Testnet, good));
     EXPECT_EQ(cache.size(), 1u);
 
     // THE Phase-L line: without a BLS verifier the cache NEVER serves. Under
@@ -472,13 +490,13 @@ TEST(DashDkgCommitments, MineableCacheStructuralAdmissionAndBlsGate)
     EXPECT_FALSE(cache.has_bls_verifier());
     EXPECT_FALSE(cache.verified_for(1, qh).has_value());
     EXPECT_FALSE(daemonless_qc_commitments(
-        LlmqNetwork::Mainnet, 1'900'812u, fake_hash_at, never_mined, &cache)
+        LlmqNetwork::Testnet, 1'900'812u, fake_hash_at, never_mined, &cache)
             .has_value())
         << "unverifiable mandatory slots must fail the whole height closed";
     // ...and with attested failed-DKG evidence the consensus-valid nulls are
     // mined (the only case where null is canonical).
     auto plan_commitments = daemonless_qc_commitments(
-        LlmqNetwork::Mainnet, 1'900'812u, fake_hash_at, never_mined, &cache,
+        LlmqNetwork::Testnet, 1'900'812u, fake_hash_at, never_mined, &cache,
         [](uint8_t, const uint256&) { return true; });
     ASSERT_TRUE(plan_commitments.has_value());
     for (const auto& c : *plan_commitments)
@@ -778,26 +796,40 @@ namespace {
 constexpr uint32_t kIncidentHeight    = 2'515'381u;
 constexpr uint32_t kIncidentCycleBase = 2'515'368u;   // 2515381 - 2515381%24
 
-// Mainnet at kIncidentHeight has TWO interval-24 windows open (types 1 and
-// 4). Pin type 4 as already-mined so the type-1 slot is the whole story —
-// exactly the shape the incident logged (first gap = type 1, qi 0).
-QuorumManager qmgr_with_type4_mined()
+// NETWORK NOTE. The incident was LOGGED on mainnet as "type=1 qi=0", but
+// type 1 was never actually required there — that report WAS the LLMQ_50_60
+// defect (dashd's IsQuorumTypeEnabled disables LLMQ_50_60 on mainnet from
+// DIP0024QuorumsHeight=1738698, so the slot could never be satisfied by
+// anything). The mainnet coordinates are therefore now a REGRESSION vector
+// (see IncidentHeightNoLongerRequiresTheDisabledType), while the cold-start
+// NAMING mechanics — which are network-independent and still matter — are
+// exercised on TESTNET, where type 1 genuinely is enabled forever.
+//
+// At kIncidentHeight the interval-24 types are all in phase 13 of [10,18]:
+// mainnet has {4}, testnet has {1, 4, 6}. Pin every type EXCEPT 1 as
+// already-mined so the type-1 slot is the whole story — exactly the shape
+// the incident logged (first gap = type 1, qi 0).
+QuorumManager qmgr_with_others_mined()
 {
     vendor::QuorumTail tail;
     tail.newQuorums.push_back(
         real_commitment(kLlmq100_67, *fake_hash_at(kIncidentCycleBase), 0, 0x44));
+    tail.newQuorums.push_back(
+        real_commitment(kLlmq25_67, *fake_hash_at(kIncidentCycleBase), 0, 0x66));
     QuorumManager q;
     q.apply(tail);
     EXPECT_TRUE(q.find(4, *fake_hash_at(kIncidentCycleBase)).has_value());
+    EXPECT_TRUE(q.find(6, *fake_hash_at(kIncidentCycleBase)).has_value());
     return q;
 }
 
 std::optional<QcBlockPlan> incident_plan(const QuorumManager& qmgr,
                                          const MineableCommitmentCache* cache,
-                                         RequiredQcSlot* gap)
+                                         RequiredQcSlot* gap,
+                                         LlmqNetwork net = LlmqNetwork::Testnet)
 {
     return build_daemonless_qc_plan(
-        LlmqNetwork::Mainnet, kIncidentHeight, qmgr, fake_hash_at,
+        net, kIncidentHeight, qmgr, fake_hash_at,
         [](const uint256&) -> std::optional<uint32_t> { return std::nullopt; },
         cache, /*null_evidence=*/nullptr, gap);
 }
@@ -829,13 +861,56 @@ TEST(DashDkgColdStart, WindowBoundIsTheRefusalsUpperBound)
     EXPECT_FALSE(is_mining_phase(kLlmq50_60, wb.last_height + 1));
 }
 
+// THE REGRESSION PROOF for the LLMQ_50_60 fix. This test FAILS on the old
+// table (which required type 1 on mainnet -> one unsatisfiable slot -> the
+// whole height fails closed) and passes on the corrected one.
+TEST(DashDkgColdStart, IncidentHeightNoLongerRequiresTheDisabledType)
+{
+    auto qmgr = qmgr_with_others_mined();
+    auto mined = [&qmgr](uint8_t t, const uint256& qh) {
+        return qmgr.find(t, qh).has_value();
+    };
+
+    // MAINNET at the incident height: phase 13 is inside the interval-24
+    // window [10,18], and the ONLY interval-24 type mainnet enables is 4,
+    // which is already mined here. So there is no mandatory slot at all...
+    auto slots = compute_required_qc_slots(
+        LlmqNetwork::Mainnet, kIncidentHeight, fake_hash_at, mined);
+    ASSERT_TRUE(slots.has_value());
+    EXPECT_TRUE(slots->empty())
+        << "mainnet must not require a runtime-disabled llmqType";
+    for (const auto& sl : *slots)
+        EXPECT_NE(sl.params.type, 1)
+            << "LLMQ_50_60 is disabled on mainnet from DIP0024QuorumsHeight";
+
+    // ...and the height SERVES rather than failing closed. This is the
+    // 9-in-24 structural outage, gone.
+    RequiredQcSlot gap{};
+    MineableCommitmentCache empty_cache;
+    auto plan = incident_plan(qmgr, &empty_cache, &gap, LlmqNetwork::Mainnet);
+    ASSERT_TRUE(plan.has_value())
+        << "the mainnet incident height must no longer fail closed";
+    EXPECT_TRUE(plan->commitments.empty());
+
+    // NEGATIVE TWIN — this test can still fail for the right reason: with the
+    // one genuinely-required mainnet type NOT mined, the height must still
+    // fail closed (the completeness gate is untouched by the type fix).
+    QuorumManager nothing_mined;
+    RequiredQcSlot gap2{};
+    EXPECT_FALSE(incident_plan(nothing_mined, &empty_cache, &gap2,
+                               LlmqNetwork::Mainnet).has_value());
+    EXPECT_EQ(gap2.params.type, 4);
+}
+
 TEST(DashDkgColdStart, IncidentReplayFailsClosedNamingTheColdStartCause)
 {
-    auto qmgr = qmgr_with_type4_mined();
+    // TESTNET — where type 1 is genuinely required forever, so the cold-start
+    // naming mechanics the incident exercised remain covered.
+    auto qmgr = qmgr_with_others_mined();
 
     // Only the type-1 slot is outstanding — the incident's exact shape.
     auto slots = compute_required_qc_slots(
-        LlmqNetwork::Mainnet, kIncidentHeight, fake_hash_at,
+        LlmqNetwork::Testnet, kIncidentHeight, fake_hash_at,
         [&qmgr](uint8_t t, const uint256& qh) {
             return qmgr.find(t, qh).has_value();
         });
@@ -877,12 +952,12 @@ TEST(DashDkgColdStart, BackFilledCommitmentServesAndItsRemovalFailsClosed)
     // predates startup — today only live relay; no P2P back-fill exists —
     // the height must serve the moment it is BLS-verifiable, with dashd's
     // real commitment in the plan rather than a null.
-    auto qmgr = qmgr_with_type4_mined();
+    auto qmgr = qmgr_with_others_mined();
     const uint256 qh = *fake_hash_at(kIncidentCycleBase);
     auto real = real_commitment(kLlmq50_60, qh, /*quorumIndex=*/0, 0x11);
 
     MineableCommitmentCache cache;
-    ASSERT_TRUE(cache.ingest(LlmqNetwork::Mainnet, real));
+    ASSERT_TRUE(cache.ingest(LlmqNetwork::Testnet, real));
     cache.set_bls_verify_fn([](const CFinalCommitment&) { return true; });
     cache.set_members_ready_fn([](uint8_t, const uint256&) { return true; });
 
@@ -910,14 +985,14 @@ TEST(DashDkgColdStart, BackFilledCommitmentServesAndItsRemovalFailsClosed)
 
 TEST(DashDkgColdStart, EveryUnsatisfiableShapeFailsClosedWithItsOwnName)
 {
-    auto qmgr = qmgr_with_type4_mined();
+    auto qmgr = qmgr_with_others_mined();
     const uint256 qh = *fake_hash_at(kIncidentCycleBase);
     auto real = real_commitment(kLlmq50_60, qh, 0, 0x11);
 
     // (1) cached, but NO BLS verifier installed => bls-verifier-absent.
     {
         MineableCommitmentCache cache;
-        ASSERT_TRUE(cache.ingest(LlmqNetwork::Mainnet, real));
+        ASSERT_TRUE(cache.ingest(LlmqNetwork::Testnet, real));
         EXPECT_FALSE(cache.has_bls_verifier());
         RequiredQcSlot gap{};
         EXPECT_FALSE(incident_plan(qmgr, &cache, &gap).has_value());
@@ -932,7 +1007,7 @@ TEST(DashDkgColdStart, EveryUnsatisfiableShapeFailsClosedWithItsOwnName)
     // (2) cached + verifier, member set still in flight => member-set-unsourced.
     {
         MineableCommitmentCache cache;
-        ASSERT_TRUE(cache.ingest(LlmqNetwork::Mainnet, real));
+        ASSERT_TRUE(cache.ingest(LlmqNetwork::Testnet, real));
         cache.set_bls_verify_fn([](const CFinalCommitment&) { return false; });
         cache.set_members_ready_fn([](uint8_t, const uint256&) { return false; });
         RequiredQcSlot gap{};
@@ -946,7 +1021,7 @@ TEST(DashDkgColdStart, EveryUnsatisfiableShapeFailsClosedWithItsOwnName)
     //     hostile/corrupt-peer case, which must read differently from (2).
     {
         MineableCommitmentCache cache;
-        ASSERT_TRUE(cache.ingest(LlmqNetwork::Mainnet, real));
+        ASSERT_TRUE(cache.ingest(LlmqNetwork::Testnet, real));
         cache.set_bls_verify_fn([](const CFinalCommitment&) { return false; });
         cache.set_members_ready_fn([](uint8_t, const uint256&) { return true; });
         RequiredQcSlot gap{};
@@ -962,7 +1037,7 @@ TEST(DashDkgColdStart, EveryUnsatisfiableShapeFailsClosedWithItsOwnName)
         MineableCommitmentCache cache;
         auto flipped = real;
         flipped.quorumIndex = 7;    // slot's index is 0
-        ASSERT_TRUE(cache.ingest(LlmqNetwork::Mainnet, flipped));
+        ASSERT_TRUE(cache.ingest(LlmqNetwork::Testnet, flipped));
         cache.set_bls_verify_fn([](const CFinalCommitment&) { return true; });
         cache.set_members_ready_fn([](uint8_t, const uint256&) { return true; });
         RequiredQcSlot gap{};
@@ -974,7 +1049,7 @@ TEST(DashDkgColdStart, EveryUnsatisfiableShapeFailsClosedWithItsOwnName)
     // (5) THE ONE SERVING SHAPE, for contrast: all four defects absent.
     {
         MineableCommitmentCache cache;
-        ASSERT_TRUE(cache.ingest(LlmqNetwork::Mainnet, real));
+        ASSERT_TRUE(cache.ingest(LlmqNetwork::Testnet, real));
         cache.set_bls_verify_fn([](const CFinalCommitment&) { return true; });
         cache.set_members_ready_fn([](uint8_t, const uint256&) { return true; });
         RequiredQcSlot gap{};
@@ -994,13 +1069,13 @@ TEST(DashDkgColdStart, DiagnosisNeverInfluencesTheServeDecision)
     // The gate must key off verified_for ALONE. A members_ready probe that
     // lies in either direction changes the NAME on the refusal and nothing
     // else — belt-and-braces against the diagnosis seam becoming a bypass.
-    auto qmgr = qmgr_with_type4_mined();
+    auto qmgr = qmgr_with_others_mined();
     const uint256 qh = *fake_hash_at(kIncidentCycleBase);
     auto real = real_commitment(kLlmq50_60, qh, 0, 0x11);
 
     // Probe says "ready" while the verifier rejects: still fails closed.
     MineableCommitmentCache lying_ready;
-    ASSERT_TRUE(lying_ready.ingest(LlmqNetwork::Mainnet, real));
+    ASSERT_TRUE(lying_ready.ingest(LlmqNetwork::Testnet, real));
     lying_ready.set_bls_verify_fn([](const CFinalCommitment&) { return false; });
     lying_ready.set_members_ready_fn([](uint8_t, const uint256&) { return true; });
     EXPECT_FALSE(incident_plan(qmgr, &lying_ready, nullptr).has_value());
@@ -1008,7 +1083,7 @@ TEST(DashDkgColdStart, DiagnosisNeverInfluencesTheServeDecision)
     // Probe says "not ready" while the verifier accepts: still SERVES (the
     // probe is observability, it can never withhold a valid commitment).
     MineableCommitmentCache lying_unready;
-    ASSERT_TRUE(lying_unready.ingest(LlmqNetwork::Mainnet, real));
+    ASSERT_TRUE(lying_unready.ingest(LlmqNetwork::Testnet, real));
     lying_unready.set_bls_verify_fn([](const CFinalCommitment&) { return true; });
     lying_unready.set_members_ready_fn([](uint8_t, const uint256&) { return false; });
     EXPECT_TRUE(incident_plan(qmgr, &lying_unready, nullptr).has_value());
@@ -1026,7 +1101,7 @@ TEST(DashDkgColdStart, EveryAdmissionRejectionHasItsOwnName)
 
     MineableCommitmentCache cache;
     // POSITIVE: the good one is accepted and says so.
-    EXPECT_EQ(cache.ingest_ex(LlmqNetwork::Mainnet, good), Adm::Accepted);
+    EXPECT_EQ(cache.ingest_ex(LlmqNetwork::Testnet, good), Adm::Accepted);
     EXPECT_STREQ(MineableCommitmentCache::admission_name(Adm::Accepted),
                  "accepted");
     EXPECT_EQ(cache.cached_signers(1, qh), 50);
@@ -1035,18 +1110,18 @@ TEST(DashDkgColdStart, EveryAdmissionRejectionHasItsOwnName)
     {
         auto bad = good; bad.llmqType = 99;
         MineableCommitmentCache c2;
-        EXPECT_EQ(c2.ingest_ex(LlmqNetwork::Mainnet, bad), Adm::UnknownType);
+        EXPECT_EQ(c2.ingest_ex(LlmqNetwork::Testnet, bad), Adm::UnknownType);
     }
     {
         auto bad = good;
         bad.nVersion = CFinalCommitment::LEGACY_BLS_NON_INDEXED_QUORUM_VERSION;
         MineableCommitmentCache c2;
-        EXPECT_EQ(c2.ingest_ex(LlmqNetwork::Mainnet, bad), Adm::WrongVersion);
+        EXPECT_EQ(c2.ingest_ex(LlmqNetwork::Testnet, bad), Adm::WrongVersion);
     }
     {
         auto bad = good; bad.signers.assign(10, true);
         MineableCommitmentCache c2;
-        EXPECT_EQ(c2.ingest_ex(LlmqNetwork::Mainnet, bad),
+        EXPECT_EQ(c2.ingest_ex(LlmqNetwork::Testnet, bad),
                   Adm::BitsetSizeMismatch);
     }
     {
@@ -1054,7 +1129,7 @@ TEST(DashDkgColdStart, EveryAdmissionRejectionHasItsOwnName)
         bad.validMembers.assign(50, false);
         for (int i = 0; i < 35; ++i) bad.validMembers[static_cast<size_t>(i)] = true;
         MineableCommitmentCache c2;
-        EXPECT_EQ(c2.ingest_ex(LlmqNetwork::Mainnet, bad),
+        EXPECT_EQ(c2.ingest_ex(LlmqNetwork::Testnet, bad),
                   Adm::ValidMembersBelowMin);
     }
     {
@@ -1062,17 +1137,17 @@ TEST(DashDkgColdStart, EveryAdmissionRejectionHasItsOwnName)
         bad.signers.assign(50, false);
         for (int i = 0; i < 35; ++i) bad.signers[static_cast<size_t>(i)] = true;
         MineableCommitmentCache c2;
-        EXPECT_EQ(c2.ingest_ex(LlmqNetwork::Mainnet, bad), Adm::SignersBelowMin);
+        EXPECT_EQ(c2.ingest_ex(LlmqNetwork::Testnet, bad), Adm::SignersBelowMin);
     }
     {
         auto bad = good; bad.membersSig.fill(0);
         MineableCommitmentCache c2;
-        EXPECT_EQ(c2.ingest_ex(LlmqNetwork::Mainnet, bad),
+        EXPECT_EQ(c2.ingest_ex(LlmqNetwork::Testnet, bad),
                   Adm::NullCryptoFields);
     }
     // Keep-best-by-CountSigners: a re-relay of the SAME commitment is not a
     // defect and must not read like one.
-    EXPECT_EQ(cache.ingest_ex(LlmqNetwork::Mainnet, good),
+    EXPECT_EQ(cache.ingest_ex(LlmqNetwork::Testnet, good),
               Adm::NotBetterThanCached);
     EXPECT_EQ(cache.size(), 1u);
 
@@ -1089,6 +1164,298 @@ TEST(DashDkgColdStart, EveryAdmissionRejectionHasItsOwnName)
 
     // And the legacy bool wrapper still means exactly "accepted".
     MineableCommitmentCache c3;
-    EXPECT_TRUE(c3.ingest(LlmqNetwork::Mainnet, good));
-    EXPECT_FALSE(c3.ingest(LlmqNetwork::Mainnet, good));
+    EXPECT_TRUE(c3.ingest(LlmqNetwork::Testnet, good));
+    EXPECT_FALSE(c3.ingest(LlmqNetwork::Testnet, good));
+}
+
+// ── enabled-set parity + the LLMQ_50_60 fix ────────────────────────────────
+//
+// NOTE FOR REVIEWERS: several open PRs append test sections to the END of this
+// file. If this block conflicts, it is a pure append-vs-append conflict — take
+// both sides.
+//
+// GROUND TRUTH used below (all re-derivable, none of it guessed):
+//   * dashpay/dash v23.1.7 validation.cpp ChainstateManager::IsQuorumTypeEnabled
+//     — the RUNTIME predicate CQuorumBlockProcessor::ProcessBlock filters the
+//     chainparams AddLLMQ list through (via GetEnabledQuorumParams). LLMQ_50_60:
+//       !fDIP0024IsActive || !fHaveDIP0024Quorums || testnet || devnet
+//   * chainparams.cpp v23.1.7: mainnet DIP0024QuorumsHeight 1738698,
+//     V19Height 1899072; testnet 770730 / 850100, LLMQ_25_67 from 847000.
+//   * A live Dash Core 23.1.7 mainnet node at height 2515629: `quorum list`
+//     returns exactly {llmq_60_75, llmq_400_60, llmq_400_85, llmq_100_67}, in
+//     that order, and nothing else.
+
+TEST(DashLlmqEnabledSet, MainnetMatchesDashdQuorumListExactlyAndInOrder)
+{
+    // CLAIM: mainnet's enabled set == the four types a live mainnet dashd
+    // reports, in dashd's own enumeration order.
+    const auto& m = enabled_llmqs(LlmqNetwork::Mainnet);
+    ASSERT_EQ(m.size(), 4u);
+    EXPECT_EQ(m[0].type, 5);    // llmq_60_75
+    EXPECT_EQ(m[1].type, 2);    // llmq_400_60
+    EXPECT_EQ(m[2].type, 3);    // llmq_400_85
+    EXPECT_EQ(m[3].type, 4);    // llmq_100_67
+
+    // THE DEFECT, named: LLMQ_50_60 is in mainnet CHAINPARAMS but is disabled
+    // by the runtime predicate at every height >= 1738698 — 160374 blocks
+    // below our serve floor. It must never be required on mainnet.
+    for (const auto& p : m)
+        EXPECT_NE(p.type, 1)
+            << "LLMQ_50_60 is runtime-disabled on mainnet; requiring it emits a"
+               " mandatory slot nothing can ever satisfy";
+    // ...nor LLMQ_25_67, which is testnet-only.
+    for (const auto& p : m) EXPECT_NE(p.type, 6);
+}
+
+TEST(DashLlmqEnabledSet, TestnetKeepsLlmq50_60Deliberately)
+{
+    // CLAIM: the mainnet fix is NOT mirrored to testnet, and that is correct
+    // rather than an oversight. IsQuorumTypeEnabled's third disjunct
+    // (`NetworkIDString() == TESTNET`) is unconditional and height-independent,
+    // so LLMQ_50_60 is enabled on testnet forever — it is also testnet's
+    // llmqTypeChainLocks and llmqTypeMnhf. Deleting it here would be a NEW
+    // defect wearing the shape of a symmetry fix.
+    const auto& t = enabled_llmqs(LlmqNetwork::Testnet);
+    ASSERT_EQ(t.size(), 6u);
+    EXPECT_EQ(t[0].type, 1);    // llmq_50_60 — STAYS
+    EXPECT_EQ(t[1].type, 5);
+    EXPECT_EQ(t[2].type, 2);
+    EXPECT_EQ(t[3].type, 3);
+    EXPECT_EQ(t[4].type, 4);
+    EXPECT_EQ(t[5].type, 6);    // llmq_25_67, enabled from testnet h=847000
+                                // < the testnet serve floor 850100
+    // The two networks genuinely differ — this is not a copy-paste artefact.
+    EXPECT_NE(enabled_llmqs(LlmqNetwork::Mainnet).size(), t.size());
+}
+
+TEST(DashLlmqEnabledSet, NoMainnetWindowHeightEverRequiresADisabledType)
+{
+    // CLAIM: the fix holds across the whole height domain, not at one lucky
+    // height. Sweep a full 576-block superperiod (lcm of 24/288/576) above the
+    // mainnet serve floor: every mandatory slot must name a type the live
+    // mainnet node actually reports.
+    const std::set<uint8_t> dashd_types{5, 2, 3, 4};
+    size_t window_heights = 0, band_24_heights = 0;
+    for (uint32_t h = 1'900'800u; h < 1'900'800u + 576u; ++h) {
+        auto slots = compute_required_qc_slots(
+            LlmqNetwork::Mainnet, h, fake_hash_at, never_mined);
+        ASSERT_TRUE(slots.has_value()) << "h=" << h;
+        if (!slots->empty()) ++window_heights;
+        for (const auto& s : *slots) {
+            EXPECT_TRUE(dashd_types.count(s.params.type) != 0)
+                << "h=" << h << " requires type "
+                << static_cast<int>(s.params.type)
+                << " which mainnet dashd does not enable";
+            EXPECT_NE(s.params.type, 1) << "h=" << h;
+        }
+        // The interval-24 band [10,18] is the one the defect blanked: it is
+        // still a window band, but now every slot in it is type 4 — a type
+        // that IS mined, so the height is satisfiable rather than dead.
+        if (h % 24u >= 10u && h % 24u <= 18u) {
+            ++band_24_heights;
+            bool has24 = false;
+            for (const auto& s : *slots)
+                if (s.params.type == 4) has24 = true;
+            EXPECT_TRUE(has24) << "h=" << h;
+        }
+    }
+    EXPECT_EQ(band_24_heights, 9u * 24u);   // 9 of every 24 heights
+    EXPECT_GT(window_heights, 0u);
+}
+
+// ── LlmqTypeReconciler: the negative-capable backstop ──────────────────────
+
+namespace {
+
+// A mined-type stream shaped like a healthy chain: every required type shows
+// up in the active set at every tip.
+std::vector<uint8_t> healthy_types(LlmqNetwork net)
+{
+    std::vector<uint8_t> v;
+    for (const auto& p : enabled_llmqs(net)) v.push_back(p.type);
+    return v;
+}
+
+std::optional<LlmqTypeFinding> finding_for(
+    const std::vector<LlmqTypeFinding>& fs, uint8_t type)
+{
+    for (const auto& f : fs) if (f.llmq_type == type) return f;
+    return std::nullopt;
+}
+
+} // namespace
+
+TEST(DashLlmqTypeReconciler, NamesARequiredTypeThatIsNeverMined)
+{
+    // CLAIM (the guard's whole reason to exist): a type we REQUIRE but that
+    // the chain never mines is named LOUDLY, while "not yet arrived" is not.
+    // This is the exact pre-fix mainnet shape, reproduced against the REAL
+    // table by starving one genuinely-required testnet type (6 / llmq_25_67).
+    LlmqTypeReconciler r(LlmqNetwork::Testnet);
+    auto stream = healthy_types(LlmqNetwork::Testnet);
+    stream.erase(std::remove(stream.begin(), stream.end(), uint8_t{6}),
+                 stream.end());
+    for (uint32_t h = 850'200u; h <= 850'200u + 48u; ++h)
+        r.observe(h, stream);
+
+    auto d = r.defects();
+    ASSERT_EQ(d.size(), 1u) << "exactly the starved type must be indicted";
+    EXPECT_EQ(d[0].llmq_type, 6);
+    EXPECT_EQ(d[0].verdict, LlmqTypeVerdict::NeverObserved);
+    EXPECT_TRUE(d[0].required);
+    EXPECT_EQ(d[0].sightings, 0u);
+    EXPECT_STREQ(llmq_type_verdict_name(d[0].verdict),
+                 "REQUIRED-BUT-NEVER-OBSERVED");
+
+    // The rendering must NAME the type — an operator must not have to open a
+    // debugger to learn which one.
+    const auto said = r.format_defects();
+    EXPECT_NE(said.find("type=6"), std::string::npos) << said;
+    EXPECT_NE(said.find("REQUIRED-BUT-NEVER-OBSERVED"), std::string::npos)
+        << said;
+
+    // Every OTHER required type reads Observed, not "unevaluated" — the check
+    // discriminates, it does not merely shrug at everything.
+    auto all = r.reconcile();
+    for (const auto& p : enabled_llmqs(LlmqNetwork::Testnet)) {
+        auto f = finding_for(all, p.type);
+        ASSERT_TRUE(f.has_value());
+        EXPECT_EQ(f->verdict, p.type == 6 ? LlmqTypeVerdict::NeverObserved
+                                          : LlmqTypeVerdict::Observed)
+            << "type " << static_cast<int>(p.type);
+    }
+}
+
+TEST(DashLlmqTypeReconciler, SaysNothingOnAHealthyChain)
+{
+    // THE NEGATIVE CONTROL. A check that always fires is as useless as one
+    // that never can: on a chain that mines every required type, the guard
+    // must be SILENT — and format_defects() must return the empty string so
+    // no caller is tempted to log a reassuring "ok" it did not earn.
+    for (auto net : {LlmqNetwork::Mainnet, LlmqNetwork::Testnet}) {
+        LlmqTypeReconciler r(net);
+        for (uint32_t h = 1'900'800u; h <= 1'900'800u + 600u; ++h)
+            r.observe(h, healthy_types(net));
+        EXPECT_TRUE(r.defects().empty());
+        EXPECT_TRUE(r.format_defects().empty());
+        for (const auto& f : r.reconcile()) {
+            EXPECT_EQ(f.verdict, LlmqTypeVerdict::Observed);
+            EXPECT_FALSE(is_llmq_type_defect(f.verdict));
+        }
+    }
+}
+
+TEST(DashLlmqTypeReconciler, RefusesToIndictWhenTheChannelItselfIsSilent)
+{
+    // FALSE-POSITIVE DISCIPLINE. A bootstrapping / drained QuorumManager
+    // reports nothing for ANY type. Absence is only evidence when presence was
+    // demonstrable on the same channel, so the honest verdict here is
+    // Unevaluated for every type — never a blanket indictment of all of them.
+    LlmqTypeReconciler r(LlmqNetwork::Mainnet);
+    for (uint32_t h = 1'900'800u; h <= 1'900'800u + 600u; ++h)
+        r.observe(h, std::vector<uint8_t>{});
+    EXPECT_TRUE(r.defects().empty());
+    for (const auto& f : r.reconcile()) {
+        EXPECT_EQ(f.verdict, LlmqTypeVerdict::Unevaluated);
+        EXPECT_STREQ(f.pending_reason, "no-required-type-observed-anywhere");
+    }
+
+    // ...and the moment ONE required type is corroborated, the same silence
+    // about the others becomes a real finding. The rule buys discrimination,
+    // it does not disable the check.
+    for (uint32_t h = 1'901'401u; h <= 1'901'401u + 48u; ++h)
+        r.observe(h, std::vector<uint8_t>{4});
+    auto d = r.defects();
+    EXPECT_EQ(d.size(), 3u);   // types 5, 2, 3 — required, still never seen
+    for (const auto& f : d)
+        EXPECT_EQ(f.verdict, LlmqTypeVerdict::NeverObserved);
+}
+
+TEST(DashLlmqTypeReconciler, WaitsForAFullDkgCycleAndSaysWhyItIsWaiting)
+{
+    // A verdict must not outrun its evidence. Before one full DKG cycle of the
+    // starved type has elapsed under observation, the verdict is Unevaluated
+    // WITH A NAMED REASON — never a fabricated pass and never a premature
+    // indictment.
+    LlmqTypeReconciler r(LlmqNetwork::Testnet);
+    auto stream = healthy_types(LlmqNetwork::Testnet);
+    stream.erase(std::remove(stream.begin(), stream.end(), uint8_t{3}),
+                 stream.end());
+    // Too few observations first.
+    for (uint32_t h = 850'200u; h < 850'200u + 4u; ++h) r.observe(h, stream);
+    {
+        auto f = finding_for(r.reconcile(), 3);
+        ASSERT_TRUE(f.has_value());
+        EXPECT_EQ(f->verdict, LlmqTypeVerdict::Unevaluated);
+        EXPECT_STREQ(f->pending_reason, "too-few-observations");
+    }
+    // Enough observations, but LLMQ_400_85's dkgInterval is 576 and the span
+    // is far shorter — still not a completed experiment.
+    for (uint32_t h = 850'204u; h < 850'204u + 100u; ++h) r.observe(h, stream);
+    {
+        auto f = finding_for(r.reconcile(), 3);
+        ASSERT_TRUE(f.has_value());
+        EXPECT_EQ(f->verdict, LlmqTypeVerdict::Unevaluated);
+        EXPECT_STREQ(f->pending_reason, "span-shorter-than-one-dkg-cycle");
+        EXPECT_TRUE(r.defects().empty());
+    }
+    // A full 576-block cycle later it IS a completed experiment, and the
+    // guard commits to the negative.
+    for (uint32_t h = 850'304u; h <= 850'304u + 600u; ++h) r.observe(h, stream);
+    {
+        auto f = finding_for(r.reconcile(), 3);
+        ASSERT_TRUE(f.has_value());
+        EXPECT_EQ(f->verdict, LlmqTypeVerdict::NeverObserved);
+        EXPECT_STREQ(f->pending_reason, "n/a");
+    }
+}
+
+TEST(DashLlmqTypeReconciler, NamesAMinedTypeWeDoNotRequire)
+{
+    // THE OTHER DIRECTION — the half a one-directional check would miss, and
+    // the one that makes this survive a future Dash consensus change. If
+    // upstream ADDS or RE-ENABLES a type, our blocks silently omit a mandatory
+    // commitment (bad-qc-missing) with no local symptom at all. Seeing a mined
+    // type we do not require is that symptom.
+    LlmqTypeReconciler r(LlmqNetwork::Mainnet);
+    auto stream = healthy_types(LlmqNetwork::Mainnet);
+    stream.push_back(7);            // a type upstream mines and we do not model
+    for (uint32_t h = 1'900'800u; h <= 1'900'800u + 600u; ++h)
+        r.observe(h, stream);
+
+    auto d = r.defects();
+    ASSERT_EQ(d.size(), 1u);
+    EXPECT_EQ(d[0].llmq_type, 7);
+    EXPECT_EQ(d[0].verdict, LlmqTypeVerdict::UnexpectedType);
+    EXPECT_FALSE(d[0].required);
+    EXPECT_GT(d[0].sightings, 0u);
+    const auto said = r.format_defects();
+    EXPECT_NE(said.find("type=7"), std::string::npos) << said;
+    EXPECT_NE(said.find("MINED-BUT-NOT-REQUIRED"), std::string::npos) << said;
+}
+
+TEST(DashLlmqTypeReconciler, ReadsTheProductionQuorumManagerSource)
+{
+    // The production overload must observe the SAME thing the hand-fed one
+    // does — otherwise the guard tested here is not the guard that ships.
+    // The mnlistdiff-fed active set IS dashd's mined-and-active commitment
+    // set (dkg_commitments.hpp header note), so it is the mined-type source.
+    QuorumManager qmgr;
+    vendor::QuorumTail tail;
+    tail.newQuorums.push_back(real_commitment(kLlmq400_60, h256(0x21), 0, 0x01));
+    tail.newQuorums.push_back(real_commitment(kLlmq400_85, h256(0x22), 0, 0x02));
+    tail.newQuorums.push_back(real_commitment(kLlmq100_67, h256(0x23), 0, 0x03));
+    qmgr.apply(tail);
+
+    LlmqTypeReconciler r(LlmqNetwork::Mainnet);
+    for (uint32_t h = 1'900'800u; h <= 1'900'800u + 600u; ++h)
+        r.observe(h, qmgr);
+    EXPECT_EQ(r.observations(), 601u);
+
+    // Types 2/3/4 are in the active set; type 5 (rotated llmq_60_75) is not,
+    // and IS required — so it is correctly indicted rather than ignored.
+    auto d = r.defects();
+    ASSERT_EQ(d.size(), 1u);
+    EXPECT_EQ(d[0].llmq_type, 5);
+    EXPECT_EQ(d[0].verdict, LlmqTypeVerdict::NeverObserved);
 }

@@ -66,6 +66,7 @@
 #include <impl/dash/coin/dkg_window.hpp>       // dash::coin::is_dkg_commitment_window (BLOCKER-1 guard)
 #include <impl/dash/coin/dkg_commitments.hpp>  // E1: build_daemonless_qc_plan (serve DKG windows daemonlessly)
 #include <impl/dash/coin/vendor/bls_verify.hpp>  // E1 Phase-L: make_commitment_bls_verifier (real qc verify seam)
+#include <impl/dash/coin/llmq_type_reconciler.hpp>  // negative-capable enabled_llmqs backstop
 #include <impl/dash/coin/quorum_member_source.hpp>  // E1 Phase-L: daemonless member-set sourcing (the provider)
 #include <impl/dash/coin/utxo_lane.hpp>    // dash::coin::UtxoLane — embedded UTXO/fee lane (E2b, #738)
 #include <impl/dash/coin/header_chain.hpp>       // dash::coin::HeaderChain — SPV header/tip authority (E2a)
@@ -3265,11 +3266,35 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             auto qc_gap_logged_h  = std::make_shared<uint32_t>(0u);
             auto qc_first_plan_h  = std::make_shared<uint32_t>(0u);
             auto qc_cold_note_done = std::make_shared<bool>(false);
+            // NEGATIVE-CAPABLE BACKSTOP for the enabled-type table itself
+            // (llmq_type_reconciler.hpp). The mainnet LLMQ_50_60 defect was
+            // invisible because "required but NONEXISTENT" and "required but
+            // NOT YET ARRIVED" print the same refusal — the second looks like
+            // patience. This watches the mnlistdiff-fed mined set (already
+            // current at every template build, so no new wire traffic) and
+            // says the thing no per-height log can: which required type has
+            // NEVER been mined while the others plainly were — and the
+            // reverse, a mined type we do not require.
+            auto qc_type_recon =
+                std::make_shared<dash::coin::LlmqTypeReconciler>(qc_net);
+            auto qc_recon_said = std::make_shared<std::string>();
             node_coin_state.set_qc_plan_fn(
                 [&node_coin_state, hc = header_chain.get(), qc_net, qc_cache,
-                 qc_gap_logged_h, qc_first_plan_h, qc_cold_note_done]
+                 qc_gap_logged_h, qc_first_plan_h, qc_cold_note_done,
+                 qc_type_recon, qc_recon_said]
                 (uint32_t next_h) -> std::optional<dash::coin::QcBlockPlan> {
                     if (*qc_first_plan_h == 0u) *qc_first_plan_h = next_h;
+                    // Observe the MINED set at the tip we are building on.
+                    if (next_h > 0)
+                        qc_type_recon->observe(next_h - 1u,
+                                               node_coin_state.qmgr());
+                    // Log only when the SENTENCE CHANGES — a new offending
+                    // type must never be swallowed by dedup on an old one.
+                    if (auto said = qc_type_recon->format_defects();
+                        !said.empty() && said != *qc_recon_said) {
+                        *qc_recon_said = said;
+                        LOG_WARNING << said;
+                    }
                     dash::coin::RequiredQcSlot gap{};
                     auto plan = dash::coin::build_daemonless_qc_plan(
                         qc_net, next_h, node_coin_state.qmgr(),
