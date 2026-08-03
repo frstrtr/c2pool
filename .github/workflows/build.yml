@@ -5,7 +5,7 @@ on:
     branches: [master, btc-embedded, dash-spv-embedded, dgb/**, windows-build, service-update]
     tags: ['v*']
   pull_request:
-    branches: [master, btc-embedded, dash-spv-embedded, dgb/**]
+    branches: [master, btc-embedded, dash-spv-embedded, dgb/**, v37-dev]
 
 # Concurrency: a newer run on the same ref cancels the stale in-progress
 # one, cutting concurrent load on the shared self-hosted pool (the OOM/
