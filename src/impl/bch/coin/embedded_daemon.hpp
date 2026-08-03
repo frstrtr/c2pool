@@ -624,6 +624,32 @@ public:
         return "none";
     }
 
+    /// D-BCH dashboard feed: per-coin embedded-daemon topology surfaced at
+    /// core::WebServer /api/node_topology (MiningInterface::set_node_topology_fn).
+    /// Display-only -- reads live daemon state, mutates no serving/consensus
+    /// path. Each datum is named TRUTHFULLY: BCH embedded transport is
+    /// SINGLE-PEER (one explicit BCHN peer or the RPC fallback, no
+    /// coin_peer_mgr), so `embedded_peers` is 0-or-1 alongside `broadcast_route`,
+    /// NOT a multi-peer getpeerinfo table (acceptance #2: name the datum the
+    /// lane cannot supply rather than render a placeholder). p2pool-merged-v36
+    /// surface: NONE (dashboard reporting, not share/PPLNS/coinbase bytes).
+    nlohmann::json dashboard_topology() {
+        const bool     emb_p2p  = m_node.has_p2p();
+        const bool     ext_rpc  = (m_coin_node && m_coin_node->has_rpc());
+        const uint32_t synced   = ibd_synced_height();
+        const uint32_t peer_tip = m_chain.peer_tip_height();
+        return nlohmann::json{
+            {"coin", "BCH"},
+            {"embedded", true},
+            {"has_rpc", ext_rpc},
+            {"synced_height", synced},
+            {"peer_tip_height", peer_tip},
+            {"sync_pct", (peer_tip > 0 ? 100.0 * synced / peer_tip : 0.0)},
+            {"embedded_peers", emb_p2p ? 1 : 0},   // single-peer embedded transport
+            {"broadcast_route", broadcast_route()},
+        };
+    }
+
 private:
     /// Populate the three converged seed tiers (idempotent). Mirrors the DGB
     /// tier-3 wire (main_dgb.cpp): DNS (tier 1) + fixed (tier 2) from
