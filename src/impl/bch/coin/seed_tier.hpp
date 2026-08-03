@@ -33,6 +33,8 @@
 // bch coin leaves (coin/*.hpp).
 // ---------------------------------------------------------------------------
 
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 #include <utility>
@@ -236,6 +238,127 @@ public:
         }
         return result;
     }
+
+    // ── Tail-walk + re-arm SSOT (pure/testable) ──────────────────────
+    //
+    // resolve_candidates() delivers an ORDERED candidate list, but a single dial
+    // of candidates.front() left the remainder unused: on peer loss the transport
+    // re-dialed the SAME front address forever, so a permanently-dead front seed
+    // stranded the embedded node on the discovery tier even though live tail /
+    // fixed / HTTP-peer candidates were already resolved. CandidateWalk is the
+    // shared cursor the transport advances on each peer loss: it walks front ->
+    // tail in order and, on the tick that wraps past the last candidate, raises
+    // `wrapped` so the owner re-invokes resolve_candidates() to rebuild the ladder
+    // (DNS may now resolve; the HTTP-peer feed may carry fresh peers). Pure state
+    // machine -- no io_context, no sockets -- so the KAT pins the exact rotation
+    // contract master violated. This type only defines the ORDER; the backoff
+    // cadence + re-entry guard + recovery reset live in the sibling EmergencyReArm
+    // state machine below, per the fleet-canonical re-arm spec (the/docs/
+    // coin-peer-manager-rearm.md sections 2.1-2.4), applied to the BCH single-peer
+    // locus (the ladder re-resolve) as its fifth, DIFFERENT case.
+    struct CandidateWalk
+    {
+        std::vector<NetService> candidates;
+        std::size_t             cursor = 0;
+
+        bool empty() const { return candidates.empty(); }
+        std::size_t size() const { return candidates.size(); }
+
+        // Return the next candidate to dial, advancing the cursor. When the
+        // cursor has already passed the last candidate it wraps to the front and
+        // sets `wrapped` true -- the signal to re-arm via a fresh resolve. The
+        // wrapped candidate is still returned so the transport never stalls while
+        // an async re-resolve is in flight. Precondition: !empty().
+        NetService next(bool& wrapped)
+        {
+            wrapped = false;
+            if (cursor >= candidates.size()) { cursor = 0; wrapped = true; }
+            return candidates[cursor++];
+        }
+
+        // Replace the candidate list from a fresh resolve and rewind the cursor.
+        // An empty refresh is IGNORED (keep walking the last good ladder rather
+        // than stranding the transport with zero candidates).
+        void rearm(std::vector<NetService> fresh)
+        {
+            if (fresh.empty()) return;
+            candidates = std::move(fresh);
+            cursor = 0;
+        }
+    };
+
+    // ── Emergency re-arm state machine (pure/testable) ────────────────
+    //
+    // Fleet-canonical never-re-arm fix, BCH fifth/DIFFERENT locus. Spec:
+    // the/docs/coin-peer-manager-rearm.md sections 2.1-2.4. BCH has NO
+    // CoinPeerManager and NO max_peers seed-admission gate (single embedded
+    // peer), so ONLY the never-re-arm half applies; the caps half does not.
+    // The BCH re-arm cycle is the LADDER RE-RESOLVE (resolve_candidates), not
+    // the three separate DNS/fixed/HTTP timers of the peer-manager lanes -- but
+    // the three MANDATORY properties are identical and pinned here, network-free:
+    //
+    //   2.1 BACKOFF   : saturating binary exponential, delay(n) = min(base<<n,
+    //                   max). SATURATING shift -- never a bare base<<n (guards
+    //                   overflow for large n). base/max are BCH-LOCAL consts
+    //                   (no PeerManagerConfig in this lane): base=60s so the
+    //                   first re-arm is never faster than the original fixed-seed
+    //                   (60s) / http (90s) tiers; max=3600s = the ~1h ceiling.
+    //   2.2 RE-ENTRY  : single latch `active`. A starved tick under the latch is
+    //                   a NO-OP, so N starved ticks between two timer firings
+    //                   schedule EXACTLY ONE re-arm (attempt advances by 1, not
+    //                   N). Owner sets the latch by scheduling on its dedicated
+    //                   emergency timer; the timer handler releases it at the top.
+    //   2.3 STOP      : RECOVERY resets attempt:=0 + clears latch (next drop
+    //                   backs off from base, not the ceiling); SHUTDOWN is the
+    //                   owner cancelling the timer + early-returning on !running;
+    //                   FLOOR never gives up -- cadence saturates at max, a
+    //                   bounded ~1h heartbeat, not a storm and not silence.
+    struct EmergencyReArm
+    {
+        // BCH-local backoff constants (no PeerManagerConfig in the single-peer
+        // embedded lane). base is a FLOOR: first real re-arm delay >= 60s.
+        static constexpr uint32_t base_backoff_sec = 60;
+        static constexpr uint32_t max_backoff_sec  = 3600;
+
+        uint32_t attempt = 0;      // n: consecutive re-arm index, 0-based
+        bool     active  = false;  // latch: a re-arm is scheduled and pending
+
+        // Saturating binary exponential backoff: delay(n) = min(base<<n, max).
+        // The shift is computed by repeated doubling with an early clamp, so it
+        // NEVER overflows for large n (a bare `base << n` is UB once n >= 32).
+        static uint32_t delay_for(uint32_t n)
+        {
+            uint64_t d = base_backoff_sec;
+            for (uint32_t i = 0; i < n; ++i) {
+                d <<= 1;
+                if (d >= max_backoff_sec) return max_backoff_sec;
+            }
+            return d < max_backoff_sec ? static_cast<uint32_t>(d) : max_backoff_sec;
+        }
+
+        // Starvation observed on a maintenance/reconnect tick. Under the latch
+        // this is a NO-OP (nullopt) -> re-entry guard, no timer storm. Otherwise
+        // it computes delay(attempt), increments attempt, sets the latch, and
+        // returns the delay (seconds) the owner must schedule on its dedicated
+        // emergency timer.
+        std::optional<uint32_t> on_starved_tick()
+        {
+            if (active) return std::nullopt;
+            uint32_t d = delay_for(attempt);
+            ++attempt;
+            active = true;
+            return d;
+        }
+
+        // Emergency timer handler reached (the scheduled delay elapsed): release
+        // the latch at the TOP, before acting, so the next starved tick can
+        // schedule the next (longer) re-arm once this cycle's action completes.
+        void on_timer_fire() { active = false; }
+
+        // Recovery: a tick observed connected >= floor. Reset the counter to base
+        // and clear the latch so the next drop starts a FRESH backoff from base.
+        void clear() { attempt = 0; active = false; }
+    };
 
 private:
     std::vector<c2pool::dns::DnsSeed>                m_dns_seeds;

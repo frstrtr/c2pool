@@ -55,6 +55,8 @@
 #include "idle_watchdog.hpp"
 
 #include <memory>
+#include <optional>
+#include <functional>
 
 #include <boost/asio.hpp>
 
@@ -170,6 +172,23 @@ private:
     using LocatorProvider = std::function<std::vector<uint256>()>;
     LocatorProvider m_locator_provider;
 
+    // Discovery tail-walk hook. When set (by the SeedTier-discovered path), the
+    // reconnect tick consults it to ROTATE m_target_addr to the next resolved
+    // candidate on peer loss instead of re-dialing the dead front forever. Unset
+    // on the explicit-configured-peer path, so that path re-dials its single
+    // address bit-for-bit as before. Returns nullopt to leave m_target_addr
+    // unchanged (e.g. empty walk). Pure transport wiring; no share/PoW surface.
+    using NextTargetProvider = std::function<std::optional<NetService>()>;
+    NextTargetProvider m_next_target_provider;
+
+    // Peer-connected (recovery) hook. When set (by the SeedTier-discovered path),
+    // connected() invokes it so the owner can reset its emergency re-arm backoff
+    // (spec section 2.3 recovery: a live peer zeroes the attempt counter). Unset
+    // on the explicit-peer / RPC-only default, which has no emergency ladder.
+    // Pure transport wiring; no share/PoW/handshake surface change.
+    using PeerConnectedCallback = std::function<void()>;
+    PeerConnectedCallback m_peer_connected_cb;
+
 public:
     NodeP2P(io::io_context* context, bch::interfaces::Node* coin, config_t* config,
             const std::string& chain_label = "CoinP2P")
@@ -190,11 +209,31 @@ public:
         m_reconnect_timer = std::make_unique<core::Timer>(m_context, true);
         m_reconnect_timer->start(30, [this]() {
             if (!m_peer && m_reconnect_enabled) {
+                // Discovery tail-walk: on peer loss rotate m_target_addr to the
+                // NEXT resolved candidate (SeedTier walk) instead of re-dialing
+                // the dead front forever. Unset on the explicit-peer path, so
+                // that path re-dials its single configured address as before.
+                if (m_next_target_provider) {
+                    if (auto nxt = m_next_target_provider())
+                        m_target_addr = *nxt;
+                }
                 LOG_INFO << "" << "[" << m_chain_label << "] Reconnecting to " << m_target_addr.to_string() << "...";
                 core::Factory<core::Client>::connect(m_target_addr);
             }
         });
     }
+
+    /// Install the discovery tail-walk provider. Consulted on each reconnect
+    /// tick (peer loss) to rotate the dial target across the resolved candidate
+    /// ladder. No-op for the explicit-peer path (never set there).
+    void set_next_target_provider(NextTargetProvider p)
+    { m_next_target_provider = std::move(p); }
+
+    /// Install the peer-connected (recovery) callback. Invoked from connected()
+    /// once a peer socket is established, so the discovered path can reset its
+    /// emergency re-arm backoff. No-op for the explicit-peer path (never set).
+    void set_peer_connected_callback(PeerConnectedCallback cb)
+    { m_peer_connected_cb = std::move(cb); }
 
     // INetwork
     void connected(std::shared_ptr<core::Socket> socket) override
@@ -202,6 +241,12 @@ public:
         m_peer = std::make_unique<Connection>(m_context, socket);
         m_handshake_complete = false;
         LOG_INFO << "" << "[" << m_chain_label << "] Connected to " << m_target_addr.to_string();
+
+        // Recovery signal (spec 2.3): a live peer resets the owner's emergency
+        // re-arm backoff so the NEXT starvation escalates from base, not the
+        // ceiling. No-op on the explicit-peer path (callback never installed).
+        if (m_peer_connected_cb)
+            m_peer_connected_cb();
 
         // Require version/verack progress soon after connect.
         ensure_timeout_timer();
