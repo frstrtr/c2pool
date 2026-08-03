@@ -1,0 +1,204 @@
+[
+  {
+    "name": "small_miner_consolidation",
+    "contribs": [
+      {
+        "id": 1,
+        "weight": 5
+      },
+      {
+        "id": 2,
+        "weight": 3
+      },
+      {
+        "id": 1,
+        "weight": 7
+      },
+      {
+        "id": 3,
+        "weight": 1
+      },
+      {
+        "id": 1,
+        "weight": 2
+      },
+      {
+        "id": 2,
+        "weight": 4
+      },
+      {
+        "id": 4,
+        "weight": 0
+      }
+    ],
+    "trace": [
+      {
+        "index": 0,
+        "total": 5,
+        "len": 1,
+        "digest_hex": "90b809b78c624ed61808d38092da4473ea21fa00400a6f79d5b82229c0189d43"
+      },
+      {
+        "index": 1,
+        "total": 8,
+        "len": 2,
+        "digest_hex": "629021dc12741a90f6ad6e42c1a18d655e3b1aa1517c9065248747bf9ca008a8"
+      },
+      {
+        "index": 2,
+        "total": 15,
+        "len": 2,
+        "digest_hex": "20eb76d7b0d3c5958db92d94a4416e1ea2ef20544de9842b73e0185ff85d9eb7"
+      },
+      {
+        "index": 3,
+        "total": 16,
+        "len": 3,
+        "digest_hex": "07c02bb17d52779eada0b54daeefefa79bbec196a2c09175a96b4c493b5b2b05"
+      },
+      {
+        "index": 4,
+        "total": 18,
+        "len": 3,
+        "digest_hex": "d1c81d130e34b89eb61c548951dec4ea87252baf924d203457f363560e216ebb"
+      },
+      {
+        "index": 5,
+        "total": 22,
+        "len": 3,
+        "digest_hex": "90dc14c19b0fb45357060eb0ce4e32aeb0d03e3e04b95289f0d142c34c8556b6"
+      },
+      {
+        "index": 6,
+        "total": 22,
+        "len": 3,
+        "digest_hex": "90dc14c19b0fb45357060eb0ce4e32aeb0d03e3e04b95289f0d142c34c8556b6"
+      }
+    ],
+    "want_balances": [
+      {
+        "id": 1,
+        "weight": 14
+      },
+      {
+        "id": 2,
+        "weight": 7
+      },
+      {
+        "id": 3,
+        "weight": 1
+      }
+    ],
+    "want_total": 22,
+    "want_len": 3,
+    "final_digest_hex": "90dc14c19b0fb45357060eb0ce4e32aeb0d03e3e04b95289f0d142c34c8556b6"
+  },
+  {
+    "name": "carry_forward_many_ids",
+    "contribs": [
+      {
+        "id": 10,
+        "weight": 100
+      },
+      {
+        "id": 11,
+        "weight": 50
+      },
+      {
+        "id": 12,
+        "weight": 25
+      },
+      {
+        "id": 10,
+        "weight": 10
+      },
+      {
+        "id": 13,
+        "weight": 7
+      },
+      {
+        "id": 11,
+        "weight": 50
+      },
+      {
+        "id": 12,
+        "weight": 25
+      },
+      {
+        "id": 10,
+        "weight": 10
+      }
+    ],
+    "trace": [
+      {
+        "index": 0,
+        "total": 100,
+        "len": 1,
+        "digest_hex": "0f200b1284ecd1ef94b9a6a15a18f5f53dd733f0147d795716bb8e16a0c157ac"
+      },
+      {
+        "index": 1,
+        "total": 150,
+        "len": 2,
+        "digest_hex": "26baa6cb06c3723a5c33a0869a5840cdd2e13209f0465177d19ced426adae0e9"
+      },
+      {
+        "index": 2,
+        "total": 175,
+        "len": 3,
+        "digest_hex": "b3927d5a7e08787fc953a9e60ddf9ebf52a9edbf240be2ceb0e74bd0a65b5310"
+      },
+      {
+        "index": 3,
+        "total": 185,
+        "len": 3,
+        "digest_hex": "1730d5b51ccfdbc709b2bb4688d56568f6941674fdeb4d075938b6d3c2cfcfbd"
+      },
+      {
+        "index": 4,
+        "total": 192,
+        "len": 4,
+        "digest_hex": "d884ae9e70d9239010489e70fead877f23fae96cb30093009dc4660204e6ae8b"
+      },
+      {
+        "index": 5,
+        "total": 242,
+        "len": 4,
+        "digest_hex": "75adbfd6d465518be846db0e3041ff9f2b42bf369692ef6daa52cf5965da109e"
+      },
+      {
+        "index": 6,
+        "total": 267,
+        "len": 4,
+        "digest_hex": "3ca84b903bfce27f7b14adf481581323cbf409923fa3662ccf535cd399dc38b4"
+      },
+      {
+        "index": 7,
+        "total": 277,
+        "len": 4,
+        "digest_hex": "77376432d8b51949e25d12ce07331d6c37308578a1229d037629f634fa45bb90"
+      }
+    ],
+    "want_balances": [
+      {
+        "id": 10,
+        "weight": 120
+      },
+      {
+        "id": 11,
+        "weight": 100
+      },
+      {
+        "id": 12,
+        "weight": 50
+      },
+      {
+        "id": 13,
+        "weight": 7
+      }
+    ],
+    "want_total": 277,
+    "want_len": 4,
+    "final_digest_hex": "77376432d8b51949e25d12ce07331d6c37308578a1229d037629f634fa45bb90"
+  }
+]
