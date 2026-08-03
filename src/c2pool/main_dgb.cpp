@@ -60,6 +60,7 @@
 
 #include <core/filesystem.hpp>
 #include <core/stratum_server.hpp>
+#include <core/web_server.hpp>     // H-STATS.944: operator dashboard + graph_db persist
 #include <btclibs/util/strencodings.h>
 
 #include <boost/asio.hpp>
@@ -101,7 +102,7 @@ void print_banner(const char* argv0, const core::CoinParams& p)
     std::cout
         << "c2pool-dgb " << C2POOL_VERSION << " — DigiByte Scrypt-only (V36)\n\n"
         << "Usage: " << argv0
-        << " [--version] [--help] [--selftest] [--run] [--stratum [H:]P]\n"
+        << " [--version] [--help] [--selftest] [--run] [--stratum [H:]P] [--http [H:]P]\n"
         << "       [--coin-daemon H:P] [--coin-magic HEX] [--regtest]\n"
         << "       [--regtest-force-won-share] [--no-p2p-relay]\n"
         << "       [--redistribute SPEC] [--sharechain-port P]\n"
@@ -179,7 +180,9 @@ int run_node(const core::CoinParams& params, bool testnet,
              bool no_p2p_relay = false,
              const std::string& redistribute_spec = "",
              bool dev_relax_algo_softforks = false,
-             bool coin_p2p_discover = false)
+             bool coin_p2p_discover = false,
+             const std::string& http_addr = "0.0.0.0",
+             uint16_t http_port = 0)
 {
     io::io_context ioc;
 
@@ -1184,6 +1187,68 @@ int run_node(const core::CoinParams& params, bool testnet,
         }
     }
 
+    // ── Operator-facing dashboard + graph_db stats persistence (H-STATS.944) ─
+    // Option A (integrator 2026-08-03, per merged bch #1040 69c09f3c2): stand up
+    // core::WebServer + MiningInterface in THIS run path — the SAME shape btc/bch
+    // adopt — rather than an inline block, held in a function-scope unique_ptr
+    // beside stratum_server so it and its stats timer outlive ioc.run().
+    // ISOLATION: constructs existing core classes only — ZERO src/core edits — so
+    // this stays OFF the four-coin smoke gate; src/impl/dgb + main_dgb only.
+    // p2pool-merged-v36 surface: NONE (operator dashboard, not share/PPLNS/coinbase
+    // bytes). node == nullptr: dgb::Node does not implement core::IMiningNode; the
+    // dashboard + graph_db stat-log path does not require it (a live adapter is a
+    // follow-up slice). Blockchain::DIGIBYTE selects the DGB (Scrypt) graph_db pairing.
+    std::unique_ptr<core::WebServer> web_server;
+    std::shared_ptr<io::steady_timer> stats_timer;
+    if (http_port != 0) {
+        web_server = std::make_unique<core::WebServer>(
+            ioc, http_addr, http_port, testnet,
+            std::shared_ptr<core::IMiningNode>{},              // no IMiningNode adapter yet
+            c2pool::address::Blockchain::DIGIBYTE);            // DGB (Scrypt) graph_db pairing
+        auto* mi = web_server->get_mining_interface();
+#ifdef C2POOL_VERSION
+        mi->set_coin_label("DGB");
+        mi->set_pool_version("c2pool/" C2POOL_VERSION);
+#endif
+        mi->set_io_context(&ioc);
+        web_server->set_stratum_port(stratum_port);
+
+        // graph_db stats persistence — survives restarts (LTC-parity site 2/3).
+        // DGB-namespaced sub-dir isolates the per-coin stat log under config_path().
+        {
+            std::string net_label = testnet ? "testnet" : "mainnet";
+            std::string graph_db_path = (core::filesystem::config_path()
+                / net_label / "dgb" / "graph_db").string();
+            mi->set_stat_log_path(graph_db_path);
+            mi->load_stat_log();
+            std::cout << "[DGB] graph_db stats persistence -> " << graph_db_path << std::endl;
+        }
+
+        if (web_server->start()) {
+            // LTC-parity site 3/3: periodic save_stat_log every 100s. Self-
+            // rescheduling steady_timer on the SAME ioc the run-loop drives;
+            // captured by shared_ptr so it outlives each async_wait continuation.
+            stats_timer = std::make_shared<io::steady_timer>(ioc);
+            auto save_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+            *save_fn = [stats_timer, save_fn, mi](boost::system::error_code ec) {
+                if (ec) return;
+                mi->save_stat_log();
+                stats_timer->expires_after(std::chrono::seconds(100));
+                stats_timer->async_wait(*save_fn);
+            };
+            stats_timer->expires_after(std::chrono::seconds(100));
+            stats_timer->async_wait(*save_fn);
+            std::cout << "[DGB] dashboard live on http://" << http_addr << ":"
+                      << http_port << " (graph_db persist every 100s)" << std::endl;
+        } else {
+            std::cout << "[DGB] WebServer FAILED to bind " << http_addr << ":"
+                      << http_port << " — dashboard disabled, run-loop continues" << std::endl;
+            web_server.reset();
+        }
+    } else {
+        std::cout << "[DGB] dashboard disabled (no --http flag)" << std::endl;
+    }
+
     std::cout << "[DGB] run-loop up: " << network_summary(params) << "\n";
     std::cout << "[DGB] io_context running. Ctrl-C to stop." << std::endl;
 
@@ -1194,6 +1259,7 @@ int run_node(const core::CoinParams& params, bool testnet,
     // alive — explicit reset keeps destruction order safe (stratum_server was
     // declared first, so it would otherwise outlive them).
     stratum_server.reset();
+    web_server.reset();
 
     std::cout << "[DGB] io_context stopped — clean exit" << std::endl;
     return 0;
@@ -1208,6 +1274,8 @@ int main(int argc, char** argv)
     bool want_run = false;
     std::string stratum_addr = "0.0.0.0";  // bind all interfaces by default
     uint16_t    stratum_port = 0;           // 0 disables stratum; --stratum sets it
+    std::string http_addr = "0.0.0.0";     // dashboard bind addr (H-STATS.944)
+    uint16_t    http_port = 0;              // 0 disables dashboard; --http sets it (H-STATS.944)
     uint16_t    sharechain_port = 0;        // 0 = default P2P_PORT (5024); --sharechain-port overrides (opt-in isolation)
     std::string coin_daemon;                // --coin-daemon HOST:PORT (embedded P2P producer target)
     std::vector<std::byte> coin_magic;      // --coin-magic HEX (network pchMessageStart)
@@ -1264,6 +1332,18 @@ int main(int argc, char** argv)
                 stratum_port = static_cast<uint16_t>(std::stoi(ep.substr(colon + 1)));
             }
         }
+        if (std::strcmp(argv[i], "--http") == 0 && i + 1 < argc) {
+            // --http [HOST:]PORT — bind the operator dashboard + graph_db stats
+            // persistence (H-STATS.944). Omit to disable (mirrors --stratum).
+            const std::string ep = argv[++i];
+            const auto colon = ep.find(':');
+            if (colon == std::string::npos) {
+                http_port = static_cast<uint16_t>(std::stoi(ep));
+            } else {
+                http_addr = ep.substr(0, colon);
+                http_port = static_cast<uint16_t>(std::stoi(ep.substr(colon + 1)));
+            }
+        }
         if (std::strcmp(argv[i], "--coin-daemon") == 0 && i + 1 < argc) {
             coin_daemon = argv[++i];               // embedded coin-daemon P2P endpoint
         }
@@ -1312,7 +1392,8 @@ int main(int argc, char** argv)
                         rpc_endpoint, rpc_conf_path,
                         regtest, force_won_share, no_p2p_relay,
                         redistribute_spec, dev_relax_algo_softforks,
-                        coin_p2p_discover);
+                        coin_p2p_discover,
+                        http_addr, http_port);
 
     // --selftest, or a bare invocation: drive the live score path so the
     // binary exercises real consensus code, then exit cleanly.
