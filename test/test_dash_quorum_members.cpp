@@ -294,7 +294,8 @@ TEST(DashQuorumMembers, FailClosedSurfaces)
     CSimplifiedMNList sml = build_kat_sml();
     const uint256 mod = kat_modifier(dash_qmk::kLlmqType);
 
-    // rotated type -> nullopt (DIP-24 quarter rotation is the qrinfo follow-up).
+    // rotated type -> nullopt, permanently: a rotated member set is quarter
+    // rotation over a qrinfo (quorum_members_rotated.hpp), never one snapshot.
     EXPECT_FALSE(compute_quorum_members(
         QuorumMemberParams{5, 60, /*use_rotation=*/true, false}, mod, sml).has_value());
 

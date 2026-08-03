@@ -57,11 +57,12 @@
 ///     legacy_scheme = (nVersion == VER_LEGACY_BLS) — the #812 finding: the SML
 ///     nVersion is the ONLY unambiguous scheme signal for a mixed quorum.
 ///
-/// ROTATED (DIP-24, llmq_60_75): ComputeQuorumMembersByQuarterRotation over
-/// the cycle snapshots (qrinfo) is NOT implemented here — compute_quorum_members
-/// returns std::nullopt for a rotated type, so the verifier FAILS CLOSED and
-/// the rotated-window slot mines the consensus-valid null commitment (reward-
-/// safe). Documented follow-up.
+/// ROTATED (DIP-24, llmq_60_75) LIVES NEXT DOOR: a rotated member set cannot be
+/// selected from ONE snapshot, so compute_quorum_members below returns
+/// std::nullopt for a rotated type — deliberately, and permanently. The
+/// quarter-rotation computation over the qrinfo cycle snapshots is
+/// vendor::compute_quorum_members_by_quarter_rotation in
+/// quorum_members_rotated.hpp; QuorumMemberSource routes rotated types there.
 ///
 /// FAIL-CLOSED throughout: pre-V20 height, rotated type, empty/short SML, a
 /// selected MN with a zero operator key, fewer confirmed+valid MNs than the
@@ -201,7 +202,9 @@ inline std::optional<std::vector<MemberOperatorKey>> compute_quorum_members(
     const QuorumMemberParams& params, const uint256& modifier,
     const CSimplifiedMNList& sml)
 {
-    if (params.use_rotation) return std::nullopt;   // DIP-24: qrinfo follow-up
+    // DIP-24: rotated selection is quarter rotation over a qrinfo, never a
+    // single snapshot — see quorum_members_rotated.hpp.
+    if (params.use_rotation) return std::nullopt;
     if (params.size == 0) return std::nullopt;
 
     struct Scored {
