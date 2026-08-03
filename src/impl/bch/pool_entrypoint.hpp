@@ -668,6 +668,31 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
         mi->set_io_context(&ioc);
         web_server->set_stratum_port(stratum_port);
 
+        // D-BCH dashboard feeds (integrator 2026-08-03): wire the live BCH
+        // data sources into the MiningInterface the H-STATS.944 seam already
+        // stood up (it was constructed with a NULL IMiningNode + zero feeds,
+        // so /api rendered empty). Reuses core/web_server.hpp generic feed
+        // setters (the same LTC-parity shape) -- ZERO src/core edit. The
+        // lambdas capture daemon/node by reference; both are declared at the
+        // top of standup_pool_run and outlive ioc.run(), so no dangle. All
+        // reads are display-only (lock-free snapshots / atomics).
+        //   /api/node_topology -- BCHN embedded daemon peers + synced height.
+        mi->set_node_topology_fn([&daemon]() { return daemon.dashboard_topology(); });
+        //   share-peers -- the pool node sharechain P2P peer snapshot.
+        mi->set_peer_info_fn([&node]() { return node.get_peer_info_json(); });
+        //   pool hashrate -- lock-free tracker snapshot published by think().
+        mi->set_pool_hashrate_fn([&node]() { return node.get_tracker_snapshot().pool_hashrate; });
+        //   sharechain stats -- chain/verified/head counts + hashrate.
+        mi->set_sharechain_stats_fn([&node]() {
+            auto s = node.get_tracker_snapshot();
+            return nlohmann::json{
+                {"chain_count", s.chain_count},
+                {"verified_count", s.verified_count},
+                {"head_count", s.head_count},
+                {"pool_hashrate", s.pool_hashrate},
+            };
+        });
+
         // graph_db stats persistence -- survives restarts (LTC-parity site 2/3;
         // mirrors main_ltc.cpp:1967-1973). BCH-namespaced sub-dir keeps the
         // per-coin stat log isolated under the shared config path.
