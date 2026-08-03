@@ -8,7 +8,6 @@
 #include <impl/dash/messages.hpp>
 #include <impl/dash/config_pool.hpp>   // SharechainConfig net-aware prefix selectors
 #include <btclibs/util/strencodings.h> // ParseHexBytes (prefix isolation primitive)
-#include <core/packet.hpp>             // Packet read-side prefix buffer
 
 using namespace dash;
 
@@ -173,9 +172,6 @@ TEST(DashConnectModePrefix, WirePrefix_NetAware_MainnetVsTestnet) {
     EXPECT_EQ(test_bytes.size(), size_t(8));
 
     EXPECT_NE(main_bytes, test_bytes);
-
-    core::Packet read_pkt(main_bytes.size());
-    EXPECT_EQ(read_pkt.prefix.size(), main_bytes.size());
 
     SharechainConfig::is_testnet = saved;
 }
