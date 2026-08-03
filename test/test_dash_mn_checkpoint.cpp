@@ -4508,3 +4508,292 @@ TEST(DashMnCheckpointReviveProbe, ProbeAnsweringNotBannedIsAMeasurementAndAsksOn
               std::string::npos)
         << rig.h.lane.revive_probe_report();
 }
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 16. THE RE-ARM LADDER MUST BE REACHABLE FROM A PATH THE FAILURE DOES NOT KILL
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// MEASURED (contabo daemonless soak0803c/d, 2026-08-03). The bridge failed
+// closed at 06:13:50 announcing "re-arms remaining: 2 — a further payee desync
+// from the maintainer will trigger one". 2h39m later: process alive, tip
+// advanced 69 blocks (68 PAST the 64-block backoff gate), 90 templates served,
+// the EMBED-GATE heartbeat still printing "cause=mn-needs-reseed value=latched"
+// every five minutes — and ZERO further asks, ZERO re-arms, ZERO MN-CKPT lines
+// of any kind.
+//
+// The cause is structural, not a missed if. rearm() had ONE caller
+// (main_dash's set_on_mn_reseed lambda); that callback has ONE invoker
+// (CoinStateMaintainer::on_block_connected's payee-desync/apply-gap branch);
+// that branch needs a PROJECTED payee, i.e. a NON-EMPTY payee queue; and its
+// own first act is to WIPE the queue and zero the apply cursor. Only a lane
+// PUBLISH refills it. A bridge that fails closed never publishes, so a second
+// ask is arithmetically impossible: the ladder's trigger was the one event its
+// own failure had already ruled out.
+//
+// These cases pin the fix AT THE TRIGGER. Each fails on the pre-fix lane,
+// because there pump() returns at its state guard and nothing else ever
+// reaches rearm().
+
+namespace {
+
+// A lane driven exactly the way main_dash drives it: pump() on every tip
+// change and nothing else. No test-only entry point — "reachable from the real
+// driver" is the property under test.
+//
+// Never returned by value: BridgeHarness's seams capture `this`.
+struct TipDrivenLane {
+    BridgeHarness h;
+    MnCheckpoint  cp{good_checkpoint()};
+
+    TipDrivenLane()
+    {
+        h.headers[kAnchorHeight] = uint256S(kAnchorHash);
+        h.blocks[1519544] = block_from_hex(kBlockHex1519544);
+        h.blocks[1519545] = block_from_hex(kBlockHex1519545);
+        h.blocks[1519546] = block_from_hex(kBlockHex1519546);
+        h.tip = 1519546;
+    }
+
+    // main_dash: header_chain->set_on_tip_changed -> mnl->pump().
+    void tip_advances_to(uint32_t height)
+    {
+        h.tip = height;
+        h.lane.pump();
+    }
+};
+
+// Fail the lane closed AFTER a full replay: the bridge reaches the tip and
+// finds no publish seam. Distinct cursor, repairable cause.
+void fail_closed_on_publish_seam(TipDrivenLane& t)
+{
+    t.h.lane.set_publish_fn({});
+    t.h.lane.arm(t.cp);
+    t.h.lane.pump();
+    ASSERT_EQ(t.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << t.h.lane.status();
+}
+
+} // namespace
+
+// ── 16.1 THE FINDING, AND THE FIX. A tip advance past the gate re-arms the
+// bridge with NO maintainer ask — because no maintainer ask is possible.
+TEST(DashMnCheckpointSelfReArm, TipAdvancePastTheGateReArmsWithNoDesyncAsk)
+{
+    TipDrivenLane t;
+    ASSERT_NO_FATAL_FAILURE(fail_closed_on_publish_seam(t));
+    auto& lane = t.h.lane;
+    ASSERT_EQ(lane.rearms(), 0u);
+    ASSERT_EQ(lane.rearm_asks(), 0u)
+        << "the trigger under test is NOT an ask — nothing may have asked";
+
+    const uint32_t gate = lane.rearm_gate_height();
+    ASSERT_NE(gate, 0u) << "a recoverable fail-close must publish a gate";
+
+    // The ONLY input from here on: the chain moves. No ask, no callback, no
+    // restart, no operator.
+    t.tip_advances_to(gate);
+
+    EXPECT_EQ(lane.rearms(), 1u)
+        << "THE DEFECT: the ladder was triggerable only by an event the"
+           " fail-close had already made impossible. "
+        << lane.rearm_posture();
+    EXPECT_EQ(lane.rearm_asks(), 1u);
+    EXPECT_NE(lane.state(), MnCheckpointLane::State::FailedClosed)
+        << "the lane must have left the terminal state: " << lane.status();
+    EXPECT_NE(lane.last_rearm_trigger().find("SELF RE-ARM"), std::string::npos)
+        << "the recovery must name which PATH pulled the trigger — with two"
+           " callers, 'a re-arm happened' no longer identifies it: "
+        << lane.last_rearm_trigger();
+    EXPECT_EQ(lane.anchor_height(), kAnchorHeight)
+        << "a self re-arm is still oldest-first: the release-pinned anchor";
+}
+
+// ── 16.2 BOUNDED. The gate is measured from the tip AT THE FAIL-CLOSE, so the
+// ORIGINAL arm's failure (no ladder backoff applies yet) is never retried over
+// the identical window on the very next block.
+TEST(DashMnCheckpointSelfReArm, TheGateHoldsUntilTheChainHasActuallyMoved)
+{
+    TipDrivenLane t;
+    ASSERT_NO_FATAL_FAILURE(fail_closed_on_publish_seam(t));
+    auto& lane = t.h.lane;
+
+    const uint32_t failed_at = t.h.tip;
+    const uint32_t gate      = lane.rearm_gate_height();
+    ASSERT_EQ(gate, failed_at + MnCheckpointLane::kRearmBackoffBlocks)
+        << "the gate must be the fail-close tip plus the backoff, or the very"
+           " next block replays the identical window";
+
+    // Every block up to gate-1 is a real tip advance through the real driver.
+    for (uint32_t h = failed_at + 1; h < gate; ++h) {
+        t.tip_advances_to(h);
+        ASSERT_EQ(lane.rearms(), 0u)
+            << "re-armed at h=" << h << ", " << (gate - h)
+            << " blocks early: " << lane.rearm_posture();
+        ASSERT_EQ(lane.rearm_asks(), 0u)
+            << "a deferred attempt must not even be ASKED for once per block —"
+               " that is a per-block log storm dressed as recovery";
+        ASSERT_EQ(lane.state(), MnCheckpointLane::State::FailedClosed);
+    }
+
+    t.tip_advances_to(gate);
+    EXPECT_EQ(lane.rearms(), 1u)
+        << "and at the gate it must actually fire: " << lane.rearm_posture();
+}
+
+// ── 16.3 BOUNDED, TERMINALLY. A re-armed replay that dies at the SAME cursor
+// is measured proof the failure is deterministic; the ladder must stop rather
+// than spend its remaining rungs reproducing it.
+TEST(DashMnCheckpointSelfReArm, IdenticalRepeatFailureBlocksTheLadderAndSaysSo)
+{
+    TipDrivenLane t;
+    auto& lane = t.h.lane;
+    // A staleness refusal reproduces EXACTLY: same cursor, every time.
+    lane.set_max_bridge_blocks(10);
+    t.h.tip = kAnchorHeight + 100;
+    lane.arm(t.cp);
+    lane.pump();
+    ASSERT_EQ(lane.state(), MnCheckpointLane::State::FailedClosed);
+    ASSERT_NE(lane.status().find("STALE"), std::string::npos) << lane.status();
+    ASSERT_FALSE(lane.rearm_blocked())
+        << "ONE fail-close is not evidence of determinism — the first recovery"
+           " must not be pre-emptively blocked";
+
+    t.tip_advances_to(lane.rearm_gate_height());
+    EXPECT_EQ(lane.rearms(), 1u)
+        << "the ladder must still get its first rung: " << lane.rearm_posture();
+    EXPECT_TRUE(lane.rearm_blocked())
+        << "the re-armed replay died at the same cursor — deterministic, so"
+           " terminal: " << lane.rearm_posture();
+    EXPECT_NE(lane.rearm_posture().find("IDENTICAL"), std::string::npos)
+        << lane.rearm_posture();
+    EXPECT_EQ(lane.rearm_gate_height(), 0u)
+        << "a blocked ladder has no gate — 0 is 'no height admits one'";
+
+    // ...and it stays blocked however far the chain moves.
+    for (int i = 0; i < 5; ++i) t.tip_advances_to(t.h.tip + 1000);
+    EXPECT_EQ(lane.rearms(), 1u);
+    EXPECT_NE(lane.rearm_posture().find("remaining capacity: NONE"),
+              std::string::npos)
+        << lane.rearm_posture();
+}
+
+// ── 16.4 THE MISLEADING NUMBER. "re-arms remaining: 2" was printed for 2h39m
+// about capacity nothing could spend. The posture must distinguish reachable
+// from unreachable, and it must ride on status(), not only on scrollback.
+TEST(DashMnCheckpointSelfReArm, PostureNamesReachableVersusUnreachableCapacity)
+{
+    TipDrivenLane t;
+    ASSERT_NO_FATAL_FAILURE(fail_closed_on_publish_seam(t));
+    auto& lane = t.h.lane;
+
+    // REACHABLE: says so, and says at which height.
+    EXPECT_NE(lane.status().find("REACHABLE"), std::string::npos)
+        << "the STATE must say its own name, not just the log: " << lane.status();
+    EXPECT_NE(lane.status().find(std::to_string(lane.rearm_gate_height())),
+              std::string::npos)
+        << "an operator must be able to read the gate height off the state: "
+        << lane.status();
+    EXPECT_EQ(lane.status().find("a further payee desync from the maintainer"
+                                 " will trigger one"),
+              std::string::npos)
+        << "THE MISLEADING SENTENCE: no such desync is possible — the"
+           " maintainer's queue is wiped: " << lane.status();
+    EXPECT_TRUE(lane.rearm_self_reachable()) << lane.rearm_posture();
+
+    // STRUCTURALLY UNREACHABLE: with no tip seam there is no live trigger and
+    // no way to measure the backoff. Remaining capacity is still 2 — and it is
+    // still unspendable, which is exactly what must NOT read as availability.
+    lane.set_tip_height_fn({});
+    EXPECT_FALSE(lane.rearm_self_reachable());
+    EXPECT_NE(lane.rearm_posture().find("STRUCTURALLY UNREACHABLE"),
+              std::string::npos)
+        << lane.rearm_posture();
+    EXPECT_NE(lane.rearm_posture().find("CANNOT be spent"), std::string::npos)
+        << lane.rearm_posture();
+}
+
+// ── 16.5 THE CAP STILL BOUNDS THE NEW TRIGGER. An exhausted ladder must not be
+// re-ASKED once per block: that is a per-block ERROR storm, and it is how a
+// bounded mechanism turns back into the fail-loop the cap exists to prevent.
+TEST(DashMnCheckpointSelfReArm, AnExhaustedLadderIsNotReAskedOncePerBlock)
+{
+    TipDrivenLane t;
+    auto& lane = t.h.lane;
+    lane.arm(t.cp);
+    lane.pump();
+    ASSERT_EQ(lane.state(), MnCheckpointLane::State::Published);
+
+    // Spend the whole ladder through the ask path, exactly as case 12 does.
+    ASSERT_EQ(lane.rearm(t.cp, "desync 1"), MnCheckpointLane::RearmOutcome::Armed);
+    t.h.tip += MnCheckpointLane::kRearmBackoffBlocks;
+    ASSERT_EQ(lane.rearm(t.cp, "desync 2"), MnCheckpointLane::RearmOutcome::Armed);
+    t.h.tip += MnCheckpointLane::kRearmBackoffBlocks * 2;
+    ASSERT_EQ(lane.rearm(t.cp, "desync 3"), MnCheckpointLane::RearmOutcome::Armed);
+    ASSERT_EQ(lane.rearms(), MnCheckpointLane::kMaxRearms);
+
+    // Fail it closed with the cap already spent.
+    lane.set_max_bridge_blocks(10);
+    lane.pump();
+    ASSERT_EQ(lane.state(), MnCheckpointLane::State::FailedClosed) << lane.status();
+    const uint32_t asks = lane.rearm_asks();
+
+    for (int i = 0; i < 200; ++i) t.tip_advances_to(t.h.tip + 1);
+
+    EXPECT_EQ(lane.rearms(), MnCheckpointLane::kMaxRearms)
+        << "the cap must survive the new trigger";
+    EXPECT_EQ(lane.rearm_asks(), asks)
+        << "200 tip advances produced " << (lane.rearm_asks() - asks)
+        << " fresh asks — an exhausted ladder must go quiet, not print an ERROR"
+           " per block";
+    EXPECT_EQ(lane.rearm_gate_height(), 0u);
+    EXPECT_FALSE(lane.rearm_self_reachable());
+    EXPECT_NE(lane.rearm_posture().find("EXHAUSTED"), std::string::npos)
+        << lane.rearm_posture();
+}
+
+// ── 16.6 END TO END, through the REAL maintainer. The finding and the fix in
+// one rig: after a fail-closed bridge the maintainer can NEVER ask again, and
+// the lane has to come back without one.
+TEST(DashMnCheckpointSelfReArm, NoSecondAskIsPossibleSoTheLaneMustRecoverAlone)
+{
+    ReseedRig r(/*wire_the_reseed_seam=*/true);
+    r.h.lane.arm(r.anchor);
+    r.h.lane.pump();
+    ASSERT_EQ(r.h.lane.state(), MnCheckpointLane::State::Published);
+    r.fire_tip();
+    ASSERT_TRUE(r.state.populated());
+
+    // Break the publish seam first, so the re-arm the ask produces FAILS
+    // CLOSED — the soak's shape exactly.
+    r.h.lane.set_publish_fn({});
+    ASSERT_TRUE(r.force_apply_gap().gap_detected);
+    ASSERT_EQ(r.reseed_calls, 1u);
+    ASSERT_EQ(r.h.lane.rearms(), 1u);
+    ASSERT_EQ(r.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << r.h.lane.status();
+    ASSERT_TRUE(r.state.mn_needs_reseed());
+    ASSERT_FALSE(r.state.populated());
+
+    // THE FINDING. Keep feeding the maintainer blocks. It cannot ask again:
+    // its payee queue is wiped, so apply_block resolves no projected payee and
+    // the desync branch is unreachable. This holds before AND after the fix —
+    // it is the reason the fix cannot live on the ask path.
+    for (uint32_t h = 1519549; h < 1519559; ++h)
+        r.maint.on_block_connected(block_from_hex(kBlockHex1519546), h);
+    EXPECT_EQ(r.reseed_calls, 1u)
+        << "a second ask is arithmetically impossible after the wipe — any"
+           " recovery that waits for one waits forever";
+
+    // ...so the recovery has to come from the tip seam, which is still alive.
+    const uint32_t gate = r.h.lane.rearm_gate_height();
+    ASSERT_NE(gate, 0u) << r.h.lane.rearm_posture();
+    r.h.tip = gate;
+    r.h.lane.pump();
+
+    EXPECT_EQ(r.reseed_calls, 1u) << "and it must do so WITHOUT a second ask";
+    EXPECT_EQ(r.h.lane.rearms(), 2u) << r.h.lane.rearm_posture();
+    EXPECT_NE(r.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << "the lane stayed terminal with the gate long cleared — this is the"
+           " 2h39m the soak measured: " << r.h.lane.status();
+}

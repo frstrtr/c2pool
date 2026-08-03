@@ -480,6 +480,11 @@ public:
         auto say = [&](RearmOutcome o, const std::string& detail) {
             m_last_rearm_reason = std::string(rearm_outcome_name(o)) + ": "
                                   + detail;
+            // WHO pulled the trigger, kept separately from WHAT happened. With
+            // two callers (the maintainer's ask and the lane's own tip-seam
+            // poll) "a re-arm occurred" no longer identifies the path, and the
+            // path is the thing this file got wrong.
+            m_last_rearm_trigger = why;
             std::ostringstream ln;
             ln << "[MN-CKPT] RE-ARM " << rearm_outcome_name(o)
                << " (ask #" << m_rearm_asks << ", attempt " << attempt_s
@@ -621,6 +626,181 @@ public:
                    " the dashd fallback.");
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // SELF RE-ARM — the trigger path that SURVIVES the failure it recovers
+    // ─────────────────────────────────────────────────────────────────────
+    //
+    // WHAT WAS BROKEN (measured, contabo daemonless soak0803c/d, 2026-08-03).
+    // rearm() had exactly ONE caller: main_dash's
+    // maintainer->set_on_mn_reseed callback. That callback has exactly ONE
+    // invoker: CoinStateMaintainer::on_block_connected's payee-desync /
+    // apply-gap branch. That branch can only fire when apply_block resolves a
+    // PROJECTED payee — i.e. on a NON-EMPTY payee queue — and its own first act
+    // is to WIPE that queue (mnstates().load({}), which also zeroes the apply
+    // cursor, so gap_detected cannot fire either). Only a lane PUBLISH refills
+    // it. So the ask chain is a closed cycle:
+    //
+    //     ask -> rearm() -> bridge -> PUBLISH -> queue refilled -> next ask
+    //
+    // and a bridge that FAILS CLOSED never publishes, so a second ask is
+    // arithmetically impossible. The re-arm ladder was triggerable only by an
+    // event that its own failure had already made unreachable.
+    //
+    // THE MEASUREMENT, verbatim. soak0803c failed closed at 06:13:50 with
+    // "re-arms remaining: 2 — a further payee desync from the maintainer will
+    // trigger one". 2h39m later the process was alive, the tip had advanced 69
+    // blocks (2515479 -> 2515548, i.e. 68 blocks PAST the 64-block backoff
+    // gate at h=2515543), 90 templates had been served, the EMBED-GATE
+    // heartbeat was still printing "cause=mn-needs-reseed value=latched" every
+    // five minutes — and there were ZERO further asks and ZERO MN-CKPT lines of
+    // any kind. Those two remaining rungs were never available capacity; they
+    // were UNREACHABLE capacity, and the log said the opposite.
+    //
+    // WHY THE FIX IS THE TRIGGER AND NOT THE POLICY. pump() is already invoked
+    // on EVERY tip change (main_dash's header_chain->set_on_tip_changed) and is
+    // the one lane seam that keeps running after a fail-close — it simply
+    // returned at its state guard. It now re-evaluates the ladder FIRST. The
+    // attempt still goes through rearm(), so everything that bounded the ladder
+    // still bounds it: the kMaxRearms cap, the doubling block backoff, the
+    // never-a-newer-anchor guards and every terminal block are unchanged. What
+    // changed is only WHO may pull the trigger — a caller that is still alive
+    // when the payee queue is wiped.
+    //
+    // AND IT MUST NOT REPLAY A WINDOW THAT WOULD FAIL IDENTICALLY. Two bounds,
+    // both named in the log:
+    //   1. the gate (rearm_gate_height): the chain must advance
+    //      kRearmBackoffBlocks past the tip AT WHICH THE LANE FAILED CLOSED, on
+    //      top of the existing per-re-arm ladder backoff. Without the first
+    //      half, the ORIGINAL arm's fail-close (m_rearms == 0, so no ladder
+    //      backoff applies yet) would self re-arm on the very next block over
+    //      the identical window.
+    //   2. the deterministic-repeat block (fail_closed): if a RE-ARMED replay
+    //      dies at the same cursor height as the previous one, that is measured
+    //      proof the failure is deterministic — the ladder is blocked
+    //      TERMINALLY and says so, instead of spending its remaining rungs on
+    //      the same block.
+
+    /// The tip height at or after which the NEXT re-arm is admissible.
+    /// 0 means NO height admits one (cap spent, terminally blocked, or the tip
+    /// at the fail-close was never observed) — 0 is never a real gate height,
+    /// so it is safe as the sentinel.
+    uint32_t rearm_gate_height() const
+    {
+        if (m_rearm_blocked || m_rearms >= kMaxRearms) return 0;
+        if (!m_failed_at_tip_known)                    return 0;
+        uint32_t gate = m_failed_at_tip + kRearmBackoffBlocks;
+        if (m_rearms > 0 && m_last_rearm_at_known) {
+            const uint32_t ladder =
+                m_last_rearm_at + (kRearmBackoffBlocks << (m_rearms - 1));
+            if (ladder > gate) gate = ladder;
+        }
+        return gate;
+    }
+
+    /// Is there a LIVE path that can still spend the remaining ladder? This is
+    /// the question "re-arms remaining: 2" used to answer wrongly.
+    bool rearm_self_reachable() const
+    {
+        return m_state == State::FailedClosed && m_rearm_pending
+               && !m_rearm_blocked && m_rearms < kMaxRearms
+               && static_cast<bool>(m_tip_height) && rearm_gate_height() != 0;
+    }
+
+    /// The ladder's posture as ONE greppable sentence that distinguishes
+    /// exhausted / terminally blocked / structurally unreachable / waiting on
+    /// backoff / ready. A remaining-count on its own is not an answer: the
+    /// defect this replaces printed "re-arms remaining: 2" for 2h39m about
+    /// capacity nothing could spend.
+    std::string rearm_posture() const
+    {
+        std::ostringstream o;
+        o << "RE-ARM POSTURE: "
+          << (m_rearms == 0
+                  ? std::string("the ORIGINAL arm is down")
+                  : ("RE-ARM " + std::to_string(m_rearms) + "/"
+                     + std::to_string(kMaxRearms) + " is down"))
+          << "; re-seed asks so far: " << m_rearm_asks << "; ";
+        if (m_rearm_blocked) {
+            o << "further re-arms are TERMINALLY BLOCKED ("
+              << m_rearm_block_reason << ") — remaining capacity: NONE";
+        } else if (m_rearms >= kMaxRearms) {
+            o << "the re-arm cap of " << kMaxRearms
+              << " is EXHAUSTED — remaining capacity: NONE";
+        } else if (m_state != State::FailedClosed || !m_rearm_pending) {
+            o << "re-arms remaining: " << (kMaxRearms - m_rearms)
+              << ", none wanted — the lane is not in a failed-closed state that"
+                 " asks for one";
+        } else if (!m_tip_height || !m_failed_at_tip_known) {
+            o << "re-arms remaining: " << (kMaxRearms - m_rearms)
+              << " but STRUCTURALLY UNREACHABLE: no tip-height seam is wired, so"
+                 " the lane has no live trigger and no way to measure the"
+                 " backoff. This capacity CANNOT be spent by this process";
+        } else {
+            const uint32_t gate = rearm_gate_height();
+            const uint32_t now  = m_tip_height();
+            o << "re-arms remaining: " << (kMaxRearms - m_rearms)
+              << " and REACHABLE: the lane re-arms ITSELF on a tip advance at"
+                 " h>=" << gate << " (tip h=" << now << " — "
+              << (now >= gate
+                      ? std::string("gate CLEARED, the next tip advance re-arms")
+                      : ("waiting on " + std::to_string(gate - now)
+                         + " more block(s)"))
+              << "). No further maintainer desync ask is needed, and none is"
+                 " possible: the wiped payee queue cannot project a payee, so it"
+                 " cannot desync again until this bridge publishes.";
+        }
+        return o.str();
+    }
+
+    /// The TICK. Called from pump() — which main_dash drives on every tip
+    /// change — and therefore from a path that is still alive after the
+    /// fail-close it recovers from. Returns true when a re-arm was ARMED.
+    ///
+    /// Cheap by construction: on the overwhelmingly common path it does two
+    /// bool tests and returns. The anchor is only COPIED when the gate has
+    /// actually cleared, so a per-block tick never copies ~2000 entries, and
+    /// rearm() is never called with a request it would only DEFER — which is
+    /// what keeps the log free of a per-block DEFERRED storm.
+    ///
+    /// HONEST NOTE ON COVERAGE. Deleting the `m_rearms >= kMaxRearms` half of
+    /// the guard below produces NO red on its own: rearm_gate_height() carries
+    /// the same check and returns 0, and rearm() itself would refuse. It is
+    /// stated rather than papered over — three layers say the same thing, and
+    /// only removing the cap from BOTH this guard AND rearm_gate_height() reds
+    /// AnExhaustedLadderIsNotReAskedOncePerBlock. Kept anyway: the guard is
+    /// what makes "poll_rearm never asks past the cap" true by reading rather
+    /// than by tracing a callee.
+    bool poll_rearm()
+    {
+        if (m_state != State::FailedClosed) return false;
+        if (!m_rearm_pending)               return false;
+        if (m_rearm_blocked || m_rearms >= kMaxRearms) return false;
+        if (!m_tip_height || !m_failed_at_tip_known)   return false;
+
+        const uint32_t now  = m_tip_height();
+        const uint32_t gate = rearm_gate_height();
+        if (gate == 0 || now < gate) {
+            // A lane waiting hours on a gate must not be SILENT about it —
+            // silence is what made the original defect invisible for 2h39m.
+            // Rate-limited in BLOCKS (the lane owns no timer and must not grow
+            // one), so it costs one line per ~kPendingLogEvery blocks.
+            if (now >= m_last_pending_log + kPendingLogEvery) {
+                m_last_pending_log = now;
+                LOG_WARNING << "[MN-CKPT] " << rearm_posture();
+            }
+            return false;
+        }
+        // Copy: rearm() -> reset_for_arm() writes m_anchor_cp, and passing it
+        // its own member would be a self-referential read during the write.
+        const MnCheckpoint cp = m_anchor_cp;
+        const auto out = rearm(
+            cp,
+            "the bridge FAILED CLOSED and the chain has advanced past the"
+            " backoff gate — SELF RE-ARM from the tip seam (the maintainer"
+            " cannot ask: its payee queue is wiped, so it cannot desync)");
+        return out == RearmOutcome::Armed;
+    }
+
     /// How many re-arms have actually been spent against the cap.
     uint32_t rearms() const           { return m_rearms; }
     /// How many times a re-seed was ASKED for, including deferrals and
@@ -632,6 +812,9 @@ public:
     /// The last named outcome, verbatim. Empty until the first ask — which is
     /// itself the answer to "was a re-seed ever asked for".
     const std::string& last_rearm_reason() const { return m_last_rearm_reason; }
+    /// The trigger text of the last ask, verbatim — which PATH asked. Empty
+    /// until the first ask.
+    const std::string& last_rearm_trigger() const { return m_last_rearm_trigger; }
     /// The earliest height at which a re-seed ask gave us evidence of
     /// divergence; 0 = no such evidence (never a valid height here).
     uint32_t first_divergence_height() const { return m_first_divergence; }
@@ -844,6 +1027,18 @@ public:
     /// idempotent and cheap when there is nothing to do.
     void pump()
     {
+        // THE RE-ARM TICK, and it must come BEFORE the state guard. This is
+        // the whole fix: pump() is driven by the tip-changed callback, which
+        // keeps firing after a fail-close (the soak proves it — the tip
+        // advanced 69 blocks while the lane sat terminal), and it was the guard
+        // below that dropped every one of those ticks on the floor. poll_rearm
+        // is a no-op unless the lane is failed-closed with a cleared gate; when
+        // it does arm, the state is Waiting and the ordinary body below picks
+        // the bridge straight up on this same call.
+        if (m_state == State::FailedClosed) {
+            poll_rearm();
+            if (m_state == State::FailedClosed) return;
+        }
         if (m_state != State::Waiting && m_state != State::Bridging) return;
         if (!m_tip_height) return;
 
@@ -2072,6 +2267,10 @@ public:
     void fail_closed(const std::string& why)
     {
         if (m_state == State::FailedClosed) return;
+        // The height the replay DIED ON, captured before anything resets it.
+        // Two fail-closes at the identical cursor are the measurement that says
+        // "this failure is deterministic" — see the block below.
+        const uint32_t cursor = m_next;
         m_state  = State::FailedClosed;
         m_status = why;
         // Deliberately ERROR, not WARNING: the operator's embedded arm will
@@ -2080,26 +2279,51 @@ public:
         LOG_ERROR << "[MN-CKPT] the embedded DASH template arm will NOT serve;"
                      " templates keep routing to the dashd fallback arm (if"
                      " configured). No masternode payee will be guessed.";
-        // Say which generation of the bridge this was, and whether any budget
-        // to try again remains. "FAIL-CLOSED" on its own does not distinguish
-        // "first attempt, three re-arms left" from "last attempt, nothing left".
-        LOG_ERROR << "[MN-CKPT] RE-ARM POSTURE: "
-                  << (m_rearms == 0 ? std::string("this was the ORIGINAL arm")
-                                    : ("this was RE-ARM " + std::to_string(m_rearms)
-                                       + "/" + std::to_string(kMaxRearms)))
-                  << "; re-seed asks so far: " << m_rearm_asks << "; "
-                  << (m_rearm_blocked
-                          ? ("further re-arms are TERMINALLY BLOCKED ("
-                             + m_rearm_block_reason + ")")
-                          : ("re-arms remaining: "
-                             + std::to_string(kMaxRearms - m_rearms)
-                             + " — a further payee desync from the maintainer"
-                               " will trigger one"))
-                  << ". Last re-arm outcome: "
+        // DETERMINISTIC REPEAT. A re-armed replay that dies at the SAME cursor
+        // as the previous one is not a transient: the window between the anchor
+        // and that height produces the same wrong queue every time, and burning
+        // the rest of the ladder on it is the fail-loop the cap exists to
+        // prevent. Requires m_rearms > 0 — the ORIGINAL arm has nothing to
+        // repeat yet — so a single fail-close never blocks the first recovery.
+        if (m_rearms > 0 && m_have_last_fail_cursor
+            && cursor == m_last_fail_cursor && !m_rearm_blocked) {
+            m_rearm_blocked      = true;
+            m_rearm_block_reason =
+                "the re-armed replay failed closed at the IDENTICAL height h="
+                + std::to_string(cursor) + " as the previous attempt, so"
+                  " replaying this anchor is DETERMINISTIC — a further re-arm"
+                  " would reproduce it";
+        }
+        m_last_fail_cursor      = cursor;
+        m_have_last_fail_cursor = true;
+
+        // ARM THE SELF RE-ARM. The tip AT THE FAIL-CLOSE is what the gate is
+        // measured from: without it the ORIGINAL arm's failure (m_rearms == 0,
+        // so the ladder backoff does not apply yet) would be retried over the
+        // identical window on the very next block.
+        m_rearm_pending    = true;
+        m_last_pending_log = 0;
+        if (m_tip_height) {
+            m_failed_at_tip       = m_tip_height();
+            m_failed_at_tip_known = true;
+        } else {
+            m_failed_at_tip_known = false;
+        }
+
+        // Say which generation of the bridge this was, whether any budget to
+        // try again remains AND — the half that used to be missing — whether
+        // anything can still spend it. "re-arms remaining: 2" was printed for
+        // 2h39m about capacity no live path could reach.
+        LOG_ERROR << "[MN-CKPT] " << rearm_posture()
+                  << " Last re-arm outcome: "
                   << (m_last_rearm_reason.empty()
                           ? std::string("n/a (no re-seed has ever been asked"
                                         " for)")
                           : m_last_rearm_reason);
+        // The STATE says its own name too, not just the scrollback: status() is
+        // what the operator surfaces read, and a posture that lives only in a
+        // log line is half-silent.
+        m_status += " — " + rearm_posture();
     }
 
     /// EVERY field an arm starts from, in ONE place.
@@ -2149,6 +2373,14 @@ public:
     /// m_has_sml_fn, which are wiring, not bridge state.
     void reset_for_arm(const MnCheckpoint& cp)
     {
+        // The lane KEEPS its own anchor. poll_rearm() has no caller to hand it
+        // one — that is the point of it — and a self re-arm that depended on an
+        // extra seam being wired in main_dash would be one more thing that can
+        // be forgotten, i.e. the same defect class again. Guarded because
+        // poll_rearm() passes a copy of this very member.
+        if (&cp != &m_anchor_cp) m_anchor_cp = cp;
+        // A fresh arm is not a lane WAITING to re-arm.
+        m_rearm_pending = false;
         m_anchor_height = cp.height;
         m_anchor_hash   = cp.blockhash;
         m_anchor_source = cp.source;
@@ -2328,6 +2560,23 @@ public:
     bool        m_rearm_blocked{false};   // terminal: no further re-arms
     std::string m_rearm_block_reason;
     std::string m_last_rearm_reason;
+    std::string m_last_rearm_trigger;
+
+    // ── SELF RE-ARM state. Also survives reset_for_arm() (except the pending
+    // flag, which a fresh arm clears): the gate is measured across bridges.
+    /// The anchor this lane is armed from, kept so poll_rearm() needs no
+    /// caller and no extra seam. One copy, overwritten per arm.
+    MnCheckpoint m_anchor_cp;
+    bool     m_rearm_pending{false};        // failed closed, wants a re-arm
+    uint32_t m_failed_at_tip{0};            // tip observed AT the fail-close
+    bool     m_failed_at_tip_known{false};  // ...if a tip seam was wired then
+    uint32_t m_last_fail_cursor{0};         // cursor the previous replay died on
+    bool     m_have_last_fail_cursor{false};
+    uint32_t m_last_pending_log{0};         // tip at the last pending line
+    /// Blocks between two "waiting on the gate" lines. ~8 DASH blocks is ~20
+    /// minutes: loud enough that a wedged ladder cannot hide for 2h39m again,
+    /// quiet enough that it is not a per-block storm.
+    static constexpr uint32_t kPendingLogEvery = 8;
 };
 
 } // namespace coin
