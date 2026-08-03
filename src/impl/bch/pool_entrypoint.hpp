@@ -63,12 +63,16 @@
 
 #include <core/log.hpp>
 #include <core/stratum_server.hpp>
+#include <core/web_server.hpp>       // H-STATS.944: operator dashboard + graph_db persist
+#include <core/filesystem.hpp>      // config_path() for the graph_db location
 #include <functional>
 
 #include <btclibs/util/strencodings.h>   // HexStr
 
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/steady_timer.hpp>   // H-STATS.944: periodic save_stat_log timer
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>   // std::getenv (BCH_DEMO_SHARE_BITS demo floor)
@@ -90,15 +94,20 @@ namespace bch
 // lifetime. `anchor_height` is the cold-start ABLA floor anchor (operator-
 // approved VM300 record, floor-equivalent). `stratum_addr`/`stratum_port` are
 // the miner-facing bind (port 0 == stratum disabled); `is_testnet` selects the
-// BCH network params the work source stamps onto generated work. Returns when
-// the io_context stops.
+// BCH network params the work source stamps onto generated work.
+// `http_addr`/`http_port` are the operator-facing dashboard bind (port 0 ==
+// web disabled); a non-zero port stands up core::WebServer + MiningInterface
+// with graph_db stats persistence (H-STATS.944, Option A: built here, not
+// inline in main_bch). Returns when the io_context stops.
 inline void standup_pool_run(boost::asio::io_context& ioc,
                              Config& config,
                              uint32_t anchor_height,
                              const std::string& stratum_addr = "0.0.0.0",
                              uint16_t stratum_port = 0,
                              bool is_testnet = false,
-                             bool is_regtest = false)
+                             bool is_regtest = false,
+                             const std::string& http_addr = "0.0.0.0",
+                             uint16_t http_port = 0)
 {
     // 1+2: embedded daemon up first -- it owns the work source + RPC fallback
     // the pool node consumes, and is the broadcast sink the node wires into.
@@ -614,6 +623,71 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
     } else {
         LOG_INFO << "[BCH-POOL] stratum disabled (no --stratum bind given);"
                  << " embedded daemon run-loop only.";
+    }
+
+    // ── Operator-facing dashboard + graph_db stats persistence (H-STATS.944) ─
+    // Option A (integrator 2026-08-03): construct core::WebServer INSIDE this
+    // factored standup rather than an inline main_bch block, so btc/dgb adopt
+    // the SAME shape. ISOLATION: constructs existing core classes only -- ZERO
+    // src/core edits -- so this stays OFF the four-coin smoke gate. Held in a
+    // unique_ptr at function scope (like stratum_server) so it and its stats
+    // timer outlive ioc.run() alongside the daemon/node they observe. node ==
+    // nullptr: BCH's Node does not implement core::IMiningNode; the dashboard +
+    // graph_db path (share/hashrate stat log) does not require it, and a live
+    // IMiningNode adapter is a follow-up slice. Blockchain::BITCOIN selects the
+    // SHA256d graph_db constant pairing (BCH has no dedicated enum value; adding
+    // one would be a src/core edit == the exceptional four-smoke path, avoided).
+    std::unique_ptr<core::WebServer> web_server;
+    std::shared_ptr<boost::asio::steady_timer> stats_timer;
+    if (http_port != 0) {
+        web_server = std::make_unique<core::WebServer>(
+            ioc, http_addr, http_port, is_testnet,
+            std::shared_ptr<core::IMiningNode>{},        // no IMiningNode adapter yet
+            c2pool::address::Blockchain::BITCOIN);       // SHA256d graph_db pairing
+        auto* mi = web_server->get_mining_interface();
+#ifdef C2POOL_VERSION
+        mi->set_coin_label("BCH");
+        mi->set_pool_version("c2pool/" C2POOL_VERSION);
+#endif
+        mi->set_io_context(&ioc);
+        web_server->set_stratum_port(stratum_port);
+
+        // graph_db stats persistence -- survives restarts (LTC-parity site 2/3;
+        // mirrors main_ltc.cpp:1967-1973). BCH-namespaced sub-dir keeps the
+        // per-coin stat log isolated under the shared config path.
+        {
+            std::string net_label = is_testnet ? "testnet" : "mainnet";
+            std::string graph_db_path = (core::filesystem::config_path()
+                / net_label / "bch" / "graph_db").string();
+            mi->set_stat_log_path(graph_db_path);
+            mi->load_stat_log();
+            LOG_INFO << "[BCH-POOL] graph_db stats persistence -> " << graph_db_path;
+        }
+
+        if (web_server->start()) {
+            // LTC-parity site 3/3: periodic save_stat_log every 100s (matches
+            // p2pool graph_db + main_ltc.cpp:7429). Self-rescheduling steady_timer
+            // on the SAME ioc the run-loop drives; captured by shared_ptr so it
+            // outlives each async_wait continuation.
+            stats_timer = std::make_shared<boost::asio::steady_timer>(ioc);
+            auto save_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+            *save_fn = [stats_timer, save_fn, mi](boost::system::error_code ec) {
+                if (ec) return;
+                mi->save_stat_log();
+                stats_timer->expires_after(std::chrono::seconds(100));
+                stats_timer->async_wait(*save_fn);
+            };
+            stats_timer->expires_after(std::chrono::seconds(100));
+            stats_timer->async_wait(*save_fn);
+            LOG_INFO << "[BCH-POOL] dashboard live on http://" << http_addr << ":"
+                     << http_port << " (graph_db persist every 100s).";
+        } else {
+            LOG_ERROR << "[BCH-POOL] WebServer FAILED to bind " << http_addr << ":"
+                      << http_port << " -- dashboard disabled, run-loop continues.";
+            web_server.reset();
+        }
+    } else {
+        LOG_INFO << "[BCH-POOL] dashboard disabled (no --http bind given).";
     }
 
     // Drive the shared io_context: pool node + embedded daemon + stratum run together.
