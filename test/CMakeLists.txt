@@ -696,6 +696,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_embedded_gbt.cpp
         test_dash_embedded_cbtx_byte_parity.cpp
         test_dash_mnlistdiff_root_parity.cpp
+        test_dash_qrinfo.cpp
         test_dash_dkg_commitments.cpp
         test_dash_sml_quorum_db.cpp
         test_dash_embedded_oracle_shadow.cpp)

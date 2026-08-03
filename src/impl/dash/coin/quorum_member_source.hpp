@@ -58,9 +58,14 @@
 /// replies here and skips the tip feed. Only STRICT matches consume: the diff
 /// must be a full snapshot (baseBlockHash null) at an awaited block hash.
 ///
-/// ROTATED (DIP-24): request() no-ops for a rotated type (compute is
-/// unsupported there); the verifier stays fail-closed. qrinfo-based rotated
-/// sourcing is the documented follow-up.
+/// ROTATED (DIP-24): request() still no-ops for a rotated type and the
+/// verifier stays fail-closed, because the quarter-rotation member COMPUTATION
+/// is not ported yet. What DOES exist now is the sourcing half: request_rotated()
+/// emits a getqrinfo and on_qrinfo() DIP-4 authenticates all four cycle
+/// mnlistdiffs (each bound to the height the cycle geometry demands) and hands
+/// back the authenticated SMLs + snapshots. Wiring those into m_ready is the
+/// remaining follow-up — see the item 3/4 note on the rotated branch of
+/// request().
 ///
 /// FAIL-CLOSED throughout: pre-V20 work block, base not dkgInterval-aligned,
 /// header gap, rotated type, snapshot authentication failure, member
@@ -77,10 +82,12 @@
 #include <impl/dash/coin/vendor/smldiff.hpp>           // CSimplifiedMNListDiff, apply_diff, ExtractMatches
 #include <impl/dash/coin/vendor/cbtx.hpp>              // CCbTx, parse_cbtx
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>     // CSimplifiedMNList
+#include <impl/dash/coin/vendor/quorum_rotation_info.hpp>  // DIP-24 CQuorumRotationInfo / CQuorumSnapshot
 
 #include <core/uint256.hpp>
 #include <core/log.hpp>
 
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -147,27 +154,35 @@ public:
             // #816 completeness gate leaves the mixed-quorum DKG window
             // unserveable and get_work routes to the reward-safe dashd fallback.
             //
-            // REMAINING WORK to make this SERVEABLE (each behind a real-vector
-            // KAT against test/data/dash_rotated_quorum_members_kat.hpp — the
-            // captured llmq_60_75 @1520064 ground truth: dashd's exact ordered
-            // 60-member set + operator keys):
-            //   1. getqrinfo P2P request: CGetQuorumRotationInfo
-            //      (baseBlockHashes + blockRequestHash=quorumHash,
-            //       extraShare=false) — a new p2p_messages type + a send seam
-            //      analogous to send_getmnlistd (send_getqrinfo).
-            //   2. CQuorumRotationInfo decode (llmq/snapshot.h /
-            //      quorum_rotation_info): the 3 CQuorumSnapshot skip-lists
-            //      (quorumSnapshotAtHMinusC/2C/3C) + the mnlistdiffs
-            //      (mnListDiffTip/AtH/AtHMinusC/2C/3C[/4C]) — decode + DIP-4
-            //      authenticate each mnlistdiff exactly like authenticate_snapshot.
-            //   3. vendor::compute_quorum_members_by_quarter_rotation port of
-            //      dashcore ComputeQuorumMembersByQuarterRotation +
+            // STATUS — items 1 and 2 have LANDED; 3 and 4 have not:
+            //   1. DONE — getqrinfo/qrinfo wire: p2p_messages.hpp
+            //      message_getqrinfo / message_qrinfo, send seam
+            //      CoinClient::send_getqrinfo (analogous to send_getmnlistd).
+            //   2. DONE — CQuorumRotationInfo decode
+            //      (vendor/quorum_rotation_info.hpp), field order PINNED against
+            //      a real 602'189-byte capture, plus per-mnlistdiff DIP-4
+            //      authentication with the SAME discipline as
+            //      authenticate_snapshot: see request_rotated() / on_qrinfo()
+            //      below. Each cycle diff is bound to its EXPECTED height, so a
+            //      peer cannot substitute another block's genuine snapshot.
+            //   3. TODO — vendor::compute_quorum_members_by_quarter_rotation:
+            //      port of dashcore ComputeQuorumMembersByQuarterRotation +
             //      BuildNewQuorumQuarterMembers + the snapshot skip-list decode
             //      (GetQuorumQuarterMembersBySnapshot), producing the ordered
-            //      MemberOperatorKey vector — MUST reproduce the captured order.
-            //   4. feed that set to the SAME m_ready map so lookup() (and #812's
-            //      verify_final_commitment) serves rotated commitments real.
-            // Fail-closed if qrinfo can't be sourced or any snapshot mnlistdiff
+            //      MemberOperatorKey vector — MUST reproduce the captured order
+            //      in test/data/dash_rotated_quorum_members_kat.hpp.
+            //   4. TODO — feed that set to the SAME m_ready map so lookup() (and
+            //      #812's verify_final_commitment) serves rotated commitments
+            //      real.
+            //
+            // Until 3 lands there is NOTHING to put in m_ready, so THIS entry
+            // point stays fail-closed and, deliberately, does NOT emit a
+            // getqrinfo: issuing a live request whose reply cannot yet produce
+            // a member set would add traffic to the reward path for no gain.
+            // The sourcing half is reachable and tested via request_rotated()
+            // + on_qrinfo(); item 3 flips this branch to call request_rotated()
+            // and finalize_rotated() to fill m_ready. That is the whole delta.
+            // Fail-closed if qrinfo can't be sourced or any cycle mnlistdiff
             // fails DIP-4 authentication (same discipline as the non-rotated
             // authenticate_snapshot).
             LOG_DEBUG_COIND << "[QC-MEMBERS] rotated type="
@@ -227,6 +242,171 @@ public:
     {
         return m_await.count(block_hash) != 0;
     }
+
+    // ═══ DIP-24 ROTATED SOURCING (items 1+2) ═══════════════════════════════
+    // Wire + authenticated decode. The member-set computation itself (item 3,
+    // compute_quorum_members_by_quarter_rotation) is NOT here yet, so nothing
+    // reaches m_ready down this path and lookup() still fails closed for
+    // rotated types. Everything below is exercised by the real-vector KAT.
+
+    using SendGetQrInfo = std::function<void(const std::vector<uint256>& bases,
+                                            const uint256& request_hash,
+                                            bool extra_share)>;
+
+    /// Optional (not a constructor arg, so no existing call site changes).
+    void set_send_getqrinfo(SendGetQrInfo f) { m_send_qrinfo = std::move(f); }
+
+    /// The four cycle SMLs a rotated member computation consumes, each already
+    /// DIP-4 authenticated and bound to its expected height.
+    struct RotatedInputs {
+        uint8_t  llmq_type{0};
+        uint256  quorum_hash;
+        uint32_t cycle_base_height{0};
+        // heights: H = base-8, then -C, -2C, -3C
+        std::array<uint32_t, 4>                      heights{};
+        std::array<vendor::CSimplifiedMNList, 4>     smls{};
+        std::array<vendor::CQuorumSnapshot, 3>       snapshots{};  // H-C, H-2C, H-3C
+        std::vector<vendor::CFinalCommitment>        last_commitment_per_index;
+    };
+
+    /// Ask a peer for the rotation info backing `quorum_hash`. Returns false
+    /// (and sends nothing) when the request cannot be validated locally —
+    /// unknown/non-rotated type, unaligned base, missing header, pre-V20.
+    /// EMPTY baseBlockHashes on purpose: it makes the peer answer with FULL
+    /// (from-genesis) lists, and only a full list is self-authenticating
+    /// against its own cbTx.merkleRootMNList.
+    bool request_rotated(uint8_t llmq_type, const uint256& quorum_hash)
+    {
+        const LlmqParamsView* p = params_for(llmq_type);
+        if (p == nullptr || !p->use_rotation) return false;
+        if (!m_send_qrinfo) return false;
+
+        auto base_h = m_height_of_hash(quorum_hash);
+        if (!base_h) return false;
+        if (p->dkg_interval == 0 || *base_h % p->dkg_interval != 0) return false;
+        // Need H-3C to exist: base - 8 - 3*C.
+        const uint64_t span = static_cast<uint64_t>(kWorkDiffDepth)
+                            + 3ull * p->dkg_interval;
+        if (*base_h < span) return false;
+        if (*base_h - kWorkDiffDepth < quorum_members_v20_floor()) return false;
+
+        m_rotated_pending[Key{llmq_type, quorum_hash}] = *base_h;
+        m_send_qrinfo(std::vector<uint256>{}, quorum_hash, /*extra_share=*/false);
+        LOG_INFO << "[QC-MEMBERS] sourcing qrinfo for ROTATED type="
+                 << static_cast<int>(llmq_type) << " quorum="
+                 << quorum_hash.GetHex().substr(0, 16)
+                 << " cycle_base_h=" << *base_h;
+        return true;
+    }
+
+    /// Consume a qrinfo reply. DIP-4 authenticates EVERY cycle mnlistdiff with
+    /// the same discipline as the non-rotated path, binding each to the height
+    /// the cycle geometry says it must be — a peer cannot answer with another
+    /// block's genuine snapshot. Returns the authenticated inputs, or nullopt
+    /// (fail closed) if anything does not check out.
+    std::optional<RotatedInputs>
+    on_qrinfo(const vendor::CQuorumRotationInfo& info)
+    {
+        // Which outstanding rotated request is this? Bind by the H diff's
+        // height: H must be (cycle_base - 8) for exactly one pending.
+        vendor::CCbTx probe_cbtx;
+        if (info.mnListDiffH.cbTx.type != 5
+            || !vendor::parse_cbtx(info.mnListDiffH.cbTx.extra_payload, probe_cbtx)
+            || probe_cbtx.nHeight < 0) {
+            LOG_WARNING << "[QC-MEMBERS] qrinfo: mnListDiffH carries no usable "
+                           "type-5 cbTx — fail closed";
+            return std::nullopt;
+        }
+        const uint64_t h_height = static_cast<uint64_t>(probe_cbtx.nHeight);
+
+        const Key* match = nullptr;
+        uint32_t   base_h = 0;
+        for (const auto& [key, base] : m_rotated_pending) {
+            if (static_cast<uint64_t>(base) == h_height + kWorkDiffDepth) {
+                match = &key;
+                base_h = base;
+                break;
+            }
+        }
+        if (match == nullptr) {
+            LOG_WARNING << "[QC-MEMBERS] qrinfo at H=" << h_height
+                        << " matches no outstanding rotated request — dropped";
+            return std::nullopt;
+        }
+        const Key key = *match;
+
+        const LlmqParamsView* p = params_for(key.llmqType);
+        if (p == nullptr || !p->use_rotation || p->dkg_interval == 0) {
+            m_rotated_pending.erase(key);
+            return std::nullopt;
+        }
+        const uint32_t C = p->dkg_interval;
+
+        RotatedInputs out;
+        out.llmq_type        = key.llmqType;
+        out.quorum_hash      = key.quorumHash;
+        out.cycle_base_height = base_h;
+
+        const vendor::CSimplifiedMNListDiff* diffs[4] = {
+            &info.mnListDiffH,
+            &info.mnListDiffAtHMinusC,
+            &info.mnListDiffAtHMinus2C,
+            &info.mnListDiffAtHMinus3C,
+        };
+        for (size_t i = 0; i < 4; ++i) {
+            const uint32_t expect_h =
+                base_h - kWorkDiffDepth - static_cast<uint32_t>(i) * C;
+            out.heights[i] = expect_h;
+
+            // A qrinfo cycle diff MUST be a FULL list: authentication applies
+            // it onto an EMPTY list, so an incremental diff would authenticate
+            // a list that is not the one at that height.
+            //
+            // ⚠ NOT the same test as the getmnlistd path's baseBlockHash.IsNull().
+            // Observed from a real dashd: when the request carries an EMPTY
+            // baseBlockHashes, the qrinfo diffs come back with baseBlockHash =
+            // the GENESIS hash, not ZERO. So "full" is signalled here by having
+            // nothing to delete (from genesis there is nothing to delete), and
+            // the actual GUARANTEE is leg (c) of the authentication below: the
+            // applied-onto-empty SML root must equal cbTx.merkleRootMNList, which
+            // an incremental diff cannot satisfy.
+            if (!diffs[i]->deletedMNs.empty()) {
+                LOG_WARNING << "[QC-MEMBERS] qrinfo cycle diff " << i
+                            << " deletes " << diffs[i]->deletedMNs.size()
+                            << " entries — not a FULL list, fail closed";
+                m_rotated_pending.erase(key);
+                return std::nullopt;
+            }
+            vendor::CCbTx cbtx;
+            auto sml = authenticate_historical_snapshot(
+                *diffs[i], expect_h, m_merkle_root_of_hash, cbtx, "QC-MEMBERS");
+            if (!sml) {
+                LOG_WARNING << "[QC-MEMBERS] qrinfo cycle diff " << i
+                            << " failed DIP-4 authentication at expected h="
+                            << expect_h << " — whole reply fails closed";
+                m_rotated_pending.erase(key);
+                return std::nullopt;
+            }
+            out.smls[i] = std::move(*sml);
+        }
+
+        out.snapshots[0] = info.quorumSnapshotAtHMinusC;
+        out.snapshots[1] = info.quorumSnapshotAtHMinus2C;
+        out.snapshots[2] = info.quorumSnapshotAtHMinus3C;
+        out.last_commitment_per_index = info.lastCommitmentPerIndex;
+
+        m_rotated_pending.erase(key);
+        LOG_INFO << "[QC-MEMBERS] qrinfo AUTHENTICATED for rotated type="
+                 << static_cast<int>(key.llmqType) << " quorum="
+                 << key.quorumHash.GetHex().substr(0, 16)
+                 << " cycle_base_h=" << base_h
+                 << " (H=" << out.heights[0] << ") — inputs ready; member "
+                    "computation (quarter rotation) NOT YET PORTED, so this "
+                    "quorum remains null-serve";
+        return out;
+    }
+
+    size_t rotated_pending_count() const { return m_rotated_pending.size(); }
 
     /// Consume a historical work-block snapshot. Returns TRUE iff the diff
     /// matched an outstanding await (so the caller must NOT also feed the
@@ -426,6 +606,9 @@ private:
     std::map<Key, Pending> m_pending;
     std::deque<Key> m_pending_fifo;
     std::map<uint256, std::vector<Key>> m_await;   // work-block hash -> waiters
+
+    SendGetQrInfo             m_send_qrinfo;
+    std::map<Key, uint32_t>   m_rotated_pending;   // rotated key -> cycle base h
 };
 
 } // namespace coin
