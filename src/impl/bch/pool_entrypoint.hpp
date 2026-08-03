@@ -640,11 +640,27 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
     std::unique_ptr<core::WebServer> web_server;
     std::shared_ptr<boost::asio::steady_timer> stats_timer;
     if (http_port != 0) {
+        // No-silent-ctor bracket (integrator req #2, per-lane port of ltc #1041).
+        // core::WebServer's ctor already logs "core::WebServer constructed on ..."
+        // (shared, blockchain= numeric only); these two BCH-namespaced lines make
+        // the boot log self-identify THIS lane's dashboard standup on the way in
+        // and out, so a ctor that throws mid-standup shows as an unmatched
+        // "standing up" with no "constructed" follow-up. src/impl/bch only.
+        LOG_INFO << "[BCH-POOL] standing up core::WebServer + MiningInterface (http bind "
+                 << http_addr << ":" << http_port << ") ...";
         web_server = std::make_unique<core::WebServer>(
             ioc, http_addr, http_port, is_testnet,
             std::shared_ptr<core::IMiningNode>{},        // no IMiningNode adapter yet
             c2pool::address::Blockchain::BITCOIN);       // SHA256d graph_db pairing
         auto* mi = web_server->get_mining_interface();
+        if (mi == nullptr) {
+            LOG_ERROR << "[BCH-POOL] core::WebServer constructed but MiningInterface is"
+                      << " NULL -- dashboard disabled, run-loop continues.";
+            web_server.reset();
+        }
+        if (mi != nullptr) {
+        LOG_INFO << "[BCH-POOL] core::WebServer + MiningInterface constructed (coin=BCH, "
+                 << "http " << http_addr << ":" << http_port << "); MiningInterface alive.";
 #ifdef C2POOL_VERSION
         mi->set_coin_label("BCH");
         mi->set_pool_version("c2pool/" C2POOL_VERSION);
@@ -686,6 +702,7 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
                       << http_port << " -- dashboard disabled, run-loop continues.";
             web_server.reset();
         }
+        } // if (mi != nullptr)
     } else {
         LOG_INFO << "[BCH-POOL] dashboard disabled (no --http bind given).";
     }
