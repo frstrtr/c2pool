@@ -1633,11 +1633,26 @@ int main(int argc, char* argv[])
     std::shared_ptr<boost::asio::steady_timer> stats_timer;
     if (http_port != 0) {
         const bool web_is_testnet = testnet || testnet4 || regtest;
+        // No-silent-ctor bracket (integrator req #2, per-lane port of bch #1050
+        // "name the WebServer standup per-lane" / ltc #1041): name THIS lane's
+        // dashboard standup on the way IN and OUT so a ctor that throws mid-standup
+        // shows as an unmatched "standing up" with no "constructed" follow-up, and
+        // guard a null MiningInterface before use. src/c2pool/main_btc.cpp only.
+        LOG_INFO << "[BTC-POOL] standing up core::WebServer + MiningInterface (http bind "
+                 << http_addr << ":" << http_port << ") ...";
         web_server = std::make_unique<core::WebServer>(
             ioc, http_addr, http_port, web_is_testnet,
             std::shared_ptr<core::IMiningNode>{},          // no IMiningNode adapter yet
             c2pool::address::Blockchain::BITCOIN);         // SHA256d graph_db pairing
         auto* mi = web_server->get_mining_interface();
+        if (mi == nullptr) {
+            LOG_ERROR << "[BTC-POOL] core::WebServer constructed but MiningInterface is"
+                      << " NULL -- dashboard disabled, run-loop continues.";
+            web_server.reset();
+        }
+        if (mi != nullptr) {
+        LOG_INFO << "[BTC-POOL] core::WebServer + MiningInterface constructed (coin=BTC, "
+                 << "http " << http_addr << ":" << http_port << "); MiningInterface alive.";
 #ifdef C2POOL_VERSION
         mi->set_coin_label("BTC");
         mi->set_pool_version("c2pool/" C2POOL_VERSION);
@@ -1679,6 +1694,7 @@ int main(int argc, char* argv[])
                       << http_port << " â dashboard disabled, run-loop continues.";
             web_server.reset();
         }
+        } // if (mi != nullptr)
     } else {
         LOG_INFO << "[BTC-POOL] dashboard disabled (no --http bind given).";
     }
