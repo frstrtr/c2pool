@@ -24,13 +24,19 @@
 #include <gtest/gtest.h>
 
 #include <impl/dash/coin/header_chain.hpp>
+#include <impl/dash/coin/chain_rpc.hpp>
 #include <impl/dash/coin/block.hpp>
 
 #include <core/uint256.hpp>
 
+#include <nlohmann/json.hpp>
+
 #include <cstdint>
+#include <ctime>
 #include <functional>
+#include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 using namespace dash::coin;
@@ -222,4 +228,387 @@ TEST(DashDGWv3Kat, RealTestnet3Window1497944ReproducesNextBits) {
     EXPECT_EQ(bits, 0x1e00f256u)
         << "DGW-v3 over the real 1497920..1497943 window must reproduce the "
            "node-assigned bits of block 1497944";
+}
+// ════════════════════════════════════════════════════════════════════════════
+// Daemonless chain queries — getbestblockhash / getblockhash /
+// getblockchaininfo answered from the header chain (chain_rpc.hpp).
+//
+// Every positive assertion below has a negative twin: for each query there is
+// a state in which the header chain CANNOT answer, and the test asserts the
+// response NAMES that state (condition + measured value + threshold) instead
+// of returning a stale hash, an empty string, or a zero.
+// ════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// A chain whose PoW target is easy enough to mine in a unit test (top 8 bits
+// zero => ~256 X11 attempts per header) while still exercising the REAL
+// check_pow / add_header_internal path — the headers below are genuinely
+// PoW-valid, not injected. allow_min_difficulty short-circuits the DGW bits
+// check at pow-limit difficulty, which is what a testnet chain does anyway.
+DashChainParams make_easy_test_params() {
+    DashChainParams p;
+    p.target_timespan = 3600;
+    p.target_spacing  = 150;
+    p.allow_min_difficulty = true;
+    p.no_retargeting = false;
+    p.pow_limit.SetHex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    // Arbitrary but fixed: init() seeds this as a genesis STUB without a PoW
+    // check, and every mined header below builds on it.
+    p.genesis_hash.SetHex("00000000000000000000000000000000000000000000000000000000000000aa");
+    p.halving_interval = 210240;
+    p.initial_subsidy = 500000000ULL;
+    p.pow_func = [](std::span<const unsigned char> data) -> uint256 {
+        return dash::crypto::hash_x11(data);
+    };
+    p.block_hash_func = p.pow_func;
+    return p;
+}
+
+// Mine a real header on top of `prev` at the pow-limit target.
+BlockHeaderType mine_header(const uint256& prev, uint32_t timestamp,
+                            uint32_t bits, const uint256& pow_limit) {
+    BlockHeaderType h;
+    h.m_version = 536870912;
+    h.m_previous_block = prev;
+    h.m_merkle_root.SetHex("00000000000000000000000000000000000000000000000000000000000000bb");
+    h.m_timestamp = timestamp;
+    h.m_bits = bits;
+    for (uint32_t nonce = 0; nonce < 50'000'000u; ++nonce) {
+        h.m_nonce = nonce;
+        if (check_pow(x11_hash(h), bits, pow_limit)) return h;
+    }
+    ADD_FAILURE() << "mine_header exhausted the nonce range — pow_limit too hard "
+                     "for a unit test";
+    return h;
+}
+
+// Build an in-memory chain of `count` real headers above the genesis stub,
+// spaced 150 s apart ending at `tip_time`. Returns the per-height hashes
+// (index 0 == genesis stub).
+struct MinedChain {
+    DashChainParams params;
+    std::unique_ptr<HeaderChain> hc;
+    std::vector<uint256> hashes;   // hashes[h] is the hash at height h
+    uint32_t tip_time{0};
+};
+
+MinedChain build_mined_chain(uint32_t count, uint32_t tip_time) {
+    MinedChain mc;
+    mc.params = make_easy_test_params();
+    mc.hc = std::make_unique<HeaderChain>(mc.params, /*db_path=*/"");
+    EXPECT_TRUE(mc.hc->init());
+    mc.hashes.push_back(mc.params.genesis_hash);
+    const uint32_t bits = mc.params.pow_limit.GetCompact();
+    uint32_t t = tip_time - count * 150u;
+    for (uint32_t i = 0; i < count; ++i) {
+        t += 150u;
+        auto h = mine_header(mc.hashes.back(), t, bits, mc.params.pow_limit);
+        EXPECT_TRUE(mc.hc->add_header(h))
+            << "mined header at height " << (i + 1) << " must be accepted";
+        mc.hashes.push_back(x11_hash(h));
+    }
+    mc.tip_time = t;
+    return mc;
+}
+
+// Assert the two honesty invariants that hold for EVERY getblockchaininfo
+// response: nothing listed as unavailable is also emitted, and no emitted
+// numeric field is a placeholder zero.
+void expect_no_field_is_both_emitted_and_unavailable(const nlohmann::json& r) {
+    ASSERT_TRUE(r.contains("unavailable")) << r.dump(2);
+    for (auto it = r["unavailable"].begin(); it != r["unavailable"].end(); ++it) {
+        EXPECT_FALSE(r.contains(it.key()))
+            << "field '" << it.key() << "' is listed unavailable but ALSO emitted "
+            << "— that is exactly the fabricated-value defect: " << r.dump(2);
+        EXPECT_FALSE(it.value().get<std::string>().empty())
+            << "unavailable['" << it.key() << "'] must name the blocking condition";
+    }
+}
+
+} // namespace
+
+// ─── getbestblockhash ───────────────────────────────────────────────────────
+
+TEST(DashChainRpc, BestBlockHashAnsweredFromSyncedHeaderChain) {
+    auto mc = build_mined_chain(3, /*tip_time=*/1'800'000'000u);
+    auto a = chain_rpc::getbestblockhash(*mc.hc, /*now=*/mc.tip_time + 60);
+    ASSERT_TRUE(a.available) << a.unavailable_reason;
+    EXPECT_EQ(a.value.get<std::string>(), mc.hashes.back().GetHex());
+    EXPECT_EQ(mc.hc->height(), 3u);
+}
+
+// NEGATIVE TWIN: a tip older than the 24 h window is not the network best
+// block. The answer must say so and name the age and the threshold.
+TEST(DashChainRpc, BestBlockHashWithheldWhenTipStale) {
+    auto mc = build_mined_chain(3, /*tip_time=*/1'800'000'000u);
+    const uint32_t now = mc.tip_time + 90'000u;   // 25 h past the tip
+    auto a = chain_rpc::getbestblockhash(*mc.hc, now);
+    ASSERT_FALSE(a.available)
+        << "a 25 h-old tip must NOT be served as bestblockhash";
+    EXPECT_NE(a.unavailable_reason.find("90000"), std::string::npos)
+        << "refusal must carry the MEASURED tip age: " << a.unavailable_reason;
+    EXPECT_NE(a.unavailable_reason.find("86400"), std::string::npos)
+        << "refusal must carry the THRESHOLD: " << a.unavailable_reason;
+    EXPECT_TRUE(a.value.is_null()) << "no stale hash may leak through the refusal";
+}
+
+// NEGATIVE TWIN: a chain that has never been initialised has no tip at all.
+TEST(DashChainRpc, BestBlockHashWithheldWhenChainHasNoTip) {
+    auto params = make_easy_test_params();
+    HeaderChain hc(params, /*db_path=*/"");   // deliberately NOT init()ed
+    auto a = chain_rpc::getbestblockhash(hc, /*now=*/1'800'000'000u);
+    ASSERT_FALSE(a.available);
+    EXPECT_NE(a.unavailable_reason.find("no tip"), std::string::npos)
+        << a.unavailable_reason;
+}
+
+// NEGATIVE TWIN: a fast-start checkpoint tip is a SYNTHETIC entry (bits=0,
+// timestamp=0) — a hard-coded anchor, not an observed best block.
+TEST(DashChainRpc, BestBlockHashWithheldAtSyntheticCheckpointAnchor) {
+    auto params = make_dash_chain_params_mainnet();
+    ASSERT_TRUE(params.fast_start_checkpoint.has_value());
+    HeaderChain hc(params, /*db_path=*/"");
+    ASSERT_TRUE(hc.init());
+    ASSERT_EQ(hc.height(), params.fast_start_checkpoint->height);
+
+    auto a = chain_rpc::getbestblockhash(hc, /*now=*/static_cast<uint32_t>(std::time(nullptr)));
+    ASSERT_FALSE(a.available)
+        << "the compiled-in checkpoint hash must not be served as the network tip";
+    EXPECT_NE(a.unavailable_reason.find("synthetic anchor"), std::string::npos)
+        << a.unavailable_reason;
+    EXPECT_NE(a.unavailable_reason.find("bits=0"), std::string::npos)
+        << a.unavailable_reason;
+}
+
+// ─── getblockhash ───────────────────────────────────────────────────────────
+
+TEST(DashChainRpc, BlockHashAnsweredForEveryOwnedHeight) {
+    auto mc = build_mined_chain(4, /*tip_time=*/1'800'000'000u);
+    const uint32_t now = mc.tip_time + 60;
+    for (uint32_t h = 1; h <= 4; ++h) {
+        auto a = chain_rpc::getblockhash(*mc.hc, h, now);
+        ASSERT_TRUE(a.available) << "height " << h << ": " << a.unavailable_reason;
+        EXPECT_EQ(a.value.get<std::string>(), mc.hashes[h].GetHex());
+    }
+}
+
+// NEGATIVE TWIN: above the tip there is no block, and the refusal names both
+// the requested height and the tip height it was compared against.
+TEST(DashChainRpc, BlockHashWithheldAboveTip) {
+    auto mc = build_mined_chain(3, /*tip_time=*/1'800'000'000u);
+    auto a = chain_rpc::getblockhash(*mc.hc, 9999u, mc.tip_time + 60);
+    ASSERT_FALSE(a.available);
+    EXPECT_NE(a.unavailable_reason.find("9999"), std::string::npos) << a.unavailable_reason;
+    EXPECT_NE(a.unavailable_reason.find("above owned tip"), std::string::npos)
+        << a.unavailable_reason;
+    EXPECT_TRUE(a.value.is_null());
+}
+
+// NEGATIVE TWIN: below the fast-start anchor the headers were never
+// downloaded. The refusal must name the anchor height, not return "".
+TEST(DashChainRpc, BlockHashWithheldBelowFastStartAnchor) {
+    auto params = make_dash_chain_params_mainnet();
+    const uint32_t cp = params.fast_start_checkpoint->height;
+    HeaderChain hc(params, /*db_path=*/"");
+    ASSERT_TRUE(hc.init());
+
+    auto a = chain_rpc::getblockhash(hc, cp - 1, /*now=*/1'800'000'000u);
+    ASSERT_FALSE(a.available);
+    EXPECT_NE(a.unavailable_reason.find("below owned anchor"), std::string::npos)
+        << a.unavailable_reason;
+    EXPECT_NE(a.unavailable_reason.find(std::to_string(cp)), std::string::npos)
+        << "refusal must name the MEASURED anchor height: " << a.unavailable_reason;
+}
+
+// NEGATIVE TWIN: the anchor height itself resolves to a synthetic entry with
+// no real header behind it.
+TEST(DashChainRpc, BlockHashWithheldAtSyntheticAnchorHeight) {
+    auto params = make_dash_chain_params_mainnet();
+    const uint32_t cp = params.fast_start_checkpoint->height;
+    HeaderChain hc(params, /*db_path=*/"");
+    ASSERT_TRUE(hc.init());
+    auto a = chain_rpc::getblockhash(hc, cp, /*now=*/1'800'000'000u);
+    ASSERT_FALSE(a.available);
+    EXPECT_NE(a.unavailable_reason.find("synthetic anchor"), std::string::npos)
+        << a.unavailable_reason;
+}
+
+// NEGATIVE TWIN: on a STALE tip the last few blocks may still be reorged away.
+// Buried heights stay answerable; heights inside the margin do not.
+TEST(DashChainRpc, BlockHashStaleTipServesBuriedWithholdsRecent) {
+    auto mc = build_mined_chain(10, /*tip_time=*/1'800'000'000u);
+    const uint32_t now = mc.tip_time + 90'000u;   // stale
+    const uint32_t tip = mc.hc->height();
+    ASSERT_EQ(tip, 10u);
+
+    // Inside the reorg margin -> withheld, and the refusal names the margin.
+    for (uint32_t h = tip - chain_rpc::STALE_TIP_REORG_MARGIN + 1; h <= tip; ++h) {
+        auto a = chain_rpc::getblockhash(*mc.hc, h, now);
+        EXPECT_FALSE(a.available) << "height " << h << " is within the margin of a stale tip";
+        EXPECT_NE(a.unavailable_reason.find("not synced"), std::string::npos)
+            << a.unavailable_reason;
+    }
+    // Buried -> still answered, because PoW does not go stale.
+    for (uint32_t h = 1; h <= tip - chain_rpc::STALE_TIP_REORG_MARGIN; ++h) {
+        auto a = chain_rpc::getblockhash(*mc.hc, h, now);
+        EXPECT_TRUE(a.available) << "height " << h << ": " << a.unavailable_reason;
+        EXPECT_EQ(a.value.get<std::string>(), mc.hashes[h].GetHex());
+    }
+}
+
+// ─── getblockchaininfo ──────────────────────────────────────────────────────
+
+TEST(DashChainRpc, ChainInfoSyncedEmitsOwnedFieldsOnly) {
+    auto mc = build_mined_chain(3, /*tip_time=*/1'800'000'000u);
+    auto r = chain_rpc::getblockchaininfo(*mc.hc, /*now=*/mc.tip_time + 60);
+
+    EXPECT_EQ(r["chain"], "test");
+    EXPECT_TRUE(r["synced"].get<bool>()) << r.dump(2);
+    EXPECT_EQ(r["blocks"].get<uint32_t>(), 3u);
+    EXPECT_EQ(r["headers"].get<uint32_t>(), 3u);
+    EXPECT_EQ(r["bestblockhash"].get<std::string>(), mc.hashes.back().GetHex());
+    EXPECT_EQ(r["tip_age_seconds"].get<int64_t>(), 60);
+    EXPECT_EQ(r["tip_max_age_seconds"].get<int64_t>(), chain_rpc::TIP_MAX_AGE_SECONDS);
+    EXPECT_EQ(r["source"], chain_rpc::SOURCE_TAG);
+    EXPECT_GT(r["difficulty"].get<double>(), 0.0);
+    EXPECT_EQ(r["mediantime"].get<uint32_t>(), mc.hc->median_time_past());
+
+    // chainwork is anchor-relative here and is therefore NEVER emitted.
+    EXPECT_FALSE(r.contains("chainwork"))
+        << "anchor-relative work must not masquerade as a daemon chainwork";
+    EXPECT_TRUE(r["unavailable"].contains("chainwork"));
+    EXPECT_FALSE(r.contains("verificationprogress"));
+    expect_no_field_is_both_emitted_and_unavailable(r);
+}
+
+// NEGATIVE TWIN: a stale tip must not present blocks/headers/bestblockhash as
+// current. They move under "stale" and are named in "unavailable".
+TEST(DashChainRpc, ChainInfoStaleTipMovesTipFieldsToStale) {
+    auto mc = build_mined_chain(3, /*tip_time=*/1'800'000'000u);
+    auto r = chain_rpc::getblockchaininfo(*mc.hc, /*now=*/mc.tip_time + 90'000u);
+
+    EXPECT_FALSE(r["synced"].get<bool>());
+    EXPECT_FALSE(r.contains("blocks"))        << r.dump(2);
+    EXPECT_FALSE(r.contains("headers"))       << r.dump(2);
+    EXPECT_FALSE(r.contains("bestblockhash")) << r.dump(2);
+    ASSERT_TRUE(r.contains("sync_blocked_by"));
+    EXPECT_NE(r["sync_blocked_by"].get<std::string>().find("90000"), std::string::npos);
+    EXPECT_NE(r["sync_blocked_by"].get<std::string>().find("86400"), std::string::npos);
+
+    ASSERT_TRUE(r.contains("stale"));
+    EXPECT_EQ(r["stale"]["tip_height"].get<uint32_t>(), 3u);
+    EXPECT_EQ(r["stale"]["tip_hash"].get<std::string>(), mc.hashes.back().GetHex());
+    expect_no_field_is_both_emitted_and_unavailable(r);
+}
+
+// NEGATIVE TWIN: at a synthetic checkpoint anchor, difficulty and mediantime
+// would both be fabricated zeros. They must be withheld, not zeroed.
+TEST(DashChainRpc, ChainInfoSyntheticAnchorWithholdsDifficultyAndMediantime) {
+    auto params = make_dash_chain_params_mainnet();
+    HeaderChain hc(params, /*db_path=*/"");
+    ASSERT_TRUE(hc.init());
+    auto r = chain_rpc::getblockchaininfo(hc, /*now=*/1'800'000'000u);
+
+    EXPECT_EQ(r["chain"], "main");
+    EXPECT_FALSE(r["synced"].get<bool>());
+    EXPECT_FALSE(r.contains("difficulty"))
+        << "bits=0 would divide by a null target — a fabricated zero: " << r.dump(2);
+    EXPECT_FALSE(r.contains("mediantime"))
+        << "median_time_past() is 0 at a synthetic anchor — a fabricated zero";
+    EXPECT_NE(r["unavailable"]["difficulty"].get<std::string>().find("fabricated"),
+              std::string::npos);
+    EXPECT_EQ(r["first_indexed_height"].get<uint32_t>(),
+              params.fast_start_checkpoint->height);
+    // Confirms that median_time_past() really would have returned the zero we
+    // refused to publish — the withheld field is not a false alarm.
+    EXPECT_EQ(hc.median_time_past(), 0u);
+    expect_no_field_is_both_emitted_and_unavailable(r);
+}
+
+// NEGATIVE TWIN: with no tip at all, every tip-derived field is unavailable
+// and none is emitted as 0 / "".
+TEST(DashChainRpc, ChainInfoNoTipWithholdsEveryTipDerivedField) {
+    auto params = make_easy_test_params();
+    HeaderChain hc(params, /*db_path=*/"");   // deliberately NOT init()ed
+    auto r = chain_rpc::getblockchaininfo(hc, /*now=*/1'800'000'000u);
+
+    for (const char* f : {"blocks", "headers", "bestblockhash", "mediantime", "difficulty"}) {
+        EXPECT_FALSE(r.contains(f)) << f << " must not be emitted with no tip: " << r.dump(2);
+        EXPECT_TRUE(r["unavailable"].contains(f)) << f << " must be named unavailable";
+    }
+    EXPECT_FALSE(r["synced"].get<bool>());
+    EXPECT_EQ(r["headers_stored"].get<uint64_t>(), 0u);
+    expect_no_field_is_both_emitted_and_unavailable(r);
+}
+
+// ─── invariants across the three ────────────────────────────────────────────
+
+// Anti-drift guard. chain_rpc::sync_status() reimplements the freshness
+// predicate over HeaderChain's PUBLIC api so header_chain.hpp needs no edit.
+// If someone changes HeaderChain::is_synced()'s window (or ours) without the
+// other, this goes red instead of the two silently disagreeing.
+TEST(DashChainRpc, SyncStatusMatchesHeaderChainIsSynced) {
+    const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+
+    auto fresh = build_mined_chain(2, /*tip_time=*/now - 600);       // 10 min old
+    EXPECT_TRUE(fresh.hc->is_synced());
+    EXPECT_EQ(chain_rpc::sync_status(*fresh.hc, now).synced, fresh.hc->is_synced());
+
+    auto stale = build_mined_chain(2, /*tip_time=*/now - 200'000u);  // ~55 h old
+    EXPECT_FALSE(stale.hc->is_synced());
+    EXPECT_EQ(chain_rpc::sync_status(*stale.hc, now).synced, stale.hc->is_synced());
+}
+
+// getbestblockhash and getblockchaininfo are served by one backend, so they
+// can never report different tips.
+TEST(DashChainRpc, BestBlockHashAgreesWithChainInfo) {
+    auto mc = build_mined_chain(3, /*tip_time=*/1'800'000'000u);
+    const uint32_t now = mc.tip_time + 60;
+    auto best = chain_rpc::getbestblockhash(*mc.hc, now);
+    auto info = chain_rpc::getblockchaininfo(*mc.hc, now);
+    ASSERT_TRUE(best.available);
+    EXPECT_EQ(best.value.get<std::string>(), info["bestblockhash"].get<std::string>());
+    // ... and the tip that getblockhash reports at the chain-info height.
+    auto at_tip = chain_rpc::getblockhash(*mc.hc, info["blocks"].get<uint32_t>(), now);
+    ASSERT_TRUE(at_tip.available) << at_tip.unavailable_reason;
+    EXPECT_EQ(at_tip.value.get<std::string>(), best.value.get<std::string>());
+}
+
+TEST(DashChainRpc, FirstIndexedHeightFindsTheAnchor) {
+    auto mc = build_mined_chain(5, /*tip_time=*/1'800'000'000u);
+    auto anchor = chain_rpc::first_indexed_height(*mc.hc);
+    ASSERT_TRUE(anchor.has_value());
+    EXPECT_EQ(*anchor, 0u) << "genesis-stub chains are indexed from height 0";
+
+    auto params = make_dash_chain_params_mainnet();
+    HeaderChain cp_chain(params, /*db_path=*/"");
+    ASSERT_TRUE(cp_chain.init());
+    auto cp_anchor = chain_rpc::first_indexed_height(cp_chain);
+    ASSERT_TRUE(cp_anchor.has_value());
+    EXPECT_EQ(*cp_anchor, params.fast_start_checkpoint->height)
+        << "the binary search must land on the fast-start checkpoint, not 0";
+}
+
+// The dispatch surface the web server installs: unknown methods are refused by
+// name rather than answered, so the six remaining daemon RPCs can never be
+// silently faked by this backend.
+TEST(DashChainRpc, ChainQueryRefusesMethodsTheHeaderChainDoesNotOwn) {
+    auto mc = build_mined_chain(2, /*tip_time=*/1'800'000'000u);
+    const uint32_t now = mc.tip_time + 60;
+    for (const char* m : {"getblock", "getpeerinfo", "getrawmempool",
+                          "getnetworkinfo", "getmininginfo", "protx"}) {
+        auto r = chain_rpc::chain_query(*mc.hc, m, nlohmann::json::array(), now);
+        ASSERT_TRUE(r.contains("error")) << m << " must be refused: " << r.dump();
+        EXPECT_NE(r["error"].get<std::string>().find(m), std::string::npos);
+    }
+    // getblockhash with no height is a caller error, and says so.
+    auto bad = chain_rpc::chain_query(*mc.hc, "getblockhash", nlohmann::json::array(), now);
+    ASSERT_TRUE(bad.contains("error"));
+    EXPECT_NE(bad["error"].get<std::string>().find("height parameter"), std::string::npos);
+
+    // Happy path through the same dispatch returns the BARE daemon-shaped value.
+    auto ok = chain_rpc::chain_query(*mc.hc, "getbestblockhash", nlohmann::json::array(), now);
+    EXPECT_TRUE(ok.is_string()) << ok.dump();
+    EXPECT_EQ(ok.get<std::string>(), mc.hashes.back().GetHex());
 }

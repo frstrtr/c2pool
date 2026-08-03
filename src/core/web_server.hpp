@@ -1302,6 +1302,29 @@ public:
     std::string call_explorer_blockhash(uint32_t h, const std::string& c) { return m_explorer_blockhash_fn(h, c); }
     nlohmann::json call_explorer_getblock(const std::string& h, const std::string& c) { return m_explorer_getblock_fn(h, c); }
 
+    // ── Daemonless coin-chain query hook ───────────────────────────────────
+    // A coin backend that can answer chain queries (getbestblockhash /
+    // getblockhash / getblockchaininfo) from its OWN validated state — e.g.
+    // DASH's SPV HeaderChain — installs one function here instead of three.
+    // One hook for all three keeps the answers structurally consistent: a
+    // bestblockhash can never disagree with the bestblockhash inside the same
+    // backend's getblockchaininfo.
+    //
+    // The return value is the bare daemon-compatible result on success, or an
+    // object carrying "error"/"unavailable_reason" naming the condition that
+    // blocked the answer, with the measured value and the threshold. A backend
+    // must never substitute a plausible zero for state it does not own — the
+    // callers here forward the refusal verbatim rather than flattening it.
+    using coin_chain_query_fn_t = std::function<nlohmann::json(
+        const std::string& method, const nlohmann::json& params, const std::string& chain)>;
+    void set_coin_chain_query_fn(coin_chain_query_fn_t fn) { m_coin_chain_query_fn = thread_safe_wrap(std::move(fn)); }
+    bool has_coin_chain_query_fn() const { return !!m_coin_chain_query_fn; }
+    nlohmann::json call_coin_chain_query(const std::string& method,
+                                         const nlohmann::json& params,
+                                         const std::string& chain) {
+        return m_coin_chain_query_fn(method, params, chain);
+    }
+
     // Mempool explorer callbacks
     using explorer_mempoolinfo_fn_t  = std::function<nlohmann::json(const std::string& chain)>;
     using explorer_rawmempool_fn_t   = std::function<nlohmann::json(const std::string& chain, bool verbose, uint32_t limit)>;
@@ -1427,6 +1450,8 @@ private:
     explorer_chaininfo_fn_t m_explorer_chaininfo_fn;
     explorer_blockhash_fn_t m_explorer_blockhash_fn;
     explorer_getblock_fn_t  m_explorer_getblock_fn;
+    // Daemonless coin-chain query hook (DASH header chain; see setter above)
+    coin_chain_query_fn_t   m_coin_chain_query_fn;
     // Mempool explorer callbacks
     explorer_mempoolinfo_fn_t  m_explorer_mempoolinfo_fn;
     explorer_rawmempool_fn_t   m_explorer_rawmempool_fn;
