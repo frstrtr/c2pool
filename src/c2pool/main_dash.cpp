@@ -70,6 +70,7 @@
 #include <impl/dash/coin/utxo_lane.hpp>    // dash::coin::UtxoLane — embedded UTXO/fee lane (E2b, #738)
 #include <impl/dash/coin/header_chain.hpp>       // dash::coin::HeaderChain — SPV header/tip authority (E2a)
 #include <impl/dash/coin/chain_rpc.hpp>          // dash::coin::chain_rpc — daemonless getbestblockhash/getblockhash/getblockchaininfo
+#include <impl/dash/coin/bestblock_diag.hpp>     // #1046 bestblock out=0 diagnostic classifier (RpcNotString/BadHexLen/Ok)
 #include <impl/dash/coin/coin_state_maintainer.hpp>  // dash::coin::CoinStateMaintainer — populate ordering gate (E2a)
 #include <impl/dash/coin/sml_quorum_db.hpp>      // dash::coin::SMLDb / QuorumDb — SML+quorum persistence (incremental restart)
 #include <impl/dash/coin/credit_pool_db.hpp>     // dash::coin::CreditPoolDb — credit-pool tip persistence (E2 restart resume)
@@ -4103,13 +4104,29 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 tip.SetHex(tip_hex);
                 if (tip.IsNull())
                     return;
-                boost::asio::post(*rpc_pool, [rpc, tip, &ioc, &p2p_node]() {
+                // DIAG(#1046, non-soak dev tree): the ENTER marker resolves the
+                // "lambda never invoked" case -- if [Stratum] tip-poll logs a NEW
+                // tip but this line is ABSENT, announce_bestblock was not called.
+                LOG_INFO << "[Pool] bestblock DIAG(#1046): announce ENTER tip="
+                         << tip_hex.substr(0, 16);
+                boost::asio::post(*rpc_pool, [rpc, tip, tip_hex, &ioc, &p2p_node]() {
                     std::string hdr_hex;
                     try {
                         // BLOCKING -- BACKGROUND THREAD (never the io thread).
                         auto r = rpc->getblockheader(tip, /*verbose=*/false);
-                        if (r.is_string())
-                            hdr_hex = r.get<std::string>();
+                        // DIAG(#1046): the three-way classify replaces the two
+                        // formerly-silent returns. RpcNotString vs BadHexLen are
+                        // now distinguishable in the log; Ok falls through.
+                        auto cls =
+                            dash::coin::classify_bestblock_header(r, hdr_hex);
+                        if (cls != dash::coin::BestblockFetch::Ok) {
+                            LOG_WARNING << "[Pool] bestblock DIAG(#1046): BAIL "
+                                        << dash::coin::bestblock_fetch_name(cls)
+                                        << " (r.type=" << r.type_name()
+                                        << ", hex_len=" << hdr_hex.size()
+                                        << ") tip=" << tip_hex.substr(0, 16);
+                            return; // refuse to send a non-80-byte header
+                        }
                     } catch (const std::exception& e) {
                         LOG_WARNING << "[Pool] bestblock: getblockheader failed "
                                        "(non-fatal, next tip re-announces): "
@@ -4118,8 +4135,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     } catch (...) {
                         return; // never crash on an advisory announcement
                     }
-                    if (hdr_hex.size() != 160)
-                        return; // not an 80-byte header -- refuse to send garbage
+                    // Classified Ok above (exactly 160 hex chars); broadcast.
+                    LOG_INFO << "[Pool] bestblock DIAG(#1046): fetch Ok len=160 "
+                                "-> broadcast tip=" << tip_hex.substr(0, 16);
                     boost::asio::post(ioc, [hdr_hex = std::move(hdr_hex), &p2p_node]() {
                         try {
                             dash::coin::BlockHeaderType hdr;
