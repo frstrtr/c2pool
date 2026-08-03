@@ -208,6 +208,13 @@ jobs:
       # ── Analysis ──────────────────────────────────────────────────────────
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4
+        # Step-level cap on the analyze phase only. The 90-min job cap
+        # (see analyze.timeout-minutes) covers init+build+analyze together;
+        # this tighter step cap fast-reds a wedged run-queries/extractor
+        # (the CodeQL-java-tracer runaway class, e.g. runner 145-1) without
+        # waiting on the whole-job budget. Whole-job p95 of successful runs
+        # is 59.2 min, so analyze alone sits comfortably under 60.
+        timeout-minutes: 60
         with:
           category: "/language:${{ matrix.language }}"
           # Cap the run-queries footprint on the shared self-hosted 905 box so
