@@ -10,6 +10,7 @@
 #include "vendor/blockencodings.hpp"
 #include "vendor/smldiff.hpp"
 #include "vendor/llmq_commitment.hpp"
+#include "vendor/quorum_rotation_info.hpp"
 
 #include <impl/bitcoin_family/coin/base_p2p_messages.hpp>
 
@@ -189,6 +190,52 @@ BEGIN_MESSAGE(mnlistdiff)
     )
     {
         READWRITE(obj.m_diff);
+    }
+END_MESSAGE()
+
+// ── DIP-0024 rotated-quorum sourcing ──────────────────────────────────────
+// "getqrinfo" / "qrinfo" (dashcore llmq/snapshot.h). The rotated member set
+// is NOT derivable from the single work-block snapshot getmnlistd returns —
+// only qrinfo carries the quarter-rotation snapshots + cycle-base mnlistdiffs
+// that ComputeQuorumMembersByQuarterRotation needs. See
+// vendor/quorum_rotation_info.hpp for the wire layout (pinned from a real
+// capture) and for why the reply is carried as raw bytes here.
+BEGIN_MESSAGE(getqrinfo)
+    MESSAGE_FIELDS
+    (
+        (std::vector<uint256>, m_base_block_hashes),
+        (uint256,              m_block_request_hash),
+        (bool,                 m_extra_share)
+    )
+    {
+        READWRITE(obj.m_base_block_hashes,
+                  obj.m_block_request_hash,
+                  obj.m_extra_share);
+    }
+END_MESSAGE()
+
+// The qrinfo payload is carried RAW and decoded by
+// vendor::decode_quorum_rotation_info in the handler. Reason: the nested
+// CSimplifiedMNListDiff reader is fail-closed (returns bool) because it must
+// re-materialise the opaque quorum tail byte-exactly, and a READWRITE body has
+// no way to signal "refuse this message" other than throwing. Keeping the
+// decode out of the codec keeps a malformed qrinfo a LOCAL, logged refusal
+// instead of a stream-level exception on the coin connection.
+BEGIN_MESSAGE(qrinfo)
+    MESSAGE_FIELDS
+    (
+        (std::vector<unsigned char>, m_raw)
+    )
+    {
+        if constexpr (std::is_same_v<Formatter, UnserializeFormatter>) {
+            size_t n = stream.cursor_size();
+            obj.m_raw.resize(n);
+            if (n) stream.read(std::as_writable_bytes(std::span{obj.m_raw}));
+        } else {
+            if (!obj.m_raw.empty()) {
+                stream.write(std::as_bytes(std::span{obj.m_raw}));
+            }
+        }
     }
 END_MESSAGE()
 

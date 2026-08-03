@@ -237,6 +237,13 @@ private:
     using MnListDiffFilter = HistoricalMnListDiffDemux::Filter;
     HistoricalMnListDiffDemux m_historical_mnlistdiff_demux;
 
+    // DIP-24 qrinfo consumers. Unlike mnlistdiff there is no tip-feed hazard
+    // (nothing else consumes qrinfo, so nothing can be corrupted by a stray
+    // reply); this is a plain additive fan-out, and no registered consumer
+    // means a received qrinfo is logged and dropped.
+    using QrInfoConsumer = std::function<void(const vendor::CQuorumRotationInfo&)>;
+    std::vector<QrInfoConsumer> m_qrinfo_consumers;
+
 public:
     CoinClient(io::io_context* context, dash::interfaces::Node* coin, config_t* config,
                const std::string& chain_label = "COIN-P2P")
@@ -401,6 +408,12 @@ public:
     {
         return m_historical_mnlistdiff_demux.filter_count();
     }
+    /// Register a DIP-24 qrinfo consumer (additive, same rationale as above).
+    void add_qrinfo_consumer(QrInfoConsumer c)
+    {
+        m_qrinfo_consumers.push_back(std::move(c));
+    }
+    size_t qrinfo_consumer_count() const { return m_qrinfo_consumers.size(); }
     /// Fired on socket connect (before handshake) with the peer endpoint — the
     /// DashCoinPeerManager scores the connect + tracks anchors off this.
     void set_on_peer_connected(PeerLifecycleCallback cb) { m_on_peer_connected = std::move(cb); }
@@ -454,6 +467,21 @@ public:
     {
         if (!m_peer) return;
         auto msg = message_getmnlistd::make_raw(base_block_hash, block_hash);
+        m_peer->write(msg);
+    }
+
+    /// Send a getqrinfo (DIP-24 quorum-rotation-info request) — the ROTATED
+    /// counterpart of send_getmnlistd above. An EMPTY baseBlockHashes asks for
+    /// FULL (base=ZERO) mnlistdiffs at every cycle height, which is what the
+    /// member-set port needs: a full list is self-authenticating against its
+    /// own cbTx.merkleRootMNList, an incremental one is not.
+    void send_getqrinfo(const std::vector<uint256>& base_block_hashes,
+                        const uint256& block_request_hash,
+                        bool extra_share = false)
+    {
+        if (!m_peer) return;
+        auto msg = message_getqrinfo::make_raw(base_block_hashes,
+                                               block_request_hash, extra_share);
         m_peer->write(msg);
     }
 
@@ -847,6 +875,30 @@ private:
         }
     }
 
+    ADD_P2P_HANDLER(qrinfo)
+    {
+        // DIP-24 quorum rotation info. Decoded HERE (not in the codec) so a
+        // malformed reply is a local, logged refusal rather than a stream
+        // exception on the coin connection — see p2p_messages.hpp.
+        vendor::CQuorumRotationInfo info;
+        if (!vendor::decode_quorum_rotation_info(msg->m_raw, info)) {
+            LOG_WARNING << "[" << m_chain_label << "] qrinfo: UNDECODABLE ("
+                        << msg->m_raw.size()
+                        << "B) — dropped, rotated sourcing stays fail-closed";
+            return;
+        }
+        LOG_INFO << "[" << m_chain_label << "] qrinfo: tip="
+                 << info.mnListDiffTip.blockHash.GetHex().substr(0, 16)
+                 << " H=" << info.mnListDiffH.blockHash.GetHex().substr(0, 16)
+                 << " snapshots(active)="
+                 << info.quorumSnapshotAtHMinusC.activeQuorumMembers.size() << "/"
+                 << info.quorumSnapshotAtHMinus2C.activeQuorumMembers.size() << "/"
+                 << info.quorumSnapshotAtHMinus3C.activeQuorumMembers.size()
+                 << " lastCommitmentPerIndex=" << info.lastCommitmentPerIndex.size()
+                 << " extraShare=" << (info.extraShare ? 1 : 0);
+        for (auto& c : m_qrinfo_consumers) c(info);
+    }
+
     // ── E-SUPERBLOCK: governance objects + votes (daemonless superblock) ──
 
     ADD_P2P_HANDLER(govobj)
@@ -957,6 +1009,7 @@ private:
     ADD_P2P_HANDLER(getblocks)     { /* we don't serve blocks */ }
     ADD_P2P_HANDLER(getheaders)    { /* we don't serve headers */ }
     ADD_P2P_HANDLER(getmnlistd)    { /* we don't serve SML diffs */ }
+    ADD_P2P_HANDLER(getqrinfo)     { /* we don't serve rotation info either */ }
     ADD_P2P_HANDLER(cmpctblock)    { LOG_DEBUG_COIND << "[" << m_chain_label << "] cmpctblock ignored (E1)"; }
     ADD_P2P_HANDLER(getblocktxn)   { /* we never announce compact blocks */ }
     ADD_P2P_HANDLER(blocktxn)      { /* no pending compact block in E1 */ }
