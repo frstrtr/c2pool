@@ -1,0 +1,100 @@
+name: DGB G3a smoke — populated block production
+
+# ci-steward 2026-08-03. Per-coin populated-block gate for the DGB (DigiByte)
+# lane, mirroring BCH G3a and DASH G3a. CI plumbing only — NO consensus knowledge
+# here; the dgb lane owns the targets, the gate script (tests/gates/
+# dgb_g3a_regtest_block_production.sh) and the live driver.
+#
+# Network-free CI arm only in CI: ctest -R the populated-block assembly / witness
+# commitment / won-block reconstruction suites BY NAME with an empty-suite guard
+# demanding a positive test count (false-green trap caught in the script). The
+# optional live-regtest arm stays opt-in (DGB_REGTEST_LIVE=1 + DGB_SRC) and is
+# never enabled in CI, so this leg needs no live digibyted.
+#
+# Neutral-skip: on branches/coins without the DGB populated-block sources the job
+# is a green no-op (PR #47 per-coin source guard preserved). Register as a required
+# check only after a confirmed non-hollow green rollup on the runner.
+
+on:
+  # additive: callable by ci-required.yml aggregator (no push/PR behaviour change)
+  workflow_call:
+  push:
+    branches: [master]
+
+env:
+  GIT_HTTP_LOW_SPEED_LIMIT: '1000'
+  GIT_HTTP_LOW_SPEED_TIME: '20'
+
+jobs:
+  dgb-g3a-smoke:
+    name: DGB G3a smoke — populated block production
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set per-job Conan home
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+          else
+            echo "CONAN_HOME=$HOME/.conan2-ci/$RUNNER_NAME" >> "$GITHUB_ENV"
+          fi
+
+      - name: Check DGB populated-block source presence
+        id: presence
+        run: |
+          if [ -f "src/impl/dgb/test/block_assembly_test.cpp" ] && [ -f "tests/gates/dgb_g3a_regtest_block_production.sh" ]; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+            echo "::notice::DGB populated-block sources present — running G3a smoke."
+          else
+            echo "exists=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::DGB populated-block sources absent on this branch — neutral skip."
+          fi
+
+      - name: Install system dependencies
+        if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends g++ cmake make libleveldb-dev libsecp256k1-dev
+
+      - uses: actions/setup-python@v6
+        if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'
+        with: { python-version: '3.12' }
+
+      - name: Install Conan 2
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version
+          fi
+
+      - name: Show committed Conan profile
+        if: steps.presence.outputs.exists == '1'
+        run: conan profile show -pr:a=ci/conan/linux-gcc13.profile
+
+      - name: Restore Conan cache (github-hosted only)
+        if: runner.environment == 'github-hosted' && steps.presence.outputs.exists == '1'
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/conan2
+          key: conan2-ubuntu24-gcc13-dgb-g3a-${{ hashFiles('conanfile.txt', 'ci/conan/linux-gcc13.profile', 'conan.lock') }}
+          restore-keys: |
+            conan2-ubuntu24-gcc13-dgb-g3a-
+            conan2-ubuntu24-gcc13-
+
+      - name: Clean stale build dir (self-hosted workspace is reused)
+        if: steps.presence.outputs.exists == '1' && runner.environment != 'github-hosted'
+        run: rm -rf build_dgb_g3a
+
+      - name: Run DGB G3a smoke (dgb-lane entrypoint)
+        if: steps.presence.outputs.exists == '1'
+        env:
+          BUILD_DIR: ${{ github.workspace }}/build_dgb_g3a
+        run: bash tests/gates/dgb_g3a_regtest_block_production.sh
+
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace
