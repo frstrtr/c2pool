@@ -4887,6 +4887,7 @@ TEST(DashMnPayeeLatch, SeededMaintainerStillFoldsAndStillReportsDivergence)
     // A coinbase that pays nobody this set projects: a genuine divergence.
     auto blk = repay_coinbase(block_from_hex(kBlockHex1519544),
                               payout_of(cp, kQ1), synth_script(0x7f));
+    latch_bind(blk);   // rewriting the coinbase moved the body's merkle root
     const auto r = m.on_block_connected(blk, kAnchorHeight + 1);
 
     EXPECT_TRUE(r.payee_desync)
