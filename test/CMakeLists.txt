@@ -691,12 +691,18 @@ if (BUILD_TESTING AND GTest_FOUND)
     # -> a standalone target would be a NOT_BUILT sentinel). Do NOT re-add
     # standalone add_executable/gtest_add_tests for any of them — CTest would
     # register unbuilt executables (ctest "Not Run" exit 8, the Linux x86_64 red).
-    # DASH_FIXTURE_DIR is needed by the from-wire fixture loader (mnlistdiff).
+    # DASH_FIXTURE_DIR is needed by the from-wire fixture loader (mnlistdiff)
+    # and by the qrinfo / rotated-quorum suites, which read the real 602'189-byte
+    # testnet qrinfo capture. test_dash_rotated_quorum_members.cpp is folded here
+    # for the same reason as test_dash_qrinfo.cpp: this target IS in the build.yml
+    # "Build tests" --target allowlist, and a standalone target would be a
+    # NOT_BUILT sentinel (the push bot lacks `workflow` scope, #769).
     add_executable(test_dash_embedded_gbt
         test_dash_embedded_gbt.cpp
         test_dash_embedded_cbtx_byte_parity.cpp
         test_dash_mnlistdiff_root_parity.cpp
         test_dash_qrinfo.cpp
+        test_dash_rotated_quorum_members.cpp
         test_dash_dkg_commitments.cpp
         test_dash_sml_quorum_db.cpp
         test_dash_embedded_oracle_shadow.cpp)
