@@ -1667,6 +1667,14 @@ int main(int argc, char* argv[])
             std::string net_label = web_is_testnet ? "testnet" : "mainnet";
             std::string graph_db_path = (core::filesystem::config_path()
                 / net_label / "btc" / "graph_db").string();
+            // #1040 gap (STATS.944 restart proof, 2026-08-03): the graph_db parent
+            // dir (config_path()/<net>/btc/) was never created, so save_stat_log's
+            // tmp-write + rename failed every 100s and NO stats survived restart.
+            // Mirror the main_btc.cpp:358 / main_dgb.cpp:196 create_directories(net_dir)
+            // best-effort pattern, targeting the actual stat-log parent.
+            std::error_code graph_db_mkdir_ec;
+            std::filesystem::create_directories(
+                std::filesystem::path(graph_db_path).parent_path(), graph_db_mkdir_ec);
             mi->set_stat_log_path(graph_db_path);
             mi->load_stat_log();
             LOG_INFO << "[BTC-POOL] graph_db stats persistence -> " << graph_db_path;
