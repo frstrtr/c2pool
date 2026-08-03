@@ -3618,8 +3618,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // Simplified MN List (leg 4's wire form) omits scriptPayout +
         // nLastPaidHeight, and leg 3's apply_block only folds special txs from
         // blocks we actually connect (a full DIP3-height replay = E2d). So when
-        // the dashd-RPC arm is ARMED, fetch the full valid DMN set ONCE via
-        // `protx list valid true` (payoutAddress + lastPaidHeight — everything
+        // the dashd-RPC arm is ARMED, fetch the full REGISTERED DMN set ONCE via
+        // `protx list registered true` (payoutAddress + lastPaidHeight — everything
         // GetMNPayee ordering needs) and publish it through the EXISTING leg-4
         // event, so the maintainer takes it exactly like any other resync. The
         // parse FAILS CLOSED (mn_seed.hpp): any undecodable payoutAddress
@@ -3647,7 +3647,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 for (int attempt = 0; attempt < 3; ++attempt) {
                     const uint32_t h_before = static_cast<uint32_t>(
                         rpc_ptr->getblockchaininfo().value("blocks", 0));
-                    protx_list = rpc_ptr->protx_list_valid_detailed();
+                    protx_list = rpc_ptr->protx_list_registered_detailed();
                     const uint32_t h_after = static_cast<uint32_t>(
                         rpc_ptr->getblockchaininfo().value("blocks", 0));
                     if (h_before == h_after && h_after != 0) {
@@ -3666,11 +3666,32 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     std::cout << "[run] E2c MN-set seed LOADED (" << tag
                               << "): "
                               << seed_stats.seeded << "/" << seed_stats.total
-                              << " valid MNs (" << seed_stats.evo << " Evo)"
+                              << " registered MNs (" << seed_stats.evo
+                              << " Evo; " << seed_stats.pose_banned
+                              << " PoSe-banned, i.e. PRESENT but INELIGIBLE"
+                                 " -> "
+                              << (seed_stats.seeded - seed_stats.pose_banned)
+                              << " payee-eligible)"
                                  " as-of h=" << as_of << " from dashd `protx"
-                                 " list valid true` -> maintainer DMN half"
+                                 " list registered true` -> maintainer DMN half"
                                  " ARMED; populated() flips once the header"
                                  " tip syncs\n";
+                    if (seed_stats.pose_banned == 0) {
+                        // Not fatal — a chain can genuinely have none — but on
+                        // mainnet it is the signature of a `valid`-filtered
+                        // source, and a valid-filtered seed cannot ever
+                        // reinstate a revived masternode. Say so at the seam
+                        // rather than letting a later "REINSTATED: 0" be read
+                        // as "none were needed".
+                        std::cout << "[run] E2c MN-set seed NOTE (" << tag
+                                  << "): the seeded set carries ZERO"
+                                     " PoSe-banned masternodes. If this is"
+                                     " mainnet that is the fingerprint of a"
+                                     " `protx list valid`-filtered source: no"
+                                     " ProUpServTx revive of a banned-at-seed"
+                                     " masternode can be honoured, because"
+                                     " there is no entry to revive.\n";
+                    }
                 } else if (as_of == 0) {
                     std::cout << "[run] E2c MN-set seed SKIPPED (" << tag
                               << ": dashd tip"
@@ -3941,7 +3962,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // CoinStateMaintainer::on_block_connected, on a payee DESYNC or an
             // apply GAP, wipes the payee set, latches m_mn_needs_reseed,
             // demotes to the dashd fallback and calls m_on_mn_reseed(). The RPC
-            // branch above answers it with a fresh `protx list valid`. This
+            // branch above answers it with a fresh `protx list registered`. This
             // branch used to answer it with NOTHING — the ask went into a void.
             //
             // MEASURED, contabo daemonless soak: the ask fired THREE times in

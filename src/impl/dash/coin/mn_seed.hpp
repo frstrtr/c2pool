@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
-/// E2c (#738): RPC MN-set seed — dashd `protx list valid true` JSON ->
+/// E2c (#738): RPC MN-set seed — dashd `protx list registered true` JSON ->
 /// the payout-bearing DMN baseline CoinStateMaintainer::on_mn_list_update()
 /// loads at cold start.
 ///
@@ -15,8 +15,8 @@
 /// routes to the dashd-RPC fallback arm.
 ///
 /// THE SEED: when a coin-RPC is configured (the mining-hotel posture — dashd
-/// present), fetch the full valid deterministic-MN set ONCE at startup via
-/// `protx list valid true` and convert it here into the exact
+/// present), fetch the full REGISTERED deterministic-MN set ONCE at startup
+/// via `protx list registered true` and convert it here into the exact
 /// vector<pair<proTxHash, MNState>> the maintainer's resync leg takes. That
 /// JSON carries everything payee selection needs that the SML does not:
 ///   - state.payoutAddress   -> MNState.scriptPayout      (the payee itself)
@@ -28,6 +28,27 @@
 /// would rank every MN equal and project the WRONG payee — exactly the
 /// bad-cb-payee class the coinbase fix (#746) closed. Never mint payees from
 /// payout-incomplete data.
+///
+/// WHY `registered` AND NOT `valid` (the reinstatement gap). `protx list
+/// valid` filters out every PoSe-banned masternode, so in a valid-seeded set
+/// "banned at seed height" and "does not exist" are the SAME observation:
+/// absence. The forward replay only ADDS masternodes (ProRegTx is the only
+/// insertion path), so when a ProUpServTx later REVIVES a banned-at-seed
+/// masternode, MnStateMachine::apply_block's lookup misses, the revive is
+/// dropped as "unknown MN", and that masternode can never re-enter the DIP-3
+/// payment queue. Our queue head is then permanently the NEXT entry — every
+/// projection after the missed revive is one slot ahead of dashd's.
+/// (Mainnet: proTx 7afbd798… PoSe-banned at 2511957, revived by a ProUpServTx
+/// in 2513357, absent from a 2513000 `valid` anchor; at h=2515416 dashd's
+/// payee IS 7afbd798… and a valid-seeded set cannot contain it.)
+///
+/// Seeding the REGISTERED set carries those masternodes WITH their
+/// PoSeBanHeight. They are PRESENT but INELIGIBLE — isValid is DERIVED as
+/// (PoSeBanHeight == 0), and every selection path
+/// (rank_payee_candidates/pick_paid_mn) filters on it — so eligibility is
+/// COMPUTED rather than implied by absence, and the ProUpServTx revive branch
+/// works as written. `eligible_size()`, not `size()`, is the number
+/// comparable to `protx list valid`.
 ///
 /// ADDRESS -> SCRIPT round trip: dashd consensus (CheckService on ProRegTx /
 /// ProUpRegTx) only admits P2PKH / P2SH payout scripts, and payoutAddress is
@@ -73,6 +94,15 @@ struct MnSeedStats {
     size_t evo{0};             // of which Evo (platform) MNs
     size_t payout_decode_failed{0};  // payoutAddress undecodable -> seed ABORTED
     size_t malformed{0};       // entry missing proTxHash/state -> seed ABORTED
+    // Of `seeded`, how many carry a live PoSeBanHeight — i.e. are PRESENT in
+    // the set but payee-INELIGIBLE. `seeded - pose_banned` is the number
+    // directly comparable to `protx list valid`.
+    //
+    // This counter is the difference between "no masternode needed
+    // reinstating" and "reinstatement is structurally impossible here": a
+    // ZERO here on mainnet means the source was `valid`-filtered, so no
+    // ProUpServTx revive can ever find an entry to revive.
+    size_t pose_banned{0};
 };
 
 namespace detail {
@@ -236,9 +266,16 @@ inline std::vector<std::pair<uint256, MNState>> parse_protx_list_seed(
             detail::sane_height_json(s, "consecutivePayments");
         if (s.contains("revocationReason") && s["revocationReason"].is_number())
             mn.nRevocationReason = s["revocationReason"].get<uint16_t>();
-        // `protx list valid` already filters to non-banned MNs; keep the
-        // defensive ban-height projection anyway.
+        // ELIGIBILITY IS COMPUTED, NEVER IMPLIED BY ABSENCE. The seed source
+        // is `protx list registered true`, which INCLUDES PoSe-banned
+        // masternodes, so this projection is load-bearing rather than
+        // defensive: it is what makes a banned masternode present-but-
+        // ineligible instead of missing. (Under the old `valid`-filtered
+        // source, absence was the only encoding of "banned" — which also
+        // made it the encoding of "does not exist", so a later ProUpServTx
+        // revive had nothing to revive.)
         mn.isValid = (mn.nPoSeBanHeight == 0);
+        if (!mn.isValid) ++st.pose_banned;
 
         // THE payee keystone: payoutAddress -> scriptPayout, byte-exact.
         mn.scriptPayout.m_data = detail::payout_address_to_script(

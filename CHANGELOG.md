@@ -2,6 +2,43 @@
 
 ## [Unreleased]
 
+### DASH — daemonless masternode set: seed completeness (the reinstatement gap)
+- **The pinned anchor and the RPC seed now carry the REGISTERED masternode set,
+  not the valid one.** `protx list valid` filters every PoSe-banned masternode
+  out, which made "PoSe-banned at seed height" and "does not exist" the same
+  observation: absence. The forward replay's only insertion path is `ProRegTx`,
+  which a long-registered masternode never emits again — so a `ProUpServTx` that
+  REVIVED such a masternode inside the replay window found no entry, was dropped
+  as an unknown masternode, and that masternode could never re-enter the DIP-3
+  payment queue. Our queue head then stayed permanently one slot ahead of
+  dashd's, which is a served `bad-cb-payee`.
+  Traced on mainnet: proTx `7afbd798…` PoSe-banned at 2511957, revived by a
+  `ProUpServTx` in block 2513357, absent from the `valid`-based 2513000 anchor;
+  at h=2515416 dashd's payee queue head *is* `7afbd798…`.
+- **Mainnet anchor re-pinned at the same height 2513000** from
+  `protx list registered true`: 2974 registered masternodes, of which 2068
+  payee-eligible and 906 present-but-INELIGIBLE. The 2068 eligible records are
+  **byte-identical** to the previous pin — the re-pin is purely additive.
+  `count` now counts REGISTERED masternodes; the number comparable to
+  `protx list valid <h>` is the runtime's `eligible_size()`.
+- **A revive is now measured.** `MnStateMachine::ApplyResult` gained `revived`
+  (ProUpServTx revives applied) and `revive_dropped_unknown` (revives dropped
+  for a masternode the set does not contain — non-zero is a defect, not a
+  statistic), and a dropped revive is logged at `WARNING` naming the proTxHash.
+- **"REINSTATED: 0" now says which zero it is.** The bridge reports
+  `anchor_ineligible()` and a `reinstatement_report()` that distinguishes "none
+  needed" from "impossible on this anchor" — a `valid`-filtered anchor carries
+  no revivable entry at all, so its zero was never a measurement.
+- **Standing exclusions are documented and tested as REVOCABLE.** The demotion
+  walk and the on-demand re-adjudication retire a queue head by setting a
+  nonzero ban height and KEEPING the entry, precisely so a later chain revive
+  lifts it; the log lines no longer claim the exclusion is "permanent".
+- **Payee tiebreak pinned by a known-answer test** on the real score-tied pair
+  at mainnet h=2515416 (`7afbd798…` vs `7a16c86c…`), whose display-hex order is
+  the OPPOSITE of the wire byte order — so the KAT can actually detect a
+  byte-order regression that the mainnet replay dataset cannot separate from the
+  absent-masternode defect.
+
 ### DASH — daemonless masternode-set seed (E2d)
 - **Release-pinned masternode-set checkpoint + forward replay** — `--embedded-mainnet`
   can now cold-start the payout-bearing masternode set without a dashd RPC. This was

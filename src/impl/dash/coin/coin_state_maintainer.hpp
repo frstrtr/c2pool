@@ -886,7 +886,7 @@ public:
     }
 
     /// Wire the authoritative MN re-seed sink (main_dash points this at the
-    /// E2c `protx list valid true` seed fetch when a coin RPC is configured).
+    /// E2c `protx list registered true` seed fetch when a coin RPC is configured).
     /// Invoked from on_block_connected's payee-desync fail-closed path AFTER
     /// the payee set is wiped and the bundle demoted — the arm stays on the
     /// dashd fallback until the re-seed lands via on_mn_list_update. Optional:

@@ -600,16 +600,28 @@ nlohmann::json NodeRPC::getblock(uint256 blockhash, int verbosity)
     return CallAPIMethod("getblock", {blockhash, verbosity});
 }
 
-// E2c (#738): the MN-set seed fetch. `protx list valid true` returns every
-// registered, non-PoSe-banned masternode at the current tip with the detailed
-// per-MN state (payoutAddress, lastPaidHeight, registeredHeight, PoSe
-// heights, pubKeyOperator, ...). Chosen over `protx diff`: the diff (even
-// extended) carries payoutAddress but NOT lastPaidHeight/registeredHeight, so
-// a diff-seeded set would rank every MN equal in GetMNPayee ordering and
+// E2c (#738): the MN-set seed fetch. `protx list registered true` returns
+// every REGISTERED masternode at the current tip — PoSe-banned ones included,
+// each carrying its PoSeBanHeight — with the detailed per-MN state
+// (payoutAddress, lastPaidHeight, registeredHeight, PoSe heights,
+// pubKeyOperator, ...). Chosen over `protx diff`: the diff (even extended)
+// carries payoutAddress but NOT lastPaidHeight/registeredHeight, so a
+// diff-seeded set would rank every MN equal in GetMNPayee ordering and
 // project the WRONG payee (the bad-cb-payee class #746 fixed).
-nlohmann::json NodeRPC::protx_list_valid_detailed()
+//
+// `registered`, NOT `valid`. `valid` filters the PoSe-banned masternodes out
+// entirely, so a banned masternode is INDISTINGUISHABLE from one that does
+// not exist. The replay only ever ADDS (ProRegTx) — so a ProUpServTx that
+// revives a banned-at-seed masternode finds no entry, is dropped as "unknown
+// MN", and that masternode can never return to the DIP-3 payment queue. Our
+// queue head is then permanently the NEXT entry, i.e. every projection after
+// the missed revive is one slot ahead of dashd's. Seeding the REGISTERED set
+// keeps the banned masternodes PRESENT but INELIGIBLE (isValid is derived as
+// PoSeBanHeight == 0), so eligibility is computed rather than implied by
+// absence, and the revive path in apply_block works as written.
+nlohmann::json NodeRPC::protx_list_registered_detailed()
 {
-    return CallAPIMethod("protx", {"list", "valid", true});
+    return CallAPIMethod("protx", {"list", "registered", true});
 }
 
 } // namespace coin

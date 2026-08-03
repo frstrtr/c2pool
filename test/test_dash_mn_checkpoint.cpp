@@ -56,6 +56,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <span>
@@ -3823,4 +3824,357 @@ TEST(DashMnCheckpointReseed, ReArmDropsThePreservedMismatchOfAFailedBridge)
     EXPECT_EQ(after.height, 0u);
     EXPECT_TRUE(after.ranked.empty());
     EXPECT_FALSE(after.projected.has_value());
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 13. SEED COMPLETENESS — a masternode PoSe-banned AT the anchor must be
+//     PRESENT and INELIGIBLE, never absent.
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// TRACED ON CHAIN (hotel dashd 23.1.7, mainnet):
+//
+//   proTx 7afbd798…  PoSe-banned at h=2511957
+//                    REVIVED by a ProUpServTx in block 2513357
+//   `protx list valid   true 2513000` -> 2068 entries, 7afbd798… ABSENT
+//   `protx list registered true 2513000` -> 2974 entries, 7afbd798… present
+//                                            with poseBanHeight 2511957
+//   h=2515416 coinbase pays Xod7jBYgNygf9Sspift6prXqYgsMcJf6Xw  = 7afbd798…
+//   h=2515417 coinbase pays Xuizi1a6DhjzAsmcUE8mzba9mZLHGqWQNH  = 7a16c86c…
+//
+// A `valid`-filtered anchor cannot contain 7afbd798… at all, so its queue head
+// at 2515416 is necessarily the NEXT entry (7a16c86c…) — the whole "off-by-one"
+// is the shape of ONE ABSENT QUEUE ENTRY.
+//
+// The replay cannot repair it: the only insertion paths are the seed and
+// ProRegTx, and a masternode registered at h=1047763 will never emit another
+// ProRegTx. Its revive arrives as a ProUpServTx, which apply_block drops for an
+// unknown proTxHash.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace {
+
+// The SHIPPED mainnet anchor, compiled in exactly as main_dash.cpp compiles it.
+// Asserting on the artifact itself is the point: every other test here runs on
+// a fixture, and a fixture cannot tell you what the release actually carries.
+const char* const kShippedMainnetAnchor =
+#include <impl/dash/coin/checkpoints/dash_mn_checkpoint_mainnet.inc>
+    ;
+
+// The traced mainnet pair, in dashd's own display (big-endian) hex.
+const char* const kMnBannedThenRevived =
+    "7afbd798bda1e97548af7600c8aa63fbcf424285911a89d73fceb8cea869355f";
+const char* const kMnNextInQueue =
+    "7a16c86c3ba2b7ec19e13064505195f700e8cb7729e5ccb6c8aa0657cdfa9d82";
+
+const MNState* find_entry(const MnCheckpoint& cp, const char* protx)
+{
+    const uint256 want = uint256S(protx);
+    for (const auto& [h, st] : cp.entries)
+        if (h == want) return &st;
+    return nullptr;
+}
+
+} // namespace
+
+// ── CASE 13.1. THE SHIPPED ARTIFACT. The compiled-in mainnet anchor must be
+// the REGISTERED set. A `valid`-filtered anchor carries zero PoSe-banned
+// entries — which is not "no masternode is banned" (impossible on mainnet), it
+// is "banned masternodes were deleted", and deletion is what makes a revive
+// unrepresentable.
+TEST(DashMnAnchorSeedCompleteness, ShippedMainnetAnchorCarriesTheBannedMasternodes)
+{
+    auto cp = parse_mn_checkpoint(kShippedMainnetAnchor, "mainnet");
+    ASSERT_TRUE(cp.ok) << cp.error;
+    ASSERT_FALSE(cp.unpinned) << "this test asserts on a PINNED release anchor";
+
+    size_t banned = 0;
+    for (const auto& [h, st] : cp.entries) {
+        if (st.nPoSeBanHeight == 0) continue;
+        ++banned;
+        EXPECT_FALSE(st.isValid)
+            << h.GetHex() << " carries a live ban height but is eligible —"
+                             " isValid must be DERIVED from poseBanHeight";
+        EXPECT_FALSE(st.scriptPayout.m_data.empty())
+            << h.GetHex() << " is banned but payee-less; it needs a payout"
+                             " script for the block after its revive";
+    }
+    EXPECT_GT(banned, 0u)
+        << "the shipped mainnet anchor carries ZERO PoSe-banned masternodes."
+           " A real DIP-3 set at any mainnet height has banned members, so this"
+           " is the fingerprint of a `protx list valid`-filtered capture: a"
+           " banned masternode is ABSENT rather than present-and-ineligible,"
+           " and no ProUpServTx revive inside the bridge window can be honoured"
+           " because there is no entry to revive.";
+
+    // Height-gated so a future re-pin at a different height does not have to
+    // carry these exact numbers — but at THIS height they are the traced ones.
+    if (cp.height == 2513000) {
+        const MNState* revived_later = find_entry(cp, kMnBannedThenRevived);
+        ASSERT_NE(revived_later, nullptr)
+            << "proTx 7afbd798… is absent from the anchor. dashd pays it at"
+               " h=2515416 after its ProUpServTx revive in 2513357, and a set"
+               " that does not contain it cannot ever project it.";
+        EXPECT_EQ(revived_later->nPoSeBanHeight, 2511957u)
+            << "the anchor must carry the ban height dashd reports, not just"
+               " the fact of a ban";
+        EXPECT_FALSE(revived_later->isValid);
+
+        EXPECT_EQ(cp.entries.size(), 2974u) << "registered set size";
+        EXPECT_EQ(cp.entries.size() - banned, 2068u)
+            << "the payee-ELIGIBLE half must be unchanged from the previous"
+               " `valid`-based pin at this height — the re-pin is purely"
+               " additive, it moves no eligible masternode's payout state";
+    }
+}
+
+// ── CASE 13.2. THE MECHANISM, both directions, on the same block.
+// A ProUpServTx reviving a masternode the set HAS is applied and counted; the
+// identical block against a `valid`-filtered set (same anchor minus the banned
+// entry) drops the revive and SAYS SO.
+TEST(DashMnAnchorSeedCompleteness, RegisteredSeedHonoursTheReviveValidFilteredDropsIt)
+{
+    auto cp = good_checkpoint();
+
+    // The REGISTERED-set shape: kQ1 is PoSe-banned at the anchor, so it is
+    // present-and-ineligible.
+    std::vector<std::pair<uint256, MNState>> registered_seed;
+    for (auto [h, st] : cp.entries) {
+        if (h == uint256S(kQ1)) {
+            st.nPoSeBanHeight = 1519500;
+            st.isValid        = false;
+        }
+        registered_seed.emplace_back(h, st);
+    }
+    // The `valid`-FILTERED shape: the very same set with the banned masternode
+    // deleted. This is what `protx list valid` returns.
+    std::vector<std::pair<uint256, MNState>> valid_filtered_seed;
+    for (const auto& e : registered_seed)
+        if (e.second.isValid) valid_filtered_seed.push_back(e);
+    ASSERT_EQ(valid_filtered_seed.size() + 1, registered_seed.size());
+
+    // Block 1519544 with a ProUpServTx reviving kQ1. Its coinbase is repaid to
+    // kQ2 because with kQ1 out of the queue (banned in one machine, absent in
+    // the other) kQ2 IS the projected payee in BOTH — so the two machines
+    // differ only in what they do with the revive.
+    auto blk = repay_coinbase(block_from_hex(kBlockHex1519544),
+                              payout_of(cp, kQ1), payout_of(cp, kQ2));
+    blk.m_txs.push_back(pro_up_serv_tx(kQ1));
+
+    MnStateMachine complete;
+    complete.load(registered_seed, 1519543);
+    ASSERT_EQ(complete.ineligible_size(), 1u);
+    const auto rc = complete.apply_block(blk, 1519544);
+    EXPECT_FALSE(rc.payee_desync);
+    EXPECT_EQ(rc.revived, 1u)
+        << "the ProUpServTx must reinstate a masternode the set HAS";
+    EXPECT_EQ(rc.revive_dropped_unknown, 0u);
+    const MNState& back = complete.entries().at(uint256S(kQ1));
+    EXPECT_TRUE(back.isValid);
+    EXPECT_EQ(back.nPoSeBanHeight, 0u);
+    EXPECT_EQ(back.nPoSeRevivedHeight, 1519544u);
+    EXPECT_EQ(complete.eligible_size(), 6u)
+        << "the revived masternode is back in the payee-eligible set";
+
+    MnStateMachine filtered;
+    filtered.load(valid_filtered_seed, 1519543);
+    ASSERT_EQ(filtered.ineligible_size(), 0u)
+        << "a valid-filtered seed carries no ineligible entries at all — which"
+           " is exactly why its 'reinstated 0' is not a measurement";
+    const auto rf = filtered.apply_block(blk, 1519544);
+    EXPECT_FALSE(rf.payee_desync);
+    EXPECT_EQ(rf.revived, 0u);
+    EXPECT_EQ(rf.revive_dropped_unknown, 1u)
+        << "the revive was dropped and must be COUNTED and NAMED — a silent"
+           " drop is how this defect survived: the chain put a masternode back"
+           " in the payment queue and we did not";
+    EXPECT_EQ(filtered.entries().count(uint256S(kQ1)), 0u);
+    EXPECT_EQ(filtered.eligible_size(), 5u)
+        << "the two sets have now permanently diverged by one queue entry —"
+           " every later projection is one slot ahead of the chain's";
+}
+
+// ── CASE 13.3. The exclusion this bridge records must stay REVOCABLE. The
+// demotion walk retires a queue head by setting a NONZERO ban height and
+// KEEPING the entry, precisely so a later ProUpServTx can lift it. Mainnet
+// e8626fcd… was excluded that way and revived at h=2515219, inside the same
+// bridge window.
+TEST(DashMnAnchorSeedCompleteness, WalkExclusionIsRevocableByALaterRevive)
+{
+    auto cp = good_checkpoint();
+    MnStateMachine m;
+    m.load(cp.entries, 1519543);
+    m.set_sml_recovery_cap(8);
+    m.set_sml_validity_fn(
+        [](const uint256& h) -> std::optional<bool> {
+            return h == uint256S(kQ1) ? std::optional<bool>{false}
+                                      : std::optional<bool>{true};
+        });
+    m.set_sml_current_height(1519544);
+
+    const auto r1 = m.apply_block(
+        repay_coinbase(block_from_hex(kBlockHex1519544),
+                       payout_of(cp, kQ1), payout_of(cp, kQ2)),
+        1519544);
+    ASSERT_FALSE(r1.payee_desync);
+    ASSERT_EQ(r1.sml_recovered, 1u);
+    const MNState& excluded = m.entries().at(uint256S(kQ1));
+    ASSERT_FALSE(excluded.isValid);
+    ASSERT_NE(excluded.nPoSeBanHeight, 0u)
+        << "an exclusion recorded WITHOUT a ban height is irrevocable: the"
+           " ProUpServTx revival branch is gated on banHeight != 0";
+
+    // 1519545 as the network produced it: with kQ1 excluded and kQ2 paid at
+    // 1519544, queue slot 3 (kQ3) is the projected payee and the real coinbase
+    // already pays it — no repay needed. The ProUpServTx is the only addition.
+    auto blk45 = block_from_hex(kBlockHex1519545);
+    blk45.m_txs.push_back(pro_up_serv_tx(kQ1));
+    const auto r2 = m.apply_block(blk45, 1519545);
+    EXPECT_FALSE(r2.payee_desync);
+    EXPECT_EQ(r2.revived, 1u)
+        << "a standing exclusion must be lifted by a chain revive — 'permanent'"
+           " means 'for the rest of the replay unless the chain says otherwise',"
+           " not 'irrevocable'";
+    const MNState& reinstated = m.entries().at(uint256S(kQ1));
+    EXPECT_TRUE(reinstated.isValid);
+    EXPECT_EQ(reinstated.nPoSeBanHeight, 0u);
+    EXPECT_EQ(reinstated.nPoSeRevivedHeight, 1519545u);
+}
+
+// ── CASE 13.4. "REINSTATED: 0" must say WHICH zero it is.
+TEST(DashMnAnchorSeedCompleteness, ReinstatementReportSeparatesNoneFromImpossible)
+{
+    // A `valid`-filtered anchor: nothing in it can ever be reinstated.
+    {
+        BridgeHarness h;
+        h.lane.arm(good_checkpoint());
+        EXPECT_EQ(h.lane.anchor_ineligible(), 0u);
+        const std::string s = h.lane.reinstatement_report();
+        EXPECT_NE(s.find("REINSTATEMENT: NOT MEASURABLE"), std::string::npos)
+            << s;
+        EXPECT_NE(s.find("protx list valid"), std::string::npos)
+            << "the report must NAME the cause, not just the number: " << s;
+    }
+    // A registered-set anchor: the same zero now means "none were needed".
+    {
+        auto cp = good_checkpoint();
+        for (auto& [hash, st] : cp.entries) {
+            if (hash != uint256S(kQ1)) continue;
+            st.nPoSeBanHeight = 1519500;
+            st.isValid        = false;
+        }
+        BridgeHarness h;
+        h.lane.arm(cp);
+        EXPECT_EQ(h.lane.anchor_ineligible(), 1u);
+        const std::string s = h.lane.reinstatement_report();
+        EXPECT_NE(s.find("REINSTATEMENT: measurable"), std::string::npos) << s;
+        EXPECT_EQ(s.find("NOT MEASURABLE"), std::string::npos) << s;
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 14. THE TIEBREAK KAT — pinned INDEPENDENTLY of the absent-node defect.
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// At h=2515416 the two head candidates are an EXACT score tie, so the payee is
+// decided ONLY by proTxHash byte order. That matters here because the
+// absent-node hypothesis and a wrong-byte-order hypothesis predict the SAME
+// wrong projection at that height — the mainnet dataset cannot separate them.
+// This KAT separates them: it contains no banned masternode and no replay, only
+// the ordering rule, checked against what the chain actually paid.
+//
+// State as of h=2515415 (dashd `protx list registered true 2515415`):
+//
+//   7afbd798…  registeredHeight 1047763  lastPaid 2511418  revived 2513357
+//   7a16c86c…  registeredHeight 1042754  lastPaid 2513357  revived 2212209
+//
+// CompareByLastPaid_GetHeight scores BOTH at 2513357 (one by its revive, one by
+// its payment). dashd then paid:
+//
+//   h=2515416 -> 7afbd798…      h=2515417 -> 7a16c86c…
+//
+// The order is dashcore's uint256 operator<, i.e. memcmp over the INTERNAL
+// (little-endian) bytes — NOT the display hex, which orders this pair the OTHER
+// WAY ROUND. That opposition is what makes this pair a discriminating KAT.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST(DashMnPayeeTiebreak, ScoreTieAtMainnet2515416IsBrokenTheWayTheChainBrokeIt)
+{
+    MNState a;                        // 7afbd798… — revived into the tie
+    a.isValid           = true;
+    a.nRegisteredHeight = 1047763;
+    a.nLastPaidHeight   = 2511418;
+    a.nPoSeRevivedHeight = 2513357;
+    a.scriptPayout.m_data = synth_script(0xa1);
+
+    MNState b;                        // 7a16c86c… — paid into the tie
+    b.isValid           = true;
+    b.nRegisteredHeight = 1042754;
+    b.nLastPaidHeight   = 2513357;
+    b.nPoSeRevivedHeight = 2212209;
+    b.scriptPayout.m_data = synth_script(0xb2);
+
+    const uint256 ha = uint256S(kMnBannedThenRevived);
+    const uint256 hb = uint256S(kMnNextInQueue);
+
+    // The two hypotheses this KAT separates: the DISPLAY hex orders the pair
+    // one way, the WIRE bytes the other. If they agreed, this test could not
+    // detect a wrong-byte-order bug.
+    ASSERT_GT(ha.GetHex(), hb.GetHex())
+        << "display-hex (big-endian) order puts 7a16c86c… first";
+    ASSERT_LT(std::memcmp(ha.data(), hb.data(), 32), 0)
+        << "wire (little-endian) order puts 7afbd798… first";
+
+    MnStateMachine m;
+    m.load({{ha, a}, {hb, b}}, 2515415);
+
+    // The tie is REAL — assert it rather than assuming it, so a future change
+    // to the scoring rule turns this into a failure instead of a vacuous pass.
+    const auto ranked = m.rank_payee_candidates(2);
+    ASSERT_EQ(ranked.size(), 2u);
+    ASSERT_EQ(MnStateMachine::payee_score(m.entries().at(ha)), 2513357);
+    ASSERT_EQ(MnStateMachine::payee_score(m.entries().at(hb)), 2513357);
+
+    EXPECT_EQ(ranked[0], ha)
+        << "h=2515416 paid Xod7jBYgNygf9Sspift6prXqYgsMcJf6Xw = 7afbd798…;"
+           " ordering the tie by DISPLAY hex (or by c2pool's big-endian"
+           " CompareTo) yields 7a16c86c… — the wrong payee, and a served"
+           " bad-cb-payee";
+    EXPECT_EQ(ranked[1], hb)
+        << "h=2515417 paid Xuizi1a6DhjzAsmcUE8mzba9mZLHGqWQNH = 7a16c86c…";
+    EXPECT_EQ(m.find_expected_payee(), std::optional<uint256>{ha});
+}
+
+// ── NEGATIVE CONTROL. Break the tie by one block and the SCORE must win, in
+// the direction opposite to the byte order. Without this, the case above could
+// be passing for a machine that ranks by proTxHash alone.
+TEST(DashMnPayeeTiebreak, ScoreOutranksTheHashWhenTheTieIsBroken)
+{
+    MNState a;
+    a.isValid            = true;
+    a.nRegisteredHeight  = 1047763;
+    a.nLastPaidHeight    = 2511418;
+    a.nPoSeRevivedHeight = 2513357;
+    a.scriptPayout.m_data = synth_script(0xa1);
+
+    MNState b = a;
+    b.nRegisteredHeight  = 1042754;
+    b.nLastPaidHeight    = 2513356;   // one block OLDER -> b outranks a
+    b.nPoSeRevivedHeight = 2212209;
+    b.scriptPayout.m_data = synth_script(0xb2);
+
+    const uint256 ha = uint256S(kMnBannedThenRevived);
+    const uint256 hb = uint256S(kMnNextInQueue);
+
+    MnStateMachine m;
+    m.load({{ha, a}, {hb, b}}, 2515415);
+    ASSERT_LT(MnStateMachine::payee_score(m.entries().at(hb)),
+              MnStateMachine::payee_score(m.entries().at(ha)));
+
+    const auto ranked = m.rank_payee_candidates(2);
+    ASSERT_EQ(ranked.size(), 2u);
+    EXPECT_EQ(ranked[0], hb)
+        << "the lower CompareByLastPaid score must win even though the byte"
+           " order puts the other masternode first — the tiebreak is a"
+           " TIEbreak, not the primary key";
 }

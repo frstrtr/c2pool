@@ -130,6 +130,27 @@ public:
         size_t registered{0};
         size_t updated{0};
         size_t revoked{0};
+        // ── REINSTATEMENT, measured ──────────────────────────────────────
+        // A PoSe revive reaches us as a ProUpServTx (dashcore
+        // specialtxman.cpp:361-370). Before these two counters existed the
+        // revive branch incremented only `updated`, so a bridge could report
+        // "REINSTATED: 0" whether it had seen no revive, or had seen one and
+        // silently thrown it away. Those are different facts and now have
+        // different counters.
+        //
+        // revived: ProUpServTx revives APPLIED (banHeight cleared,
+        //          revivedHeight set) — the reinstatement actually happened.
+        size_t revived{0};
+        // revive_dropped_unknown: ProUpServTx naming a proTxHash this set has
+        //          NO entry for. This is the SEED-COMPLETENESS defect's
+        //          signature: a `protx list valid`-filtered seed omits
+        //          PoSe-banned masternodes entirely, and the replay's only
+        //          insertion path is ProRegTx — which a long-registered
+        //          masternode will never emit again. Every count here is a
+        //          masternode dashd has put back in the payment queue and we
+        //          have not, i.e. a permanent one-slot offset in every later
+        //          projection. NON-ZERO IS A DEFECT, not a statistic.
+        size_t revive_dropped_unknown{0};
         size_t spent{0};       // collateral spent → MN removed
         size_t paid{0};        // projected payee marked paid this block
         size_t total_after{0};
@@ -653,11 +674,27 @@ public:
                                       // bumped on a flip-to-valid
         size_t ban_height_set{0};     // Bug 14: nPoSeBanHeight set
                                       // on a flip-to-invalid (was 0)
-        size_t sml_only{0};           // SML had it, m_entries didn't —
-                                      // a no-op; apply_block will
-                                      // register on the next ProRegTx
-                                      // for this MN (or the next
-                                      // load() reseed from snapshot)
+        // SML had it, m_entries didn't. A NO-OP THAT DOES NOT SELF-HEAL.
+        //
+        // This field used to be commented "apply_block will register on the
+        // next ProRegTx for this MN (or the next load() reseed from
+        // snapshot)". BOTH of those are FALSE for the case that matters — a
+        // masternode PoSe-banned before the set was seeded:
+        //   • there is no next ProRegTx. The masternode registered long ago;
+        //     ProRegTx is emitted ONCE per registration and will not recur.
+        //     Its revive arrives as a ProUpServTx, which apply_block drops
+        //     for an unknown proTxHash (revive_dropped_unknown).
+        //   • a reseed re-reads the SAME source. If that source was
+        //     `protx list valid` it filters the banned masternode out again,
+        //     so the reseed reproduces the gap exactly.
+        // A comment asserting a recovery that cannot happen is why the gap
+        // went unseen; the recovery is SEED COMPLETENESS (seed the REGISTERED
+        // set, carrying PoSeBanHeight), not this counter.
+        //
+        // With a registered-set seed this number is ~0, and a non-zero value
+        // is a real anomaly worth reporting — an SML entry we have no record
+        // of at all.
+        size_t sml_only{0};
     };
     SyncFromSmlResult sync_validity_from_sml(
         const vendor::CSimplifiedMNList& sml,
@@ -728,6 +765,17 @@ public:
         }
         return n;
     }
+
+    /// Masternodes PRESENT in the set but payee-INELIGIBLE (PoSe-banned).
+    /// size() - eligible_size().
+    ///
+    /// This exists so a caller can tell "no masternode needed reinstating"
+    /// apart from "reinstatement is structurally impossible here". A set
+    /// seeded from `protx list valid` carries ZERO ineligible entries — not
+    /// because none were banned, but because the banned ones were filtered
+    /// out — and in such a set no ProUpServTx revive can ever find an entry
+    /// to revive, so a "REINSTATED: 0" is not a measurement.
+    size_t ineligible_size() const { return m_entries.size() - eligible_size(); }
 
     /// What the installed SML hook says about a proTxHash, verbatim (nullopt
     /// = absent from the SML / no hook). Exposed so a caller's fail-closed
@@ -876,7 +924,9 @@ public:
                     << "] attested INVALID by the masternode list dated EXACTLY"
                        " at h=" << height << " (DIP-4 client-verified against"
                        " this block's own coinbase commitment) — excluded"
-                       " permanently with banHeight=" << height
+                       " for the rest of this replay with banHeight=" << height
+                    << " (REVOCABLE: the entry is KEPT, so a later ProUpServTx"
+                       " revive reinstates it — see ApplyResult::revived)"
                     << "; payment attributed to "
                     << out.accepted->GetHex().substr(0, 16)
                     << " whose scriptPayout matches this coinbase exactly. No"
@@ -1016,7 +1066,31 @@ public:
                     break;
                 }
                 auto it = m_entries.find(ptx.proTxHash);
-                if (it == m_entries.end()) break; // unknown MN
+                if (it == m_entries.end()) {
+                    // NOT a benign no-op. A ProUpServTx is the ONLY way a
+                    // PoSe-banned masternode gets revived, and the only
+                    // insertion paths this machine has are the seed and
+                    // ProRegTx — neither of which will ever produce an entry
+                    // for a masternode that registered long before the seed
+                    // and was banned before it. Dropping this silently is how
+                    // a seed built from `protx list valid` (which filters
+                    // banned masternodes OUT) puts our payment queue
+                    // permanently one slot ahead of dashd's. Count it and
+                    // NAME it.
+                    ++r.revive_dropped_unknown;
+                    LOG_WARNING
+                        << "[MNS-SM] ProUpServTx h=" << height << " for proTx "
+                        << ptx.proTxHash.GetHex().substr(0, 16)
+                        << " DROPPED: no entry in this masternode set. If that"
+                           " masternode was PoSe-banned when the set was"
+                           " seeded, the seed was `valid`-filtered and is"
+                           " INCOMPLETE — dashd has just put this masternode"
+                           " back in the payment queue and we cannot, so every"
+                           " later payee projection is one queue slot ahead."
+                           " Re-seed from `protx list registered true` / a"
+                           " registered-set checkpoint anchor.";
+                    break;
+                }
                 it->second.netInfo = ptx.netInfo;
                 it->second.scriptOperatorPayout.m_data =
                     ptx.scriptOperatorPayout.m_data;
@@ -1027,11 +1101,17 @@ public:
                         it->second.platformHTTPPort = ptx.platformHTTPPort;
                     }
                 }
-                // PoSe revive (dashcore specialtxman.cpp:361-370).
+                // PoSe revive (dashcore specialtxman.cpp:361-370). This is
+                // also what makes every PERMANENT exclusion this machine
+                // records REVOCABLE: the demotion walk and the on-demand
+                // re-adjudication both retire a masternode by setting a
+                // NONZERO banHeight and leaving the entry in place, precisely
+                // so this branch can undo it when the chain says so.
                 if (it->second.nPoSeBanHeight != 0) {
                     it->second.nPoSeBanHeight   = 0;
                     it->second.nPoSeRevivedHeight = height;
                     it->second.isValid          = true;
+                    ++r.revived;
                 }
                 ++r.updated;
                 break;
@@ -1184,13 +1264,21 @@ private:
     // outcome: on refusal nothing is mutated.
     //
     // On acceptance the demoted entries are flipped isValid=false with
-    // nPoSeBanHeight = height, PERMANENTLY. One-shot exclusion would be
-    // strictly wrong: the MN would return to the head of the queue at its
-    // next turn (~|MN set| blocks later — ~2068 on DASH mainnet) and desync
-    // the replay all over again. The nonzero ban height additionally makes
-    // pass 1's ProUpServTx revival branch (gated on nPoSeBanHeight != 0)
-    // functional for that MN, so a genuine revival inside the replay window
-    // is picked up normally.
+    // nPoSeBanHeight = height. The exclusion is STANDING — it holds for every
+    // later block of the replay — but it is NOT IRREVOCABLE, and the
+    // distinction is load-bearing. One-shot exclusion would be strictly
+    // wrong: the MN would return to the head of the queue at its next turn
+    // (~|MN set| blocks later — ~2068 on DASH mainnet) and desync the replay
+    // all over again. Equally, an exclusion that could never be lifted would
+    // be wrong in the other direction: the chain revives PoSe-banned
+    // masternodes inside a normal bridge window (mainnet e8626fcd… was
+    // excluded here and revived by a ProUpServTx at 2515219, well inside the
+    // same window). Keeping the ENTRY and marking it with a NONZERO ban
+    // height is what satisfies both: pass 1's ProUpServTx revival branch is
+    // gated on nPoSeBanHeight != 0, so a genuine revival lifts the exclusion
+    // and is counted (ApplyResult::revived). Deleting the entry, or excluding
+    // it with banHeight left at 0, would silently make the exclusion
+    // permanent in the literal sense.
     //
     // Returns true iff a payment was attributed (r.paid / r.sml_recovered
     // updated); false means "no licensed repair" and the caller must desync.
@@ -1333,8 +1421,10 @@ private:
         LOG_WARNING << "[MNS-SM] SML BAN-RECOVERY h=" << height
                     << ": projected payee(s) [" << demoted_hexes
                     << "] attested INVALID by the SML (consensus PoSe ban, not"
-                       " tx-visible) — excluded permanently with banHeight="
-                    << height << "; payment attributed to "
+                       " tx-visible) — excluded for the rest of this replay"
+                       " with banHeight=" << height
+                    << " (REVOCABLE: the entry is KEPT, so a later ProUpServTx"
+                       " revive reinstates it); payment attributed to "
                     << accepted->GetHex().substr(0, 16)
                     << " whose scriptPayout matches this coinbase exactly"
                        " (bridge total " << m_sml_recovered_total << "/"

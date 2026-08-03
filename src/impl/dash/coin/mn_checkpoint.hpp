@@ -83,7 +83,25 @@
 ///   17 pubKeyOperator       96 hex (BLS) or `-`
 ///
 /// `isValid` is DERIVED as (poseBanHeight == 0) — the same projection
-/// mn_seed.hpp makes from `protx list valid true`. It is never stored.
+/// mn_seed.hpp makes from `protx list registered true`. It is never stored.
+///
+/// THE ANCHOR CARRIES THE **REGISTERED** SET, NOT THE VALID SET, AND THAT IS
+/// LOAD-BEARING. `protx list valid` filters PoSe-banned masternodes OUT, so in
+/// a valid-filtered anchor "banned at the anchor height" and "does not exist"
+/// are the SAME observation: absence. The forward replay's only insertion path
+/// is ProRegTx, which a long-registered masternode will never emit again — so
+/// a ProUpServTx REVIVE inside the replay window finds no entry, is dropped as
+/// an unknown masternode (ApplyResult::revive_dropped_unknown), and that
+/// masternode can never re-enter the DIP-3 payment queue. Our queue head then
+/// stays permanently one slot ahead of dashd's, which is a served
+/// bad-cb-payee. (Mainnet: proTx 7afbd798… banned at 2511957, revived by a
+/// ProUpServTx in 2513357, absent from a `valid`-based 2513000 anchor; at
+/// h=2515416 dashd's payee IS 7afbd798….) Carrying the banned masternodes
+/// present-but-INELIGIBLE makes eligibility COMPUTED rather than implied by
+/// absence, and the revive path works as written.
+///
+/// `count` therefore counts REGISTERED masternodes. The number comparable to
+/// dashd's `protx list valid <height>` is MnStateMachine::eligible_size().
 ///
 /// DIGEST DOMAIN: SHA-256 over every line of the file EXCEPT the `digest`
 /// line itself and except blank/`#` comment lines, each line stripped of
