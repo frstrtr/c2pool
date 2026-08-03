@@ -3139,10 +3139,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // per-MN SML nVersion populating MemberOperatorKey::legacy_scheme
             // — a mixed quorum needs the scheme flag; Evo-only for the
             // platform type, #814 R4), and caches it. The provider is a pure
-            // cache lookup (never blocks the template path). NON-ROTATED types
-            // only (llmq_50_60 etc.); rotated (DIP-24) returns nullopt ->
-            // null-serve (qrinfo-based rotated sourcing is a documented
-            // follow-up). Anything uncertain -> nullopt -> fail-closed.
+            // cache lookup (never blocks the template path). ROTATED (DIP-24,
+            // llmq_60_75) types source instead via ONE getqrinfo per CYCLE:
+            // the reply carries the four cycle work-block lists + the three
+            // quarter-rotation snapshots, is DIP-4 authenticated per cycle
+            // diff, and yields all signingActiveQuorumCount member sets in one
+            // go (each keyed by its own quorumHash = cycleBase + quorumIndex).
+            // Anything uncertain -> nullopt -> fail-closed.
             auto qc_member_source =
                 std::make_shared<dash::coin::QuorumMemberSource>(
                     qc_net,
@@ -3167,6 +3170,25 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     [cp = coin_p2p.get()](const uint256& base, const uint256& tgt) {
                         if (cp) cp->send_getmnlistd(base, tgt);
                     });
+
+            // DIP-24 rotated lane: the getqrinfo send seam + the qrinfo reply
+            // consumer. Both are OPTIONAL by construction — with neither wired
+            // the rotated branch of request() simply cannot send and every
+            // rotated quorum stays null-serve, which is the pre-item-4 posture.
+            if (coin_p2p) {
+                qc_member_source->set_send_getqrinfo(
+                    [cp = coin_p2p.get()](const std::vector<uint256>& bases,
+                                          const uint256& req, bool extra) {
+                        if (cp) cp->send_getqrinfo(bases, req, extra);
+                    });
+                // Unlike mnlistdiff there is no tip-feed hazard here: nothing
+                // else consumes qrinfo, so this consumer needs no demux.
+                coin_p2p->add_qrinfo_consumer(
+                    [qc_member_source]
+                    (const dash::coin::vendor::CQuorumRotationInfo& info) {
+                        qc_member_source->on_qrinfo(info);
+                    });
+            }
 
             dash::coin::vendor::MemberKeysProvider qc_member_keys =
                 [qc_member_source](uint8_t llmq_type, const uint256& quorum_hash)

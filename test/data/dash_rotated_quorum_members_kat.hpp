@@ -6,12 +6,15 @@
 // testnet dashd @192.168.86.52 (`quorum info 5 <quorumHash> false`).
 //
 // This is dashd's AUTHORITATIVE ordered member set for a rotated quorum: the
-// exact order + operator BLS keys that ComputeQuorumMembersByQuarterRotation
-// (llmq/utils.cpp) must reproduce before the rotated DKG window can serve
-// real (instead of the reward-safe fail-closed null-serve). The follow-up
-// qrinfo wire + CQuorumSnapshot decode + quarter-rotation port pins against
-// THIS vector (member order + keys) exactly as the non-rotated path pins
-// against dash_quorum_members_kat.hpp.
+// exact order + operator BLS keys ComputeQuorumMembersByQuarterRotation
+// (llmq/utils.cpp) must reproduce before the rotated DKG window can serve real
+// (instead of the reward-safe fail-closed null-serve).
+//
+// THE ORDER GATE THAT PINS AGAINST THIS VECTOR IS
+// test/test_dash_rotated_quorum_members.cpp — index-by-index, exactly as the
+// non-rotated path pins against dash_quorum_members_kat.hpp. Membership-only
+// uses of this vector (test_dash_qrinfo.cpp, test_dash_quorum_member_source.cpp)
+// check a NECESSARY CONDITION only and are labelled as such where they appear.
 // ===========================================================================
 #include <array>
 #include <cstdint>

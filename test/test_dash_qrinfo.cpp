@@ -29,14 +29,14 @@
 //
 // WHAT THIS SUITE DOES *NOT* ESTABLISH
 // ------------------------------------
-// The quarter-rotation member COMPUTATION (item 3,
-// ComputeQuorumMembersByQuarterRotation) is NOT ported yet, so this suite
-// makes NO claim about member ORDER and does not exercise
-// test/data/dash_rotated_quorum_members_kat.hpp's ordering. What it does prove
-// about that KAT is the NECESSARY CONDITION: every one of the 60 ground-truth
-// members is present in each authenticated cycle SML with a byte-identical
-// operator key, so the sourced inputs are sufficient and only the ordering
-// algorithm is missing. Do not mistake that for the ordering gate.
+// Member ORDER. This suite gates the WIRE and the AUTHENTICATION only; what it
+// proves about test/data/dash_rotated_quorum_members_kat.hpp is the NECESSARY
+// CONDITION — every one of the 60 ground-truth members is present in each
+// authenticated cycle SML with a byte-identical operator key, so the sourced
+// inputs are sufficient. The ORDERING gate against that KAT lives in
+// test_dash_rotated_quorum_members.cpp (same executable), which pins
+// ComputeQuorumMembersByQuarterRotation index-by-index. Do not mistake the
+// membership check below for the ordering gate.
 //
 // Merkle-proof leg note: leg (b) of authenticate_historical_snapshot (cbTx
 // proven into the PoW-VERIFIED header) is the same shared function the
@@ -517,20 +517,24 @@ TEST(DashQrInfo, OnQrInfoDropsAnUnsolicitedReply)
     EXPECT_FALSE(src.on_qrinfo(h.info).has_value());
 }
 
-// The point of the whole slice: sourcing does NOT make a rotated quorum
-// serveable yet. lookup() must still fail closed.
-TEST(DashQrInfo, RotatedLookupStillFailsClosedAfterSourcing)
+// A cycle whose per-index BASE BLOCK HASHES are not held cannot be published:
+// each rotated quorum is keyed by the hash of the block at cycleBase +
+// quorumIndex, and this Harness deliberately holds no height index at all. The
+// member set is computed, has nowhere to go, and the quorum stays null-serve.
+// The POSITIVE path — a header index present, lookup() serving dashd's exact
+// order — is gated in test_dash_rotated_quorum_members.cpp.
+TEST(DashQrInfo, RotatedCycleWithoutAHeightIndexPublishesNothing)
 {
     Harness h;
     h.load();
-    auto src = h.make();
+    auto src = h.make();   // hash_at_height() returns nullopt for every height
     uint256 qh;
     qh.SetHex(dash::coin::testdata::kRot6075_QuorumHash);
     ASSERT_TRUE(src.request_rotated(dash::coin::testdata::kRot6075_LlmqType, qh));
     ASSERT_TRUE(src.on_qrinfo(h.info).has_value());
 
     EXPECT_FALSE(src.lookup(dash::coin::testdata::kRot6075_LlmqType, qh).has_value())
-        << "item 3 (quarter-rotation compute) is not ported; rotated serving "
-           "MUST remain null-serve";
+        << "no held header for the slot base block => nothing to key on => "
+           "null-serve";
     EXPECT_EQ(src.ready_count(), 0u);
 }
