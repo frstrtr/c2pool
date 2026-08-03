@@ -7893,6 +7893,7 @@ WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t 
     , solo_mode_(false)
 {
     mining_interface_ = std::make_shared<MiningInterface>(testnet);
+    LOG_INFO << "core::WebServer constructed on " << bind_address_ << ":" << port_ << " (MiningInterface " << (mining_interface_ ? "alive" : "NULL") << ", blockchain=" << static_cast<int>(blockchain_) << ")";
 }
 
 WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet, std::shared_ptr<IMiningNode> node)
@@ -7907,6 +7908,7 @@ WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t 
     , solo_mode_(false)
 {
     mining_interface_ = std::make_shared<MiningInterface>(testnet, node);
+    LOG_INFO << "core::WebServer constructed on " << bind_address_ << ":" << port_ << " (MiningInterface " << (mining_interface_ ? "alive" : "NULL") << ", blockchain=" << static_cast<int>(blockchain_) << ")";
 }
 
 WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet, std::shared_ptr<IMiningNode> node, Blockchain blockchain)
@@ -7921,6 +7923,7 @@ WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t 
     , solo_mode_(false)
 {
     mining_interface_ = std::make_shared<MiningInterface>(testnet, node, blockchain);
+    LOG_INFO << "core::WebServer constructed on " << bind_address_ << ":" << port_ << " (MiningInterface " << (mining_interface_ ? "alive" : "NULL") << ", blockchain=" << static_cast<int>(blockchain_) << ")";
 }
 
 WebServer::~WebServer()
