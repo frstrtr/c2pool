@@ -4068,6 +4068,14 @@ TEST(DashMnAnchorSeedCompleteness, ReinstatementReportSeparatesNoneFromImpossibl
         const std::string s = h.lane.reinstatement_report();
         EXPECT_NE(s.find("REINSTATEMENT: measurable"), std::string::npos) << s;
         EXPECT_EQ(s.find("NOT MEASURABLE"), std::string::npos) << s;
+        // ...and "measurable" is still not the whole truth. A complete anchor
+        // makes a revive REPRESENTABLE; it does not make an unobserved ban
+        // OBSERVABLE. Both branches of this report have to carry the
+        // second qualification, so a reader of either one is told which zero
+        // they are looking at.
+        EXPECT_NE(s.find("BAN-STATE PROBE"), std::string::npos)
+            << "a complete anchor still cannot see a PoSe ban that starts and"
+               " ends inside one fold interval: " << s;
     }
 }
 
@@ -4177,4 +4185,326 @@ TEST(DashMnPayeeTiebreak, ScoreOutranksTheHashWhenTheTieIsBroken)
         << "the lower CompareByLastPaid score must win even though the byte"
            " order puts the other masternode first — the tiebreak is a"
            " TIEbreak, not the primary key";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 15. THE BAN-STATE PROBE — a ban that starts AND ends between two folds
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// MEASURED (mainnet, anchor 2513000, fold interval 500, replay to 2515511;
+// hotel dashd 23.1.7 asked directly for the PRE-BLOCK state of every
+// ProUpServTx in the window, 2026-08-03):
+//
+//   22 ProUpServTx in 2513001..2515530
+//   20 landed on a masternode dashd HAD banned            -> dashd revived
+//   15 of those 20 this replay also believed banned       -> applied
+//    5 it did not (banned AND revived between two folds)  -> MISSED
+//    2 landed on a masternode that was NOT banned         -> no revive, and
+//      dashd set no revive height either
+//
+// The replay's own progress line agreed: "+15 reinstated [0 SML-fold, 15
+// ProUpServTx]". Scored our way, the 5 missed masternodes reach the head of
+// our queue at 2515511 / ~2516175 / ~2516176 / ~2516332 / ~2517466 — and the
+// bridge fail-closed at 2515511 projecting the first of them, 80b4892b…,
+// which dashd does not pay until ~2516627. The failure ORDER is predicted by
+// the defect, not just the single failing height.
+//
+// 80b4892b… was PoSe-banned at 2514570 and revived at 2514574: a FOUR-BLOCK
+// ban inside the 2514150..2514650 fold interval. No cadence of fold points can
+// see that — a ban+revive pair fits between any two fixed samples — so the
+// repair is to sample AT the event: fold the list dated at the block BEFORE a
+// ProUpServTx whose revive turns on a ban we have not measured.
+namespace {
+
+constexpr uint32_t kRpAnchor = 2513000;
+constexpr uint32_t kRpTip    = 2513005;
+constexpr uint32_t kRpRevive = 2513003;   // the ProUpServTx block
+constexpr size_t   kRpRank   = 40;        // far from the queue head on purpose
+constexpr size_t   kRpSetSize = 64;
+
+// The ban is invisible to every fold point, by construction.
+static_assert(kRpRevive > kRpAnchor && kRpRevive < kRpTip,
+              "the ProUpServTx must land strictly between the anchor fold and"
+              " the tip fold");
+static_assert(kRpRevive - kRpAnchor < MnCheckpointLane::kDefaultFoldInterval,
+              "and strictly inside one fold interval — that is the defect");
+
+MutableTransaction pro_up_serv_tx_for(const uint256& protx)
+{
+    CProUpServTx p;
+    p.nVersion  = dash::coin::vendor::ProTxVersion::BASIC_BLS;
+    p.nType     = dash::coin::vendor::MnType::REGULAR;
+    p.proTxHash = protx;
+    p.netInfo.port_be = 0x2334;
+
+    MutableTransaction tx;
+    tx.type          = CProUpServTx::SPECIALTX_TYPE;
+    tx.extra_payload = protx_payload_bytes(p);
+    bitcoin_family::coin::TxIn in;
+    in.prevout.hash  = uint256{};
+    in.prevout.index = 0xFFFFFFFF;
+    in.sequence      = 0xFFFFFFFF;
+    tx.vin.push_back(in);
+    return tx;
+}
+
+// The measured shape, network-free:
+//   * every list attests every masternode VALID — including the anchor's and
+//     the tip's, so no fold point can ever learn of the ban;
+//   * EXCEPT the list dated at kRpRevive-1, which attests rank kRpRank banned.
+//     That is the only height at which the ban is observable at all;
+//   * block kRpRevive carries a ProUpServTx for rank kRpRank on top of the
+//     coinbase the chain actually produced.
+MnCheckpoint build_revive_probe_scenario(SnapshotRig& rig)
+{
+    const uint256 anchor_hash = uint256S(kAnchorHash);
+    MnCheckpoint cp = synthetic_anchor(kRpSetSize, kRpAnchor, anchor_hash);
+
+    std::vector<std::pair<uint256, bool>> all_valid, banned_one;
+    for (size_t i = 0; i < cp.entries.size(); ++i) {
+        all_valid.emplace_back(cp.entries[i].first, true);
+        banned_one.emplace_back(cp.entries[i].first, i != kRpRank);
+    }
+    rig.attest = all_valid;                       // the default at ANY height
+    rig.install(kRpAnchor, kRpTip, anchor_hash);
+    // The one height at which the ban exists.
+    rig.by_height[kRpRevive - 1] =
+        make_snapshot(rig.h.headers[kRpRevive - 1], kRpRevive - 1, banned_one);
+
+    rig.h.blocks = simulate_chain(cp, kRpAnchor, kRpTip, 0, {});
+    rig.h.blocks[kRpRevive].m_txs.push_back(
+        pro_up_serv_tx_for(cp.entries[kRpRank].first));
+    return cp;
+}
+
+void drive_to_publish(SnapshotRig& rig)
+{
+    for (uint32_t i = 0; i < 64 && !rig.h.published
+                         && !rig.h.lane.failed_closed(); ++i)
+        rig.h.lane.pump();
+}
+
+} // namespace
+
+// ── CASE 15.1 (THE LOAD-BEARING ONE). The revive must land with dashd's
+// height. PREVIOUSLY RED: no fold covers kRpRevive-1, so the machine believed
+// the masternode never banned, the gate read false, and nPoSeRevivedHeight
+// stayed at 0 while dashd set kRpRevive.
+TEST(DashMnCheckpointReviveProbe, BanBetweenFoldsIsMeasuredAtTheProUpServTx)
+{
+    SnapshotRig rig;
+    const auto cp = build_revive_probe_scenario(rig);
+
+    rig.h.lane.arm(cp);
+    drive_to_publish(rig);
+
+    ASSERT_TRUE(rig.h.published) << rig.h.lane.status();
+    EXPECT_EQ(rig.h.lane.revive_probes(), 1u)
+        << "exactly one ProUpServTx in this replay turned on an unmeasured"
+           " ban, so exactly one list should have been asked for";
+    EXPECT_EQ(rig.h.lane.revive_unmeasured(), 0u)
+        << "nothing may be left unmeasured when a probe was available: "
+        << rig.h.lane.revive_probe_report();
+    EXPECT_EQ(rig.h.lane.tx_revived(), 1u);
+
+    const MNState& revived = published_rank(rig.h, cp, kRpRank);
+    EXPECT_EQ(revived.nPoSeRevivedHeight, kRpRevive)
+        << "dashd scores this masternode by its revive height from here on."
+           " Leaving it at the stale last payment is what put mainnet"
+           " 80b4892b… at the head of our queue at 2515511, ~1100 blocks"
+           " before dashd will pay it.";
+    EXPECT_TRUE(revived.isValid);
+    EXPECT_EQ(revived.nPoSeBanHeight, 0u);
+    EXPECT_EQ(MnStateMachine::payee_score(revived),
+              static_cast<int>(kRpRevive));
+}
+
+// ── CASE 15.2. THE TWIN, with the probe disabled. Same chain, same lists —
+// the pre-change behaviour exactly. The revive is lost, and the ONLY
+// difference the change makes here is that the loss is now NAMED.
+TEST(DashMnCheckpointReviveProbe, ProbeDisabledLosesTheReviveAndSaysSo)
+{
+    SnapshotRig rig;
+    const auto cp = build_revive_probe_scenario(rig);
+    rig.h.lane.set_revive_probe_cap(0);
+
+    rig.h.lane.arm(cp);
+    drive_to_publish(rig);
+
+    ASSERT_TRUE(rig.h.published) << rig.h.lane.status();
+    EXPECT_EQ(rig.h.lane.revive_probes(), 0u);
+    EXPECT_EQ(rig.h.lane.revive_unmeasured(), 1u)
+        << "a ProUpServTx applied without measuring its gate is a BLIND SPOT"
+           " and must be counted, not swallowed into `updated`";
+    EXPECT_EQ(rig.h.lane.tx_revived(), 0u);
+    EXPECT_EQ(published_rank(rig.h, cp, kRpRank).nPoSeRevivedHeight, 0u)
+        << "this IS the defect, reproduced: our score for this masternode is"
+           " now its stale last payment and dashd's is the revive height";
+
+    const std::string s = rig.h.lane.revive_probe_report();
+    EXPECT_NE(s.find("UNKNOWN"), std::string::npos) << s;
+    EXPECT_NE(s.find("ABSENCE OF MEASUREMENT"), std::string::npos)
+        << "the report must say WHICH zero this is: " << s;
+    // And the reinstatement report — the line an operator actually reads —
+    // must carry it too, instead of a bare "reinstated 0".
+    EXPECT_NE(rig.h.lane.reinstatement_report().find("BAN-STATE PROBE"),
+              std::string::npos)
+        << rig.h.lane.reinstatement_report();
+}
+
+// ── CASE 15.3. "n/a", not "0". A replay in which no ProUpServTx ever needed a
+// probe has NOT measured zero blind spots; it has never exercised the path.
+// Same discipline as ondemand_report().
+TEST(DashMnCheckpointReviveProbe, NeverExercisedReportsNotApplicableNotZero)
+{
+    SnapshotRig rig;
+    const uint256 anchor_hash = uint256S(kAnchorHash);
+    const auto cp = synthetic_anchor(kRpSetSize, kRpAnchor, anchor_hash);
+    std::vector<std::pair<uint256, bool>> all_valid;
+    for (const auto& e : cp.entries) all_valid.emplace_back(e.first, true);
+    rig.attest = all_valid;
+    rig.install(kRpAnchor, kRpTip, anchor_hash);
+    rig.h.blocks = simulate_chain(cp, kRpAnchor, kRpTip, 0, {});
+
+    rig.h.lane.arm(cp);
+    drive_to_publish(rig);
+
+    ASSERT_TRUE(rig.h.published) << rig.h.lane.status();
+    EXPECT_EQ(rig.h.lane.revive_probes(), 0u);
+    EXPECT_EQ(rig.h.lane.revive_unmeasured(), 0u);
+    EXPECT_NE(rig.h.lane.revive_probe_report().find("n/a"), std::string::npos)
+        << "no ProUpServTx reached the probe path, so every number here is"
+           " NEVER EVALUATED — printing a bare 0 would claim a measurement: "
+        << rig.h.lane.revive_probe_report();
+}
+
+// ── CASE 15.4. An UNANSWERED probe must not wedge the bridge and must not
+// re-ask forever: the latch is on the height, so a re-delivered block cannot
+// re-open a request that was already abandoned. The blind spot survives and is
+// reported — that is the honest outcome, not a fail-closed.
+TEST(DashMnCheckpointReviveProbe, UnansweredProbeAbandonsWithoutWedgingOrRelooping)
+{
+    SnapshotRig rig;
+    const auto cp = build_revive_probe_scenario(rig);
+    // Answer the fold POINTS (anchor + tip) but never the probe.
+    rig.h.lane.set_request_snapshot_fn([&rig](const uint256& bh) {
+        rig.requested.push_back(bh);
+        auto hi = rig.height_of.find(bh);
+        if (hi == rig.height_of.end()) return;
+        if (hi->second == kRpRevive - 1) return;     // the probe: no reply
+        rig.h.lane.on_historical_snapshot(
+            rig.snapshot_for(hi->second, bh).diff);
+    });
+
+    rig.h.lane.arm(cp);
+    const uint32_t kBound = 8 * (MnCheckpointLane::kFoldGiveUpPumps + 2);
+    for (uint32_t i = 0; i < kBound && !rig.h.published
+                         && !rig.h.lane.failed_closed(); ++i)
+        rig.h.lane.pump();
+
+    EXPECT_TRUE(rig.h.published)
+        << "an unanswered PROBE must degrade, not wedge: " << rig.h.lane.status();
+    EXPECT_EQ(rig.h.lane.revive_probes(), 1u)
+        << "the latch is on the probed height, so the re-delivered block must"
+           " not open a second probe for it";
+    EXPECT_EQ(rig.h.lane.revive_unmeasured(), 1u)
+        << "the ambiguity survived unmeasured and has to say so";
+    size_t asks_for_the_probe = 0;
+    for (const auto& bh : rig.requested)
+        if (rig.height_of[bh] == kRpRevive - 1) ++asks_for_the_probe;
+    EXPECT_LE(asks_for_the_probe, MnCheckpointLane::kFoldRetryPumps + 1u)
+        << "the probe re-asked " << asks_for_the_probe
+        << " times — the give-up path is not bounding it";
+}
+
+// ── CASE 15.5. A re-arm replays the SAME heights from the SAME anchor. A latch
+// or a spent budget carried across would suppress exactly the probe the second
+// attempt exists to take.
+TEST(DashMnCheckpointReviveProbe, ReArmGivesTheSecondBridgeAFreshProbeBudget)
+{
+    SnapshotRig rig;
+    const auto cp = build_revive_probe_scenario(rig);
+    rig.h.lane.arm(cp);
+    drive_to_publish(rig);
+    ASSERT_TRUE(rig.h.published);
+    ASSERT_EQ(rig.h.lane.revive_probes(), 1u);
+
+    SnapshotRig rig2;
+    const auto cp2 = build_revive_probe_scenario(rig2);
+    rig2.h.lane.arm(cp2);
+    drive_to_publish(rig2);
+    ASSERT_TRUE(rig2.h.published);
+    ASSERT_EQ(rig2.h.lane.rearm(cp2, "test re-arm"),
+              MnCheckpointLane::RearmOutcome::Armed)
+        << rig2.h.lane.status();
+    EXPECT_EQ(rig2.h.lane.revive_probes(), 0u);
+    EXPECT_EQ(rig2.h.lane.revive_unmeasured(), 0u);
+    EXPECT_EQ(rig2.h.lane.revive_probe_cap(),
+              MnCheckpointLane::kReviveProbeBase)
+        << "a re-armed bridge must not quote the previous bridge's sized"
+           " budget before its own pump() has sized one";
+
+    rig2.h.published = false;
+    drive_to_publish(rig2);
+    ASSERT_TRUE(rig2.h.published) << rig2.h.lane.status();
+    EXPECT_EQ(rig2.h.lane.revive_probes(), 1u)
+        << "the second bridge must take the probe again — a latch left"
+           " standing would silently skip it";
+    EXPECT_EQ(published_rank(rig2.h, cp2, kRpRank).nPoSeRevivedHeight,
+              kRpRevive);
+}
+
+// ── CASE 15.6. The probe that answers "NOT banned" — mainnet d07e1f49… at
+// 2515068, which had ban height -1 and PoSe penalty 0. dashcore revives
+// nothing there, so neither may we; the point of the probe is that this zero
+// is now a MEASUREMENT rather than an assumption.
+//
+// It is also the case that pins ASK-ONCE. A snapshot answered INLINE re-enters
+// on_block_connected() with this very block while begin_fold() is still on the
+// stack, so "ask once" is a property of the code, not of the call graph. What
+// terminates it here is that the fold RECORDS its own date: the re-entry finds
+// the ban state measured for this height and has nothing left to ask about.
+// Mutating the probe to fold the WRONG height removes that and the request
+// count went to 3377 — which is the mutation this assertion is here for.
+//
+// The height LATCH is the second, independent terminator, and it is the only
+// one left when the probe goes UNANSWERED (no reply, no recorded date). That
+// case is CASE 15.4, not this one.
+TEST(DashMnCheckpointReviveProbe, ProbeAnsweringNotBannedIsAMeasurementAndAsksOnce)
+{
+    SnapshotRig rig;
+    const uint256 anchor_hash = uint256S(kAnchorHash);
+    const auto cp = synthetic_anchor(kRpSetSize, kRpAnchor, anchor_hash);
+    std::vector<std::pair<uint256, bool>> all_valid;
+    for (const auto& e : cp.entries) all_valid.emplace_back(e.first, true);
+    rig.attest = all_valid;                       // NO ban at any height
+    rig.install(kRpAnchor, kRpTip, anchor_hash);
+    rig.h.blocks = simulate_chain(cp, kRpAnchor, kRpTip, 0, {});
+    rig.h.blocks[kRpRevive].m_txs.push_back(
+        pro_up_serv_tx_for(cp.entries[kRpRank].first));
+
+    rig.h.lane.arm(cp);
+    drive_to_publish(rig);
+
+    ASSERT_TRUE(rig.h.published) << rig.h.lane.status();
+    EXPECT_EQ(rig.h.lane.revive_probes(), 1u);
+    EXPECT_EQ(rig.h.lane.revive_declined(), 1u)
+        << "a list dated at h-1 attesting NOT banned is an answer, and has to"
+           " be counted apart from 'we never looked'";
+    EXPECT_EQ(rig.h.lane.revive_unmeasured(), 0u);
+    EXPECT_EQ(rig.h.lane.tx_revived(), 0u);
+    EXPECT_EQ(published_rank(rig.h, cp, kRpRank).nPoSeRevivedHeight, 0u)
+        << "dashd set no revive height here either — writing one would move"
+           " this masternode DOWN the queue and diverge the other way";
+
+    size_t asks = 0;
+    for (const auto& bh : rig.requested)
+        if (rig.height_of[bh] == kRpRevive - 1) ++asks;
+    EXPECT_EQ(asks, 1u)
+        << "the probe asked " << asks << " times for h=" << (kRpRevive - 1)
+        << " — the latch is not closing over an INLINE reply, which re-enters"
+           " on_block_connected() before begin_fold() returns";
+    EXPECT_NE(rig.h.lane.revive_probe_report().find("0 left unmeasured"),
+              std::string::npos)
+        << rig.h.lane.revive_probe_report();
 }

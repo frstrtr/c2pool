@@ -151,6 +151,51 @@ public:
         //          have not, i.e. a permanent one-slot offset in every later
         //          projection. NON-ZERO IS A DEFECT, not a statistic.
         size_t revive_dropped_unknown{0};
+        // ── THE BAN WE NEVER MEASURED ────────────────────────────────────
+        // dashcore revives on a ProUpServTx ONLY when the masternode
+        // IsBanned() at that point (specialtxman.cpp:361-370), and the branch
+        // below mirrors that gate exactly. The mirror is only as good as our
+        // belief about who is banned — and a PoSe ban is not a transaction. A
+        // block replay NEVER observes one; we learn of bans only by folding a
+        // masternode list sampled at discrete heights. So a masternode banned
+        // AND revived strictly BETWEEN two folds is, to this machine, never
+        // banned at all: the ProUpServTx arrives, the gate is false, and
+        // nPoSeRevivedHeight is left alone. dashd set it. From then on
+        // payee_score() scores that masternode by its stale nLastPaidHeight
+        // instead of its revive height, and we project it as queue head
+        // roughly one full queue length before dashd will pay it.
+        //
+        // TRACED ON MAINNET (2026-08-03, anchor 2513000, fold interval 500):
+        // proTx 80b4892b… PoSe-banned at 2514570 and revived by a ProUpServTx
+        // at 2514574 — a four-block ban, entirely inside the 2514150..2514650
+        // fold interval. dashd scores it 2514574; we scored it 2513453, its
+        // last payment. At h=2515511 that put it at the head of OUR queue and
+        // at rank 1116 of dashd's. Five of the window's 22 ProUpServTx had
+        // this shape, and their our-score ranks predict the failure order
+        // exactly: 2515511, ~2516175, ~2516176, ~2516332, ~2517466.
+        //
+        // "Just set revivedHeight on every ProUpServTx" is REFUTED by the
+        // same dataset: 2 of those 22 were service updates from masternodes
+        // that were NOT banned (d07e1f49… at 2515068, ban height -1, penalty
+        // 0), and dashd set no revive height for them. Guessing a revive
+        // there pushes the masternode 1568 blocks DOWN the queue and fails
+        // the other way round. The ban state is not derivable from the
+        // transaction; it has to be measured.
+        //
+        // revive_unmeasured: ProUpServTx applied for a masternode this set
+        //          holds and believes NOT banned, WITHOUT a masternode list
+        //          dated at the pre-block height to check that belief. The
+        //          revive outcome at this height is UNKNOWN — not "no
+        //          revive". NON-ZERO IS A BLIND SPOT, not a statistic.
+        size_t revive_unmeasured{0};
+        // The proTxHashes behind revive_unmeasured, so a caller can name them
+        // instead of reporting a bare count.
+        std::vector<uint256> revive_unmeasured_protx;
+        // revive_declined_measured: ProUpServTx for a masternode a list dated
+        //          EXACTLY at height-1 attests NOT banned. dashcore revives
+        //          nothing here and neither do we — and that zero IS a
+        //          measurement.
+        size_t revive_declined_measured{0};
         size_t spent{0};       // collateral spent → MN removed
         size_t paid{0};        // projected payee marked paid this block
         size_t total_after{0};
@@ -355,6 +400,10 @@ public:
         m_entries.clear();
         m_collateral_index.clear();
         m_last_applied_height = as_of_height;
+        // The ban-state measurement described the ENTRIES, not the machine.
+        // Replacing the entries retires it: a fold dated at some height says
+        // nothing about a set that was not the one it was folded into.
+        m_ban_state_measured_at = 0;
         // A pending mismatch describes a queue that no longer exists once the
         // set is reloaded. Leaving it would let a re-armed lane re-adjudicate
         // an old height against a new set.
@@ -369,6 +418,45 @@ public:
     // apply_block is FORWARD-ONLY: any call at height <= this is skipped
     // whole (see ApplyResult::skipped_out_of_order).
     uint32_t last_applied_height() const { return m_last_applied_height; }
+
+    /// The height a wholesale masternode-list fold last reconciled this set's
+    /// PoSe ban state at (0 = never). Set by sync_validity_from_sml(), which
+    /// is the ONLY path that can observe a consensus PoSe ban, and cleared by
+    /// load(). This is what turns "we do not believe it is banned" into
+    /// either a measurement or an assumption.
+    uint32_t ban_state_measured_at() const { return m_ban_state_measured_at; }
+
+    /// True when the ban state this machine holds was measured against a list
+    /// dated at the block BEFORE `height` — i.e. the exact pre-block list
+    /// dashcore consults when it decides whether a ProUpServTx revives.
+    bool ban_state_measured_for(uint32_t height) const
+    {
+        return m_ban_state_measured_at != 0
+            && m_ban_state_measured_at + 1 == height;
+    }
+
+    /// The proTxHashes in `block` whose revive outcome this machine cannot
+    /// decide: a ProUpServTx for a masternode it HOLDS and believes NOT
+    /// banned, at a height whose pre-block ban state was never measured.
+    ///
+    /// Called BEFORE apply_block so a caller can go and measure — the cursor
+    /// is standing exactly on height-1 at that moment, which is the one
+    /// position at which a fold for height-1 is valid. Empty means apply_block
+    /// will report revive_unmeasured == 0 for this block, and the two share
+    /// the predicate below so they cannot drift apart.
+    std::vector<uint256> unmeasured_revive_candidates(
+        const dash::coin::BlockType& block, uint32_t height) const
+    {
+        std::vector<uint256> out;
+        if (ban_state_measured_for(height)) return out;
+        for_each_proupserv(block, [&](const uint256& protx) {
+            auto it = m_entries.find(protx);
+            if (it == m_entries.end()) return;          // revive_dropped_unknown
+            if (it->second.nPoSeBanHeight != 0) return; // gate already true
+            out.push_back(protx);
+        });
+        return out;
+    }
 
     size_t size() const { return m_entries.size(); }
 
@@ -701,6 +789,12 @@ public:
         uint32_t current_height)
     {
         SyncFromSmlResult r;
+        // This IS the ban-state measurement. A fold is the only input this
+        // machine has that can carry a consensus PoSe ban, so the height it
+        // is dated at is the height up to which "not banned" means something.
+        // Recorded before the walk so it holds even when nothing flipped —
+        // "nothing flipped" is the most important case to be able to date.
+        m_ban_state_measured_at = current_height;
         for (const auto& sml_entry : sml.mnList) {
             ++r.scanned;
             auto it = m_entries.find(sml_entry.proRegTxHash);
@@ -1112,6 +1206,41 @@ public:
                     it->second.nPoSeRevivedHeight = height;
                     it->second.isValid          = true;
                     ++r.revived;
+                } else if (ban_state_measured_for(height)) {
+                    // The gate is false and we KNOW it: a list dated exactly
+                    // at height-1 — the same pre-block list dashcore's
+                    // IsBanned() reads — attests this masternode not banned.
+                    // dashcore revives nothing here either. This zero is a
+                    // measurement, so it gets its own counter rather than
+                    // disappearing into `updated`.
+                    ++r.revive_declined_measured;
+                } else {
+                    // The gate is false and we DO NOT KNOW it. See
+                    // ApplyResult::revive_unmeasured. Nothing is guessed in
+                    // either direction — a guessed revive is as wrong as a
+                    // missed one, and both have been measured on mainnet.
+                    ++r.revive_unmeasured;
+                    r.revive_unmeasured_protx.push_back(ptx.proTxHash);
+                    LOG_WARNING
+                        << "[MNS-SM] ProUpServTx h=" << height << " for proTx "
+                        << ptx.proTxHash.GetHex().substr(0, 16)
+                        << " applied as a plain service update: this set"
+                           " believes the masternode NOT PoSe-banned, but that"
+                           " belief was never measured — the last wholesale"
+                           " ban-state fold is dated h="
+                        << (m_ban_state_measured_at == 0
+                                ? std::string("NEVER")
+                                : std::to_string(m_ban_state_measured_at))
+                        << ", not h=" << (height == 0 ? 0u : height - 1)
+                        << ". A PoSe ban is consensus-computed, never a"
+                           " transaction, so a ban that starts AND ends"
+                           " between two folds is invisible to a block replay."
+                           " If dashd had it banned here it set"
+                           " nPoSeRevivedHeight=" << height
+                        << " and we did not, and every later projection puts"
+                           " it ~one queue length ahead of the chain. Fold a"
+                           " list dated at h=" << (height == 0 ? 0u : height - 1)
+                        << " BEFORE applying this block to decide it.";
                 }
                 ++r.updated;
                 break;
@@ -1472,6 +1601,29 @@ private:
     // Forward-only apply cursor: height of the last block folded by
     // apply_block (0 = none since load). See ApplyResult::skipped_out_of_order.
     uint32_t m_last_applied_height{0};
+
+    // Height of the last wholesale ban-state reconcile (sync_validity_from_sml).
+    // 0 = the ban state in this set has NEVER been measured against a dated
+    // list; it is whatever the seed carried plus whatever transactions moved.
+    uint32_t m_ban_state_measured_at{0};
+
+    /// Walk every ProUpServTx in a block, in tx order, handing the caller the
+    /// proTxHash it names. The pre-scan and the apply BOTH go through here so
+    /// "what this block will do to the revive gate" has one definition.
+    /// Parse failures are skipped silently: apply_block logs them at the point
+    /// where it can also name the height.
+    template <typename Fn>
+    static void for_each_proupserv(const dash::coin::BlockType& block, Fn&& fn)
+    {
+        for (size_t i = 1; i < block.m_txs.size(); ++i) {
+            const auto& tx = block.m_txs[i];
+            if (tx.type != 2) continue;
+            if (tx.extra_payload.empty()) continue;
+            vendor::CProUpServTx ptx;
+            if (!vendor::parse_protx_payload(tx.extra_payload, ptx)) continue;
+            fn(ptx.proTxHash);
+        }
+    }
 
     // Compute a tx's identifying hash. Mirrors dashcore's
     // CTransaction::GetHash() which is SHA256d(serialized_tx).

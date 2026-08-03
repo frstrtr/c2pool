@@ -1374,3 +1374,212 @@ TEST(DashMnState, SmlRecoveryExclusionSurvivesTheNextQueueTurn) {
     EXPECT_EQ(m.sml_recovered_total(), 1u);
     EXPECT_EQ(m.entries().at(b).nLastPaidHeight, 2400002u);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// THE BAN WE NEVER MEASURED — ProUpServTx revive gate vs fold sampling
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// dashcore revives on a ProUpServTx iff the masternode IsBanned() in the
+// PRE-BLOCK list. This machine mirrors that gate against ITS OWN belief about
+// who is banned — and that belief only ever changes at a fold. A PoSe ban is
+// consensus-computed, never a transaction, so a ban that starts AND ends
+// between two folds never enters the belief, the gate reads false, and
+// nPoSeRevivedHeight is left at the masternode's stale last payment while
+// dashd moves it to the revive height.
+//
+// TRACED ON MAINNET (2026-08-03, anchor 2513000, fold interval 500): proTx
+// 80b4892b… banned at 2514570, revived by a ProUpServTx at 2514574 — four
+// blocks, entirely inside the 2514150..2514650 fold interval. We scored it
+// 2513453 (its last payment); dashd scored it 2514574. That put it at the head
+// of OUR queue at 2515511 and at rank 1116 of dashd's.
+//
+// The obvious repair — set nPoSeRevivedHeight on EVERY ProUpServTx — is
+// refuted by the same window: 2 of its 22 ProUpServTx came from masternodes
+// that were NOT banned (d07e1f49… at 2515068, ban height -1, PoSe penalty 0)
+// and dashd set no revive height for them. So the machine must MEASURE the
+// gate, and where it cannot, say so.
+
+namespace {
+
+// A masternode set holding one entry that is valid and unbanned — the state in
+// which a ProUpServTx's outcome depends entirely on a ban we may not have seen.
+struct ReviveFixture {
+    MnStateMachine m;
+    uint256        mn;
+    BlockType      blk;      // coinbase pays `mn`, plus a ProUpServTx for it
+
+    explicit ReviveFixture(uint32_t last_paid = 2513453)
+    {
+        mn = raw256_byte(0, 0x5A);
+        MNState s;
+        s.isValid             = true;
+        s.nRegisteredHeight   = 2400000;
+        s.nLastPaidHeight     = last_paid;
+        s.nPoSeBanHeight      = 0;
+        s.nPoSeRevivedHeight  = 0;
+        s.scriptPayout.m_data = script_bytes(0xE1);
+        m.load(std::vector<std::pair<uint256, MNState>>{{mn, s}}, 2514573);
+
+        CProUpServTx ups;
+        ups.nVersion  = ProTxVersion::BASIC_BLS;
+        ups.nType     = MnType::REGULAR;
+        ups.proTxHash = mn;
+        ups.netInfo.ip = seq_array<16>(0x22);
+        ups.netInfo.port_be = 0x2334;
+        ups.inputsHash = raw256(0x41);
+        ups.sig        = seq_array<96>(0x42);
+        blk.m_txs.push_back(coinbase_tx({script_bytes(0xE1)}));
+        blk.m_txs.push_back(
+            special_tx(CProUpServTx::SPECIALTX_TYPE, protx_payload(ups)));
+    }
+
+    // Fold a list dated at `height` attesting `mn` valid/invalid.
+    void fold(uint32_t height, bool valid)
+    {
+        CSimplifiedMNListEntry e;
+        e.proRegTxHash = mn;
+        e.isValid      = valid;
+        m.sync_validity_from_sml(
+            CSimplifiedMNList(std::vector<CSimplifiedMNListEntry>{e}), height);
+    }
+};
+
+} // namespace
+
+// ── CASE A. No fold dated at the pre-block height: the revive outcome is
+// UNKNOWN and must be counted as such. Nothing is guessed in either direction.
+TEST(DashMnReviveBanState, UnmeasuredBanIsCountedNotGuessed) {
+    ReviveFixture f;
+    ASSERT_EQ(f.m.ban_state_measured_at(), 0u);
+    ASSERT_FALSE(f.m.ban_state_measured_for(2514574));
+
+    const auto r = f.m.apply_block(f.blk, 2514574);
+    EXPECT_EQ(r.revive_unmeasured, 1u)
+        << "a ProUpServTx whose revive turns on a ban state this set never"
+           " measured is a BLIND SPOT and has to be counted as one";
+    ASSERT_EQ(r.revive_unmeasured_protx.size(), 1u);
+    EXPECT_EQ(r.revive_unmeasured_protx.front(), f.mn)
+        << "the report must NAME the masternode, not just count it";
+    EXPECT_EQ(r.revived, 0u);
+    EXPECT_EQ(r.revive_declined_measured, 0u);
+    EXPECT_EQ(r.updated, 1u) << "the service update itself still applies";
+    // The refuted repair, pinned: nothing is written to the revive height on a
+    // ban we did not measure. Mutating the else-branch into
+    // `nPoSeRevivedHeight = height` reds exactly here.
+    EXPECT_EQ(f.m.entries().at(f.mn).nPoSeRevivedHeight, 0u)
+        << "mainnet d07e1f49… sent a ProUpServTx at 2515068 while NOT banned"
+           " (ban height -1, PoSe penalty 0) and dashd set no revive height."
+           " Guessing one there moves the masternode 1568 blocks DOWN the"
+           " queue — a divergence in the other direction, not a fix.";
+}
+
+// ── CASE B. A list dated EXACTLY at the pre-block height attesting the
+// masternode NOT banned. dashcore revives nothing here and neither do we — but
+// this zero is a MEASUREMENT and gets its own counter.
+TEST(DashMnReviveBanState, MeasuredNotBannedIsADifferentZero) {
+    ReviveFixture f;
+    f.fold(2514573, /*valid=*/true);
+    ASSERT_EQ(f.m.ban_state_measured_at(), 2514573u);
+    ASSERT_TRUE(f.m.ban_state_measured_for(2514574));
+
+    const auto r = f.m.apply_block(f.blk, 2514574);
+    EXPECT_EQ(r.revive_declined_measured, 1u);
+    EXPECT_EQ(r.revive_unmeasured, 0u)
+        << "'the list at h-1 says not banned' and 'we never looked' are"
+           " different facts and must not share a counter";
+    EXPECT_TRUE(r.revive_unmeasured_protx.empty());
+    EXPECT_EQ(r.revived, 0u);
+    EXPECT_EQ(f.m.entries().at(f.mn).nPoSeRevivedHeight, 0u);
+}
+
+// ── CASE C. The same list dated at the same height, attesting the masternode
+// BANNED. That is the mainnet 80b4892b… shape, and the revive must land with
+// dashd's height.
+TEST(DashMnReviveBanState, MeasuredBanAtThePreBlockHeightLandsTheRevive) {
+    ReviveFixture f;
+    f.fold(2514573, /*valid=*/false);
+    ASSERT_FALSE(f.m.entries().at(f.mn).isValid);
+    ASSERT_EQ(f.m.entries().at(f.mn).nPoSeBanHeight, 2514573u);
+
+    const auto r = f.m.apply_block(f.blk, 2514574);
+    EXPECT_EQ(r.revived, 1u);
+    EXPECT_EQ(r.revive_unmeasured, 0u);
+    EXPECT_EQ(r.revive_declined_measured, 0u);
+    const MNState& back = f.m.entries().at(f.mn);
+    EXPECT_TRUE(back.isValid);
+    EXPECT_EQ(back.nPoSeBanHeight, 0u);
+    EXPECT_EQ(back.nPoSeRevivedHeight, 2514574u)
+        << "dashd scores this masternode by its revive height from here on;"
+           " scoring it by its last payment (2513453) puts it at the head of"
+           " our queue ~1100 blocks before dashd will pay it";
+    EXPECT_EQ(MnStateMachine::payee_score(back), 2514574);
+}
+
+// ── CASE D. A list dated at the WRONG height is not a measurement of this
+// block's gate. h-2 cannot speak for h-1: the ban we are looking for is
+// exactly the kind that lasts four blocks.
+TEST(DashMnReviveBanState, AListDatedOffByOneIsNotAMeasurement) {
+    ReviveFixture f;
+    f.fold(2514572, /*valid=*/true);          // one block too early
+    EXPECT_FALSE(f.m.ban_state_measured_for(2514574));
+    const auto r = f.m.apply_block(f.blk, 2514574);
+    EXPECT_EQ(r.revive_unmeasured, 1u);
+    EXPECT_EQ(r.revive_declined_measured, 0u);
+}
+
+// ── CASE E. The pre-scan and the apply must agree about what a block contains,
+// because the whole repair is "ask BEFORE applying". They share the predicate;
+// this pins that they cannot drift.
+TEST(DashMnReviveBanState, PreScanAgreesWithTheApply) {
+    {
+        ReviveFixture f;
+        const auto cands = f.m.unmeasured_revive_candidates(f.blk, 2514574);
+        ASSERT_EQ(cands.size(), 1u);
+        EXPECT_EQ(cands.front(), f.mn);
+        EXPECT_EQ(f.m.apply_block(f.blk, 2514574).revive_unmeasured,
+                  cands.size());
+    }
+    {   // measured at h-1: nothing to ask about
+        ReviveFixture f;
+        f.fold(2514573, true);
+        EXPECT_TRUE(f.m.unmeasured_revive_candidates(f.blk, 2514574).empty());
+        EXPECT_EQ(f.m.apply_block(f.blk, 2514574).revive_unmeasured, 0u);
+    }
+    {   // already believed banned: the gate is decided, no ambiguity
+        ReviveFixture f;
+        f.fold(2514573, false);
+        EXPECT_TRUE(f.m.unmeasured_revive_candidates(f.blk, 2514574).empty());
+        const auto r = f.m.apply_block(f.blk, 2514574);
+        EXPECT_EQ(r.revive_unmeasured, 0u);
+        EXPECT_EQ(r.revived, 1u);
+    }
+    {   // proTxHash we do not hold at all: that is revive_dropped_unknown, a
+        // DIFFERENT defect (seed completeness) with its own counter. A probe
+        // would tell us nothing, so it must not be requested.
+        ReviveFixture f;
+        f.m.load(std::vector<std::pair<uint256, MNState>>{}, 2514573);
+        EXPECT_TRUE(f.m.unmeasured_revive_candidates(f.blk, 2514574).empty());
+        const auto r = f.m.apply_block(f.blk, 2514574);
+        EXPECT_EQ(r.revive_unmeasured, 0u);
+        EXPECT_EQ(r.revive_dropped_unknown, 1u);
+    }
+}
+
+// ── CASE F. A measurement describes the ENTRIES it was folded into. Replacing
+// them (a re-seed / re-arm) retires it — otherwise a re-armed bridge would
+// believe it had measured a set it has never looked at.
+TEST(DashMnReviveBanState, LoadRetiresTheMeasurement) {
+    ReviveFixture f;
+    f.fold(2514573, true);
+    ASSERT_TRUE(f.m.ban_state_measured_for(2514574));
+
+    MNState s;
+    s.isValid             = true;
+    s.nRegisteredHeight   = 2400000;
+    s.nLastPaidHeight     = 2513453;
+    s.scriptPayout.m_data = script_bytes(0xE1);
+    f.m.load(std::vector<std::pair<uint256, MNState>>{{f.mn, s}}, 2514573);
+    EXPECT_EQ(f.m.ban_state_measured_at(), 0u);
+    EXPECT_FALSE(f.m.ban_state_measured_for(2514574));
+    EXPECT_EQ(f.m.apply_block(f.blk, 2514574).revive_unmeasured, 1u);
+}
