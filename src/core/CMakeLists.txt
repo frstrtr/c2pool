@@ -42,10 +42,18 @@ set(source
 
 find_package(yaml-cpp REQUIRED)
 
-# core_util: dependency-free leaf carrying core::timestamp(), split out to
-# break the core <-> {pool,ltc,c2pool} static-link SCC (V36 gate). Source
+# core_util: link-dependency-free leaf carrying core::timestamp(), split out
+# to break the core <-> {pool,ltc,c2pool} static-link SCC (V36 gate). Source
 # half landed in 07165699; this wires the leaf library into the build.
 add_library(core_util STATIC core_util.cpp)
+# Boost::headers is an INTERFACE (include-dirs-only) target, so this adds NO
+# link edge and does NOT reintroduce the SCC the split was made to break. It
+# is required because the top-level -include core/boost_asio_compat.hpp force-
+# include (CMakeLists.txt) injects <boost/version.hpp> into EVERY CXX TU,
+# including this one. Self-hosted runners masked the gap with a system libboost
+# on the default include path; the github-hosted live-bootstrap gate has boost
+# only as conan target-scoped includes, so the leaf must carry the header path.
+target_link_libraries(core_util PUBLIC Boost::headers)
 
 add_library(core OBJECT ${source})
 target_link_libraries(core PUBLIC core_util btclibs)

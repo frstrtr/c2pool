@@ -58,10 +58,18 @@ jobs:
           path: ${{ runner.temp }}/conan2
           key: conan2-ubuntu24-gcc13-${{ hashFiles('conanfile.txt', 'ci/conan/linux-gcc13.profile') }}
 
+      # Match the green coin-matrix provisioning exactly: lockfile-pinned deps
+      # and an EXPLICIT build_type=Release so conan generates the Release dep
+      # data cmake then consumes (no host/build build_type drift).
       - name: Conan install
         run: |
           for attempt in 1 2 3; do
-            if conan install . -pr:a=ci/conan/linux-gcc13.profile --build=missing --output-folder=build_ci; then exit 0; fi
+            if conan install . \
+              -pr:a=ci/conan/linux-gcc13.profile \
+              --lockfile=conan.lock \
+              --build=missing \
+              --output-folder=build_ci \
+              --settings=build_type=Release; then exit 0; fi
             echo "conan install failed (attempt $attempt/3); retrying in $((attempt * 15))s"
             sleep $((attempt * 15))
           done
