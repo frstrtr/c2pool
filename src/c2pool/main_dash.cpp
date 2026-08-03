@@ -2431,6 +2431,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         header_chain = std::make_unique<dash::coin::HeaderChain>(dash_params, hdr_db);
         header_chain->init();
 
+        // CROSS-LANE ASYMMETRY CLOSED: HeaderChain::is_synced() was DEFINED
+        // AND NEVER CALLED on the DASH path (bch 13 callers, ltc 12, nmc 12,
+        // btc 6, dgb 6, dash 0) -- a predicate nothing invokes is a lie about
+        // what the code checks. Every other freshness gate on NodeCoinState is
+        // relative to OUR OWN tip and so is satisfied by a node that is
+        // thousands of blocks behind but internally consistent; this is the
+        // only comparison against anything outside our own view. LTC's
+        // template_builder.hpp:376 is the reference pattern (refuse, do not
+        // serve). A refusal here is a template-SERVE refusal, never a
+        // block-SUBMIT refusal, and it now NAMES itself as "chain-not-synced".
+        node_coin_state.set_chain_synced_fn(
+            [hc = header_chain.get()] { return hc && hc->is_synced(); });
+
         // ── Daemonless chain queries ──────────────────────────────────────
         // getbestblockhash / getblockhash / getblockchaininfo are answered
         // from the header chain we just opened — a PoW(X11)+DGW-validated,
@@ -2457,6 +2470,66 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             std::cout << "[run] daemonless chain queries ARMED "
                          "(getbestblockhash/getblockhash/getblockchaininfo "
                          "answered from the header chain)\n";
+
+            // ── DEFECT-3 operator surface: WHY the embedded arm is not serving ──
+            // web-static/dashboard.html has read a per-coin `no_work_reason` since
+            // 08-02 and test_web_honesty_regression pins the contract from both
+            // sides -- but NOTHING in the tree ever produced one: main_dash never
+            // called set_node_topology_fn at all, so the field was permanently
+            // absent and the card rendered a declining node identically to a dead
+            // one. This is the producer. The reason is the SAME DeclineReport the
+            // arm-selection branch returned (DASHWorkSource::embedded_arm_status_json),
+            // so the page and the journal cannot disagree.
+            //
+            // Lifetime: web_server is explicitly reset() after ioc.run() returns,
+            // BEFORE header_chain / coin_p2p unwind at scope exit, so these raw
+            // captures cannot outlive their targets.
+            web_server->get_mining_interface()->set_node_topology_fn(
+                [ws = work_source, hc = header_chain.get(),
+                 cp = coin_p2p.get(), testnet]() -> nlohmann::json {
+                    nlohmann::json c = nlohmann::json::object();
+                    c["coin"]     = "DASH";
+                    c["primary"]  = true;
+                    c["embedded"] = true;
+                    // CoinClient is a single-peer client: 1 or 0, measured, not
+                    // guessed. Omitting it would make the dashboard default to
+                    // 0 and mislabel every decline as "faulted".
+                    const bool connected = cp && cp->is_connected();
+                    c["peers"] = connected ? 1 : 0;
+                    if (hc) {
+                        const uint32_t hh = hc->height();
+                        c["header_height"] = hh;
+                        // The peer's advertised best height is the only target
+                        // we actually observe; absent it we publish NO target
+                        // and no synced flag rather than invent one.
+                        const uint32_t target = connected ? cp->peer_start_height() : 0;
+                        if (target > 0) {
+                            c["target_height"] = target;
+                            c["sync_percent"]  =
+                                100.0 * static_cast<double>(hh) / static_cast<double>(target);
+                            c["synced"] = (hh + 1 >= target);
+                        }
+                    }
+                    // arm + the ONE named cause, with value and threshold.
+                    nlohmann::json arm = ws->embedded_arm_status_json();
+                    c["arm"]               = arm.value("arm", std::string("unknown"));
+                    c["no_work_cause"]     = arm.value("no_work_reason", std::string());
+                    c["no_work_value"]     = arm.value("no_work_value", std::string("n/a"));
+                    c["no_work_threshold"] = arm.value("no_work_threshold", std::string("n/a"));
+                    // The dashboard renders no_work_reason VERBATIM, so carry
+                    // the value and threshold in it -- "declined" alone repeats
+                    // the very defect this exists to fix.
+                    const std::string cause = c["no_work_cause"].get<std::string>();
+                    c["no_work_reason"] = cause.empty()
+                        ? std::string()
+                        : cause + " (value=" + c["no_work_value"].get<std::string>()
+                                + " threshold=" + c["no_work_threshold"].get<std::string>() + ")";
+                    return nlohmann::json{
+                        {"node_symbol", "DASH"},
+                        {"auto_detected", false},
+                        {"testnet", testnet},
+                        {"coins", nlohmann::json::array({c})}};
+                });
         }
 
         maintainer = std::make_unique<dash::coin::CoinStateMaintainer>(node_coin_state);

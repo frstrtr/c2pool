@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace dash {
@@ -164,6 +165,43 @@ public:
     /// exactly one block's platform reward (constant 66,966,830 duffs).
     void set_mn_rr_height(int h) { m_mn_rr_height = h; }
     int mn_rr_height() const { return m_mn_rr_height; }
+
+    /// HEADER-SYNC gate (the DASH half of a cross-lane asymmetry: bch 13, ltc
+    /// 12, nmc 12, btc 6, dgb 6 callers of is_synced(); DASH had ZERO —
+    /// HeaderChain::is_synced() was DEFINED AND NEVER CALLED, machinery that
+    /// compiled and could not be reached).
+    ///
+    /// Every other freshness gate on this class is RELATIVE to our own tip:
+    /// credit-pool height == prev_height, SML hash == prev_hash, payee cursor
+    /// == prev_height. All of them hold perfectly on a node thousands of blocks
+    /// behind but internally CONSISTENT — a peer answering getmnlistd at OUR
+    /// tip returns a diff for that old block, the credit pool advances off the
+    /// same old blocks, and the payee queue folds them in step. Nothing in the
+    /// set can tell "current" from "self-consistently stale", because none of
+    /// them compares against anything outside our own view.
+    ///
+    /// This is that comparison. LTC's builder is the reference pattern in our
+    /// own tree: template_builder.hpp:116 defaults is_synced() to FALSE so a
+    /// subclass must positively PROVE sync, and :376 THROWS rather than serve.
+    /// Unset here (default) leaves the clause unevaluated so every pre-existing
+    /// KAT is byte-unchanged; main_dash wires it to HeaderChain::is_synced() so
+    /// the production daemonless arm cannot mine on a stale tip.
+    void set_chain_synced_fn(std::function<bool()> fn) {
+        m_chain_synced_fn = std::move(fn);
+    }
+
+    /// DIAGNOSTIC: which half of the publish precondition the maintainer is
+    /// still missing. `populated()` is set by set_tip() only when the
+    /// maintainer holds BOTH a tip and an authoritative MN set, so a bare
+    /// "not-populated" collapses two very different operator situations —
+    /// "still syncing headers" and "the MN set has not been seeded/bridged" —
+    /// into one uninformative word. The maintainer publishes both bits here so
+    /// the refusal can carry them as its MEASURED value. Never read by any
+    /// serve or reward path. Unset => the report prints "n/a", not "0".
+    void set_populate_inputs(bool have_tip, bool have_mn) {
+        m_have_tip_dbg = have_tip ? 1 : 0;
+        m_have_mn_dbg  = have_mn ? 1 : 0;
+    }
 
     /// Enable the SML-required viability gate. main_dash.cpp turns this on for
     /// the embedded coin-P2P arm so a template is only served once the CCbTx
@@ -333,17 +371,43 @@ public:
     ///   - a non-null ChainLock is committed when freshness is required.
     /// Only enforced under the require_sml (embedded/CCbTx) posture; the legacy
     /// empty-payload posture is unchanged.
-    bool embedded_template_emit_ok(const DashWorkData& w) const {
+    /// `why` mirrors dashd's `TestBlockValidity(BlockValidationState& state, ...)`
+    /// (dashcore src/node/miner.cpp:337): an optional out-param naming the
+    /// FAILING check, so the caller can say what it discarded instead of
+    /// logging a bare "pre-emit check FAILED". Defaulted null keeps every
+    /// existing caller and KAT source-compatible.
+    bool embedded_template_emit_ok(const DashWorkData& w,
+                                   DeclineReport* why = nullptr) const {
+        auto reject = [why](const char* c, std::string v, std::string t) -> bool {
+            if (why) {
+                why->viable    = false;
+                why->cause     = c;
+                why->value     = std::move(v);
+                why->threshold = std::move(t);
+            }
+            return false;
+        };
+        if (why) *why = DeclineReport{};
         if (!m_require_sml) return true;
         // Symmetry with viability (review PR #780 nit): a stale quorum set must
         // never reach emit. (Under the H-1 heal this is already gated by
         // have_sml=false, but re-asserting keeps the defence-in-depth uniform.)
-        if (!m_quorum_healthy) return false;
+        if (!m_quorum_healthy)
+            return reject("emit-quorum-unhealthy", "quorum-tail-parse-failed", "parsed-ok");
+        // Defence in depth (the pre-emit gate re-asserts the height-class
+        // guards even if viability was bypassed): a cached template built while
+        // synced must not be SERVED after the chain has fallen behind.
+        if (m_chain_synced_fn && !m_chain_synced_fn())
+            return reject("emit-chain-not-synced",
+                          "tip=" + std::to_string(m_prev_height) + ",synced=false",
+                          "header-tip-current");
         const uint32_t next_h = m_prev_height + 1;
         // Superblock height-class guard (E-SUPERBLOCK): refuse unless the
         // daemonless govsync provider is trigger-confident for this height
         // (resolve_superblock().ok folds disabled-arm + unfunded cases).
-        if (!resolve_superblock(next_h).ok) return false;
+        if (!resolve_superblock(next_h).ok)
+            return reject("emit-superblock-refused", "not-trigger-confident",
+                          "trigger-confident@h=" + std::to_string(next_h));
         // E1: with a qc plan installed the DKG-window heights are SERVED,
         // not refused — re-derive the mandatory type-6 set here and require
         // the BUILT template to carry exactly it (count + payload bytes, in
@@ -352,30 +416,43 @@ public:
         std::optional<QcBlockPlan> qc_plan;
         if (m_qc_plan_fn) {
             qc_plan = m_qc_plan_fn(next_h);
-            if (!qc_plan) return false;   // underivable — fail closed
+            if (!qc_plan)   // underivable — fail closed
+                return reject("emit-qc-plan-underivable", "nullopt",
+                              "derivable-qc-plan@h=" + std::to_string(next_h));
             // Collect the type-6 payloads actually in the template.
             std::vector<std::vector<unsigned char>> got;
             for (const auto& tx : w.m_txs)
                 if (tx.type == vendor::CFinalCommitmentTxPayload::SPECIALTX_TYPE)
                     got.push_back(tx.extra_payload);
-            if (got.size() != qc_plan->commitments.size()) return false;
+            if (got.size() != qc_plan->commitments.size())
+                return reject("emit-qc-count-drift", std::to_string(got.size()),
+                              std::to_string(qc_plan->commitments.size()));
             for (size_t i = 0; i < got.size(); ++i) {
                 auto expect = build_qc_tx(next_h, qc_plan->commitments[i]);
-                if (got[i] != expect.extra_payload) return false;
+                if (got[i] != expect.extra_payload)
+                    return reject("emit-qc-payload-drift", "qc[" + std::to_string(i) + "]-bytes",
+                                  "planned-qc[" + std::to_string(i) + "]-bytes");
             }
         } else if (m_commitment_window_fn && m_commitment_window_fn(next_h)) {
-            return false;
+            return reject("emit-dkg-commitment-window",
+                          "in-window@h=" + std::to_string(next_h), "off-window");
         }
         if (m_require_fresh_bestcl
             && m_best_cl_height < static_cast<int32_t>(m_prev_height) - 1)
-            return false;
+            return reject("emit-bestcl-stale",
+                          m_best_cl_height > 0 ? std::to_string(m_best_cl_height)
+                                               : std::string("n/a"),
+                          ">=" + std::to_string(static_cast<int64_t>(m_prev_height) - 1));
         // SOAK FIX (independent HEIGHT check): the credit-pool seed's OWN cbTx
         // height must be the tip we build on, else the accrual commits a stale
         // creditPoolBalance (bad-cbtx-assetlocked-amount). Independent of the
         // seed's value/hash — the only check that catches a one-block-behind seed.
         if (m_require_fresh_credit_pool
             && m_credit_pool_height != static_cast<int32_t>(m_prev_height))
-            return false;
+            return reject("emit-creditpool-stale",
+                          m_credit_pool_height >= 0 ? std::to_string(m_credit_pool_height)
+                                                    : std::string("n/a"),
+                          std::to_string(m_prev_height));
         // E4 re-soak fix: the payee queue must have folded every block
         // through the tip this template builds on, else the projected
         // masternode payee is a stale queue slot (bad-cb-payee). Re-assert
@@ -383,12 +460,24 @@ public:
         // viability bypass) can never reach a miner.
         if (m_require_fresh_mn_payee
             && m_mnstates.last_applied_height() != m_prev_height)
-            return false;
+            return reject("emit-payee-stale",
+                          m_mnstates.last_applied_height() != 0
+                              ? std::to_string(m_mnstates.last_applied_height())
+                              : std::string("n/a"),
+                          std::to_string(m_prev_height));
         vendor::CCbTx cb;
-        if (!vendor::parse_cbtx(w.m_coinbase_payload, cb)) return false;
-        if (cb.nHeight != static_cast<int32_t>(next_h)) return false;
+        if (!vendor::parse_cbtx(w.m_coinbase_payload, cb))
+            return reject("emit-cbtx-unparseable",
+                          std::to_string(w.m_coinbase_payload.size()) + "-payload-bytes",
+                          "parseable-CCbTx");
+        if (cb.nHeight != static_cast<int32_t>(next_h))
+            return reject("emit-cbtx-height-drift", std::to_string(cb.nHeight),
+                          std::to_string(next_h));
         auto sml_copy = m_sml;
-        if (cb.merkleRootMNList != sml_copy.CalcMerkleRoot()) return false;
+        if (cb.merkleRootMNList != sml_copy.CalcMerkleRoot())
+            return reject("emit-mnlist-root-drift",
+                          cb.merkleRootMNList.GetHex().substr(0, 12),
+                          sml_copy.CalcMerkleRoot().GetHex().substr(0, 12));
         // E1: under a qc plan the committed root must be the WITH-BLOCK root
         // (fold of the plan's commitments over the active set — equal to the
         // plain root while the plan is all-null, diverging only once Phase L
@@ -396,8 +485,12 @@ public:
         const uint256 expected_quorum_root = qc_plan
             ? qc_plan->merkle_root_quorums
             : compute_merkle_root_quorums(m_qmgr);
-        if (cb.merkleRootQuorums != expected_quorum_root) return false;
-        if (m_require_fresh_bestcl && !cb.has_best_cl_signature()) return false;
+        if (cb.merkleRootQuorums != expected_quorum_root)
+            return reject("emit-quorum-root-drift",
+                          cb.merkleRootQuorums.GetHex().substr(0, 12),
+                          expected_quorum_root.GetHex().substr(0, 12));
+        if (m_require_fresh_bestcl && !cb.has_best_cl_signature())
+            return reject("emit-bestcl-null-committed", "null-clsig", "non-null-clsig");
         // SOAK RE-FIX (build-vs-serve skew): re-derive the expected creditPool
         // from the CURRENT seed at emit/serve time and require the BUILT CbTx to
         // commit exactly that — mirroring the merkle-root re-derivation above.
@@ -412,7 +505,10 @@ public:
                 m_credit_pool
                 + compute_dash_platform_reward_post_v20_mn_rr(next_h,
                                                               m_mn_rr_height);
-            if (cb.creditPoolBalance != expected_credit_pool) return false;
+            if (cb.creditPoolBalance != expected_credit_pool)
+                return reject("emit-creditpool-value-drift",
+                              std::to_string(cb.creditPoolBalance),
+                              std::to_string(expected_credit_pool));
         }
         return true;
     }
@@ -449,42 +545,16 @@ public:
         // block-SUBMIT refusal.
         const bool payee_resolvable =
             !m_require_resolvable_payee || mn_payee_resolvable_at_tip();
-        e.has_state            = m_populated
-                                 && qc_ok
-                                 && (!m_utxo_ready_fn || m_utxo_ready_fn())
-                                 && sb.ok
-                                 // BLOCKER-1: refuse DKG commitment-window
-                                 // heights — unless the E1 qc plan serves them.
-                                 && (m_qc_plan_fn
-                                     || !m_commitment_window_fn
-                                     || !m_commitment_window_fn(m_prev_height + 1))
-                                 // BLOCKER-2: refuse a stale/absent bestCL.
-                                 && (!m_require_fresh_bestcl
-                                     || m_best_cl_height
-                                            >= static_cast<int32_t>(m_prev_height) - 1)
-                                 // SOAK FIX (independent HEIGHT check): refuse a
-                                 // credit-pool seed whose OWN cbTx height is not
-                                 // the tip we build on — catches a seed lagging by
-                                 // a block even when its (self-consistent) value
-                                 // and hash-tag look fresh (bad-cbtx-assetlocked-amount).
-                                 && (!m_require_fresh_credit_pool
-                                     || m_credit_pool_height
-                                            == static_cast<int32_t>(m_prev_height))
-                                 // E4 re-soak fix (bad-cb-payee at 1519827):
-                                 // refuse a payee queue that has not folded
-                                 // every block through the tip we build on —
-                                 // its projected payee is a stale queue slot
-                                 // (dashd-exact projection requires
-                                 // GetMNPayee on the list that connected
-                                 // pindexPrev).
-                                 && (!m_require_fresh_mn_payee
-                                     || m_mnstates.last_applied_height()
-                                            == m_prev_height)
-                                 && (!m_require_sml
-                                     || (m_have_sml
-                                         && m_quorum_healthy
-                                         && m_sml_current_hash == m_prev_hash))
-                                 && payee_resolvable;
+        // ── THE decision, and its reason, from ONE evaluation ────────────────
+        // dashd's ValidationState idiom (consensus/validation.h:69): the call
+        // that returns false is the call that records why. Previously this was
+        // a ten-clause AND producing a bare bool, with classify_decline()
+        // holding an independent SECOND transcription of the same clauses for
+        // logging — and the two had already drifted (classify_decline never
+        // checked payee_resolvable, so a #996 money-path refusal surfaced as
+        // "viable-race"). There is now exactly one list.
+        e.decline   = evaluate_viability(qc_ok, sb.ok, payee_resolvable);
+        e.has_state = e.decline.viable;
         if (m_require_resolvable_payee && !payee_resolvable) {
             LOG_WARNING << "[EMBED-GATE] h=" << (m_prev_height + 1)
                         << " REFUSE embedded template: MN payment due but payee"
@@ -542,58 +612,174 @@ public:
         return select_dash_work(make_embedded_work_inputs(), dashd_fallback);
     }
 
-    /// DIAGNOSTIC (log-only): when select_work() falls closed to the dashd arm,
-    /// name WHICH viability clause in make_embedded_work_inputs() was the FIRST
-    /// unsatisfied one. Pure const read of the SAME members, evaluated in the
-    /// same AND-order has_state uses -- it NEVER alters arm selection or any
-    /// reward/serve path. Turns the shadow oracle's identical FALL-CLOSED lines
-    /// into a diagnosis instead of a tally. NOTE: this classifies embedded
-    /// VIABILITY only. The shadow calls select_work() directly, so the live
-    /// get_work mainnet gate (--embedded-mainnet, work_source.cpp) is NOT on
-    /// this path; a wholly-unfed bundle surfaces as "not-populated", which on a
-    /// gate-off node is how the absent mainnet opt-in manifests here.
+    /// DIAGNOSTIC surface over the SINGLE evaluation in
+    /// make_embedded_work_inputs(). This does NOT re-derive anything: it runs
+    /// the same bundle assembly and returns the reason that assembly recorded,
+    /// so the name an operator reads is by construction the name of the branch
+    /// that actually fired. (Before, this method held its own copy of the
+    /// clause list — the drift that mislabelled #996 payee-unresolvable
+    /// refusals as "viable-race".)
+    ///
+    /// NOTE: this classifies embedded VIABILITY only. The live get_work mainnet
+    /// gate (--embedded-mainnet, work_source.cpp) sits ABOVE it; a wholly-unfed
+    /// bundle surfaces as "not-populated", which on a gate-off node is how the
+    /// absent mainnet opt-in manifests here.
+    DeclineReport describe_decline() const {
+        return make_embedded_work_inputs().decline;
+    }
+
+    /// Legacy string form — byte-identical wire text for every pre-existing
+    /// cause, because the shadow ledger and its KATs key on it. New callers
+    /// should take describe_decline(), which keeps value and threshold apart.
     std::string classify_decline() const {
-        const uint32_t next_h = m_prev_height + 1;
-        // MN PAYEE-DESYNC LATCH — checked FIRST because it is a strictly more
-        // informative cause of the not-populated state that follows it. Before
-        // this line the latch was log-only: the smoke rig reported 639
-        // consecutive "not-populated" declines while the actual cause (a payee
-        // desync at h=2514874 that can only be cleared by an authoritative
-        // re-seed a daemonless node cannot obtain) appeared nowhere a human
-        // reading the decline classification would look.
-        if (m_mn_needs_reseed) return "mn-needs-reseed";
-        if (!m_populated)      return "not-populated";
-        if (m_prev_hash.IsNull()) return "no-tip";
-        if (m_qc_plan_fn && !m_qc_plan_fn(next_h)) return "qc-plan-underivable";
-        if (m_utxo_ready_fn && !m_utxo_ready_fn())  return "utxo-immature";
-        if (!resolve_superblock(next_h).ok)         return "superblock-refused";
-        if (!m_qc_plan_fn && m_commitment_window_fn && m_commitment_window_fn(next_h))
-            return "dkg-commitment-window";
-        if (m_require_fresh_bestcl
-            && m_best_cl_height < static_cast<int32_t>(m_prev_height) - 1)
-            return "bestcl-stale h=" + std::to_string(m_best_cl_height)
-                 + " vs tip=" + std::to_string(m_prev_height);
-        if (m_require_fresh_credit_pool
-            && m_credit_pool_height != static_cast<int32_t>(m_prev_height))
-            return "creditpool-stale h=" + std::to_string(m_credit_pool_height)
-                 + " vs tip=" + std::to_string(m_prev_height);
-        if (m_require_fresh_mn_payee
-            && m_mnstates.last_applied_height() != m_prev_height)
-            return "payee-stale h=" + std::to_string(m_mnstates.last_applied_height())
-                 + " vs tip=" + std::to_string(m_prev_height);
-        if (m_require_sml) {
-            if (!m_have_sml)       return "no-dmn-set";
-            if (!m_quorum_healthy) return "quorum-unhealthy";
-            if (m_sml_current_hash != m_prev_hash)
-                return "dmn-stale sml=" + m_sml_current_hash.GetHex().substr(0, 12)
-                     + " vs tip=" + m_prev_hash.GetHex().substr(0, 12);
-        }
-        // has_state says viable => the Phase-1 select_work sample and this read
-        // straddled a concurrent apply_block. Rare, and named honestly.
-        return "viable-race";
+        const DeclineReport d = describe_decline();
+        if (d.viable) return "viable-race";
+        if (d.cause == "bestcl-stale")
+            return d.cause + " h=" + d.value + " vs tip=" + std::to_string(m_prev_height);
+        if (d.cause == "creditpool-stale" || d.cause == "payee-stale")
+            return d.cause + " h=" + d.value + " vs tip=" + d.threshold;
+        if (d.cause == "dmn-stale")
+            return "dmn-stale sml=" + d.value + " vs tip=" + d.threshold;
+        return d.cause;
     }
 
 private:
+    /// THE clause list. The ONLY transcription of embedded-arm viability:
+    /// make_embedded_work_inputs() derives has_state from `.viable`, and
+    /// describe_decline()/classify_decline() read the very same object, so the
+    /// decision and its name are one thing. Clauses are evaluated in the order
+    /// the old AND used, and the FIRST unmet one is returned — exactly one
+    /// named cause, never a list of maybes.
+    ///
+    /// qc_ok / sb_ok / payee_resolvable are passed IN because the caller has
+    /// already paid for them (the qc plan and superblock schedule are needed by
+    /// the builder regardless); re-invoking those predicates here would double
+    /// the cost on a per-template path and, worse, could observe a different
+    /// answer than the one the bundle was built from.
+    DeclineReport evaluate_viability(bool qc_ok, bool sb_ok,
+                                     bool payee_resolvable) const {
+        const uint32_t next_h = m_prev_height + 1;
+        const std::string tip = std::to_string(m_prev_height);
+        auto refuse = [](const char* c, std::string v, std::string t) {
+            DeclineReport r;
+            r.viable    = false;
+            r.cause     = c;
+            r.value     = std::move(v);
+            r.threshold = std::move(t);
+            return r;
+        };
+
+        DeclineReport d;   // viable by default
+
+        if (!m_populated)
+            // Say WHICH half the maintainer is missing. -1 means it has never
+            // reported, which is "n/a" — not "0", which would read as "we
+            // measured have_tip and it was false".
+            d = refuse("not-populated",
+                       (m_have_tip_dbg < 0 || m_have_mn_dbg < 0)
+                           ? std::string("n/a")
+                           : "have_tip=" + std::to_string(m_have_tip_dbg)
+                                 + ",have_mn=" + std::to_string(m_have_mn_dbg),
+                       "have_tip=1,have_mn=1");
+        else if (m_chain_synced_fn && !m_chain_synced_fn())
+            // Checked EARLY: on a stale tip every relative gate below can be
+            // satisfied and still be wrong, so their answers are not evidence.
+            d = refuse("chain-not-synced", "tip=" + tip + ",synced=false",
+                       "header-tip-current");
+        else if (!qc_ok)
+            d = refuse("qc-plan-underivable", "nullopt",
+                       "derivable-qc-plan@h=" + std::to_string(next_h));
+        else if (m_utxo_ready_fn && !m_utxo_ready_fn())
+            d = refuse("utxo-immature", "utxo_ready=false", "utxo_ready=true");
+        else if (!sb_ok)
+            d = refuse("superblock-refused", "not-trigger-confident",
+                       "trigger-confident@h=" + std::to_string(next_h));
+        else if (!m_qc_plan_fn && m_commitment_window_fn && m_commitment_window_fn(next_h))
+            d = refuse("dkg-commitment-window", "in-window@h=" + std::to_string(next_h),
+                       "off-window");
+        else if (m_require_fresh_bestcl
+                 && m_best_cl_height < static_cast<int32_t>(m_prev_height) - 1)
+            // best_cl_height 0 means "no clsig ever observed", NOT "ChainLock at
+            // height 0" — print n/a rather than report a measurement never taken.
+            d = refuse("bestcl-stale",
+                       m_best_cl_height > 0 ? std::to_string(m_best_cl_height)
+                                            : std::string("n/a"),
+                       ">=" + std::to_string(static_cast<int64_t>(m_prev_height) - 1));
+        else if (m_require_fresh_credit_pool
+                 && m_credit_pool_height != static_cast<int32_t>(m_prev_height))
+            // -1 is the member's own "never seeded" sentinel.
+            d = refuse("creditpool-stale",
+                       m_credit_pool_height >= 0 ? std::to_string(m_credit_pool_height)
+                                                 : std::string("n/a"),
+                       tip);
+        else if (m_require_fresh_mn_payee
+                 && m_mnstates.last_applied_height() != m_prev_height)
+            // 0 means the payee queue has never folded a block.
+            d = refuse("payee-stale",
+                       m_mnstates.last_applied_height() != 0
+                           ? std::to_string(m_mnstates.last_applied_height())
+                           : std::string("n/a"),
+                       tip);
+        else if (m_require_sml && !m_have_sml)
+            d = refuse("no-dmn-set", std::to_string(m_sml.size()) + "-entries",
+                       ">=1-entry");
+        else if (m_require_sml && !m_quorum_healthy)
+            d = refuse("quorum-unhealthy", "quorum-tail-parse-failed", "parsed-ok");
+        else if (m_require_sml && m_sml_current_hash != m_prev_hash)
+            // A ZERO sml hash is "cold / wiped by reorg", not a block hash.
+            d = refuse("dmn-stale",
+                       m_sml_current_hash.IsNull()
+                           ? std::string("n/a")
+                           : m_sml_current_hash.GetHex().substr(0, 12),
+                       m_prev_hash.GetHex().substr(0, 12));
+        else if (!payee_resolvable)
+            d = refuse("payee-unresolvable",
+                       std::to_string(m_mnstates.entries().size())
+                           + "-entries-none-payable",
+                       "expected-payee-in-SML@h=" + std::to_string(next_h));
+
+        if (d.viable) return d;
+
+        // DIAGNOSTIC REFINEMENT — renames an already-taken refusal, never
+        // creates one. Both of these are strictly more informative than the
+        // clause they replace, and neither is part of has_state, so they can
+        // only run once viability has already failed. (The old classify_decline
+        // checked m_prev_hash.IsNull() unconditionally and could therefore
+        // report "no-tip" for an arm that was in fact serving.)
+        if (m_mn_needs_reseed) {
+            // The smoke rig once reported 639 consecutive "not-populated"
+            // declines while the real cause was a payee desync that only an
+            // authoritative re-seed clears — invisible to anyone reading the
+            // classification.
+            d.cause     = "mn-needs-reseed";
+            d.value     = "latched";
+            d.threshold = "cleared-by-authoritative-reseed";
+        } else if (d.cause == "not-populated" && m_prev_hash.IsNull()
+                   && m_have_tip_dbg < 0) {
+            // ONLY when the maintainer has told us nothing (never reported).
+            //
+            // Measured on the daemonless rig 2026-08-03: the header chain was
+            // at h=2515420 and advancing every ~60 s, and this refinement was
+            // reporting "no-tip". THIS CLASS's m_prev_hash is null merely
+            // BECAUSE set_tip() has not run — a consequence of not publishing,
+            // not an independent fact — and set_tip() only runs once the
+            // maintainer holds BOTH halves. So while the MN set is unseeded,
+            // prev_hash stays null forever no matter how current the headers
+            // are, and relabelling to "no-tip" told the operator the exact
+            // opposite of the truth: chase a header-sync fault that does not
+            // exist, while the real blocker (have_mn=0) went unnamed.
+            //
+            // When the maintainer HAS reported, its have_tip/have_mn pair is
+            // strictly better information than our own null pointer, in both
+            // directions — have_tip=0 says headers, have_tip=1 says MN set —
+            // so it wins.
+            d.cause     = "no-tip";
+            d.value     = "prev_hash=null,maintainer-never-reported";
+            d.threshold = "prev_hash!=null";
+        }
+        return d;
+    }
+
     // #996 helper: is the MN payee the embedded builder will need actually
     // resolvable at the tip we build on? Mirrors embedded_gbt.hpp's build-time
     // condition (build_embedded_workdata gates the MN PackedPayment on
@@ -666,6 +852,7 @@ private:
     uint256  m_sml_current_hash;              // block hash the SML is current at (ZERO = cold/reorg)
     bool     m_require_sml{false};            // gate viability on have_sml (embedded arm)
     std::function<bool()> m_utxo_ready_fn;   // optional UTXO maturity gate (E2b)
+    std::function<bool()> m_chain_synced_fn; // optional ABSOLUTE header-sync gate (never serve a stale tip)
     std::function<bool(uint32_t)> m_is_superblock_fn;  // superblock-height predicate
     // E-SUPERBLOCK: daemonless governance-sourced superblock schedule provider
     // + opt-in gate. Default gate OFF => every superblock height refuses (old
@@ -692,6 +879,9 @@ private:
     // so classify_decline() can NAME it. Never consulted by any serve/reward
     // path — the latch itself lives (and gates) in the maintainer.
     bool     m_mn_needs_reseed{false};
+    // Publish-precondition mirror (-1 = the maintainer has never reported).
+    int8_t   m_have_tip_dbg{-1};
+    int8_t   m_have_mn_dbg{-1};
     uint32_t m_prev_height{0};
     uint256  m_prev_hash;
     uint32_t m_bits_for_next{0};
