@@ -4797,3 +4797,105 @@ TEST(DashMnCheckpointSelfReArm, NoSecondAskIsPossibleSoTheLaneMustRecoverAlone)
         << "the lane stayed terminal with the gate long cleared — this is the"
            " 2h39m the soak measured: " << r.h.lane.status();
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 17. THE UNSEEDED PAYEE FOLD — the phantom desync the 0803 soaks reported.
+//
+// Three independent contabo soaks (0803c/d/e, started at tips 2515478 /
+// 2515518 / 2515558) each reported PAYEE DESYNC at exactly h=2513168 and
+// h=2513261, wiped the payee set, demoted, and spent a bridge re-arm. Neither
+// height is a divergence.
+//
+// The maintainer and MnCheckpointLane subscribe to the SAME
+// Node::block_connected event and hold SEPARATE MnStateMachines. The lane's
+// request_window() downloads historical block bodies from the anchor forward;
+// every one of them was also delivered here, to a payee machine that no
+// authoritative snapshot had ever seeded. apply_block's out-of-order and
+// contiguity guards are both conditioned on `m_last_applied_height != 0`, so a
+// cold cursor accepted the first body and rode the window. The ProRegTx in
+// mainnet block 2513167 then registered the ONE entry this set held, and
+// 2513168 projected it — a one-element queue ranks by nothing, so this was
+// never a payee_score()/nRegisteredHeight fault. The real coinbase paid the
+// real queue head, and the mismatch was reported as a divergence.
+//
+// The lane, replaying the SAME blocks through the SAME apply_block but holding
+// the full 2974-entry anchor, mis-scored NEITHER registration. That contrast is
+// the whole diagnosis, and these cases pin both halves of it.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashMnPayeeLatch, UnseededMaintainerRefusesToFoldBridgeWindowBodies)
+{
+    dash::coin::NodeCoinState st;
+    dash::coin::CoinStateMaintainer m{st};
+    m.set_require_seeded_mn_set(true);          // the embedded-arm posture
+
+    // The pure-daemonless startup state, not a contrived one: the checkpoint is
+    // armed into the LANE, and nothing seeds this machine until the bridge
+    // publishes.
+    ASSERT_EQ(st.mnstates().size(), 0u);
+    ASSERT_EQ(st.mnstates().last_applied_height(), 0u);
+
+    // A historical bridge-window body carrying the window's first ProRegTx —
+    // mainnet 2513167's shape.
+    const uint32_t kReg = 2513167;
+    auto reg_blk = block_from_hex(kBlockHex1519544);
+    reg_blk.m_txs.push_back(pro_reg_tx(synth_script(0x42), 1));
+    latch_bind(reg_blk);   // the body must still bind to its header
+
+    const auto r1 = m.on_block_connected(reg_blk, kReg);
+    EXPECT_EQ(r1.registered, 0u)
+        << "a ProRegTx carried by a bridge-window body must not enter the LIVE"
+           " payee machine — that registration belongs to the lane's private"
+           " replay, which holds the anchored set to put it in context";
+    EXPECT_EQ(st.mnstates().size(), 0u);
+    EXPECT_EQ(st.mnstates().last_applied_height(), 0u)
+        << "the cursor must stay cold. Pinning it to a historical height is what"
+           " manufactured the 2005-block APPLY GAP the moment the live tip"
+           " arrived, and that gap burned a third re-seed ask";
+
+    // The next block is the one that reported PAYEE DESYNC on mainnet, because
+    // its predecessor had left a payment queue of exactly one masternode.
+    auto next_blk = block_from_hex(kBlockHex1519544);
+    const auto r2 = m.on_block_connected(next_blk, kReg + 1);
+    EXPECT_FALSE(r2.payee_desync)
+        << "an unseeded queue cannot diverge from anything. Reporting a desync"
+           " here wiped a masternode set that never existed, demoted the arm,"
+           " and spent one of only three bridge re-arms";
+    EXPECT_FALSE(r2.gap_detected);
+    EXPECT_FALSE(st.mn_needs_reseed());
+
+    // The guard must SAY IT FIRED. Without this witness every expectation above
+    // also passes on a maintainer whose block_connected subscription is simply
+    // dead — an absence and a refusal must not be the same observation.
+    EXPECT_EQ(m.unseeded_payee_folds_skipped(), 2u);
+    EXPECT_EQ(m.unseeded_payee_first_height(), kReg);
+    EXPECT_EQ(m.unseeded_payee_last_height(), kReg + 1);
+}
+
+// The other half: the guard must not have bought its silence by disabling
+// detection. Once a height-stamped snapshot is in force, the SAME machine folds
+// normally and a REAL divergence is still terminal.
+TEST(DashMnPayeeLatch, SeededMaintainerStillFoldsAndStillReportsDivergence)
+{
+    dash::coin::NodeCoinState st;
+    dash::coin::CoinStateMaintainer m{st};
+    m.set_require_seeded_mn_set(true);
+
+    auto cp = good_checkpoint();
+    m.on_mn_list_update(cp.entries, kAnchorHeight);
+    ASSERT_FALSE(st.mn_needs_reseed());
+
+    // A coinbase that pays nobody this set projects: a genuine divergence.
+    auto blk = repay_coinbase(block_from_hex(kBlockHex1519544),
+                              payout_of(cp, kQ1), synth_script(0x7f));
+    latch_bind(blk);   // rewriting the coinbase moved the body's merkle root
+    const auto r = m.on_block_connected(blk, kAnchorHeight + 1);
+
+    EXPECT_TRUE(r.payee_desync)
+        << "the guard must gate on 'is a snapshot in force', never on 'is a"
+           " mismatch inconvenient' — a seeded queue that disagrees with an"
+           " accepted coinbase is exactly the bad-cb-payee this arm exists to"
+           " refuse to serve";
+    EXPECT_TRUE(st.mn_needs_reseed());
+    EXPECT_EQ(m.unseeded_payee_folds_skipped(), 0u)
+        << "a seeded fold must never be counted as an unseeded skip";
+}

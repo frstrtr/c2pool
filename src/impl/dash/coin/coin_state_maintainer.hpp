@@ -761,6 +761,65 @@ public:
             r.total_after = m_state.mnstates().size();
             return r;
         }
+        // ── UNSEEDED PAYEE FOLD (soak-found 2026-08-03, phantom-desync class).
+        // The payee machine may fold a block ONLY while an authoritative,
+        // height-stamped snapshot is in force. Without one it holds no payment
+        // queue, so a projection off it is a guess -- precisely what the
+        // anti-mint latch below refuses to SERVE, but which was still being
+        // COMPUTED, and whose mismatch was then reported as a divergence.
+        //
+        // MEASURED, three independent runs (contabo soaks 0803c/d/e, started at
+        // tips 2515478/2515518/2515558, identical heights every time). In the
+        // pure-daemonless posture nothing seeds this machine until
+        // MnCheckpointLane publishes. Meanwhile the lane's own request_window()
+        // downloads HISTORICAL block bodies from the anchor forward, and both
+        // the lane and this maintainer subscribe to the SAME
+        // Node::block_connected event -- so those historical bodies were folded
+        // in here too. Both of MnStateMachine::apply_block's ordering guards are
+        // conditioned on `m_last_applied_height != 0`, so a cold cursor accepts
+        // the first body and then rides the window contiguously.
+        //
+        // The chain did the rest. Block 2513167 carried the first ProRegTx in
+        // the window; it registered the ONE entry this set held. Block 2513168
+        // projected it -- a one-element queue ranks by nothing, so nRegisteredHeight
+        // and payee_score() never entered into it -- the real coinbase paid the
+        // real queue head, and that was reported as PAYEE DESYNC. Wipe, demote,
+        // and one of only three bridge re-arms spent on a masternode set that
+        // never existed. The wipe resets the cursor to 0, re-opening the same
+        // hole, so it repeated at the next registration (2513260 -> 2513261) and
+        // stopped only when a live tip block pinned the cursor forward and the
+        // out-of-order guard began dropping the remaining bodies. Of the nine
+        // ProRegTx in 2513001..2515567, both that landed inside the unguarded
+        // run mis-scored; the other seven were never applied at all.
+        //
+        // Refuse the fold, and SAY WHICH refusal this is. "No seed yet" and "the
+        // queue diverged from the chain" are opposite conditions -- one is
+        // ordinary startup, the other is a defect -- and in the log they were
+        // indistinguishable.
+        if (m_require_seeded_mn && m_mn_snapshot_height == 0) {
+            ++m_unseeded_payee_folds;
+            if (m_unseeded_payee_first_h == 0) m_unseeded_payee_first_h = height;
+            m_unseeded_payee_last_h = height;
+            if (m_unseeded_payee_folds == 1
+                || (m_unseeded_payee_folds % 1000) == 0) {
+                LOG_INFO
+                    << "[EMB-DASH] payee fold SKIPPED at h=" << height
+                    << ": no authoritative masternode snapshot is in force"
+                       " (snapshot height 0, "
+                    << (m_mn_needs_reseed ? "re-seed pending after a wipe"
+                                          : "never seeded")
+                    << ") — NOT a divergence. An unseeded payee machine has no"
+                       " payment queue, so any projection off it would be a"
+                       " guess and any mismatch a phantom. "
+                    << m_unseeded_payee_folds << " block(s) skipped so far (h="
+                    << m_unseeded_payee_first_h << ".." << height
+                    << "). Folding resumes when the checkpoint bridge or an RPC"
+                       " seed publishes a height-stamped set.";
+            }
+            MnStateMachine::ApplyResult r;
+            r.total_after = m_state.mnstates().size();
+            return r;
+        }
         auto r    = m_state.mnstates().apply_block(block, height);
         // PAYEE DESYNC (soak-found 2026-07-22, bad-cb-payee class): the
         // connected block's coinbase does not pay the MN our queue projects.
@@ -857,6 +916,16 @@ public:
     /// turns it on for the whole embedded arm.
     void set_require_seeded_mn_set(bool on) { m_require_seeded_mn = on; }
     bool require_seeded_mn_set() const { return m_require_seeded_mn; }
+
+    /// The unseeded-payee-fold guard's own witnesses: how many blocks it
+    /// refused to fold because no height-stamped masternode snapshot was in
+    /// force, and the height span they covered. A nonzero count during a
+    /// checkpoint bridge is EXPECTED and benign — it is the historical block
+    /// bodies the bridge is downloading, which belong to the lane's private
+    /// replay machine and not to this one.
+    size_t   unseeded_payee_folds_skipped() const { return m_unseeded_payee_folds; }
+    uint32_t unseeded_payee_first_height()  const { return m_unseeded_payee_first_h; }
+    uint32_t unseeded_payee_last_height()   const { return m_unseeded_payee_last_h; }
 
     /// Height the applied SML/quorum state is current AT (0 = none yet),
     /// tracked off each accepted mnlistdiff's cbTx.nHeight. Read-only;
@@ -1194,6 +1263,15 @@ private:
     // queue; only a non-empty on_mn_list_update resync clears it. While set,
     // MN-readiness must not re-arm off incidental per-block registrations.
     bool m_mn_needs_reseed{false};
+
+    // Blocks the unseeded-payee-fold guard refused, and the height span they
+    // covered. Counted rather than merely skipped so a test can assert the
+    // guard FIRED: "no payee desync was reported" is also what a silently
+    // broken block_connected subscription produces, and the two must not be
+    // the same observation.
+    size_t   m_unseeded_payee_folds{0};
+    uint32_t m_unseeded_payee_first_h{0};
+    uint32_t m_unseeded_payee_last_h{0};
 
     // Last observed tip params, applied on republish().
     uint32_t m_prev_height{0};
