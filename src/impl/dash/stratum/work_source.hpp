@@ -511,6 +511,12 @@ private:
     // stale credit-pool seed cannot be served after the seed advances.
     mutable bool                template_cache_is_embedded_{false};
     mutable std::chrono::steady_clock::time_point template_last_fail_at_{};
+    // Generation the last FAILED sourcing attempt was made against (captured
+    // BEFORE the blocking source ran). The negative cache only holds while the
+    // generation is unchanged: a bump (tip change / coin-state advance) is an
+    // event that changes the answer and must re-source immediately instead of
+    // waiting out kRetryAfter (soak0804e resume-quantization fix).
+    mutable uint64_t            template_last_fail_gen_{0};
 
     // io-thread-decouple: background single-flight template refresh.
     // refresh_executor_ posts the blocking re-source onto the rpc_pool thread

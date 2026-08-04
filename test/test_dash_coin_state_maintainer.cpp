@@ -713,6 +713,106 @@ TEST(DashCoinStateMaintainer, SmlApplyAndReorgFireStateDirty) {
     EXPECT_EQ(dirty, 2) << "reorg wipe must re-issue work (drop orphaned-branch template)";
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// soak0804e (creditpool-stale ~3.3% of wall-clock, every decline exactly
+// value = threshold-1): between the header tip-advance and the tip BODY parse
+// the credit-pool seed is one block behind and the serve gate correctly
+// refuses. Ingest was already event-driven end-to-end (inv -> getdata ->
+// full_block -> block_connected -> advance_credit_pool_on_block), but the
+// RESUME was not: the successful tip-body fold ended in republish() without
+// firing the state-dirty sink, so no work re-issue happened until the next
+// UNRELATED signal (template request / mnlistdiff / next tip). This KAT pins
+// the event-driven resume: the tip body arriving must (a) advance the
+// credit-pool seed to the tip, (b) turn the gate viable, and (c) fire
+// set_on_state_dirty — with NO template request in between. It also pins that
+// the gate still refuses BETWEEN tip-advance and body-parse: the consensus
+// gate is untouched (dashd demands exact creditPoolBalance equality,
+// bad-cbtx-assetlocked-amount); this is latency work, not gate work.
+// ════════════════════════════════════════════════════════════════════════
+static BlockType make_cbtx_block(uint32_t height, int64_t credit_pool,
+                                 const std::vector<unsigned char>& payee_script) {
+    dash::coin::vendor::CCbTx cb;
+    cb.nVersion = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+    cb.nHeight  = static_cast<int32_t>(height);
+    cb.creditPoolBalance = credit_pool;
+    BlockType blk;
+    blk.m_txs.push_back(make_spend(raw256(0x90), 0, 500000000, height));
+    blk.m_txs[0].type = 5;                                    // CbTx
+    blk.m_txs[0].extra_payload = dash::coin::encode_cbtx(cb);
+    blk.m_txs[0].vout[0].scriptPubKey.m_data = payee_script;  // pays projected MN
+    bind_block(blk);
+    return blk;
+}
+
+TEST(DashCoinStateMaintainer, TipBodyArrivalFiresStateDirtyWithoutTemplateRequest) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    int dirty = 0;
+    m.set_on_state_dirty([&] { ++dirty; });
+
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)));
+    st.set_require_fresh_credit_pool(true);
+
+    // Header tip advance to H: the credit-pool seed (never seeded, -1) is now
+    // behind the tip — the gate MUST refuse, and with the creditpool cause.
+    // This is the correct refusal that MUST be preserved.
+    m.on_new_tip(H, raw256(0xCD), BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER,
+                 CURTIME, VERSION);
+    auto before = st.describe_decline();
+    EXPECT_FALSE(before.viable);
+    EXPECT_EQ(before.cause, "creditpool-stale")
+        << "between tip-advance and body-parse the gate must refuse on the "
+           "credit-pool axis";
+
+    const int dirty_before = dirty;
+
+    // The tip BODY arrives (event-driven ingest): type-5 CbTx coinbase
+    // carrying the committed creditPoolBalance at its own nHeight == tip.
+    // This is the moment the decline condition ends.
+    m.on_block_connected(make_cbtx_block(H, 123'456'789LL, p2pkh_script(0x30)), H);
+
+    // (a) the seed advanced to the tip off the block's OWN committed value...
+    EXPECT_EQ(st.credit_pool_height(), static_cast<int32_t>(H));
+    EXPECT_EQ(st.credit_pool(), 123'456'789LL);
+    // ...(b) the gate now evaluates viable...
+    EXPECT_TRUE(st.describe_decline().viable)
+        << "credit-pool seed current at the tip must clear the refusal";
+    // ...(c) and the state-dirty sink fired — the event-driven resume. No
+    // select_work()/template request happened between tip-advance and here.
+    EXPECT_GT(dirty, dirty_before)
+        << "tip-body fold must re-issue work (bump + notify) instead of "
+           "waiting for the next template request / unrelated signal";
+}
+
+// Guard against a notify storm during the E2b historical window fill: a body
+// fold BELOW the tip advances the seed to a non-tip height — still stale at
+// the tip — and must NOT fire the re-issue sink.
+TEST(DashCoinStateMaintainer, HistoricalBodyFoldBelowTipDoesNotFireStateDirty) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    int dirty = 0;
+    m.set_on_state_dirty([&] { ++dirty; });
+
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)));
+    st.set_require_fresh_credit_pool(true);
+    m.on_new_tip(H, raw256(0xCD), BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER,
+                 CURTIME, VERSION);
+    const int dirty_before = dirty;
+
+    // A HISTORICAL body (H-3 < tip H) folds in during window fill.
+    m.on_block_connected(make_cbtx_block(H - 3, 111'000'000LL, p2pkh_script(0x30)),
+                         H - 3);
+
+    EXPECT_EQ(st.credit_pool_height(), static_cast<int32_t>(H - 3));
+    EXPECT_FALSE(st.describe_decline().viable)
+        << "a seed below the tip must still refuse (the correct refusal is "
+           "preserved)";
+    EXPECT_EQ(st.describe_decline().cause, "creditpool-stale");
+    EXPECT_EQ(dirty, dirty_before)
+        << "a historical fold must not fire the re-issue sink (no notify "
+           "storm during the bootstrap window fill)";
+}
+
 // ── #814 review R1 hardening: stale ZERO-base snapshots must not corrupt the
 // tip SML ─────────────────────────────────────────────────────────────────────
 //

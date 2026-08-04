@@ -1089,6 +1089,45 @@ TEST(DashStratumWorkSource, InvalidateTemplateCacheForcesRefetchAndBumpsGenerati
     EXPECT_EQ(fallback_calls, 2);
 }
 
+// soak0804e resume-quantization pin: a FAILED sourcing attempt (set-gap /
+// declined gate) is negative-cached for kRetryAfter (5 s) so a down dashd is
+// not hammered by every session's 1 s notify-retry — but a work-generation
+// bump is an EVENT (tip change / coin-state advance, e.g. the credit-pool
+// seed catching up to the tip body) that changes the answer, so it must break
+// THROUGH the negative cache. Before this fix the event-driven resume was
+// quantized to the retry window: the maintainer had already advanced the
+// credit pool and fired state-dirty (bump + notify), the gate was viable, yet
+// cached_work() refused to re-source for up to 5 more seconds — exactly the
+// [5,5,5,5,5] s creditpool-stale episode floor the soak measured.
+TEST(DashStratumWorkSource, GenerationBumpBreaksThroughNegativeTemplateCache)
+{
+    dash::coin::NodeCoinState cs;   // unpopulated -> fallback arm
+    int fallback_calls = 0;
+    auto ws = std::make_unique<dash::stratum::DASHWorkSource>(
+        cs,
+        [&fallback_calls]() {
+            ++fallback_calls;
+            return dash::coin::DashWorkData{};   // set-gap: every attempt FAILS
+        });
+
+    // First pull: sources once, fails, arms the negative cache.
+    EXPECT_TRUE(ws->get_current_work_template().empty());
+    EXPECT_EQ(fallback_calls, 1);
+
+    // Second pull inside kRetryAfter with NO event: the throttle must hold
+    // (the down-dashd protection is unchanged).
+    EXPECT_TRUE(ws->get_current_work_template().empty());
+    EXPECT_EQ(fallback_calls, 1) << "no event => the retry throttle must hold";
+
+    // An event fires (the state-dirty sink's bump_work_generation): the next
+    // pull must re-source IMMEDIATELY instead of waiting out kRetryAfter.
+    ws->bump_work_generation();
+    EXPECT_TRUE(ws->get_current_work_template().empty());
+    EXPECT_EQ(fallback_calls, 2)
+        << "a work-generation bump must break through the negative template "
+           "cache (event-driven resume, not the 5 s retry quantum)";
+}
+
 // Fallback-arm event-driven tip refresh pin: on the dashd-fallback arm the
 // template cache only re-sources on the 30 s staleness TTL, so a new DASH block
 // can leave miners hashing a stale tip for up to ~30 s (accepted pseudoshares
