@@ -717,6 +717,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     # for the same reason as test_dash_qrinfo.cpp: this target IS in the build.yml
     # "Build tests" --target allowlist, and a standalone target would be a
     # NOT_BUILT sentinel (the push bot lacks `workflow` scope, #769).
+    # test_dash_mn_confirm_rollover.cpp / test_dash_collateral_spend_filter.cpp
+    # (sml_projection.hpp): the two silent block-loss defects of the committed
+    # merkleRootMNList — the height-driven confirmedHash rollover
+    # (specialtxman.cpp:206-215) and MN-collateral spends by normal type-0 txs
+    # (specialtxman.cpp:457-464). Folded here for the same reason as the other
+    # leaves above: this target IS in the build.yml "Build tests" --target
+    # allowlist, and a standalone target would be a NOT_BUILT sentinel (#769).
     add_executable(test_dash_embedded_gbt
         test_dash_embedded_gbt.cpp
         test_dash_embedded_cbtx_byte_parity.cpp
@@ -725,7 +732,9 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_rotated_quorum_members.cpp
         test_dash_dkg_commitments.cpp
         test_dash_sml_quorum_db.cpp
-        test_dash_embedded_oracle_shadow.cpp)
+        test_dash_embedded_oracle_shadow.cpp
+        test_dash_mn_confirm_rollover.cpp
+        test_dash_collateral_spend_filter.cpp)
     target_compile_definitions(test_dash_embedded_gbt PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_embedded_gbt PRIVATE
