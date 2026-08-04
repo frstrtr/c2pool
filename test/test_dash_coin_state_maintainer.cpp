@@ -1297,3 +1297,326 @@ TEST(DashCoinStateMaintainer, DuplicateAcrossTransportsIsNoOpNeverDowngrades) {
         EXPECT_EQ(served->CountSigners(), 50);
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// BODY-FIRST SERVE TIP (operator direction off soak0804e; the follow-up the
+// #1089 thread scoped). The serve tip — m_prev_height, the template height
+// and the threshold of every freshness gate — advances ONLY when the tip
+// block's inputs have been parsed (tip body fold, or the tip-targeted
+// mnlistdiff cbTx), atomically with the credit-pool advance. The header tip
+// keeps advancing on headers exactly as before and stays visible to its
+// consumers (stale-work invalidation / job rebuild / won-block detection are
+// wired off the header chain in main_dash and are untouched).
+//
+// FAILS-ON-MASTER: on header-first master m_prev_height is written directly
+// in on_new_tip — the serve height exceeds the parsed-body height by design
+// for the whole body window, so the invariant assertions below cannot hold
+// there. (Default-off legacy mode is pinned separately below.)
+// ════════════════════════════════════════════════════════════════════════
+
+#include <impl/dash/crypto/hash_x11.hpp>
+
+
+// Accrual-consistent balance for a CONTIGUOUS next block: the independent
+// credit-pool advance verifies computed == from-wire (prev + platform reward,
+// no asset locks/unlocks in these fabricated blocks); an inconsistent value
+// trips the ACCRUAL DRIFT fail-closed path and blocks the seed advance.
+static int64_t next_balance(const NodeCoinState& st, int64_t prev_balance,
+                            uint32_t height) {
+    return prev_balance
+           + dash::coin::compute_dash_platform_reward_post_v20_mn_rr(
+                 height, st.mn_rr_height());
+}
+
+static uint256 block_hash_of(const BlockType& b) {
+    auto packed = ::pack(static_cast<const dash::coin::BlockHeaderType&>(b));
+    return dash::crypto::hash_x11(packed.get_span());
+}
+
+// THE CENTREPIECE: "serve height never exceeds the height whose body has
+// been parsed." Header arrival must not advance the serve tip; the body fold
+// must — atomically with the credit-pool advance.
+TEST(DashCoinStateMaintainer, BodyFirstServeTipNeverExceedsParsedBodyHeight) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    m.set_body_first_serve_tip(true);
+    st.set_require_fresh_credit_pool(true);
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)));
+
+    // ── Establish the serve tip at H-1: header first, then its body. ──
+    auto b1 = make_cbtx_block(H - 1, 111'000'000LL, p2pkh_script(0x30));
+    m.on_new_tip(H - 1, block_hash_of(b1), BITS, MTP,
+                 DASH_PUBKEY_VER, DASH_P2SH_VER, CURTIME, VERSION);
+    // Header alone: the serve tip must NOT exist yet (cold start).
+    EXPECT_TRUE(m.tip_body_pending());
+    EXPECT_EQ(m.header_tip_height(), H - 1);
+    EXPECT_EQ(m.serve_tip_height(), 0u)
+        << "INVARIANT: no body parsed yet, no serve tip may exist";
+    EXPECT_FALSE(m.live());
+    // The refusal names itself: tip-body-pending, not a header-sync fault.
+    EXPECT_EQ(st.describe_decline().cause, "tip-body-pending");
+
+    m.on_block_connected(b1, H - 1);
+    EXPECT_FALSE(m.tip_body_pending());
+    EXPECT_EQ(m.serve_tip_height(), H - 1) << "body parsed => serve tip promoted";
+    ASSERT_TRUE(m.live());
+    {
+        WorkSelection sel = st.select_work([]() { return DashWorkData{}; });
+        EXPECT_EQ(sel.source, WorkSource::Embedded);
+        EXPECT_EQ(sel.work.m_height, H) << "serving next-height H over parsed H-1";
+    }
+
+    // ── Header H arrives, body DELAYED. ──
+    const int64_t bal2 = next_balance(st, 111'000'000LL, H);
+    auto b2 = make_cbtx_block(H, bal2, p2pkh_script(0x30));
+    m.on_new_tip(H, block_hash_of(b2), BITS, MTP,
+                 DASH_PUBKEY_VER, DASH_P2SH_VER, CURTIME, VERSION);
+    // Header-tip consumers see the new header immediately...
+    EXPECT_EQ(m.header_tip_height(), H);
+    EXPECT_TRUE(m.tip_body_pending());
+    // ...but the INVARIANT holds: serve height stays at the parsed height.
+    EXPECT_EQ(m.serve_tip_height(), H - 1)
+        << "INVARIANT VIOLATED: serve height exceeds the height whose body "
+           "has been parsed (this is exactly header-first master's behaviour)";
+    // The serve gates hold VIABLE at the old height — the body window is a
+    // normal transient (every pool serves prev-tip work during propagation),
+    // NOT an error/decline state.
+    EXPECT_TRUE(st.describe_decline().viable)
+        << "tip-body-pending must not be treated as an error state";
+    {
+        WorkSelection sel = st.select_work([]() { return DashWorkData{}; });
+        EXPECT_EQ(sel.source, WorkSource::Embedded);
+        EXPECT_EQ(sel.work.m_height, H) << "still building on parsed H-1";
+    }
+
+    // ── Body H arrives: serve tip + credit pool advance ATOMICALLY. ──
+    m.on_block_connected(b2, H);
+    EXPECT_EQ(m.serve_tip_height(), H);
+    EXPECT_EQ(st.credit_pool_height(), static_cast<int32_t>(H));
+    EXPECT_EQ(st.credit_pool(), bal2);
+    EXPECT_TRUE(st.describe_decline().viable)
+        << "no creditpool-stale window may exist after the atomic advance";
+    {
+        WorkSelection sel = st.select_work([]() { return DashWorkData{}; });
+        EXPECT_EQ(sel.work.m_height, H + 1);
+    }
+}
+
+// Legacy default pinned: with body-first NOT enabled, on_new_tip promotes the
+// serve tip immediately (header-first) — byte-identical pre-split behaviour
+// for every existing posture (KATs, dashd-RPC/ZMQ tip feed with no body feed).
+TEST(DashCoinStateMaintainer, HeaderFirstDefaultPromotesServeTipOnHeader) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)));
+    m.on_new_tip(H, raw256(0xCD), BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER,
+                 CURTIME, VERSION);
+    EXPECT_EQ(m.serve_tip_height(), H);
+    EXPECT_FALSE(m.tip_body_pending());
+    EXPECT_TRUE(m.live());
+}
+
+// The body fold's promotion must fire the state-dirty re-issue sink (builds
+// on #1089's event-driven resume) — serve tip + credit pool advance, gate
+// resumes, with NO template request in between.
+TEST(DashCoinStateMaintainer, BodyFirstPromotionFiresStateDirtyWithoutTemplateRequest) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    m.set_body_first_serve_tip(true);
+    st.set_require_fresh_credit_pool(true);
+    int dirty = 0;
+    m.set_on_state_dirty([&] { ++dirty; });
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)));
+
+    auto b1 = make_cbtx_block(H - 1, 111'000'000LL, p2pkh_script(0x30));
+    m.on_new_tip(H - 1, block_hash_of(b1), BITS, MTP,
+                 DASH_PUBKEY_VER, DASH_P2SH_VER, CURTIME, VERSION);
+    m.on_block_connected(b1, H - 1);
+    ASSERT_TRUE(m.live());
+
+    auto b2 = make_cbtx_block(H, next_balance(st, 111'000'000LL, H),
+                              p2pkh_script(0x30));
+    m.on_new_tip(H, block_hash_of(b2), BITS, MTP,
+                 DASH_PUBKEY_VER, DASH_P2SH_VER, CURTIME, VERSION);
+    const int dirty_before = dirty;
+    // No select_work()/template request happens between here and the fold.
+    m.on_block_connected(b2, H);
+    EXPECT_EQ(m.serve_tip_height(), H);
+    EXPECT_GT(dirty, dirty_before)
+        << "promotion must re-issue work (bump + notify) event-driven";
+}
+
+// Cold-start path: the initial header sync ends at a tip whose body is never
+// inv'd — the tip-targeted mnlistdiff's authoritative cbTx carries the same
+// block inputs and must promote the pending serve tip.
+TEST(DashCoinStateMaintainer, BodyFirstMnlistdiffAtTipPromotesPendingServeTip) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    m.set_body_first_serve_tip(true);
+    st.set_require_fresh_credit_pool(true);
+    // Payee axis current at the tip via the snapshot's as_of height.
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)), /*as_of_height=*/H);
+
+    const uint256 tip_hash = raw256(0x54);
+    m.on_new_tip(H, tip_hash, BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER,
+                 CURTIME, VERSION);
+    EXPECT_TRUE(m.tip_body_pending());
+    EXPECT_EQ(m.serve_tip_height(), 0u);
+
+    m.on_mnlistdiff(diff_with_seed(uint256::ZERO, tip_hash, H,
+                                   111'000'000LL, sml_entry(0x40)));
+    EXPECT_FALSE(m.tip_body_pending());
+    EXPECT_EQ(m.serve_tip_height(), H)
+        << "a tip-targeted diff cbTx is a body-equivalent input advance";
+    EXPECT_TRUE(m.live());
+}
+
+// A diff at the tip must NOT promote while the payee cursor lags the tip —
+// that would trade the removed creditpool-stale window for an identical
+// payee-stale one.
+TEST(DashCoinStateMaintainer, BodyFirstDiffDoesNotPromoteOverLaggingPayeeCursor) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    m.set_body_first_serve_tip(true);
+    st.set_require_fresh_credit_pool(true);
+    // Snapshot as-of H-1: payee cursor is one behind the pending tip H.
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)), /*as_of_height=*/H - 1);
+
+    const uint256 tip_hash = raw256(0x54);
+    m.on_new_tip(H, tip_hash, BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER,
+                 CURTIME, VERSION);
+    m.on_mnlistdiff(diff_with_seed(uint256::ZERO, tip_hash, H,
+                                   111'000'000LL, sml_entry(0x40)));
+    EXPECT_TRUE(m.tip_body_pending())
+        << "promotion must wait for the payee axis to reach the tip";
+    EXPECT_EQ(m.serve_tip_height(), 0u);
+}
+
+// Doomed-tip bound: a pending window that outlives the overdue budget (lost
+// body the p2p watchdog could not recover / credit-pool drift) demotes the
+// serve tip instead of serving knowingly-doomed old-tip work; the eventual
+// body re-arms it.
+TEST(DashCoinStateMaintainer, BodyFirstOverduePendingDemotesThenBodyReArms) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    m.set_body_first_serve_tip(true);
+    st.set_require_fresh_credit_pool(true);
+    int64_t now = 1'000'000;
+    m.set_now_fn([&] { return now; });
+    m.set_tip_body_overdue_secs(30);
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)));
+
+    auto b1 = make_cbtx_block(H - 1, 111'000'000LL, p2pkh_script(0x30));
+    m.on_new_tip(H - 1, block_hash_of(b1), BITS, MTP,
+                 DASH_PUBKEY_VER, DASH_P2SH_VER, CURTIME, VERSION);
+    m.on_block_connected(b1, H - 1);
+    ASSERT_TRUE(m.live());
+
+    auto b2 = make_cbtx_block(H, next_balance(st, 111'000'000LL, H),
+                              p2pkh_script(0x30));
+    m.on_new_tip(H, block_hash_of(b2), BITS, MTP,
+                 DASH_PUBKEY_VER, DASH_P2SH_VER, CURTIME, VERSION);
+    // Inside the budget: still serving old-height work.
+    now += 29;
+    m.on_mempool_tx(make_spend(raw256(0x91), 0, 1'000, 7));
+    EXPECT_TRUE(m.live());
+
+    // Budget exceeded: demote — refusing beats serving doomed-tip work.
+    now += 2;
+    m.on_mempool_tx(make_spend(raw256(0x92), 0, 1'000, 8));
+    EXPECT_FALSE(m.live())
+        << "overdue pending window must stop serving old-tip work";
+    EXPECT_EQ(st.describe_decline().cause, "tip-body-pending")
+        << "the overdue refusal must carry the named transient";
+
+    // The body finally lands: promotion re-arms the serve tip.
+    m.on_block_connected(b2, H);
+    EXPECT_TRUE(m.live());
+    EXPECT_EQ(m.serve_tip_height(), H);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Bounded full-block buffer (LTC-style retention): eviction proven at the
+// bound — cap 24 with no ChainLock, shrink-to-floor 6 with a fresh one.
+// FAILS-ON-MASTER: no retention exists there at all.
+// ════════════════════════════════════════════════════════════════════════
+TEST(DashCoinStateMaintainer, FullBlockBufferEvictsAtBound) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    m.set_full_block_buffer(true);
+
+    const uint32_t H0 = H;
+    for (uint32_t i = 0; i < 30; ++i)
+        m.on_block_connected(
+            make_cbtx_block(H0 + i, 1'000LL + i, p2pkh_script(0x30)), H0 + i);
+    // No ChainLock observed => the cap alone bounds retention.
+    EXPECT_EQ(m.block_buffer_depth(), 24u) << "cap must bound the buffer";
+    EXPECT_EQ(m.block_buffer_lowest_height(), H0 + 6);
+    EXPECT_EQ(m.block_buffer_highest_height(), H0 + 29);
+    EXPECT_GE(m.block_buffer_evictions(), 6u) << "eviction must be OBSERVED";
+
+    // A fresh ChainLock near the tip shrinks retention to the floor: nothing
+    // at or below a ChainLocked height can reorg.
+    std::array<uint8_t, 96> sig{};
+    sig[0] = 1;
+    st.set_best_cl(static_cast<int32_t>(H0 + 29),
+                   sig, dash::coin::ClProvenance::ChainCommitted);
+    m.on_block_connected(
+        make_cbtx_block(H0 + 30, 2'000LL, p2pkh_script(0x30)), H0 + 30);
+    EXPECT_EQ(m.block_buffer_depth(), 6u)
+        << "with a tip-fresh ChainLock the floor governs";
+    EXPECT_EQ(m.block_buffer_highest_height(), H0 + 30);
+}
+
+// Reorg WITHIN the buffer depth: the credit pool is rolled back to the fork
+// point from the RETAINED fork-point body's own committed CCbTx balance — no
+// cold wipe on the credit-pool axis. Beyond the buffer (no retained body
+// still on the new branch) the existing wipe path is unchanged.
+// FAILS-ON-MASTER: on_sml_reorg unconditionally wipes the seed to -1.
+TEST(DashCoinStateMaintainer, ReorgWithinBufferReplaysCreditPoolUndoFromRetainedBodies) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    m.set_full_block_buffer(true);
+
+    const uint32_t H0 = H;
+    const int64_t bal_a = 1'000LL;
+    const int64_t bal_b = next_balance(st, bal_a, H0 + 1);
+    const int64_t bal_c = next_balance(st, bal_b, H0 + 2);
+    auto a = make_cbtx_block(H0,     bal_a, p2pkh_script(0x30));
+    auto b = make_cbtx_block(H0 + 1, bal_b, p2pkh_script(0x30));
+    auto c = make_cbtx_block(H0 + 2, bal_c, p2pkh_script(0x30));
+    m.on_block_connected(a, H0);
+    m.on_block_connected(b, H0 + 1);
+    m.on_block_connected(c, H0 + 2);
+    ASSERT_EQ(st.credit_pool_height(), static_cast<int32_t>(H0 + 2));
+    ASSERT_EQ(m.block_buffer_depth(), 3u);
+
+    // New branch after the reorg: H0 is still ours (fork point), H0+1 is a
+    // DIFFERENT block, H0+2 not present.
+    const uint256 a_hash = block_hash_of(a);
+    m.set_chain_hash_at_height_fn(
+        [&](uint32_t h) -> std::optional<uint256> {
+            if (h == H0) return a_hash;
+            if (h == H0 + 1) return raw256(0xEE);   // new-branch block != b
+            return std::nullopt;
+        });
+    m.on_sml_reorg();
+    EXPECT_EQ(st.credit_pool_height(), static_cast<int32_t>(H0))
+        << "credit pool must roll back to the fork point, not wipe to -1";
+    EXPECT_EQ(st.credit_pool(), bal_a)
+        << "the rolled-back balance is the retained body's own committed value";
+    EXPECT_EQ(m.block_buffer_highest_height(), H0)
+        << "orphan-branch bodies above the fork point must be dropped";
+
+    // ── Beyond the buffer: no retained body on the new branch => wipe. ──
+    NodeCoinState st2;
+    CoinStateMaintainer m2(st2);
+    m2.set_full_block_buffer(true);
+    m2.on_block_connected(make_cbtx_block(H0, 1'000LL, p2pkh_script(0x30)), H0);
+    m2.set_chain_hash_at_height_fn(
+        [](uint32_t) -> std::optional<uint256> { return std::nullopt; });
+    m2.on_sml_reorg();
+    EXPECT_EQ(st2.credit_pool_height(), -1)
+        << "beyond the buffer the existing wipe + cold-resync path stays";
+    EXPECT_EQ(st2.credit_pool(), 0);
+}
