@@ -113,6 +113,10 @@ struct inventory_type
         filtered_block  = 3,
         cmpct_block     = 4,
         wtx             = 5,            // MSG_WTX (BIP 339)
+        // Dash-specific getdata/inv types (dashcore src/protocol.h:495-524,
+        // enum GetDataMsg). Only the ones we actually request are listed.
+        quorum_final_commitment = 21,   // MSG_QUORUM_FINAL_COMMITMENT
+        clsig           = 29,           // MSG_CLSIG (dashcore protocol.h:522)
         witness_tx      = 0x40000001,   // MSG_WITNESS_TX (BIP 144)
         witness_block   = 0x40000002,   // MSG_WITNESS_BLOCK (BIP 144)
     };

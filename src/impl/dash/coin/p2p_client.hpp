@@ -12,7 +12,8 @@
 //   * handshake: version/verack (HandshakeTracker below — the KAT'd state
 //     machine), advertising protocol 70230, the SAME version the vendored
 //     SML/clsig codecs assume (vendor/smldiff.hpp, vendor/quorum_tail.hpp);
-//   * keep-alive: 30s ping cadence + idle/handshake timeout teardown;
+//   * keep-alive: Dash-Core-semantics ping/pong liveness (PeerLiveness below)
+//     + handshake timeout teardown;
 //   * reconnect: 30s retry while disconnected, rotating the dial plan.
 //
 // Ported 1:1 from the PROVEN per-coin clients (src/impl/dgb/coin/p2p_node.hpp
@@ -48,6 +49,9 @@
 #include <impl/dash/coin/historical_sml.hpp>    // HistoricalMnListDiffDemux (reward-critical tip/historical split)
 
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <exception>
 #include <memory>
 #include <string>
 #include <vector>
@@ -160,6 +164,127 @@ public:
     }
 };
 
+// ── Peer liveness policy (pure, KAT-able) ────────────────────────────────
+//
+// Decides, from timestamps alone, whether a peer is still alive. Extracted
+// from the client so the rules are unit-testable without sockets or wall
+// clocks (test/test_dash_coin_p2p_client.cpp).
+//
+// WHY THIS EXISTS. The previous rule was a single "no inbound message for
+// IDLE_TIMEOUT_SEC (100s) => drop". That rule cannot tell "healthy and quiet"
+// from "dead": a peer that is synced with us at the chain tip legitimately
+// sends nothing for minutes at a time, so the better-synced we are, the
+// faster we killed our own peers. Every inv-PUSHED message type — qfcommit
+// (announced once, at DKG finalize) and clsig (announced ~once per block) —
+// requires being connected AT THE MOMENT the peer announces, so peer churn
+// destroys their acquisition probability. Request/response traffic
+// (getmnlistd -> mnlistdiff) survives churn because we re-ask on every fresh
+// handshake; inv-push does not. That asymmetry is exactly why the masternode
+// bridge completes while the quorum plan never does.
+//
+// The replacement mirrors Dash Core / Bitcoin Core net.cpp:
+//
+//   * ping the peer once it has been quiet for m_ping_interval_sec
+//     (Dash Core PING_INTERVAL = 2 min);
+//   * ANY inbound message — pong included — is liveness evidence and pushes
+//     the deadline out;
+//   * only drop when a ping has gone UNANSWERED past m_peer_timeout_sec
+//     (Dash Core TIMEOUT_INTERVAL = 20 min), or when nothing at all has been
+//     received for that same interval.
+//
+// INVARIANT: liveness is evidence about the PEER. Nothing we SEND may push
+// the deadline out — that is what turns a half-open socket into a connection
+// we believe is healthy. The only mutator of m_last_recv is on_inbound().
+class PeerLiveness
+{
+public:
+    enum class Action
+    {
+        None,             // nothing to do this tick
+        SendPing,         // peer has been quiet for ping_interval; probe it
+        DropIdle,         // nothing received at all within peer_timeout
+        DropPingTimeout,  // our ping went unanswered past peer_timeout
+    };
+
+private:
+    time_t m_ping_interval_sec{120};
+    time_t m_peer_timeout_sec{1200};
+
+    int64_t  m_last_recv{0};
+    bool     m_ping_outstanding{false};
+    int64_t  m_ping_sent_at{0};
+    uint64_t m_ping_nonce{0};
+    uint64_t m_pings_sent{0};
+    uint64_t m_pongs_matched{0};
+
+public:
+    void configure(time_t ping_interval_sec, time_t peer_timeout_sec)
+    {
+        if (ping_interval_sec > 0) m_ping_interval_sec = ping_interval_sec;
+        if (peer_timeout_sec > 0)  m_peer_timeout_sec = peer_timeout_sec;
+    }
+
+    time_t ping_interval_sec() const { return m_ping_interval_sec; }
+    time_t peer_timeout_sec() const { return m_peer_timeout_sec; }
+
+    /// Begin (or restart) a session at `now` — call on handshake completion.
+    /// Counters are session-scoped and reset with it.
+    void start(int64_t now)
+    {
+        m_last_recv = now;
+        m_ping_outstanding = false;
+        m_ping_sent_at = 0;
+        m_ping_nonce = 0;
+        m_pings_sent = 0;
+        m_pongs_matched = 0;
+    }
+
+    /// ANY inbound message. The ONLY thing that pushes the deadline out.
+    void on_inbound(int64_t now) { m_last_recv = now; }
+
+    /// A pong. Only a nonce MATCHING the outstanding ping clears it — a peer
+    /// must not be able to hold a link "alive" by replaying an old nonce, and
+    /// an unsolicited pong is not an answer to anything. Returns true if this
+    /// pong closed the outstanding ping.
+    bool on_pong(uint64_t nonce, int64_t now)
+    {
+        on_inbound(now);
+        if (!m_ping_outstanding || nonce != m_ping_nonce)
+            return false;
+        m_ping_outstanding = false;
+        ++m_pongs_matched;
+        return true;
+    }
+
+    /// Record that a ping with `nonce` was actually written to the wire.
+    void note_ping_sent(uint64_t nonce, int64_t now)
+    {
+        m_ping_outstanding = true;
+        m_ping_nonce = nonce;
+        m_ping_sent_at = now;
+        ++m_pings_sent;
+    }
+
+    /// Evaluate the policy. Pure: the caller performs the action and reports
+    /// a ping back through note_ping_sent().
+    Action tick(int64_t now) const
+    {
+        if (m_ping_outstanding && (now - m_ping_sent_at) >= m_peer_timeout_sec)
+            return Action::DropPingTimeout;
+        if ((now - m_last_recv) >= m_peer_timeout_sec)
+            return Action::DropIdle;
+        if (!m_ping_outstanding && (now - m_last_recv) >= m_ping_interval_sec)
+            return Action::SendPing;
+        return Action::None;
+    }
+
+    bool ping_outstanding() const { return m_ping_outstanding; }
+    uint64_t ping_nonce() const { return m_ping_nonce; }
+    uint64_t pings_sent() const { return m_pings_sent; }
+    uint64_t pongs_matched() const { return m_pongs_matched; }
+    int64_t last_recv() const { return m_last_recv; }
+};
+
 #define ADD_P2P_HANDLER(name)\
     void handle(std::unique_ptr<dash::coin::p2p::message_##name> msg)
 
@@ -172,8 +297,16 @@ class CoinClient : public core::ICommunicator, public core::INetwork, public cor
 
 private:
     static constexpr time_t CONNECT_TIMEOUT_SEC = 10;
-    static constexpr time_t IDLE_TIMEOUT_SEC = 100;
-    static constexpr time_t PING_INTERVAL_SEC = 30;
+    // Dash Core net.h PING_INTERVAL: probe a peer that has been quiet this long.
+    static constexpr time_t PING_INTERVAL_SEC = 120;
+    // Dash Core net.h TIMEOUT_INTERVAL: drop only when a ping has gone
+    // UNANSWERED this long (or nothing at all arrived in that window). This
+    // replaces the old 100s "peer sent us nothing => peer is dead" rule, which
+    // could not distinguish a healthy tip-synced peer from a dead one.
+    static constexpr time_t PEER_TIMEOUT_SEC = 1200;
+    // How often the liveness policy is evaluated. Only a scheduling grain —
+    // the decisions themselves are timestamp-based, so this never changes them.
+    static constexpr time_t LIVENESS_TICK_SEC = 10;
     static constexpr time_t RECONNECT_INTERVAL_SEC = 30;
 
     // Dash Core PROTOCOL_VERSION we advertise. MUST stay >= 70230: the
@@ -190,8 +323,13 @@ private:
 
     std::unique_ptr<Connection> m_peer;
     std::unique_ptr<core::Timer> m_reconnect_timer;
-    std::unique_ptr<core::Timer> m_ping_timer;
+    // Repeating post-handshake keepalive/liveness tick. Drives m_liveness.
+    std::unique_ptr<core::Timer> m_liveness_timer;
+    // One-shot HANDSHAKE deadline only (CONNECT_TIMEOUT_SEC). Post-handshake
+    // liveness is m_liveness_timer's job.
     std::unique_ptr<core::Timer> m_timeout_timer;
+    PeerLiveness m_liveness;
+    time_t m_liveness_tick_sec{LIVENESS_TICK_SEC};
     DialPlan m_dial_plan;
     bool m_reconnect_enabled = false;
     HandshakeTracker m_handshake;
@@ -257,7 +395,7 @@ public:
     {
         m_reconnect_enabled = false;
         if (m_reconnect_timer) m_reconnect_timer->stop();
-        stop_ping_timer();
+        stop_liveness_timer();
         stop_timeout_timer();
     }
 
@@ -347,7 +485,7 @@ public:
 
     void disconnect() override
     {
-        stop_ping_timer();
+        stop_liveness_timer();
         stop_timeout_timer();
         m_handshake.reset();
         m_peer.reset();
@@ -387,6 +525,29 @@ public:
     int64_t peer_uptime_sec() const {
         return std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - m_connected_at).count();
+    }
+
+    // ── keepalive observability ──────────────────────────────────────────
+    /// Whether a ping we sent is still waiting for its pong.
+    bool ping_outstanding() const { return m_liveness.ping_outstanding(); }
+    /// Pings sent / pongs matched in the CURRENT session (reset per handshake).
+    uint64_t pings_sent() const { return m_liveness.pings_sent(); }
+    uint64_t pongs_matched() const { return m_liveness.pongs_matched(); }
+    /// Nonce of the most recent ping (0 before the first one).
+    uint64_t last_ping_nonce() const { return m_liveness.ping_nonce(); }
+    time_t ping_interval_sec() const { return m_liveness.ping_interval_sec(); }
+    time_t peer_timeout_sec() const { return m_liveness.peer_timeout_sec(); }
+
+    /// TEST-ONLY: scale the keepalive cadence so the liveness policy can be
+    /// driven in seconds of real time rather than minutes. Production never
+    /// calls this — the defaults are PING_INTERVAL_SEC / PEER_TIMEOUT_SEC /
+    /// LIVENESS_TICK_SEC. Call BEFORE the handshake completes; the tick
+    /// interval is read when the liveness timer is armed.
+    void set_keepalive_for_test(time_t ping_interval_sec, time_t peer_timeout_sec,
+                                time_t tick_sec)
+    {
+        m_liveness.configure(ping_interval_sec, peer_timeout_sec);
+        if (tick_sec > 0) m_liveness_tick_sec = tick_sec;
     }
 
     // ── E2+ seams ────────────────────────────────────────────────────────
@@ -530,7 +691,7 @@ public:
             m_peer.reset();
         // else: already disconnected (double-fire race) — safe to ignore
 
-        stop_ping_timer();
+        stop_liveness_timer();
         stop_timeout_timer();
         m_handshake.reset();
     }
@@ -544,14 +705,18 @@ public:
     {
         on_activity();
 
+        // Copy the command BEFORE parse: parse() consumes rmsg, and the guard
+        // below has to be able to name what threw.
+        const std::string cmd = rmsg ? rmsg->m_command : std::string("<null>");
+
         p2p::Handler::result_t result;
         try
         {
             result = m_handler.parse(rmsg);
         } catch (const std::runtime_error& ec)
         {
-            LOG_ERROR << "[" << m_chain_label << "] handle(" << rmsg->m_command
-                      << ", " << rmsg->m_data.size() << " bytes): " << ec.what();
+            LOG_ERROR << "[" << m_chain_label << "] handle(" << cmd
+                      << "): " << ec.what();
             return;
         } catch (const std::out_of_range&)
         {
@@ -559,11 +724,50 @@ public:
             // governance/quorum traffic (spork, senddsq, qsendrecsigs, ...)
             // unsolicited; ignoring them is protocol-legal for a light client.
             LOG_DEBUG_COIND << "[" << m_chain_label << "] ignoring unhandled command '"
-                            << rmsg->m_command << "' (" << rmsg->m_data.size() << " bytes)";
+                            << cmd << "'";
+            return;
+        } catch (const std::exception& ec)
+        {
+            // Anything else out of the codec (std::length_error / bad_alloc /
+            // ios_base::failure variants) — see the dispatch guard below for
+            // why NOTHING may escape this function.
+            LOG_ERROR << "[" << m_chain_label << "] parse('" << cmd
+                      << "') threw: " << ec.what() << " — message dropped";
             return;
         }
 
-        std::visit([&](auto& msg){ handle(std::move(msg)); }, result);
+        // ── READ-LOOP PRESERVATION GUARD ─────────────────────────────────
+        //
+        // This function is called from core::Socket::message_processing, and
+        // the socket's read loop is re-armed by the line AFTER that call
+        // (core/socket.cpp Socket::read_payload: `message_processing(packet);
+        // read();`). An exception escaping here therefore unwinds straight
+        // past `read()` and out of the asio completion handler — the socket
+        // stays OPEN, no error() callback ever fires, and the connection
+        // becomes permanently deaf while still looking connected. main_dash's
+        // #755 io-handler guard catches the throw at ioc.run() and resumes the
+        // loop, so the process survives and the damage is invisible: the ONLY
+        // subsequent symptom is this client's own liveness timer firing later
+        // on a peer that has actually been silenced by us.
+        //
+        // Handlers below fan out into subscriber code (new_block /
+        // new_mnlistdiff / new_qfcommit / new_chainlock ...) that we do not
+        // own, so a throw from any of them must be contained here. A bad
+        // message costs that message, never the peer.
+        try
+        {
+            std::visit([&](auto& msg){ handle(std::move(msg)); }, result);
+        } catch (const std::exception& ec)
+        {
+            LOG_ERROR << "[" << m_chain_label << "] handler for '" << cmd
+                      << "' threw: " << ec.what()
+                      << " — message dropped, peer kept (read loop preserved)";
+        } catch (...)
+        {
+            LOG_ERROR << "[" << m_chain_label << "] handler for '" << cmd
+                      << "' threw a non-std exception"
+                      << " — message dropped, peer kept (read loop preserved)";
+        }
     }
 
     const std::vector<std::byte>& get_prefix() const override
@@ -596,10 +800,10 @@ private:
             m_timeout_timer = std::make_unique<core::Timer>(m_context, false);
     }
 
-    void ensure_ping_timer()
+    void ensure_liveness_timer()
     {
-        if (!m_ping_timer)
-            m_ping_timer = std::make_unique<core::Timer>(m_context, true);
+        if (!m_liveness_timer)
+            m_liveness_timer = std::make_unique<core::Timer>(m_context, true);
     }
 
     void stop_timeout_timer()
@@ -608,22 +812,36 @@ private:
             m_timeout_timer->stop();
     }
 
-    void stop_ping_timer()
+    void stop_liveness_timer()
     {
-        if (m_ping_timer)
-            m_ping_timer->stop();
+        if (m_liveness_timer)
+            m_liveness_timer->stop();
     }
 
+    static int64_t now_sec()
+    {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    /// Inbound traffic observed. This is the ONLY liveness input — nothing we
+    /// SEND may push the deadline out (see PeerLiveness's invariant).
     void on_activity()
     {
         if (!m_peer)
             return;
-        ensure_timeout_timer();
-        auto timeout = m_handshake.complete() ? IDLE_TIMEOUT_SEC : CONNECT_TIMEOUT_SEC;
-        m_timeout_timer->restart(timeout);
+        m_liveness.on_inbound(now_sec());
+        if (!m_handshake.complete())
+        {
+            // Pre-handshake the deadline is still the short CONNECT one: a
+            // peer that opens a socket and then stalls mid-version must not
+            // hold an outbound slot for the full liveness window.
+            ensure_timeout_timer();
+            m_timeout_timer->restart(CONNECT_TIMEOUT_SEC);
+        }
     }
 
-    void timeout(const char* reason)
+    void timeout(const std::string& reason)
     {
         auto endpoint = m_peer ? m_peer->get_addr()
                                : (m_dial_plan.empty() ? NetService{} : m_dial_plan.current());
@@ -634,8 +852,42 @@ private:
     {
         if (!m_peer || !m_handshake.complete())
             return;
-        auto msg_ping = message_ping::make_raw(core::random::random_nonce());
+        const uint64_t nonce = core::random::random_nonce();
+        auto msg_ping = message_ping::make_raw(nonce);
         m_peer->write(msg_ping);
+        m_liveness.note_ping_sent(nonce, now_sec());
+        LOG_DEBUG_COIND << "[" << m_chain_label << "] ping sent (nonce="
+                        << nonce << ", quiet for "
+                        << (now_sec() - m_liveness.last_recv()) << "s)";
+    }
+
+    /// Post-handshake keepalive tick. Sends a ping to a peer that has gone
+    /// quiet, and drops the peer ONLY on an unanswered ping / total silence
+    /// past PEER_TIMEOUT_SEC.
+    void on_liveness_tick()
+    {
+        if (!m_peer || !m_handshake.complete())
+            return;
+        const int64_t now = now_sec();
+        switch (m_liveness.tick(now))
+        {
+        case PeerLiveness::Action::SendPing:
+            send_ping();
+            break;
+        case PeerLiveness::Action::DropPingTimeout:
+            LOG_WARNING << "[" << m_chain_label << "] ping (nonce="
+                        << m_liveness.ping_nonce() << ") unanswered for "
+                        << m_liveness.peer_timeout_sec() << "s";
+            timeout("ping unanswered for "
+                    + std::to_string(m_liveness.peer_timeout_sec()) + "s");
+            break;
+        case PeerLiveness::Action::DropIdle:
+            timeout("no message received in "
+                    + std::to_string(m_liveness.peer_timeout_sec()) + "s");
+            break;
+        case PeerLiveness::Action::None:
+            break;
+        }
     }
 
     // ── handshake ────────────────────────────────────────────────────────
@@ -682,18 +934,14 @@ private:
                  << " (peer proto=" << m_peer_version
                  << " height=" << m_peer_start_height << ")";
 
-        ensure_timeout_timer();
-        // Rebind the timeout reason at handshake completion: post-handshake
-        // expiries are idle timeouts, not the "handshake timeout" armed in
-        // connected(). start() re-sets m_handler, and on_activity()'s restart()
-        // reuses it — so idle expiries now log the correct reason.
-        m_timeout_timer->start(IDLE_TIMEOUT_SEC, [this]() {
-            timeout("idle timeout");
-        });
+        // The handshake deadline has been met — retire it. From here liveness
+        // is the ping/pong policy, NOT a bare "peer went quiet" stopwatch.
+        stop_timeout_timer();
 
-        ensure_ping_timer();
-        m_ping_timer->start(PING_INTERVAL_SEC, [this]() {
-            send_ping();
+        m_liveness.start(now_sec());
+        ensure_liveness_timer();
+        m_liveness_timer->start(m_liveness_tick_sec, [this]() {
+            on_liveness_tick();
         });
 
         if (m_on_handshake_complete)
@@ -710,26 +958,45 @@ private:
 
     ADD_P2P_HANDLER(pong)
     {
-        // liveness already refreshed by on_activity()
+        // on_activity() already refreshed last-recv for ANY inbound message;
+        // this additionally CLOSES the outstanding ping, which is what stops
+        // the ping-unanswered deadline from ever maturing on a live peer. A
+        // nonce that does not match an outstanding ping is still liveness
+        // evidence but answers nothing.
+        const bool matched = m_liveness.on_pong(msg->m_nonce, now_sec());
+        LOG_DEBUG_COIND << "[" << m_chain_label << "] pong (nonce=" << msg->m_nonce
+                        << (matched ? ") — ping answered" : ") — unsolicited/stale");
     }
 
     // ── E1 seam handlers: parse + fire interfaces::Node events, NO ingest ─
 
     ADD_P2P_HANDLER(inv)
     {
-        // E1: announce-only. Block invs fire new_block (the E2 ingest seam);
-        // NO getdata pulls yet — the ingest legs are later slices.
+        // Block invs fire new_block (the E2 ingest seam, which pulls headers
+        // then the block). Object invs in the pull policy get an immediate
+        // getdata; everything else is ignored.
         for (auto& inv : msg->m_invs)
         {
-            // E1 Phase-L sourcing leg: pull relayed DKG final commitments
-            // (MSG_QUORUM_FINAL_COMMITMENT = 21, dashcore protocol.h). The
-            // qfcommit handler below feeds the MineableCommitmentCache.
-            if (static_cast<uint32_t>(inv.m_type) == 21u)
+            // Sourcing legs: pull the announced object for every inv type in
+            // the pull policy (inv_type_is_pulled, p2p_messages.hpp) —
+            // MSG_QUORUM_FINAL_COMMITMENT = 21 feeding the Phase-L
+            // MineableCommitmentCache, and MSG_CLSIG = 29 feeding the
+            // ChainLock lane. Dash announces both by inv and serves them only
+            // on getdata; without this the clsig handler below can never fire,
+            // which is exactly why on_new_chainlock had never been reached.
+            //
+            // NOTE the ChainLock inv hash is SerializeHash(clsig) — SHA256d
+            // over the whole 132-byte ChainLockSig — NOT the locked block's
+            // hash, so it is only ever echoed straight back in the getdata; we
+            // cannot derive it and must not try. dashd also serves ONLY its
+            // current best ChainLock (GetChainLockByHash refuses anything
+            // else), so a getdata for a superseded announcement legitimately
+            // comes back notfound; that is benign and self-correcting — the
+            // next ChainLock is announced ~2.5 min later.
+            if (inv_type_is_pulled(inv.m_type))
             {
                 auto getdata_msg = message_getdata::make_raw(
-                    {inventory_type(
-                        static_cast<inventory_type::inv_type>(21u),
-                        inv.m_hash)});
+                    {inventory_type(inv.m_type, inv.m_hash)});
                 m_peer->write(getdata_msg);
                 continue;
             }

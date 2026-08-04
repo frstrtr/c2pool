@@ -627,17 +627,46 @@ public:
         notify_state_dirty();
     }
 
+    /// Verifier seam for live ChainLock adoption: BLS-verifies a clsig's
+    /// recovered threshold signature against the quorum that dashcore's
+    /// SelectQuorumForSigning says must have signed it. Installed by main_dash
+    /// from chainlock_verify.hpp; UNSET IS FAIL-CLOSED (see on_new_chainlock).
+    using ChainLockVerifyFn = std::function<bool(
+        int32_t height, const uint256& block_hash,
+        const std::array<uint8_t, 96>& sig)>;
+
+    void set_chainlock_verify_fn(ChainLockVerifyFn fn) {
+        m_chainlock_verify = std::move(fn);
+    }
+
     /// ChainLock reception: adopt the freshly-observed ChainLock as the best CL
     /// for the CCbTx bestCL* fields. The clsig message carries {height,
     /// block_hash, 96-byte recovered threshold sig}. Only advances forward.
-    void on_new_chainlock(int32_t height,
+    ///
+    /// ⚠ VERIFICATION IS MANDATORY. This value is committed into the coinbase
+    /// of every template we then serve (bestCLHeightDiff / bestCLSignature). A
+    /// clsig arrives from an arbitrary p2p peer, so adopting one unverified
+    /// would let a hostile peer choose our coinbase's ChainLock fields — dashd
+    /// would reject the resulting block and we would lose it. When no verifier
+    /// is installed, or verification FAILS, we adopt NOTHING and keep the
+    /// lagging-but-chain-committed bestCL derived from an observed block's
+    /// CCbTx (the pre-existing behaviour) — a refusal costs freshness, an
+    /// erroneous acceptance costs a block.
+    void on_new_chainlock(int32_t height, const uint256& block_hash,
                           const std::array<uint8_t, 96>& sig) {
-        if (height > m_state.best_cl_height()) {
-            m_state.set_best_cl(height, sig);
-            // A fresher bestCL* changes the next template's committed CCbTx —
-            // re-issue work so the served template carries the new ChainLock.
-            notify_state_dirty();
+        if (height <= m_state.best_cl_height()) return;   // never regress
+        if (!m_chainlock_verify) return;                  // no verifier => fail closed
+        if (!m_chainlock_verify(height, block_hash, sig)) {
+            LOG_WARNING << "[CL] rejected unverified ChainLock height=" << height
+                        << " block=" << block_hash.GetHex().substr(0, 16) << "...";
+            return;
         }
+        m_state.set_best_cl(height, sig);
+        LOG_INFO << "[CL] adopted VERIFIED ChainLock height=" << height
+                 << " block=" << block_hash.GetHex().substr(0, 16) << "...";
+        // A fresher bestCL* changes the next template's committed CCbTx —
+        // re-issue work so the served template carries the new ChainLock.
+        notify_state_dirty();
     }
 
     /// Reorg (SML axis): a chain reorganisation can invalidate the incremental
@@ -1264,6 +1293,7 @@ private:
     // MineableCommitmentCache admission (see set_on_new_quorum_commitments).
     std::function<void(const std::vector<vendor::CFinalCommitment>&)>
         m_on_new_quorum_commitments;
+    ChainLockVerifyFn     m_chainlock_verify; // unset => live ChainLocks never adopted (fail closed)
     // E2: independent DIP-0027 credit-pool accrual, advanced per ingested block
     // (on_block_connected) and re-anchored per accepted mnlistdiff. Verified
     // against each block's own from-wire cbTx; persisted via the hook below.

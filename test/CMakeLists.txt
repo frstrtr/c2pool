@@ -566,6 +566,26 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_quorum_root PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_quorum_root "" AUTO)
 
+    # Live-path ChainLock acquisition + verification KAT, against a REAL mainnet
+    # ChainLock (tip 2515965) and the real LLMQ_400_60 candidate set.
+    # DELIBERATELY *NOT* inside the C2POOL_DASH_BLS gate: the request-id, DKG-
+    # window scan-set and quorum-SELECTION halves need no BLS backend, and they
+    # are the pieces most likely to drift silently (in particular the memcmp-vs-
+    # bignum score-ordering trap, which selects a DIFFERENT quorum if broken).
+    # Those run in EVERY build; the BLS crypto KATs — including the tampered-
+    # signature negative — are #ifdef C2POOL_DASH_BLS-gated in the source and
+    # exercise only when the backend is linked. dash_bls_verify compiles
+    # unconditionally (fail-closed stub without the backend), so this always links.
+    add_executable(test_dash_chainlock_verify test_dash_chainlock_verify.cpp)
+    target_link_libraries(test_dash_chainlock_verify PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_bls_verify dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_chainlock_verify PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_chainlock_verify "" AUTO)
+
     # KNOWN COVERAGE GAP (surfaced by the top-level drift-guard, #883 follow-up):
     # the three targets below are gated behind C2POOL_DASH_BLS, but no workflow
     # in .github/workflows/ enables that flag yet, so they are never built or run

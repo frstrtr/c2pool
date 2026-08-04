@@ -1326,6 +1326,16 @@ int run_node(const core::CoinParams& params, bool testnet,
             return static_cast<double>(aps.GetLow64());
         });
 
+        // (6) share-peers — the pool node sharechain P2P peer snapshot
+        //     (IO-thread-published, lock-free; NEVER iterates the live
+        //     m_peers map). Feeds core MiningInterface::update_stat_log ->
+        //     entry.peers (incoming/outgoing counts), so /web/graph_data
+        //     serves a real "peers" series and the share-peers dashboard
+        //     panel populates. Mirrors bch #1055 (set_peer_info_fn ->
+        //     node.get_peer_info_json()). Display-only; p2pool-merged-v36
+        //     surface: NONE (dashboard reporting, not share/PPLNS bytes).
+        mi->set_peer_info_fn([&p2p_node]() { return p2p_node.get_peer_info_json(); });
+
         // graph_db stats persistence — survives restarts (LTC-parity site 2/3).
         // DGB-namespaced sub-dir isolates the per-coin stat log under config_path().
         {
