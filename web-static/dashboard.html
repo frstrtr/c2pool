@@ -1847,9 +1847,10 @@
                 
                 <!-- Second Row: Miners Block Value -->
                 <div class="stat-card">
-                    <h3><span class="icon">💰</span> Miners Block Value</h3>
+                    <h3><span class="icon">💰</span> Miners Block Value <small style="opacity:0.7;">(gross, pre-fee)</small></h3>
                     <div class="stat-value warning"><span id="block_value_miner">-</span> <small class="symbol-small" id="block_value_symbol">-</small></div>
                     <div class="stat-sub merged-child-hint" style="color: #c3a634; font-size: 1.1em; margin-top: -4px;">+<span id="merged_block_value">-</span> <span class="merged-child-symbol-hint">DOGE</span></div>
+                    <div class="stat-detail" style="white-space: nowrap;" title="#948: this card shows the GROSS miner share; the pool fee is deducted to give the NET amount the API reports as block_value_miner">Fee: <span id="block_value_fee">-</span> &rarr; net <span id="block_value_miner_net">-</span></div>
                     <div class="stat-detail" style="white-space: nowrap;">Expected: <span id="time_to_block">-</span> <span class="merged-child-hint"><span style="color: #c3a634;">|</span> <span style="color: #c3a634;"><span id="time_to_merged_block">-</span></span></span></div>
                 </div>
                 
@@ -3195,7 +3196,16 @@
                 d3.select('#uptime').text(format_dt(local_stats.uptime));
                 d3.select('#block_value').text(d3.format('.4f')(local_stats.block_value));
                 d3.select('#block_value_payments').text(d3.format('.4f')(local_stats.block_value_payments || 0));
-                d3.select('#block_value_miner').text(d3.format('.4f')(local_stats.block_value_miner || local_stats.block_value));
+                // #948: the card headline is the GROSS (pre-fee) miner share so it
+                // matches the API block_value_miner_gross field and the label says so;
+                // the fee and the resulting NET (legacy block_value_miner) are shown below.
+                var bvm_gross = (local_stats.block_value_miner_gross != null) ? local_stats.block_value_miner_gross
+                              : (local_stats.block_value_miner != null ? local_stats.block_value_miner : local_stats.block_value);
+                d3.select('#block_value_miner').text(d3.format('.4f')(bvm_gross));
+                if (local_stats.block_value_fee != null)
+                    d3.select('#block_value_fee').text(d3.format('.4f')(local_stats.block_value_fee));
+                if (local_stats.block_value_miner_net != null)
+                    d3.select('#block_value_miner_net').text(d3.format('.4f')(local_stats.block_value_miner_net));
                 
                 // Node fee percentage and computed amounts
                 var nodeFee = local_stats.fee != null ? local_stats.fee : 0;

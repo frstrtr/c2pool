@@ -1655,3 +1655,91 @@ TEST(DashboardBestShare, RecordGatesOnHasBestNotAverage) {
         << "renderBestShare must gate the record on bs.has_best_share; without "
            "it a syncing node renders the sharechain average as a 'Best Share'.";
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #948 — block_value_miner (NET of pool fee) vs block_value_payments (GROSS):
+// the two sibling fields used different conventions with nothing in the name
+// saying so, and block_value_miner + block_value_payments != block_value, so a
+// consumer that assumed the parts sum silently dropped the fee. The fix keeps
+// the legacy keys byte-for-byte and adds explicit gross / net / fee fields such
+// that the reconciliation identity holds on a fee'd node. These pin it.
+//
+// Live hotel primary (DASH, --fee 1) numbers, re-derived per the issue:
+//     block_value           1.77033183
+//     block_value_payments   1.32774887   (75%: masternode + treasury)
+//     miner GROSS 25%        0.44258296
+//     pool fee 1%            0.00442583
+//     miner NET              0.43815713   (== legacy block_value_miner)
+namespace {
+// MiningInterface is non-copyable/non-movable (atomic + mutex members), so we
+// configure a caller-owned instance in place rather than return one by value.
+void feed_coin_work(MiningInterface& mi, double block_value, double payments) {
+    // m_cached_template stays null -> rest_local_stats reads the coin-work feed,
+    // the c2pool-dash topology where WebServer drives no work pipeline of its own.
+    mi.set_coin_work_fn([block_value, payments] {
+        MiningInterface::CoinWorkInfo w;
+        w.valid = true;
+        w.network_difficulty = 28231.0;
+        w.coinbase_value_sat = static_cast<uint64_t>(llround(block_value * 1e8));
+        w.payment_amount_sat = static_cast<uint64_t>(llround(payments * 1e8));
+        w.height = 2200000;
+        return w;
+    });
+}
+} // namespace
+
+TEST(WebBlockValueReconcile, GrossNetFeeReconcileOnFeedNode) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+    mi.set_pool_fee_percent(1.0);
+    feed_coin_work(mi, 1.77033183, 1.32774887);
+    json r = mi.rest_local_stats();
+
+    ASSERT_TRUE(r.contains("block_value_miner_gross"))
+        << "gross miner share must be exposed explicitly (#948)";
+    ASSERT_TRUE(r.contains("block_value_fee"))
+        << "pool-fee deduction must be a visible field so the parts reconcile (#948)";
+    ASSERT_TRUE(r.contains("block_value_miner_net"));
+
+    const double bv    = r["block_value"].get<double>();
+    const double gross = r["block_value_miner_gross"].get<double>();
+    const double fee   = r["block_value_fee"].get<double>();
+    const double net   = r["block_value_miner_net"].get<double>();
+    const double pay   = r["block_value_payments"].get<double>();
+    const double legacy= r["block_value_miner"].get<double>();
+
+    // Values match the live re-derivation.
+    EXPECT_NEAR(bv,    1.77033183, 1e-8);
+    EXPECT_NEAR(gross, 0.44258296, 1e-8);
+    EXPECT_NEAR(fee,   0.00442583, 1e-7);
+    EXPECT_NEAR(net,   0.43815713, 1e-7);
+
+    // The reconciliation identity the issue demands: gross + payments == block_value.
+    EXPECT_NEAR(gross + pay, bv, 1e-8)
+        << "block_value_miner_gross + block_value_payments must equal block_value";
+    // Gross decomposes into the net share plus the fee.
+    EXPECT_NEAR(gross, net + fee, 1e-9)
+        << "gross must equal net + fee so the fee is a derivable deduction";
+    // The legacy field is unchanged and is the NET value (not gross).
+    EXPECT_DOUBLE_EQ(legacy, net)
+        << "legacy block_value_miner must keep its exact NET value (no consumer break)";
+    EXPECT_GT(gross, legacy)
+        << "with a non-zero fee the gross share must exceed the net legacy field, "
+           "which is the whole point of the #948 mislabel";
+}
+
+// A zero-fee node cannot distinguish gross from net, but the fields must still
+// be present and the identity must still hold (fee == 0, gross == net).
+TEST(WebBlockValueReconcile, ZeroFeeStillPresentAndConsistent) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+    mi.set_pool_fee_percent(0.0);
+    feed_coin_work(mi, 1.77033183, 1.32774887);
+    json r = mi.rest_local_stats();
+
+    ASSERT_TRUE(r.contains("block_value_fee"));
+    EXPECT_NEAR(r["block_value_fee"].get<double>(), 0.0, 1e-12);
+    EXPECT_DOUBLE_EQ(r["block_value_miner_gross"].get<double>(),
+                     r["block_value_miner_net"].get<double>());
+    EXPECT_NEAR(r["block_value_miner_gross"].get<double>() +
+                r["block_value_payments"].get<double>(),
+                r["block_value"].get<double>(), 1e-8);
+}
