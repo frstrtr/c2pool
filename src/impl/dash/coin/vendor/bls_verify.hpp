@@ -141,6 +141,36 @@ bool verify_govvote_operator_sig(
     const uint256& digest,
     const std::vector<uint8_t>& vch_sig);
 
+// ── ChainLock recovered-threshold-signature verify ──────────────────────────
+//
+// dashcore llmq::VerifyRecoveredSig's final step (src/llmq/quorumsman.cpp:749-751):
+//     SignHash signHash{llmqType, quorum->qc->quorumHash, id, msgHash};
+//     sig.VerifyInsecure(quorum->qc->quorumPublicKey, signHash.Get());
+// and VerifyInsecure (src/bls/bls.cpp:294-310) is
+//     Scheme(legacy)->Verify(pubKey.impl, bls::Bytes(hash.begin(), 32), impl)
+// i.e. the 32 sign-hash bytes are the MESSAGE handed to the scheme, which
+// applies its own hash-to-curve — do NOT pre-hash them again here.
+//
+// SCHEME IS HARD-PINNED TO BASIC (fLegacy=false), for BOTH the 96-byte
+// signature wire decode and the verify DST, and for the 48-byte G1 quorum
+// public key. dashcore flips bls::bls_legacy_scheme to false at V19 activation
+// (src/evo/specialtxman.cpp) and every live ChainLock we can act on is
+// post-V19. Unlike the govvote path there is NO pubkey-encoding fallback: the
+// quorumPublicKey reaches us from a mnlistdiff-sourced CFinalCommitment whose
+// wire encoding is basic post-V19, and a legacy retry here would only ever
+// broaden what we accept on a consensus-critical adoption.
+//
+// The caller (chainlock_verify.hpp) is responsible for having selected the
+// CORRECT signing quorum — this function only answers "did THIS key sign THIS
+// hash". Passing the wrong quorum's key yields false (fail closed).
+//
+// FAIL-CLOSED: returns false when the BLS backend is absent, either point
+// fails to deserialize, or the verify fails. Never throws.
+bool verify_chainlock_sig(
+    const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& quorum_public_key,
+    const uint256& sign_hash,
+    const std::array<uint8_t, CFinalCommitment::BLS_SIG_SIZE>& sig);
+
 } // namespace vendor
 } // namespace coin
 } // namespace dash

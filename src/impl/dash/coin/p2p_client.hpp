@@ -717,19 +717,31 @@ private:
 
     ADD_P2P_HANDLER(inv)
     {
-        // E1: announce-only. Block invs fire new_block (the E2 ingest seam);
-        // NO getdata pulls yet — the ingest legs are later slices.
+        // Block invs fire new_block (the E2 ingest seam, which pulls headers
+        // then the block). Object invs in the pull policy get an immediate
+        // getdata; everything else is ignored.
         for (auto& inv : msg->m_invs)
         {
-            // E1 Phase-L sourcing leg: pull relayed DKG final commitments
-            // (MSG_QUORUM_FINAL_COMMITMENT = 21, dashcore protocol.h). The
-            // qfcommit handler below feeds the MineableCommitmentCache.
-            if (static_cast<uint32_t>(inv.m_type) == 21u)
+            // Sourcing legs: pull the announced object for every inv type in
+            // the pull policy (inv_type_is_pulled, p2p_messages.hpp) —
+            // MSG_QUORUM_FINAL_COMMITMENT = 21 feeding the Phase-L
+            // MineableCommitmentCache, and MSG_CLSIG = 29 feeding the
+            // ChainLock lane. Dash announces both by inv and serves them only
+            // on getdata; without this the clsig handler below can never fire,
+            // which is exactly why on_new_chainlock had never been reached.
+            //
+            // NOTE the ChainLock inv hash is SerializeHash(clsig) — SHA256d
+            // over the whole 132-byte ChainLockSig — NOT the locked block's
+            // hash, so it is only ever echoed straight back in the getdata; we
+            // cannot derive it and must not try. dashd also serves ONLY its
+            // current best ChainLock (GetChainLockByHash refuses anything
+            // else), so a getdata for a superseded announcement legitimately
+            // comes back notfound; that is benign and self-correcting — the
+            // next ChainLock is announced ~2.5 min later.
+            if (inv_type_is_pulled(inv.m_type))
             {
                 auto getdata_msg = message_getdata::make_raw(
-                    {inventory_type(
-                        static_cast<inventory_type::inv_type>(21u),
-                        inv.m_hash)});
+                    {inventory_type(inv.m_type, inv.m_hash)});
                 m_peer->write(getdata_msg);
                 continue;
             }

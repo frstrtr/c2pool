@@ -248,6 +248,50 @@ bool verify_govvote_operator_sig(
 #endif // C2POOL_DASH_BLS
 }
 
+// ── ChainLock recovered-threshold-signature verify ──────────────────────────
+
+bool verify_chainlock_sig(
+    const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& quorum_public_key,
+    const uint256& sign_hash,
+    const std::array<uint8_t, CFinalCommitment::BLS_SIG_SIZE>& sig)
+{
+#ifndef C2POOL_DASH_BLS
+    (void)quorum_public_key;
+    (void)sign_hash;
+    (void)sig;
+    return false;   // no BLS backend → fail closed (ChainLock never adopted)
+#else
+    try {
+        // Quorum public key: G1, basic scheme (post-V19 wire encoding).
+        bls::G1Element pk;
+        try {
+            pk = bls::G1Element::FromBytes(
+                bls::Bytes(quorum_public_key.data(), quorum_public_key.size()),
+                /*fLegacy=*/false);
+        } catch (...) {
+            return false;
+        }
+        if (!pk.IsValid()) return false;
+
+        // Recovered threshold signature: G2, basic scheme.
+        bls::G2Element s;
+        try {
+            s = bls::G2Element::FromBytes(bls::Bytes(sig.data(), sig.size()),
+                                          /*fLegacy=*/false);
+        } catch (...) {
+            return false;   // not a basic-encoded G2 point → dashd rejects too
+        }
+
+        // The 32 sign-hash bytes are the message; BasicSchemeMPL applies the
+        // DST "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_" hash-to-curve.
+        return bls::BasicSchemeMPL().Verify(
+            pk, bls::Bytes(sign_hash.data(), 32), s);
+    } catch (...) {
+        return false;   // any relic/dashbls throw → fail closed
+    }
+#endif // C2POOL_DASH_BLS
+}
+
 // ── seam factory ────────────────────────────────────────────────────────────
 
 std::function<bool(const CFinalCommitment&)>
