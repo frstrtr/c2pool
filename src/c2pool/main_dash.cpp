@@ -66,6 +66,7 @@
 #include <impl/dash/coin/dkg_window.hpp>       // dash::coin::is_dkg_commitment_window (BLOCKER-1 guard)
 #include <impl/dash/coin/dkg_commitments.hpp>  // E1: build_daemonless_qc_plan (serve DKG windows daemonlessly)
 #include <impl/dash/coin/vendor/bls_verify.hpp>  // E1 Phase-L: make_commitment_bls_verifier (real qc verify seam)
+#include <impl/dash/coin/chainlock_verify.hpp>   // live-path ChainLock quorum selection + BLS verify gate
 #include <impl/dash/coin/llmq_type_reconciler.hpp>  // negative-capable enabled_llmqs backstop
 #include <impl/dash/coin/quorum_member_source.hpp>  // E1 Phase-L: daemonless member-set sourcing (the provider)
 #include <impl/dash/coin/utxo_lane.hpp>    // dash::coin::UtxoLane — embedded UTXO/fee lane (E2b, #738)
@@ -642,7 +643,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                   << " — min-proto=" << dash::SharechainConfig::MINIMUM_PROTOCOL_VERSION
                   << " prefix=" << dash::SharechainConfig::prefix_hex() << "\n";
     } else {
-        std::cout << "[run] --connect mode: inbound listener suppressed\n";
+        // Symmetry with the LISTENING branch above: the --connect leg frames
+        // every outbound packet with this same prefix (pool/node.hpp:88
+        // get_prefix), so it must be observable on the connect path too — a
+        // peered regtest showed the listen leg logged prefix= but the connect
+        // leg did not, leaving connect-mode prefix agreement unverifiable from
+        // the log alone.
+        std::cout << "[run] --connect mode: inbound listener suppressed"
+                  << " — min-proto=" << dash::SharechainConfig::MINIMUM_PROTOCOL_VERSION
+                  << " prefix=" << dash::SharechainConfig::prefix_hex() << "\n";
     }
     // #754 download/outbound slice: ACTIVE outbound dialing from the addr
     // store (--addnode/--connect seeds registered by the NodeImpl ctor) plus
@@ -3470,15 +3479,67 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 if (cp) cp->send_getmnlistd(uint256::ZERO, tip);
             });
 
+        // ChainLock verifier: BLS-verify a relayed clsig against the quorum
+        // dashcore's SelectQuorumForSigning says must have signed it, before
+        // the maintainer may adopt its height as the CCbTx bestCL*. Candidate
+        // quorums come from the mnlistdiff-sourced active set (llmqTypeChainLocks
+        // = LLMQ_400_60 on mainnet, LLMQ_50_60 on testnet); each quorumHash is
+        // itself a block hash, so the header chain supplies its base height.
+        // Fail-closed at every step — see chainlock_verify.hpp.
+        maintainer->set_chainlock_verify_fn(
+            [st = &node_coin_state, hc = header_chain.get(),
+             net = (testnet ? dash::coin::LlmqNetwork::Testnet
+                            : dash::coin::LlmqNetwork::Mainnet)](
+                int32_t height, const uint256& block_hash,
+                const std::array<uint8_t, 96>& sig) -> bool {
+                const auto* p = dash::coin::chainlock::chainlock_params(net);
+                if (p == nullptr) return false;
+
+                // Never adopt a ChainLock ABOVE our own header tip. Adoption is
+                // monotonic, and embedded_gbt.hpp:496-503 clears bestCLHeightDiff
+                // /bestCLSignature entirely whenever best_cl_height exceeds the
+                // height we are building on — so adopting an over-tip ChainLock
+                // would pin the CCbTx bestCL* fields to ZERO (diverging from
+                // dashd, which would commit a real diff) until our tip caught up,
+                // and we could never fall back to the older usable value. Holding
+                // the previous ChainLock is strictly better. Self-correcting:
+                // dashd re-announces its best ChainLock roughly every block.
+                // This also bounds BLS work on a peer replaying junk heights.
+                auto tip = hc->tip();
+                if (!tip || height > static_cast<int32_t>(tip->height)) return false;
+
+                // Collect the active quorums of the ChainLock-signing type,
+                // each with the height of its base block (the quorumHash IS a
+                // block hash, so the header chain resolves it directly — the
+                // same lookup QuorumMemberSource's HeightOfHash seam uses).
+                std::vector<dash::coin::chainlock::QuorumCandidate> cands;
+                for (const auto& e : st->qmgr().active_entries()) {
+                    if (e.key.llmqType != p->type) continue;
+                    auto hdr = hc->get_header(e.key.quorumHash);
+                    if (!hdr) continue;          // base header not held => skip
+                    dash::coin::chainlock::QuorumCandidate c;
+                    c.quorum_hash        = e.key.quorumHash;
+                    c.base_height        = hdr->height;
+                    c.quorum_public_key  = e.commitment.quorumPublicKey;
+                    cands.push_back(c);
+                }
+                auto target = dash::coin::chainlock::build_sign_target(
+                    *p, std::move(cands), height, block_hash);
+                if (!target) return false;       // no quorum selectable => fail closed
+                return dash::coin::vendor::verify_chainlock_sig(
+                    target->quorum.quorum_public_key, target->sign_hash, sig);
+            });
+
         // Leg 6 (ChainLock sig): Node::new_chainlock_sig -> maintainer
         // .on_new_chainlock. The clsig message carries the recovered 96-byte
         // threshold sig (new_chainlock above drops it); the maintainer adopts
-        // the freshest observed ChainLock height+sig as the CCbTx bestCL*.
+        // the freshest observed ChainLock height+sig as the CCbTx bestCL*
+        // ONLY IF the verifier above accepts it.
         coin_feed_subs.push_back(
             coin_state.new_chainlock_sig.subscribe(
                 [m = maintainer.get()]
                 (const dash::interfaces::Node::ChainLockSigEvent& c) {
-                    m->on_new_chainlock(c.height, c.sig);
+                    m->on_new_chainlock(c.height, c.block_hash, c.sig);
                 }));
 
         // Bridge: new_headers -> HeaderChain::add_headers (X11 PoW + DGW

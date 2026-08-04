@@ -90,10 +90,22 @@ END_MESSAGE()
 // SPV A1 (parity audit): Dash ChainLockSig (clsig) message.
 // Reference: dashcore/src/chainlock/clsig.h — ChainLockSig struct.
 // Wire layout: nHeight(i32 LE) + blockHash(32B LE) + sig(96B BLS blob).
-// Peers push this unsolicited when a ChainLock is freshly aggregated,
-// and also on demand via inv+getdata(MSG_CLSIG=29). Parsing the sig is
-// not required — we treat it as opaque bytes; the fact that we received
-// the message at all is dashd's signal that the block is finalized.
+//
+// ACQUISITION: Dash Core ANNOUNCES a ChainLock by inv and serves the object
+// only on getdata (announce: chainlock/handler.cpp:128 + RelayInv; serve:
+// net_processing.cpp:2992-2998). It does NOT push clsig unsolicited — so the
+// inv→getdata(MSG_CLSIG=29) leg in p2p_client's inv handler is what makes this
+// message reachable at all. dashd serves ONLY its current best ChainLock, so a
+// getdata for a superseded announcement returns notfound; that is benign.
+//
+// ⚠ THE SIGNATURE IS NOT OPAQUE. Receiving this message is NOT by itself
+// evidence that the block is finalized — a clsig arrives from an arbitrary
+// peer and its height/blockHash/sig are committed into the coinbase of every
+// template we then serve (CCbTx bestCLHeightDiff/bestCLSignature). The 96-byte
+// recovered threshold signature MUST be BLS-verified against the quorum
+// dashcore's SelectQuorumForSigning designates before any of it is adopted —
+// see chainlock_verify.hpp and CoinStateMaintainer::on_new_chainlock, which is
+// fail-closed without a verifier.
 // ── BIP 152 compact-block messages (Phase S2) ─────────────────────────────
 // Wire types vendored from dashcore at src/impl/dash/coin/vendor/; see
 // vendor/README.md for the adaptation notes.
@@ -141,6 +153,28 @@ BEGIN_MESSAGE(clsig)
         READWRITE(Using<ArrayType<DefaultFormat, 96>>(obj.m_sig));
     }
 END_MESSAGE()
+
+/// The inv-announcement sourcing policy: which inv types the DASH coin-P2P
+/// client answers with a getdata for the object itself.
+///
+/// Dash relays these objects announce-first (inv), serving the body only on
+/// request, so an inv type absent from this set is an object we can NEVER
+/// receive — which is exactly how the ChainLock leg stayed dark: clsig was
+/// decodable and handled, but nothing ever asked for one, so the handler had
+/// never once fired. Kept as a free function (rather than inline in the inv
+/// handler) so the policy is unit-testable without a live socket peer.
+///
+///   MSG_QUORUM_FINAL_COMMITMENT = 21 — relayed DKG final commitments
+///                                      (Phase-L MineableCommitmentCache)
+///   MSG_CLSIG                   = 29 — ChainLocks (dashcore protocol.h:522)
+///
+/// Block invs are deliberately NOT here: they take the getheaders-then-block
+/// path in the inv handler, not a bare getdata.
+inline bool inv_type_is_pulled(inventory_type::inv_type t)
+{
+    return t == inventory_type::quorum_final_commitment
+        || t == inventory_type::clsig;
+}
 
 // ── Phase C-SML step 4: Simplified MN List sync messages ──────────────
 // Wire commands (dashcore protocol.cpp:68-69):

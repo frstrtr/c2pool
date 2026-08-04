@@ -500,22 +500,70 @@ TEST(DashCoinStateMaintainer, OnNewChainlockAdoptsForwardOnlyAndFiresDirty) {
     CoinStateMaintainer m(st);
     int dirty = 0;
     m.set_on_state_dirty([&] { ++dirty; });
+    // Accepting verifier: this test covers the forward-only/dirty axis only.
+    m.set_chainlock_verify_fn(
+        [](int32_t, const uint256&, const std::array<uint8_t, 96>&) { return true; });
 
+    const uint256 bh = uint256::ZERO;
     std::array<uint8_t, 96> sig{}; sig[0] = 0x11;
-    m.on_new_chainlock(1500000, sig);
+    m.on_new_chainlock(1500000, bh, sig);
     EXPECT_EQ(st.best_cl_height(), 1500000);
     EXPECT_EQ(dirty, 1) << "a fresher ChainLock must re-issue work";
 
     // A stale (<=) height is ignored — no adoption, no re-issue.
     std::array<uint8_t, 96> older{}; older[0] = 0x22;
-    m.on_new_chainlock(1499999, older);
+    m.on_new_chainlock(1499999, bh, older);
     EXPECT_EQ(st.best_cl_height(), 1500000);
     EXPECT_EQ(dirty, 1);
 
     // A forward ChainLock advances + re-issues again.
-    m.on_new_chainlock(1500005, sig);
+    m.on_new_chainlock(1500005, bh, sig);
     EXPECT_EQ(st.best_cl_height(), 1500005);
     EXPECT_EQ(dirty, 2);
+}
+
+// C-2b chainlock adoption is GATED ON VERIFICATION. These are the reward-
+// critical negatives: an unverified clsig from a hostile peer must never reach
+// the CCbTx bestCL* fields we commit into a served template.
+TEST(DashCoinStateMaintainer, OnNewChainlockFailsClosedWithoutVerifier) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    int dirty = 0;
+    m.set_on_state_dirty([&] { ++dirty; });
+
+    // NO verifier installed -> adopt nothing (the pre-existing lagging
+    // chain-committed derivation stays authoritative).
+    std::array<uint8_t, 96> sig{}; sig[0] = 0x11;
+    m.on_new_chainlock(1500000, uint256::ZERO, sig);
+    EXPECT_EQ(st.best_cl_height(), 0)
+        << "no verifier must mean no adoption, not blind adoption";
+    EXPECT_EQ(dirty, 0);
+}
+
+TEST(DashCoinStateMaintainer, OnNewChainlockRejectedWhenVerifierSaysNo) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    int dirty = 0, calls = 0;
+    m.set_on_state_dirty([&] { ++dirty; });
+    m.set_chainlock_verify_fn(
+        [&](int32_t, const uint256&, const std::array<uint8_t, 96>&) {
+            ++calls;
+            return false;                 // verification FAILS
+        });
+
+    std::array<uint8_t, 96> sig{}; sig[0] = 0x11;
+    m.on_new_chainlock(1500000, uint256::ZERO, sig);
+    EXPECT_EQ(calls, 1) << "the verifier must actually be consulted";
+    EXPECT_EQ(st.best_cl_height(), 0) << "a failing verify must not adopt";
+    EXPECT_EQ(dirty, 0);
+
+    // And the identical ChainLock IS adopted once the verifier accepts it —
+    // proving the refusal above came from the gate, not from some other guard.
+    m.set_chainlock_verify_fn(
+        [](int32_t, const uint256&, const std::array<uint8_t, 96>&) { return true; });
+    m.on_new_chainlock(1500000, uint256::ZERO, sig);
+    EXPECT_EQ(st.best_cl_height(), 1500000);
+    EXPECT_EQ(dirty, 1);
 }
 
 // H-1 (PR #780): a malformed quorum tail must NOT be papered over. It heals like
