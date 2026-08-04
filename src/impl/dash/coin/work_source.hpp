@@ -144,6 +144,14 @@ struct EmbeddedWorkInputs {
     // (viable()==false) so the arm fails closed to dashd instead.
     std::vector<SuperblockPayment>   superblock_payments;
 
+    // UTXO-IMMATURE SERVING (see NodeCoinState::set_utxo_immature_policy). True
+    // while the UTXO/fee lane is still below its maturity depth AND the policy
+    // is ServeEmptyTxSet: the arm stays VIABLE (has_state true) and the builder
+    // emits a coinbase-only body instead of the arm refusing outright. Does not
+    // participate in viable() -- it is not a reason to serve or not serve, only
+    // a statement about WHAT is served.
+    bool                             suppress_mempool_txs{false};
+
     bool viable() const {
         return has_state && mnstates != nullptr && mempool != nullptr;
     }
@@ -218,7 +226,9 @@ inline WorkSelection select_dash_work(
                 emb.superblock_payments.empty() ? nullptr
                                                 : &emb.superblock_payments,
                 // confirmedHash rollover projection threshold (sml_projection.hpp).
-                emb.mn_min_confirmations);
+                emb.mn_min_confirmations,
+                // UTXO-immature serving: coinbase-only body, fees exactly 0.
+                emb.suppress_mempool_txs);
         },
         dashd_fallback);
 }

@@ -439,7 +439,16 @@ void DASHWorkSource::resource_template_now() const
                      << (sel.source == coin::WorkSource::Embedded
                              ? "EMBEDDED" : "dashd-fallback")
                      << " h=" << sel.work.m_height
-                     << " mn_payee=" << mn_payee;
+                     << " mn_payee=" << mn_payee
+                     // A deliberately coinbase-only template says so ON THE ARM
+                     // LINE, not only in the builder's log: the soak that
+                     // measures serve-rate reads THIS line, and "served" without
+                     // "served WHAT" would hide the fee trade-off entirely.
+                     << (sel.work.m_txset_empty_cause.empty()
+                             ? std::string()
+                             : " txset=empty cause=" + sel.work.m_txset_empty_cause
+                                   + " forgone_fees<="
+                                   + std::to_string(sel.work.m_txset_forgone_fees));
             work_is_embedded = (sel.source == coin::WorkSource::Embedded);
             // ── DEFECT-3: the gate must SAY WHY it refused ──────────────────
             // sel.decline came out of the branch that chose the arm (dashd's

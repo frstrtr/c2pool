@@ -132,10 +132,16 @@ public:
     void set_request_block_fn(RequestBlockFn fn) { m_request_fn = std::move(fn); }
 
     /// Coinbase-maturity mining gate (main_ltc.cpp ~1785-1801): embedded
-    /// templates must not be built until the UTXO view is at least
+    /// templates must not INCLUDE MEMPOOL TXS until the UTXO view is at least
     /// coinbase_maturity + reorg-buffer deep, or they may spend immature
-    /// coinbase outputs. DASH_MINING_GATE_DEPTH = 100 + 6 = 106
+    /// coinbase outputs / misprice a fee. DASH_MINING_GATE_DEPTH = 100 + 6 = 106
     /// (utxo_adapter.hpp; dashcore consensus.h COINBASE_MATURITY).
+    ///
+    /// This predicate reports only the DEPTH. On the dash arm it no longer
+    /// implies "serve nothing": NodeCoinState::set_utxo_immature_policy decides
+    /// what to do while it is false, and the default is to serve a coinbase-only
+    /// template (consensus requires no mempool tx; with zero txs the fee term is
+    /// exactly 0). Refusing the whole window cost ~4.4 h of every cold start.
     bool mining_utxo_ready() const
     {
         if (!m_cache) return false;

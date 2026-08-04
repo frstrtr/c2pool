@@ -259,6 +259,7 @@ void print_banner(const char* argv0)
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
         << "           [--external-ip ADDR]\n"
         << "           [--embedded-utxo] [--embedded-mainnet] [--embedded-mn-bridge-max N]\n"
+        << "           [--embedded-utxo-immature-refuse]\n"
         << "           [--bestcl-policy freshness|consensus-exact]\n"
         << "           [--embedded-oracle-shadow]\n"
         << "           [--oracle-graduation-blocks N] [--oracle-class-coverage K]\n"
@@ -537,7 +538,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // geometrically in this number (see p2p_client.hpp).
              std::size_t coin_p2p_peers =
                  dash::coin::p2p::CoinClient<dash::Config>::DEFAULT_POOL_PEERS,
-             const std::string& bestcl_policy = "freshness")
+             const std::string& bestcl_policy = "freshness",
+             // --embedded-utxo-immature-refuse: true restores the pre-existing
+             // refuse-until-blocks_connected>=106 posture. Default false serves
+             // the immature window with a coinbase-only (empty mempool tx set)
+             // template -- consensus-valid, fees exactly 0, nothing to overstate.
+             bool embedded_utxo_immature_refuse = false)
 {
     namespace io = boost::asio;
 
@@ -1617,6 +1623,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // spends. The dashd fallback is unaffected.
             node_coin_state.set_utxo_ready_fn(
                 [&utxo_lane]() { return utxo_lane.mining_utxo_ready(); });
+            // What the arm DOES during that window. Default (flag absent):
+            // SERVE it with a coinbase-only body rather than refuse outright.
+            // Consensus never requires a mempool tx, so a tx-free block is
+            // valid; with zero txs the fee term is exactly 0, so the subsidy,
+            // MN payment and creditPool this template commits are all exact and
+            // the bad-cb-amount risk the gate existed to prevent is absent by
+            // construction rather than merely improbable. The trade is the
+            // forgone fees, which the builder reports on every such template.
+            // --embedded-utxo-immature-refuse restores the old posture.
+            node_coin_state.set_utxo_immature_policy(
+                embedded_utxo_immature_refuse
+                    ? dash::coin::UtxoImmaturePolicy::Refuse
+                    : dash::coin::UtxoImmaturePolicy::ServeEmptyTxSet);
             utxo_block_sub = coin_state.block_connected.subscribe(
                 [&utxo_lane](const dash::interfaces::BlockConnected& bc) {
                     utxo_lane.on_block_connected(bc.block, bc.height);
@@ -1625,7 +1644,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                       << " best_height=" << utxo_lane.cache()->get_best_height()
                       << " (mempool fee pricing live; block feed = E1/E2a leg;"
                          " maturity gate " << dash::coin::DASH_MINING_GATE_DEPTH
-                      << " blocks)\n";
+                      << " blocks, immature-window policy="
+                      << (embedded_utxo_immature_refuse
+                              ? "REFUSE (dashd fallback for the whole window)"
+                              : "SERVE-EMPTY-TXSET (coinbase-only, fees=0)")
+                      << ")\n";
         } else {
             std::cout << "[run] embedded UTXO/fee lane FAILED to open " << utxo_path
                       << " -- fees stay unknown; dashd-RPC fallback unaffected\n";
@@ -3953,7 +3976,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                   << ") + CoinStateMaintainer + 6 ingest subscriptions;"
                      " populate flips get_work to the EMBEDDED arm once the tip"
                      " (headers) AND the DMN set (block-connect apply_block) are"
-                     " present" << (embedded_utxo ? " + UTXO maturity>=106" : "")
+                     " present"
+                  << (embedded_utxo
+                          ? (embedded_utxo_immature_refuse
+                                 ? " + UTXO maturity>=106"
+                                 : " (UTXO immaturity serves coinbase-only, not"
+                                   " a refusal)")
+                          : "")
                   << "\n";
 
         // ── E2c (#738): RPC MN-set SEED — flip the DMN half of populated() ──
@@ -4963,6 +4992,13 @@ int main(int argc, char** argv)
     std::string stratum_host = "0.0.0.0";      // --stratum [HOST:]PORT bind interface (default all)
     uint16_t    stratum_port = 0;              // 0 disables the Stratum accept-loop; --stratum sets it
     bool embedded_utxo = false;                // --embedded-utxo: arm the E2b UTXO/fee lane (opt-in)
+    // --embedded-utxo-immature-refuse: restore the pre-existing CONSERVATIVE
+    // posture -- refuse EVERY embedded template until the UTXO lane reaches
+    // blocks_connected >= 106 (~4.4 h of a cold start served by dashd only).
+    // Default OFF: the immature window is served with a coinbase-only body,
+    // which is consensus-valid and cannot overstate a fee (see
+    // NodeCoinState::set_utxo_immature_policy).
+    bool embedded_utxo_immature_refuse = false;
     std::string bestcl_policy = "freshness";   // --bestcl-policy: freshness (default, conservative proxy) | consensus-exact (dashcore's actual CheckCbTxBestChainlock rule)
     bool embedded_oracle_shadow = false;       // --embedded-oracle-shadow: per-block dashd cross-check (OBSERVE-only)
     uint64_t oracle_grad_blocks = 5000;        // --oracle-graduation-blocks N (consecutive clean)
@@ -5041,6 +5077,8 @@ int main(int argc, char** argv)
             embedded_superblock = true;
         else if (std::strcmp(argv[i], "--embedded-utxo") == 0)
             embedded_utxo = true;
+        else if (std::strcmp(argv[i], "--embedded-utxo-immature-refuse") == 0)
+            embedded_utxo_immature_refuse = true;
         else if (std::strcmp(argv[i], "--bestcl-policy") == 0 && i + 1 < argc)
             bestcl_policy = argv[++i];
         else if (std::strcmp(argv[i], "--coinbase-text") == 0 && i + 1 < argc)
@@ -5196,7 +5234,8 @@ int main(int argc, char** argv)
                         coin_p2p_magic, force_won_block,
                         operator_message_blob_hex, embedded_superblock,
                         embedded_oracle_shadow, oracle_grad_blocks,
-                        oracle_class_coverage, coin_p2p_peers, bestcl_policy);
+                        oracle_class_coverage, coin_p2p_peers, bestcl_policy,
+                        embedded_utxo_immature_refuse);
     }
     return run_selftest();
 }

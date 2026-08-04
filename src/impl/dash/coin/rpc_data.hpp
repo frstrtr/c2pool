@@ -112,6 +112,21 @@ struct DashWorkData {
 
     // RPC round-trip latency (seconds).
     int64_t m_latency{0};
+
+    // ── NON-CONSENSUS diagnostic: "this template's tx set is empty ON PURPOSE"
+    // Empty string = normal template (mempool selection ran as usual). Non-empty
+    // = the embedded builder DELIBERATELY served a coinbase-only body and this
+    // names WHY (currently only "utxo-immature-serving"). Never serialized, never
+    // read by any consensus path -- it exists so the node can SAY it is in the
+    // degraded-but-valid serving mode instead of running there silently, and so a
+    // soak can measure both the duration and the price.
+    //
+    // m_txset_forgone_fees is the mempool's total KNOWN fees at build time: the
+    // upper bound on what a fully-populated template could have collected. It is
+    // an upper bound, not the exact loss (selection also drops unknown-fee,
+    // special, and MN-collateral-spending txs), so read it as "at most this much".
+    std::string m_txset_empty_cause;
+    uint64_t    m_txset_forgone_fees{0};
 };
 
 } // namespace coin
