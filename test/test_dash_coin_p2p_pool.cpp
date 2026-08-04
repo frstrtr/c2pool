@@ -925,4 +925,94 @@ TEST(DashCoinP2PPool, a_throwing_subscriber_costs_one_message_not_the_pool)
         << "inbound dispatch stopped after a handler threw";
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// LOST-BODY WATCHDOG (#1089 208 s tail; same defect class as the #1077
+// rotated-pending wedge: a request with no timeout). request_block_tracked's
+// getdata unanswered for BODY_REREQUEST_SEC=10 is re-issued from a DIFFERENT
+// handshaked peer, rotating on successive attempts, capped at
+// BODY_REREQUEST_MAX=4, each re-request named (`cause=body-rerequest`) —
+// killing the 208 s / 600 s inv-TTL tail. FAILS-ON-MASTER: request_block has
+// no tracking, no timeout, no re-request at all.
+// ══════════════════════════════════════════════════════════════════════════
+
+TEST(DashCoinP2PPool, lost_tip_body_is_rerequested_from_a_rotated_peer_at_T)
+{
+    PoolRig rig;
+    rig.use_fake_clock();
+    for (int i = 1; i <= 3; ++i) rig.handshake(i);
+
+    const uint256 h = hash_n(0xB0D7);
+    const uint64_t p1_before = rig.session(1)->msgs_sent;
+    const uint64_t p2_before = rig.session(2)->msgs_sent;
+    const uint64_t p3_before = rig.session(3)->msgs_sent;
+
+    rig.client.request_block_tracked(h);
+    EXPECT_EQ(rig.client.pending_body_count(), 1u);
+    // The initial getdata goes to the primary (peer 1), like request_block.
+    EXPECT_EQ(rig.session(1)->msgs_sent, p1_before + 1);
+
+    // T-1 seconds of silence: no re-request yet.
+    rig.run_seconds(9);
+    EXPECT_EQ(rig.client.body_rerequests_total(), 0u)
+        << "re-requested before the 10 s timeout";
+
+    // Crossing T: exactly one re-request, and NOT to the peer that failed us.
+    rig.run_seconds(1);
+    EXPECT_EQ(rig.client.body_rerequests_total(), 1u)
+        << "an unanswered tracked body request must be re-requested at T=10 s";
+    EXPECT_EQ(rig.session(1)->msgs_sent, p1_before + 1)
+        << "the re-request must rotate OFF the peer that did not answer";
+    EXPECT_EQ((rig.session(2)->msgs_sent - p2_before)
+                  + (rig.session(3)->msgs_sent - p3_before),
+              1u)
+        << "exactly one re-request, to one other peer";
+    EXPECT_EQ(rig.client.pending_body_count(), 1u) << "still unanswered";
+}
+
+TEST(DashCoinP2PPool, body_rerequest_is_capped_then_backstop_owns_it)
+{
+    PoolRig rig;
+    rig.use_fake_clock();
+    for (int i = 1; i <= 2; ++i) rig.handshake(i);
+
+    rig.client.request_block_tracked(hash_n(0xDEAD));
+    // Nothing ever answers: attempts must stop at the cap and the slot must
+    // be released to the headers-driven / inv-TTL backstop (bounded by
+    // design — not a forever-retry loop).
+    rig.run_seconds(120);
+    EXPECT_EQ(rig.client.body_rerequests_total(), 4u)
+        << "re-requests must be capped at BODY_REREQUEST_MAX";
+    EXPECT_EQ(rig.client.body_rerequests_exhausted(), 1u);
+    EXPECT_EQ(rig.client.pending_body_count(), 0u)
+        << "an exhausted slot must be released, not retried forever";
+}
+
+TEST(DashCoinP2PPool, body_arrival_disarms_the_watchdog)
+{
+    PoolRig rig;
+    rig.use_fake_clock();
+    for (int i = 1; i <= 2; ++i) rig.handshake(i);
+
+    // A real (if empty-bodied) block whose X11 header hash the handler will
+    // compute — track exactly that hash.
+    dash::coin::BlockType blk;
+    blk.m_version = 0x20000000;
+    blk.m_timestamp = 1'700'000'000u;
+    auto packed_hdr =
+        pack(static_cast<const dash::coin::BlockHeaderType&>(blk));
+    const uint256 bh = dash::crypto::hash_x11(packed_hdr.get_span());
+
+    rig.client.request_block_tracked(bh);
+    EXPECT_EQ(rig.client.pending_body_count(), 1u);
+
+    // The body arrives — from the OTHER peer, which must disarm it too.
+    rig.deliver(2, p2p::message_block::make_raw(blk));
+    EXPECT_EQ(rig.client.pending_body_count(), 0u)
+        << "receipt from any peer must disarm the watchdog";
+
+    // And no re-request ever fires afterwards.
+    rig.run_seconds(60);
+    EXPECT_EQ(rig.client.body_rerequests_total(), 0u);
+}
+
 } // namespace

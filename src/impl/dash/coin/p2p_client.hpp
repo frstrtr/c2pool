@@ -562,6 +562,23 @@ private:
     // second.
     static constexpr time_t POOL_TICK_SEC = 1;
     static constexpr time_t RECONNECT_INTERVAL_SEC = 30;
+    // ── Lost-body watchdog (#1089 208 s tail; same defect class as the
+    // #1077 rotated-pending wedge: a request with no timeout). A tracked
+    // getdata(block) answered by nothing has NO protocol-level retry, and
+    // InvDedup (TTL 600 s) suppresses the same block's inv from every other
+    // peer — so a single lost body request can stall the tip body for up to
+    // 10 minutes (the 208 s episode measured on soak0804e sits squarely in
+    // this class). T = 10 s: ~5x the worst normal same-stream headers→block
+    // gap (~1-2 s), far below the 157.5 s block interval, and a false
+    // positive costs one duplicate block-sized response — cheap. Re-requests
+    // rotate through the pool's OTHER handshaked peers (post-#1082 up to 8),
+    // capped at 4 (~50 s total), after which the headers-driven re-request /
+    // inv-TTL expiry remains the backstop.
+    static constexpr time_t BODY_REREQUEST_SEC = 10;
+    static constexpr int    BODY_REREQUEST_MAX = 4;
+    // Tracked slots are bounded by design: the tip body plus a short burst
+    // of near-tip blocks; oldest evicted beyond this.
+    static constexpr size_t PENDING_BODY_CAP  = 8;
     // Pool-status log cadence (the soak's direct read on peer count + durability).
     static constexpr time_t POOL_STATUS_INTERVAL_SEC = 60;
     // A dial that never calls back (no connected(), no connect_failed()) must not
@@ -611,6 +628,21 @@ private:
     std::map<std::string, int64_t> m_dialing;
     // Collapses the N-peer inv fan-in to one getdata. Bounded + expiring.
     InvDedup m_inv_dedup;
+
+    // ── Lost-body watchdog state (see BODY_REREQUEST_* above) ────────────
+    // One slot per tracked outstanding getdata(block); disarmed by the block
+    // handler on receipt (from ANY peer), serviced by the pool tick.
+    struct PendingBody
+    {
+        uint256     hash;
+        int64_t     first_req{0};
+        int64_t     last_req{0};
+        int         rerequests{0};
+        std::string last_peer;    // don't re-ask the peer that just failed us
+    };
+    std::vector<PendingBody> m_pending_bodies;
+    uint64_t m_body_rerequests_total{0};
+    uint64_t m_body_rerequests_exhausted{0};
 
     std::unique_ptr<core::Timer> m_reconnect_timer;
     // ONE repeating tick for the whole pool (liveness, handshake deadlines,
@@ -1117,6 +1149,32 @@ public:
             {inventory_type(inventory_type::block, block_hash)});
         m_primary->write(msg);
     }
+
+    /// Request a full block AND arm the lost-body watchdog for it (tip-follow
+    /// path — see the BODY_REREQUEST_* rationale above). Plain
+    /// request_block() stays untracked for the bulk/historical legs (UTXO
+    /// window refill, checkpoint-lane windows), whose volume would defeat the
+    /// bound and whose own re-request loops already exist.
+    void request_block_tracked(const uint256& block_hash)
+    {
+        request_block(block_hash);
+        const int64_t now = now_sec();
+        for (auto& pb : m_pending_bodies)
+            if (pb.hash == block_hash) { pb.last_req = now; return; }
+        if (m_pending_bodies.size() >= PENDING_BODY_CAP)
+            m_pending_bodies.erase(m_pending_bodies.begin());   // oldest slot
+        PendingBody pb;
+        pb.hash      = block_hash;
+        pb.first_req = now;
+        pb.last_req  = now;
+        pb.last_peer = m_primary ? m_primary->key : std::string{};
+        m_pending_bodies.push_back(std::move(pb));
+    }
+
+    /// Watchdog observability (KATs + POOL-STATUS).
+    std::size_t pending_body_count()    const { return m_pending_bodies.size(); }
+    uint64_t body_rerequests_total()    const { return m_body_rerequests_total; }
+    uint64_t body_rerequests_exhausted() const { return m_body_rerequests_exhausted; }
 
     /// Send a getmnlistd (SML diff request) — E2/E3 masternode-list sync seam.
     void send_getmnlistd(const uint256& base_block_hash, const uint256& block_hash)
@@ -1679,8 +1737,61 @@ private:
             remove_peer(p, why);
         }
 
+        service_pending_bodies(now);
         prune_stale_dials(now);
         maybe_log_pool_status(now);
+    }
+
+    /// Lost-body watchdog service (one pass per pool tick). A tracked
+    /// getdata(block) unanswered for BODY_REREQUEST_SEC is re-issued — from a
+    /// DIFFERENT handshaked peer when the pool holds one (the announcing peer
+    /// may be slow/wedged; its neighbours demonstrably hold the block they
+    /// all announced), rotating through the pool on successive attempts —
+    /// bounded at BODY_REREQUEST_MAX, every re-request named in the log.
+    void service_pending_bodies(int64_t now)
+    {
+        for (auto it = m_pending_bodies.begin(); it != m_pending_bodies.end();)
+        {
+            PendingBody& pb = *it;
+            if (now - pb.last_req < BODY_REREQUEST_SEC) { ++it; continue; }
+            if (pb.rerequests >= BODY_REREQUEST_MAX)
+            {
+                ++m_body_rerequests_exhausted;
+                LOG_WARNING << "[" << m_chain_label
+                            << "] body-rerequest EXHAUSTED hash="
+                            << pb.hash.GetHex().substr(0, 16) << "... after "
+                            << pb.rerequests << " re-request(s) over "
+                            << (now - pb.first_req)
+                            << "s — leaving recovery to the headers-driven"
+                               " re-request / inv-TTL backstop";
+                it = m_pending_bodies.erase(it);
+                continue;
+            }
+            // Rotate through the handshaked peers, preferring one we did not
+            // just ask; a single-peer pool re-asks the same peer (still
+            // strictly better than the 600 s inv-TTL wait).
+            std::vector<PeerSession*> cands;
+            for (auto& up : m_pool)
+                if (up->handshake.complete()) cands.push_back(up.get());
+            if (cands.empty()) { ++it; continue; }   // retry when the pool refills
+            PeerSession* target =
+                cands[static_cast<size_t>(pb.rerequests) % cands.size()];
+            if (target->key == pb.last_peer && cands.size() > 1)
+                target = cands[(static_cast<size_t>(pb.rerequests) + 1)
+                               % cands.size()];
+            auto msg = message_getdata::make_raw(
+                {inventory_type(inventory_type::block, pb.hash)});
+            target->write(msg);
+            ++pb.rerequests;
+            ++m_body_rerequests_total;
+            pb.last_req  = now;
+            pb.last_peer = target->key;
+            LOG_INFO << "[" << m_chain_label << "] cause=body-rerequest attempt="
+                     << pb.rerequests << " peer=" << target->key << " hash="
+                     << pb.hash.GetHex().substr(0, 16) << "... unanswered_for="
+                     << (now - pb.first_req) << "s";
+            ++it;
+        }
     }
 
     /// THE MEASUREMENT. One line, every POOL_STATUS_INTERVAL_SEC, naming the
@@ -1722,7 +1833,10 @@ private:
                  << m_inv_dedup.capacity()
                  << " admitted=" << st.admitted
                  << " suppressed=" << st.suppressed
-                 << " evicted(cap/ttl)=" << st.evicted_capacity << "/" << st.evicted_ttl;
+                 << " evicted(cap/ttl)=" << st.evicted_capacity << "/" << st.evicted_ttl
+                 << " pending_bodies=" << m_pending_bodies.size()
+                 << " body_rerequests=" << m_body_rerequests_total
+                 << "/" << m_body_rerequests_exhausted;
     }
 
     // ── handshake ────────────────────────────────────────────────────────
@@ -1925,6 +2039,11 @@ private:
         // on its socket, and its deferral state is the one waiting.
         try { p->conn->get_block(blockhash, msg->m_block); } catch (...) {}
         try { p->conn->get_header(blockhash, header); } catch (...) {}
+        // Lost-body watchdog: the body has arrived (from whichever peer
+        // answered first) — disarm its slot.
+        for (auto it = m_pending_bodies.begin();
+             it != m_pending_bodies.end(); ++it)
+            if (it->hash == blockhash) { m_pending_bodies.erase(it); break; }
         LOG_INFO << "[" << m_chain_label << "] block received from " << p->key
                  << ": " << blockhash.GetHex().substr(0, 16) << "...";
         m_coin->full_block.happened(msg->m_block);
