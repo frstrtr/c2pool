@@ -636,7 +636,8 @@ jobs:
       - name: Smoke test (--help)
         if: steps.presence.outputs.exists == '1'
         run: |
-          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-6.dll" build_ci/src/c2pool/Release/
+          # SONAME-agnostic glob: upstream bumps libsecp256k1-N.dll (6->7 etc). Do NOT re-pin a number.
+          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-*.dll" build_ci/src/c2pool/Release/
           $ErrorActionPreference = 'SilentlyContinue'
           # --help writes usage to stderr; buffer first so Select-Object truncation
           # cannot break the pipe and surface a NativeCommandError (false red).
@@ -654,8 +655,9 @@ jobs:
           Copy-Item "build_ci/src/c2pool/Release/c2pool-${COIN}.exe" "${PKG}/"
           # DLL must be next to exe for Windows DLL search path (portable ZIP)
           # Also copy to lib/ for Inno Setup installer compatibility
-          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-6.dll" "${PKG}/"
-          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-6.dll" "${PKG}/lib/"
+          # SONAME-agnostic glob: upstream bumps libsecp256k1-N.dll (6->7 etc). Do NOT re-pin a number.
+          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-*.dll" "${PKG}/"
+          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-*.dll" "${PKG}/lib/"
           Copy-Item start.bat "${PKG}/"
           Copy-Item -Recurse web-static/* "${PKG}/web-static/"
           Copy-Item explorer/explorer.py "${PKG}/explorer/"
