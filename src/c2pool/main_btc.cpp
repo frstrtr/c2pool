@@ -1777,6 +1777,18 @@ int main(int argc, char* argv[])
         }
     }
 
+    // LTC-parity site 3/3 (the TRUE third, missing until now): save the stat
+    // log on clean shutdown. load-on-start (:1722) + periodic-100s (:1735) only
+    // persist at tick boundaries, so without this every restart drops whatever
+    // accumulated since the last 100s tick. Mirrors main_ltc.cpp:7456-7457
+    // ("Save stats on shutdown"). web_server (and thus its MiningInterface) is
+    // still alive here — the reset()s below run after. Display-only stat log;
+    // p2pool-merged-v36 surface: NONE.
+    if (web_server) {
+        if (auto* mi = web_server->get_mining_interface())
+            mi->save_stat_log();
+    }
+
     // ── Graceful shutdown — explicit teardown order ──────────────────────
     //
     // ioc.run() returned because the signal handler called ioc.stop(). Now
