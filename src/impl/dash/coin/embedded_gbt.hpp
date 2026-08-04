@@ -165,7 +165,27 @@ inline DashWorkData build_embedded_workdata(
     // (15, dashcore chainparams.cpp:177); testnet/devnet/regtest are 1. Only
     // consulted when the CCbTx seams (sml + qmgr) are supplied. SAFE-ADDITIVE:
     // appended last so every existing positional caller is byte-unchanged.
-    int mn_min_confirmations = DASH_MN_MIN_CONFIRMATIONS_MAINNET)
+    int mn_min_confirmations = DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+    // ── UTXO-IMMATURE SERVING seam ───────────────────────────────────────────
+    // When true, SKIP mempool selection entirely and build a coinbase-only body
+    // (the mandatory type-6 quorum commitments above still ride -- they are
+    // consensus-REQUIRED at a DKG height and carry zero fee, so dropping them
+    // would make the block invalid while keeping none of them costs nothing).
+    //
+    // WHY THIS IS CONSENSUS-SAFE, not a shortcut: consensus never requires any
+    // mempool transaction in a block. With zero selected txs total_fees is
+    // exactly 0, so block_value == subsidy exactly; platform_reward and the
+    // creditPool accrual are height-derived and never touched fees; mn_payment
+    // is a pure function of block_value. Every value this template commits is
+    // therefore EXACT, and exact by the cheapest possible route -- there is no
+    // fee to overstate, so the bad-cb-amount risk the maturity gate exists to
+    // prevent is structurally absent rather than merely unlikely. That matters
+    // here because this builder has no TestBlockValidity equivalent: fee
+    // exactness normally rides entirely on the UTXO lane, and this mode is the
+    // one path that does not depend on it at all.
+    //
+    // Default false => every existing positional caller is byte-unchanged.
+    bool suppress_mempool_txs = false)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
@@ -187,8 +207,15 @@ inline DashWorkData build_embedded_workdata(
     // special txs; including one without accounting for it yields bad-cbtx. The
     // safe-minimal cut keeps the embedded block special-tx-free so the creditPool
     // accrual below is exactly the platform-reward term.
+    // suppress_mempool_txs: coinbase-only body, total_fees == 0 exactly. The
+    // mempool is not even consulted for selection (only, below, for the forgone-
+    // fee report), so no partially-warm UTXO view can price anything into this
+    // template.
     auto [selected, total_fees] =
-        mempool.get_sorted_txs_with_fees(MAX_BLOCK_BYTES, /*exclude_special=*/true);
+        suppress_mempool_txs
+            ? std::pair<std::vector<Mempool::SelectedTx>, uint64_t>{{}, 0ull}
+            : mempool.get_sorted_txs_with_fees(MAX_BLOCK_BYTES,
+                                               /*exclude_special=*/true);
     // MN-collateral spend filter (sml_projection.hpp, FINDING-2). The C-3
     // special-tx cut above is NOT sufficient: dashd's verifier removes a
     // masternode from the list when ANY block tx — special or not — spends
@@ -291,7 +318,7 @@ inline DashWorkData build_embedded_workdata(
     // block as normal. Genuinely empty mempools never trip. Mirrors the
     // LTC/DOGE TemplateBuilder guard; additive only — masternode payment /
     // CbTx / superblock projection below is untouched either way.
-    {
+    if (!suppress_mempool_txs) {
         const uint64_t mempool_bytes = static_cast<uint64_t>(mempool.byte_size());
         const uint64_t mempool_fees  = mempool.total_known_fees();
         const bool tripped = underfill_guard_trips(selected_bytes,
@@ -306,6 +333,27 @@ inline DashWorkData build_embedded_workdata(
                         << " sat fees) — near-empty block on a non-empty "
                         << "mempool; template-fill regression, gates cutover.";
         }
+    } else {
+        // ── NAME THE STATE ───────────────────────────────────────────────────
+        // The underfill guard is DELIBERATELY not consulted here: it exists to
+        // catch an UNEXPLAINED near-empty template, and this one is explained.
+        // Letting it fire would train operators to ignore the one line that is
+        // supposed to mean "template-fill regression".
+        //
+        // Instead the mode says its own name, on the template itself and in the
+        // log, with the price attached. A soak greps this to answer both "how
+        // long did the node run coinbase-only" and "what did that cost".
+        const uint64_t mempool_fees = mempool.total_known_fees();
+        w.m_txset_empty_cause  = "utxo-immature-serving";
+        w.m_txset_forgone_fees = mempool_fees;
+        if (underfill_tripped) *underfill_tripped = false;
+        LOG_INFO << "[GBT-EMB] arm=EMBEDDED txset=empty"
+                 << " cause=utxo-immature-serving"
+                 << " h=" << w.m_height
+                 << " mempool_tx=" << mempool.size()
+                 << " forgone_fees<=" << mempool_fees
+                 << " sat (coinbase-only body: subsidy exact, no fee to"
+                    " overstate; a valid block beats no block)";
     }
 
     // Platform Credit Pool burn (DIP-0027): emit OP_RETURN payment

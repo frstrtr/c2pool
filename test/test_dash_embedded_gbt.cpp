@@ -920,3 +920,243 @@ TEST(DashEmbeddedGbt, E2ForgedBlockBodyRefusedDoesNotAdvanceSeed) {
     EXPECT_EQ(st.credit_pool_height(), static_cast<int32_t>(H));
     EXPECT_EQ(st.credit_pool(), CP1_real);
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// UTXO-IMMATURE SERVING — the coinbase-only template (pure-daemonless OPT-IN)
+//
+// The DEFAULT during the UTXO-immature window is to REFUSE (p2pool semantics:
+// an unsynced node does not serve templates — pinned in
+// test_dash_node_coin_state.cpp DefaultRefusesTheImmatureWindowExactlyAsBefore).
+// The suppress_mempool_txs seam exercised here is the explicit opt-in for
+// pure-daemonless nodes with no fallback: serve a coinbase-only template
+// rather than nothing for ~106 blocks (~4.4 h at ~150 s/block).
+//
+// Consensus never requires a mempool transaction in a block, so a
+// coinbase-only template is a fully valid block; and because this builder has
+// no TestBlockValidity equivalent, the decisive property is that with ZERO
+// selected txs the fee term is exactly 0 — there is no fee to overstate, so
+// bad-cb-amount is structurally impossible in this mode rather than merely
+// improbable.
+//
+// These pin exactly that: the suppressed template is byte-valid (subsidy exact,
+// CCbTx fields exact, fees exactly zero and never above the normal template),
+// and it SAYS it is running in that mode.
+// ════════════════════════════════════════════════════════════════════════════
+
+// Build one template from a mempool holding a fee-paying tx, with and without
+// suppression, from otherwise IDENTICAL state — so every difference asserted
+// below is attributable to the suppression flag alone.
+namespace {
+struct ImmatureFixture {
+    UTXOViewCache      utxo{nullptr};
+    Mempool            mp;
+    MnStateMachine     mnstates;
+    uint256            prev_hash{raw256(0xAB)};
+    MutableTransaction tx;
+    static constexpr int64_t  FEE  = 10'000;
+    static constexpr uint32_t BITS = 0x1b104be3u;
+    static constexpr uint32_t MTP  = 1'700'000'000u;
+
+    ImmatureFixture() : mnstates(single_mn(p2pkh_script(0x30))) {
+        uint256 prev = mint_hash(77);
+        utxo.add_coin(Outpoint(prev, 0),
+                      Coin(100'000, {}, /*height=*/1, /*cb=*/false));
+        mp.set_utxo(&utxo);
+        tx = make_spend(prev, 0, 100'000 - FEE, /*salt=*/7);
+        EXPECT_TRUE(mp.add_tx(tx));
+    }
+
+    dash::coin::DashWorkData build(bool suppress,
+                                   const CSimplifiedMNList* sml = nullptr,
+                                   const QuorumManager* qmgr = nullptr,
+                                   int64_t credit_pool = 0) const {
+        return build_embedded_workdata(
+            /*prev_height=*/H - 1, prev_hash, mnstates, mp,
+            BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER,
+            /*curtime=*/1'700'000'123u, /*version=*/0x20000000u,
+            /*underfill_tripped=*/nullptr,
+            sml, qmgr,
+            /*best_cl_height=*/0, dash::coin::k_zero_cl_sig, credit_pool,
+            /*qc_commitments=*/nullptr, /*quorum_root_override=*/nullptr,
+            dash::coin::DASH_MN_RR_HEIGHT_MAINNET,
+            /*superblock_payments=*/nullptr,
+            dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+            /*suppress_mempool_txs=*/suppress);
+    }
+};
+}  // namespace
+
+TEST(DashUtxoImmatureServing, SuppressedTemplateIsCoinbaseOnlyWithExactSubsidy) {
+    ImmatureFixture f;
+
+    // Control: without suppression the fee-paying tx IS selected, so the
+    // fixture genuinely has something to lose (a vacuous mempool would make
+    // every assertion below pass for the wrong reason).
+    auto normal = f.build(/*suppress=*/false);
+    ASSERT_EQ(normal.m_txs.size(), 1u);
+    ASSERT_EQ(normal.m_tx_fees[0], static_cast<uint64_t>(ImmatureFixture::FEE));
+
+    auto empty = f.build(/*suppress=*/true);
+
+    // (1) Coinbase-only body.
+    EXPECT_TRUE(empty.m_txs.empty());
+    EXPECT_TRUE(empty.m_tx_fees.empty());
+    EXPECT_TRUE(empty.m_tx_hashes.empty());
+    EXPECT_TRUE(empty.m_tx_data_hex.empty());
+
+    // (2) Value fields exact, recomputed independently from the same
+    //     closed-form formulas dashcore uses. total_fees is exactly 0.
+    const int64_t reward = compute_dash_block_reward_post_v20(H);
+    const int64_t platform_reward =
+        compute_dash_platform_reward_post_v20_mn_rr(H);
+    const int64_t mn_payment =
+        compute_dash_mn_payment_post_v20(reward) - platform_reward;
+    EXPECT_EQ(empty.m_coinbase_value, static_cast<uint64_t>(reward))
+        << "with zero txs the coinbase value must be the bare subsidy";
+    EXPECT_EQ(empty.m_payment_amount, static_cast<uint64_t>(mn_payment));
+
+    // (3) NO fee overstatement — the one failure mode that costs a block
+    //     (bad-cb-amount). The suppressed template must claim strictly LESS
+    //     than the fee-bearing one, never more.
+    EXPECT_LT(empty.m_coinbase_value, normal.m_coinbase_value);
+    EXPECT_EQ(normal.m_coinbase_value - empty.m_coinbase_value,
+              static_cast<uint64_t>(ImmatureFixture::FEE));
+
+    // (4) Payout structure is otherwise untouched: platform burn first, then
+    //     the base58 MN payee.
+    ASSERT_EQ(empty.m_packed_payments.size(), 2u);
+    EXPECT_EQ(empty.m_packed_payments[0].payee, "!6a");
+    EXPECT_EQ(empty.m_packed_payments[0].amount,
+              static_cast<uint64_t>(platform_reward));
+    EXPECT_EQ(empty.m_packed_payments[1].amount,
+              static_cast<uint64_t>(mn_payment));
+    EXPECT_NE(empty.m_packed_payments[1].payee.front(), '!');
+
+    // (5) Header fields unchanged by the mode.
+    EXPECT_EQ(empty.m_height, H);
+    EXPECT_EQ(empty.m_previous_block, f.prev_hash);
+    EXPECT_EQ(empty.m_bits, ImmatureFixture::BITS);
+    EXPECT_EQ(empty.m_mintime, ImmatureFixture::MTP + 1u);
+    EXPECT_EQ(empty.m_version, normal.m_version);
+}
+
+TEST(DashUtxoImmatureServing, SuppressedTemplateNamesItselfAndReportsThePrice) {
+    ImmatureFixture f;
+
+    auto normal = f.build(/*suppress=*/false);
+    EXPECT_TRUE(normal.m_txset_empty_cause.empty())
+        << "a normal template must NOT claim to be deliberately empty";
+    EXPECT_EQ(normal.m_txset_forgone_fees, 0u);
+
+    auto empty = f.build(/*suppress=*/true);
+    // Silence here would hide a real economic trade-off: a soak has to be able
+    // to measure how long the node ran coinbase-only and what it cost.
+    EXPECT_EQ(empty.m_txset_empty_cause, "utxo-immature-serving");
+    EXPECT_EQ(empty.m_txset_forgone_fees, f.mp.total_known_fees());
+    EXPECT_EQ(empty.m_txset_forgone_fees,
+              static_cast<uint64_t>(ImmatureFixture::FEE));
+}
+
+TEST(DashUtxoImmatureServing, SuppressedTemplateCbTxIsByteIdenticalToNormal) {
+    // The CCbTx commits merkleRootMNList / merkleRootQuorums / bestCL* /
+    // creditPoolBalance — NONE of which is a function of transaction fees
+    // (the credit-pool accrual is prev + platformReward, and platformReward is
+    // height-derived). So suppressing the tx set must not move a single CbTx
+    // byte. If a future edit ever couples fees into that payload, this goes red
+    // before it can cost a block.
+    CSimplifiedMNListEntry e1; e1.proRegTxHash = raw256(0x11); e1.isValid = true;
+    CSimplifiedMNListEntry e2; e2.proRegTxHash = raw256(0x22); e2.isValid = true;
+    CSimplifiedMNList sml(std::vector<CSimplifiedMNListEntry>{e1, e2});
+    QuorumManager qmgr;
+    const int64_t CP = 123'456'789LL;
+
+    ImmatureFixture f;
+    auto normal = f.build(/*suppress=*/false, &sml, &qmgr, CP);
+    auto empty  = f.build(/*suppress=*/true,  &sml, &qmgr, CP);
+
+    ASSERT_FALSE(empty.m_coinbase_payload.empty())
+        << "the suppressed template must still carry a REAL type-5 payload";
+    EXPECT_EQ(empty.m_coinbase_payload, normal.m_coinbase_payload)
+        << "fees do not enter the CCbTx; suppression must not move its bytes";
+
+    // …and it parses to the right height + an unchanged credit-pool accrual.
+    CCbTx got;
+    ASSERT_TRUE(parse_cbtx(empty.m_coinbase_payload, got));
+    EXPECT_EQ(got.nHeight, static_cast<int32_t>(H));
+    EXPECT_EQ(got.creditPoolBalance,
+              CP + compute_dash_platform_reward_post_v20_mn_rr(H));
+    CSimplifiedMNList sml_copy = sml;
+    EXPECT_EQ(got.merkleRootMNList, sml_copy.CalcMerkleRoot());
+    EXPECT_EQ(got.merkleRootQuorums, compute_merkle_root_quorums(qmgr));
+}
+
+TEST(DashUtxoImmatureServing, SuppressionDoesNotTripTheUnderfillGuard) {
+    // The underfill guard exists to flag an UNEXPLAINED near-empty template.
+    // This one is explained, and letting the guard fire here would train
+    // operators to ignore the line that is supposed to mean "template-fill
+    // regression".
+    ImmatureFixture f;
+    bool tripped_normal = false;
+    bool tripped_empty  = false;
+
+    build_embedded_workdata(
+        H - 1, f.prev_hash, f.mnstates, f.mp,
+        ImmatureFixture::BITS, ImmatureFixture::MTP,
+        DASH_PUBKEY_VER, DASH_P2SH_VER,
+        1'700'000'123u, 0x20000000u, &tripped_normal);
+
+    build_embedded_workdata(
+        H - 1, f.prev_hash, f.mnstates, f.mp,
+        ImmatureFixture::BITS, ImmatureFixture::MTP,
+        DASH_PUBKEY_VER, DASH_P2SH_VER,
+        1'700'000'123u, 0x20000000u, &tripped_empty,
+        nullptr, nullptr, 0, dash::coin::k_zero_cl_sig, 0,
+        nullptr, nullptr, dash::coin::DASH_MN_RR_HEIGHT_MAINNET,
+        nullptr, dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+        /*suppress_mempool_txs=*/true);
+
+    EXPECT_FALSE(tripped_empty)
+        << "a deliberately coinbase-only template is not an underfill defect";
+    EXPECT_FALSE(tripped_normal)
+        << "control: this fixture's mempool is too small to trip the guard "
+           "either way, so the assertion above is about the mode, not the size";
+}
+
+// End-to-end through the SELECTOR: NodeCoinState's suppression flag must reach
+// build_embedded_workdata. A flag that is set but never threaded would leave
+// the arm serving a normal template off an immature UTXO view — the one
+// dangerous variant.
+TEST(DashUtxoImmatureServing, SelectorThreadsSuppressionIntoTheBuilder) {
+    ImmatureFixture f;
+    dash::coin::EmbeddedWorkInputs e;
+    e.has_state           = true;
+    e.prev_height         = H - 1;
+    e.prev_hash           = f.prev_hash;
+    e.mnstates            = &f.mnstates;
+    e.mempool             = &f.mp;
+    e.bits_for_next       = ImmatureFixture::BITS;
+    e.mtp_at_tip          = ImmatureFixture::MTP;
+    e.address_version     = DASH_PUBKEY_VER;
+    e.address_p2sh_version = DASH_P2SH_VER;
+    e.curtime             = 1'700'000'123u;
+    e.version             = 0x20000000u;
+
+    auto never = []() -> dash::coin::DashWorkData {
+        ADD_FAILURE() << "viable bundle must not reach the dashd fallback";
+        return {};
+    };
+
+    e.suppress_mempool_txs = false;
+    auto sel_normal = dash::coin::select_dash_work(e, never);
+    ASSERT_EQ(sel_normal.source, dash::coin::WorkSource::Embedded);
+    EXPECT_EQ(sel_normal.work.m_txs.size(), 1u);
+
+    e.suppress_mempool_txs = true;
+    auto sel_empty = dash::coin::select_dash_work(e, never);
+    ASSERT_EQ(sel_empty.source, dash::coin::WorkSource::Embedded)
+        << "suppression changes WHAT is served, never WHETHER";
+    EXPECT_TRUE(sel_empty.work.m_txs.empty());
+    EXPECT_EQ(sel_empty.work.m_txset_empty_cause, "utxo-immature-serving");
+    EXPECT_EQ(sel_empty.work.m_coinbase_value,
+              static_cast<uint64_t>(compute_dash_block_reward_post_v20(H)));
+}

@@ -75,6 +75,24 @@ enum class ClProvenance { Unknown, ChainCommitted, BlsVerified };
 ///  - ConsensusExact  : require exactly what dashcore requires, no more.
 enum class BestClPolicy { Off, Freshness, ConsensusExact };
 
+/// What the embedded arm does while the UTXO/fee lane is below its maturity
+/// depth (UtxoLane::mining_utxo_ready == false, i.e. blocks_connected < 106).
+/// See set_utxo_immature_policy() for the reasoning and the default.
+///
+///  - Refuse          : DEFAULT — p2pool semantics, the project design law: an
+///                      unsynced node does not serve block templates. Refuse
+///                      the arm ("utxo-immature") and route to the dashd
+///                      fallback (full templates where one is armed) for the
+///                      whole immature window.
+///  - ServeEmptyTxSet : explicit OPT-IN for pure-daemonless deployments with
+///                      no fallback to route to: stay viable and serve a
+///                      COINBASE-ONLY template. Consensus never requires a
+///                      mempool transaction, so a tx-free block is fully
+///                      valid; with zero txs the fee term is exactly 0, so
+///                      subsidy / MN payment / creditPool are all exact and
+///                      nothing can be overstated.
+enum class UtxoImmaturePolicy { ServeEmptyTxSet, Refuse };
+
 /// In-process coin-state the running node maintains for LOCAL template
 /// assembly. Non-copyable: it owns a Mempool (itself non-copyable) and is
 /// node-owned, never duplicated. The maintainer mutates mnstates()/mempool()
@@ -322,13 +340,57 @@ public:
 
     /// Coinbase-maturity mining gate (E2b/#738) — the dash analog of the LTC
     /// EmbeddedCoinNode::set_utxo_ready_fn (main_ltc.cpp ~1785-1801). When
-    /// set, embedded-template viability additionally requires the predicate
-    /// (UtxoLane::mining_utxo_ready: blocks_connected >= 106) so templates
-    /// cannot include txs spending immature coinbase outputs; until then
-    /// has_state stays false and get_work routes to the retained dashd
-    /// fallback. Unset (default) preserves the pre-E2b behaviour exactly.
+    /// set, the predicate (UtxoLane::mining_utxo_ready: blocks_connected >= 106)
+    /// reports whether the UTXO view is deep enough to price mempool txs, so a
+    /// template can never include a tx whose fee we cannot compute exactly.
+    ///
+    /// WHAT THE ARM DOES while that predicate is false is set separately by
+    /// set_utxo_immature_policy(): by DEFAULT (Refuse -- p2pool semantics, an
+    /// unsynced node does not serve templates) it declines ("utxo-immature")
+    /// and get_work routes to the retained dashd fallback for the whole
+    /// window, the pre-existing behaviour. Under the opt-in
+    /// UtxoImmaturePolicy::ServeEmptyTxSet the arm stays viable and serves a
+    /// COINBASE-ONLY template (fees exactly 0, nothing to overstate). Unset
+    /// (default) leaves both moot: with no predicate installed the window does
+    /// not exist and nothing is suppressed.
     void set_utxo_ready_fn(std::function<bool()> fn) {
         m_utxo_ready_fn = std::move(fn);
+    }
+
+    /// What to do during the immature window the predicate above reports.
+    ///
+    /// ── WHY THE DEFAULT IS Refuse (operator design law, p2pool semantics) ────
+    /// An unsynced node is a node with unverified state, and the project rule --
+    /// stated repeatedly by the operator, and the behaviour p2pool always had --
+    /// is that an unsynced node does not serve block templates. Miners idling is
+    /// the correct posture: cheaper than hashing work the node cannot fully
+    /// stand behind. Where an external dashd fallback is armed, the refusal is
+    /// also strictly better than any degraded serve -- the fallback returns FULL
+    /// templates. So the default refuses ("utxo-immature") for the whole
+    /// blocks_connected < 106 window, exactly as before this policy existed.
+    ///
+    /// ── WHY ServeEmptyTxSet EXISTS AS AN OPT-IN ──────────────────────────────
+    /// On a PURE-DAEMONLESS node there is no fallback to route to: the refusal
+    /// costs the whole window (~106 blocks x ~150 s ~= 4.4 h of a cold start)
+    /// with nothing served by anyone. For operators who prefer a subsidy-only
+    /// block over no block, the opt-in serves a COINBASE-ONLY template instead.
+    /// That is consensus-safe by construction: consensus never requires a
+    /// mempool transaction, and with zero selected txs the fee term is exactly
+    /// 0 -- there is nothing to overstate, so the bad-cb-amount risk the
+    /// maturity gate guards (this builder has no TestBlockValidity equivalent;
+    /// fee exactness rides entirely on the UTXO lane) is structurally absent in
+    /// that mode. Every other viability gate -- chain-synced, qc plan,
+    /// superblock, bestCL, credit pool, payee freshness, SML/quorum roots --
+    /// still has to pass either way. The cost is the forgone fees, which the
+    /// builder reports on every such template (m_txset_forgone_fees).
+    ///
+    /// main_dash: --embedded-utxo-immature-serve-empty selects the opt-in;
+    /// flag absent = Refuse, byte-identical to the pre-policy behaviour.
+    void set_utxo_immature_policy(UtxoImmaturePolicy p) {
+        m_utxo_immature_policy = p;
+    }
+    UtxoImmaturePolicy utxo_immature_policy() const {
+        return m_utxo_immature_policy;
     }
 
     /// Superblock-height guard. On a Dash superblock height the coinbase MUST
@@ -816,6 +878,11 @@ public:
         // block-SUBMIT refusal.
         const bool payee_resolvable =
             !m_require_resolvable_payee || mn_payee_resolvable_at_tip();
+        // Evaluated ONCE here, like qc_ok / sb_ok, and threaded into BOTH the
+        // viability clause and the tx-suppression flag -- so the decision to
+        // serve and the decision about what to serve cannot observe different
+        // answers from the same predicate.
+        const bool utxo_immature = m_utxo_ready_fn && !m_utxo_ready_fn();
         // ── THE decision, and its reason, from ONE evaluation ────────────────
         // dashd's ValidationState idiom (consensus/validation.h:69): the call
         // that returns false is the call that records why. Previously this was
@@ -824,8 +891,16 @@ public:
         // logging — and the two had already drifted (classify_decline never
         // checked payee_resolvable, so a #996 money-path refusal surfaced as
         // "viable-race"). There is now exactly one list.
-        e.decline   = evaluate_viability(qc_ok, sb.ok, payee_resolvable);
+        e.decline   = evaluate_viability(qc_ok, sb.ok, payee_resolvable,
+                                         utxo_immature);
         e.has_state = e.decline.viable;
+        // NAME THE STATE: while the UTXO lane is immature under the OPT-IN
+        // serving policy we DO serve, but only a coinbase-only body. The
+        // builder marks the template (m_txset_empty_cause) and logs the
+        // forgone fees, so this degraded-but-valid mode is never silent.
+        e.suppress_mempool_txs =
+            utxo_immature
+            && m_utxo_immature_policy == UtxoImmaturePolicy::ServeEmptyTxSet;
         if (m_require_resolvable_payee && !payee_resolvable) {
             LOG_WARNING << "[EMBED-GATE] h=" << (m_prev_height + 1)
                         << " REFUSE embedded template: MN payment due but payee"
@@ -929,7 +1004,8 @@ private:
     /// the cost on a per-template path and, worse, could observe a different
     /// answer than the one the bundle was built from.
     DeclineReport evaluate_viability(bool qc_ok, bool sb_ok,
-                                     bool payee_resolvable) const {
+                                     bool payee_resolvable,
+                                     bool utxo_immature) const {
         const uint32_t next_h = m_prev_height + 1;
         const std::string tip = std::to_string(m_prev_height);
         auto refuse = [](const char* c, std::string v, std::string t) {
@@ -964,7 +1040,14 @@ private:
         else if (!qc_ok)
             d = refuse("qc-plan-underivable", "nullopt",
                        "derivable-qc-plan@h=" + std::to_string(next_h));
-        else if (m_utxo_ready_fn && !m_utxo_ready_fn())
+        else if (utxo_immature
+                 && m_utxo_immature_policy == UtxoImmaturePolicy::Refuse)
+            // The DEFAULT posture (p2pool semantics: an unsynced node does not
+            // serve templates). Under the opt-in ServeEmptyTxSet policy the
+            // immature window is SERVED with a coinbase-only body instead --
+            // see set_utxo_immature_policy(); the arm stays viable and
+            // make_embedded_work_inputs sets suppress_mempool_txs so the
+            // builder emits no mempool txs.
             d = refuse("utxo-immature", "utxo_ready=false", "utxo_ready=true");
         else if (!sb_ok)
             d = refuse("superblock-refused", "not-trigger-confident",
@@ -1141,6 +1224,11 @@ private:
     uint256  m_sml_current_hash;              // block hash the SML is current at (ZERO = cold/reorg)
     bool     m_require_sml{false};            // gate viability on have_sml (embedded arm)
     std::function<bool()> m_utxo_ready_fn;   // optional UTXO maturity gate (E2b)
+    // Default REFUSES the immature window (p2pool semantics: an unsynced node
+    // does not serve templates) -- byte-identical to the pre-policy behaviour.
+    // ServeEmptyTxSet is the pure-daemonless opt-in (subsidy-only block beats
+    // no block when there is no fallback). See set_utxo_immature_policy().
+    UtxoImmaturePolicy m_utxo_immature_policy{UtxoImmaturePolicy::Refuse};
     std::function<bool()> m_chain_synced_fn; // optional ABSOLUTE header-sync gate (never serve a stale tip)
     std::function<bool(uint32_t)> m_is_superblock_fn;  // superblock-height predicate
     // E-SUPERBLOCK: daemonless governance-sourced superblock schedule provider
