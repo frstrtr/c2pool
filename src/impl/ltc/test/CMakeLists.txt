@@ -38,3 +38,34 @@ if (BUILD_TESTING)
     target_include_directories(ltc_g3a_populated_test PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/btclibs)
     add_test(NAME LtcG3aPopulated COMMAND ltc_g3a_populated_test)
 endif()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ci-allowlist-exempt: ltc_embedded_bootstrap_gate  -- LIVE network gate; built +
+# run ONLY by .github/workflows/ltc-embedded-bootstrap-live-gate.yml (real DNS +
+# P2P egress). It MUST NOT run inside the hermetic offline `share_test` suite or
+# the default build.yml --target list, so it is exempt from the allowlist
+# drift-guard by design (a standalone live harness, per the checker's escape
+# hatch) and is only defined when its own workflow sets LTC_LIVE_BOOTSTRAP_GATE.
+#
+# embedded_bootstrap_live_test.cpp: proves the DEFAULT-ON embedded LTC bootstrap
+# (main_ltc.cpp `embedded_ltc = true`): DNS-seed resolve -> TCP connect ->
+# version/verack -> getheaders -> HeaderChain tip ADVANCES past genesis, against
+# the REAL LTC P2P network with no LAN daemon and no hardcoded IP. Fixture name
+# is deliberately NOT *LiveTest, so `ctest --exclude-regex 'LiveTest\.'` does not
+# silently skip it. The five test/test_phase*_live.cpp harnesses fail all three
+# of the acceptance conditions (LAN IP default, *LiveTest name, ctest-excluded);
+# this target is the first coverage of the reuse-source bootstrap path.
+option(LTC_LIVE_BOOTSTRAP_GATE
+       "Build the LTC embedded-bootstrap live network gate (real egress)" OFF)
+if (LTC_LIVE_BOOTSTRAP_GATE AND BUILD_TESTING AND GTest_FOUND)
+    add_executable(ltc_embedded_bootstrap_gate embedded_bootstrap_live_test.cpp)
+    target_link_libraries(ltc_embedded_bootstrap_gate PRIVATE
+        GTest::gtest_main GTest::gtest
+        core ltc
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage ltc_coin pool)
+    target_include_directories(ltc_embedded_bootstrap_gate PRIVATE
+        ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/btclibs)
+    add_test(NAME LtcEmbeddedBootstrapGate COMMAND ltc_embedded_bootstrap_gate)
+    set_tests_properties(LtcEmbeddedBootstrapGate PROPERTIES
+        LABELS "live;bootstrap" TIMEOUT 240)
+endif()
