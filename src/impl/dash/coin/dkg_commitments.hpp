@@ -473,6 +473,55 @@ inline MutableTransaction build_qc_tx(uint32_t height,
     return tx;
 }
 
+// ── PoSe interaction of REAL commitments (the #1083 landmine, enforced) ────
+
+/// dashcore's IsNull predicate over a commitment, exactly as the
+/// merkleRootQuorums fold applies it (CFinalCommitment::IsNull:
+/// CountSigners()==0 && CountValidMembers()==0). Null commitments take the
+/// IsNull() exempt path in dashd's verifier (specialtxman.cpp:427-432), so
+/// they can never trigger a PoSe punishment.
+inline bool qc_commitment_is_null(const vendor::CFinalCommitment& c)
+{
+    return c.CountSigners() == 0 && c.CountValidMembers() == 0;
+}
+
+/// Is the verifier's PoSe pass over this commitment PROVABLY a no-op?
+///
+/// dashd's verifier PoSe-punishes every quorum member the commitment marks
+/// invalid when a NON-NULL commitment is in a block — specialtxman.cpp:159-174
+/// HandleQuorumCommitment: for i over members.size(), `if (!qc.validMembers[i])
+/// ... mnList.PoSePunish(members[i]->proTxHash, mnList.CalcPenalty(66))` — and
+/// a punishment that crosses the ban threshold flips that MN's validity IN THE
+/// SAME BLOCK's MN list, changing the merkleRootMNList the same coinbase
+/// commits. c2pool does not fold that pass into its committed root (the full
+/// fold mirrors the confirmedHash rollover projection and is not built), and
+/// penalty-crossing cannot be computed daemonlessly at all: PoSe penalty state
+/// is not in the SML, so it must never be guessed.
+///
+/// The INTERIM serve predicate is therefore the provable no-op: every LISTED
+/// member — index < member_count, where member_count is the size of the
+/// deterministic member list dashd indexes validMembers with
+/// (GetAllQuorumMembers; daemonlessly the QuorumMemberSource set the BLS
+/// verify already required) — is marked valid, so the punish loop touches
+/// nothing and the committed MN root is exact. validMembers bits at
+/// index >= member_count are DKG padding up to params.size (dashcore's own
+/// Verify requires them unset) and prove nothing either way.
+///
+/// Fail-closed: a member_count of 0 or one exceeding the bitset cannot prove
+/// the no-op (nothing to index the bitset against), so the answer is false —
+/// the caller must refuse, never serve. Null commitments are exempt by the
+/// same IsNull predicate the fold and dashd's verifier use.
+inline bool qc_pose_pass_provably_noop(const vendor::CFinalCommitment& c,
+                                       size_t member_count)
+{
+    if (qc_commitment_is_null(c)) return true;   // IsNull() exempt path
+    if (member_count == 0 || member_count > c.validMembers.size())
+        return false;                            // cannot prove — fail closed
+    for (size_t i = 0; i < member_count; ++i)
+        if (!c.validMembers[i]) return false;    // dashd would PoSePunish members[i]
+    return true;
+}
+
 // ── Mineable-commitment cache (Phase-L seam) ───────────────────────────────
 
 /// Collects REAL finalized commitments off the coin-P2P `qfcommit` relay —

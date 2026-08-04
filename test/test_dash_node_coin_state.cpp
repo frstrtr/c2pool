@@ -1377,3 +1377,182 @@ TEST(DashServeGateNamesRefusal, NoTipOnlyWhenTheMaintainerNeverReported) {
     EXPECT_EQ(d.value, "prev_hash=null,maintainer-never-reported")
         << "and it must say that it is inferring, not measuring";
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// The #1083 PoSe landmine, ENFORCED (emit-qc-real-pose-unfolded).
+//
+// dashd's verifier PoSe-punishes every quorum member a NON-NULL in-block
+// commitment marks invalid (specialtxman.cpp:159-174 HandleQuorumCommitment
+// -> PoSePunish(CalcPenalty(66))), and a punishment crossing the ban
+// threshold flips that MN's validity IN THE SAME BLOCK's MN list — changing
+// the merkleRootMNList the same coinbase commits. Null commitments are
+// exempt (specialtxman.cpp:427-432, IsNull() guard). c2pool folds no PoSe
+// pass into its committed root; since #1077 wired rotated member sourcing
+// the real-commitment lane is LIVE, so a verified real commitment carrying
+// !validMembers[i] for a listed member is a servable bad-cbtx-mnmerkleroot —
+// a silently losable block. The pre-emit gate must refuse it; the ONLY thing
+// standing there before this gate was a comment (embedded_gbt.hpp), and a
+// comment refuses nothing.
+//
+// Shared fixture: the QcPlanServesDkgWindowHeightAndEmitGateEnforcesIt
+// posture (tip 1518417 => next 1518418), with the plan fn returning ONE
+// commitment — the same closure shape production installs, minus sourcing.
+// ════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+dash::coin::vendor::CFinalCommitment make_real_qc(bool punish_listed_member)
+{
+    // A structurally real (non-null) testnet LLMQ_50_60 commitment: full
+    // 50-member quorum, non-zero crypto fields. punish_listed_member marks
+    // ONE listed member invalid — the exact landmine input.
+    dash::coin::vendor::CFinalCommitment c;
+    c.nVersion = dash::coin::vendor::CFinalCommitment
+                     ::BASIC_BLS_NON_INDEXED_QUORUM_VERSION;
+    c.llmqType    = 1;                    // LLMQ_50_60 (testnet-enabled)
+    c.quorumHash  = raw256(0x50);
+    c.quorumIndex = 0;
+    c.signers.assign(50, true);
+    c.validMembers.assign(50, true);
+    if (punish_listed_member) c.validMembers[7] = false;
+    c.quorumPublicKey.fill(0x11);
+    c.quorumVvecHash = raw256(0x22);
+    c.quorumSig.fill(0x33);
+    c.membersSig.fill(0x44);
+    return c;
+}
+
+// Seed the same healthy DKG-window serving posture the E1 qc-plan test uses,
+// with a plan fn returning exactly `qc` + a fixed with-block root override.
+void seed_real_qc_serving(NodeCoinState& st,
+                          const dash::coin::vendor::CFinalCommitment& qc)
+{
+    seed_single_mn(st, p2pkh_script(0x30));
+    seed_sml(st);
+    st.set_require_sml(true);
+    st.set_sml_current_hash(raw256(0xAB));
+    dash::coin::QcBlockPlan plan;
+    plan.commitments = {qc};
+    plan.merkle_root_quorums = raw256(0x77);
+    st.set_qc_plan_fn([plan](uint32_t) {
+        return std::optional<dash::coin::QcBlockPlan>{plan};
+    });
+    st.set_tip(1518417, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u);
+}
+
+} // namespace
+
+// THE MASTER DEFECT, pinned. On pre-gate master this test FAILS at the
+// EXPECT_FALSE: the punishing real commitment sails through the pre-emit
+// gate (count/payload/root all self-consistent) and the template SERVES —
+// the silently losable block. No PoSe-noop capability is wired here, which
+// is exactly the state production shipped in: the gate must fail CLOSED on
+// capability absence, not only on a proven punishment.
+TEST(DashQcPoseGate, RealCommitmentPunishingListedMemberIsRefusedAtEmit) {
+    NodeCoinState st;
+    seed_real_qc_serving(st, make_real_qc(/*punish_listed_member=*/true));
+
+    // The template BUILDS and carries the real qc tx — viability alone does
+    // not (and cannot cheaply) prove the PoSe no-op; the emit gate is the
+    // enforcement point, exactly like the other emit re-derivations.
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded);
+    ASSERT_EQ(sel.work.m_txs.size(), 1u);
+    ASSERT_EQ(sel.work.m_txs[0].type, 6);
+
+    DeclineReport why;
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why))
+        << "a REAL commitment that PoSe-punishes a listed member reached the "
+           "miner: dashd's verifier flips that MN in THIS block's list and "
+           "the committed merkleRootMNList is wrong (bad-cbtx-mnmerkleroot = "
+           "a silently lost block)";
+    EXPECT_EQ(why.cause, "emit-qc-real-pose-unfolded");
+    EXPECT_EQ(why.threshold, "pose-pass-provably-noop(all-listed-members-valid)");
+    EXPECT_NE(why.value.find("pose_noop=n/a"), std::string::npos)
+        << "capability ABSENT must print n/a, not a fabricated verdict: "
+        << why.value;
+}
+
+// Negative twin: with the PoSe-noop capability wired and every listed member
+// valid (the common case), the SAME posture serves exactly as before — the
+// gate is punishment-specific, not a blanket real-commitment refuse.
+TEST(DashQcPoseGate, AllListedMembersValidServesExactlyAsBefore) {
+    NodeCoinState st;
+    seed_real_qc_serving(st, make_real_qc(/*punish_listed_member=*/false));
+    st.set_qc_pose_noop_fn(
+        [](const dash::coin::vendor::CFinalCommitment& c)
+            -> std::optional<bool> {
+            // The production shape: judge against the deterministic member
+            // list's size (full 50-member quorum here).
+            return dash::coin::qc_pose_pass_provably_noop(c, 50);
+        });
+
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded);
+    DeclineReport why;
+    EXPECT_TRUE(st.embedded_template_emit_ok(sel.work, &why))
+        << "cause=" << why.cause << " value=" << why.value;
+
+    // And the pre-existing drift enforcement is untouched: dropping the
+    // mandatory commitment still discards the template (bad-qc-missing).
+    DashWorkData tampered = sel.work;
+    tampered.m_txs.clear();
+    EXPECT_FALSE(st.embedded_template_emit_ok(tampered));
+}
+
+// With the capability WIRED, a proven punishment refuses with the measured
+// value naming the offending commitment — cause/value/threshold discipline.
+TEST(DashQcPoseGate, PunishingCommitmentRefusedEvenWithCapabilityWired) {
+    NodeCoinState st;
+    seed_real_qc_serving(st, make_real_qc(/*punish_listed_member=*/true));
+    st.set_qc_pose_noop_fn(
+        [](const dash::coin::vendor::CFinalCommitment& c)
+            -> std::optional<bool> {
+            return dash::coin::qc_pose_pass_provably_noop(c, 50);
+        });
+
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded);
+    DeclineReport why;
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why));
+    EXPECT_EQ(why.cause, "emit-qc-real-pose-unfolded");
+    EXPECT_NE(why.value.find("pose_noop=unproven"), std::string::npos)
+        << "a MEASURED failed proof must say 'unproven', not 'n/a': "
+        << why.value;
+    EXPECT_NE(why.value.find("type=1"), std::string::npos) << why.value;
+}
+
+// A wired capability that CANNOT answer (member set no longer cached) must
+// refuse — nullopt is "cannot prove", and unprovable serves nothing.
+TEST(DashQcPoseGate, UnprovableMemberSetFailsClosed) {
+    NodeCoinState st;
+    seed_real_qc_serving(st, make_real_qc(/*punish_listed_member=*/false));
+    st.set_qc_pose_noop_fn(
+        [](const dash::coin::vendor::CFinalCommitment&)
+            -> std::optional<bool> { return std::nullopt; });
+
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded);
+    DeclineReport why;
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why));
+    EXPECT_EQ(why.cause, "emit-qc-real-pose-unfolded");
+    EXPECT_NE(why.value.find("pose_noop=n/a"), std::string::npos) << why.value;
+}
+
+// Null commitments are exempt by dashd's own IsNull() guard — an all-null
+// plan serves with NO capability wired, byte-unchanged. (The E1 qc-plan test
+// above already proves this through the full daemonless plan; this twin pins
+// it against the gate directly so the exemption cannot silently narrow.)
+TEST(DashQcPoseGate, NullCommitmentPlanIsExemptWithoutCapability) {
+    NodeCoinState st;
+    const auto null_qc = dash::coin::build_null_commitment(
+        dash::coin::kLlmq50_60, raw256(0x50), 0);
+    seed_real_qc_serving(st, null_qc);
+    // No set_qc_pose_noop_fn on purpose.
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded);
+    DeclineReport why;
+    EXPECT_TRUE(st.embedded_template_emit_ok(sel.work, &why))
+        << "cause=" << why.cause << " value=" << why.value;
+}

@@ -65,6 +65,7 @@
 #include <impl/dash/coin/arm_resolution.hpp>   // dash::coin::resolve_embedded_arm (#738 arm decision, one place)
 #include <impl/dash/coin/dkg_window.hpp>       // dash::coin::is_dkg_commitment_window (BLOCKER-1 guard)
 #include <impl/dash/coin/dkg_commitments.hpp>  // E1: build_daemonless_qc_plan (serve DKG windows daemonlessly)
+#include <impl/dash/coin/qc_episode_classifier.hpp>  // [QC-EPISODE] terminal-event classifier (null-arm design §8)
 #include <impl/dash/coin/vendor/bls_verify.hpp>  // E1 Phase-L: make_commitment_bls_verifier (real qc verify seam)
 #include <impl/dash/coin/chainlock_verify.hpp>   // live-path ChainLock quorum selection + BLS verify gate
 #include <impl/dash/coin/llmq_type_reconciler.hpp>  // negative-capable enabled_llmqs backstop
@@ -3472,6 +3473,32 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     return qc_member_source->lookup(t, qh).has_value();
                 });
 
+            // PoSe-fold gate (the #1083 landmine ENFORCED — see
+            // NodeCoinState::set_qc_pose_noop_fn and dkg_commitments.hpp
+            // qc_pose_pass_provably_noop). A REAL in-block commitment makes
+            // dashd's verifier PoSe-punish every member it marks invalid
+            // (specialtxman.cpp:159-174), which can flip that MN's validity
+            // in the SAME block's list — the template's committed
+            // merkleRootMNList is then wrong (bad-cbtx-mnmerkleroot, a
+            // silently lost block). No PoSe fold exists here, so the pre-emit
+            // gate refuses any real commitment whose PoSe pass is not
+            // PROVABLY a no-op: every listed member valid, judged against the
+            // SAME deterministic member list the BLS verifier already sourced
+            // (its size is the members.size() dashd's punish loop runs over).
+            // Member set gone from cache => nullopt => refuse (fail-closed).
+            // Null commitments are exempt (IsNull() guard, specialtxman.cpp
+            // :432) — today's all-null plans are byte-unchanged.
+            node_coin_state.set_qc_pose_noop_fn(
+                [qc_member_source](
+                    const dash::coin::vendor::CFinalCommitment& c)
+                    -> std::optional<bool> {
+                    auto members =
+                        qc_member_source->lookup(c.llmqType, c.quorumHash);
+                    if (!members) return std::nullopt;   // cannot prove
+                    return dash::coin::qc_pose_pass_provably_noop(
+                        c, members->size());
+                });
+
             // DEMUX: route the source's HISTORICAL getmnlistd replies away from
             // the tip-SML maintainer (a base=ZERO snapshot would overwrite it).
             // ADDITIVE, not a slot: the MN-checkpoint lane registers its own
@@ -3539,6 +3566,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             auto qc_gap_logged_h  = std::make_shared<uint32_t>(0u);
             auto qc_first_plan_h  = std::make_shared<uint32_t>(0u);
             auto qc_cold_note_done = std::make_shared<bool>(false);
+            // [QC-EPISODE] terminal-event classifier (null-arm design §8,
+            // recommendation 1 — the measurement that decides whether the
+            // null arm is ever worth building). Every qc-plan-underivable
+            // episode ends real-arrived (the flood delivered), real-mined
+            // (another miner mined it) or window-closed-null (the window
+            // closed with no real commitment ever seen — the ONLY case the
+            // null arm could ever help). One line per episode at RESUME,
+            // derived from facts the caches already hold; no new state
+            // machine, no new wire traffic.
+            auto qc_episode =
+                std::make_shared<dash::coin::QcEpisodeClassifier>();
             // NEGATIVE-CAPABLE BACKSTOP for the enabled-type table itself
             // (llmq_type_reconciler.hpp). The mainnet LLMQ_50_60 defect was
             // invisible because "required but NONEXISTENT" and "required but
@@ -3554,7 +3592,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             node_coin_state.set_qc_plan_fn(
                 [&node_coin_state, hc = header_chain.get(), qc_net, qc_cache,
                  qc_gap_logged_h, qc_first_plan_h, qc_cold_note_done,
-                 qc_type_recon, qc_recon_said]
+                 qc_type_recon, qc_recon_said, qc_episode]
                 (uint32_t next_h) -> std::optional<dash::coin::QcBlockPlan> {
                     if (*qc_first_plan_h == 0u) *qc_first_plan_h = next_h;
                     // Observe the MINED set at the tip we are building on.
@@ -3656,6 +3694,61 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                    " 1520106. The refusal clears when any miner"
                                    " mines the commitment or when the window"
                                    " above closes — whichever comes first.";
+                        }
+                    }
+                    // ── [QC-EPISODE] terminal-event classification ────────
+                    // A slot-shaped refusal starts (or re-slots) the episode;
+                    // the first derivable plan afterwards is the RESUME, and
+                    // the terminal class is read off facts the caches hold at
+                    // that instant: the commitment cache (did the flood
+                    // deliver it => real-arrived), the mnlistdiff-fed
+                    // QuorumManager (did another miner mine it => real-mined),
+                    // or neither past the window's last height
+                    // (window-closed-null — the only case dashd's null arm
+                    // would have recovered; its measured wall-clock is the
+                    // standing input to the null-arm defer/build decision).
+                    // Structural nullopts (header gap / below the serve
+                    // floor: gap.quorum_hash null) are not commitment waits
+                    // and neither start nor end an episode.
+                    {
+                        const int64_t ep_now_sec =
+                            std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::steady_clock::now()
+                                    .time_since_epoch())
+                                .count();
+                        if (!plan) {
+                            if (!gap.quorum_hash.IsNull()) {
+                                const auto ep_wb = dash::coin::qc_window_bound(
+                                    gap.params, next_h);
+                                qc_episode->observe_underivable(
+                                    next_h, gap.params.type, gap.quorum_index,
+                                    gap.quorum_hash, ep_wb.last_height,
+                                    ep_now_sec);
+                            }
+                        } else if (auto slot = qc_episode->pending()) {
+                            const bool ep_cache_has = qc_cache->has_commitment(
+                                slot->llmq_type, slot->quorum_hash);
+                            const bool ep_mined =
+                                node_coin_state.qmgr()
+                                    .find(slot->llmq_type, slot->quorum_hash)
+                                    .has_value();
+                            if (auto ended = qc_episode->observe_derivable(
+                                    next_h, ep_cache_has, ep_mined,
+                                    ep_now_sec)) {
+                                LOG_INFO
+                                    << "[QC-EPISODE] cause=qc-plan-underivable"
+                                    << " dur=" << ended->duration_sec << "s"
+                                    << " terminal="
+                                    << dash::coin::QcEpisodeClassifier
+                                           ::terminal_name(ended->terminal)
+                                    << " type="
+                                    << static_cast<int>(ended->llmq_type)
+                                    << " quorum="
+                                    << ended->quorum_hash.GetHex().substr(0, 16)
+                                    << "... qi=" << ended->quorum_index
+                                    << " h=[" << ended->first_height << ".."
+                                    << ended->resumed_height << "]";
+                            }
                         }
                     }
                     return plan;
