@@ -67,12 +67,19 @@ namespace coin
 // CoinClient's submit_block_p2p_raw. EMPTY == no embedded P2P sink present
 // (no --coin-p2p-connect peer, or --no-p2p-relay suppression).
 //
-// RETURNS true iff the block was actually relayed onto a CONNECTED coin-P2P
-// peer (H1 honest-reporting contract). submit_block_p2p_raw SILENTLY DROPS a
-// won block when the peer is disconnected, so the sink MUST report false in
+// RETURNS true iff the block was actually relayed onto at least one CONNECTED,
+// HANDSHAKED coin-P2P peer (H1 honest-reporting contract). submit_block_p2p_raw
+// drops a won block when no peer is answerable, so the sink MUST report false in
 // that case — otherwise the dispatcher would claim landed_first=p2p while the
 // block was dropped, falsely relying on a dead arm instead of the submitblock
 // RPC backup.
+//
+// RELAY POLICY (multi-peer pool): the CoinClient BROADCASTS a found block to
+// EVERY handshaked peer and returns the count. Duplicate submission of a found
+// block is a non-event — each receiving node forwards it anyway and one that
+// already holds it ignores the copy — whereas a MISSED submission is a lost
+// block with no retry, because the share is already spent. The asymmetry is the
+// whole argument for buying redundancy with bandwidth on this one message.
 using P2pRelaySink = std::function<bool(const std::vector<unsigned char>&)>;
 
 // submitblock RPC sink (ARM B, backup): the run-loop binds this to
@@ -177,8 +184,8 @@ inline BlockBroadcast broadcast_won_block(const P2pRelaySink& p2p_relay,
     if (p2p_relay) {
         try {
             // H1 honest reporting: only claim p2p_sent when the sink confirms the
-            // block was relayed onto a CONNECTED peer. A disconnected coin-P2P
-            // peer means submit_block_p2p_raw would silently drop the block, so
+            // block was relayed onto at least one HANDSHAKED peer. With no
+            // answerable coin-P2P peer submit_block_p2p_raw relays to nobody, so
             // the sink returns false and we rely on ARM B instead of masking the
             // loss with a false landed_first=p2p.
             const bool relayed = p2p_relay(block_bytes);

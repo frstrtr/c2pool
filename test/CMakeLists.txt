@@ -992,7 +992,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     # (coin/coin_peer_manager.hpp): source scoring (daemon penalty / addr-crawl
     # bonus), selection ordering, /16 Sybil group caps, anchor persistence, and
     # the pinned protected local node. Same target, no new allowlist entry.
-    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp)
+    # Fourth TU: test_dash_coin_p2p_pool.cpp — the MULTI-PEER POOL: concurrency,
+    # per-peer state isolation (a pong from one peer must never close another's
+    # ping), independent reaping of a silent peer, inv fan-in collapse to ONE
+    # getdata, the BOUNDED dedup set proven by eviction, refill after a loss, and
+    # the broadcast-to-all won-block relay policy. Same target, no new allowlist
+    # entry.
+    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp test_dash_coin_p2p_pool.cpp)
     target_link_libraries(test_dash_p2p_node PRIVATE
         GTest::gtest_main GTest::gtest
         dash_block_replay   # E1: coin/vendor/blockencodings.cpp — the full p2p Handler
