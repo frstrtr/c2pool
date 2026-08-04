@@ -405,6 +405,17 @@ using Handler = MessageHandler<
     message_qfcommit,
     message_getmnlistd,
     message_mnlistdiff,
+    // ⚠ DIP-24 ROTATED LANE — these two MUST stay in this list.
+    // A message type absent here is NOT in MessageHandler::m_handlers, so
+    // MessageHandler::parse() throws std::out_of_range and CoinClient::handle
+    // drops the payload on the "unhandled command" path — at DEBUG level.
+    // That is exactly how the rotated lane failed silently in production: the
+    // getqrinfo went out, dashd answered, and the ~600 kB qrinfo was discarded
+    // before ADD_P2P_HANDLER(qrinfo) — which existed, fully written, with a
+    // registered consumer — could ever run. Nothing in any log said so.
+    // test_dash_qrinfo_wire.cpp gates the registry membership directly.
+    message_getqrinfo,
+    message_qrinfo,
     message_govobj,
     message_govobjvote,
     message_govsync

@@ -688,6 +688,10 @@ private:
     using QrInfoConsumer = std::function<void(const vendor::CQuorumRotationInfo&)>;
     std::vector<QrInfoConsumer> m_qrinfo_consumers;
 
+    // Commands already reported as dropped-unhandled, so the WARNING fires
+    // once per distinct command instead of once per message. See handle().
+    std::set<std::string> m_unhandled_seen;
+
 public:
     CoinClient(io::io_context* context, dash::interfaces::Node* coin, config_t* config,
                const std::string& chain_label = "COIN-P2P")
@@ -1275,17 +1279,31 @@ public:
             // Command outside our Handler set — dashd peers push spork/
             // governance/quorum traffic (spork, senddsq, qsendrecsigs, ...)
             // unsolicited; ignoring them is protocol-legal for a light client.
-            // PER-PEER first-drop set: one WARNING per (peer, command), then
-            // silence. Per-peer because the interesting signal is "THIS peer
-            // speaks something we don't", and because a shared set would let
-            // the first peer's vocabulary mask every later peer's.
-            if (peer->unhandled_seen.insert(cmd).second)
+            // A DROPPED REPLY TO A REQUEST WE SENT is not benign, and this path
+            // used to be indistinguishable from it: the DIP-24 rotated lane sent
+            // getqrinfo, dashd answered, and the qrinfo landed here because the
+            // type was missing from p2p::Handler. At DEBUG nobody ever saw it and
+            // the whole lane looked like "nothing happened". So the FIRST drop of
+            // each command is a WARNING naming it and its size.
+            //
+            // PER-PEER, not shared: with a pool the interesting signal is "THIS
+            // peer speaks something we do not", and one shared set would let the
+            // first peer's vocabulary mask every later peer's — re-hiding exactly
+            // what this warning exists to surface. Bounded by (peers x distinct
+            // commands), so it still cannot flood; repeats stay at DEBUG.
+            if (peer->unhandled_seen.insert(cmd).second) {
                 LOG_WARNING << "[" << m_chain_label << "] peer " << peer->key
-                            << " sent unhandled command '" << cmd
-                            << "' — ignored (first occurrence only)";
-            else
+                            << " DROPPED unhandled p2p command '" << cmd
+                            << "' cause=not_in_handler_set value="
+                            << (rmsg ? rmsg->m_data.size() : 0) << "B (first occurrence "
+                               "for this peer; further drops log at debug). If this is a "
+                               "REPLY to something we requested, the requesting lane "
+                               "is silently dead — add the type to p2p::Handler.";
+            } else {
                 LOG_DEBUG_COIND << "[" << m_chain_label << "] ignoring unhandled command '"
-                                << cmd << "' from " << peer->key;
+                                << cmd << "' from " << peer->key << " ("
+                                << (rmsg ? rmsg->m_data.size() : 0) << " bytes)";
+            }
             return;
         } catch (const std::exception& ec)
         {
@@ -2039,12 +2057,14 @@ private:
         // exception on the coin connection — see p2p_messages.hpp.
         vendor::CQuorumRotationInfo info;
         if (!vendor::decode_quorum_rotation_info(msg->m_raw, info)) {
-            LOG_WARNING << "[" << m_chain_label << "] qrinfo: UNDECODABLE ("
-                        << msg->m_raw.size()
-                        << "B) — dropped, rotated sourcing stays fail-closed";
+            LOG_WARNING << "[" << m_chain_label << "] qrinfo REJECTED cause=undecodable"
+                        << " value=" << msg->m_raw.size()
+                        << "B — dropped, rotated sourcing stays fail-closed";
             return;
         }
-        LOG_INFO << "[" << m_chain_label << "] qrinfo: tip="
+        // RECEIVED is its own named event: before this existed, "no reply came"
+        // and "a reply came and was dropped" were indistinguishable from a log.
+        LOG_INFO << "[" << m_chain_label << "] qrinfo RECEIVED tip="
                  << info.mnListDiffTip.blockHash.GetHex().substr(0, 16)
                  << " H=" << info.mnListDiffH.blockHash.GetHex().substr(0, 16)
                  << " snapshots(active)="
@@ -2052,7 +2072,16 @@ private:
                  << info.quorumSnapshotAtHMinus2C.activeQuorumMembers.size() << "/"
                  << info.quorumSnapshotAtHMinus3C.activeQuorumMembers.size()
                  << " lastCommitmentPerIndex=" << info.lastCommitmentPerIndex.size()
-                 << " extraShare=" << (info.extraShare ? 1 : 0);
+                 << " extraShare=" << (info.extraShare ? 1 : 0)
+                 << " consumers=" << m_qrinfo_consumers.size();
+        if (m_qrinfo_consumers.empty()) {
+            // Reachable posture, not a bug: coin-P2P on but the rotated lane
+            // unwired. Say so rather than letting the reply vanish.
+            LOG_WARNING << "[" << m_chain_label << "] qrinfo DISCARDED cause=no_consumer"
+                        << " — rotated member sourcing is not wired, every rotated "
+                           "quorum stays null-serve";
+            return;
+        }
         for (auto& c : m_qrinfo_consumers) c(info);
     }
 

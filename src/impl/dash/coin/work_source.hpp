@@ -121,6 +121,10 @@ struct EmbeddedWorkInputs {
     // (per-chainparams in dashcore). Mainnet default; main_dash sets the
     // testnet value via NodeCoinState::set_mn_rr_height (E4 re-soak fix).
     int                              mn_rr_height{DASH_MN_RR_HEIGHT_MAINNET};
+    // Consensus::Params.nMasternodeMinimumConfirmations for the confirmedHash
+    // rollover projection (sml_projection.hpp): mainnet 15, testnet/devnet/
+    // regtest 1. Threaded from NodeCoinState::set_mn_min_confirmations.
+    int                              mn_min_confirmations{DASH_MN_MIN_CONFIRMATIONS_MAINNET};
 
     // E1 daemonless DKG-window seams (dkg_commitments.hpp QcBlockPlan,
     // populated by NodeCoinState::make_embedded_work_inputs when a qc plan fn
@@ -212,7 +216,9 @@ inline WorkSelection select_dash_work(
                 emb.mn_rr_height,
                 // E-SUPERBLOCK: funded superblock schedule (empty => normal block).
                 emb.superblock_payments.empty() ? nullptr
-                                                : &emb.superblock_payments);
+                                                : &emb.superblock_payments,
+                // confirmedHash rollover projection threshold (sml_projection.hpp).
+                emb.mn_min_confirmations);
         },
         dashd_fallback);
 }

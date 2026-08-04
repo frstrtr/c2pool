@@ -36,7 +36,12 @@
 ///       hashMerkleRoot (header already PoW-verified by the header chain) at
 ///       tx index 0 (the coinbase);
 ///   (c) the snapshot SML's computed merkle root == cbTx.merkleRootMNList.
-/// Any failure -> the pending quorums for that hash FAIL CLOSED (null-serve).
+/// Any failure -> the pending quorums for that hash FAIL CLOSED: their member
+/// set stays unsourced, so no commitment can be BLS-verified for those slots.
+/// That is a REFUSAL, not a null serve — the slot is unsatisfiable and the
+/// whole height falls back to dashd (cause=qc-plan-underivable). c2pool never
+/// mines a null commitment to fill the shortfall (dkg_commitments.hpp HEIGHT
+/// COMPLETENESS: doing so diverged merkleRootQuorums at block 1520106).
 ///
 /// MODIFIER (#814 review R5): the coinbase ChainLock input is the work block's
 /// OWN cbTx bestCLSignature — v23.1.7 GetNonNullCoinbaseChainlock does NOT
@@ -82,6 +87,20 @@
 /// non-rotated one (one outstanding per cycle base, deduped, FIFO-reaped) and
 /// is only made for a cycle whose geometry validates locally first.
 ///
+/// OBSERVABILITY ON THE ROTATED LANE (the defect this discipline exists for):
+/// three live soaks cached 32 type-5 (LLMQ_60_75) qfcommits and produced ZERO
+/// "[QC-MEMBERS] READY type=5", and NOTHING in the logs could distinguish
+///   (a) the getqrinfo was never sent,
+///   (b) it was sent and no reply came,
+///   (c) a reply came and was dropped.
+/// It was (c): message_qrinfo was missing from the p2p::Handler type list, so
+/// every reply died in the "unhandled command" catch at DEBUG level and
+/// on_qrinfo() was never called. Both the registry gap and the silence are
+/// fixed. Every terminal state of this lane is now a RotatedOutcome that names
+/// itself in the log with the cause=/value=/threshold= discipline the serve
+/// gate uses, and an unanswered getqrinfo TIMES OUT by name — which also stops
+/// one lost reply from wedging its cycle forever behind the dedup branch.
+///
 /// FAIL-CLOSED throughout: pre-V20 work block, base not dkgInterval-aligned,
 /// header gap, unknown type, snapshot authentication failure, member
 /// computation ambiguous (score tie / short quarter / zero operator key)
@@ -104,15 +123,85 @@
 #include <core/log.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <map>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace dash {
 namespace coin {
+
+/// Every terminal outcome of the DIP-24 ROTATED lane, so the lane can never
+/// again fail without saying which of them happened.
+///
+/// WHY THIS EXISTS: three live soaks cached 32 type-5 (LLMQ_60_75) qfcommits
+/// and produced zero READY, and the logs could not distinguish "the request
+/// was never sent" from "it was sent and no reply came" from "a reply came and
+/// was dropped". Each rotated exit below now names itself with the same
+/// cause=/value=/threshold= discipline the serve gate uses.
+enum class RotatedOutcome {
+    kNone = 0,
+    // request() / request_rotated() — the SEND side
+    kRequestSent,
+    kRequestDeduped,             // a getqrinfo for this cycle is already out
+    kRequestAlreadyReady,        // the cycle is served; no traffic needed
+    kRefusedUnknownType,
+    kRefusedNotRotated,
+    kRefusedNoSendSeam,          // set_send_getqrinfo() never called
+    kRefusedIntervalZero,
+    kRefusedBaseHeaderMissing,   // header chain does not hold the quorum base
+    kRefusedIndexOutOfRange,     // quorumIndex >= signingActiveQuorumCount
+    kRefusedCycleHeaderGap,      // cycle-base header not held
+    kRefusedBaseUnaligned,       // cycle base not on a dkgInterval boundary
+    kRefusedCycleSpanTooShallow, // chain shorter than base-8-3C
+    kRefusedPreV20,
+    // on_qrinfo() — the REPLY side
+    kReplyNoCbTx,
+    kReplyUnsolicited,           // matched no outstanding request
+    kReplyTypeVanished,
+    kReplyNotFullList,
+    kReplyAuthFailed,
+    // finalize_rotated() — the COMPUTE side
+    kComputeAmbiguous,
+    kNoSlotHeaders,
+    kReady,
+    // expire_rotated_requests()
+    kTimedOut,                   // getqrinfo sent, no reply inside the window
+};
+
+inline const char* rotated_outcome_name(RotatedOutcome o)
+{
+    switch (o) {
+    case RotatedOutcome::kNone:                     return "none";
+    case RotatedOutcome::kRequestSent:              return "request_sent";
+    case RotatedOutcome::kRequestDeduped:           return "request_deduped";
+    case RotatedOutcome::kRequestAlreadyReady:      return "already_ready";
+    case RotatedOutcome::kRefusedUnknownType:       return "unknown_llmq_type";
+    case RotatedOutcome::kRefusedNotRotated:        return "type_not_rotated";
+    case RotatedOutcome::kRefusedNoSendSeam:        return "no_send_seam";
+    case RotatedOutcome::kRefusedIntervalZero:      return "dkg_interval_zero";
+    case RotatedOutcome::kRefusedBaseHeaderMissing: return "base_header_not_held";
+    case RotatedOutcome::kRefusedIndexOutOfRange:   return "quorum_index_out_of_range";
+    case RotatedOutcome::kRefusedCycleHeaderGap:    return "cycle_base_header_not_held";
+    case RotatedOutcome::kRefusedBaseUnaligned:     return "cycle_base_unaligned";
+    case RotatedOutcome::kRefusedCycleSpanTooShallow: return "cycle_span_too_shallow";
+    case RotatedOutcome::kRefusedPreV20:            return "pre_v20_work_block";
+    case RotatedOutcome::kReplyNoCbTx:              return "reply_no_type5_cbtx";
+    case RotatedOutcome::kReplyUnsolicited:         return "reply_unsolicited";
+    case RotatedOutcome::kReplyTypeVanished:        return "reply_type_vanished";
+    case RotatedOutcome::kReplyNotFullList:         return "reply_not_full_list";
+    case RotatedOutcome::kReplyAuthFailed:          return "reply_dip4_auth_failed";
+    case RotatedOutcome::kComputeAmbiguous:         return "member_compute_ambiguous";
+    case RotatedOutcome::kNoSlotHeaders:            return "no_slot_base_headers";
+    case RotatedOutcome::kReady:                    return "ready";
+    case RotatedOutcome::kTimedOut:                 return "request_timed_out";
+    }
+    return "unnamed";   // unreachable; a new enumerator without a name is a bug
+}
 
 class QuorumMemberSource {
 public:
@@ -152,11 +241,23 @@ public:
     /// quorum is admitted, so the member set is ready by the DKG-window height.
     void request(uint8_t llmq_type, const uint256& quorum_hash)
     {
+        // request() is kicked on every admitted qfcommit, which makes it the
+        // one reliable heartbeat this class has. Use it to retire rotated
+        // requests that were sent and never answered — otherwise a single
+        // unanswered getqrinfo wedges its cycle FOREVER (every later slot of
+        // that cycle dedupes against the stuck pending and sends nothing).
+        // That is precisely what a dropped reply produced in the soaks.
+        expire_rotated_requests();
+
         const Key key{llmq_type, quorum_hash};
         if (m_ready.count(key) || m_pending.count(key)) return;
 
         const LlmqParamsView* p = params_for(llmq_type);
-        if (p == nullptr) return;                       // unknown type => fail closed
+        if (p == nullptr) {                             // unknown type => fail closed
+            note_rotated(RotatedOutcome::kRefusedUnknownType,
+                         "type=" + std::to_string(static_cast<int>(llmq_type)));
+            return;
+        }
         if (p->use_rotation) {
             // ── ROTATED (DIP-24, e.g. llmq_60_75) ───────────────────────────
             // A rotated quorum's member set is NOT derivable from a single
@@ -170,14 +271,32 @@ public:
             // does: quorumIndex = baseHeight % dkgInterval, and the cycle base
             // is baseHeight - quorumIndex. Upstream also REFUSES an index at or
             // beyond signingActiveQuorumCount (`return {}`), so do we.
+            const std::string who =
+                "type=" + std::to_string(static_cast<int>(llmq_type))
+                + " quorum=" + quorum_hash.GetHex().substr(0, 16);
             auto rot_base_h = m_height_of_hash(quorum_hash);
-            if (!rot_base_h) return;                    // base header not held
-            if (p->dkg_interval == 0) return;
+            if (!rot_base_h) {                          // base header not held
+                note_rotated(RotatedOutcome::kRefusedBaseHeaderMissing, who);
+                return;
+            }
+            if (p->dkg_interval == 0) {
+                note_rotated(RotatedOutcome::kRefusedIntervalZero, who);
+                return;
+            }
             const uint32_t quorum_index = *rot_base_h % p->dkg_interval;
-            if (quorum_index >= p->signing_active_quorum_count) return;
+            if (quorum_index >= p->signing_active_quorum_count) {
+                note_rotated(RotatedOutcome::kRefusedIndexOutOfRange,
+                             who + " value=" + std::to_string(quorum_index)
+                             + " threshold=" + std::to_string(p->signing_active_quorum_count));
+                return;
+            }
             const uint32_t cycle_h = *rot_base_h - quorum_index;
             auto cycle_hash = m_hash_at_height(cycle_h);
-            if (!cycle_hash || cycle_hash->IsNull()) return;   // header gap
+            if (!cycle_hash || cycle_hash->IsNull()) {   // header gap
+                note_rotated(RotatedOutcome::kRefusedCycleHeaderGap,
+                             who + " cycle_base_h=" + std::to_string(cycle_h));
+                return;
+            }
             request_rotated(llmq_type, *cycle_hash);
             return;
         }
@@ -273,36 +392,72 @@ public:
     /// per-index entry point is request(), which derives it.
     bool request_rotated(uint8_t llmq_type, const uint256& quorum_hash)
     {
+        const std::string who =
+            "type=" + std::to_string(static_cast<int>(llmq_type))
+            + " cycle_base=" + quorum_hash.GetHex().substr(0, 16);
+
         const LlmqParamsView* p = params_for(llmq_type);
-        if (p == nullptr || !p->use_rotation) return false;
-        if (!m_send_qrinfo) return false;
+        if (p == nullptr)
+            return note_rotated_false(RotatedOutcome::kRefusedUnknownType, who);
+        if (!p->use_rotation)
+            return note_rotated_false(RotatedOutcome::kRefusedNotRotated, who);
+        // The one refusal that is a WIRING fault, not a data fault: with no
+        // send seam the lane emits nothing at all and every rotated quorum
+        // stays unsourced forever (its slots refuse; they are NOT null-served
+        // -- see the 1520106 incident). It must never be silent again.
+        if (!m_send_qrinfo)
+            return note_rotated_false(RotatedOutcome::kRefusedNoSendSeam, who);
 
         auto base_h = m_height_of_hash(quorum_hash);
-        if (!base_h) return false;
-        if (p->dkg_interval == 0 || *base_h % p->dkg_interval != 0) return false;
+        if (!base_h)
+            return note_rotated_false(RotatedOutcome::kRefusedBaseHeaderMissing, who);
+        if (p->dkg_interval == 0)
+            return note_rotated_false(RotatedOutcome::kRefusedIntervalZero, who);
+        if (*base_h % p->dkg_interval != 0)
+            return note_rotated_false(
+                RotatedOutcome::kRefusedBaseUnaligned,
+                who + " value=" + std::to_string(*base_h)
+                + " threshold=dkg_interval:" + std::to_string(p->dkg_interval));
         // Need H-3C to exist: base - 8 - 3*C.
         const uint64_t span = static_cast<uint64_t>(kWorkDiffDepth)
                             + 3ull * p->dkg_interval;
-        if (*base_h < span) return false;
-        if (*base_h - kWorkDiffDepth < quorum_members_v20_floor()) return false;
+        if (*base_h < span)
+            return note_rotated_false(
+                RotatedOutcome::kRefusedCycleSpanTooShallow,
+                who + " value=" + std::to_string(*base_h)
+                + " threshold=" + std::to_string(span));
+        if (*base_h - kWorkDiffDepth < quorum_members_v20_floor())
+            return note_rotated_false(
+                RotatedOutcome::kRefusedPreV20,
+                who + " value=" + std::to_string(*base_h - kWorkDiffDepth)
+                + " threshold=" + std::to_string(quorum_members_v20_floor()));
 
         const Key ckey{llmq_type, quorum_hash};
         // ONE outstanding getqrinfo per cycle base: the 32 slots of a cycle all
         // resolve to this same request, and a duplicate would draw a second
         // 600 kB reply that no await matches (the R1 hazard, per-cycle form).
-        if (m_rotated_pending.count(ckey)) return true;
+        if (m_rotated_pending.count(ckey)) {
+            m_last_rotated = RotatedOutcome::kRequestDeduped;
+            return true;
+        }
         // The cycle's index-0 quorum hash IS the cycle base hash, so a ready
         // cycle needs no re-request.
-        if (m_ready.count(ckey)) return true;
+        if (m_ready.count(ckey)) {
+            m_last_rotated = RotatedOutcome::kRequestAlreadyReady;
+            return true;
+        }
         reap_rotated_if_needed();
 
-        m_rotated_pending[ckey] = *base_h;
+        m_rotated_pending[ckey] = RotatedPending{*base_h, m_now()};
         m_rotated_fifo.push_back(ckey);
         m_send_qrinfo(std::vector<uint256>{}, quorum_hash, /*extra_share=*/false);
-        LOG_INFO << "[QC-MEMBERS] sourcing qrinfo for ROTATED type="
-                 << static_cast<int>(llmq_type) << " quorum="
-                 << quorum_hash.GetHex().substr(0, 16)
-                 << " cycle_base_h=" << *base_h;
+        m_last_rotated = RotatedOutcome::kRequestSent;
+        LOG_INFO << "[QC-MEMBERS] rotated getqrinfo SENT outcome="
+                 << rotated_outcome_name(RotatedOutcome::kRequestSent)
+                 << " " << who << " cycle_base_h=" << *base_h
+                 << " timeout=" << kRotatedRequestTimeoutSec << "s"
+                 << " (awaiting a qrinfo RECEIVED line; if none appears a "
+                    "TIMED OUT line will)";
         return true;
     }
 
@@ -316,28 +471,37 @@ public:
     {
         // Which outstanding rotated request is this? Bind by the H diff's
         // height: H must be (cycle_base - 8) for exactly one pending.
+        // Named ARRIVAL: this is the line whose absence made "no reply came"
+        // and "a reply came and was dropped" indistinguishable in the soaks.
+        LOG_INFO << "[QC-MEMBERS] qrinfo ARRIVED at member source: "
+                 << "lastCommitmentPerIndex=" << info.lastCommitmentPerIndex.size()
+                 << " outstanding=" << m_rotated_pending.size();
+
         vendor::CCbTx probe_cbtx;
         if (info.mnListDiffH.cbTx.type != 5
             || !vendor::parse_cbtx(info.mnListDiffH.cbTx.extra_payload, probe_cbtx)
             || probe_cbtx.nHeight < 0) {
-            LOG_WARNING << "[QC-MEMBERS] qrinfo: mnListDiffH carries no usable "
-                           "type-5 cbTx — fail closed";
+            note_rotated(RotatedOutcome::kReplyNoCbTx,
+                         "mnListDiffH carries no usable type-5 cbTx");
             return std::nullopt;
         }
         const uint64_t h_height = static_cast<uint64_t>(probe_cbtx.nHeight);
 
         const Key* match = nullptr;
         uint32_t   base_h = 0;
-        for (const auto& [key, base] : m_rotated_pending) {
-            if (static_cast<uint64_t>(base) == h_height + kWorkDiffDepth) {
+        for (const auto& [key, pend] : m_rotated_pending) {
+            if (static_cast<uint64_t>(pend.cycle_base_height)
+                == h_height + kWorkDiffDepth) {
                 match = &key;
-                base_h = base;
+                base_h = pend.cycle_base_height;
                 break;
             }
         }
         if (match == nullptr) {
-            LOG_WARNING << "[QC-MEMBERS] qrinfo at H=" << h_height
-                        << " matches no outstanding rotated request — dropped";
+            note_rotated(RotatedOutcome::kReplyUnsolicited,
+                         "value=H:" + std::to_string(h_height)
+                         + " threshold=outstanding:"
+                         + std::to_string(m_rotated_pending.size()));
             return std::nullopt;
         }
         const Key key = *match;
@@ -345,6 +509,8 @@ public:
         const LlmqParamsView* p = params_for(key.llmqType);
         if (p == nullptr || !p->use_rotation || p->dkg_interval == 0) {
             erase_rotated_pending(key);
+            note_rotated(RotatedOutcome::kReplyTypeVanished,
+                         "type=" + std::to_string(static_cast<int>(key.llmqType)));
             return std::nullopt;
         }
         const uint32_t C = p->dkg_interval;
@@ -378,20 +544,23 @@ public:
             // applied-onto-empty SML root must equal cbTx.merkleRootMNList, which
             // an incremental diff cannot satisfy.
             if (!diffs[i]->deletedMNs.empty()) {
-                LOG_WARNING << "[QC-MEMBERS] qrinfo cycle diff " << i
-                            << " deletes " << diffs[i]->deletedMNs.size()
-                            << " entries — not a FULL list, fail closed";
                 erase_rotated_pending(key);
+                note_rotated(RotatedOutcome::kReplyNotFullList,
+                             "cycle_diff=" + std::to_string(i)
+                             + " value=deletedMNs:"
+                             + std::to_string(diffs[i]->deletedMNs.size())
+                             + " threshold=0 — whole reply fails closed");
                 return std::nullopt;
             }
             vendor::CCbTx cbtx;
             auto sml = authenticate_historical_snapshot(
                 *diffs[i], expect_h, m_merkle_root_of_hash, cbtx, "QC-MEMBERS");
             if (!sml) {
-                LOG_WARNING << "[QC-MEMBERS] qrinfo cycle diff " << i
-                            << " failed DIP-4 authentication at expected h="
-                            << expect_h << " — whole reply fails closed";
                 erase_rotated_pending(key);
+                note_rotated(RotatedOutcome::kReplyAuthFailed,
+                             "cycle_diff=" + std::to_string(i)
+                             + " expected_h=" + std::to_string(expect_h)
+                             + " — whole reply fails closed");
                 return std::nullopt;
             }
             out.smls[i] = std::move(*sml);
@@ -449,10 +618,11 @@ public:
         auto sets = vendor::compute_quorum_members_by_quarter_rotation(
             rp, cycles, snaps);
         if (!sets) {
-            LOG_WARNING << "[QC-MEMBERS] rotated member computation AMBIGUOUS "
-                           "for cycle_base_h=" << in.cycle_base_height
-                        << " type=" << static_cast<int>(in.llmq_type)
-                        << " -> fail closed (null-serve for the whole cycle)";
+            note_rotated(RotatedOutcome::kComputeAmbiguous,
+                         "type=" + std::to_string(static_cast<int>(in.llmq_type))
+                         + " cycle_base_h=" + std::to_string(in.cycle_base_height)
+                         + " -> fail closed (whole cycle stays unsourced; its "
+                           "slots refuse, they are NOT null-served)");
             return 0;
         }
 
@@ -470,23 +640,71 @@ public:
             ++published;
         }
         if (published == 0) {
-            LOG_WARNING << "[QC-MEMBERS] rotated cycle_base_h="
-                        << in.cycle_base_height << " type="
-                        << static_cast<int>(in.llmq_type)
-                        << " computed " << sets->size() << " member sets but NO "
-                           "slot base-block header is held -> nothing published, "
-                           "cycle stays null-serve";
+            note_rotated(RotatedOutcome::kNoSlotHeaders,
+                         "type=" + std::to_string(static_cast<int>(in.llmq_type))
+                         + " cycle_base_h=" + std::to_string(in.cycle_base_height)
+                         + " value=published:0 threshold=computed:"
+                         + std::to_string(sets->size())
+                         + " -- no slot base-block header held; nothing published, "
+                           "cycle stays unsourced (its slots refuse)");
         } else {
-            LOG_INFO << "[QC-MEMBERS] ROTATED READY type="
-                     << static_cast<int>(in.llmq_type) << " cycle_base_h="
-                     << in.cycle_base_height << " slots=" << published << "/"
-                     << sets->size() << " members=" << p->size
+            m_last_rotated = RotatedOutcome::kReady;
+            // Mirrors the non-rotated "[QC-MEMBERS] READY type=" token so a
+            // single grep answers "did ANY type reach ready?" for both lanes.
+            LOG_INFO << "[QC-MEMBERS] READY type="
+                     << static_cast<int>(in.llmq_type)
+                     << " members=" << p->size
+                     << " outcome=" << rotated_outcome_name(RotatedOutcome::kReady)
+                     << " lane=ROTATED cycle_base_h=" << in.cycle_base_height
+                     << " slots=" << published << "/" << sets->size()
                      << " (real-commitment serving ENABLED for this cycle)";
         }
         return published;
     }
 
     size_t rotated_pending_count() const { return m_rotated_pending.size(); }
+
+    /// The most recent named outcome of the rotated lane. Exists so a test can
+    /// assert that a failure NAMED ITSELF, not merely that it failed — the
+    /// property the soaks could not check.
+    RotatedOutcome last_rotated_outcome() const { return m_last_rotated; }
+
+    /// Monotonic clock seam (seconds). Defaults to steady_clock; tests inject.
+    using NowSeconds = std::function<int64_t()>;
+    void set_clock(NowSeconds f) { if (f) m_now = std::move(f); }
+
+    /// A getqrinfo the peer never answered must EXPIRE, for two reasons that
+    /// the soaks demonstrated together:
+    ///   (1) DIAGNOSTIC — "sent, never answered" is otherwise indistinguishable
+    ///       from "sent, answered, dropped"; only one of them is a peer problem;
+    ///   (2) LIVENESS — a stuck pending makes every later slot of that cycle
+    ///       take the dedup branch and send nothing, so ONE lost reply wedges
+    ///       the cycle permanently. Expiry re-opens it for the next qfcommit.
+    /// Returns the number expired. Driven off request() (the qfcommit kick).
+    size_t expire_rotated_requests()
+    {
+        const int64_t now = m_now();
+        std::vector<Key> dead;
+        for (const auto& [key, pend] : m_rotated_pending) {
+            if (now - pend.sent_at >= kRotatedRequestTimeoutSec)
+                dead.push_back(key);
+        }
+        for (const auto& key : dead) {
+            const auto it = m_rotated_pending.find(key);
+            const uint32_t base_h = it->second.cycle_base_height;
+            const int64_t  age    = now - it->second.sent_at;
+            erase_rotated_pending(key);
+            note_rotated(RotatedOutcome::kTimedOut,
+                         "type=" + std::to_string(static_cast<int>(key.llmqType))
+                         + " cycle_base=" + key.quorumHash.GetHex().substr(0, 16)
+                         + " cycle_base_h=" + std::to_string(base_h)
+                         + " value=age_s:" + std::to_string(age)
+                         + " threshold=" + std::to_string(kRotatedRequestTimeoutSec)
+                         + " — NO qrinfo reply reached the member source; cycle "
+                           "re-opened for re-request");
+        }
+        return dead.size();
+    }
 
     /// Consume a historical work-block snapshot. Returns TRUE iff the diff
     /// matched an outstanding await (so the caller must NOT also feed the
@@ -528,6 +746,28 @@ private:
     // llmq/snapshot.h @ v23.1.7: WORK_DIFF_DEPTH = 8.
     static constexpr uint32_t kWorkDiffDepth = 8;
 
+    /// How long a getqrinfo may stay outstanding before it is declared dead.
+    /// Sized well above a normal round trip for a ~600 kB reply while staying
+    /// far under DASH's 2.5-minute block time, so a wedged cycle re-opens
+    /// within the same block it was requested in.
+    static constexpr int64_t kRotatedRequestTimeoutSec = 120;
+
+    /// Record + LOG a named rotated outcome. EVERY exit of the rotated lane
+    /// goes through here (or sets m_last_rotated directly for the two
+    /// non-events, dedup and already-ready), so no rotated path can end
+    /// without saying which outcome it was.
+    void note_rotated(RotatedOutcome o, const std::string& detail)
+    {
+        m_last_rotated = o;
+        LOG_WARNING << "[QC-MEMBERS] rotated lane cause="
+                    << rotated_outcome_name(o) << " " << detail;
+    }
+    bool note_rotated_false(RotatedOutcome o, const std::string& detail)
+    {
+        note_rotated(o, detail);
+        return false;
+    }
+
     struct Key {
         uint8_t llmqType;
         uint256 quorumHash;
@@ -546,6 +786,12 @@ private:
         uint256  quorum_hash;
         uint32_t work_height{0};
         uint256  work_hash;
+    };
+    /// An outstanding getqrinfo. `sent_at` is what makes "no reply came" a
+    /// NAMED, TIMED outcome instead of an entry that sits there forever.
+    struct RotatedPending {
+        uint32_t cycle_base_height{0};
+        int64_t  sent_at{0};
     };
 
     const LlmqParamsView* params_for(uint8_t type) const
@@ -588,7 +834,8 @@ private:
             diff, expect_h, m_merkle_root_of_hash, cbtx_out, "QC-MEMBERS");
         if (!sml) {
             LOG_WARNING << "[QC-MEMBERS] " << keys.size()
-                        << " quorum(s) fail closed (null-serve)";
+                        << " quorum(s) fail closed (member set unsourced -> "
+                           "those slots refuse, they are NOT null-served)";
         }
         return sml;
     }
@@ -628,7 +875,8 @@ private:
         } else {
             LOG_WARNING << "[QC-MEMBERS] member computation ambiguous for quorum "
                         << pend.quorum_hash.GetHex().substr(0, 16)
-                        << " -> fail closed (null-serve)";
+                        << " -> fail closed (member set unsourced -> this slot "
+                           "refuses, it is NOT null-served)";
         }
     }
 
@@ -642,13 +890,25 @@ private:
 
     // Same bound + rationale as reap_if_needed(), for the qrinfo lane. A
     // rotated cycle is 32 slots wide, so far fewer outstanding requests are
-    // ever legitimate; an evicted cycle simply stays null-serve.
+    // ever legitimate; an evicted cycle simply stays unsourced, so its slots
+    // refuse (fail-safe) — they are never null-served.
     static constexpr size_t kRotatedPendingCap = 8;
     void reap_rotated_if_needed()
     {
         while (m_rotated_pending.size() >= kRotatedPendingCap
                && !m_rotated_fifo.empty()) {
-            m_rotated_pending.erase(m_rotated_fifo.front());
+            const Key victim = m_rotated_fifo.front();
+            auto it = m_rotated_pending.find(victim);
+            if (it != m_rotated_pending.end()) {
+                LOG_WARNING << "[QC-MEMBERS] rotated lane cause=pending_cap_evicted"
+                            << " type=" << static_cast<int>(victim.llmqType)
+                            << " cycle_base_h=" << it->second.cycle_base_height
+                            << " value=" << m_rotated_pending.size()
+                            << " threshold=" << kRotatedPendingCap
+                            << " — oldest outstanding getqrinfo dropped, that "
+                               "cycle stays null-serve until re-requested";
+                m_rotated_pending.erase(it);
+            }
             m_rotated_fifo.pop_front();
         }
     }
@@ -663,7 +923,8 @@ private:
 
     // Bound outstanding requests: evict the OLDEST pending (and its await
     // membership) once the cap is hit — a dead peer must not grow state
-    // forever, and an evicted quorum simply stays null-serve (fail-safe).
+    // forever, and an evicted quorum simply stays unsourced, so its slot
+    // refuses (fail-safe) — it is never null-served.
     void reap_if_needed()
     {
         while (m_pending.size() >= kPendingCap && !m_pending_fifo.empty()) {
@@ -708,9 +969,14 @@ private:
     std::deque<Key> m_pending_fifo;
     std::map<uint256, std::vector<Key>> m_await;   // work-block hash -> waiters
 
-    SendGetQrInfo             m_send_qrinfo;
-    std::map<Key, uint32_t>   m_rotated_pending;   // cycle-base key -> cycle base h
-    std::deque<Key>           m_rotated_fifo;
+    SendGetQrInfo                  m_send_qrinfo;
+    std::map<Key, RotatedPending>  m_rotated_pending;  // cycle-base key -> when/where
+    std::deque<Key>                m_rotated_fifo;
+    RotatedOutcome                 m_last_rotated{RotatedOutcome::kNone};
+    NowSeconds                     m_now{[] {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::steady_clock::now().time_since_epoch()).count();
+    }};
 };
 
 } // namespace coin

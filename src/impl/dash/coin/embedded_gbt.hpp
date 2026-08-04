@@ -29,6 +29,7 @@
 /// the actual coin_rpc->getwork() output, logging match/mismatch.
 
 #include <impl/dash/coin/mn_state_machine.hpp>
+#include <impl/dash/coin/sml_projection.hpp>    // confirmedHash rollover pass + collateral-spend predicate
 #include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/subsidy.hpp>
 #include <impl/dash/coin/governance_object.hpp>   // SuperblockPayment (daemonless superblock outputs)
@@ -158,7 +159,13 @@ inline DashWorkData build_embedded_workdata(
     // confidently-UNFUNDED superblock height serves normally). The MN payment /
     // platform burn / mempool selection above are untouched — superblock
     // outputs are purely additive, matching dashcore GetBlockTxOuts ordering.
-    const std::vector<SuperblockPayment>* superblock_payments = nullptr)
+    const std::vector<SuperblockPayment>* superblock_payments = nullptr,
+    // Network seam: Consensus::Params.nMasternodeMinimumConfirmations for the
+    // confirmedHash rollover projection (sml_projection.hpp). Mainnet default
+    // (15, dashcore chainparams.cpp:177); testnet/devnet/regtest are 1. Only
+    // consulted when the CCbTx seams (sml + qmgr) are supplied. SAFE-ADDITIVE:
+    // appended last so every existing positional caller is byte-unchanged.
+    int mn_min_confirmations = DASH_MN_MIN_CONFIRMATIONS_MAINNET)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
@@ -182,6 +189,37 @@ inline DashWorkData build_embedded_workdata(
     // accrual below is exactly the platform-reward term.
     auto [selected, total_fees] =
         mempool.get_sorted_txs_with_fees(MAX_BLOCK_BYTES, /*exclude_special=*/true);
+    // MN-collateral spend filter (sml_projection.hpp, FINDING-2). The C-3
+    // special-tx cut above is NOT sufficient: dashd's verifier removes a
+    // masternode from the list when ANY block tx — special or not — spends
+    // its collateral outpoint (specialtxman.cpp:457-464, no type guard), and
+    // that removal changes the merkleRootMNList the CbTx must commit. A plain
+    // type-0 collateral spend selected here would poison EVERY template built
+    // while it sits in the mempool (bad-cbtx-mnmerkleroot on a winning share
+    // = a silently lost block). No tx is ever mandatory, so EXCLUDING it is
+    // consensus-clean — dashd's own miner folds the removal instead, but the
+    // exclusion needs no second root computation. Fee follows the tx out of
+    // the template so block_value / mn_payment below stay exact.
+    {
+        size_t kept = 0;
+        for (size_t i = 0; i < selected.size(); ++i) {
+            uint256 protx;
+            if (tx_spends_mn_collateral(mnstates, selected[i].tx, &protx)) {
+                total_fees -= selected[i].fee;
+                LOG_WARNING << "[GBT-EMB] excluding tx "
+                            << dash::coin::dash_txid(selected[i].tx).GetHex().substr(0, 16)
+                            << " from template h=" << (prev_height + 1)
+                            << ": spends collateral of MN "
+                            << protx.GetHex().substr(0, 16)
+                            << " (verifier would remove the MN and expect a "
+                            << "different merkleRootMNList)";
+                continue;
+            }
+            if (kept != i) selected[kept] = std::move(selected[i]);
+            ++kept;
+        }
+        selected.resize(kept);
+    }
     int64_t block_value      = reward + static_cast<int64_t>(total_fees);
     int64_t platform_reward  = compute_dash_platform_reward_post_v20_mn_rr(
         w.m_height, mn_rr_height);
@@ -213,6 +251,20 @@ inline DashWorkData build_embedded_workdata(
     // (node/miner.cpp CreateNewBlock), and the daemonless template mirrors
     // that for byte parity. Zero fee, zero in/out; consensus-checked via
     // the NodeCoinState emit gate against the same deterministic plan.
+    //
+    // ██ PHASE-L LANDMINE — PoSe punishment on REAL commitments ██
+    // dashd's verifier PoSe-punishes every !validMembers[i] quorum member
+    // when a NON-NULL commitment is in the block (specialtxman.cpp:159-174
+    // HandleQuorumCommitment -> PoSePunish(CalcPenalty(66))), and a penalty
+    // that crosses the ban threshold flips that MN's isValid IN THE SAME
+    // BLOCK's MN list — changing the merkleRootMNList THIS coinbase commits.
+    // Null commitments are exempt (specialtxman.cpp:432 IsNull() guard), so
+    // today's all-null qc plans cannot trip it and the projected root above
+    // stays correct. THE DAY Phase L serves REAL (non-null) commitments,
+    // this inclusion site MUST fold the PoSe pass into the committed MN root
+    // (mirror of the confirmedHash rollover projection above) or every block
+    // carrying a commitment with a failed member is bad-cbtx-mnmerkleroot —
+    // a silently lost block. Do not ship real commitments without it.
     if (qc_commitments != nullptr) {
         for (const auto& c : *qc_commitments) {
             MutableTransaction qtx = build_qc_tx(w.m_height, c);
@@ -361,8 +413,34 @@ inline DashWorkData build_embedded_workdata(
         // (pre-MN_RR) the balance carries forward unchanged, also correct.
         const int64_t accrued_credit_pool =
             last_observed_credit_pool + platform_reward;
+        // confirmedHash rollover (sml_projection.hpp, FINDING-1): the tip SML
+        // is the verifier's PREV list, not the list for the block being
+        // templated — dashd's rebuild starts with a purely height-driven
+        // confirmation pass (specialtxman.cpp:206-215) that flips a
+        // registered MN's confirmedHash at the crossing height with NO tx
+        // causing it. Commit the PROJECTED root, not the tip root. When the
+        // projection is unprojectable (a null-confirmedHash entry with no
+        // known registration height) the root below may be stale; the
+        // NodeCoinState viability + pre-emit gates fail closed on exactly
+        // that condition ("mn-confirm-rollover-pending"), so this build can
+        // never be SERVED — the warning is for callers outside that gate.
+        auto proj = project_sml_confirmations(
+            *sml, prev_height, prev_hash, mnstates, mn_min_confirmations);
+        if (!proj.ok) {
+            LOG_WARNING << "[GBT-EMB] confirmedHash rollover UNPROJECTABLE at h="
+                        << (prev_height + 1) << ": SML entry "
+                        << proj.unprojectable_protx.GetHex().substr(0, 16)
+                        << " has null confirmedHash but no known registration "
+                        << "height — committed merkleRootMNList may be stale "
+                        << "(emit gate refuses this template)";
+        } else if (proj.confirmed > 0) {
+            LOG_INFO << "[GBT-EMB] confirmedHash rollover: " << proj.confirmed
+                     << " MN(s) cross nMasternodeMinimumConfirmations at h="
+                     << (prev_height + 1)
+                     << " — committing projected merkleRootMNList";
+        }
         vendor::CCbTx cb = build_embedded_cbtx(
-            prev_height, *sml, *qmgr, best_cl_height, best_cl_sig,
+            prev_height, proj.sml, *qmgr, best_cl_height, best_cl_sig,
             accrued_credit_pool, quorum_root_override);
         w.m_coinbase_payload = encode_cbtx(cb);
     } else {

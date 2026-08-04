@@ -717,6 +717,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     # for the same reason as test_dash_qrinfo.cpp: this target IS in the build.yml
     # "Build tests" --target allowlist, and a standalone target would be a
     # NOT_BUILT sentinel (the push bot lacks `workflow` scope, #769).
+    # test_dash_mn_confirm_rollover.cpp / test_dash_collateral_spend_filter.cpp
+    # (sml_projection.hpp): the two silent block-loss defects of the committed
+    # merkleRootMNList — the height-driven confirmedHash rollover
+    # (specialtxman.cpp:206-215) and MN-collateral spends by normal type-0 txs
+    # (specialtxman.cpp:457-464). Folded here for the same reason as the other
+    # leaves above: this target IS in the build.yml "Build tests" --target
+    # allowlist, and a standalone target would be a NOT_BUILT sentinel (#769).
     add_executable(test_dash_embedded_gbt
         test_dash_embedded_gbt.cpp
         test_dash_embedded_cbtx_byte_parity.cpp
@@ -725,7 +732,9 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_rotated_quorum_members.cpp
         test_dash_dkg_commitments.cpp
         test_dash_sml_quorum_db.cpp
-        test_dash_embedded_oracle_shadow.cpp)
+        test_dash_embedded_oracle_shadow.cpp
+        test_dash_mn_confirm_rollover.cpp
+        test_dash_collateral_spend_filter.cpp)
     target_compile_definitions(test_dash_embedded_gbt PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_embedded_gbt PRIVATE
@@ -841,6 +850,24 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_dash_node_coin_state PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_node_coin_state "" AUTO)
+
+    # bestCL template gate: dashcore's CheckCbTxBestChainlock rule (consensus-
+    # exact) vs the original freshness proxy, plus the fail-closed fences
+    # (missing prev-block committed CL, unverified advance, unjustified
+    # provenance). DELIBERATELY NOT BLS-gated: the gate is a pure state
+    # decision over heights + provenance and must be exercised on EVERY build,
+    # including a BLS-dark one — proving the relaxation cannot degenerate into
+    # a no-op there is the whole point of two of its cases. Same header-only
+    # link set as test_dash_node_coin_state.
+    add_executable(test_dash_bestcl_gate test_dash_bestcl_gate.cpp)
+    target_link_libraries(test_dash_bestcl_gate PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_bestcl_gate PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_bestcl_gate "" AUTO)
 
     # DASHWorkSource (dash::stratum): concrete core::stratum::IWorkSource for
     # DASH X11 -- 4b construction + contract KAT. Links the dash_stratum OBJECT
@@ -992,13 +1019,23 @@ if (BUILD_TESTING AND GTest_FOUND)
     # (coin/coin_peer_manager.hpp): source scoring (daemon penalty / addr-crawl
     # bonus), selection ordering, /16 Sybil group caps, anchor persistence, and
     # the pinned protected local node. Same target, no new allowlist entry.
-    # Fourth TU: test_dash_coin_p2p_pool.cpp — the MULTI-PEER POOL: concurrency,
-    # per-peer state isolation (a pong from one peer must never close another's
-    # ping), independent reaping of a silent peer, inv fan-in collapse to ONE
-    # getdata, the BOUNDED dedup set proven by eviction, refill after a loss, and
-    # the broadcast-to-all won-block relay policy. Same target, no new allowlist
-    # entry.
-    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp test_dash_coin_p2p_pool.cpp)
+    # Fourth and fifth TUs on this target:
+    #  * test_dash_coin_p2p_pool.cpp — the MULTI-PEER POOL: concurrency, per-peer
+    #    state isolation (a pong from one peer must never close another's ping),
+    #    independent reaping, inv fan-in collapsing to ONE getdata, the BOUNDED
+    #    dedup set proven by eviction, refill after a loss, broadcast relay.
+    #  * test_dash_qrinfo_wire.cpp — the DIP-24 rotated lane driven from RAW WIRE
+    #    BYTES through p2p::Handler::parse() into QuorumMemberSource.
+    # THIS TARGET, not test_dash_embedded_gbt: the qrinfo gate is Handler REGISTRY
+    # membership, which needs the full p2p Handler instantiated, which ODR-uses
+    # CBlockHeaderAndShortTxIDs::FillShortTxIDSelector() out of dash_block_replay
+    # — only linked here. No new build.yml --target entry needed (test_dash_p2p_node
+    # is already allowlisted; the push bot lacks `workflow` scope, #769, so a
+    # standalone target would be a NOT_BUILT sentinel).
+    # DASH_FIXTURE_DIR: the wire suite replays the real 602'189-byte testnet capture.
+    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp test_dash_coin_p2p_pool.cpp test_dash_qrinfo_wire.cpp)
+    target_compile_definitions(test_dash_p2p_node PRIVATE
+        DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_p2p_node PRIVATE
         GTest::gtest_main GTest::gtest
         dash_block_replay   # E1: coin/vendor/blockencodings.cpp — the full p2p Handler

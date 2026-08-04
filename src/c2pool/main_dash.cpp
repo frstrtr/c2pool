@@ -259,6 +259,7 @@ void print_banner(const char* argv0)
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
         << "           [--external-ip ADDR]\n"
         << "           [--embedded-utxo] [--embedded-mainnet] [--embedded-mn-bridge-max N]\n"
+        << "           [--bestcl-policy freshness|consensus-exact]\n"
         << "           [--embedded-oracle-shadow]\n"
         << "           [--oracle-graduation-blocks N] [--oracle-class-coverage K]\n"
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
@@ -293,6 +294,16 @@ void print_banner(const char* argv0)
         << "        are transport only and NEVER move the arm. Even when armed, every\n"
         << "        per-template gate (SML fresh at tip, non-superblock, credit-pool seed\n"
         << "        height, bestCL, MN-payee cursor, DKG plan) fails closed to dashd.\n"
+        << "        --bestcl-policy selects HOW the bestCL gate decides. `freshness`\n"
+        << "        (DEFAULT) keeps the conservative proxy: refuse unless the best\n"
+        << "        observed ChainLock is within one block of the tip. `consensus-exact`\n"
+        << "        enforces dashcore CheckCbTxBestChainlock itself -- the committed\n"
+        << "        ChainLock must merely be non-null and NOT OLDER than the one the\n"
+        << "        previous block committed -- which is what dashd's own miner does\n"
+        << "        (it re-commits the previous block's signature when it holds nothing\n"
+        << "        fresher). Still fails closed: it refuses unless the previous block's\n"
+        << "        own committed ChainLock is held, and a value ADVANCED past it must\n"
+        << "        have passed local BLS verification.\n"
         << "        --coin-p2p-magic HEX overrides the embedded coin-P2P wire magic\n"
         << "        (default mainnet bf0c6bbd / testnet cee2caff; regtest fcc1b7dc).\n"
         << "        --regtest-force-won-block (regtest E5 harness, fail-closed) drives\n"
@@ -525,7 +536,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // announced exactly once each, so miss probability falls
              // geometrically in this number (see p2p_client.hpp).
              std::size_t coin_p2p_peers =
-                 dash::coin::p2p::CoinClient<dash::Config>::DEFAULT_POOL_PEERS)
+                 dash::coin::p2p::CoinClient<dash::Config>::DEFAULT_POOL_PEERS,
+             const std::string& bestcl_policy = "freshness")
 {
     namespace io = boost::asio;
 
@@ -2975,10 +2987,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             //      threshold itself reseeds from the weighted VALID SML count
             //      on every diff (reseed_funding_threshold — dashcore's own
             //      tally/denominator asymmetry).
-            //   3. the R5 govsync-completeness gate
-            //      (set_superblock_sync_complete_fn) is STILL NOT wired — the
-            //      NodeCoinState guard refuses the serve path structurally,
-            //      so R3 landing here can never by itself open it.
+            //   3. the R5 govsync-completeness gate IS wired
+            //      (set_superblock_sync_complete_fn, below), so the guard is no
+            //      longer a structural refusal: it is a RUNTIME predicate over
+            //      GovernanceMaintainer::gov_sync_complete() (>= min peers,
+            //      settled, quiesced). It still closes on its own whenever
+            //      govsync has not completed, and R3 landing here does not by
+            //      itself open it.
             // The parse/selection/template-emit logic is proven by the KATs;
             // flipping this fully live is still gated on R5 completeness + the
             // R6 desync latch + a funded-superblock soak.
@@ -3141,6 +3156,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             testnet ? dash::coin::DASH_MN_RR_HEIGHT_TESTNET
                     : dash::coin::DASH_MN_RR_HEIGHT_MAINNET);
 
+        // confirmedHash rollover projection threshold (sml_projection.hpp):
+        // the network's nMasternodeMinimumConfirmations (per-chainparams in
+        // dashcore v23.1.7 chainparams.cpp — mainnet 15 at :177, testnet 1 at
+        // :376). Gates the height-driven confirmation pass the template build
+        // + viability + pre-emit gates replicate so the committed
+        // merkleRootMNList matches the verifier's rebuilt list at an MN's
+        // confirmation-crossing height (bad-cbtx-mnmerkleroot otherwise).
+        node_coin_state.set_mn_min_confirmations(
+            testnet ? dash::coin::DASH_MN_MIN_CONFIRMATIONS_TESTNET
+                    : dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET);
+
         // review PR #780 BLOCKER-1 (CRITICAL): refuse the embedded arm on DKG
         // commitment-window heights. There the block MUST carry mandatory type-6
         // quorum-commitment txs (which the C-3 filter strips) and merkleRootQuorums
@@ -3161,15 +3187,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // are SERVED instead of refused: the mandatory type-6 commitment set is
         // derived from local state only — params-table math + quorum base
         // hashes off the embedded header chain + the mnlistdiff-fed
-        // QuorumManager as dashd's HasMinedCommitment — and filled with the
-        // consensus-valid NULL commitments dashd's own miner mines when it
-        // holds no verified DKG result (real relayed commitments are Phase L,
-        // behind a BLS verifier). merkleRootQuorums stays the PROVEN
-        // active-set root (null commitments never fold in). Any height where
-        // the set cannot be derived (header gap, below the per-network V19
-        // serve floor — which also covers --regtest chains riding the testnet
-        // flag) yields nullopt and the arm fails closed to the dashd fallback,
-        // exactly the old refusal. The emit gate re-derives this same plan and
+        // QuorumManager as dashd's HasMinedCommitment — and every mandatory
+        // slot must carry a BLS-VERIFIED REAL commitment. Serving is PER-HEIGHT
+        // ALL-OR-NOTHING: one unsatisfiable slot fails the WHOLE height closed
+        // to the dashd fallback. Null commitments are NOT mined to fill the
+        // shortfall (that arm is dashd's, and copying it diverged
+        // merkleRootQuorums at block 1520106 — see dkg_commitments.hpp HEIGHT
+        // COMPLETENESS). merkleRootQuorums stays the PROVEN active-set root.
+        // The same nullopt/fail-closed result covers a set that cannot be
+        // derived at all (header gap, below the per-network V19 serve floor —
+        // which also covers --regtest chains riding the testnet flag), exactly
+        // the old refusal. The emit gate re-derives this same plan and
         // hard-rejects any template whose type-6 set drifts from it.
         if (run_arm.embedded_arm_enabled) {
             const auto qc_net = testnet ? dash::coin::LlmqNetwork::Testnet
@@ -3177,11 +3205,28 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // Phase-L sourcing leg: collect REAL relayed DKG commitments off
             // the coin-P2P qfcommit stream (structural admission only). The
             // cache serves NOTHING into templates until a BLS12-381 verifier
-            // is installed (MineableCommitmentCache::set_bls_verify_fn — the
-            // exact Phase-L follow-up); until then every required slot mines
-            // the consensus-valid null commitment, same as dashd without a
-            // DKG result. [QC-MINEABLE] is the field-checkable signal that
-            // the sourcing leg is live.
+            // is installed (MineableCommitmentCache::set_bls_verify_fn — done
+            // by the VERIFY leg below, and inert unless the build actually
+            // links dashbls).
+            //
+            // A required slot with no verified commitment is NOT null-served.
+            // dashd's miner does mine the null commitment there
+            // (GetMineableCommitments, "null commitment required" arm); c2pool
+            // deliberately does not copy it, because a null is only CANONICAL
+            // when that DKG genuinely failed: at block 1520106 null-serving a
+            // SUCCEEDED DKG skipped leaves every dashd folds in and diverged
+            // merkleRootQuorums (bad-cbtx). So the slot is unsatisfiable and
+            // the WHOLE height fails closed to the dashd fallback, NAMED
+            // cause=qc-plan-underivable. The refusal is BOUNDED: it ends when
+            // any other miner mines the commitment (the slot then reads
+            // already-mined off the mnlistdiff-fed QuorumManager) or when the
+            // DKG mining window closes — both by cycleStart +
+            // dkgMiningWindowEnd. Full reasoning: dkg_commitments.hpp, HEIGHT
+            // COMPLETENESS + COLD-START HOLE. Null is served ONLY on positive
+            // failed-DKG evidence (DkgNullEvidenceFn), and production passes
+            // no such source — see /*null_evidence=*/nullptr at the
+            // build_daemonless_qc_plan call below. [QC-MINEABLE] is the
+            // field-checkable signal that the sourcing leg is live.
             auto qc_cache =
                 std::make_shared<dash::coin::MineableCommitmentCache>();
 
@@ -3192,8 +3237,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // quorumPublicKey, both over BuildCommitmentHash). The verifier
             // sources the ordered member operator key set via the provider
             // below; anything it cannot establish with certainty fails CLOSED
-            // (verified_for -> nullopt -> the slot mines the consensus-valid
-            // null commitment, exactly the pre-Phase-L posture — reward-safe).
+            // (verified_for -> nullopt -> the slot is unsatisfiable -> the
+            // whole height falls back to dashd, exactly the pre-Phase-L
+            // posture — reward-safe; the slot is NOT null-served).
             //
             // MEMBER-SET SOURCING (E1 Phase-L, the piece that ENABLES real-
             // commitment serving): the deterministic quorum member selection
@@ -3243,10 +3289,112 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         if (cp) cp->send_getmnlistd(base, tgt);
                     });
 
+            // ── ONE admission path for EVERY commitment transport ──────────
+            // (qc-plan-underivable fix). The cache used to be fed from exactly
+            // one source: the qfcommit push subscription below. Push requires
+            // being connected at the instant of the inv — measured on the
+            // 2026-08 soaks as a 14 s – 5 m 35 s arrival race after
+            // window-open on a healthy-peer host (7.5% of wall-clock declined
+            // qc-plan-underivable) and total cold-start starvation on a host
+            // whose peers churn. But FULL commitments also arrive over
+            // request/response — mnlistdiff `newQuorums` and qrinfo
+            // `lastCommitmentPerIndex` carry the complete DIP-4
+            // CFinalCommitment — and were dropped after existence
+            // bookkeeping. Every transport now funnels through THIS ingest,
+            // so the admission guarantees (structural checks + the BLS verify
+            // hook behind verified_for) hold identically regardless of
+            // arrival shape, and every ingest names its transport in the
+            // [QC-MINEABLE] line — the soak-checkable evidence of which
+            // transport actually supplied a commitment.
+            //
+            // SAY WHY on the reject path too: a dropped commitment that
+            // leaves no trace makes a later "no-commitment-cached" refusal
+            // indistinguishable from "never reached us" — opposite diagnoses
+            // (our bug vs a relay hole).
+            auto qc_ingest_from =
+                [qc_cache, qc_net, qc_member_source](
+                    const dash::coin::vendor::CFinalCommitment& c,
+                    const char* source, bool kick_member_fetch) {
+                    using Adm = dash::coin::MineableCommitmentCache::Admission;
+                    const auto adm = qc_cache->ingest_ex(qc_net, c);
+                    if (adm == Adm::Accepted) {
+                        LOG_INFO << "[QC-MINEABLE] cached commitment type="
+                                 << static_cast<int>(c.llmqType)
+                                 << " quorum="
+                                 << c.quorumHash.GetHex().substr(0, 16)
+                                 << "... signers=" << c.CountSigners()
+                                 << " source=" << source
+                                 << " cache=" << qc_cache->size();
+                        // Proactively source the member set so it is READY by
+                        // the DKG-window height that must serve it.
+                        if (kick_member_fetch)
+                            qc_member_source->request(c.llmqType, c.quorumHash);
+                    } else if (adm == Adm::NotBetterThanCached) {
+                        // EXPECTED steady-state overlap now that several
+                        // transports carry the same commitment (push +
+                        // mnlistdiff + qrinfo): an equal-or-better copy is
+                        // already held, the arrival is a no-op and NEVER a
+                        // downgrade. Same tag so a soak can still count
+                        // arrivals per transport, but named as the duplicate
+                        // it is, not a defect.
+                        LOG_INFO << "[QC-MINEABLE] duplicate commitment type="
+                                 << static_cast<int>(c.llmqType)
+                                 << " quorum="
+                                 << c.quorumHash.GetHex().substr(0, 16)
+                                 << "... signers=" << c.CountSigners()
+                                 << " source=" << source
+                                 << " cache=" << qc_cache->size();
+                    } else {
+                        LOG_INFO << "[QC-MINEABLE] REJECTED relayed"
+                                    " commitment type="
+                                 << static_cast<int>(c.llmqType)
+                                 << " quorum="
+                                 << c.quorumHash.GetHex().substr(0, 16)
+                                 << "... signers=" << c.CountSigners()
+                                 << " reason="
+                                 << dash::coin::MineableCommitmentCache
+                                        ::admission_name(adm)
+                                 << " source=" << source
+                                 << " cache=" << qc_cache->size();
+                    }
+                };
+
+            // Member-set fetch amplification guard for the BATCH transports:
+            // a cold full mnlistdiff snapshot re-carries EVERY active quorum
+            // (~100-200 on mainnet), and kicking a historical getmnlistd
+            // member-set fetch for each would fan out megabytes of wire
+            // traffic for quorums whose DKG mining window closed long ago
+            // (their slots cannot be required again short of a reorg wipe).
+            // Only commitments whose mining window is still open at the
+            // header tip get the proactive fetch; INGEST itself is
+            // unconditional — the cache entry is cheap, and the case where a
+            // closed-window commitment matters again (a reorg wiping the
+            // QuorumManager near the tip) re-offers it inside a window this
+            // filter passes.
+            auto qc_member_fetch_worthwhile =
+                [hc = header_chain.get(), qc_net](
+                    const dash::coin::vendor::CFinalCommitment& c) -> bool {
+                    auto tip = hc->tip();
+                    if (!tip) return false;
+                    auto base = hc->get_header(c.quorumHash);
+                    if (!base) return false;
+                    for (const auto& p : dash::coin::enabled_llmqs(qc_net)) {
+                        if (p.type != c.llmqType) continue;
+                        if (p.dkg_interval == 0) return false;
+                        const auto wb =
+                            dash::coin::qc_window_bound(p, base->height);
+                        return tip->height <= wb.last_height;
+                    }
+                    return false;
+                };
+
             // DIP-24 rotated lane: the getqrinfo send seam + the qrinfo reply
             // consumer. Both are OPTIONAL by construction — with neither wired
-            // the rotated branch of request() simply cannot send and every
-            // rotated quorum stays null-serve, which is the pre-item-4 posture.
+            // the rotated branch of request() simply cannot send, so no rotated
+            // member set is ever sourced and every rotated slot stays
+            // unsatisfiable: any height whose mandatory set contains one fails
+            // closed to the dashd fallback (NOT null-served — dkg_commitments.hpp
+            // HEIGHT COMPLETENESS). That is the pre-item-4 posture.
             if (coin_p2p) {
                 qc_member_source->set_send_getqrinfo(
                     [cp = coin_p2p.get()](const std::vector<uint256>& bases,
@@ -3256,8 +3404,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // Unlike mnlistdiff there is no tip-feed hazard here: nothing
                 // else consumes qrinfo, so this consumer needs no demux.
                 coin_p2p->add_qrinfo_consumer(
-                    [qc_member_source]
+                    [qc_member_source, qc_ingest_from,
+                     qc_member_fetch_worthwhile]
                     (const dash::coin::vendor::CQuorumRotationInfo& info) {
+                        // Rotated-quorum tee (DIP-24, type 5):
+                        // lastCommitmentPerIndex carries the FULL final
+                        // commitments per quorumIndex — same admission path
+                        // as every other transport, source-tagged for the
+                        // soak.
+                        for (const auto& c : info.lastCommitmentPerIndex)
+                            qc_ingest_from(c, "qrinfo",
+                                           qc_member_fetch_worthwhile(c));
                         qc_member_source->on_qrinfo(info);
                     });
             }
@@ -3273,7 +3430,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             if (dash::coin::vendor::bls_backend_available()) {
                 LOG_INFO << "[QC-PHASE-L] dashbls verifier + member-set sourcing "
                             "installed (real qc inclusion when the member set is "
-                            "sourced; fail-closed to null-serve otherwise)";
+                            "sourced; otherwise the slot is unsatisfiable and the "
+                            "WHOLE height refuses with cause=qc-plan-underivable "
+                            "and falls back to dashd -- never null-served)";
             }
 
             // REFUSAL-DIAGNOSIS seam (observability only, never gates a serve):
@@ -3302,40 +3461,33 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
             coin_feed_subs.push_back(
                 coin_state.new_qfcommit.subscribe(
-                    [qc_cache, qc_net, qc_member_source]
+                    [qc_ingest_from]
                     (const dash::coin::vendor::CFinalCommitment& c) {
-                        // SAY WHY on the reject path too. A relayed qfcommit
-                        // that structural admission drops used to leave NO
-                        // trace, so a later "no-commitment-cached" refusal was
-                        // indistinguishable from "the commitment never reached
-                        // us" — opposite diagnoses (our bug vs a relay hole).
-                        using Adm =
-                            dash::coin::MineableCommitmentCache::Admission;
-                        const auto adm = qc_cache->ingest_ex(qc_net, c);
-                        if (adm != Adm::Accepted) {
-                            LOG_INFO << "[QC-MINEABLE] REJECTED relayed"
-                                        " commitment type="
-                                     << static_cast<int>(c.llmqType)
-                                     << " quorum="
-                                     << c.quorumHash.GetHex().substr(0, 16)
-                                     << "... signers=" << c.CountSigners()
-                                     << " reason="
-                                     << dash::coin::MineableCommitmentCache
-                                            ::admission_name(adm)
-                                     << " cache=" << qc_cache->size();
-                        }
-                        if (adm == Adm::Accepted) {
-                            LOG_INFO << "[QC-MINEABLE] cached commitment type="
-                                     << static_cast<int>(c.llmqType)
-                                     << " quorum="
-                                     << c.quorumHash.GetHex().substr(0, 16)
-                                     << "... signers=" << c.CountSigners()
-                                     << " cache=" << qc_cache->size();
-                            // Proactively source the member set so it is READY by
-                            // the DKG-window height that must serve it.
-                            qc_member_source->request(c.llmqType, c.quorumHash);
-                        }
+                        // PUSH transport: relayed once at DKG finalize, so a
+                        // live arrival is inside (or just ahead of) an open
+                        // window by construction — kick the member fetch
+                        // unconditionally, exactly the pre-fix behaviour.
+                        qc_ingest_from(c, "qfcommit-push",
+                                       /*kick_member_fetch=*/true);
                     }));
+            // ── qc-plan-underivable CLOSURE: the request/response tee ──────
+            // mnlistdiff is the transport that measurably ALWAYS works
+            // (277/277 per soak on both hosts, including the one whose peers
+            // churn every 101 s) and is re-requested on every fresh
+            // handshake, so feeding the cache from it removes the
+            // be-connected-at-the-inv dependency the push-only feed had. The
+            // maintainer hands over tail.newQuorums of every ACCEPTED diff
+            // (its base-continuity / stale-snapshot R1 / malformed-tail H-1
+            // guards have already run); admission is the SAME ingest as the
+            // push path above, so verified_for's guarantees are
+            // transport-independent.
+            maintainer->set_on_new_quorum_commitments(
+                [qc_ingest_from, qc_member_fetch_worthwhile]
+                (const std::vector<dash::coin::vendor::CFinalCommitment>& qcs) {
+                    for (const auto& c : qcs)
+                        qc_ingest_from(c, "mnlistdiff",
+                                       qc_member_fetch_worthwhile(c));
+                });
             // COMPLETENESS GATE (definitive-soak block 1520106): the plan is
             // per-height all-or-nothing — any mandatory slot without a
             // BLS-verified real commitment (no attested-null evidence source
@@ -3488,7 +3640,28 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // Only meaningful when the embedded arm actually serves (testnet or
         // --embedded-mainnet); harmless otherwise (the arm is off, work_source
         // never consults viability).
-        node_coin_state.set_require_fresh_bestcl(run_arm.embedded_arm_enabled);
+        //
+        // POLICY SELECTION (--bestcl-policy, DEFAULT freshness = unchanged).
+        // The freshness predicate is a PROXY: dashcore constrains the committed
+        // ChainLock only relative to what the PREVIOUS BLOCK committed, never
+        // against the tip or wall-clock recency (dash v23.1.7
+        // src/evo/specialtxman.cpp:129-141). `consensus-exact` enforces that
+        // real rule instead — see NodeCoinState::set_bestcl_policy. Kept as a
+        // runtime flag, not a rebuild, so the conservative posture is one
+        // restart away if a soak ever disagrees.
+        if (!run_arm.embedded_arm_enabled) {
+            node_coin_state.set_bestcl_policy(dash::coin::BestClPolicy::Off);
+        } else if (bestcl_policy == "consensus-exact") {
+            node_coin_state.set_bestcl_policy(
+                dash::coin::BestClPolicy::ConsensusExact);
+            LOG_INFO << "[EMB-DASH] bestCL gate policy = CONSENSUS-EXACT"
+                        " (dashcore CheckCbTxBestChainlock rule; requires the"
+                        " tip block's own committed ChainLock)";
+        } else {
+            node_coin_state.set_bestcl_policy(dash::coin::BestClPolicy::Freshness);
+            LOG_INFO << "[EMB-DASH] bestCL gate policy = FRESHNESS"
+                        " (conservative proxy: best CL within one block of tip)";
+        }
 
         // SOAK FIX (bad-cbtx-assetlocked-amount): the DIP-0027 credit-pool seed
         // rides a separate on_mnlistdiff step and can lag one block while the SML
@@ -4752,7 +4925,8 @@ int main(int argc, char** argv)
 
     // Name the BLS backend unconditionally at startup: a stub (BLS-dark) node
     // is otherwise indistinguishable from an armed one until a DKG-window
-    // height silently null-serves -- which is how this fleet ran BLS-dark for
+    // height silently fails closed to the dashd fallback (no verifier => no
+    // slot can ever be satisfied) -- which is how this fleet ran BLS-dark for
     // months without anyone noticing.
     std::cout << "[init] DASH BLS backend: "
               << (dash::coin::vendor::bls_backend_available()
@@ -4789,6 +4963,7 @@ int main(int argc, char** argv)
     std::string stratum_host = "0.0.0.0";      // --stratum [HOST:]PORT bind interface (default all)
     uint16_t    stratum_port = 0;              // 0 disables the Stratum accept-loop; --stratum sets it
     bool embedded_utxo = false;                // --embedded-utxo: arm the E2b UTXO/fee lane (opt-in)
+    std::string bestcl_policy = "freshness";   // --bestcl-policy: freshness (default, conservative proxy) | consensus-exact (dashcore's actual CheckCbTxBestChainlock rule)
     bool embedded_oracle_shadow = false;       // --embedded-oracle-shadow: per-block dashd cross-check (OBSERVE-only)
     uint64_t oracle_grad_blocks = 5000;        // --oracle-graduation-blocks N (consecutive clean)
     uint64_t oracle_class_coverage = 20;       // --oracle-class-coverage K (per height class)
@@ -4866,6 +5041,8 @@ int main(int argc, char** argv)
             embedded_superblock = true;
         else if (std::strcmp(argv[i], "--embedded-utxo") == 0)
             embedded_utxo = true;
+        else if (std::strcmp(argv[i], "--bestcl-policy") == 0 && i + 1 < argc)
+            bestcl_policy = argv[++i];
         else if (std::strcmp(argv[i], "--coinbase-text") == 0 && i + 1 < argc)
             coinbase_text = argv[++i];
         else if (std::strcmp(argv[i], "--embedded-oracle-shadow") == 0)
@@ -5019,7 +5196,7 @@ int main(int argc, char** argv)
                         coin_p2p_magic, force_won_block,
                         operator_message_blob_hex, embedded_superblock,
                         embedded_oracle_shadow, oracle_grad_blocks,
-                        oracle_class_coverage, coin_p2p_peers);
+                        oracle_class_coverage, coin_p2p_peers, bestcl_policy);
     }
     return run_selftest();
 }

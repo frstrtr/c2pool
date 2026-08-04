@@ -490,6 +490,20 @@ public:
         const size_t q_deleted = qr.deleted;
         m_state.set_quorum_healthy(true);
 
+        // 2b) qc-plan-underivable tee: newQuorums are COMPLETE DIP-4
+        //     CFinalCommitments (pubkey, vvec hash, quorumSig, membersSig,
+        //     bitsets), not just (llmqType, quorumHash) existence — hand them
+        //     to the wired consumer (main_dash funnels them through the SAME
+        //     MineableCommitmentCache admission path the qfcommit push uses)
+        //     instead of dropping the crypto payload on the floor after the
+        //     has_mined bookkeeping above. Fired only for an ACCEPTED diff:
+        //     every reject/heal path (base-continuity, stale-snapshot R1,
+        //     malformed-tail H-1) returned before this point, so a consumer
+        //     never sees commitments off a diff whose SML apply was refused.
+        //     Optional (unset in KATs = no-op).
+        if (m_on_new_quorum_commitments && !qt.newQuorums.empty())
+            m_on_new_quorum_commitments(qt.newQuorums);
+
         // 3) bestCL* + creditPool: the diff's embedded cbTx is the coinbase of
         //    diff.blockHash and its extra_payload is the authoritative type-5
         //    CCbTx for that height. Seed the fields the roots don't carry so the
@@ -540,8 +554,20 @@ public:
                         // older bestCL must not roll the committed bestCL* back
                         // (that would desync the next template's CCbTx from dashd).
                         if (best_h > 0 && best_h >= m_state.best_cl_height())
-                            m_state.set_best_cl(best_h, observed.bestCLSignature);
+                            m_state.set_best_cl(best_h, observed.bestCLSignature,
+                                                ClProvenance::ChainCommitted);
                     }
+                    // Record what THIS block's coinbase committed, keyed by its
+                    // own on-wire nHeight. Distinct from the "best" above: this
+                    // is the term dashcore's CheckCbTxBestChainlock inequality
+                    // is stated against (block H-1's committed CL), and it is
+                    // recorded even when NULL — "block H-1 committed nothing"
+                    // is a legal, constraint-free state, not an absence of
+                    // information. See NodeCoinState::set_tip_cbtx_chainlock.
+                    m_state.set_tip_cbtx_chainlock(
+                        observed.nHeight, observed.has_best_cl_signature(),
+                        observed.nHeight - 1
+                            - static_cast<int32_t>(observed.bestCLHeightDiff));
                 }
             }
         }
@@ -647,7 +673,10 @@ public:
                         << " block=" << block_hash.GetHex().substr(0, 16) << "...";
             return;
         }
-        m_state.set_best_cl(height, sig);
+        // BlsVerified is the ONLY provenance that lets the consensus-exact gate
+        // commit a ChainLock NEWER than the one block H-1 committed — that is
+        // the case dashcore makes us prove with BLS (specialtxman.cpp:164-167).
+        m_state.set_best_cl(height, sig, ClProvenance::BlsVerified);
         LOG_INFO << "[CL] adopted VERIFIED ChainLock height=" << height
                  << " block=" << block_hash.GetHex().substr(0, 16) << "...";
         // A fresher bestCL* changes the next template's committed CCbTx —
@@ -1004,6 +1033,20 @@ public:
         m_on_full_resync = std::move(fn);
     }
 
+    /// Wire the mnlistdiff QUORUM-COMMITMENT tee (qc-plan-underivable fix).
+    /// Invoked from on_mnlistdiff with `tail.newQuorums` of every ACCEPTED
+    /// diff — the full CFinalCommitments the wire already carries. main_dash
+    /// points this at the MineableCommitmentCache ingest (the SAME admission
+    /// path the coin-P2P qfcommit push subscription uses), which removes the
+    /// be-connected-at-the-inv transport dependency the push-only feed had:
+    /// mnlistdiff is request/response and re-requested on every fresh
+    /// handshake, so a commitment missed as a push is still sourced. Optional
+    /// (unset in KATs / non-embedded postures = no-op).
+    void set_on_new_quorum_commitments(
+        std::function<void(const std::vector<vendor::CFinalCommitment>&)> fn) {
+        m_on_new_quorum_commitments = std::move(fn);
+    }
+
     /// Wire the SML/quorum PERSISTENCE sink (main_dash points this at
     /// SMLDb::write_sml + QuorumDb::write_quorums). Invoked after each accepted
     /// mnlistdiff that leaves a non-empty SML applied, with the block hash the
@@ -1071,6 +1114,32 @@ private:
     // self-consistent-but-stale trap that refuted 3 prior soaks). The seed's height
     // is taken straight off the wire (cbTx.nHeight == connected height, checked),
     // so it can never be mistaken as current at a height we did not observe.
+    /// Fold an on-chain coinbase CCbTx into the two bestCL data the template
+    /// gate needs. `observed` MUST already have been validated to carry its own
+    /// nHeight off the wire (the caller does this).
+    ///
+    ///  - set_tip_cbtx_chainlock: what THIS block committed, keyed by its own
+    ///    height. Recorded even when null — "committed nothing" is a legal
+    ///    state that REMOVES the consensus constraint, not missing information.
+    ///  - set_best_cl: the value we would ourselves commit next. Tagged
+    ///    ChainCommitted: the network accepted this signature inside a block, so
+    ///    re-committing it needs no local BLS — the same justification dashd's
+    ///    miner relies on (v23.1.7 src/node/miner.cpp:143-146).
+    ///
+    /// Monotonic on both axes: a late or duplicate OLD block can never roll
+    /// either back (a regressed bestCL would desync our CCbTx from dashd's).
+    void adopt_chain_committed_chainlock(const vendor::CCbTx& observed) {
+        const int32_t committed_cl_h =
+            observed.nHeight - 1 - static_cast<int32_t>(observed.bestCLHeightDiff);
+        m_state.set_tip_cbtx_chainlock(observed.nHeight,
+                                       observed.has_best_cl_signature(),
+                                       committed_cl_h);
+        if (observed.has_best_cl_signature() && committed_cl_h > 0
+            && committed_cl_h >= m_state.best_cl_height())
+            m_state.set_best_cl(committed_cl_h, observed.bestCLSignature,
+                                ClProvenance::ChainCommitted);
+    }
+
     void advance_credit_pool_on_block(const dash::coin::BlockType& block,
                                       uint32_t height) {
         if (block.m_txs.empty()) return;                 // no coinbase
@@ -1087,6 +1156,15 @@ private:
                         << " — skip credit-pool advance";
             return;
         }
+        // ── bestCL axis (rides the SAME validated parse; own monotonic guards).
+        // This block's coinbase is the authoritative statement of what the
+        // chain committed AT this height, and once this height is the tip it is
+        // precisely the "previous block's committed ChainLock" that dashcore's
+        // CheckCbTxBestChainlock measures our next template against. Recording
+        // it here — not only on the far rarer mnlistdiff — is what lets
+        // BestClPolicy::ConsensusExact evaluate the real rule every block.
+        adopt_chain_committed_chainlock(observed);
+
         const int64_t from_wire = observed.creditPoolBalance;
         // Network-aware platform-share gate (E4 re-soak fix): the MN_RR
         // activation height is per-chainparams; the state holds the network's
@@ -1261,6 +1339,10 @@ private:
     std::function<void()> m_on_full_resync;  // H-1 heal -> reset sml_base + full re-sync
     std::function<void(const uint256&)> m_on_sml_persist;  // accepted diff -> SMLDb/QuorumDb write
     std::function<void()> m_on_sml_clear;    // reorg/heal -> SMLDb/QuorumDb wipe (extended to CreditPoolDb)
+    // qc-plan-underivable tee: accepted diff's full tail.newQuorums ->
+    // MineableCommitmentCache admission (see set_on_new_quorum_commitments).
+    std::function<void(const std::vector<vendor::CFinalCommitment>&)>
+        m_on_new_quorum_commitments;
     ChainLockVerifyFn     m_chainlock_verify; // unset => live ChainLocks never adopted (fail closed)
     // E2: independent DIP-0027 credit-pool accrual, advanced per ingested block
     // (on_block_connected) and re-anchored per accepted mnlistdiff. Verified
