@@ -643,7 +643,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                   << " — min-proto=" << dash::SharechainConfig::MINIMUM_PROTOCOL_VERSION
                   << " prefix=" << dash::SharechainConfig::prefix_hex() << "\n";
     } else {
-        std::cout << "[run] --connect mode: inbound listener suppressed\n";
+        // Symmetry with the LISTENING branch above: the --connect leg frames
+        // every outbound packet with this same prefix (pool/node.hpp:88
+        // get_prefix), so it must be observable on the connect path too — a
+        // peered regtest showed the listen leg logged prefix= but the connect
+        // leg did not, leaving connect-mode prefix agreement unverifiable from
+        // the log alone.
+        std::cout << "[run] --connect mode: inbound listener suppressed"
+                  << " — min-proto=" << dash::SharechainConfig::MINIMUM_PROTOCOL_VERSION
+                  << " prefix=" << dash::SharechainConfig::prefix_hex() << "\n";
     }
     // #754 download/outbound slice: ACTIVE outbound dialing from the addr
     // store (--addnode/--connect seeds registered by the NodeImpl ctor) plus
