@@ -108,9 +108,11 @@ inline constexpr uint8_t kLlmqTypePlatformTestnet = 6;   // LLMQ_25_67
 
 // V20 activation floor (chainparams.cpp DEPLOYMENT_V20 nActivationHeight).
 // This module ONLY serves member sets for quorums whose WORK block is post-V20
-// (the modifier era it reproduces). Below it -> std::nullopt -> null-serve
-// (reward-safe: the DKG-window slot mines the consensus-valid null commitment,
-// or the arm falls back to dashd). RE-DIFF on a vendored-dashcore pin bump.
+// (the modifier era it reproduces). Below it -> std::nullopt -> the member set
+// is unsourced, so the slot cannot be satisfied and the whole DKG-window height
+// falls back to dashd (reward-safe; the slot is NOT null-served — see
+// dkg_commitments.hpp HEIGHT COMPLETENESS). RE-DIFF on a vendored-dashcore pin
+// bump.
 inline constexpr uint32_t kV20FloorMainnet = 1'987'776u;
 inline constexpr uint32_t kV20FloorTestnet =   905'100u;
 
