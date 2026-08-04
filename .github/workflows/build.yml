@@ -5,7 +5,7 @@ on:
     branches: [master, btc-embedded, dash-spv-embedded, dgb/**, windows-build, service-update]
     tags: ['v*']
   pull_request:
-    branches: [master, btc-embedded, dash-spv-embedded, dgb/**]
+    branches: [master, btc-embedded, dash-spv-embedded, dgb/**, v37-dev]
 
 # Concurrency: a newer run on the same ref cancels the stale in-progress
 # one, cutting concurrent load on the shared self-hosted pool (the OOM/
@@ -1017,7 +1017,8 @@ jobs:
 
       - name: Verify binary
         run: |
-          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-6.dll" build_ci/src/c2pool/Release/
+          # SONAME-agnostic glob: upstream bumps libsecp256k1-N.dll (6->7 etc). Do NOT re-pin a number.
+          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-*.dll" build_ci/src/c2pool/Release/
           # Run the binary to completion and capture its output BEFORE slicing.
           # Piping straight into `Select-Object -First 3` closes the pipe after 3
           # lines while c2pool.exe is still writing its banner, so the next stdout
@@ -1038,8 +1039,9 @@ jobs:
           Copy-Item build_ci/src/c2pool/Release/c2pool.exe "${PKG}/"
           # DLL must be next to exe for Windows DLL search path (portable ZIP)
           # Also copy to lib/ for Inno Setup installer compatibility
-          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-6.dll" "${PKG}/"
-          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-6.dll" "${PKG}/lib/"
+          # SONAME-agnostic glob: upstream bumps libsecp256k1-N.dll (6->7 etc). Do NOT re-pin a number.
+          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-*.dll" "${PKG}/"
+          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-*.dll" "${PKG}/lib/"
           Copy-Item start.bat "${PKG}/"
           Copy-Item -Recurse web-static/* "${PKG}/web-static/"
           Copy-Item explorer/explorer.py "${PKG}/explorer/"
