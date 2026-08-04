@@ -93,6 +93,29 @@ struct PoolRig
         config.coin()->m_p2p.prefix = ParseHexBytes("cee2caff");   // testnet magic
     }
 
+    // ── simulated clock ──────────────────────────────────────────────────
+    // Same rationale as the sibling single-peer TU: every deadline in the
+    // client is a comparison against its now_sec(), so the liveness tests drive
+    // SIMULATED seconds and assert on exact decisions. No wall clock means no
+    // race with a sanitizer-slowed runner, and the SHIPPED 120s/1200s constants
+    // become free to assert against.
+    int64_t fake_now{1'000'000};
+    void use_fake_clock() { client.set_now_fn([this]{ return fake_now; }); }
+
+    /// One simulated second at a time, running the pool tick on each — the
+    /// cadence the real repeating timer produces. `on_second` stands in for the
+    /// peers' replies.
+    void run_seconds(int64_t seconds,
+                     const std::function<void(int64_t)>& on_second = nullptr)
+    {
+        for (int64_t i = 0; i < seconds; ++i)
+        {
+            ++fake_now;
+            client.tick_for_test();
+            if (on_second) on_second(fake_now);
+        }
+    }
+
     static NetService peer_addr(int n)
     {
         // RFC 5737 TEST-NET-1 literals: never resolvable, never routable, and
@@ -290,18 +313,14 @@ TEST(DashCoinP2PPool, a_pong_from_one_peer_never_closes_another_peers_ping)
 {
     PoolRig rig;
     rig.client.set_max_peers(3);
-    // Ping after 1s quiet, drop only after 30s unanswered, evaluate every 1s.
-    // The long timeout keeps the test about NONCE ISOLATION, not reaping.
-    rig.client.set_keepalive_for_test(/*ping*/1, /*peer_timeout*/30, /*tick*/1);
+    rig.use_fake_clock();                 // SHIPPED thresholds: 120s / 1200s
     rig.handshake(1);
     rig.handshake(2);
     ASSERT_EQ(rig.client.handshaked_peer_count(), 2u);
 
-    // Let the pool tick ping BOTH peers, then stop.
-    boost::asio::steady_timer stop(rig.ioc);
-    stop.expires_after(std::chrono::milliseconds(2500));
-    stop.async_wait([&](const boost::system::error_code&){ rig.ioc.stop(); });
-    rig.ioc.run();
+    // Advance to the ping interval so the pool tick probes BOTH peers. Neither
+    // answers, which is what leaves two outstanding pings to confuse.
+    rig.run_seconds(rig.client.ping_interval_sec());
 
     const PeerSession* p1 = rig.session(1);
     const PeerSession* p2 = rig.session(2);
@@ -367,42 +386,39 @@ TEST(DashCoinP2PPool, silent_peer_is_dropped_while_the_others_keep_delivering)
 {
     PoolRig rig;
     rig.client.set_max_peers(3);
-    // Ping after 1s quiet, drop after 3s unanswered, tick every 1s.
-    rig.client.set_keepalive_for_test(/*ping*/1, /*peer_timeout*/3, /*tick*/1);
+    rig.use_fake_clock();                 // SHIPPED thresholds: 120s / 1200s
     rig.handshake(1);
     rig.handshake(2);
     rig.handshake(3);
     ASSERT_EQ(rig.client.handshaked_peer_count(), 3u);
+    const int64_t t0 = rig.fake_now;
 
     std::set<std::string> dropped;
     rig.client.set_on_peer_disconnected(
         [&](const NetService& s){ dropped.insert(s.to_string()); });
 
     // Peers 1 and 2 answer every ping. Peer 3 says nothing, ever.
-    boost::asio::steady_timer pump(rig.ioc);
-    std::function<void()> tick = [&]{
-        pump.expires_after(std::chrono::milliseconds(100));
-        pump.async_wait([&](const boost::system::error_code& ec){
-            if (ec) return;
-            for (int n : {1, 2}) {
-                const PeerSession* s = rig.session(n);
-                if (s && s->liveness.ping_outstanding())
-                    rig.deliver(n, p2p::message_pong::make_raw(
-                        s->liveness.ping_nonce()));
-            }
-            tick();
-        });
+    const auto answer_1_and_2 = [&](int64_t){
+        for (int n : {1, 2}) {
+            const PeerSession* s = rig.session(n);
+            if (s && s->liveness.ping_outstanding())
+                rig.deliver(n, p2p::message_pong::make_raw(
+                    s->liveness.ping_nonce()));
+        }
     };
-    tick();
 
-    boost::asio::steady_timer stop(rig.ioc);
-    stop.expires_after(std::chrono::seconds(6));   // > 1.5x the peer timeout
-    stop.async_wait([&](const boost::system::error_code&){
-        pump.cancel();
-        rig.ioc.stop();
-    });
-    rig.ioc.run();
+    // One second BEFORE peer 3's own deadline, all three are still held: the
+    // silent peer is not reaped early, and the chatty ones have not dragged it
+    // along either.
+    rig.run_seconds(rig.client.peer_timeout_sec() - 1, answer_1_and_2);
+    EXPECT_EQ(rig.client.connected_peer_count(), 3u)
+        << "a peer was reaped before its own deadline matured";
+    EXPECT_TRUE(dropped.empty());
 
+    // The very next second, peer 3 — and ONLY peer 3 — is gone.
+    rig.run_seconds(1, answer_1_and_2);
+    ASSERT_EQ(rig.fake_now - t0, rig.client.peer_timeout_sec());
+    EXPECT_EQ(dropped.size(), 1u) << "reaping the silent peer took others with it";
     EXPECT_EQ(dropped.count(PoolRig::peer_key(3)), 1u)
         << "the fully silent peer was never reaped";
     EXPECT_EQ(rig.session(3), nullptr);
@@ -412,7 +428,13 @@ TEST(DashCoinP2PPool, silent_peer_is_dropped_while_the_others_keep_delivering)
     EXPECT_NE(rig.session(1), nullptr);
     EXPECT_NE(rig.session(2), nullptr);
     EXPECT_TRUE(rig.client.is_handshake_complete());
-    EXPECT_GE(rig.session(1)->liveness.pongs_matched(), 1u);
+    // EXACT: one ping per PING_INTERVAL_SEC over the window, every one answered.
+    const uint64_t expected_pings =
+        static_cast<uint64_t>(rig.client.peer_timeout_sec() /
+                              rig.client.ping_interval_sec());
+    EXPECT_EQ(rig.session(1)->liveness.pings_sent(), expected_pings);
+    EXPECT_EQ(rig.session(1)->liveness.pongs_matched(), expected_pings);
+    EXPECT_EQ(rig.session(2)->liveness.pongs_matched(), expected_pings);
 
     // ...and they KEEP DELIVERING: a fresh inv from a survivor is still acted on.
     int fired = 0;

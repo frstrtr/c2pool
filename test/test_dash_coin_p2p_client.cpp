@@ -395,6 +395,30 @@ struct ClientRig
         config.coin()->m_p2p.prefix = ParseHexBytes("cee2caff");   // testnet magic
     }
 
+    // ── simulated clock ──────────────────────────────────────────────────
+    // Every deadline in the client is a comparison against its now_sec(). Wire
+    // that to a counter we control so the liveness policy runs in SIMULATED
+    // seconds: no wall clock, no io_context, no race with a slow runner. See
+    // CoinClient::set_now_fn for why elapsed-milliseconds assertions were
+    // removed from this file.
+    int64_t fake_now{1'000'000};
+    void use_fake_clock() { client.set_now_fn([this]{ return fake_now; }); }
+
+    /// Advance simulated time one second at a time, running the pool tick on
+    /// each one — exactly the cadence the real repeating timer produces. A
+    /// single jump would NOT be equivalent for the ping cadence, so it is not
+    /// used. `on_second` runs after each tick and stands in for the peer.
+    void run_seconds(int64_t seconds,
+                     const std::function<void(int64_t)>& on_second = nullptr)
+    {
+        for (int64_t i = 0; i < seconds; ++i)
+        {
+            ++fake_now;
+            client.tick_for_test();
+            if (on_second) on_second(fake_now);
+        }
+    }
+
     // Stand the session up the way Factory does on a live connect. A null
     // socket is legal for the Connection leaf (write() no-ops, get_addr()
     // yields the empty NetService) — everything ABOVE the socket is real.
@@ -582,86 +606,132 @@ TEST(DashCoinP2PClient, message_after_a_throwing_handler_is_still_processed)
     EXPECT_TRUE(rig.client.is_connected());
 }
 
-// ── (e) Keepalive over the real client + real io_context ──────────────────
+// ── (e) Keepalive over the REAL client, driven by a SIMULATED clock ───────
 //
-// Scaled cadence (seconds, not minutes) so the REAL timer path — liveness
-// timer -> PeerLiveness::tick -> send_ping / timeout -> error() — runs in a
-// unit test. The policy itself is unchanged; only the constants are. These two
-// tests prove the PLUMBING (timer armed, ping written, pong routed, drop
-// raised through error()); the SHIPPED thresholds are asserted against the
-// real protocol constants in tolerates_silence_past_peer_ping_and_block_interval
-// above, where simulated time makes a >150s window free.
-TEST(DashCoinP2PClient, quiet_peer_that_answers_pings_survives_past_old_deadline)
+// These drive the real plumbing — pool tick -> PeerLiveness::tick -> send_ping
+// / timeout -> error() -> session teardown — through the client's injected time
+// source rather than the wall clock.
+//
+// They previously ran against real time and asserted on elapsed milliseconds.
+// That is a race the machine eventually wins: under AddressSanitizer the binary
+// runs 2-10x slower and `EXPECT_GE(elapsed, 3000)` failed at 2999 on a loaded
+// runner. Widening the tolerance would have moved the flake rather than removed
+// it, and would have left a test that cannot distinguish "the deadline logic
+// regressed" from "the runner was busy". Driving simulated seconds instead makes
+// the assertions EXACT — a ping at T+120, a drop at T+1200 — and lets them be
+// made against the SHIPPED constants (PING_INTERVAL_SEC / PEER_TIMEOUT_SEC)
+// rather than scaled stand-ins, because simulated hours cost nothing.
+TEST(DashCoinP2PClient, quiet_peer_that_answers_pings_survives_indefinitely)
 {
     ClientRig rig;
-    // ping every 1s, drop only after 4s unanswered, evaluate every 1s.
-    rig.client.set_keepalive_for_test(/*ping*/1, /*peer_timeout*/4, /*tick*/1);
+    rig.use_fake_clock();                 // SHIPPED thresholds: 120s / 1200s
     rig.wire_connected();
     rig.deliver(rig.peer_version(70230, 1, 100, "/Dash Core:21.1.0/"));
     rig.deliver(dash::coin::p2p::message_verack::make_raw());
     ASSERT_TRUE(rig.client.is_handshake_complete());
+    ASSERT_EQ(rig.client.ping_interval_sec(), 120);
+    ASSERT_EQ(rig.client.peer_timeout_sec(), 1200);
 
-    // Stand in for the peer: whenever a ping is outstanding, answer it with a
-    // matching pong through the real inbound path — and send NOTHING else.
-    boost::asio::steady_timer peer(rig.ioc);
-    std::function<void()> pump = [&]{
-        peer.expires_after(std::chrono::milliseconds(50));
-        peer.async_wait([&](const boost::system::error_code& ec){
-            if (ec) return;
-            if (rig.client.is_connected() && rig.client.ping_outstanding())
-                rig.deliver(dash::coin::p2p::message_pong::make_raw(
-                    rig.client.last_ping_nonce()));
-            if (rig.client.is_connected()) pump();
-        });
-    };
-    pump();
-
-    // The client's liveness timer repeats for as long as the peer lives, so
-    // run() would never return on a HEALTHY peer — which is the point. Bound
-    // the observation window explicitly.
-    boost::asio::steady_timer stop(rig.ioc);
-    stop.expires_after(std::chrono::seconds(6));   // > 1.5x the peer timeout
-    stop.async_wait([&](const boost::system::error_code&){
-        peer.cancel();
-        rig.ioc.stop();
+    // The peer answers every ping with a matching pong through the real inbound
+    // path, and sends NOTHING else — the "healthy but quiet at the chain tip"
+    // case the retired 100s idle rule used to kill.
+    const int64_t SIM_SECONDS = 7200;     // two simulated hours
+    rig.run_seconds(SIM_SECONDS, [&](int64_t){
+        if (rig.client.is_connected() && rig.client.ping_outstanding())
+            rig.deliver(dash::coin::p2p::message_pong::make_raw(
+                rig.client.last_ping_nonce()));
     });
 
-    rig.ioc.run();
-
     EXPECT_TRUE(rig.client.is_connected())
-        << "a peer that answers every ping was dropped";
+        << "a peer that answered every ping was dropped";
     EXPECT_TRUE(rig.client.is_handshake_complete());
-    EXPECT_GE(rig.client.pings_sent(), 2u);
-    EXPECT_EQ(rig.client.pongs_matched(), rig.client.pings_sent());
+    // EXACT, not a range: one ping per PING_INTERVAL_SEC, each answered
+    // immediately, for the whole window. 7200/120 = 60.
+    EXPECT_EQ(rig.client.pings_sent(), 60u);
+    EXPECT_EQ(rig.client.pongs_matched(), 60u);
     EXPECT_FALSE(rig.client.ping_outstanding());
 }
 
-TEST(DashCoinP2PClient, silent_peer_is_still_dropped_but_only_after_peer_timeout)
+TEST(DashCoinP2PClient, silent_peer_is_dropped_at_exactly_the_peer_timeout)
 {
     // Negative control: lifting the deadline must NOT make us keep dead peers.
     ClientRig rig;
-    rig.client.set_keepalive_for_test(/*ping*/1, /*peer_timeout*/3, /*tick*/1);
-    rig.client.set_on_peer_disconnected([&](const NetService&){ rig.ioc.stop(); });
+    rig.use_fake_clock();                 // SHIPPED thresholds: 120s / 1200s
+    bool dropped = false;
+    rig.client.set_on_peer_disconnected([&](const NetService&){ dropped = true; });
+    rig.wire_connected();
+    rig.deliver(rig.peer_version(70230, 1, 100, "/Dash Core:21.1.0/"));
+    rig.deliver(dash::coin::p2p::message_verack::make_raw());
+    ASSERT_TRUE(rig.client.is_handshake_complete());
+    const int64_t t_handshake = rig.fake_now;
+
+    // The peer says nothing, ever. It is PROBED first (we never conclude a peer
+    // is dead without asking), then dropped when the silence — not the ping —
+    // reaches PEER_TIMEOUT_SEC.
+    rig.run_seconds(rig.client.ping_interval_sec());
+    EXPECT_EQ(rig.client.pings_sent(), 1u) << "we must probe before concluding";
+    EXPECT_TRUE(rig.client.ping_outstanding());
+    EXPECT_TRUE(rig.client.is_connected());
+
+    // One second BEFORE the deadline: still held. This is the half of the
+    // assertion that a widened tolerance would have destroyed.
+    rig.run_seconds(rig.client.peer_timeout_sec() - rig.client.ping_interval_sec() - 1);
+    ASSERT_EQ(rig.fake_now - t_handshake, rig.client.peer_timeout_sec() - 1);
+    EXPECT_TRUE(rig.client.is_connected())
+        << "dropped BEFORE the peer timeout matured";
+    EXPECT_FALSE(dropped);
+
+    // The very next second: gone.
+    rig.run_seconds(1);
+    ASSERT_EQ(rig.fake_now - t_handshake, rig.client.peer_timeout_sec());
+    EXPECT_FALSE(rig.client.is_connected()) << "a fully silent peer was never dropped";
+    EXPECT_TRUE(dropped);
+    EXPECT_EQ(rig.client.pongs_matched(), 0u);
+    EXPECT_EQ(rig.client.pings_sent(), 1u);
+}
+
+// ── (f) The ONE test that must observe REAL time ──────────────────────────
+//
+// Everything above is clock-driven and therefore proves the POLICY. None of it
+// would notice if ensure_pool_timer() were deleted and the tick never armed at
+// all — the tests call tick_for_test() themselves. This is the single
+// narrowly-scoped case that closes that gap: a real io_context, a real
+// core::Timer, and the question "did the client arm anything?".
+//
+// It is deliberately a LIVENESS assertion, not a timing one: it waits for the
+// first ping to appear and stops the moment it does. A slower machine makes it
+// take longer, never makes it fail — the only way it fails is if the tick is
+// genuinely never armed. That is why the watchdog is 20s against a 1s cadence
+// rather than a tight bound.
+TEST(DashCoinP2PClient, pool_tick_timer_is_actually_armed_on_the_io_context)
+{
+    ClientRig rig;
+    rig.client.set_keepalive_for_test(/*ping*/1, /*peer_timeout*/600, /*tick*/1);
     rig.wire_connected();
     rig.deliver(rig.peer_version(70230, 1, 100, "/Dash Core:21.1.0/"));
     rig.deliver(dash::coin::p2p::message_verack::make_raw());
     ASSERT_TRUE(rig.client.is_handshake_complete());
 
-    // Watchdog: if the drop never happens the liveness timer repeats forever,
-    // so bound the run and let the assertion below report it instead of hanging.
+    // Stop as soon as the client pings of its own accord.
+    boost::asio::steady_timer poll(rig.ioc);
+    std::function<void()> watch = [&]{
+        poll.expires_after(std::chrono::milliseconds(50));
+        poll.async_wait([&](const boost::system::error_code& ec){
+            if (ec) return;
+            if (rig.client.pings_sent() > 0) { rig.ioc.stop(); return; }
+            watch();
+        });
+    };
+    watch();
+
     boost::asio::steady_timer watchdog(rig.ioc);
-    watchdog.expires_after(std::chrono::seconds(15));
+    watchdog.expires_after(std::chrono::seconds(20));   // 20x the cadence
     watchdog.async_wait([&](const boost::system::error_code&){ rig.ioc.stop(); });
+    rig.ioc.run();
 
-    const auto t0 = std::chrono::steady_clock::now();
-    rig.ioc.run();                                  // returns once the peer is dropped
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - t0).count();
-
-    EXPECT_FALSE(rig.client.is_connected()) << "a fully silent peer was never dropped";
-    EXPECT_GE(rig.client.pings_sent(), 1u) << "we must probe before concluding";
-    EXPECT_EQ(rig.client.pongs_matched(), 0u);
-    EXPECT_GE(elapsed, 3000) << "dropped before the peer timeout matured";
+    EXPECT_GE(rig.client.pings_sent(), 1u)
+        << "the pool tick timer was never armed on the io_context — every "
+           "clock-driven test above would still pass with the tick deleted";
 }
 
 } // namespace

@@ -626,6 +626,15 @@ private:
     bool m_reconnect_enabled = false;
     std::string m_chain_label = "COIN-P2P";
 
+    // Wall-clock source for EVERY deadline this client evaluates: handshake
+    // deadlines, the ping/unanswered-ping policy, dial-slot reclamation.
+    // Default is the steady clock; tests inject a fake one (same seam shape as
+    // CoinStateMaintainer::set_now_fn).
+    std::function<int64_t()> m_now_fn{[]() {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }};
+
     int64_t m_last_status_log{0};
     uint64_t m_sessions_started{0};
     uint64_t m_sessions_lost{0};
@@ -966,6 +975,35 @@ public:
         for (auto& p : m_pool)
             p->liveness.configure(m_ping_interval_sec, m_peer_timeout_sec);
     }
+
+    /// Override the time source every deadline is measured against (default:
+    /// the steady clock).
+    ///
+    /// WHY THIS SEAM EXISTS. Every deadline here — handshake, ping interval,
+    /// unanswered-ping drop, dial-slot reclamation — is a comparison against
+    /// now_sec(). A test that instead measures ELAPSED REAL MILLISECONDS is
+    /// racing the machine: under AddressSanitizer the binary runs 2-10x slower,
+    /// and an assertion like `elapsed >= 3000` loses that race by a millisecond
+    /// on a loaded runner. Worse, a test with slop widened to absorb that can no
+    /// longer tell "the deadline logic regressed" from "the runner was busy" —
+    /// it becomes a check that cannot fail.
+    ///
+    /// So the tests drive SIMULATED seconds through this seam and assert on the
+    /// resulting DECISIONS (ping sent at exactly T+120, peer dropped at exactly
+    /// T+1200), which is what the policy actually promises. That is
+    /// deterministic under any sanitizer and any load, and it still fails for
+    /// the right reason if the policy changes. It also lets the tests assert
+    /// against the SHIPPED constants (120s/1200s) rather than scaled stand-ins,
+    /// because simulated hours are free.
+    void set_now_fn(std::function<int64_t()> fn)
+    {
+        if (fn) m_now_fn = std::move(fn);
+    }
+
+    /// TEST-ONLY: run ONE pool tick synchronously, exactly as the repeating
+    /// pool timer would. Paired with set_now_fn this replaces the io_context
+    /// entirely for policy tests — no real timer, no real waiting, no race.
+    void tick_for_test() { on_pool_tick(); }
 
     /// TEST-ONLY: stand a peer session up with a synthetic endpoint and NO
     /// socket, the way Factory does on a live connect. A null socket is legal
@@ -1539,11 +1577,11 @@ private:
         m_pool_timer->start(m_pool_tick_sec, [this]() { on_pool_tick(); });
     }
 
-    static int64_t now_sec()
-    {
-        return std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-    }
+    /// The ONE time source every deadline in this client is measured against.
+    /// Injectable (set_now_fn) so the liveness policy can be driven by
+    /// simulated seconds instead of wall-clock ones — see the seam's rationale
+    /// on set_now_fn below.
+    int64_t now_sec() const { return m_now_fn(); }
 
     /// Inbound traffic observed FROM THIS PEER. This is the ONLY liveness input
     /// — nothing we SEND may push the deadline out (see PeerLiveness's
