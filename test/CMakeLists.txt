@@ -731,6 +731,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_qrinfo.cpp
         test_dash_rotated_quorum_members.cpp
         test_dash_dkg_commitments.cpp
+        test_dash_qc_episode_classifier.cpp
         test_dash_sml_quorum_db.cpp
         test_dash_embedded_oracle_shadow.cpp
         test_dash_mn_confirm_rollover.cpp

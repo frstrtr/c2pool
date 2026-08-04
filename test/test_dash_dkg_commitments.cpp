@@ -1459,3 +1459,76 @@ TEST(DashLlmqTypeReconciler, ReadsTheProductionQuorumManagerSource)
     EXPECT_EQ(d[0].llmq_type, 5);
     EXPECT_EQ(d[0].verdict, LlmqTypeVerdict::NeverObserved);
 }
+
+// ── qc_pose_pass_provably_noop: the interim PoSe serve predicate ───────────
+//
+// dashd PoSe-punishes every member a NON-NULL in-block commitment marks
+// invalid (specialtxman.cpp:159-174 HandleQuorumCommitment ->
+// PoSePunish(CalcPenalty(66))), mutating the SAME block's merkleRootMNList
+// when a punishment crosses the ban threshold; null commitments are exempt
+// (specialtxman.cpp:427-432 IsNull() guard). c2pool folds no PoSe pass, so a
+// real commitment is servable ONLY when that pass is provably a no-op: every
+// LISTED member (index < member_count of the deterministic member list dashd
+// indexes validMembers with) marked valid. These KATs pin the predicate's
+// fail-closed edges.
+
+TEST(DashQcPoseNoopPredicate, NullCommitmentIsExemptByConstruction)
+{
+    // The arm-synthesized null (all-false bitsets, zero crypto) takes the
+    // IsNull() exempt path in every verifier — provably a no-op regardless
+    // of member count, even an unknowable one (0).
+    const auto null_c = build_null_commitment(kLlmq50_60, h256(0x31), 0);
+    EXPECT_TRUE(qc_commitment_is_null(null_c));
+    EXPECT_TRUE(qc_pose_pass_provably_noop(null_c, 0));
+    EXPECT_TRUE(qc_pose_pass_provably_noop(null_c, 50));
+}
+
+TEST(DashQcPoseNoopPredicate, AllListedMembersValidIsProvableNoop)
+{
+    // The common case: a full quorum, every listed member valid — the PoSe
+    // punish loop touches nothing, serving stays unblocked.
+    const auto c = real_commitment(kLlmq50_60, h256(0x32), 0, 0x01);
+    EXPECT_FALSE(qc_commitment_is_null(c));
+    EXPECT_TRUE(qc_pose_pass_provably_noop(c, 50));
+}
+
+TEST(DashQcPoseNoopPredicate, PaddingBitsBeyondMemberCountProveNothingBad)
+{
+    // A NON-FULL quorum: 40 members on a size-50 type. dashcore's own Verify
+    // requires bits at index >= members.size() unset, so a fully-valid
+    // commitment there has false bits [40,50) — DKG padding, not punished
+    // members. The predicate must NOT read padding as a punishment (that
+    // would refuse every non-full quorum forever).
+    auto c = real_commitment(kLlmq50_60, h256(0x33), 0, 0x02);
+    for (size_t i = 40; i < 50; ++i) {
+        c.signers[i]      = false;
+        c.validMembers[i] = false;
+    }
+    EXPECT_TRUE(qc_pose_pass_provably_noop(c, 40));
+    // The SAME bitset judged against a 50-member list reads indices [40,50)
+    // as punished listed members — refused. member_count is load-bearing.
+    EXPECT_FALSE(qc_pose_pass_provably_noop(c, 50));
+}
+
+TEST(DashQcPoseNoopPredicate, OnePunishedListedMemberRefuses)
+{
+    // THE LANDMINE INPUT: a verified real commitment carrying
+    // !validMembers[i] for a listed member — dashd would PoSePunish
+    // members[7] in the block's own MN list. Never provably a no-op.
+    auto c = real_commitment(kLlmq50_60, h256(0x34), 0, 0x03);
+    c.validMembers[7] = false;
+    EXPECT_FALSE(qc_pose_pass_provably_noop(c, 50));
+    // Punished member visible even at the smallest count that lists it.
+    EXPECT_FALSE(qc_pose_pass_provably_noop(c, 8));
+    // A count that does NOT list index 7 cannot see a punishment there.
+    EXPECT_TRUE(qc_pose_pass_provably_noop(c, 7));
+}
+
+TEST(DashQcPoseNoopPredicate, UnprovableMemberCountsFailClosed)
+{
+    // No member list (count 0) or a count exceeding the bitset: the punish
+    // loop cannot be modeled, so the answer is REFUSE, never a guess.
+    const auto c = real_commitment(kLlmq50_60, h256(0x35), 0, 0x04);
+    EXPECT_FALSE(qc_pose_pass_provably_noop(c, 0));
+    EXPECT_FALSE(qc_pose_pass_provably_noop(c, 51));
+}
