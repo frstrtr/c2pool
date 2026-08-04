@@ -289,6 +289,15 @@ public:
         m_have_mn_dbg  = have_mn ? 1 : 0;
     }
 
+    /// DIAGNOSTIC (body-first serve tip): the maintainer knows a newer header
+    /// tip whose block inputs (body / tip-targeted mnlistdiff cbTx) have not
+    /// been parsed yet. This is the NORMAL ~1-2 s propagation transient of
+    /// the body-first split, not an error state; publishing it here lets a
+    /// not-populated refusal during that window (cold start / overdue demote)
+    /// carry its own name instead of masquerading as a header-sync fault.
+    /// Never read by any serve or reward path.
+    void set_tip_body_pending_dbg(bool v) { m_tip_body_pending_dbg = v; }
+
     /// Enable the SML-required viability gate. main_dash.cpp turns this on for
     /// the embedded coin-P2P arm so a template is only served once the CCbTx
     /// commitment inputs are present (review finding H3: no mid-sync half-built block).
@@ -1037,6 +1046,14 @@ private:
             d.cause     = "mn-needs-reseed";
             d.value     = "latched";
             d.threshold = "cleared-by-authoritative-reseed";
+        } else if (d.cause == "not-populated" && m_tip_body_pending_dbg) {
+            // Body-first serve tip: a header tip is known but its block
+            // inputs have not been parsed yet (cold start before the first
+            // promotion, or an overdue-demoted pending window). The named
+            // transient — NOT a header-sync fault, NOT an error state; the
+            // value keeps both populate halves visible.
+            d.cause     = "tip-body-pending";
+            d.threshold = "tip-body-folded";
         } else if (d.cause == "not-populated" && m_prev_hash.IsNull()
                    && m_have_tip_dbg < 0) {
             // ONLY when the maintainer has told us nothing (never reported).
@@ -1173,6 +1190,9 @@ private:
     // Publish-precondition mirror (-1 = the maintainer has never reported).
     int8_t   m_have_tip_dbg{-1};
     int8_t   m_have_mn_dbg{-1};
+    // Body-first serve tip: header tip known, block inputs not yet parsed
+    // (set_tip_body_pending_dbg). Diagnostic only, never gates anything.
+    bool     m_tip_body_pending_dbg{false};
     uint32_t m_prev_height{0};
     uint256  m_prev_hash;
     uint32_t m_bits_for_next{0};

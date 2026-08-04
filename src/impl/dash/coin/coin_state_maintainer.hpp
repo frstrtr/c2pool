@@ -52,6 +52,8 @@
 #include <cstdint>
 #include <ctime>
 #include <functional>
+#include <iterator>
+#include <map>
 #include <optional>
 #include <string>
 #include <utility>
@@ -359,6 +361,10 @@ public:
                          << vr.flipped_to_invalid << " banned +"
                          << vr.flipped_to_valid << " revived @ h=" << vh;
         }
+        // BODY-FIRST: an authoritative snapshot loaded as-of the pending tip
+        // completes the payee axis — the last promotion precondition when the
+        // credit-pool seed already reached the tip (diff-before-seed order).
+        maybe_promote_pending_tip();
         if (!m_have_mn)
             demote();
         else
@@ -381,6 +387,7 @@ public:
     /// SML at exactly the state dashd commits for TIP+1 is the #1 item the live
     /// byte-parity KAT against a running dashd must confirm; do not assume.
     void on_mnlistdiff(const vendor::CSimplifiedMNListDiff& diff) {
+        check_tip_body_overdue();
         // E2 credit-pool persist locals: set when the diff's cbTx re-anchors the
         // pool, flushed (aligned with the SML persist) at the bottom so a restart
         // resumes the credit pool at the SAME tip as SMLDb/QuorumDb.
@@ -628,6 +635,13 @@ public:
         // recomputes nAbsVoteReq per tally; a one-shot seed would freeze a
         // cold-start 0 forever or drift as the list grows).
         reseed_funding_threshold();
+        // BODY-FIRST: a diff whose authoritative cbTx re-anchored the
+        // credit-pool seed AT the pending header tip carries the same block
+        // inputs a tip-body fold does — promote the serve tip off it (this is
+        // the cold-start path: the initial header sync ends at a tip whose
+        // body is never inv'd, and the tip-targeted mnlistdiff is what makes
+        // it servable).
+        maybe_promote_pending_tip();
         if (!m_have_mn_sml)
             demote();
         else
@@ -705,13 +719,79 @@ public:
         // full-snapshot resync must not be blocked by the stale-guard.
         m_sml_current_height = 0;
         m_sml_height_paired  = false;
-        // Invalidate the credit-pool seed's freshness too (height -1 != any tip),
-        // so the arm fails closed on the credit-pool axis until a fresh re-seed.
-        m_state.set_credit_pool(0, uint256::ZERO, -1);
-        // E2: wipe the independent running accrual as well — its balance was built
-        // on the now-orphaned branch. It re-bootstraps from the first post-reorg
-        // block's / full-snapshot's authoritative cbTx (never a stale carry-over).
-        m_credit_pool_sm.clear();
+        // ── Credit-pool axis: REORG UNDO from the retained full-block buffer ──
+        // A reorg whose fork point is still inside the bounded full-block
+        // buffer does not need the cold wipe on this axis: the retained
+        // fork-point body's OWN coinbase CCbTx carries the creditPoolBalance
+        // the chain committed AT that height (an independent, network-accepted
+        // value — the same non-self-referential source the per-block advance
+        // verifies against). Rolling the pool back to the fork point from that
+        // retained body lets the new branch's bodies advance CONTIGUOUSLY and
+        // verify, instead of the seed sitting at -1 until the next mnlistdiff
+        // re-anchor. The fork point is found by comparing retained body hashes
+        // against the NEW branch's height index (the header chain has already
+        // switched when this runs). Beyond the buffer — or with the buffer /
+        // lookup unwired (KAT posture, dashd-RPC posture) — the existing
+        // wipe + cold-resync path below is UNCHANGED.
+        // NOTE the deliberate asymmetry: the SML/quorum axis above is still
+        // wiped even inside the buffer. Bodies cannot reconstruct the DMN
+        // list — a cbTx commits merkleRootMNList, and a root is not a list —
+        // so the mnlistdiff cold-resync (one request/response round-trip,
+        // re-issued by main_dash's reorg wiring) remains the only sound
+        // MN-root recovery.
+        bool cp_undone = false;
+        if (m_block_buffer_enabled && m_chain_hash_at_height_fn
+            && !m_block_buffer.empty()) {
+            std::optional<uint32_t> fork_h;
+            for (auto it = m_block_buffer.rbegin();
+                 it != m_block_buffer.rend(); ++it) {
+                auto on_chain = m_chain_hash_at_height_fn(it->first);
+                if (on_chain && *on_chain == it->second.hash) {
+                    fork_h = it->first;
+                    break;
+                }
+            }
+            if (fork_h) {
+                // Retained bodies ABOVE the fork point are orphan-branch
+                // bodies — drop them (they must never re-seed anything).
+                while (!m_block_buffer.empty()
+                       && m_block_buffer.rbegin()->first > *fork_h) {
+                    m_block_buffer.erase(std::prev(m_block_buffer.end()));
+                    ++m_block_buffer_evictions;
+                }
+                const auto& rb = m_block_buffer.rbegin()->second;
+                if (!rb.block.m_txs.empty() && rb.block.m_txs[0].type == 5
+                    && !rb.block.m_txs[0].extra_payload.empty()) {
+                    vendor::CCbTx cb;
+                    if (vendor::parse_cbtx(rb.block.m_txs[0].extra_payload, cb)
+                        && cb.nVersion >= vendor::CCbTx::VERSION_CLSIG_AND_BALANCE
+                        && cb.nHeight == static_cast<int32_t>(*fork_h)) {
+                        m_credit_pool_sm.seed(cb.creditPoolBalance, *fork_h);
+                        m_state.set_credit_pool(cb.creditPoolBalance, rb.hash,
+                                                static_cast<int32_t>(*fork_h));
+                        cp_undone = true;
+                        LOG_INFO << "[EMB-DASH] reorg undo: credit pool rolled"
+                                    " back to fork point h=" << *fork_h
+                                 << " balance=" << cb.creditPoolBalance
+                                 << " from retained body (buffer depth="
+                                 << m_block_buffer.size()
+                                 << ") — no cold credit-pool wipe inside the"
+                                    " buffer";
+                    }
+                }
+            }
+        }
+        if (!cp_undone) {
+            // Invalidate the credit-pool seed's freshness (height -1 != any
+            // tip), so the arm fails closed on the credit-pool axis until a
+            // fresh re-seed.
+            m_state.set_credit_pool(0, uint256::ZERO, -1);
+            // E2: wipe the independent running accrual as well — its balance
+            // was built on the now-orphaned branch. It re-bootstraps from the
+            // first post-reorg block's / full-snapshot's authoritative cbTx
+            // (never a stale carry-over).
+            m_credit_pool_sm.clear();
+        }
         // Wipe the PERSISTED SML/quorum stores too. The on-disk state is now for
         // an orphaned branch; it is self-consistent so the root-verify on the
         // next restart WOULD pass and serve a wrong-branch template. Clearing it
@@ -734,6 +814,10 @@ public:
     /// publication; it only enriches the next assembled template. Returns the
     /// mempool's accept verdict (false = rejected: bad utxo ref / already in).
     bool on_mempool_tx(const MutableTransaction& tx) {
+        // Mempool relay is the highest-cadence event through the maintainer,
+        // so it doubles as the clock the tip-body-overdue bound is checked on
+        // (the maintainer owns no timer; see check_tip_body_overdue).
+        check_tip_body_overdue();
         return m_state.mempool().add_tx(tx);
     }
 
@@ -741,20 +825,61 @@ public:
     /// embedded template needs and mark tip-readiness, then republish if the
     /// MN list is also ready. curtime/version left 0 defer to
     /// build_embedded_workdata()'s own SAFE-ADDITIVE defaults.
+    ///
+    /// BODY-FIRST SERVE TIP (operator direction off soak0804e / #1089): under
+    /// set_body_first_serve_tip(true) this records the HEADER tip only. The
+    /// SERVE tip (m_prev_* — the template height and the threshold every
+    /// freshness gate compares against) advances ONLY once the block inputs
+    /// for this exact tip block have been parsed: the tip body's coinbase
+    /// CCbTx folded (on_block_connected) or an authoritative mnlistdiff cbTx
+    /// at the tip (on_mnlistdiff). That is dashd's own ordering — its tip
+    /// advances after full-block processing — and it removes the
+    /// creditpool-stale window as a class: we never DECLARE a tip we cannot
+    /// yet serve. Header-tip consumers (stale-work invalidation, job rebuild,
+    /// won-block detection, mnlistdiff pull — all wired in main_dash off the
+    /// header chain's tip-changed callback) are NOT delayed; only the serve
+    /// tip is. Between header and body the arm keeps serving prev=old-tip
+    /// work — the same propagation-window behaviour every pool has — named
+    /// `tip-body-pending`, which is a NORMAL TRANSIENT, not an error state.
     void on_new_tip(uint32_t prev_height, const uint256& prev_hash,
                     uint32_t bits_for_next, uint32_t mtp_at_tip,
                     uint8_t address_version, uint8_t address_p2sh_version,
                     uint32_t curtime = 0, uint32_t version = 0) {
-        m_prev_height          = prev_height;
-        m_prev_hash            = prev_hash;
-        m_bits_for_next        = bits_for_next;
-        m_mtp_at_tip           = mtp_at_tip;
-        m_address_version      = address_version;
-        m_address_p2sh_version = address_p2sh_version;
-        m_curtime              = curtime;
-        m_version              = version;
-        m_have_tip             = true;
-        republish();
+        m_hdr_prev_height          = prev_height;
+        m_hdr_prev_hash            = prev_hash;
+        m_hdr_bits_for_next        = bits_for_next;
+        m_hdr_mtp_at_tip           = mtp_at_tip;
+        m_hdr_address_version      = address_version;
+        m_hdr_address_p2sh_version = address_p2sh_version;
+        m_hdr_curtime              = curtime;
+        m_hdr_version              = version;
+        m_have_hdr_tip             = true;
+        if (!m_body_first_serve_tip) {
+            // Header-first (legacy, DEFAULT): promote immediately —
+            // byte-identical to the pre-split behaviour.
+            promote_serve_tip();
+            republish();
+            return;
+        }
+        // Body-first: a new header tip opens (or re-opens) the body-pending
+        // window. A body/diff that already made the credit-pool seed current
+        // AT this exact block (body raced ahead of the header event) promotes
+        // immediately.
+        m_tip_body_pending  = true;
+        m_tip_pending_since = m_now_fn();
+        m_tip_overdue_latched = false;
+        if (maybe_promote_pending_tip()) {
+            republish();
+            return;
+        }
+        m_state.set_tip_body_pending_dbg(true);
+        LOG_INFO << "[EMB-DASH] tip-body-pending h=" << prev_height << " "
+                 << prev_hash.GetHex().substr(0, 16)
+                 << "... — serve tip holds at "
+                 << (m_have_tip ? ("h=" + std::to_string(m_prev_height))
+                                : std::string("none"))
+                 << " until the tip body folds (normal transient,"
+                    " dashd-equivalent propagation window)";
     }
 
     /// Header / think path (block connect): fold a newly-connected block's
@@ -784,10 +909,23 @@ public:
         // E2b bootstrap causes no notify storm. The refusal between
         // tip-advance and body-parse is untouched: this is latency work, the
         // gate itself is not weakened.
+        check_tip_body_overdue();
         const bool cp_was_current_at_tip =
             m_have_tip
             && m_state.credit_pool_height() == static_cast<int32_t>(m_prev_height);
         auto r = on_block_connected_impl(block, height);
+        // BODY-FIRST serve-tip promotion: if this fold made the credit-pool
+        // seed current AT the pending header tip, the serve tip advances NOW —
+        // atomically with the credit-pool/MN-root input advance that just
+        // happened inside the impl (single-threaded event path; nothing can
+        // observe the state between the fold and this promotion). The
+        // atomicity invariant this pins: the serve height never exceeds the
+        // height whose body has been parsed.
+        if (maybe_promote_pending_tip()) {
+            republish();
+            notify_state_dirty();
+            return r;
+        }
         const bool cp_now_current_at_tip =
             m_have_tip
             && m_state.credit_pool_height() == static_cast<int32_t>(m_prev_height);
@@ -826,6 +964,11 @@ private:
         // Runs BEFORE the MN snapshot fence: the credit pool is a distinct axis
         // (asset-lock/unlock + platform-reward), independent of the payee set.
         advance_credit_pool_on_block(block, height);
+
+        // Bounded full-block retention (LTC-style "highest sufficient number
+        // of full blocks"): the body is merkle-bound (checked above), so it is
+        // eligible for the reorg-undo buffer. No-op unless enabled.
+        buffer_insert(block, height);
 
         // E-SUPERBLOCK (R6): superblock desync cross-check + store pruning —
         // the superblock analogue of the MN payee-desync latch below (#807,
@@ -977,6 +1120,11 @@ public:
     /// reorg) is left in place.
     void on_invalidate() {
         m_have_tip = false;
+        // Body-first bookkeeping: the header tip we were awaiting a body for
+        // is invalidated with everything else; a fresh on_new_tip re-arms.
+        m_have_hdr_tip = false;
+        m_tip_body_pending = false;
+        m_state.set_tip_body_pending_dbg(false);
         demote();
     }
 
@@ -1008,6 +1156,71 @@ public:
     /// turns it on for the whole embedded arm.
     void set_require_seeded_mn_set(bool on) { m_require_seeded_mn = on; }
     bool require_seeded_mn_set() const { return m_require_seeded_mn; }
+
+    /// BODY-FIRST SERVE TIP (operator direction, soak0804e follow-up to
+    /// #1089). When enabled, on_new_tip records the HEADER tip only; the
+    /// SERVE tip (what m_prev_height / every freshness gate sees) advances
+    /// exactly when the block inputs for that tip have been parsed — the tip
+    /// body's coinbase folded, or an authoritative mnlistdiff cbTx at the tip
+    /// — atomically with the credit-pool advance. Default OFF: every existing
+    /// construction site (KATs, the dashd-RPC/ZMQ tip posture, whose tip feed
+    /// has NO body feed and would otherwise never promote) keeps byte-
+    /// identical header-first behaviour. main_dash enables it for the
+    /// coin-P2P daemonless arm, where full bodies demonstrably flow.
+    /// REQUIRES the v20+ CCbTx posture (promotion is keyed on the credit-pool
+    /// seed becoming current at the tip) — exactly the posture the daemonless
+    /// arm already requires for the creditpool freshness gate.
+    void set_body_first_serve_tip(bool on) { m_body_first_serve_tip = on; }
+    bool body_first_serve_tip() const { return m_body_first_serve_tip; }
+
+    /// Body-first observability (STATE SAYS ITS OWN NAME): is the maintainer
+    /// currently holding the serve tip below a known header tip, awaiting the
+    /// tip body? TRUE is the normal ~1-2 s propagation transient, never an
+    /// error state.
+    bool tip_body_pending() const { return m_tip_body_pending; }
+    /// The header tip (advances on headers exactly as before) and the serve
+    /// tip (advances body-first when enabled). serve <= header always under
+    /// body-first — the atomicity invariant.
+    uint32_t header_tip_height() const { return m_have_hdr_tip ? m_hdr_prev_height : 0; }
+    uint32_t serve_tip_height()  const { return m_have_tip ? m_prev_height : 0; }
+
+    /// How long a body-pending window may last before the serve tip is
+    /// DEMOTED instead of continuing to serve old-tip work (the doomed-tip
+    /// bound the operator direction names for the lost-body tail: past the
+    /// propagation window, prev=old-height work is knowingly doomed and
+    /// refusing is safer than serving it). The p2p body-rerequest watchdog
+    /// (10 s, up to 4 rotated peers) should resolve a lost body well inside
+    /// this. Checked opportunistically on maintainer events (mempool relay is
+    /// the high-cadence clock). Overridable for tests.
+    void set_tip_body_overdue_secs(int64_t s) { m_tip_body_overdue_secs = s; }
+
+    /// Bounded full-block buffer (LTC-style retention, operator direction):
+    /// retain merkle-bound bodies above the last ChainLocked height + margin,
+    /// floor 6, cap 24 (~1 h of DASH blocks). ChainLock depth is the
+    /// principled reachability cap — nothing at or below a ChainLocked block
+    /// can reorg — and DASH ChainLocks normally land within seconds, so the
+    /// steady-state depth is the floor. Purpose: reorg undo for the
+    /// credit-pool axis without a wipe + cold-resync inside the buffer depth
+    /// (see on_sml_reorg); beyond it the existing wipe + reseed path stays.
+    /// Default OFF (no retention, no memory cost) — main_dash enables it for
+    /// the daemonless arm alongside body-first.
+    void set_full_block_buffer(bool on) { m_block_buffer_enabled = on; }
+    /// Height -> hash lookup on the CURRENT chain (main_dash wires the header
+    /// chain's height index). The reorg-undo fork-point search compares
+    /// retained body hashes against it. Unset => undo never fires (existing
+    /// wipe path, KAT posture).
+    void set_chain_hash_at_height_fn(
+        std::function<std::optional<uint256>(uint32_t)> fn) {
+        m_chain_hash_at_height_fn = std::move(fn);
+    }
+    size_t   block_buffer_depth()     const { return m_block_buffer.size(); }
+    uint64_t block_buffer_evictions() const { return m_block_buffer_evictions; }
+    uint32_t block_buffer_lowest_height() const {
+        return m_block_buffer.empty() ? 0 : m_block_buffer.begin()->first;
+    }
+    uint32_t block_buffer_highest_height() const {
+        return m_block_buffer.empty() ? 0 : m_block_buffer.rbegin()->first;
+    }
 
     /// The unseeded-payee-fold guard's own witnesses: how many blocks it
     /// refused to fold because no height-stamped masternode snapshot was in
@@ -1331,6 +1544,121 @@ private:
         m_gov_store.prune_executed(static_cast<int32_t>(height));
     }
 
+    // ── BODY-FIRST serve-tip machinery ───────────────────────────────────
+
+    /// Copy the stashed header-tip params into the SERVE slots. In
+    /// header-first (legacy) mode this runs inside on_new_tip, byte-identical
+    /// to the old direct assignment; in body-first mode it runs only from
+    /// maybe_promote_pending_tip().
+    void promote_serve_tip() {
+        m_prev_height          = m_hdr_prev_height;
+        m_prev_hash            = m_hdr_prev_hash;
+        m_bits_for_next        = m_hdr_bits_for_next;
+        m_mtp_at_tip           = m_hdr_mtp_at_tip;
+        m_address_version      = m_hdr_address_version;
+        m_address_p2sh_version = m_hdr_address_p2sh_version;
+        m_curtime              = m_hdr_curtime;
+        m_version              = m_hdr_version;
+        m_have_tip             = true;
+        m_tip_body_pending     = false;
+        m_tip_overdue_latched  = false;
+    }
+
+    /// Promote the pending header tip to the serve tip iff the credit-pool
+    /// seed is current AT that exact block (hash AND height — the hash match
+    /// is what keeps a same-height competing block's body from promoting the
+    /// wrong tip's params). The seed is the witness that the tip block's
+    /// inputs were parsed: the body fold and the mnlistdiff cbTx re-anchor
+    /// both stamp it with the block's own identity. Returns true iff
+    /// promotion happened; caller republishes.
+    bool maybe_promote_pending_tip() {
+        if (!m_body_first_serve_tip || !m_tip_body_pending) return false;
+        if (!m_have_hdr_tip) return false;
+        if (m_state.credit_pool_current_hash() != m_hdr_prev_hash) return false;
+        if (m_state.credit_pool_height()
+            != static_cast<int32_t>(m_hdr_prev_height)) return false;
+        // The PAYEE axis must be current at the tip too (its cursor advances
+        // in the tip-body apply_block, or a snapshot loaded as-of the tip):
+        // promoting off a tip-targeted mnlistdiff that outraced the body
+        // would advance the serve tip into a payee-stale refusal — trading
+        // the removed creditpool-stale window for an identical one on the
+        // payee axis. An EMPTY payee machine (pre-seed cold start, post-wipe)
+        // has no cursor to be stale and does not hold promotion back — the
+        // MN-readiness half of populated() already gates serving there.
+        if (!m_state.mnstates().entries().empty()
+            && m_state.mnstates().last_applied_height() != m_hdr_prev_height)
+            return false;
+        promote_serve_tip();
+        m_state.set_tip_body_pending_dbg(false);
+        LOG_INFO << "[EMB-DASH] serve tip promoted h=" << m_prev_height << " "
+                 << m_prev_hash.GetHex().substr(0, 16)
+                 << "... (body-first: tip block inputs parsed, credit-pool"
+                    " seed current at tip)";
+        return true;
+    }
+
+    /// Doomed-tip bound: a body-pending window that outlives
+    /// m_tip_body_overdue_secs (lost body the p2p watchdog could not recover,
+    /// or a credit-pool ACCRUAL DRIFT that blocks the seed) must stop serving
+    /// old-tip work — past the propagation window that work is knowingly
+    /// doomed, and refusing (dashd fallback / not-populated) is the safe
+    /// state. Promotion re-arms the serve tip when the inputs finally land.
+    /// The maintainer owns no timer, so this is checked opportunistically on
+    /// every maintainer event (mempool relay being the high-cadence clock).
+    void check_tip_body_overdue() {
+        if (!m_body_first_serve_tip || !m_tip_body_pending) return;
+        if (m_tip_overdue_latched) return;
+        if (m_now_fn() - m_tip_pending_since < m_tip_body_overdue_secs) return;
+        m_tip_overdue_latched = true;
+        LOG_WARNING << "[EMB-DASH] tip-body-overdue h=" << m_hdr_prev_height
+                    << " pending for "
+                    << (m_now_fn() - m_tip_pending_since)
+                    << "s (> " << m_tip_body_overdue_secs
+                    << "s) — demoting the serve tip: serving h="
+                    << m_prev_height << "-based work past the propagation"
+                       " window is doomed-tip work; failing closed until the"
+                       " tip block's inputs land";
+        if (!m_have_tip) return;   // nothing was being served anyway
+        m_have_tip = false;
+        demote();
+        notify_state_dirty();
+    }
+
+    /// Bounded full-block retention (see set_full_block_buffer). Called from
+    /// on_block_connected_impl AFTER the merkle bind check — only bound
+    /// bodies are retained. Retention depth: heights above the last
+    /// ChainLocked height + a 2-block margin, clamped to [floor 6, cap 24];
+    /// no ChainLock observed => the cap alone bounds it (a ChainLock outage
+    /// of ~1 h exhausts the buffer and the wipe path takes over, by design).
+    void buffer_insert(const dash::coin::BlockType& block, uint32_t height) {
+        if (!m_block_buffer_enabled) return;
+        m_block_buffer[height] =
+            RetainedBlock{block_identity_hash(block), block};
+        ++m_block_buffer_inserts;
+        const uint32_t hi = m_block_buffer.rbegin()->first;
+        const int32_t  cl = m_state.best_cl_height();
+        uint64_t depth_target = kBlockBufferCap;
+        if (cl > 0 && static_cast<uint32_t>(cl) <= hi)
+            depth_target = static_cast<uint64_t>(hi - static_cast<uint32_t>(cl))
+                           + kBlockBufferClMargin;
+        depth_target = std::min<uint64_t>(
+            std::max<uint64_t>(depth_target, kBlockBufferFloor),
+            kBlockBufferCap);
+        while (!m_block_buffer.empty()
+               && m_block_buffer.begin()->first + depth_target <= hi) {
+            m_block_buffer.erase(m_block_buffer.begin());
+            ++m_block_buffer_evictions;
+        }
+        // Periodic depth line (soak-greppable measurement, ~once per cap's
+        // worth of inserts ≈ 1 h at steady state).
+        if ((m_block_buffer_inserts % kBlockBufferCap) == 1)
+            LOG_INFO << "[EMB-DASH] full-block buffer depth="
+                     << m_block_buffer.size() << " span=["
+                     << m_block_buffer.begin()->first << ".." << hi
+                     << "] target=" << depth_target << " cl_h=" << cl
+                     << " evictions=" << m_block_buffer_evictions;
+    }
+
     // Publish only when both prerequisites are present; otherwise leave the
     // holder in whatever (un)published state it is in -- callers reach demote()
     // explicitly for the invalidating transitions.
@@ -1419,7 +1747,9 @@ private:
     uint32_t m_unseeded_payee_first_h{0};
     uint32_t m_unseeded_payee_last_h{0};
 
-    // Last observed tip params, applied on republish().
+    // SERVE-TIP params, applied on republish(). Under body-first these lag
+    // the header tip by the body-pending window; header-first (default)
+    // they are assigned directly in on_new_tip via promote_serve_tip().
     uint32_t m_prev_height{0};
     uint256  m_prev_hash;
     uint32_t m_bits_for_next{0};
@@ -1428,6 +1758,42 @@ private:
     uint8_t  m_address_p2sh_version{0};
     uint32_t m_curtime{0};
     uint32_t m_version{0};
+
+    // HEADER-TIP stash (body-first split). Always written by on_new_tip;
+    // promoted into the serve slots immediately (header-first) or on the tip
+    // block's inputs being parsed (body-first).
+    bool     m_have_hdr_tip{false};
+    uint32_t m_hdr_prev_height{0};
+    uint256  m_hdr_prev_hash;
+    uint32_t m_hdr_bits_for_next{0};
+    uint32_t m_hdr_mtp_at_tip{0};
+    uint8_t  m_hdr_address_version{0};
+    uint8_t  m_hdr_address_p2sh_version{0};
+    uint32_t m_hdr_curtime{0};
+    uint32_t m_hdr_version{0};
+
+    // Body-first mode + pending-window state. Defaults keep every existing
+    // construction site byte-identical (header-first).
+    bool    m_body_first_serve_tip{false};
+    bool    m_tip_body_pending{false};
+    bool    m_tip_overdue_latched{false};
+    int64_t m_tip_pending_since{0};
+    int64_t m_tip_body_overdue_secs{30};
+
+    // Bounded full-block buffer (reorg undo). Keyed by height; hash is the
+    // block's own X11 identity, used by the fork-point search.
+    struct RetainedBlock {
+        uint256 hash;
+        dash::coin::BlockType block;
+    };
+    static constexpr size_t   kBlockBufferFloor    = 6;
+    static constexpr size_t   kBlockBufferCap      = 24;   // ~1 h of DASH blocks
+    static constexpr uint32_t kBlockBufferClMargin = 2;
+    bool m_block_buffer_enabled{false};
+    std::map<uint32_t, RetainedBlock> m_block_buffer;
+    uint64_t m_block_buffer_inserts{0};
+    uint64_t m_block_buffer_evictions{0};
+    std::function<std::optional<uint256>(uint32_t)> m_chain_hash_at_height_fn;
 };
 
 } // namespace coin

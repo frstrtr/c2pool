@@ -3802,7 +3802,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             coin_state.new_block.subscribe(
                 [cp = coin_p2p.get(), hc = header_chain.get()](const uint256& hash) {
                     cp->send_getheaders(70230, hc->get_locator(), uint256::ZERO);
-                    cp->request_block(hash);
+                    // TRACKED: this is the tip-body pull, the one request the
+                    // serve tip now waits on (body-first). The lost-body
+                    // watchdog re-requests it from a rotated peer after 10 s
+                    // (`cause=body-rerequest` in the log) instead of waiting
+                    // out the 600 s inv-dedup TTL — the #1089 208 s tail.
+                    cp->request_block_tracked(hash);
                 }));
 
         // new_chainlock -> record into the best-chainlock tracker (finalization
@@ -3824,6 +3829,27 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     if (batch.empty()) return;
                     cp->send_getheaders(70230, hc->get_locator(), uint256::ZERO);
                 }));
+
+        // ── BODY-FIRST SERVE TIP + bounded full-block buffer (operator
+        // direction off soak0804e; the follow-up the #1089 thread scopes).
+        // Enabled ONLY here, on the coin-P2P daemonless arm, where full
+        // bodies demonstrably flow (the dashd-RPC/ZMQ tip posture has no body
+        // feed and stays header-first). From here on the header-chain tip
+        // callback below keeps driving stale-work invalidation / job rebuild
+        // / the mnlistdiff pull EXACTLY as before (header-tip consumers are
+        // not delayed), while the maintainer's serve tip — the template
+        // height and every freshness-gate threshold — advances only when the
+        // tip block's inputs are parsed, atomically with the credit-pool
+        // advance. `creditpool-stale` then ceases to exist as a class in
+        // normal operation; the ~1-2 s window is named `tip-body-pending`.
+        maintainer->set_body_first_serve_tip(true);
+        maintainer->set_full_block_buffer(true);
+        maintainer->set_chain_hash_at_height_fn(
+            [hc = header_chain.get()](uint32_t h) -> std::optional<uint256> {
+                auto e = hc->get_header_by_height(h);
+                if (!e) return std::nullopt;
+                return e->hash;
+            });
 
         // Tip-changed callback: (a) fire Node::new_tip (leg 2 arms tip-readiness
         // -> the maintainer republishes once the MN list is ALSO seeded ->
