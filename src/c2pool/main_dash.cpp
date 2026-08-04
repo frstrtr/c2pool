@@ -3180,6 +3180,105 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         if (cp) cp->send_getmnlistd(base, tgt);
                     });
 
+            // ── ONE admission path for EVERY commitment transport ──────────
+            // (qc-plan-underivable fix). The cache used to be fed from exactly
+            // one source: the qfcommit push subscription below. Push requires
+            // being connected at the instant of the inv — measured on the
+            // 2026-08 soaks as a 14 s – 5 m 35 s arrival race after
+            // window-open on a healthy-peer host (7.5% of wall-clock declined
+            // qc-plan-underivable) and total cold-start starvation on a host
+            // whose peers churn. But FULL commitments also arrive over
+            // request/response — mnlistdiff `newQuorums` and qrinfo
+            // `lastCommitmentPerIndex` carry the complete DIP-4
+            // CFinalCommitment — and were dropped after existence
+            // bookkeeping. Every transport now funnels through THIS ingest,
+            // so the admission guarantees (structural checks + the BLS verify
+            // hook behind verified_for) hold identically regardless of
+            // arrival shape, and every ingest names its transport in the
+            // [QC-MINEABLE] line — the soak-checkable evidence of which
+            // transport actually supplied a commitment.
+            //
+            // SAY WHY on the reject path too: a dropped commitment that
+            // leaves no trace makes a later "no-commitment-cached" refusal
+            // indistinguishable from "never reached us" — opposite diagnoses
+            // (our bug vs a relay hole).
+            auto qc_ingest_from =
+                [qc_cache, qc_net, qc_member_source](
+                    const dash::coin::vendor::CFinalCommitment& c,
+                    const char* source, bool kick_member_fetch) {
+                    using Adm = dash::coin::MineableCommitmentCache::Admission;
+                    const auto adm = qc_cache->ingest_ex(qc_net, c);
+                    if (adm == Adm::Accepted) {
+                        LOG_INFO << "[QC-MINEABLE] cached commitment type="
+                                 << static_cast<int>(c.llmqType)
+                                 << " quorum="
+                                 << c.quorumHash.GetHex().substr(0, 16)
+                                 << "... signers=" << c.CountSigners()
+                                 << " source=" << source
+                                 << " cache=" << qc_cache->size();
+                        // Proactively source the member set so it is READY by
+                        // the DKG-window height that must serve it.
+                        if (kick_member_fetch)
+                            qc_member_source->request(c.llmqType, c.quorumHash);
+                    } else if (adm == Adm::NotBetterThanCached) {
+                        // EXPECTED steady-state overlap now that several
+                        // transports carry the same commitment (push +
+                        // mnlistdiff + qrinfo): an equal-or-better copy is
+                        // already held, the arrival is a no-op and NEVER a
+                        // downgrade. Same tag so a soak can still count
+                        // arrivals per transport, but named as the duplicate
+                        // it is, not a defect.
+                        LOG_INFO << "[QC-MINEABLE] duplicate commitment type="
+                                 << static_cast<int>(c.llmqType)
+                                 << " quorum="
+                                 << c.quorumHash.GetHex().substr(0, 16)
+                                 << "... signers=" << c.CountSigners()
+                                 << " source=" << source
+                                 << " cache=" << qc_cache->size();
+                    } else {
+                        LOG_INFO << "[QC-MINEABLE] REJECTED relayed"
+                                    " commitment type="
+                                 << static_cast<int>(c.llmqType)
+                                 << " quorum="
+                                 << c.quorumHash.GetHex().substr(0, 16)
+                                 << "... signers=" << c.CountSigners()
+                                 << " reason="
+                                 << dash::coin::MineableCommitmentCache
+                                        ::admission_name(adm)
+                                 << " source=" << source
+                                 << " cache=" << qc_cache->size();
+                    }
+                };
+
+            // Member-set fetch amplification guard for the BATCH transports:
+            // a cold full mnlistdiff snapshot re-carries EVERY active quorum
+            // (~100-200 on mainnet), and kicking a historical getmnlistd
+            // member-set fetch for each would fan out megabytes of wire
+            // traffic for quorums whose DKG mining window closed long ago
+            // (their slots cannot be required again short of a reorg wipe).
+            // Only commitments whose mining window is still open at the
+            // header tip get the proactive fetch; INGEST itself is
+            // unconditional — the cache entry is cheap, and the case where a
+            // closed-window commitment matters again (a reorg wiping the
+            // QuorumManager near the tip) re-offers it inside a window this
+            // filter passes.
+            auto qc_member_fetch_worthwhile =
+                [hc = header_chain.get(), qc_net](
+                    const dash::coin::vendor::CFinalCommitment& c) -> bool {
+                    auto tip = hc->tip();
+                    if (!tip) return false;
+                    auto base = hc->get_header(c.quorumHash);
+                    if (!base) return false;
+                    for (const auto& p : dash::coin::enabled_llmqs(qc_net)) {
+                        if (p.type != c.llmqType) continue;
+                        if (p.dkg_interval == 0) return false;
+                        const auto wb =
+                            dash::coin::qc_window_bound(p, base->height);
+                        return tip->height <= wb.last_height;
+                    }
+                    return false;
+                };
+
             // DIP-24 rotated lane: the getqrinfo send seam + the qrinfo reply
             // consumer. Both are OPTIONAL by construction — with neither wired
             // the rotated branch of request() simply cannot send and every
@@ -3193,8 +3292,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // Unlike mnlistdiff there is no tip-feed hazard here: nothing
                 // else consumes qrinfo, so this consumer needs no demux.
                 coin_p2p->add_qrinfo_consumer(
-                    [qc_member_source]
+                    [qc_member_source, qc_ingest_from,
+                     qc_member_fetch_worthwhile]
                     (const dash::coin::vendor::CQuorumRotationInfo& info) {
+                        // Rotated-quorum tee (DIP-24, type 5):
+                        // lastCommitmentPerIndex carries the FULL final
+                        // commitments per quorumIndex — same admission path
+                        // as every other transport, source-tagged for the
+                        // soak.
+                        for (const auto& c : info.lastCommitmentPerIndex)
+                            qc_ingest_from(c, "qrinfo",
+                                           qc_member_fetch_worthwhile(c));
                         qc_member_source->on_qrinfo(info);
                     });
             }
@@ -3241,40 +3349,33 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
             coin_feed_subs.push_back(
                 coin_state.new_qfcommit.subscribe(
-                    [qc_cache, qc_net, qc_member_source]
+                    [qc_ingest_from]
                     (const dash::coin::vendor::CFinalCommitment& c) {
-                        // SAY WHY on the reject path too. A relayed qfcommit
-                        // that structural admission drops used to leave NO
-                        // trace, so a later "no-commitment-cached" refusal was
-                        // indistinguishable from "the commitment never reached
-                        // us" — opposite diagnoses (our bug vs a relay hole).
-                        using Adm =
-                            dash::coin::MineableCommitmentCache::Admission;
-                        const auto adm = qc_cache->ingest_ex(qc_net, c);
-                        if (adm != Adm::Accepted) {
-                            LOG_INFO << "[QC-MINEABLE] REJECTED relayed"
-                                        " commitment type="
-                                     << static_cast<int>(c.llmqType)
-                                     << " quorum="
-                                     << c.quorumHash.GetHex().substr(0, 16)
-                                     << "... signers=" << c.CountSigners()
-                                     << " reason="
-                                     << dash::coin::MineableCommitmentCache
-                                            ::admission_name(adm)
-                                     << " cache=" << qc_cache->size();
-                        }
-                        if (adm == Adm::Accepted) {
-                            LOG_INFO << "[QC-MINEABLE] cached commitment type="
-                                     << static_cast<int>(c.llmqType)
-                                     << " quorum="
-                                     << c.quorumHash.GetHex().substr(0, 16)
-                                     << "... signers=" << c.CountSigners()
-                                     << " cache=" << qc_cache->size();
-                            // Proactively source the member set so it is READY by
-                            // the DKG-window height that must serve it.
-                            qc_member_source->request(c.llmqType, c.quorumHash);
-                        }
+                        // PUSH transport: relayed once at DKG finalize, so a
+                        // live arrival is inside (or just ahead of) an open
+                        // window by construction — kick the member fetch
+                        // unconditionally, exactly the pre-fix behaviour.
+                        qc_ingest_from(c, "qfcommit-push",
+                                       /*kick_member_fetch=*/true);
                     }));
+            // ── qc-plan-underivable CLOSURE: the request/response tee ──────
+            // mnlistdiff is the transport that measurably ALWAYS works
+            // (277/277 per soak on both hosts, including the one whose peers
+            // churn every 101 s) and is re-requested on every fresh
+            // handshake, so feeding the cache from it removes the
+            // be-connected-at-the-inv dependency the push-only feed had. The
+            // maintainer hands over tail.newQuorums of every ACCEPTED diff
+            // (its base-continuity / stale-snapshot R1 / malformed-tail H-1
+            // guards have already run); admission is the SAME ingest as the
+            // push path above, so verified_for's guarantees are
+            // transport-independent.
+            maintainer->set_on_new_quorum_commitments(
+                [qc_ingest_from, qc_member_fetch_worthwhile]
+                (const std::vector<dash::coin::vendor::CFinalCommitment>& qcs) {
+                    for (const auto& c : qcs)
+                        qc_ingest_from(c, "mnlistdiff",
+                                       qc_member_fetch_worthwhile(c));
+                });
             // COMPLETENESS GATE (definitive-soak block 1520106): the plan is
             // per-height all-or-nothing — any mandatory slot without a
             // BLS-verified real commitment (no attested-null evidence source
