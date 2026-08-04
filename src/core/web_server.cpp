@@ -3695,6 +3695,21 @@ nlohmann::json MiningInterface::rest_local_stats()
     result["miner_hash_rates"] = miner_rates;
     result["miner_dead_hash_rates"] = miner_dead;
 
+    // #919 per-node LOCAL hashrate (local_hashps) -- the series a local-hashrate
+    // graph polls over time. This is THIS node's own work rate, read from the
+    // real stratum work-rate counter (m_stratum_hashrate_fn, the same live
+    // per-node source the node-fee "local_hr" leg below trusts), NOT the empty
+    // m_node stub that produced the founding poolhashps=0 lie. Distinct from
+    // poolhashps, which is the pool-wide attempts/s the "Pool: X GH/s" print
+    // reports. Honest-absent: with no work-rate source wired the counter is
+    // COLD and we emit null, never a flat 0 that would falsely claim this node
+    // mines nothing. A wired source reporting 0.0 is a TRUE reading (no active
+    // local miners) and is surfaced as 0, not null.
+    if (m_stratum_hashrate_fn)
+        result["local_hashps"] = m_stratum_hashrate_fn();
+    else
+        result["local_hashps"] = nullptr;
+
     // shares — {total, orphan, dead}
     // Sharechain stats now use O(log n) StatsSkipList — no caching needed.
     nlohmann::json cached_sc;
