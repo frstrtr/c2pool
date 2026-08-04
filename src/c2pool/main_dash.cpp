@@ -324,6 +324,14 @@ void print_banner(const char* argv0)
         << "        rotation INDEPENDENT of the local dashd — the network-standalone\n"
         << "        arm (daemonless witness). Any --coin-p2p-connect peer is kept as a\n"
         << "        pinned/preferred node alongside the discovered set.\n"
+        << "        --coin-p2p-peers N (default 8, cap 16) sets how many coin-network\n"
+        << "        peers the embedded arm holds CONCURRENTLY. This is an EVIDENCE\n"
+        << "        knob, not bandwidth: a DKG final commitment (qfcommit) and a\n"
+        << "        ChainLock (clsig) are each announced EXACTLY ONCE by inv and\n"
+        << "        served only by their own digest, so an announcement you did not\n"
+        << "        witness is an object you can never fetch. Holding N peers drops\n"
+        << "        the miss probability geometrically -- which is what makes\n"
+        << "        \"we hold no commitment, therefore mine null\" trustworthy.\n"
         << "        --web-port PORT (alias --http-port, default 8080) serves the FULL\n"
         << "        c2pool web dashboard + JSON API on --web-host (default 0.0.0.0)\n"
         << "        from --dashboard-dir (default web-static); --web-port 0 disables.\n"
@@ -523,6 +531,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              bool embedded_oracle_shadow = false,
              uint64_t oracle_grad_blocks = 5000,
              uint64_t oracle_class_coverage = 20,
+             // --coin-p2p-peers N: how many CONCURRENT coin-network peers the
+             // embedded arm holds. Not a throughput knob: qfcommit/clsig are
+             // announced exactly once each, so miss probability falls
+             // geometrically in this number (see p2p_client.hpp).
+             std::size_t coin_p2p_peers =
+                 dash::coin::p2p::CoinClient<dash::Config>::DEFAULT_POOL_PEERS,
              const std::string& bestcl_policy = "freshness")
 {
     namespace io = boost::asio;
@@ -1396,6 +1410,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
         coin_p2p = std::make_unique<dash::coin::p2p::CoinClient<dash::Config>>(
             &ioc, &coin_state, &config, "COIN-P2P");
+        // MULTI-PEER POOL. The embedded arm holds N concurrent coin-network
+        // peers instead of one. This is the precondition for ever trusting
+        // "we hold no commitment for this slot, therefore mine null": a DKG
+        // final commitment is announced exactly ONCE (RelayInv at finalize)
+        // and served only by its own digest, so an announcement missed is an
+        // object that can never be fetched. One peer made "we didn't hear it"
+        // a guess; N peers make it evidence. See p2p_client.hpp.
+        coin_p2p->set_max_peers(coin_p2p_peers);
 
         if (coin_p2p_discover_eff) {
             // ── Network-standalone arm: seed-discovered, SCORED, group-diverse
@@ -1406,6 +1428,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             const uint16_t coin_port = testnet ? 19999 : 9999;
             dash::coin::DashPeerManagerConfig pm_cfg;
             pm_cfg.valid_ports = { coin_port };
+            // The manager BOUNDS the candidate set it hands back per call; with
+            // the shipped default (3) it could never propose enough targets to
+            // fill an 8-peer pool no matter how many peers it knew. Raise the
+            // per-call budget to the pool target. Selection itself — scoring,
+            // /16 group diversity, backoff — is unchanged and still the
+            // manager's job; this only stops it capping the pool.
+            pm_cfg.max_concurrent_connections =
+                static_cast<int>(coin_p2p->max_peers());
+            pm_cfg.max_connections_per_cycle =
+                static_cast<int>(coin_p2p->max_peers());
             const std::string pm_data_dir = (core::filesystem::config_path()
                 / net_subdir / "dash_embedded_peers").string();
             coin_peer_mgr = std::make_unique<dash::coin::DashCoinPeerManager>(
@@ -1490,7 +1522,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                                 pinned = coin_p2p_targets,
                                                 pinned_keys]() {
                 std::vector<NetService> refreshed = pinned; // pinned always preferred, first
-                for (auto& ep : mgr->get_peers_to_connect(pinned_keys))
+                // Feed the scorer the peers we ACTUALLY HOLD, not just the
+                // pinned ones. Two things depend on it with a pool: it stops
+                // proposing peers we are already connected to (which would
+                // waste every refill slot), and its /16 group-diversity
+                // accounting is computed against the live pool instead of an
+                // empty set — so the eight peers we end up with are eight
+                // independent witnesses, not eight sockets into one datacentre.
+                std::set<std::string> held = pinned_keys;
+                for (auto& k : cp->connected_peer_keys()) held.insert(k);
+                for (auto& ep : mgr->get_peers_to_connect(held))
                     refreshed.push_back(ep.to_net_service());
                 cp->update_dial_targets(std::move(refreshed));
             });
@@ -1503,7 +1544,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                       << pinned_str << " magic=" << net_magic_hex
                       << " proto=70230 dns_seeds=" << dash::coin::dash_dns_seeds(testnet).size()
                       << " fixed_seeds=" << dash::coin::dash_fixed_seeds(testnet).size()
-                      << " initial_dial=" << dial.size() << " target[s]\n"
+                      << " initial_dial=" << dial.size() << " target[s]"
+                      << " pool=" << coin_p2p->max_peers() << " concurrent peer[s]\n"
                          "[run]       (network-standalone witness: independent peers -> independent\n"
                          "[run]       mempool/relay view; oracle-shadow standalone graduation gate)\n";
         } else {
@@ -1513,7 +1555,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                       << coin_p2p_targets.front().to_string()
                       << (coin_p2p_targets.size() > 1
                               ? " (+" + std::to_string(coin_p2p_targets.size() - 1)
-                                    + " alternate[s], reconnect rotates)"
+                                    + " alternate[s]; pool holds up to "
+                                    + std::to_string(coin_p2p->max_peers())
+                                    + " concurrently)"
                               : "")
                       << " magic=" << net_magic_hex
                       << " proto=70230 (E1: dial+handshake+keep-alive only;\n"
@@ -1637,10 +1681,22 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // (loud dispatcher log if neither arm is reachable).
                 if (!coin_p2p || !coin_p2p->is_handshake_complete()) {
                     std::cout << "[DASH-STRATUM-BLOCK] embedded P2P relay skipped: "
-                                 "coin-P2P peer not connected/handshaked -- relying "
+                                 "no handshaked coin-P2P peer -- relying "
                                  "on submitblock-RPC backup\n";
                     return false;
                 }
+                // RELAY POLICY: BROADCAST TO EVERY HANDSHAKED PEER (money path).
+                // submit_block_p2p_raw writes the block to all of them and
+                // returns the count. Duplicate submission of a found block is a
+                // non-event -- every node that receives it forwards it anyway,
+                // and one that already has it ignores the copy. A MISSED
+                // submission is a lost block with no retry, because the share is
+                // already spent. The asymmetry is the whole argument: we buy
+                // redundancy with bandwidth we do not care about, on the one
+                // message per day where it matters.
+                std::cout << "[DASH-STRATUM-BLOCK] embedded P2P relay: broadcasting to "
+                          << coin_p2p->handshaked_peer_count()
+                          << " handshaked peer(s)\n";
                 io::post(ioc, [&coin_p2p, bytes = block_bytes]() {
                     if (coin_p2p) coin_p2p->submit_block_p2p_raw(bytes);
                 });
@@ -2513,18 +2569,25 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     c["coin"]     = "DASH";
                     c["primary"]  = true;
                     c["embedded"] = true;
-                    // CoinClient is a single-peer client: 1 or 0, measured, not
-                    // guessed. Omitting it would make the dashboard default to
-                    // 0 and mislabel every decline as "faulted".
+                    // MEASURED pool state, never guessed. Omitting it would make
+                    // the dashboard default to 0 and mislabel every decline as
+                    // "faulted". distinct_addrs is published alongside the count
+                    // because "3 connections, 1 address" is exactly the failure
+                    // the single-peer rotation produced unnoticed for 9h.
                     const bool connected = cp && cp->is_connected();
-                    c["peers"] = connected ? 1 : 0;
+                    c["peers"] = cp ? static_cast<int>(cp->connected_peer_count()) : 0;
+                    if (cp) {
+                        c["peers_handshaked"] = static_cast<int>(cp->handshaked_peer_count());
+                        c["peers_target"]     = static_cast<int>(cp->max_peers());
+                        c["peers_distinct_addrs"] = static_cast<int>(cp->distinct_peer_addresses());
+                    }
                     if (hc) {
                         const uint32_t hh = hc->height();
                         c["header_height"] = hh;
                         // The peer's advertised best height is the only target
                         // we actually observe; absent it we publish NO target
                         // and no synced flag rather than invent one.
-                        const uint32_t target = connected ? cp->peer_start_height() : 0;
+                        const uint32_t target = connected ? cp->best_peer_height() : 0;
                         if (target > 0) {
                             c["target_height"] = target;
                             c["sync_percent"]  =
@@ -4889,6 +4952,12 @@ int main(int argc, char** argv)
     bool no_p2p_relay = false;                 // --no-p2p-relay: suppress the embedded P2P-relay won-block arm (A/B isolation; RPC backup stays live)
     bool embedded_mainnet = false;             // --embedded-mainnet: gate-lift, allow the daemonless embedded template arm on MAINNET (byte-parity proven; default OFF = dashd fallback)
     std::string coin_p2p_magic = "";           // --coin-p2p-magic HEX: override the embedded CoinClient wire magic (e.g. regtest fcc1b7dc); default mainnet/testnet
+    // --coin-p2p-peers N: CONCURRENT embedded coin-P2P peers (default 8, cap 16).
+    // EVIDENCE knob, not bandwidth: a DKG final commitment is announced exactly
+    // ONCE and served only by commitment hash, so "we never heard it" is only
+    // trustworthy in proportion to how many peers we were holding at the time.
+    std::size_t coin_p2p_peers =
+        dash::coin::p2p::CoinClient<dash::Config>::DEFAULT_POOL_PEERS;
     bool force_won_block = false;              // --regtest-force-won-block: fail-closed regtest E5 harness (drive one real won block through the run-path dual-path)
     bool embedded_superblock = false;          // --embedded-superblock: OPT-IN daemonless superblock payee sourcing via govsync (E-SUPERBLOCK); default OFF = superblock heights fall back to dashd (reward-safe)
     std::string stratum_host = "0.0.0.0";      // --stratum [HOST:]PORT bind interface (default all)
@@ -4964,6 +5033,8 @@ int main(int argc, char** argv)
             embedded_mainnet = true;
         else if (std::strcmp(argv[i], "--coin-p2p-magic") == 0 && i + 1 < argc)
             coin_p2p_magic = argv[++i];
+        else if (std::strcmp(argv[i], "--coin-p2p-peers") == 0 && i + 1 < argc)
+            coin_p2p_peers = static_cast<std::size_t>(std::strtoul(argv[++i], nullptr, 10));
         else if (std::strcmp(argv[i], "--regtest-force-won-block") == 0)
             force_won_block = true;
         else if (std::strcmp(argv[i], "--embedded-superblock") == 0)
@@ -5125,7 +5196,7 @@ int main(int argc, char** argv)
                         coin_p2p_magic, force_won_block,
                         operator_message_blob_hex, embedded_superblock,
                         embedded_oracle_shadow, oracle_grad_blocks,
-                        oracle_class_coverage, bestcl_policy);
+                        oracle_class_coverage, coin_p2p_peers, bestcl_policy);
     }
     return run_selftest();
 }
