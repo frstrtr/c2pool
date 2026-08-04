@@ -1743,3 +1743,130 @@ TEST(WebBlockValueReconcile, ZeroFeeStillPresentAndConsistent) {
                 r["block_value_payments"].get<double>(),
                 r["block_value"].get<double>(), 1e-8);
 }
+
+// ===========================================================================
+// Standalone-coin merged-UI purge (follow-up to #896/#912): a coin with no
+// merged child (DASH/BTC/DGB) must not render ANY merged-mining card, column,
+// or SPV row anywhere in the web-static layer -- not just the Username line.
+// These KATs pin the topology gates added to dashboard.html (Merged Payout
+// column), miners.html / miner.html (Merged Mining Blocks sections), and
+// loading.html (SPV rows). Same charter: never imply revenue or a chain
+// topology that does not exist.
+// ===========================================================================
+#ifndef WEB_STATIC_DIR
+#error "WEB_STATIC_DIR must be defined by CMake"
+#endif
+
+namespace {
+std::string read_web_static(const std::string& name) {
+    std::ifstream f(std::string(WEB_STATIC_DIR) + "/" + name);
+    EXPECT_TRUE(f.good()) << "cannot open " << WEB_STATIC_DIR << "/" << name;
+    std::stringstream ss; ss << f.rdbuf();
+    return ss.str();
+}
+} // namespace
+
+// dashboard.html: the Active-Miners "Merged Payout" column (header AND the
+// dynamically appended cells) must carry the merged-child-hint gate. The cells
+// are appended on every table re-render, AFTER the one-shot d3 toggle ran, so
+// the gate must also exist as a CSS rule keyed off a body class the topology
+// handler stamps -- otherwise re-rendered rows resurrect the DOGE column.
+TEST(DashboardMergedGating, MinersTableMergedPayoutColumnIsGated) {
+    const auto html = read_dashboard();
+    for (const auto& line : lines_of(html)) {
+        if (line.find(">Merged Payout</th>") != std::string::npos) {
+            EXPECT_NE(line.find("merged-child-hint"), std::string::npos)
+                << "the Merged Payout column header is not topology-gated; a "
+                   "standalone coin renders a phantom DOGE payout column:\n"
+                << line;
+        }
+    }
+    // Body-class CSS gate covers dynamically appended cells.
+    EXPECT_NE(html.find("body.no-merged-child .merged-child-hint"),
+              std::string::npos)
+        << "missing the body-class CSS gate; merged cells appended after the "
+           "currency_info toggle ran (miner-table re-renders) stay visible on "
+           "a standalone coin.";
+    EXPECT_NE(html.find("classList.toggle('no-merged-child', !mergedChild)"),
+              std::string::npos)
+        << "the topology handler does not stamp the no-merged-child body "
+           "class; the CSS gate never engages.";
+    // The dynamically appended merged-payout cell must carry the gate class.
+    EXPECT_NE(html.find("minerRow.append('td').attr('class', 'merged-child-hint')"),
+              std::string::npos)
+        << "the per-miner merged-payout cell is appended without the gate "
+           "class; every miner row shows '0.0000 DOGE' on a standalone coin.";
+}
+
+// miners.html: the "Merged Mining Blocks" section must be hidden by default
+// and revealed only when currency_info advertises a merged child. Both failure
+// directions: standalone stays hidden, merged parent still shows it.
+TEST(WebStaticMergedGating, MinersPageMergedBlocksSectionIsTopologyGated) {
+    const auto html = read_web_static("miners.html");
+    for (const auto& line : lines_of(html)) {
+        if (line.find("id=\"merged_blocks_header\"") != std::string::npos) {
+            EXPECT_NE(line.find("display: none"), std::string::npos)
+                << "merged_blocks_header renders by default; a standalone coin "
+                   "shows a Merged Mining Blocks card:\n" << line;
+        }
+        if (line.find("id=\"merged_blocks_panel\"") != std::string::npos) {
+            EXPECT_NE(line.find("display: none"), std::string::npos)
+                << "merged_blocks_panel renders by default on a standalone "
+                   "coin:\n" << line;
+        }
+    }
+    EXPECT_NE(html.find("info.merged_child_symbol"), std::string::npos)
+        << "no topology reveal path: a merged parent (LTC) would lose its "
+           "Merged Mining Blocks section.";
+}
+
+// miner.html: same contract for the per-miner page (header + summary stat
+// cards + blocks table), which previously rendered zeroed merged cards
+// unconditionally.
+TEST(WebStaticMergedGating, MinerPageMergedBlocksSectionIsTopologyGated) {
+    const auto html = read_web_static("miner.html");
+    const std::vector<std::string> gated_ids = {
+        "merged_blocks_header", "merged_summary_grid", "merged_blocks_panel"};
+    for (const auto& id : gated_ids) {
+        bool declared = false, hidden = false;
+        for (const auto& line : lines_of(html)) {
+            if (line.find("id=\"" + id + "\"") != std::string::npos) {
+                declared = true;
+                if (line.find("display: none") != std::string::npos) hidden = true;
+            }
+        }
+        EXPECT_TRUE(declared) << "expected element '" << id << "' not found; "
+            "if it moved, re-point this KAT.";
+        EXPECT_TRUE(hidden) << "'" << id << "' renders by default; a "
+            "standalone coin shows zeroed merged-mining cards.";
+    }
+    EXPECT_NE(html.find("info.merged_child_symbol"), std::string::npos)
+        << "no topology reveal path: a merged parent (LTC) would lose its "
+           "merged blocks section on the miner page.";
+}
+
+// loading.html: the startup page must not hardcode LTC/DOGE SPV rows. The
+// parent row's label is currency_info-driven and both rows appear only when
+// the node reports SPV progress; the child row additionally requires a merged
+// child in the topology. A DASH node must show neither an LTC nor a DOGE row.
+TEST(WebStaticMergedGating, LoadingPageSpvRowsAreTopologyDriven) {
+    const auto html = read_web_static("loading.html");
+    EXPECT_EQ(html.find(">LTC SPV</span>"), std::string::npos)
+        << "loading.html hardcodes an LTC SPV row label; a standalone DASH "
+           "node presents itself as an LTC node while starting up.";
+    EXPECT_EQ(html.find(">DOGE SPV</span>"), std::string::npos)
+        << "loading.html hardcodes a DOGE SPV row label; a standalone coin "
+           "advertises a merged chain it does not have.";
+    for (const auto& line : lines_of(html)) {
+        if (line.find("id=\"row-parent-spv\"") != std::string::npos ||
+            line.find("id=\"row-child-spv\"") != std::string::npos) {
+            EXPECT_NE(line.find("display:none"), std::string::npos)
+                << "SPV row renders by default (before the node reports any "
+                   "SPV state):\n" << line;
+        }
+    }
+    EXPECT_NE(html.find("ci.merged_child_symbol"), std::string::npos)
+        << "the child SPV row is not keyed off the merged-child topology.";
+    EXPECT_NE(html.find("ci.symbol"), std::string::npos)
+        << "the parent SPV row label is not currency_info-driven.";
+}

@@ -634,6 +634,11 @@
             color: var(--success);
         }
         
+        /* Standalone-parent topology (no merged child, e.g. DASH/BTC/DGB):
+           hide every merged-mining UI element, including ones appended after
+           the currency_info gate ran (dynamic table cells). The body class is
+           set from currency_info.merged_child_symbol — never hardcoded. */
+        body.no-merged-child .merged-child-hint { display: none !important; }
         /* Merged payout sub-rows */
         .merged-payout-row td {
             font-size: 0.72rem;
@@ -1952,7 +1957,7 @@
                                 <th title="Last pseudoshare received">Last Seen</th>
                                 <th title="Dead on Arrival rate">DOA Rate</th>
                                 <th title="Predicted payout if block found now">Predicted Payout</th>
-                                <th title="Predicted merged mining payout if block found now">Merged Payout</th>
+                                <th class="merged-child-hint" title="Predicted merged mining payout if block found now">Merged Payout</th>
                             </tr>
                         </thead>
                         <tbody></tbody>
@@ -2774,9 +2779,11 @@
                     var payoutSymbol = (currency_info && currency_info.symbol) || 'COIN';
                     minerRow.append('td').text(d3.format('.4f')(payout) + ' ' + payoutSymbol);
                     
-                    // Merged payout
+                    // Merged payout — cell carries merged-child-hint so the
+                    // topology CSS gate (body.no-merged-child) hides it on
+                    // standalone parents together with its column header.
                     var mergedEntry = mergedPayouts[miner.address];
-                    var mergedPayoutCell = minerRow.append('td');
+                    var mergedPayoutCell = minerRow.append('td').attr('class', 'merged-child-hint');
                     if (mergedEntry && mergedEntry.merged && mergedEntry.merged.length > 0) {
                         var mp = mergedEntry.merged[0];
                         mergedPayoutCell
@@ -2839,7 +2846,9 @@
                         var doaPercent = worker.hashrate > 0 ? worker.doa_hashrate / worker.hashrate : 0;
                         workerRow.append('td').text(d3.format('.2%')(doaPercent));
                         workerRow.append('td').text('-');
-                        workerRow.append('td').text('-');
+                        // Merged-payout filler cell — hidden with its column on
+                        // standalone parents (body.no-merged-child).
+                        workerRow.append('td').attr('class', 'merged-child-hint').text('-');
                     });
                 });
                 });
@@ -2874,6 +2883,10 @@
             // (DASH/BTC/DGB) shows just PARENT_ADDR.WORKER. Never serve merged-
             // mining worker instructions on a coin with no merged child.
             var mergedChild = info && info.merged_child_symbol;
+            // Body class drives a CSS rule so merged-mining cells appended
+            // later (miner-table re-renders) are hidden too, not only the
+            // elements that existed when this callback ran.
+            document.body.classList.toggle('no-merged-child', !mergedChild);
             if (mergedChild) {
                 d3.selectAll('.merged-child-symbol-hint').text(mergedChild);
                 d3.selectAll('.merged-child-hint').style('display', null);
