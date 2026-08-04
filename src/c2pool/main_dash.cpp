@@ -3210,7 +3210,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             if (dash::coin::vendor::bls_backend_available()) {
                 LOG_INFO << "[QC-PHASE-L] dashbls verifier + member-set sourcing "
                             "installed (real qc inclusion when the member set is "
-                            "sourced; fail-closed to null-serve otherwise)";
+                            "sourced; otherwise the slot is unsatisfiable and the "
+                            "WHOLE height refuses with cause=qc-plan-underivable "
+                            "and falls back to dashd -- never null-served)";
             }
 
             // REFUSAL-DIAGNOSIS seam (observability only, never gates a serve):
