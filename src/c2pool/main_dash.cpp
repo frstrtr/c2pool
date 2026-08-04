@@ -3078,6 +3078,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             testnet ? dash::coin::DASH_MN_RR_HEIGHT_TESTNET
                     : dash::coin::DASH_MN_RR_HEIGHT_MAINNET);
 
+        // confirmedHash rollover projection threshold (sml_projection.hpp):
+        // the network's nMasternodeMinimumConfirmations (per-chainparams in
+        // dashcore v23.1.7 chainparams.cpp — mainnet 15 at :177, testnet 1 at
+        // :376). Gates the height-driven confirmation pass the template build
+        // + viability + pre-emit gates replicate so the committed
+        // merkleRootMNList matches the verifier's rebuilt list at an MN's
+        // confirmation-crossing height (bad-cbtx-mnmerkleroot otherwise).
+        node_coin_state.set_mn_min_confirmations(
+            testnet ? dash::coin::DASH_MN_MIN_CONFIRMATIONS_TESTNET
+                    : dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET);
+
         // review PR #780 BLOCKER-1 (CRITICAL): refuse the embedded arm on DKG
         // commitment-window heights. There the block MUST carry mandatory type-6
         // quorum-commitment txs (which the C-3 filter strips) and merkleRootQuorums

@@ -27,6 +27,7 @@
 #include <impl/dash/coin/quorum_root.hpp>        // compute_merkle_root_quorums (pre-emit recompute)
 #include <impl/dash/coin/dkg_commitments.hpp>    // QcBlockPlan (E1 daemonless DKG-window serving)
 #include <impl/dash/coin/vendor/simplifiedmns.hpp> // vendor::CSimplifiedMNList (merkleRootMNList source)
+#include <impl/dash/coin/sml_projection.hpp>     // confirmedHash rollover projection + collateral-spend predicate
 #include <impl/dash/coin/vendor/cbtx.hpp>        // vendor::parse_cbtx (pre-emit CbTx self-check)
 #include <impl/dash/coin/subsidy.hpp>            // compute_dash_platform_reward_post_v20_mn_rr (creditPool re-check)
 
@@ -165,6 +166,16 @@ public:
     /// exactly one block's platform reward (constant 66,966,830 duffs).
     void set_mn_rr_height(int h) { m_mn_rr_height = h; }
     int mn_rr_height() const { return m_mn_rr_height; }
+
+    /// Network nMasternodeMinimumConfirmations (dashcore Params().GetConsensus()
+    /// .nMasternodeMinimumConfirmations — per-chainparams: mainnet 15, testnet/
+    /// devnet/regtest 1; see sml_projection.hpp). Gates the confirmedHash
+    /// rollover projection in the template build, the viability clause and the
+    /// pre-emit root re-check. main_dash sets the testnet value next to
+    /// set_mn_rr_height; the mainnet default keeps every existing caller
+    /// byte-unchanged.
+    void set_mn_min_confirmations(int c) { m_mn_min_confirmations = c; }
+    int mn_min_confirmations() const { return m_mn_min_confirmations; }
 
     /// HEADER-SYNC gate (the DASH half of a cross-lane asymmetry: bch 13, ltc
     /// 12, nmc 12, btc 6, dgb 6 callers of is_synced(); DASH had ZERO —
@@ -465,6 +476,20 @@ public:
                               ? std::to_string(m_mnstates.last_applied_height())
                               : std::string("n/a"),
                           std::to_string(m_prev_height));
+        // FINDING-2 defence in depth: no template tx may spend a known MN
+        // collateral outpoint. dashd's verifier removes that MN from the list
+        // for THIS block (specialtxman.cpp:457-464, ALL txs, no special-tx
+        // guard), so a committed root built from the unmodified list is
+        // bad-cbtx-mnmerkleroot — a silently lost block on a winning share.
+        // The builder already filters these out of selection; re-assert here
+        // so a cached/bypassed template can never reach a miner.
+        for (const auto& tx : w.m_txs) {
+            uint256 protx;
+            if (tx_spends_mn_collateral(m_mnstates, tx, &protx))
+                return reject("emit-collateral-spend-in-template",
+                              "mn=" + protx.GetHex().substr(0, 12),
+                              "no-template-tx-spends-mn-collateral");
+        }
         vendor::CCbTx cb;
         if (!vendor::parse_cbtx(w.m_coinbase_payload, cb))
             return reject("emit-cbtx-unparseable",
@@ -473,11 +498,25 @@ public:
         if (cb.nHeight != static_cast<int32_t>(next_h))
             return reject("emit-cbtx-height-drift", std::to_string(cb.nHeight),
                           std::to_string(next_h));
-        auto sml_copy = m_sml;
-        if (cb.merkleRootMNList != sml_copy.CalcMerkleRoot())
+        // FINDING-1: the root block next_h must commit is the tip SML with the
+        // verifier's height-driven confirmation pass applied (specialtxman.cpp
+        // :206-215 — see sml_projection.hpp). Comparing against the RAW tip
+        // root here would re-approve the exact stale root the rollover
+        // poisons, so re-derive the PROJECTED root; fail closed when the pass
+        // is unprojectable (a null-confirmedHash entry with no known
+        // registration height — at most ~nMasternodeMinimumConfirmations
+        // blocks per unknown registration).
+        auto proj = project_sml_confirmations(m_sml, m_prev_height, m_prev_hash,
+                                              m_mnstates,
+                                              m_mn_min_confirmations);
+        if (!proj.ok)
+            return reject("emit-mn-confirm-rollover-pending",
+                          "protx=" + proj.unprojectable_protx.GetHex().substr(0, 12),
+                          "known-registration-height");
+        if (cb.merkleRootMNList != proj.sml.CalcMerkleRoot())
             return reject("emit-mnlist-root-drift",
                           cb.merkleRootMNList.GetHex().substr(0, 12),
-                          sml_copy.CalcMerkleRoot().GetHex().substr(0, 12));
+                          proj.sml.CalcMerkleRoot().GetHex().substr(0, 12));
         // E1: under a qc plan the committed root must be the WITH-BLOCK root
         // (fold of the plan's commitments over the active set — equal to the
         // plain root while the plan is all-null, diverging only once Phase L
@@ -574,6 +613,7 @@ public:
         e.curtime              = m_curtime;
         e.version              = m_version;
         e.mn_rr_height         = m_mn_rr_height;
+        e.mn_min_confirmations = m_mn_min_confirmations;
         // E-SUPERBLOCK: hand the resolved treasury schedule to the builder.
         // Empty at non-superblock heights and confidently-unfunded superblocks
         // (normal block); the winning trigger's payees at a funded superblock.
@@ -732,6 +772,19 @@ private:
                            ? std::string("n/a")
                            : m_sml_current_hash.GetHex().substr(0, 12),
                        m_prev_hash.GetHex().substr(0, 12));
+        else if (m_require_sml && find_unprojectable_confirmation(m_sml, m_mnstates))
+            // FINDING-1 fail-closed fallback: an SML entry awaits its
+            // height-driven confirmedHash rollover (specialtxman.cpp:206-215)
+            // but the DMN view holds no registration height for it, so the
+            // pass — and therefore the merkleRootMNList block next_h must
+            // commit — cannot be projected. Refusing here costs at most
+            // ~nMasternodeMinimumConfirmations blocks of embedded serve per
+            // unknown registration; serving would risk a committed stale root
+            // (bad-cbtx-mnmerkleroot = a silently lost winning share).
+            d = refuse("mn-confirm-rollover-pending",
+                       "protx=" + find_unprojectable_confirmation(m_sml, m_mnstates)
+                                      ->GetHex().substr(0, 12),
+                       "known-registration-height");
         else if (!payee_resolvable)
             d = refuse("payee-unresolvable",
                        std::to_string(m_mnstates.entries().size())
@@ -872,6 +925,7 @@ private:
     // freshness gates above it defaults ON.
     bool     m_require_resolvable_payee{true};   // refuse embedded when a due MN payee is unresolvable (#996)
     int      m_mn_rr_height{DASH_MN_RR_HEIGHT_MAINNET}; // network MN_RR activation height (platform-share gate)
+    int      m_mn_min_confirmations{DASH_MN_MIN_CONFIRMATIONS_MAINNET}; // network nMasternodeMinimumConfirmations (rollover projection)
     uint256  m_credit_pool_current_hash;     // block hash the credit-pool seed is current at
     int32_t  m_credit_pool_height{-1};       // seed cbTx's OWN height (-1 = never seeded)
     bool     m_quorum_healthy{true};         // last diff's quorum tail parsed OK
