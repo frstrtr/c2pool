@@ -314,6 +314,13 @@ void DASHWorkSource::resource_template_now() const
     // OUTSIDE the lock (the fallback arm is a blocking dashd RPC); the cache is
     // then updated under template_mutex_.
 
+    // Captured BEFORE sourcing: a failed attempt negative-caches against THIS
+    // generation, so an event (work-generation bump) that lands while the
+    // blocking source runs still breaks through the retry throttle (soak0804e
+    // resume-quantization fix — see cached_work()).
+    const uint64_t gen_at_source =
+        work_generation_.load(std::memory_order_relaxed);
+
     // ── Mainnet embedded gate (v0.2.4 trigger) ──────────────────────────────
     // The SML/QuorumManager wiring emits a real DIP-0004 type-5 CCbTx, and its
     // byte-parity against a real dashd getblocktemplate is PROVEN (from the raw
@@ -472,7 +479,8 @@ void DASHWorkSource::resource_template_now() const
         // on any chain): an honest absence. Keep any previous cache DROPPED --
         // serving a stale tip is worse than waiting.
         template_cache_.reset();
-        template_last_fail_at_ = now;
+        template_last_fail_at_  = now;
+        template_last_fail_gen_ = gen_at_source;
         return;
     }
     // Tip moved since the last snapshot? Bump work_generation_ so sessions
@@ -601,10 +609,18 @@ std::shared_ptr<const coin::DashWorkData> DASHWorkSource::cached_work() const
             // the bg refresh latency AND the 3 s tip-poll invalidation (which
             // RESETS the cache on a real tip change, so a rotated tip is served
             // as a set-gap until the fresh template lands, never as stale work).
+            // soak0804e resume-quantization fix: the negative cache shields a
+            // down dashd from every session's 1 s retry — but ONLY while
+            // nothing has changed. A work-generation bump is an EVENT (tip
+            // change / coin-state advance, e.g. the credit-pool seed catching
+            // up to the tip body) that changes the answer, so it breaks
+            // through; without this the event-driven resume was quantized to
+            // the kRetryAfter (5 s) window even after the gate turned viable.
             const bool recently_failed =
                 !template_cache_
                 && template_last_fail_at_.time_since_epoch().count() != 0
-                && now - template_last_fail_at_ < kRetryAfter;
+                && now - template_last_fail_at_ < kRetryAfter
+                && template_last_fail_gen_ == gen;
             if (!recently_failed && !template_refresh_inflight_.exchange(true)) {
                 refresh_executor_([this]() {
                     resource_template_now();
@@ -616,9 +632,12 @@ std::shared_ptr<const coin::DashWorkData> DASHWorkSource::cached_work() const
 
         // Legacy inline-blocking path (executor not wired: embedded/tests) --
         // BYTE-IDENTICAL to the pre-decouple behaviour. Negative cache: a recent
-        // failed sourcing attempt -> don't re-poll yet.
+        // failed sourcing attempt -> don't re-poll yet — UNLESS the generation
+        // moved since the failure (an event changed the answer; same
+        // soak0804e break-through as the executor path above).
         if (!template_cache_ && template_last_fail_at_.time_since_epoch().count() != 0
-            && now - template_last_fail_at_ < kRetryAfter)
+            && now - template_last_fail_at_ < kRetryAfter
+            && template_last_fail_gen_ == gen)
             return nullptr;
     }
 

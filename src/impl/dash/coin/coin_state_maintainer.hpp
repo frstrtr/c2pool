@@ -768,6 +768,39 @@ public:
     /// template with a phantom payee. Returns apply_block's ApplyResult.
     MnStateMachine::ApplyResult
     on_block_connected(const dash::coin::BlockType& block, uint32_t height) {
+        // EVENT-DRIVEN RESUME (soak0804e, creditpool-stale ~3.3% wall-clock):
+        // between the header tip advance (on_new_tip) and this body fold the
+        // credit-pool seed is exactly one block behind the tip and the serve
+        // gate CORRECTLY refuses (value = threshold-1; consensus demands exact
+        // creditPoolBalance equality — dashd specialtxman.cpp:749-755). The
+        // ingest was already event-driven, but the RESUME was not: a successful
+        // tip-body fold ended in republish() without firing the state-dirty
+        // sink, so no work re-issue happened until the next unrelated signal
+        // (template request / mnlistdiff / next tip, up to minutes away).
+        // Detect the stale->fresh transition on the credit-pool axis — the
+        // seed becoming current AT the tip — and fire the same re-issue path
+        // every other async advance uses (H-6). Historical window fills advance
+        // the seed to heights BELOW the tip and can never fire this, so the
+        // E2b bootstrap causes no notify storm. The refusal between
+        // tip-advance and body-parse is untouched: this is latency work, the
+        // gate itself is not weakened.
+        const bool cp_was_current_at_tip =
+            m_have_tip
+            && m_state.credit_pool_height() == static_cast<int32_t>(m_prev_height);
+        auto r = on_block_connected_impl(block, height);
+        const bool cp_now_current_at_tip =
+            m_have_tip
+            && m_state.credit_pool_height() == static_cast<int32_t>(m_prev_height);
+        if (!cp_was_current_at_tip && cp_now_current_at_tip)
+            notify_state_dirty();
+        return r;
+    }
+
+private:
+    /// The body of on_block_connected. Reached ONLY through the public wrapper
+    /// above (which detects the credit-pool stale->fresh transition around it).
+    MnStateMachine::ApplyResult
+    on_block_connected_impl(const dash::coin::BlockType& block, uint32_t height) {
         // E2 finding A (reward-critical, defence-in-depth): this component EXTRACTS
         // the reward-critical creditPoolBalance from the block's coinbase, so it
         // validates its own input at the trust boundary. The body↔header binding is
@@ -935,6 +968,7 @@ public:
         return r;
     }
 
+public:
     /// Reorg / MN-list gap / mempool flush: invalidate the live bundle so the
     /// next get_work falls back to dashd until a fresh tip rebuilds it. The
     /// stashed tip params are dropped -- a reorg means the old prev_hash is no
