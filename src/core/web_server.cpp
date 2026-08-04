@@ -3768,12 +3768,25 @@ nlohmann::json MiningInterface::rest_local_stats()
         payment_amount = static_cast<double>(coin_work.payment_amount_sat) / 1e8;
     }
     result["block_value"] = block_value;
-    // Miner portion: subsidy minus protocol payments (masternode/superblock) minus node fee
-    // For LTC/DOGE: payment_amount=0, so block_value_miner = block_value * (1 - fee)
-    // For Dash: block_value_miner = (subsidy - payment_amount) * (1 - fee)
+    // #948 gross-vs-net honesty. block_value_miner has always been NET of the
+    // pool fee while block_value_payments is GROSS: two sibling fields sharing
+    // the block_value_ prefix carry different conventions, and nothing in the
+    // name says so. Worse, block_value_miner + block_value_payments does NOT
+    // equal block_value, so a consumer that assumes the parts sum silently
+    // loses the fee. Fix additively -- the legacy keys keep their exact values
+    // (block_value_miner stays NET), and we expose the gross miner share, the
+    // fee deduction, and explicit *_gross / *_net aliases whose names state
+    // pre- vs post-fee. The reconciliation identity then holds on a fee'd node:
+    //     block_value_miner_gross + block_value_payments == block_value   (DASH)
+    //     block_value_miner_gross == block_value_miner + block_value_fee
     double fee_ratio = m_pool_fee_percent / 100.0;
-    double miner_subsidy = std::max(0.0, block_value - payment_amount);
-    result["block_value_miner"] = miner_subsidy * (1.0 - fee_ratio);
+    double miner_subsidy = std::max(0.0, block_value - payment_amount);  // GROSS miner share (pre-fee)
+    double miner_fee     = miner_subsidy * fee_ratio;                    // pool fee taken from the miner share
+    double miner_net     = miner_subsidy - miner_fee;                    // POST-fee miner share
+    result["block_value_miner"]       = miner_net;     // legacy key: unchanged value, now documented as NET
+    result["block_value_miner_net"]   = miner_net;     // explicit post-fee alias
+    result["block_value_miner_gross"] = miner_subsidy; // explicit pre-fee miner share (dashboard displays this)
+    result["block_value_fee"]         = miner_fee;     // visible pool-fee deduction, so the parts reconcile
     result["block_value_payments"] = (m_blockchain == Blockchain::DASH) ? payment_amount : block_value;
 
     // Node fee amounts per block: fee% × (local_hashrate / pool_hashrate) × block_value
