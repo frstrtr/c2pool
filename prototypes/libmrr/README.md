@@ -46,6 +46,37 @@ only — no live risk, no production wiring. Landing is held for the merge-tap.
   eviction while the ledger total is unchanged. **Not** in this drop: any
   finality gating, block-found overlay, or owed→settled transition — that is the
   finality-gated owed/overlay ledger (Drop 3), a hard scope fence.
+- **m2 Drop 3 — Finality-gated owed/overlay ledger: complete.** `mrr.Settlement`
+  (`overlay.go`): the finality gate that turns owed work into paid work. State is
+  three integer ledgers over one identity space — `owed` (accrued, un-earmarked),
+  `pending` (earmarked to a found-but-not-final block's overlay, reversible), and
+  `settled` (paid by a finalized block, irreversible) — with the conservation
+  invariant `accrued == owed + pending + settled` (**I-CONSERVE**) held across
+  every transition. The three block transitions of the m1 settlement state
+  machine are weight moves that leave I-CONSERVE invariant:
+  `BlockFound → OverlayAdded` (owed→pending), `BlockFinalized → OwedSettled +
+  OverlayCleared` (pending→settled), `BlockOrphaned → OverlayReverted`
+  (pending→owed). `Finalize(blockID, depth)` is the **symmetric finality-gate**
+  (the round-4/5 conceded fix): a payout may not settle below `finalityK` (the
+  same `Geometry.FinalityDepthK` that seals the work side) — `depth < K` returns
+  `NotFinal` and moves nothing. Because Found only *moves* owed into a keyed
+  overlay and Orphan moves the identical weight back, a found→orphaned round trip
+  restores the prior digest bit-for-bit — the reorg-safety snapshot-revert
+  property (`TestSettlement_RevertRoundTrip`); found order over disjoint
+  identities commutes (`TestSettlement_FoundOrderCommutes`); a found overlay
+  cannot draw more than an identity's owed and is rejected atomically
+  (`TestSettlement_OverdrawRejectedAtomic`, `…NoDoubleSpendAcrossBlocks`); the
+  owed base seeds from a Drop-2 `Ledger` (`NewSettlementFromLedger`, reading only
+  its exported sorted accessors — Drop 2 is untouched). The canonical `Digest()`
+  commits owed, settled, and every keyed pending overlay in ascending order,
+  domain-separated from the buffer and ledger digests. KAT-4 golden vectors
+  (`mrr/testdata/kat4_overlay_vectors.json`, three scenarios:
+  `single_block_lifecycle`, `reorg_revert_roundtrip`,
+  `concurrent_two_blocks_split_outcome`) pin per-step disposition, owed/pending/
+  settled totals, digest, the hand-derived final owed/settled balances, and the
+  snapshot-revert digest pairs; `cmd/genkat4` asserts all of that plus I-CONSERVE
+  at every step before it will mint. **Not** in this drop: Phase-2 delegated-carry
+  / carriage-liveness and the O(1) commit-root tail hybrid — hard-stop fences.
 - Phases 1 (query-side decay) and 2 (pure `retarget()` + EMA + observables +
   offline simulator) are next, per the blueprint. Phase 3 (live adaptive
   dimensioning) is **v38-fenced** — hard stop.
@@ -89,6 +120,7 @@ Regenerate the golden vectors on a reference build and review the diff:
 go run ./cmd/genkat  > mrr/testdata/kat1_vectors.json               # KAT-1: Geometry
 go run ./cmd/genkat2 > mrr/testdata/kat2_buffer_vectors.json        # KAT-2: Buffer
 go run ./cmd/genkat3 > mrr/testdata/kat3_compaction_vectors.json    # KAT-3: Compaction
+go run ./cmd/genkat4 > mrr/testdata/kat4_overlay_vectors.json       # KAT-4: Overlay
 ```
 
 `genkat2` asserts every hand-derived per-step disposition/sum/count/head before
@@ -96,7 +128,10 @@ it emits a vector, so a wrong implementation cannot mint a golden. `genkat3`
 does the same for compaction — per-step total/count/digest and the final
 per-identity balances — and additionally asserts the commutativity invariant
 (reverse, weight-sorted, and split-compact-then-merge all reproduce the
-canonical digest) inside the generator before minting.
+canonical digest) inside the generator before minting. `genkat4` asserts each
+step's disposition/totals/digest, I-CONSERVE (owed+pending+settled == accrued)
+at every step, the hand-derived final owed/settled sets, and each snapshot-revert
+digest pair before minting.
 
 ## Open items (flagged, non-blocking)
 
