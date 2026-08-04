@@ -36,7 +36,12 @@
 ///       hashMerkleRoot (header already PoW-verified by the header chain) at
 ///       tx index 0 (the coinbase);
 ///   (c) the snapshot SML's computed merkle root == cbTx.merkleRootMNList.
-/// Any failure -> the pending quorums for that hash FAIL CLOSED (null-serve).
+/// Any failure -> the pending quorums for that hash FAIL CLOSED: their member
+/// set stays unsourced, so no commitment can be BLS-verified for those slots.
+/// That is a REFUSAL, not a null serve — the slot is unsatisfiable and the
+/// whole height falls back to dashd (cause=qc-plan-underivable). c2pool never
+/// mines a null commitment to fill the shortfall (dkg_commitments.hpp HEIGHT
+/// COMPLETENESS: doing so diverged merkleRootQuorums at block 1520106).
 ///
 /// MODIFIER (#814 review R5): the coinbase ChainLock input is the work block's
 /// OWN cbTx bestCLSignature — v23.1.7 GetNonNullCoinbaseChainlock does NOT
@@ -398,7 +403,8 @@ public:
             return note_rotated_false(RotatedOutcome::kRefusedNotRotated, who);
         // The one refusal that is a WIRING fault, not a data fault: with no
         // send seam the lane emits nothing at all and every rotated quorum
-        // stays null-serve forever. It must never be silent again.
+        // stays unsourced forever (its slots refuse; they are NOT null-served
+        // -- see the 1520106 incident). It must never be silent again.
         if (!m_send_qrinfo)
             return note_rotated_false(RotatedOutcome::kRefusedNoSendSeam, who);
 
@@ -615,7 +621,8 @@ public:
             note_rotated(RotatedOutcome::kComputeAmbiguous,
                          "type=" + std::to_string(static_cast<int>(in.llmq_type))
                          + " cycle_base_h=" + std::to_string(in.cycle_base_height)
-                         + " -> null-serve for the whole cycle");
+                         + " -> fail closed (whole cycle stays unsourced; its "
+                           "slots refuse, they are NOT null-served)");
             return 0;
         }
 
@@ -638,7 +645,8 @@ public:
                          + " cycle_base_h=" + std::to_string(in.cycle_base_height)
                          + " value=published:0 threshold=computed:"
                          + std::to_string(sets->size())
-                         + " — cycle stays null-serve");
+                         + " -- no slot base-block header held; nothing published, "
+                           "cycle stays unsourced (its slots refuse)");
         } else {
             m_last_rotated = RotatedOutcome::kReady;
             // Mirrors the non-rotated "[QC-MEMBERS] READY type=" token so a
@@ -826,7 +834,8 @@ private:
             diff, expect_h, m_merkle_root_of_hash, cbtx_out, "QC-MEMBERS");
         if (!sml) {
             LOG_WARNING << "[QC-MEMBERS] " << keys.size()
-                        << " quorum(s) fail closed (null-serve)";
+                        << " quorum(s) fail closed (member set unsourced -> "
+                           "those slots refuse, they are NOT null-served)";
         }
         return sml;
     }
@@ -866,7 +875,8 @@ private:
         } else {
             LOG_WARNING << "[QC-MEMBERS] member computation ambiguous for quorum "
                         << pend.quorum_hash.GetHex().substr(0, 16)
-                        << " -> fail closed (null-serve)";
+                        << " -> fail closed (member set unsourced -> this slot "
+                           "refuses, it is NOT null-served)";
         }
     }
 
@@ -880,7 +890,8 @@ private:
 
     // Same bound + rationale as reap_if_needed(), for the qrinfo lane. A
     // rotated cycle is 32 slots wide, so far fewer outstanding requests are
-    // ever legitimate; an evicted cycle simply stays null-serve.
+    // ever legitimate; an evicted cycle simply stays unsourced, so its slots
+    // refuse (fail-safe) — they are never null-served.
     static constexpr size_t kRotatedPendingCap = 8;
     void reap_rotated_if_needed()
     {
@@ -912,7 +923,8 @@ private:
 
     // Bound outstanding requests: evict the OLDEST pending (and its await
     // membership) once the cap is hit — a dead peer must not grow state
-    // forever, and an evicted quorum simply stays null-serve (fail-safe).
+    // forever, and an evicted quorum simply stays unsourced, so its slot
+    // refuses (fail-safe) — it is never null-served.
     void reap_if_needed()
     {
         while (m_pending.size() >= kPendingCap && !m_pending_fifo.empty()) {

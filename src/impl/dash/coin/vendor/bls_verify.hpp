@@ -5,12 +5,14 @@
 /// commitments, reusing Dash Core's own verify logic + BLS backend.
 ///
 /// This is the piece the MineableCommitmentCache::set_bls_verify_fn seam
-/// (dkg_commitments.hpp) was cut for. Without it every DKG-window slot mines
-/// the consensus-valid NULL commitment (dashd's own behaviour when it holds no
-/// verified DKG result); with it, a peer-relayed commitment that PASSES
-/// dashcore's CFinalCommitment::Verify may be INCLUDED in the template, so a
-/// mainnet DKG-window block carries the same REAL commitment dashd's block
-/// carries (null-serve would diverge → bad-qc reject on a successful DKG).
+/// (dkg_commitments.hpp) was cut for. Without it no DKG-window slot can ever
+/// be satisfied, so every DKG-window height fails closed to the dashd fallback
+/// — c2pool does NOT take dashd's "mine the null commitment" arm (null-serving
+/// a SUCCEEDED DKG diverged merkleRootQuorums at block 1520106; see
+/// dkg_commitments.hpp HEIGHT COMPLETENESS). With it, a peer-relayed commitment
+/// that PASSES dashcore's CFinalCommitment::Verify may be INCLUDED in the
+/// template, so a mainnet DKG-window block carries the same REAL commitment
+/// dashd's block carries.
 ///
 /// REUSE-FIRST (operator mandate — vendor Dash Core, do not hand-roll):
 ///
@@ -76,7 +78,8 @@ uint256 build_commitment_hash(uint8_t llmq_type, const uint256& quorum_hash,
 /// True iff the dashbls backend is compiled in (C2POOL_DASH_BLS). When false,
 /// verify_final_commitment / the produced verifier fn always return false and
 /// the serve path fails closed — a build without BLS keeps the pre-Phase-L
-/// null-serve posture exactly.
+/// posture exactly: every DKG-window height refuses and falls back to dashd
+/// (it does NOT null-serve).
 bool bls_backend_available();
 
 /// Verify one commitment's crypto EXACTLY as dashcore CFinalCommitment::Verify
