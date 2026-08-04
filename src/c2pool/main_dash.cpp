@@ -2912,10 +2912,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             //      threshold itself reseeds from the weighted VALID SML count
             //      on every diff (reseed_funding_threshold — dashcore's own
             //      tally/denominator asymmetry).
-            //   3. the R5 govsync-completeness gate
-            //      (set_superblock_sync_complete_fn) is STILL NOT wired — the
-            //      NodeCoinState guard refuses the serve path structurally,
-            //      so R3 landing here can never by itself open it.
+            //   3. the R5 govsync-completeness gate IS wired
+            //      (set_superblock_sync_complete_fn, below), so the guard is no
+            //      longer a structural refusal: it is a RUNTIME predicate over
+            //      GovernanceMaintainer::gov_sync_complete() (>= min peers,
+            //      settled, quiesced). It still closes on its own whenever
+            //      govsync has not completed, and R3 landing here does not by
+            //      itself open it.
             // The parse/selection/template-emit logic is proven by the KATs;
             // flipping this fully live is still gated on R5 completeness + the
             // R6 desync latch + a funded-superblock soak.
@@ -3098,15 +3101,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // are SERVED instead of refused: the mandatory type-6 commitment set is
         // derived from local state only — params-table math + quorum base
         // hashes off the embedded header chain + the mnlistdiff-fed
-        // QuorumManager as dashd's HasMinedCommitment — and filled with the
-        // consensus-valid NULL commitments dashd's own miner mines when it
-        // holds no verified DKG result (real relayed commitments are Phase L,
-        // behind a BLS verifier). merkleRootQuorums stays the PROVEN
-        // active-set root (null commitments never fold in). Any height where
-        // the set cannot be derived (header gap, below the per-network V19
-        // serve floor — which also covers --regtest chains riding the testnet
-        // flag) yields nullopt and the arm fails closed to the dashd fallback,
-        // exactly the old refusal. The emit gate re-derives this same plan and
+        // QuorumManager as dashd's HasMinedCommitment — and every mandatory
+        // slot must carry a BLS-VERIFIED REAL commitment. Serving is PER-HEIGHT
+        // ALL-OR-NOTHING: one unsatisfiable slot fails the WHOLE height closed
+        // to the dashd fallback. Null commitments are NOT mined to fill the
+        // shortfall (that arm is dashd's, and copying it diverged
+        // merkleRootQuorums at block 1520106 — see dkg_commitments.hpp HEIGHT
+        // COMPLETENESS). merkleRootQuorums stays the PROVEN active-set root.
+        // The same nullopt/fail-closed result covers a set that cannot be
+        // derived at all (header gap, below the per-network V19 serve floor —
+        // which also covers --regtest chains riding the testnet flag), exactly
+        // the old refusal. The emit gate re-derives this same plan and
         // hard-rejects any template whose type-6 set drifts from it.
         if (run_arm.embedded_arm_enabled) {
             const auto qc_net = testnet ? dash::coin::LlmqNetwork::Testnet
@@ -3114,11 +3119,28 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // Phase-L sourcing leg: collect REAL relayed DKG commitments off
             // the coin-P2P qfcommit stream (structural admission only). The
             // cache serves NOTHING into templates until a BLS12-381 verifier
-            // is installed (MineableCommitmentCache::set_bls_verify_fn — the
-            // exact Phase-L follow-up); until then every required slot mines
-            // the consensus-valid null commitment, same as dashd without a
-            // DKG result. [QC-MINEABLE] is the field-checkable signal that
-            // the sourcing leg is live.
+            // is installed (MineableCommitmentCache::set_bls_verify_fn — done
+            // by the VERIFY leg below, and inert unless the build actually
+            // links dashbls).
+            //
+            // A required slot with no verified commitment is NOT null-served.
+            // dashd's miner does mine the null commitment there
+            // (GetMineableCommitments, "null commitment required" arm); c2pool
+            // deliberately does not copy it, because a null is only CANONICAL
+            // when that DKG genuinely failed: at block 1520106 null-serving a
+            // SUCCEEDED DKG skipped leaves every dashd folds in and diverged
+            // merkleRootQuorums (bad-cbtx). So the slot is unsatisfiable and
+            // the WHOLE height fails closed to the dashd fallback, NAMED
+            // cause=qc-plan-underivable. The refusal is BOUNDED: it ends when
+            // any other miner mines the commitment (the slot then reads
+            // already-mined off the mnlistdiff-fed QuorumManager) or when the
+            // DKG mining window closes — both by cycleStart +
+            // dkgMiningWindowEnd. Full reasoning: dkg_commitments.hpp, HEIGHT
+            // COMPLETENESS + COLD-START HOLE. Null is served ONLY on positive
+            // failed-DKG evidence (DkgNullEvidenceFn), and production passes
+            // no such source — see /*null_evidence=*/nullptr at the
+            // build_daemonless_qc_plan call below. [QC-MINEABLE] is the
+            // field-checkable signal that the sourcing leg is live.
             auto qc_cache =
                 std::make_shared<dash::coin::MineableCommitmentCache>();
 
@@ -3129,8 +3151,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // quorumPublicKey, both over BuildCommitmentHash). The verifier
             // sources the ordered member operator key set via the provider
             // below; anything it cannot establish with certainty fails CLOSED
-            // (verified_for -> nullopt -> the slot mines the consensus-valid
-            // null commitment, exactly the pre-Phase-L posture — reward-safe).
+            // (verified_for -> nullopt -> the slot is unsatisfiable -> the
+            // whole height falls back to dashd, exactly the pre-Phase-L
+            // posture — reward-safe; the slot is NOT null-served).
             //
             // MEMBER-SET SOURCING (E1 Phase-L, the piece that ENABLES real-
             // commitment serving): the deterministic quorum member selection
@@ -3281,8 +3304,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
             // DIP-24 rotated lane: the getqrinfo send seam + the qrinfo reply
             // consumer. Both are OPTIONAL by construction — with neither wired
-            // the rotated branch of request() simply cannot send and every
-            // rotated quorum stays null-serve, which is the pre-item-4 posture.
+            // the rotated branch of request() simply cannot send, so no rotated
+            // member set is ever sourced and every rotated slot stays
+            // unsatisfiable: any height whose mandatory set contains one fails
+            // closed to the dashd fallback (NOT null-served — dkg_commitments.hpp
+            // HEIGHT COMPLETENESS). That is the pre-item-4 posture.
             if (coin_p2p) {
                 qc_member_source->set_send_getqrinfo(
                     [cp = coin_p2p.get()](const std::vector<uint256>& bases,
@@ -4792,7 +4818,8 @@ int main(int argc, char** argv)
 
     // Name the BLS backend unconditionally at startup: a stub (BLS-dark) node
     // is otherwise indistinguishable from an armed one until a DKG-window
-    // height silently null-serves -- which is how this fleet ran BLS-dark for
+    // height silently fails closed to the dashd fallback (no verifier => no
+    // slot can ever be satisfied) -- which is how this fleet ran BLS-dark for
     // months without anyone noticing.
     std::cout << "[init] DASH BLS backend: "
               << (dash::coin::vendor::bls_backend_available()
