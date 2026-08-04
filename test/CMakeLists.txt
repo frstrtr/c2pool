@@ -842,6 +842,24 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_node_coin_state PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_node_coin_state "" AUTO)
 
+    # bestCL template gate: dashcore's CheckCbTxBestChainlock rule (consensus-
+    # exact) vs the original freshness proxy, plus the fail-closed fences
+    # (missing prev-block committed CL, unverified advance, unjustified
+    # provenance). DELIBERATELY NOT BLS-gated: the gate is a pure state
+    # decision over heights + provenance and must be exercised on EVERY build,
+    # including a BLS-dark one — proving the relaxation cannot degenerate into
+    # a no-op there is the whole point of two of its cases. Same header-only
+    # link set as test_dash_node_coin_state.
+    add_executable(test_dash_bestcl_gate test_dash_bestcl_gate.cpp)
+    target_link_libraries(test_dash_bestcl_gate PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_bestcl_gate PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_bestcl_gate "" AUTO)
+
     # DASHWorkSource (dash::stratum): concrete core::stratum::IWorkSource for
     # DASH X11 -- 4b construction + contract KAT. Links the dash_stratum OBJECT
     # lib (work_source.cpp) on top of the header-only coin selector link set.

@@ -259,6 +259,7 @@ void print_banner(const char* argv0)
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
         << "           [--external-ip ADDR]\n"
         << "           [--embedded-utxo] [--embedded-mainnet] [--embedded-mn-bridge-max N]\n"
+        << "           [--bestcl-policy freshness|consensus-exact]\n"
         << "           [--embedded-oracle-shadow]\n"
         << "           [--oracle-graduation-blocks N] [--oracle-class-coverage K]\n"
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
@@ -293,6 +294,16 @@ void print_banner(const char* argv0)
         << "        are transport only and NEVER move the arm. Even when armed, every\n"
         << "        per-template gate (SML fresh at tip, non-superblock, credit-pool seed\n"
         << "        height, bestCL, MN-payee cursor, DKG plan) fails closed to dashd.\n"
+        << "        --bestcl-policy selects HOW the bestCL gate decides. `freshness`\n"
+        << "        (DEFAULT) keeps the conservative proxy: refuse unless the best\n"
+        << "        observed ChainLock is within one block of the tip. `consensus-exact`\n"
+        << "        enforces dashcore CheckCbTxBestChainlock itself -- the committed\n"
+        << "        ChainLock must merely be non-null and NOT OLDER than the one the\n"
+        << "        previous block committed -- which is what dashd's own miner does\n"
+        << "        (it re-commits the previous block's signature when it holds nothing\n"
+        << "        fresher). Still fails closed: it refuses unless the previous block's\n"
+        << "        own committed ChainLock is held, and a value ADVANCED past it must\n"
+        << "        have passed local BLS verification.\n"
         << "        --coin-p2p-magic HEX overrides the embedded coin-P2P wire magic\n"
         << "        (default mainnet bf0c6bbd / testnet cee2caff; regtest fcc1b7dc).\n"
         << "        --regtest-force-won-block (regtest E5 harness, fail-closed) drives\n"
@@ -511,7 +522,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              bool embedded_superblock,
              bool embedded_oracle_shadow = false,
              uint64_t oracle_grad_blocks = 5000,
-             uint64_t oracle_class_coverage = 20)
+             uint64_t oracle_class_coverage = 20,
+             const std::string& bestcl_policy = "freshness")
 {
     namespace io = boost::asio;
 
@@ -3425,7 +3437,28 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // Only meaningful when the embedded arm actually serves (testnet or
         // --embedded-mainnet); harmless otherwise (the arm is off, work_source
         // never consults viability).
-        node_coin_state.set_require_fresh_bestcl(run_arm.embedded_arm_enabled);
+        //
+        // POLICY SELECTION (--bestcl-policy, DEFAULT freshness = unchanged).
+        // The freshness predicate is a PROXY: dashcore constrains the committed
+        // ChainLock only relative to what the PREVIOUS BLOCK committed, never
+        // against the tip or wall-clock recency (dash v23.1.7
+        // src/evo/specialtxman.cpp:129-141). `consensus-exact` enforces that
+        // real rule instead — see NodeCoinState::set_bestcl_policy. Kept as a
+        // runtime flag, not a rebuild, so the conservative posture is one
+        // restart away if a soak ever disagrees.
+        if (!run_arm.embedded_arm_enabled) {
+            node_coin_state.set_bestcl_policy(dash::coin::BestClPolicy::Off);
+        } else if (bestcl_policy == "consensus-exact") {
+            node_coin_state.set_bestcl_policy(
+                dash::coin::BestClPolicy::ConsensusExact);
+            LOG_INFO << "[EMB-DASH] bestCL gate policy = CONSENSUS-EXACT"
+                        " (dashcore CheckCbTxBestChainlock rule; requires the"
+                        " tip block's own committed ChainLock)";
+        } else {
+            node_coin_state.set_bestcl_policy(dash::coin::BestClPolicy::Freshness);
+            LOG_INFO << "[EMB-DASH] bestCL gate policy = FRESHNESS"
+                        " (conservative proxy: best CL within one block of tip)";
+        }
 
         // SOAK FIX (bad-cbtx-assetlocked-amount): the DIP-0027 credit-pool seed
         // rides a separate on_mnlistdiff step and can lag one block while the SML
@@ -4720,6 +4753,7 @@ int main(int argc, char** argv)
     std::string stratum_host = "0.0.0.0";      // --stratum [HOST:]PORT bind interface (default all)
     uint16_t    stratum_port = 0;              // 0 disables the Stratum accept-loop; --stratum sets it
     bool embedded_utxo = false;                // --embedded-utxo: arm the E2b UTXO/fee lane (opt-in)
+    std::string bestcl_policy = "freshness";   // --bestcl-policy: freshness (default, conservative proxy) | consensus-exact (dashcore's actual CheckCbTxBestChainlock rule)
     bool embedded_oracle_shadow = false;       // --embedded-oracle-shadow: per-block dashd cross-check (OBSERVE-only)
     uint64_t oracle_grad_blocks = 5000;        // --oracle-graduation-blocks N (consecutive clean)
     uint64_t oracle_class_coverage = 20;       // --oracle-class-coverage K (per height class)
@@ -4795,6 +4829,8 @@ int main(int argc, char** argv)
             embedded_superblock = true;
         else if (std::strcmp(argv[i], "--embedded-utxo") == 0)
             embedded_utxo = true;
+        else if (std::strcmp(argv[i], "--bestcl-policy") == 0 && i + 1 < argc)
+            bestcl_policy = argv[++i];
         else if (std::strcmp(argv[i], "--coinbase-text") == 0 && i + 1 < argc)
             coinbase_text = argv[++i];
         else if (std::strcmp(argv[i], "--embedded-oracle-shadow") == 0)
@@ -4948,7 +4984,7 @@ int main(int argc, char** argv)
                         coin_p2p_magic, force_won_block,
                         operator_message_blob_hex, embedded_superblock,
                         embedded_oracle_shadow, oracle_grad_blocks,
-                        oracle_class_coverage);
+                        oracle_class_coverage, bestcl_policy);
     }
     return run_selftest();
 }
