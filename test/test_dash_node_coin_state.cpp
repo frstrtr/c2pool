@@ -976,13 +976,12 @@ TEST(DashServeGateNamesRefusal, OffCommitmentWindowIsViable) {  // negative twin
     EXPECT_TRUE(st.describe_decline().viable);
 }
 
-TEST(DashServeGateNamesRefusal, UtxoImmatureIsNamedUnderConservativePolicy) {
+TEST(DashServeGateNamesRefusal, UtxoImmatureIsNamed) {
     NodeCoinState st;
     seed_healthy_armed(st);
     st.set_utxo_ready_fn([] { return false; });
-    // The refusal is now a POLICY, not an unconditional gate: only the
-    // conservative posture still declines the whole template.
-    st.set_utxo_immature_policy(dash::coin::UtxoImmaturePolicy::Refuse);
+    // No policy call: refusing IS the default (p2pool semantics — an unsynced
+    // node does not serve templates), byte-identical to the pre-policy gate.
     EXPECT_EQ(st.describe_decline().cause, "utxo-immature");
 }
 
@@ -993,53 +992,33 @@ TEST(DashServeGateNamesRefusal, UtxoMatureIsViable) {          // negative twin
     EXPECT_TRUE(st.describe_decline().viable);
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// UTXO-IMMATURE SERVING (cold-start serve-rate)
+// ════════════════════════════════════════════════════════════════════════
+// UTXO-IMMATURE SERVING (pure-daemonless OPT-IN)
 //
-// The old gate refused EVERY embedded template until blocks_connected >= 106 —
-// at ~150 s/block, ~4.4 h of every cold start with the embedded arm serving
-// nothing. Consensus never requires a mempool transaction in a block, so a
-// coinbase-only template is fully valid; and with zero txs the fee term is
-// exactly 0, so there is no fee to overstate and the bad-cb-amount risk the
-// gate guarded is structurally absent, not merely unlikely.
+// The DEFAULT during the blocks_connected < 106 window is to REFUSE — p2pool
+// semantics, the operator's design law: an unsynced node has unverified state
+// and does not serve block templates; miners idling is correct, and the dashd
+// fallback serves FULL templates where armed. The first test pins that default
+// exactly.
 //
-// These four pin the new contract: DEFAULT serves (with the tx set suppressed
-// and SAID so), the conservative flag reproduces the old behaviour exactly, and
-// a MATURE lane is never suppressed.
-// ════════════════════════════════════════════════════════════════════════════
+// ServeEmptyTxSet is the explicit opt-in for pure-daemonless nodes with no
+// fallback to route to: serve a coinbase-only template rather than nothing.
+// Consensus never requires a mempool transaction, and with zero txs the fee
+// term is exactly 0 — no fee to overstate, so the bad-cb-amount risk the gate
+// guards is structurally absent in that mode. The remaining tests pin the
+// opt-in contract: it serves, it suppresses the tx set, it SAYS so, and every
+// other gate still refuses.
+// ════════════════════════════════════════════════════════════════════════
 
-TEST(DashUtxoImmatureServing, DefaultServesTheImmatureWindow) {
+TEST(DashUtxoImmatureServing, DefaultRefusesTheImmatureWindowExactlyAsBefore) {
     NodeCoinState st;
     seed_healthy_armed(st);
     st.set_utxo_ready_fn([] { return false; });
     // No policy call at all — this is the shipped default.
-    const auto e = st.make_embedded_work_inputs();
     EXPECT_EQ(st.utxo_immature_policy(),
-              dash::coin::UtxoImmaturePolicy::ServeEmptyTxSet)
-        << "default must be the serving posture; a valid block beats no block";
-    EXPECT_TRUE(e.has_state)
-        << "an immature UTXO lane must no longer cost the whole template";
-    EXPECT_TRUE(e.decline.viable);
-    EXPECT_NE(st.describe_decline().cause, "utxo-immature");
-}
-
-TEST(DashUtxoImmatureServing, ServingModeSuppressesTheMempoolTxSet) {
-    NodeCoinState st;
-    seed_healthy_armed(st);
-    st.set_utxo_ready_fn([] { return false; });
-    const auto e = st.make_embedded_work_inputs();
-    // THE safety property: we serve, but we serve coinbase-only. Without this
-    // bit the arm would build a normal template off an immature UTXO view.
-    EXPECT_TRUE(e.suppress_mempool_txs)
-        << "serving an immature window WITHOUT suppressing the tx set is the "
-           "one variant that could overstate a fee";
-}
-
-TEST(DashUtxoImmatureServing, ConservativePolicyIsExactlyTheOldBehaviour) {
-    NodeCoinState st;
-    seed_healthy_armed(st);
-    st.set_utxo_ready_fn([] { return false; });
-    st.set_utxo_immature_policy(dash::coin::UtxoImmaturePolicy::Refuse);
+              dash::coin::UtxoImmaturePolicy::Refuse)
+        << "the default posture is REFUSE (p2pool semantics: an unsynced node "
+           "does not serve templates)";
     const auto e = st.make_embedded_work_inputs();
     EXPECT_FALSE(e.has_state);
     EXPECT_EQ(e.decline.cause, "utxo-immature");
@@ -1050,10 +1029,41 @@ TEST(DashUtxoImmatureServing, ConservativePolicyIsExactlyTheOldBehaviour) {
         << "a refusing arm serves nothing, so it suppresses nothing";
 }
 
+TEST(DashUtxoImmatureServing, OptInServesTheImmatureWindow) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_utxo_ready_fn([] { return false; });
+    st.set_utxo_immature_policy(
+        dash::coin::UtxoImmaturePolicy::ServeEmptyTxSet);
+    const auto e = st.make_embedded_work_inputs();
+    EXPECT_TRUE(e.has_state)
+        << "under the opt-in, an immature UTXO lane must not cost the whole "
+           "template";
+    EXPECT_TRUE(e.decline.viable);
+    EXPECT_NE(st.describe_decline().cause, "utxo-immature");
+}
+
+TEST(DashUtxoImmatureServing, OptInSuppressesTheMempoolTxSet) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_utxo_ready_fn([] { return false; });
+    st.set_utxo_immature_policy(
+        dash::coin::UtxoImmaturePolicy::ServeEmptyTxSet);
+    const auto e = st.make_embedded_work_inputs();
+    // THE safety property: we serve, but we serve coinbase-only. Without this
+    // bit the arm would build a normal template off an immature UTXO view.
+    EXPECT_TRUE(e.suppress_mempool_txs)
+        << "serving an immature window WITHOUT suppressing the tx set is the "
+           "one variant that could overstate a fee";
+}
+
 TEST(DashUtxoImmatureServing, MatureLaneNeverSuppresses) {     // negative twin
     NodeCoinState st;
     seed_healthy_armed(st);
     st.set_utxo_ready_fn([] { return true; });
+    // Even WITH the opt-in policy, a mature lane builds normal templates.
+    st.set_utxo_immature_policy(
+        dash::coin::UtxoImmaturePolicy::ServeEmptyTxSet);
     const auto e = st.make_embedded_work_inputs();
     EXPECT_TRUE(e.has_state);
     EXPECT_FALSE(e.suppress_mempool_txs)
@@ -1064,13 +1074,15 @@ TEST(DashUtxoImmatureServing, MatureLaneNeverSuppresses) {     // negative twin
     EXPECT_FALSE(unarmed.make_embedded_work_inputs().suppress_mempool_txs);
 }
 
-// The immature window relaxes ONLY this clause. Every other gate must still
-// refuse — otherwise "serve during immaturity" would have quietly become
-// "serve regardless", which is how a lost block gets shipped as a feature.
-TEST(DashUtxoImmatureServing, OtherGatesStillRefuseDuringTheImmatureWindow) {
+// The opt-in relaxes ONLY this clause. Every other gate must still refuse —
+// otherwise "serve during immaturity" would have quietly become "serve
+// regardless", which is how a lost block gets shipped as a feature.
+TEST(DashUtxoImmatureServing, OtherGatesStillRefuseUnderTheOptIn) {
     NodeCoinState st;
     seed_healthy_armed(st);
     st.set_utxo_ready_fn([] { return false; });
+    st.set_utxo_immature_policy(
+        dash::coin::UtxoImmaturePolicy::ServeEmptyTxSet);
     st.set_credit_pool(0, raw256(0xAB), static_cast<int32_t>(H - 4));
     const DeclineReport d = st.describe_decline();
     EXPECT_FALSE(d.viable);

@@ -137,11 +137,13 @@ public:
     /// coinbase outputs / misprice a fee. DASH_MINING_GATE_DEPTH = 100 + 6 = 106
     /// (utxo_adapter.hpp; dashcore consensus.h COINBASE_MATURITY).
     ///
-    /// This predicate reports only the DEPTH. On the dash arm it no longer
-    /// implies "serve nothing": NodeCoinState::set_utxo_immature_policy decides
-    /// what to do while it is false, and the default is to serve a coinbase-only
-    /// template (consensus requires no mempool tx; with zero txs the fee term is
-    /// exactly 0). Refusing the whole window cost ~4.4 h of every cold start.
+    /// This predicate reports only the DEPTH. What the arm does while it is
+    /// false is NodeCoinState::set_utxo_immature_policy's decision: the DEFAULT
+    /// refuses the whole window (p2pool semantics -- an unsynced node does not
+    /// serve templates; the dashd fallback serves full ones where armed), and
+    /// the pure-daemonless opt-in serves a coinbase-only template instead
+    /// (consensus requires no mempool tx; with zero txs the fee term is exactly
+    /// 0, so nothing can be overstated).
     bool mining_utxo_ready() const
     {
         if (!m_cache) return false;

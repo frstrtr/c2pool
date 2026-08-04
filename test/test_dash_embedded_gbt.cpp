@@ -922,11 +922,16 @@ TEST(DashEmbeddedGbt, E2ForgedBlockBodyRefusedDoesNotAdvanceSeed) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// UTXO-IMMATURE SERVING — the coinbase-only template (cold-start serve-rate)
+// UTXO-IMMATURE SERVING — the coinbase-only template (pure-daemonless OPT-IN)
 //
-// The embedded arm used to refuse EVERY template until the UTXO/fee lane had
-// connected 106 blocks — at ~150 s/block, ~4.4 h of every cold start serving
-// nothing. Consensus never requires a mempool transaction in a block, so a
+// The DEFAULT during the UTXO-immature window is to REFUSE (p2pool semantics:
+// an unsynced node does not serve templates — pinned in
+// test_dash_node_coin_state.cpp DefaultRefusesTheImmatureWindowExactlyAsBefore).
+// The suppress_mempool_txs seam exercised here is the explicit opt-in for
+// pure-daemonless nodes with no fallback: serve a coinbase-only template
+// rather than nothing for ~106 blocks (~4.4 h at ~150 s/block).
+//
+// Consensus never requires a mempool transaction in a block, so a
 // coinbase-only template is a fully valid block; and because this builder has
 // no TestBlockValidity equivalent, the decisive property is that with ZERO
 // selected txs the fee term is exactly 0 — there is no fee to overstate, so
