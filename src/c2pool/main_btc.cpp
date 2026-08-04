@@ -1660,6 +1660,49 @@ int main(int argc, char* argv[])
         mi->set_io_context(&ioc);
         web_server->set_stratum_port(stratum_port);
 
+        // D-BTC dashboard feeds (integrator 2026-08-03): mirror of D-BCH
+        // (PR #1055) into the live MiningInterface the H-STATS.944 seam already
+        // stood up with a NULL IMiningNode + zero feeds (so /api rendered empty).
+        // BTC has no coin/embedded_daemon.hpp dashboard_topology() -- its embedded
+        // transport is coin_node (BTC P2P) + an optional submitblock RPC fallback
+        // -- so node_topology is synthesized inline from header_chain + coin_node,
+        // and the sharechain feeds read the p2p_node NodeBridge accessors exactly
+        // like the proven LTC feeders (main_ltc.cpp:2861/3378). Reuses the generic
+        // core/web_server.hpp setters -- ZERO src/core edit. All captured objects
+        // are declared above at main scope and outlive ioc.run(); all reads are
+        // display-only (lock-free snapshots/atomics).
+        mi->set_peer_info_fn([p2p_node_raw]() -> nlohmann::json {
+            return p2p_node_raw->get_peer_info_json();
+        });
+        mi->set_pool_hashrate_fn([p2p_node_raw]() -> double {
+            return p2p_node_raw->get_tracker_snapshot().pool_hashrate;
+        });
+        mi->set_sharechain_stats_fn([p2p_node_raw]() {
+            auto s = p2p_node_raw->get_tracker_snapshot();
+            return nlohmann::json{
+                {"chain_count", s.chain_count},
+                {"verified_count", s.verified_count},
+                {"head_count", s.head_count},
+                {"pool_hashrate", s.pool_hashrate},
+            };
+        });
+        mi->set_node_topology_fn([&header_chain, &coin_node]() {
+            const uint32_t synced   = header_chain.height();
+            const uint32_t peer_tip = header_chain.peer_tip_height();
+            const bool     emb_p2p  = coin_node.has_p2p();
+            const bool     ext_rpc  = coin_node.has_rpc();
+            return nlohmann::json{
+                {"coin", "BTC"},
+                {"embedded", true},
+                {"has_rpc", ext_rpc},
+                {"synced_height", synced},
+                {"peer_tip_height", peer_tip},
+                {"sync_pct", (peer_tip > 0 ? 100.0 * synced / peer_tip : 0.0)},
+                {"embedded_peers", emb_p2p ? 1 : 0},
+                {"broadcast_route", emb_p2p ? "p2p" : (ext_rpc ? "rpc" : "none")},
+            };
+        });
+
         // graph_db stats persistence â survives restarts (LTC-parity site 2/3,
         // mirrors main_ltc.cpp:1967-1973). BTC-namespaced sub-dir keeps the per-coin
         // stat log isolated under the shared config path.
