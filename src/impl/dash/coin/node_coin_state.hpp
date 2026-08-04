@@ -45,6 +45,36 @@
 namespace dash {
 namespace coin {
 
+/// Where the currently-held best ChainLock came from. The bestCL* fields are
+/// COMMITTED into the coinbase of every template we serve, and dashcore
+/// re-verifies a non-null committed signature with BLS
+/// (specialtxman.cpp:164-167 VerifyChainLock => bad-cbtx-invalid-clsig), so
+/// "how do we justify this signature" is a consensus question, not bookkeeping.
+///
+///  - Unknown        : no provenance recorded. FAIL-CLOSED — the consensus-exact
+///                     gate refuses to serve from it. This is the DEFAULT for
+///                     set_best_cl() so that any future/unaudited writer cannot
+///                     silently make the gate permissive.
+///  - ChainCommitted : read out of a connected block's own coinbase CCbTx. The
+///                     network already accepted that signature IN that block, so
+///                     re-committing it needs no local BLS at all — this is
+///                     exactly what dashd's own miner does when it holds nothing
+///                     fresher (dash v23.1.7 src/node/miner.cpp:143-146,153-156).
+///  - BlsVerified    : a live clsig off the wire that PASSED local BLS
+///                     verification against its signing quorum
+///                     (CoinStateMaintainer::on_new_chainlock, itself fail-closed
+///                     when no verifier is installed).
+enum class ClProvenance { Unknown, ChainCommitted, BlsVerified };
+
+/// Policy for the bestCL viability/pre-emit gate. See set_bestcl_policy().
+///
+///  - Off             : no bestCL gate (pre-#780 behaviour).
+///  - Freshness       : the ORIGINAL proxy — require the best observed ChainLock
+///                      to be within one block of the tip. Conservative,
+///                      over-restrictive, and the DEFAULT when the gate is on.
+///  - ConsensusExact  : require exactly what dashcore requires, no more.
+enum class BestClPolicy { Off, Freshness, ConsensusExact };
+
 /// In-process coin-state the running node maintains for LOCAL template
 /// assembly. Non-copyable: it owns a Mempool (itself non-copyable) and is
 /// node-owned, never duplicated. The maintainer mutates mnstates()/mempool()
@@ -98,10 +128,55 @@ public:
     /// carry: the best-ChainLock height+signature and the DIP-0027 credit-pool
     /// balance. Sourced by the maintainer from the diff's embedded cbTx (the
     /// authoritative wire form as-of blockHash) and from new_chainlock events.
-    void set_best_cl(int32_t height, const std::array<uint8_t, 96>& sig) {
+    /// `prov` records HOW this signature is justified — see ClProvenance. It
+    /// defaults to Unknown (fail-closed under BestClPolicy::ConsensusExact) so
+    /// that a writer added later cannot make the gate permissive by omission.
+    void set_best_cl(int32_t height, const std::array<uint8_t, 96>& sig,
+                     ClProvenance prov = ClProvenance::Unknown) {
         m_best_cl_height = height;
         m_best_cl_sig    = sig;
+        m_best_cl_prov   = prov;
     }
+    ClProvenance best_cl_provenance() const { return m_best_cl_prov; }
+
+    /// Record the ChainLock the TIP BLOCK ITSELF committed, straight off that
+    /// block's coinbase CCbTx.
+    ///
+    /// THIS IS THE DATUM THE CONSENSUS RULE IS STATED IN. dashcore's
+    /// CheckCbTxBestChainlock (dash v23.1.7 src/evo/specialtxman.cpp:102-177)
+    /// constrains our block at height H only RELATIVE to what block H-1
+    /// committed:
+    ///
+    ///     prevCL = GetNonNullCoinbaseChainlock(pindex->pprev)   // :129-131
+    ///     if (prevCL) {
+    ///         if (!cbTx.bestCLSignature.IsValid())      -> bad-cbtx-null-clsig    // :134-137
+    ///         if (cbTx.bestCLHeightDiff > prevCL.diff+1) -> bad-cbtx-older-clsig  // :138-140
+    ///     }
+    ///
+    /// i.e. "committed CL height must not go BACKWARDS from the previous
+    /// block's". Nothing in the rule mentions the tip, wall-clock freshness, or
+    /// how recently a ChainLock was produced. Knowing block H-1's committed
+    /// (sig, heightDiff) is therefore NECESSARY AND SUFFICIENT to prove our own
+    /// committed value legal before we serve it.
+    ///
+    /// `block_height` is the height of the block whose coinbase supplied this
+    /// (validated by the caller against the CCbTx's own nHeight), `has_sig` is
+    /// false when that coinbase committed a NULL bestCLSignature (dashcore then
+    /// imposes NO constraint on us at all), and `cl_height` is the absolute
+    /// height that coinbase's committed ChainLock refers to,
+    /// block_height - bestCLHeightDiff - 1.
+    void set_tip_cbtx_chainlock(int32_t block_height, bool has_sig, int32_t cl_height) {
+        // Monotonic on the block axis: a late/duplicate delivery of an OLDER
+        // block must not roll the provenance height back (same discipline as
+        // the credit-pool seed's Nit-C guard).
+        if (block_height <= m_tip_cbtx_at_height) return;
+        m_tip_cbtx_at_height = block_height;
+        m_tip_cbtx_cl_null   = !has_sig;
+        m_tip_cbtx_cl_height = has_sig ? cl_height : -1;
+    }
+    int32_t tip_cbtx_at_height() const { return m_tip_cbtx_at_height; }
+    int32_t tip_cbtx_cl_height() const { return m_tip_cbtx_cl_height; }
+    bool    tip_cbtx_cl_null()   const { return m_tip_cbtx_cl_null; }
     /// Seed the DIP-0027 credit-pool balance, its block hash, AND its HEIGHT.
     /// The seed rides a SEPARATE on_mnlistdiff step (the diff's embedded cbTx)
     /// from the SML/merkleRoot axis and can LAG one block while the SML is already
@@ -351,7 +426,156 @@ public:
     /// <= prev_height - 1, so a CL that fresh is guaranteed non-null and >= it.
     /// If we have not observed a recent clsig (post-restart / relay gap) the arm
     /// fails closed to the dashd fallback. Default OFF preserves prior behaviour.
-    void set_require_fresh_bestcl(bool v) { m_require_fresh_bestcl = v; }
+    ///
+    /// ⚠ THE FRESHNESS PREDICATE IS A PROXY, AND IT IS EXPENSIVE. See
+    /// set_bestcl_policy() for the consensus-exact replacement and the measured
+    /// cost of keeping this one. This setter is retained verbatim: it selects
+    /// BestClPolicy::Freshness, which stays the default, so every existing
+    /// caller and KAT keeps byte-identical behaviour.
+    void set_require_fresh_bestcl(bool v) {
+        m_require_fresh_bestcl = v;
+        m_bestcl_policy = v ? BestClPolicy::Freshness : BestClPolicy::Off;
+    }
+
+    /// Select the bestCL gate policy. `Freshness` (the default whenever the
+    /// gate is enabled) is the original #780 BLOCKER-2 proxy. `ConsensusExact`
+    /// enforces dashcore's ACTUAL rule and nothing more.
+    ///
+    /// WHY THE PROXY IS WRONG (and it is a proxy — its own docs above call it
+    /// "a sufficient condition"). dashcore constrains the committed ChainLock
+    /// ONLY relative to the previous block's committed ChainLock; it never asks
+    /// for freshness. dashd's own miner, when it holds nothing newer than what
+    /// block H-1 committed, RE-COMMITS block H-1's exact signature with
+    /// heightDiff = prevDiff + 1 and mines on (dash v23.1.7
+    /// src/node/miner.cpp:143-146 "We don't know any CL, therefore inserting the
+    /// CL of the previous block" and :153-156 "Our best CL isn't newer:
+    /// inserting CL from previous block"). That path needs no ChainLock of our
+    /// own and no BLS verification whatsoever. Our builder already produces
+    /// byte-identically the same CCbTx in that situation — embedded_gbt.hpp
+    /// computes heightDiff = prev_height - best_cl_height, which for a bestCL
+    /// sourced from block H-1's coinbase is exactly prevDiff + 1. Only this
+    /// gate stopped us serving it.
+    ///
+    /// WHAT ConsensusExact REQUIRES INSTEAD. Not freshness, but PROVENANCE: we
+    /// must hold block H-1's OWN committed ChainLock (set_tip_cbtx_chainlock,
+    /// fed from the connected block's coinbase), because that is the only term
+    /// the consensus inequality is stated against. Given it, the value we would
+    /// commit is provably legal before we serve. Without it we fail closed to
+    /// the dashd fallback, exactly as before.
+    ///
+    /// FAIL-CLOSED ON A BLS-DARK BUILD. ConsensusExact never becomes permissive
+    /// when BLS is stubbed out. Committing something NEWER than block H-1's
+    /// ChainLock is the only case dashcore makes us prove with BLS, and that
+    /// case additionally requires ClProvenance::BlsVerified — which
+    /// on_new_chainlock can only produce through an installed, succeeding
+    /// verifier. A BLS-dark build therefore holds only ChainCommitted values and
+    /// re-commits block H-1's signature: dashd's own no-ChainLock behaviour.
+    void set_bestcl_policy(BestClPolicy p) {
+        m_bestcl_policy = p;
+        m_require_fresh_bestcl = (p != BestClPolicy::Off);
+    }
+    BestClPolicy bestcl_policy() const { return m_bestcl_policy; }
+
+    /// The ONE bestCL decision, shared by viability and the pre-emit gate so
+    /// they can never drift apart. Returns nullopt when the bestCL axis is
+    /// viable; otherwise {cause, value, threshold} for the decline report.
+    ///
+    /// Every refusal below is a refusal to SERVE — the caller routes to the
+    /// reward-safe dashd fallback, exactly as the freshness proxy did.
+    std::optional<std::array<std::string, 3>> bestcl_decline() const {
+        const int32_t prev_h = static_cast<int32_t>(m_prev_height);
+        auto no = [](const char* c, std::string v, std::string t) {
+            return std::optional<std::array<std::string, 3>>{
+                std::array<std::string, 3>{c, std::move(v), std::move(t)}};
+        };
+        switch (m_bestcl_policy) {
+        case BestClPolicy::Off:
+            return std::nullopt;
+
+        case BestClPolicy::Freshness:
+            // best_cl_height 0 means "no clsig ever observed", NOT "ChainLock at
+            // height 0" — print n/a rather than report a measurement never taken.
+            if (m_best_cl_height < prev_h - 1)
+                return no("bestcl-stale",
+                          m_best_cl_height > 0 ? std::to_string(m_best_cl_height)
+                                               : std::string("n/a"),
+                          ">=" + std::to_string(static_cast<int64_t>(prev_h) - 1));
+            return std::nullopt;
+
+        case BestClPolicy::ConsensusExact:
+            // (1) PROVENANCE OF THE CONSTRAINT. Without block H-1's own
+            // committed ChainLock we cannot evaluate dashcore's inequality at
+            // all, so we must not serve. This is the same INDEPENDENT-HEIGHT
+            // discipline the credit-pool seed uses: a value alone cannot tell
+            // you it is one block behind; its height can.
+            if (m_tip_cbtx_at_height != prev_h)
+                return no("bestcl-tip-cbtx-stale",
+                          m_tip_cbtx_at_height > 0
+                              ? std::to_string(m_tip_cbtx_at_height)
+                              : std::string("n/a"),
+                          std::to_string(prev_h));
+
+            if (m_tip_cbtx_cl_null) {
+                // Block H-1 committed a NULL ChainLock =>
+                // GetNonNullCoinbaseChainlock returns nullopt and dashcore
+                // imposes NO constraint (specialtxman.cpp:130-141 is skipped
+                // entirely). We may commit null, or any signature we can
+                // justify. Committing null is what dashd does here when it
+                // holds nothing (miner.cpp:167-171).
+                if (m_best_cl_height <= 0) return std::nullopt;
+                break;   // non-null: fall through to the justification check
+            }
+
+            // (2) NON-NULL. dashcore :134-137 bad-cbtx-null-clsig — once block
+            // H-1 committed a real ChainLock, ours may not be null.
+            if (m_best_cl_height <= 0)
+                return no("bestcl-absent", "n/a",
+                          "non-null (prev committed CL @"
+                              + std::to_string(m_tip_cbtx_cl_height) + ")");
+            // (3) NOT OLDER. dashcore :138-140 bad-cbtx-older-clsig, restated on
+            // the absolute-height axis: bestCLHeightDiff > prevDiff + 1 is
+            // exactly "our committed CL height < the previous block's".
+            if (m_best_cl_height < m_tip_cbtx_cl_height)
+                return no("bestcl-older-than-prev",
+                          std::to_string(m_best_cl_height),
+                          ">=" + std::to_string(m_tip_cbtx_cl_height));
+            break;
+        }
+
+        // (4) JUSTIFICATION. Reached only under ConsensusExact with a non-null
+        // value about to be committed. dashcore BLS-verifies what we commit
+        // (specialtxman.cpp:164-167 => bad-cbtx-invalid-clsig), so we must be
+        // able to say why this signature is good:
+        //   - ChainCommitted: the network already accepted it inside block H-1.
+        //     Re-committing it is dashd's own fallback and needs no local BLS.
+        //   - BlsVerified: we verified it ourselves against its signing quorum.
+        // Anything ELSE — including a value ADVANCED past block H-1's committed
+        // ChainLock without local verification — is refused. This is what keeps
+        // a BLS-dark build from silently becoming permissive: with no verifier
+        // installed on_new_chainlock adopts nothing, so nothing ever advances
+        // past ChainCommitted and this arm is never reached with an unproven
+        // signature.
+        const bool advancing =
+            !m_tip_cbtx_cl_null && m_best_cl_height > m_tip_cbtx_cl_height;
+        if (advancing && m_best_cl_prov != ClProvenance::BlsVerified)
+            return no("bestcl-unverified-advance",
+                      std::to_string(m_best_cl_height) + "@"
+                          + prov_name(m_best_cl_prov),
+                      ">" + std::to_string(m_tip_cbtx_cl_height)
+                          + " requires bls-verified");
+        if (m_best_cl_prov == ClProvenance::Unknown)
+            return no("bestcl-unjustified", "provenance=unknown",
+                      "chain-committed|bls-verified");
+        return std::nullopt;
+    }
+
+    static const char* prov_name(ClProvenance p) {
+        switch (p) {
+        case ClProvenance::ChainCommitted: return "chain-committed";
+        case ClProvenance::BlsVerified:    return "bls-verified";
+        default:                           return "unknown";
+        }
+    }
 
     /// Quorum-set health (review PR #780 nit): parse_quorum_tail fails SAFE (keeps
     /// SML sync, skips quorum tracking). On a malformed tail the QuorumManager is
@@ -448,12 +672,11 @@ public:
             return reject("emit-dkg-commitment-window",
                           "in-window@h=" + std::to_string(next_h), "off-window");
         }
-        if (m_require_fresh_bestcl
-            && m_best_cl_height < static_cast<int32_t>(m_prev_height) - 1)
-            return reject("emit-bestcl-stale",
-                          m_best_cl_height > 0 ? std::to_string(m_best_cl_height)
-                                               : std::string("n/a"),
-                          ">=" + std::to_string(static_cast<int64_t>(m_prev_height) - 1));
+        // Same single decision as viability, prefixed for the emit surface.
+        if (auto cl = bestcl_decline()) {
+            const std::string cause = "emit-" + (*cl)[0];
+            return reject(cause.c_str(), (*cl)[1], (*cl)[2]);
+        }
         // SOAK FIX (independent HEIGHT check): the credit-pool seed's OWN cbTx
         // height must be the tip we build on, else the accrual commits a stale
         // creditPoolBalance (bad-cbtx-assetlocked-amount). Independent of the
@@ -528,7 +751,16 @@ public:
             return reject("emit-quorum-root-drift",
                           cb.merkleRootQuorums.GetHex().substr(0, 12),
                           expected_quorum_root.GetHex().substr(0, 12));
-        if (m_require_fresh_bestcl && !cb.has_best_cl_signature())
+        // A null committed clsig is a defect ONLY when dashcore forbids it —
+        // i.e. when block H-1 itself committed a non-null ChainLock
+        // (specialtxman.cpp:134-137). Under ConsensusExact, when block H-1
+        // committed null, a null commit is legal and is what dashd emits
+        // (miner.cpp:167-171); refusing it there would be pure loss.
+        const bool null_commit_forbidden =
+            m_bestcl_policy == BestClPolicy::ConsensusExact
+                ? !m_tip_cbtx_cl_null
+                : m_require_fresh_bestcl;
+        if (null_commit_forbidden && !cb.has_best_cl_signature())
             return reject("emit-bestcl-null-committed", "null-clsig", "non-null-clsig");
         // SOAK RE-FIX (build-vs-serve skew): re-derive the expected creditPool
         // from the CURRENT seed at emit/serve time and require the BUILT CbTx to
@@ -709,6 +941,9 @@ private:
             return r;
         };
 
+        // Evaluated once; the SAME value the pre-emit gate uses.
+        const auto cl_decline = bestcl_decline();
+
         DeclineReport d;   // viable by default
 
         if (!m_populated)
@@ -737,14 +972,9 @@ private:
         else if (!m_qc_plan_fn && m_commitment_window_fn && m_commitment_window_fn(next_h))
             d = refuse("dkg-commitment-window", "in-window@h=" + std::to_string(next_h),
                        "off-window");
-        else if (m_require_fresh_bestcl
-                 && m_best_cl_height < static_cast<int32_t>(m_prev_height) - 1)
-            // best_cl_height 0 means "no clsig ever observed", NOT "ChainLock at
-            // height 0" — print n/a rather than report a measurement never taken.
-            d = refuse("bestcl-stale",
-                       m_best_cl_height > 0 ? std::to_string(m_best_cl_height)
-                                            : std::string("n/a"),
-                       ">=" + std::to_string(static_cast<int64_t>(m_prev_height) - 1));
+        else if (cl_decline)
+            // ONE decision, shared with the pre-emit gate (bestcl_decline()).
+            d = refuse((*cl_decline)[0].c_str(), (*cl_decline)[1], (*cl_decline)[2]);
         else if (m_require_fresh_credit_pool
                  && m_credit_pool_height != static_cast<int32_t>(m_prev_height))
             // -1 is the member's own "never seeded" sentinel.
@@ -900,6 +1130,12 @@ private:
     QuorumManager  m_qmgr;                    // merkleRootQuorums source (quorum-tail-fed)
     int32_t  m_best_cl_height{0};             // best observed ChainLock height
     std::array<uint8_t, 96> m_best_cl_sig{};  // best observed ChainLock signature
+    ClProvenance m_best_cl_prov{ClProvenance::Unknown};  // how it is justified (fail-closed default)
+    // Block H-1's OWN committed ChainLock, off its coinbase CCbTx. This is the
+    // term dashcore's CheckCbTxBestChainlock inequality is written against.
+    int32_t  m_tip_cbtx_at_height{0};         // height of the block that supplied it (0 = never)
+    int32_t  m_tip_cbtx_cl_height{-1};        // absolute CL height it committed (-1 = null/none)
+    bool     m_tip_cbtx_cl_null{false};       // that coinbase committed a NULL bestCLSignature
     int64_t  m_credit_pool{0};                // DIP-0027 credit-pool balance (seeded from cbTx)
     bool     m_have_sml{false};               // a non-empty SML has been applied
     uint256  m_sml_current_hash;              // block hash the SML is current at (ZERO = cold/reorg)
@@ -918,6 +1154,7 @@ private:
     std::function<bool(uint32_t)> m_commitment_window_fn;  // refuse embedded on DKG commitment heights
     std::function<std::optional<QcBlockPlan>(uint32_t)> m_qc_plan_fn;  // E1: serve DKG windows daemonlessly
     bool     m_require_fresh_bestcl{false};  // refuse embedded on a stale/absent bestCL
+    BestClPolicy m_bestcl_policy{BestClPolicy::Off};  // Freshness stays the default when enabled
     bool     m_require_fresh_credit_pool{false}; // refuse embedded on a lagged credit-pool seed
     bool     m_require_fresh_mn_payee{false};    // refuse embedded on a lagged payee queue (stale cursor)
     // #996: fail-CLOSED default -- reads only mnstates (always present), needs

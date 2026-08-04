@@ -554,8 +554,20 @@ public:
                         // older bestCL must not roll the committed bestCL* back
                         // (that would desync the next template's CCbTx from dashd).
                         if (best_h > 0 && best_h >= m_state.best_cl_height())
-                            m_state.set_best_cl(best_h, observed.bestCLSignature);
+                            m_state.set_best_cl(best_h, observed.bestCLSignature,
+                                                ClProvenance::ChainCommitted);
                     }
+                    // Record what THIS block's coinbase committed, keyed by its
+                    // own on-wire nHeight. Distinct from the "best" above: this
+                    // is the term dashcore's CheckCbTxBestChainlock inequality
+                    // is stated against (block H-1's committed CL), and it is
+                    // recorded even when NULL — "block H-1 committed nothing"
+                    // is a legal, constraint-free state, not an absence of
+                    // information. See NodeCoinState::set_tip_cbtx_chainlock.
+                    m_state.set_tip_cbtx_chainlock(
+                        observed.nHeight, observed.has_best_cl_signature(),
+                        observed.nHeight - 1
+                            - static_cast<int32_t>(observed.bestCLHeightDiff));
                 }
             }
         }
@@ -661,7 +673,10 @@ public:
                         << " block=" << block_hash.GetHex().substr(0, 16) << "...";
             return;
         }
-        m_state.set_best_cl(height, sig);
+        // BlsVerified is the ONLY provenance that lets the consensus-exact gate
+        // commit a ChainLock NEWER than the one block H-1 committed — that is
+        // the case dashcore makes us prove with BLS (specialtxman.cpp:164-167).
+        m_state.set_best_cl(height, sig, ClProvenance::BlsVerified);
         LOG_INFO << "[CL] adopted VERIFIED ChainLock height=" << height
                  << " block=" << block_hash.GetHex().substr(0, 16) << "...";
         // A fresher bestCL* changes the next template's committed CCbTx —
@@ -1099,6 +1114,32 @@ private:
     // self-consistent-but-stale trap that refuted 3 prior soaks). The seed's height
     // is taken straight off the wire (cbTx.nHeight == connected height, checked),
     // so it can never be mistaken as current at a height we did not observe.
+    /// Fold an on-chain coinbase CCbTx into the two bestCL data the template
+    /// gate needs. `observed` MUST already have been validated to carry its own
+    /// nHeight off the wire (the caller does this).
+    ///
+    ///  - set_tip_cbtx_chainlock: what THIS block committed, keyed by its own
+    ///    height. Recorded even when null — "committed nothing" is a legal
+    ///    state that REMOVES the consensus constraint, not missing information.
+    ///  - set_best_cl: the value we would ourselves commit next. Tagged
+    ///    ChainCommitted: the network accepted this signature inside a block, so
+    ///    re-committing it needs no local BLS — the same justification dashd's
+    ///    miner relies on (v23.1.7 src/node/miner.cpp:143-146).
+    ///
+    /// Monotonic on both axes: a late or duplicate OLD block can never roll
+    /// either back (a regressed bestCL would desync our CCbTx from dashd's).
+    void adopt_chain_committed_chainlock(const vendor::CCbTx& observed) {
+        const int32_t committed_cl_h =
+            observed.nHeight - 1 - static_cast<int32_t>(observed.bestCLHeightDiff);
+        m_state.set_tip_cbtx_chainlock(observed.nHeight,
+                                       observed.has_best_cl_signature(),
+                                       committed_cl_h);
+        if (observed.has_best_cl_signature() && committed_cl_h > 0
+            && committed_cl_h >= m_state.best_cl_height())
+            m_state.set_best_cl(committed_cl_h, observed.bestCLSignature,
+                                ClProvenance::ChainCommitted);
+    }
+
     void advance_credit_pool_on_block(const dash::coin::BlockType& block,
                                       uint32_t height) {
         if (block.m_txs.empty()) return;                 // no coinbase
@@ -1115,6 +1156,15 @@ private:
                         << " — skip credit-pool advance";
             return;
         }
+        // ── bestCL axis (rides the SAME validated parse; own monotonic guards).
+        // This block's coinbase is the authoritative statement of what the
+        // chain committed AT this height, and once this height is the tip it is
+        // precisely the "previous block's committed ChainLock" that dashcore's
+        // CheckCbTxBestChainlock measures our next template against. Recording
+        // it here — not only on the far rarer mnlistdiff — is what lets
+        // BestClPolicy::ConsensusExact evaluate the real rule every block.
+        adopt_chain_committed_chainlock(observed);
+
         const int64_t from_wire = observed.creditPoolBalance;
         // Network-aware platform-share gate (E4 re-soak fix): the MN_RR
         // activation height is per-chainparams; the state holds the network's
