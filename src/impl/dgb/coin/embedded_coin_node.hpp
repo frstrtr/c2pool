@@ -53,6 +53,8 @@
 #include "hash_format.hpp"            // u256_be_display_hex SSOT
 #include "embedded_coinbase_value.hpp"  // resolve_coinbase_value SSOT (#207)
 #include "template_builder.hpp"       // build_work_template SSOT + CoinNodeInterface
+#include "live_node_status.hpp"    // make_live_node_status SSOT (D-DGB.LIVEADAPTER)
+#include <functional>
 #include "rpc_data.hpp"               // rpc::WorkData
 
 namespace dgb::coin
@@ -147,10 +149,43 @@ public:
     // truthful false, never an optimistic claim of readiness.
     bool is_synced() const override { return false; }
 
+    // -- D-DGB.LIVEADAPTER: live embedded-node handle --------------------------
+    // A LIVE embedded coin-daemon node handle (the M3 P2P header-download node)
+    // is what makes getblockchaininfo()/is_synced() MEANINGFUL. Until M3 lands
+    // there is no such node feeding m_chain, so this probe is NULL and the
+    // readings above are a fake zero. The probe is the seam M3 installs: a cheap
+    // bool getter bound to the embedded node's connectivity. NULL probe (or one
+    // returning false) => no live upstream. Never dereferenced when absent.
+    using LiveNodeProbe = std::function<bool()>;
+    void set_live_node_probe(LiveNodeProbe probe) { m_live_probe = std::move(probe); }
+
+    // True iff a live embedded coin-daemon node handle is present AND reports
+    // up. A throwing probe is treated as NOT-live (never propagates a crash to
+    // the dashboard hook) -- "never a crash" per D-DGB.LIVEADAPTER.
+    bool has_live_node() const
+    {
+        if (!m_live_probe) return false;
+        try { return m_live_probe(); } catch (...) { return false; }
+    }
+
+    // Dashboard-facing status object. Routes through the make_live_node_status
+    // SSOT so /api/spv_progress and /api/node_topology label an absent handle
+    // IDENTICALLY as {"live":false,"state":"no live node"} with null height/
+    // synced -- never a fake zero. Reads the chain tip ONLY when live.
+    nlohmann::json live_status()
+    {
+        const bool live = has_live_node();
+        return make_live_node_status(
+            live,
+            live ? getblockchaininfo().value("blocks", 0) : 0,
+            live ? is_synced() : false);
+    }
+
 private:
     c2pool::dgb::HeaderChain& m_chain;
     core::SubsidyFunc         m_subsidy_func;
     EmbeddedTxSource          m_tx_source;
+    LiveNodeProbe             m_live_probe;   // NULL => no live embedded node (D-DGB.LIVEADAPTER)
 };
 
 } // namespace dgb::coin

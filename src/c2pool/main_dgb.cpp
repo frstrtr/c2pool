@@ -1257,9 +1257,15 @@ int run_node(const core::CoinParams& params, bool testnet,
 
         // (2) embedded DGB daemon synced height + peer count — /api/spv_progress.
         mi->set_spv_progress_fn([&embedded_coin, &coin_peer_mgr]() {
+            // D-DGB.LIVEADAPTER: when no live embedded node feeds the chain the
+            // status is labelled "no live node" with null height/synced -- NOT a
+            // fake 0/false that reads as a real node at genesis.
+            const nlohmann::json st = embedded_coin.live_status();
             nlohmann::json r = nlohmann::json::object();
-            r["dgb_height"] = embedded_coin.getblockchaininfo().value("blocks", 0);
-            r["dgb_synced"] = embedded_coin.is_synced();
+            r["dgb_live"]   = st["live"];
+            r["dgb_state"]  = st["state"];
+            r["dgb_height"] = st["height"];   // null unless a live node is present
+            r["dgb_synced"] = st["synced"];   // null unless a live node is present
             r["dgb_peers"]  = coin_peer_mgr ? coin_peer_mgr->connected_count() : 0;
             return r;
         });
@@ -1275,8 +1281,14 @@ int run_node(const core::CoinParams& params, bool testnet,
             dgb_e["embedded"] = true;
             dgb_e["has_rpc"]  = coin_node.has_rpc();
             dgb_e["peers"]    = coin_peer_mgr ? coin_peer_mgr->connected_count() : 0;
-            dgb_e["synced"]   = embedded_coin.is_synced();
-            dgb_e["height"]   = embedded_coin.getblockchaininfo().value("blocks", 0);
+            // D-DGB.LIVEADAPTER: honest live-node status. No live embedded node
+            // => live:false, state:"no live node", null height/synced (never a
+            // fake zero). Flips to real readings once the M3 node handle lands.
+            const nlohmann::json st = embedded_coin.live_status();
+            dgb_e["live"]     = st["live"];
+            dgb_e["state"]    = st["state"];
+            dgb_e["synced"]   = st["synced"];
+            dgb_e["height"]   = st["height"];
             nlohmann::json coins = nlohmann::json::array();
             coins.push_back(dgb_e);
 
