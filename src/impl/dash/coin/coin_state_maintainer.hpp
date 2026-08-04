@@ -490,6 +490,20 @@ public:
         const size_t q_deleted = qr.deleted;
         m_state.set_quorum_healthy(true);
 
+        // 2b) qc-plan-underivable tee: newQuorums are COMPLETE DIP-4
+        //     CFinalCommitments (pubkey, vvec hash, quorumSig, membersSig,
+        //     bitsets), not just (llmqType, quorumHash) existence — hand them
+        //     to the wired consumer (main_dash funnels them through the SAME
+        //     MineableCommitmentCache admission path the qfcommit push uses)
+        //     instead of dropping the crypto payload on the floor after the
+        //     has_mined bookkeeping above. Fired only for an ACCEPTED diff:
+        //     every reject/heal path (base-continuity, stale-snapshot R1,
+        //     malformed-tail H-1) returned before this point, so a consumer
+        //     never sees commitments off a diff whose SML apply was refused.
+        //     Optional (unset in KATs = no-op).
+        if (m_on_new_quorum_commitments && !qt.newQuorums.empty())
+            m_on_new_quorum_commitments(qt.newQuorums);
+
         // 3) bestCL* + creditPool: the diff's embedded cbTx is the coinbase of
         //    diff.blockHash and its extra_payload is the authoritative type-5
         //    CCbTx for that height. Seed the fields the roots don't carry so the
@@ -975,6 +989,20 @@ public:
         m_on_full_resync = std::move(fn);
     }
 
+    /// Wire the mnlistdiff QUORUM-COMMITMENT tee (qc-plan-underivable fix).
+    /// Invoked from on_mnlistdiff with `tail.newQuorums` of every ACCEPTED
+    /// diff — the full CFinalCommitments the wire already carries. main_dash
+    /// points this at the MineableCommitmentCache ingest (the SAME admission
+    /// path the coin-P2P qfcommit push subscription uses), which removes the
+    /// be-connected-at-the-inv transport dependency the push-only feed had:
+    /// mnlistdiff is request/response and re-requested on every fresh
+    /// handshake, so a commitment missed as a push is still sourced. Optional
+    /// (unset in KATs / non-embedded postures = no-op).
+    void set_on_new_quorum_commitments(
+        std::function<void(const std::vector<vendor::CFinalCommitment>&)> fn) {
+        m_on_new_quorum_commitments = std::move(fn);
+    }
+
     /// Wire the SML/quorum PERSISTENCE sink (main_dash points this at
     /// SMLDb::write_sml + QuorumDb::write_quorums). Invoked after each accepted
     /// mnlistdiff that leaves a non-empty SML applied, with the block hash the
@@ -1232,6 +1260,10 @@ private:
     std::function<void()> m_on_full_resync;  // H-1 heal -> reset sml_base + full re-sync
     std::function<void(const uint256&)> m_on_sml_persist;  // accepted diff -> SMLDb/QuorumDb write
     std::function<void()> m_on_sml_clear;    // reorg/heal -> SMLDb/QuorumDb wipe (extended to CreditPoolDb)
+    // qc-plan-underivable tee: accepted diff's full tail.newQuorums ->
+    // MineableCommitmentCache admission (see set_on_new_quorum_commitments).
+    std::function<void(const std::vector<vendor::CFinalCommitment>&)>
+        m_on_new_quorum_commitments;
     // E2: independent DIP-0027 credit-pool accrual, advanced per ingested block
     // (on_block_connected) and re-anchored per accepted mnlistdiff. Verified
     // against each block's own from-wire cbTx; persisted via the hook below.

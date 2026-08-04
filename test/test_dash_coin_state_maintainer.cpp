@@ -818,3 +818,334 @@ TEST(DashCoinStateMaintainer, SeedReconcileAppliesAlreadyPresentSmlBan) {
     EXPECT_FALSE(st.mnstates().find_expected_payee().has_value())
         << "a banned MN must never be projected as expected payee";
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// qc-plan-underivable fix: the mnlistdiff → MineableCommitmentCache tee.
+//
+// Pre-fix, the cache was fed from EXACTLY one source — the coin-P2P qfcommit
+// push subscription — which requires being connected at the instant of the
+// inv (measured: a 14 s – 5 m 35 s arrival race after window-open, 7.5% of
+// wall-clock declined qc-plan-underivable on a healthy-peer host, total
+// cold-start starvation on a churning host). mnlistdiff replies carry the
+// COMPLETE CFinalCommitments in tail.newQuorums and the maintainer recorded
+// only (llmqType, quorumHash) existence, dropping the crypto payload. These
+// tests pin the tee: set_on_new_quorum_commitments hands every ACCEPTED
+// diff's newQuorums to the wired consumer, which (as main_dash wires it)
+// funnels them through the SAME ingest_ex admission path the push uses.
+// ════════════════════════════════════════════════════════════════════════
+
+using dash::coin::MineableCommitmentCache;
+using dash::coin::LlmqNetwork;
+using dash::coin::LlmqParamsView;
+using dash::coin::vendor::CFinalCommitment;
+
+namespace {
+
+// Deterministic per-height pseudo hash (mirrors the dkg_commitments KATs).
+std::optional<uint256> qc_fake_hash_at(uint32_t h)
+{
+    uint256 u;
+    std::memset(u.data(), 0xAB, 32);
+    std::memcpy(u.data(), &h, 4);
+    return u;
+}
+
+bool qc_never_mined(uint8_t, const uint256&) { return false; }
+
+// A structurally-admissible REAL commitment for params `p` (all signers set,
+// non-null crypto fields) — same shape the dkg_commitments KATs use.
+CFinalCommitment qc_real_commitment(const LlmqParamsView& p, const uint256& qh,
+                                    int16_t qi, uint8_t seed)
+{
+    CFinalCommitment c;
+    c.nVersion = p.use_rotation
+        ? CFinalCommitment::BASIC_BLS_INDEXED_QUORUM_VERSION
+        : CFinalCommitment::BASIC_BLS_NON_INDEXED_QUORUM_VERSION;
+    c.llmqType    = p.type;
+    c.quorumHash  = qh;
+    c.quorumIndex = qi;
+    c.signers.assign(p.size, true);
+    c.validMembers.assign(p.size, true);
+    c.quorumPublicKey.fill(seed);
+    uint256 vv; std::memset(vv.data(), seed, 32); c.quorumVvecHash = vv;
+    c.quorumSig.fill(seed);
+    c.membersSig.fill(seed);
+    return c;
+}
+
+// Serialize a quorum tail carrying only newQuorums (no deletions, no CL sigs)
+// in the exact wire shape parse_quorum_tail expects.
+std::vector<unsigned char> qc_tail_bytes(const std::vector<CFinalCommitment>& qcs)
+{
+    ::PackStream s;
+    WriteCompactSize(s, 0);                      // deletedQuorums
+    WriteCompactSize(s, qcs.size());             // newQuorums
+    for (const auto& c : qcs) s << c;
+    WriteCompactSize(s, 0);                      // quorumsCLSigs
+    auto sp = s.get_span();
+    return std::vector<unsigned char>(
+        reinterpret_cast<const unsigned char*>(sp.data()),
+        reinterpret_cast<const unsigned char*>(sp.data()) + sp.size());
+}
+
+} // namespace
+
+// THE headline: a commitment that arrives ONLY via mnlistdiff — ZERO qfcommit
+// push messages — must make verified_for serve it, i.e. the daemonless qc plan
+// becomes derivable over request/response alone. Verified to FAIL on pre-fix
+// master: set_on_new_quorum_commitments does not exist there (this TU does not
+// compile), and the behavioural core is impossible by construction — the only
+// production feed into MineableCommitmentCache was the push subscription
+// (main_dash.cpp new_qfcommit), so after on_mnlistdiff the cache is empty and
+// daemonless_qc_commitments returns nullopt = the qc-plan-underivable decline.
+TEST(DashCoinStateMaintainer, CommitmentOnlyViaMnlistdiffMakesQcPlanDerivable) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    MineableCommitmentCache cache;
+
+    // Wire the tee exactly as main_dash does: the SAME admission path
+    // (ingest_ex, testnet enabled-set) the qfcommit push subscription uses.
+    m.set_on_new_quorum_commitments(
+        [&cache](const std::vector<CFinalCommitment>& qcs) {
+            for (const auto& c : qcs)
+                cache.ingest_ex(LlmqNetwork::Testnet, c);
+        });
+
+    // 1900812 is phase 12 of the 24-cycle, above the testnet serve floor:
+    // the mandatory set is one slot each for types 1 / 4 / 6, all at the
+    // cycle base 1900800.
+    const uint32_t next_h = 1'900'812u;
+    const uint256  qh     = *qc_fake_hash_at(1'900'800u);
+    const std::vector<CFinalCommitment> qcs{
+        qc_real_commitment(dash::coin::kLlmq50_60,  qh, 0, 0x11),
+        qc_real_commitment(dash::coin::kLlmq100_67, qh, 0, 0x22),
+        qc_real_commitment(dash::coin::kLlmq25_67,  qh, 0, 0x33)};
+
+    CSimplifiedMNListDiff d = diff_with_seed(uint256::ZERO, raw256(0xA0),
+                                             1'900'811, 100'000'000LL,
+                                             sml_entry(0x40));
+    d.quorum_tail = qc_tail_bytes(qcs);
+    m.on_mnlistdiff(d);
+
+    // The cache holds all three commitments off the diff alone.
+    EXPECT_EQ(cache.size(), 3u);
+    EXPECT_TRUE(cache.has_commitment(1, qh));
+    EXPECT_TRUE(cache.has_commitment(4, qh));
+    EXPECT_TRUE(cache.has_commitment(6, qh));
+
+    // With the BLS hook passing (stub — the hook is the SAME seam the push
+    // path serves through), verified_for yields them and the plan for the
+    // window height is derivable. has_mined is deliberately `never`: this is
+    // the posture where the slots are still REQUIRED (pre-mine race /
+    // reorg-wiped QuorumManager), i.e. exactly when the cache must serve.
+    cache.set_bls_verify_fn([](const CFinalCommitment&) { return true; });
+    auto plan = dash::coin::daemonless_qc_commitments(
+        LlmqNetwork::Testnet, next_h, qc_fake_hash_at, qc_never_mined, &cache);
+    ASSERT_TRUE(plan.has_value())
+        << "commitments sourced ONLY via mnlistdiff must derive the qc plan";
+    ASSERT_EQ(plan->size(), 3u);
+    for (const auto& c : *plan)
+        EXPECT_GT(c.CountSigners(), 0) << "a REAL commitment must be served, not null";
+}
+
+// The tee fires ONLY for an ACCEPTED diff: every reject/heal path
+// (base-continuity, stale-ZERO-base R1, malformed-tail H-1) must not hand
+// commitments to the consumer — a refused diff's payload is untrusted.
+TEST(DashCoinStateMaintainer, QuorumCommitmentTeeFiresOnlyForAcceptedDiffs) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    size_t batches = 0, commitments = 0;
+    m.set_on_new_quorum_commitments(
+        [&](const std::vector<CFinalCommitment>& qcs) {
+            ++batches;
+            commitments += qcs.size();
+        });
+
+    const uint256 qh = *qc_fake_hash_at(1'900'800u);
+
+    // 1) Accepted cold full snapshot → tee fires once with one commitment.
+    CSimplifiedMNListDiff d1 = diff_with_seed(uint256::ZERO, raw256(0xA0),
+                                              1'900'811, 100'000'000LL,
+                                              sml_entry(0x40));
+    d1.quorum_tail = qc_tail_bytes({qc_real_commitment(dash::coin::kLlmq50_60,
+                                                       qh, 0, 0x11)});
+    m.on_mnlistdiff(d1);
+    EXPECT_EQ(batches, 1u);
+    EXPECT_EQ(commitments, 1u);
+
+    // 2) Base-continuity reject (base != SML-current) → NO tee.
+    CSimplifiedMNListDiff bad = diff_with_seed(raw256(0xB0), raw256(0xC0),
+                                               1'900'812, 100'000'001LL,
+                                               sml_entry(0x41));
+    bad.quorum_tail = qc_tail_bytes({qc_real_commitment(dash::coin::kLlmq100_67,
+                                                        qh, 0, 0x22)});
+    m.on_mnlistdiff(bad);
+    EXPECT_EQ(batches, 1u) << "a base-continuity-rejected diff must not tee";
+
+    // 3) Stale ZERO-base snapshot (R1: cb height <= current) → NO tee.
+    CSimplifiedMNListDiff stale = diff_with_seed(uint256::ZERO, raw256(0xD0),
+                                                 1'900'810, 100'000'002LL,
+                                                 sml_entry(0x42));
+    stale.quorum_tail = qc_tail_bytes({qc_real_commitment(dash::coin::kLlmq25_67,
+                                                          qh, 0, 0x33)});
+    m.on_mnlistdiff(stale);
+    EXPECT_EQ(batches, 1u) << "a stale-snapshot-rejected diff must not tee";
+
+    // 4) Malformed tail (H-1 heal path) → NO tee.
+    CSimplifiedMNListDiff mal = diff_with_seed(raw256(0xA0), raw256(0xE0),
+                                               1'900'812, 100'000'003LL,
+                                               sml_entry(0x43));
+    mal.quorum_tail = {0x01};   // deletedQuorums count=1 with no body
+    m.on_mnlistdiff(mal);
+    EXPECT_EQ(batches, 1u) << "a malformed-tail diff must not tee";
+    EXPECT_EQ(commitments, 1u);
+}
+
+// A tampered commitment arriving via mnlistdiff must be rejected EXACTLY as
+// the same commitment arriving as a qfcommit push — same admission verdicts,
+// nothing cached; and a structurally-admissible copy whose BLS signature the
+// verifier refuses is withheld by verified_for regardless of transport.
+TEST(DashCoinStateMaintainer, TamperedCommitmentViaMnlistdiffRejectedAsPush) {
+    using Adm = MineableCommitmentCache::Admission;
+    const uint256 qh = *qc_fake_hash_at(1'900'800u);
+
+    // Tampered shapes: >=threshold-but-<minSize signers (the block-losing
+    // colluding shape) and null crypto fields.
+    auto below_min = qc_real_commitment(dash::coin::kLlmq50_60, qh, 0, 0x11);
+    below_min.signers.assign(50, false);
+    for (int i = 0; i < 35; ++i) below_min.signers[static_cast<size_t>(i)] = true;
+    auto null_crypto = qc_real_commitment(dash::coin::kLlmq50_60, qh, 0, 0x11);
+    null_crypto.quorumSig.fill(0);
+    auto good = qc_real_commitment(dash::coin::kLlmq50_60, qh, 0, 0x11);
+
+    // Push-path verdicts (the reference: direct ingest_ex, as the qfcommit
+    // subscription calls it).
+    MineableCommitmentCache push_cache;
+    const auto push_v1 = push_cache.ingest_ex(LlmqNetwork::Testnet, below_min);
+    const auto push_v2 = push_cache.ingest_ex(LlmqNetwork::Testnet, null_crypto);
+    EXPECT_EQ(push_v1, Adm::SignersBelowMin);
+    EXPECT_EQ(push_v2, Adm::NullCryptoFields);
+    EXPECT_EQ(push_cache.size(), 0u);
+
+    // mnlistdiff-path verdicts through the tee: MUST be identical.
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    MineableCommitmentCache cache;
+    std::vector<Adm> seen;
+    m.set_on_new_quorum_commitments(
+        [&](const std::vector<CFinalCommitment>& qcs) {
+            for (const auto& c : qcs)
+                seen.push_back(cache.ingest_ex(LlmqNetwork::Testnet, c));
+        });
+    CSimplifiedMNListDiff d = diff_with_seed(uint256::ZERO, raw256(0xA0),
+                                             1'900'811, 100'000'000LL,
+                                             sml_entry(0x40));
+    d.quorum_tail = qc_tail_bytes({below_min, null_crypto, good});
+    m.on_mnlistdiff(d);
+
+    ASSERT_EQ(seen.size(), 3u);
+    EXPECT_EQ(seen[0], push_v1) << "mnlistdiff admission must equal push admission";
+    EXPECT_EQ(seen[1], push_v2) << "mnlistdiff admission must equal push admission";
+    EXPECT_EQ(seen[2], Adm::Accepted);
+    EXPECT_EQ(cache.size(), 1u) << "only the untampered commitment may be cached";
+
+    // BLS-invalid (structurally fine, wrong signature): the SAME verifier
+    // hook gates both transports — verified_for withholds it.
+    cache.set_bls_verify_fn(
+        [](const CFinalCommitment& c) { return c.quorumSig[0] == 0x11; });
+    ASSERT_TRUE(cache.verified_for(1, qh).has_value());
+    const uint256 qh2 = *qc_fake_hash_at(1'900'776u);   // previous cycle base
+    auto sig_bad = qc_real_commitment(dash::coin::kLlmq50_60, qh2, 0, 0x99);
+    CSimplifiedMNListDiff d2 = diff_with_seed(raw256(0xA0), raw256(0xB0),
+                                              1'900'812, 100'000'001LL,
+                                              sml_entry(0x41));
+    d2.quorum_tail = qc_tail_bytes({sig_bad});
+    m.on_mnlistdiff(d2);
+    EXPECT_TRUE(cache.has_commitment(1, qh2))
+        << "structural admission cannot detect a bad signature";
+    EXPECT_FALSE(cache.verified_for(1, qh2).has_value())
+        << "a BLS-refused commitment must be withheld whatever its transport";
+}
+
+// Duplicate arrival across transports — push then mnlistdiff AND mnlistdiff
+// then push — is a no-op: keep-best-by-CountSigners holds the first copy, the
+// cache never grows, and a weaker (fewer-signers) later copy NEVER downgrades
+// a served entry.
+TEST(DashCoinStateMaintainer, DuplicateAcrossTransportsIsNoOpNeverDowngrades) {
+    using Adm = MineableCommitmentCache::Admission;
+    const uint256 qh = *qc_fake_hash_at(1'900'800u);
+    auto good = qc_real_commitment(dash::coin::kLlmq50_60, qh, 0, 0x11);
+
+    // ── push first, mnlistdiff second ────────────────────────────────────
+    {
+        NodeCoinState st;
+        CoinStateMaintainer m(st);
+        MineableCommitmentCache cache;
+        std::vector<Adm> seen;
+        m.set_on_new_quorum_commitments(
+            [&](const std::vector<CFinalCommitment>& qcs) {
+                for (const auto& c : qcs)
+                    seen.push_back(cache.ingest_ex(LlmqNetwork::Testnet, c));
+            });
+        ASSERT_EQ(cache.ingest_ex(LlmqNetwork::Testnet, good), Adm::Accepted);
+
+        CSimplifiedMNListDiff d = diff_with_seed(uint256::ZERO, raw256(0xA0),
+                                                 1'900'811, 100'000'000LL,
+                                                 sml_entry(0x40));
+        d.quorum_tail = qc_tail_bytes({good});
+        m.on_mnlistdiff(d);
+        ASSERT_EQ(seen.size(), 1u);
+        EXPECT_EQ(seen[0], Adm::NotBetterThanCached) << "duplicate must be a no-op";
+        EXPECT_EQ(cache.size(), 1u);
+
+        cache.set_bls_verify_fn([](const CFinalCommitment&) { return true; });
+        auto served = cache.verified_for(1, qh);
+        ASSERT_TRUE(served.has_value());
+        EXPECT_EQ(served->CountSigners(), 50);
+
+        // A WEAKER copy (45 of 50 signers, still >= minSize 40) arriving on a
+        // later incremental must not replace the held 50-signer copy.
+        auto weaker = good;
+        weaker.signers.assign(50, false);
+        for (int i = 0; i < 45; ++i) weaker.signers[static_cast<size_t>(i)] = true;
+        CSimplifiedMNListDiff d2 = diff_with_seed(raw256(0xA0), raw256(0xB0),
+                                                  1'900'812, 100'000'001LL,
+                                                  sml_entry(0x41));
+        d2.quorum_tail = qc_tail_bytes({weaker});
+        m.on_mnlistdiff(d2);
+        ASSERT_EQ(seen.size(), 2u);
+        EXPECT_EQ(seen[1], Adm::NotBetterThanCached);
+        auto still = cache.verified_for(1, qh);
+        ASSERT_TRUE(still.has_value());
+        EXPECT_EQ(still->CountSigners(), 50) << "a verified entry must never downgrade";
+    }
+
+    // ── mnlistdiff first, push second ────────────────────────────────────
+    {
+        NodeCoinState st;
+        CoinStateMaintainer m(st);
+        MineableCommitmentCache cache;
+        std::vector<Adm> seen;
+        m.set_on_new_quorum_commitments(
+            [&](const std::vector<CFinalCommitment>& qcs) {
+                for (const auto& c : qcs)
+                    seen.push_back(cache.ingest_ex(LlmqNetwork::Testnet, c));
+            });
+        CSimplifiedMNListDiff d = diff_with_seed(uint256::ZERO, raw256(0xA0),
+                                                 1'900'811, 100'000'000LL,
+                                                 sml_entry(0x40));
+        d.quorum_tail = qc_tail_bytes({good});
+        m.on_mnlistdiff(d);
+        ASSERT_EQ(seen.size(), 1u);
+        EXPECT_EQ(seen[0], Adm::Accepted);
+
+        // The SAME commitment now arrives as a push: no-op, no growth.
+        EXPECT_EQ(cache.ingest_ex(LlmqNetwork::Testnet, good),
+                  Adm::NotBetterThanCached);
+        EXPECT_EQ(cache.size(), 1u);
+        cache.set_bls_verify_fn([](const CFinalCommitment&) { return true; });
+        auto served = cache.verified_for(1, qh);
+        ASSERT_TRUE(served.has_value());
+        EXPECT_EQ(served->CountSigners(), 50);
+    }
+}
