@@ -337,6 +337,22 @@ if (BUILD_TESTING AND GTest_FOUND)
         nlohmann_json::nlohmann_json)
     gtest_add_tests(dgb_embedded_coin_node_test "" AUTO)
 
+    # dgb_live_node_status_test: guards the D-DGB.LIVEADAPTER null-handle seam
+    # (EmbeddedCoinNode::has_live_node()/live_status() + make_live_node_status).
+    # Proves an absent live-node handle renders as a labelled "no live node"
+    # state with null height/synced -- never a fake zero -- and that a throwing
+    # probe is treated as not-live (never a crash). Same proven SCC set as
+    # dgb_embedded_coin_node_test. MUST also be in BOTH build.yml --target
+    # allowlists (#143 NOT_BUILT trap).
+    add_executable(dgb_live_node_status_test live_node_status_test.cpp)
+    target_link_libraries(dgb_live_node_status_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb dgb_stratum
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain
+        nlohmann_json::nlohmann_json)
+    gtest_add_tests(dgb_live_node_status_test "" AUTO)
+
     # dgb_embedded_tx_select_test: guards make_mempool_tx_source
     # (embedded_tx_select.cpp), the production Mempool -> GBT transactions[]
     # {data,txid,hash,fee} + fee-total shaper EmbeddedCoinNode injects. Compiles
