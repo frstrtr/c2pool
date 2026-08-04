@@ -129,8 +129,35 @@ protected:
     // a RawMessage into a typed message variant. Mirrors dgb::NodeImpl::m_handler.
     dash::Handler m_handler;
 
-    // Callback fired when a bestblock message is received from a peer; wired by
-    // the work layer (slice .4) to trigger a work refresh. Mirrors dgb.
+    // Callback fired when a bestblock message is received from a pool peer.
+    //
+    // NOT WIRED ON THE DASH LANE (audited 2026-08-04) — and that is the norm,
+    // not a DASH regression: btc/dgb/bch declare the identical seam and leave
+    // it unset too; src/c2pool/main_ltc.cpp is the ONLY set_on_bestblock call
+    // site in the tree. Inbound bestblock on DASH is therefore observability
+    // only (the "[Pool] New best block from peer" line in
+    // dash/protocol_actual.cpp + protocol_legacy.cpp). The SEND side IS wired:
+    // main_dash's fallback-arm tip-notify announces via broadcast_bestblock().
+    //
+    // DASH does not need it as a tip source. Both arms already have a
+    // first-party coin-tip signal that the refresh trio (invalidate template
+    // cache + bump work generation + notify_all) hangs off:
+    //   * embedded arm  -> header_chain->set_on_tip_changed (coin-P2P headers),
+    //   * fallback arm  -> --coin-zmq-hashblock (instant) with a 3 s
+    //                      getbestblockhash poll backstop, behind one shared
+    //                      last-seen-tip dedup.
+    // LTC wires it because pool-P2P is its PRIMARY block source; DASH's is not.
+    //
+    // IF IT IS EVER WIRED, the hazard to solve first: the argument is a
+    // PEER-ASSERTED header hash, not our own tip. Feeding it straight into the
+    // fallback arm's fire_refresh would (a) let an unbounded stream of distinct
+    // bogus hashes drive a template-rebuild storm (LTC's leading-edge dedup is
+    // per-hash, so it does not bound that), and (b) POISON the shared tip_dedup
+    // with a hash dashd has not connected yet — the re-source returns the OLD
+    // template and the real tip-change refresh is then suppressed as
+    // "not a new tip", i.e. exactly the stale-work outcome the hook exists to
+    // prevent. Any wiring must confirm the hash against our own tip source
+    // before it is allowed to touch the dedup.
     std::function<void(const uint256&)> m_on_bestblock;
 
     // Thread pool for parallel share_init_verify (X11 CPU work). Keeps the
@@ -1157,7 +1184,10 @@ public:
         catch (const std::invalid_argument&) { /* request already timed out */ }
     }
 
-    // Register a callback fired when a bestblock message is received from a peer.
+    // Register a callback fired when a bestblock message is received from a
+    // pool peer. Currently UNCALLED on the DASH lane by design — see the
+    // m_on_bestblock declaration for why, and for the dedup-poisoning hazard
+    // that must be handled before anything is wired here.
     void set_on_bestblock(std::function<void(const uint256&)> fn) { m_on_bestblock = std::move(fn); }
 
     // ── Tracker accessors ───────────────────────────────────────────────

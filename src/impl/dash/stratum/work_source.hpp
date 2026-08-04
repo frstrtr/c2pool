@@ -302,9 +302,20 @@ public:
     /// dashd getblocktemplate's before serving; on mismatch, serve dashd's
     /// reward-safe template instead. Catches ANY credit-pool seed bug (present or
     /// future) that the daemonless self-checks cannot. NOT pure-daemonless (uses
-    /// dashd), so it is opt-in; main_dash enables it for --embedded-mainnet where
-    /// a dashd fallback is configured. Pure-daemonless mode leaves it off and
-    /// relies on the independent seed-height gate.
+    /// dashd), so it is armed only where a dashd RPC arm actually exists.
+    ///
+    /// WIRING (main_dash.cpp): gbt_xcheck_ is set whenever the EMBEDDED ARM IS
+    /// ENABLED **AND** a dashd RPC arm is ARMED — i.e.
+    /// `(testnet || embedded_mainnet) && rpc`. The `testnet` leg is not an
+    /// accident: the embedded arm is enabled unconditionally on testnet/regtest
+    /// (embedded_arm_enabled = is_testnet_ || embedded_mainnet_, see
+    /// work_source.cpp resource_template_now), so the backstop covers exactly
+    /// the set of configurations that can serve an embedded template. The
+    /// `&& rpc` leg matters because dashd_fallback_() is invoked on EVERY
+    /// embedded template; an UNARMED arm returns the empty set-gap default and
+    /// made every healthy daemonless serve read as a fallback in the log.
+    /// Pure-daemonless mode (no rpc) therefore leaves it off and relies on the
+    /// independent seed-height + pre-emit gates.
     void set_gbt_xcheck(bool v) { gbt_xcheck_ = v; }
 
     /// Set the current share-target bits (compact-target encoding).
