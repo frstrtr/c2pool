@@ -416,6 +416,30 @@ public:
         m_qc_plan_fn = std::move(fn);
     }
 
+    /// PoSe no-op proof for one REAL (non-null) type-6 commitment — the
+    /// enforcement of the #1083 landmine comment at the inclusion site
+    /// (embedded_gbt.hpp). dashd's verifier PoSe-punishes every member a
+    /// non-null in-block commitment marks invalid (specialtxman.cpp:159-174),
+    /// which can flip that MN's validity in the SAME block's list and change
+    /// the merkleRootMNList this coinbase commits — bad-cbtx-mnmerkleroot, a
+    /// silently lost block. c2pool does not fold that pass, so the pre-emit
+    /// gate refuses any real commitment whose PoSe pass is not PROVABLY a
+    /// no-op (qc_pose_pass_provably_noop: every listed member valid).
+    ///
+    /// The fn answers exactly that question for one commitment:
+    ///   true    => the PoSe pass provably touches nothing — servable;
+    ///   false   => at least one listed member would be punished — refuse;
+    ///   nullopt => cannot be established (member set not sourced) — refuse.
+    /// UNSET (default) => the capability is absent and every non-null
+    /// commitment is refused (fail-closed insurance until a real PoSe fold
+    /// into the committed MN root is built). Null commitments are exempt by
+    /// dashd's own IsNull() guard (specialtxman.cpp:427-432) and are never
+    /// consulted, so the all-null production plans are byte-unchanged.
+    void set_qc_pose_noop_fn(
+        std::function<std::optional<bool>(const vendor::CFinalCommitment&)> fn) {
+        m_qc_pose_noop_fn = std::move(fn);
+    }
+
     /// bestCL freshness guard (review PR #780 BLOCKER-2, HIGH). dashcore
     /// CheckCbTxBestChainlock rejects a block whose committed bestCLSignature is
     /// null or older than the previous block's committed ChainLock
@@ -667,6 +691,36 @@ public:
                 if (got[i] != expect.extra_payload)
                     return reject("emit-qc-payload-drift", "qc[" + std::to_string(i) + "]-bytes",
                                   "planned-qc[" + std::to_string(i) + "]-bytes");
+            }
+            // ── PoSe-fold gate on REAL commitments (the #1083 landmine, now
+            // ENFORCED — a comment refuses nothing). A verified real
+            // commitment carrying !validMembers[i] for a listed member makes
+            // dashd's verifier PoSePunish that MN (specialtxman.cpp:159-174),
+            // and a punishment crossing the ban threshold flips the MN's
+            // validity in THIS block's list — the committed merkleRootMNList
+            // above is then wrong: bad-cbtx-mnmerkleroot, a silently lost
+            // block. c2pool folds no PoSe pass, so serve a real commitment
+            // ONLY when its PoSe pass is PROVABLY a no-op (every listed
+            // member valid — the common case, so real-commitment serving
+            // stays unblocked). Absent capability / unprovable => refuse:
+            // fail-closed insurance until a real PoSe fold (mirror of the
+            // confirmedHash rollover projection) is built. Null commitments
+            // are exempt by dashd's own IsNull() guard (specialtxman.cpp:432)
+            // — all-null plans are byte-unchanged through here.
+            for (size_t i = 0; i < qc_plan->commitments.size(); ++i) {
+                const auto& c = qc_plan->commitments[i];
+                if (qc_commitment_is_null(c)) continue;   // IsNull() exempt
+                const std::optional<bool> noop =
+                    m_qc_pose_noop_fn ? m_qc_pose_noop_fn(c) : std::nullopt;
+                if (!noop.has_value() || !*noop)
+                    return reject(
+                        "emit-qc-real-pose-unfolded",
+                        "qc[" + std::to_string(i) + "]:type="
+                            + std::to_string(static_cast<int>(c.llmqType))
+                            + ",quorum=" + c.quorumHash.GetHex().substr(0, 12)
+                            + ",pose_noop="
+                            + (noop.has_value() ? "unproven" : "n/a"),
+                        "pose-pass-provably-noop(all-listed-members-valid)");
             }
         } else if (m_commitment_window_fn && m_commitment_window_fn(next_h)) {
             return reject("emit-dkg-commitment-window",
@@ -1153,6 +1207,9 @@ private:
     std::function<bool()> m_superblock_sync_complete_fn;
     std::function<bool(uint32_t)> m_commitment_window_fn;  // refuse embedded on DKG commitment heights
     std::function<std::optional<QcBlockPlan>(uint32_t)> m_qc_plan_fn;  // E1: serve DKG windows daemonlessly
+    // PoSe no-op proof for a REAL commitment (emit-qc-real-pose-unfolded gate);
+    // unset => capability absent => every non-null commitment refused.
+    std::function<std::optional<bool>(const vendor::CFinalCommitment&)> m_qc_pose_noop_fn;
     bool     m_require_fresh_bestcl{false};  // refuse embedded on a stale/absent bestCL
     BestClPolicy m_bestcl_policy{BestClPolicy::Off};  // Freshness stays the default when enabled
     bool     m_require_fresh_credit_pool{false}; // refuse embedded on a lagged credit-pool seed
