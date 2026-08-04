@@ -972,7 +972,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     # (coin/coin_peer_manager.hpp): source scoring (daemon penalty / addr-crawl
     # bonus), selection ordering, /16 Sybil group caps, anchor persistence, and
     # the pinned protected local node. Same target, no new allowlist entry.
-    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp)
+    # Fourth TU: test_dash_qrinfo_wire.cpp — the DIP-24 rotated lane driven
+    # from RAW WIRE BYTES through p2p::Handler::parse() into
+    # QuorumMemberSource, plus the named-outcome / request-timeout gates.
+    # THIS TARGET, not test_dash_embedded_gbt: the gate is Handler REGISTRY
+    # membership, which needs the full p2p Handler instantiated, which
+    # ODR-uses CBlockHeaderAndShortTxIDs::FillShortTxIDSelector() out of
+    # dash_block_replay — only linked here. Same target, no new build.yml
+    # --target allowlist entry needed (test_dash_p2p_node is already in it;
+    # the push bot lacks `workflow` scope, #769, so a standalone target would
+    # be a NOT_BUILT sentinel).
+    # DASH_FIXTURE_DIR is new on this target: the wire suite replays the real
+    # 602'189-byte testnet qrinfo capture.
+    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp test_dash_qrinfo_wire.cpp)
+    target_compile_definitions(test_dash_p2p_node PRIVATE
+        DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_p2p_node PRIVATE
         GTest::gtest_main GTest::gtest
         dash_block_replay   # E1: coin/vendor/blockencodings.cpp — the full p2p Handler
