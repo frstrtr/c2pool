@@ -28,6 +28,7 @@
 #include <set>
 #include <ctime>
 #include <chrono>
+#include <limits>
 #include <cmath>
 #include <fstream>
 #ifndef _WIN32
@@ -3565,6 +3566,32 @@ void MiningInterface::verify_found_block(size_t index)
     {
         try { m_persist_block_fn(blk); }
         catch (...) {}
+    }
+}
+
+int MiningInterface::run_block_verification_now(const std::string& block_hash)
+{
+    size_t idx = SIZE_MAX;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        for (size_t i = 0; i < m_found_blocks.size(); ++i) {
+            if (m_found_blocks[i].hash == block_hash) { idx = i; break; }
+        }
+    }
+    if (idx == SIZE_MAX) return std::numeric_limits<int>::min();
+
+    // verify_found_block() takes m_blocks_mutex itself — must not hold it here.
+    verify_found_block(idx);
+
+    std::lock_guard<std::mutex> lock(m_blocks_mutex);
+    if (idx >= m_found_blocks.size()) return std::numeric_limits<int>::min();
+    switch (m_found_blocks[idx].status) {
+        case BlockStatus::confirmed:
+            return static_cast<int>(m_found_blocks[idx].confirmations);
+        case BlockStatus::orphaned:
+            return -1;
+        default:
+            return 0;
     }
 }
 

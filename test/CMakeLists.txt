@@ -327,7 +327,14 @@ if (BUILD_TESTING AND GTest_FOUND)
     # same reason as the second: a standalone target would need a build.yml
     # --target edit and would trip CI's NOT_BUILT sentinel until it had one
     # (#769/#883/#893).
-    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp)
+    # test_dash_block_confirm_lane.cpp: the post-broadcast found-block
+    # confirmation / orphan lane (daemonless resolve_status verdict + the
+    # MiningInterface pending→confirmed / pending→orphaned status flip). FOLDED
+    # in as another TU for the same reason as the found-block TU above — a
+    # standalone target would need a build.yml --target edit and trip CI's
+    # NOT_BUILT sentinel until it had one. Needs exactly this link set (core
+    # MiningInterface; the resolver is header-only).
+    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_block_confirm_lane.cpp)
     target_link_libraries(test_dash_node PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
