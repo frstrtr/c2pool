@@ -1942,6 +1942,94 @@ TEST(DashStratumC1MainnetGate, GbtXcheckServesDashdOnCreditPoolMismatch)
         << "on a creditPool mismatch the backstop must serve dashd's template";
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Tip-transition fallback leak: on every new block the serve path re-sources
+// during the body-pending window and (correctly) gets the dashd fallback; the
+// serve-tip promotion then lands ~0.1-0.4 s later — routinely WHILE that
+// blocking fallback GBT source is still in flight. The promotion fires the
+// state-dirty sink (bump_work_generation + notify_all), but master stamped the
+// stored snapshot with a work_generation_.load() taken AT STORE TIME, which
+// swallows the racing bump: the fallback template reads as current for the
+// full kStaleAfter (30 s) window and several fallback serves leak per block
+// after the embedded arm is already viable.
+//
+// THE MEASUREMENT (fails on master): after the promotion's bump, the very
+// next template request must re-evaluate the arm gates and serve EMBEDDED —
+// not the stale cached fallback decision. Gate semantics are untouched; only
+// the re-evaluation latency is.
+TEST(DashStratumC1MainnetGate, PromotionBumpDuringInFlightSourceMakesNextTemplateEmbedded)
+{
+    dash::coin::NodeCoinState cs;   // NOT populated yet: the pending window
+    dash::stratum::DASHWorkSource* wsp = nullptr;
+    int fallback_calls = 0;
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        if (++fallback_calls == 1) {
+            // The serve-tip promotion lands while this (in prod: blocking
+            // dashd GBT RPC) source is in flight: the maintainer publishes
+            // the now-viable embedded bundle and fires the state-dirty sink.
+            seed_populated(cs);
+            if (wsp) wsp->bump_work_generation();
+        }
+        return rich_work();
+    };
+    auto submit = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    wsp = &ws;
+
+    // Serve 1: sourced during the pending window -> dashd fallback (the
+    // normal propagation-window serve; the promotion lands mid-flight).
+    auto t1 = ws.get_current_work_template();
+    ASSERT_FALSE(t1.empty());
+    EXPECT_EQ(t1.value("previousblockhash", ""), std::string(kPrevHashHex))
+        << "the in-flight serve itself is the fallback — that part is normal";
+
+    // Serve 2 — the very next template request after the promotion: must be
+    // EMBEDDED. On master the fallback snapshot was stamped with the
+    // post-bump generation, so it reads as fresh and this serves fallback.
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    auto t2 = ws.get_current_work_template();
+    ASSERT_FALSE(t2.empty());
+    EXPECT_EQ(t2.value("previousblockhash", ""), emb_prev.GetHex())
+        << "stale cached arm decision leaked a dashd-fallback serve after "
+           "the serve-tip promotion";
+    EXPECT_EQ(t2.value("height", 0u), kEmbeddedPrevHeight + 1u);
+
+    dash::stratum::WorkJobTargetInputs job_in;
+    job_in.sane_target_min.SetHex(
+        "0000000000000000000000000000000000000000000000000000000000000001");
+    job_in.sane_target_max.SetHex(
+        "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    job_in.share_info_bits_target.SetHex(
+        "0000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    auto gw = ws.get_work(job_in);
+    EXPECT_EQ(gw.source, dash::coin::WorkSource::Embedded);
+}
+
+// Negative twin: an ORDINARY re-source with no racing event must keep today's
+// exact caching behaviour — stored fresh, served from cache, ONE sourcing —
+// so the promotion fix cannot regress into a re-source storm.
+TEST(DashStratumC1MainnetGate, UnracedSourceStaysCachedWithoutReSourceStorm)
+{
+    dash::coin::NodeCoinState cs;   // unpopulated: fallback arm throughout
+    int fallback_calls = 0;
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        ++fallback_calls;
+        return rich_work();
+    };
+    auto submit = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    const int calls_after_first = fallback_calls;
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    EXPECT_EQ(fallback_calls, calls_after_first)
+        << "no event fired between serves: the second must be a cache hit";
+}
+
 TEST(DashDashboardWiring, LocalStatsIdleWarningWhenNoWorkers)
 {
     // No provider wired and an empty local registry -> the honest idle warning

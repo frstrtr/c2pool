@@ -364,11 +364,18 @@ public:
         // BODY-FIRST: an authoritative snapshot loaded as-of the pending tip
         // completes the payee axis — the last promotion precondition when the
         // credit-pool seed already reached the tip (diff-before-seed order).
-        maybe_promote_pending_tip();
+        const bool promoted = maybe_promote_pending_tip();
         if (!m_have_mn)
             demote();
         else
             republish();
+        // The promotion just closed a pending window during which the work
+        // source cached a fallback (or old-tip) decision. Re-issue work
+        // event-driven — same sink as the body-fold promotion — so the next
+        // template request re-evaluates the arm instead of riding the stale
+        // cache until an unrelated signal lands.
+        if (promoted)
+            notify_state_dirty();
     }
 
     /// Reception path (mnlistdiff, SML axis — DAEMONLESS CCbTx source): apply a
@@ -870,6 +877,14 @@ public:
         m_tip_overdue_latched = false;
         if (maybe_promote_pending_tip()) {
             republish();
+            // Promotion is a serve-arm transition, not just a state write: the
+            // work source may hold a fallback template cached during the (now
+            // closed) pending window. Fire the same event-driven re-issue path
+            // the body-fold promotion uses (bump + notify), so the very next
+            // template request re-evaluates the arm — without this the stale
+            // cached decision keeps serving dashd-fallback until the next
+            // unrelated work signal.
+            notify_state_dirty();
             return;
         }
         m_state.set_tip_body_pending_dbg(true);
