@@ -689,7 +689,18 @@ if (BUILD_TESTING AND GTest_FOUND)
     # over the SimplifiedMNList leaf (#309). Last absent header before the
     # embedded_gbt capstone. Header-only over core/uint256 + core/pack +
     # core/hash; no ltc/pool SCC dependency.
-    add_executable(test_dash_mn_state test_dash_mn_state.cpp)
+    # Second TU (W1, dash/replay): test_dash_replay_fold.cpp — the DML fold
+    # engine (replay_fold_engine.hpp): dashd RebuildListFromBlock transcription
+    # KAT'd against REAL mainnet chain bytes (the h=2516756 PoSe REVIVE, the
+    # h=2516412 case-D punish/ban, 4-block quiet sequence), the per-block
+    # committed-cbTx-root self-check hard stop, and the versioned full-state
+    # snapshot v3 (save/load/resume/fail-loud). FOLDED into this EXISTING
+    # allowlisted target on purpose — a new add_executable would not be in the
+    # build.yml --target list and would silently report "Not Run" (#143
+    # NOT_BUILT trap). Needs dash_x11 for the block-identity hash — already in
+    # this target's link set.
+    add_executable(test_dash_mn_state test_dash_mn_state.cpp
+                   test_dash_replay_fold.cpp)
     target_link_libraries(test_dash_mn_state PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
