@@ -605,7 +605,7 @@ jobs:
             for MF in "${HEAVY_LEG_HOLDERFILE:-/tmp/c2pool-heavy-leg.holder}".*; do
               [ -f "$MF" ] || continue
               read -r _mh _ < "$MF" 2>/dev/null || true
-              [ "${_mh:-}" = "$H" ] && rm -f "$MF"
+              [ "${_mh:-}" = "$H" ] && rm -f "$MF" || true
             done
           fi
   # ════════════════════════════════════════════════════════════════════════════
@@ -1023,7 +1023,10 @@ jobs:
     name: Qt WebEngine leak gate
     needs: changes
     if: ${{ needs.changes.outputs.qt == 'true' || github.event_name != 'pull_request' }}
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    # Pinned to draft-release (persistent 145/198/905 pool: NOPASSWD sudo +
+    # Qt6/xvfb). Excludes transient c2pool-heavy hosts (oplex7020) that lack
+    # Qt6 and NOPASSWD sudo. #1122 routing fix.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","draft-release"]') || 'ubuntu-24.04' }}
     # Hard ceiling: orphaned QtWebEngine/Chromium helper children survive
     # the inner `timeout 180`, holding the xvfb pipe open and hanging the
     # job to the 360-min runner default. Cap it so a hung leak gate is

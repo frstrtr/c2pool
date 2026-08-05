@@ -424,6 +424,6 @@ jobs:
             for MF in "${HEAVY_LEG_HOLDERFILE:-/tmp/c2pool-heavy-leg.holder}".*; do
               [ -f "$MF" ] || continue
               read -r _mh _ < "$MF" 2>/dev/null || true
-              [ "${_mh:-}" = "$H" ] && rm -f "$MF"
+              [ "${_mh:-}" = "$H" ] && rm -f "$MF" || true
             done
           fi
