@@ -30,7 +30,14 @@ env:
 jobs:
   doge-aux-smoke:
     name: DOGE AuxPoW smoke — embedded per-coin gtests
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-heavy"]') || 'ubuntu-24.04' }}
+    # ccache for the gate's from-source c2pool build: cmake reads
+    # CMAKE_<LANG>_COMPILER_LAUNCHER from the env as cache-var defaults, so the
+    # tests/gates/*.sh entrypoint stays untouched. Cache = runner-persistent
+    # ~/.cache/ccache on self-hosted (keyed by compiler+flags by ccache itself).
+    env:
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
     steps:
       - uses: actions/checkout@v6
 

@@ -277,7 +277,11 @@ jobs:
     name: Linux x86_64 (AsAN+UBSan)
     # dash bring-up slices may opt out of sanitizers via dash-skip-sanitizers; KEEP for consensus/payout slices (default = on)
     if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-skip-sanitizers')) }}
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    # Heavy leg → dedicated c2pool-heavy runner host(s), disjoint from the
+    # c2pool-build fleet so the per-host heavy-leg flock (#1105) stops
+    # contending with the ASan+CodeQL pair on VM905. ccache is already wired
+    # into this job's cmake configure below (COMPILER_LAUNCHER=ccache).
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-heavy"]') || 'ubuntu-24.04' }}
     continue-on-error: true
     steps:
       # Reap-guard: host-scoped exclusivity vs the other RAM-heavy leg

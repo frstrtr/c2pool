@@ -53,7 +53,11 @@ jobs:
     # STEP cap on the analyze phase below keeps the wedged-tracer fast-red
     # property unchanged.
     timeout-minutes: 150
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    # Heavy leg → dedicated c2pool-heavy runner host(s): no longer shares a
+    # physical host (nor the per-host heavy-leg flock of #1105) with the
+    # c2pool-build fleet. Deliberately NO ccache launcher here — a ccache hit
+    # skips the real compiler exec and starves the CodeQL tracer (empty DB).
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-heavy"]') || 'ubuntu-24.04' }}
     permissions:
       security-events: write
       packages: read
