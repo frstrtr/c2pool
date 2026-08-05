@@ -26,6 +26,7 @@
 #include <iomanip>
 #include <sstream>
 #include <set>
+#include <cstdio>   // std::rename (best-share sidecar atomic replace)
 #include <ctime>
 #include <chrono>
 #include <limits>
@@ -2511,6 +2512,17 @@ nlohmann::json MiningInterface::rest_recent_blocks()
         if (!found_locally)                        method = "relayed";
         else if (b.time_to_find > 0 && b.luck > 0) method = "simple_avg";
         else                                       method = "first_block";
+        // #942 second slice, extended to EVERY unmeasured field (hotel,
+        // 2026-08-05): the primary's rows for our own blocks rendered
+        // network_difficulty=0.0, subsidy=0, pool_hashrate=0.0 as if they
+        // were data. A zero that was never measured is emitted as null — the
+        // same honesty rule the timing fields already follow — so the UI
+        // renders '-' instead of a fabricated measurement. A luck of 0 on a
+        // found_locally row means "not computed" (first block, or recorded
+        // with no difficulty), never "0% lucky": also null.
+        auto num_or_null = [](double v) {
+            return v > 0.0 ? nlohmann::json(v) : nlohmann::json(nullptr);
+        };
         arr.push_back({
             {"ts", b.ts},
             {"hash", b.hash},
@@ -2524,13 +2536,14 @@ nlohmann::json MiningInterface::rest_recent_blocks()
             {"miner", b.miner},
             {"share", b.share_hash},
             {"found_locally", found_locally},
-            {"network_difficulty", b.network_difficulty},
-            {"share_difficulty", b.share_difficulty},
-            {"pool_hashrate_at_find", b.pool_hashrate},
-            {"subsidy", b.subsidy},
-            {"expected_time", found_locally ? nlohmann::json(b.expected_time) : nlohmann::json(nullptr)},
-            {"time_to_find", found_locally ? nlohmann::json(b.time_to_find) : nlohmann::json(nullptr)},
-            {"luck", found_locally ? nlohmann::json(b.luck) : nlohmann::json(nullptr)},
+            {"network_difficulty", num_or_null(b.network_difficulty)},
+            {"share_difficulty", num_or_null(b.share_difficulty)},
+            {"pool_hashrate_at_find", num_or_null(b.pool_hashrate)},
+            {"subsidy", b.subsidy != 0 ? nlohmann::json(b.subsidy)
+                                       : nlohmann::json(nullptr)},
+            {"expected_time", found_locally ? num_or_null(b.expected_time) : nlohmann::json(nullptr)},
+            {"time_to_find", found_locally ? num_or_null(b.time_to_find) : nlohmann::json(nullptr)},
+            {"luck", found_locally ? num_or_null(b.luck) : nlohmann::json(nullptr)},
             {"luck_method", method}
         });
     }
@@ -2824,10 +2837,39 @@ nlohmann::json MiningInterface::rest_global_stats()
     result["network_hashrate"] = net_hashrate;
     result["shares_in_chain"] = total_shares;
     result["unique_miners"] = unique_miners;
+    // WHAT unique_miners COUNTS, stated so the card can label it (hotel,
+    // 2026-08-05: the operator read 5 against ~33 connected rigs and called
+    // it wrong — it was counting something else). It is the number of
+    // DISTINCT PAYOUT ADDRESSES holding shares in the sharechain window,
+    // POOL-WIDE (every node's miners, workers collapsed per address); the
+    // rigs number the operator expected is local stratum sessions, published
+    // separately here so the two can never be conflated again.
+    result["unique_miners_scope"] = "sharechain-payout-addresses-pool-wide";
+    {
+        int local_workers = 0;
+        auto workers = effective_stratum_workers();
+        local_workers = static_cast<int>(workers.size());
+        result["local_workers"] = local_workers;
+    }
     result["current_height"] = chain_height;
     result["uptime_seconds"] = rest_uptime();
     result["status"] = "operational";
-    result["last_block"] = 0;
+    // last_block: was a hardcoded 0 since the field's introduction — never
+    // set on any chain (both hotel nodes showed 0 with 100+ ledger rows).
+    // Sourced from the found-block ledger (persistent, so a restart does not
+    // zero it): the newest row for THIS node's primary chain.
+    {
+        uint64_t last_h = 0, last_ts = 0;
+        const std::string primary = node_symbol();
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        for (const auto& b : m_found_blocks) {
+            if (!primary.empty() && b.chain != primary) continue;
+            if (b.height > last_h) { last_h = b.height; last_ts = b.ts; }
+        }
+        result["last_block"] = last_h;
+        result["last_block_ts"] =
+            last_ts ? nlohmann::json(last_ts) : nlohmann::json(nullptr);
+    }
 
     return result;
 }
@@ -3356,12 +3398,70 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
     if (ts == 0) ts = static_cast<uint64_t>(std::time(nullptr));
     std::string hash_hex = hash.GetHex();
 
-    // Runtime dedup: skip if this hash+chain combo already exists
+    // ── MEASUREMENT FALLBACKS (hotel, 2026-08-05) ────────────────────────
+    // Both record paths passed mi->get_network_difficulty(), which reads a
+    // cache that is only refreshed when somebody polls /local_stats — so a
+    // block found before the first dashboard hit was recorded with
+    // network_difficulty=0, which zeroed expected_time, which zeroed luck,
+    // which the chart then DREW as 0% luck (the operator's wrong-luck-trend
+    // complaint, rows h=2516911/2516914). The live template knows the real
+    // difficulty at find time; ask it before accepting a zero. Same for a
+    // zero subsidy on the primary chain (row 2516914 recorded subsidy=0
+    // because the embedded arm leaves get_current_work_template() empty).
+    if (network_difficulty <= 0.0 || subsidy == 0) {
+        CoinWorkInfo cw;
+        if (m_coin_work_fn) cw = m_coin_work_fn();
+        if (cw.valid) {
+            if (network_difficulty <= 0.0 && cw.network_difficulty > 0.0)
+                network_difficulty = cw.network_difficulty;
+            if (subsidy == 0 && chain == node_symbol())
+                subsidy = cw.coinbase_value_sat;
+        }
+        if (network_difficulty <= 0.0)
+            network_difficulty =
+                m_network_difficulty.load(std::memory_order_relaxed);
+    }
+
+    // Runtime dedup — with ENRICHMENT. Measured (hotel primary): rows for
+    // OUR OWN blocks h=2516911/2516914 sat as miner="" share="" subsidy=0
+    // junk forever, because they were persisted by an older binary before
+    // attribution existed, restored at startup, and the plain early-return
+    // here then blocked the attributed re-record (sharechain hook) for the
+    // rest of time. An ATTRIBUTED record now upgrades an unattributed row in
+    // place; nothing ever downgrades, and a second attributed record for the
+    // same (hash, chain) still dedups exactly as before.
     {
         std::lock_guard<std::mutex> lock(m_blocks_mutex);
-        for (const auto& existing : m_found_blocks) {
-            if (existing.hash == hash_hex && existing.chain == chain)
-                return;  // already recorded
+        for (auto& existing : m_found_blocks) {
+            if (existing.hash != hash_hex || existing.chain != chain)
+                continue;
+            const bool existing_unattributed =
+                existing.share_hash.empty() && existing.miner.empty();
+            const bool incoming_attributed =
+                !share_hash.empty() || !miner.empty();
+            if (existing_unattributed && incoming_attributed) {
+                existing.miner      = miner;
+                existing.share_hash = share_hash;
+                if (existing.share_difficulty <= 0.0)
+                    existing.share_difficulty = share_difficulty;
+                if (existing.network_difficulty <= 0.0)
+                    existing.network_difficulty = network_difficulty;
+                if (existing.pool_hashrate <= 0.0)
+                    existing.pool_hashrate = pool_hashrate;
+                if (existing.subsidy == 0) existing.subsidy = subsidy;
+                LOG_INFO << "[Pool] found-block row ENRICHED (was recorded"
+                            " unattributed): h=" << existing.height
+                         << " hash=" << hash_hex.substr(0, 16)
+                         << " miner=" << miner;
+                if (m_persist_block_fn) {
+                    try { m_persist_block_fn(existing); }
+                    catch (const std::exception& e) {
+                        LOG_WARNING << "[Pool] Failed to persist enriched"
+                                       " found block: " << e.what();
+                    }
+                }
+            }
+            return;  // already recorded (possibly just enriched)
         }
     }
 
@@ -3818,11 +3918,37 @@ nlohmann::json MiningInterface::rest_local_stats()
         }
     }
     // Fall back to the coin target's live template when WebServer has none.
+    double burn_amount = 0.0;
     if (block_value == 0.0 && coin_work.valid) {
         block_value    = static_cast<double>(coin_work.coinbase_value_sat) / 1e8;
-        payment_amount = static_cast<double>(coin_work.payment_amount_sat) / 1e8;
+        // MEASURED WRONG SPLIT (hotel, 2026-08-05, DASH mainnet). The
+        // dashboard said miner_gross=0.9404 (53% of the block) while the
+        // ACCEPTED coinbase of our own h=2516911 paid miners 0.4428 (25%):
+        // payment_amount_sat carries only the projected MN payee — it rides
+        // in share serialization and MUST keep that meaning — so the 0.4979
+        // DIP-0027 platform OP_RETURN burn was silently counted as miner
+        // money. payments_total_sat is the display-side truth: the sum of
+        // EVERY non-miner coinbase output (MN payee + operator split +
+        // superblock + burn). Fall back to the legacy field only when the
+        // producer did not fill it (LTC path: both 0, byte-identical).
+        payment_amount = static_cast<double>(
+            coin_work.payments_total_sat != 0 ? coin_work.payments_total_sat
+                                              : coin_work.payment_amount_sat) / 1e8;
+        burn_amount    = static_cast<double>(coin_work.burn_sat) / 1e8;
     }
     result["block_value"] = block_value;
+    // WHICH template the number describes, and how old it is. block_value
+    // renders identically whether the template is live or was last sourced
+    // an hour ago (hotel primary: 0 local miners => nothing refreshes it) —
+    // the height + age let the dashboard say so instead of presenting a
+    // stale number as current.
+    if (coin_work.valid) {
+        result["block_value_height"] = coin_work.height;
+        result["block_value_age_sec"] =
+            coin_work.template_age_sec >= 0
+                ? nlohmann::json(coin_work.template_age_sec)
+                : nlohmann::json(nullptr);
+    }
     // #948 gross-vs-net honesty. block_value_miner has always been NET of the
     // pool fee while block_value_payments is GROSS: two sibling fields sharing
     // the block_value_ prefix carry different conventions, and nothing in the
@@ -3843,6 +3969,10 @@ nlohmann::json MiningInterface::rest_local_stats()
     result["block_value_miner_gross"] = miner_subsidy; // explicit pre-fee miner share (dashboard displays this)
     result["block_value_fee"]         = miner_fee;     // visible pool-fee deduction, so the parts reconcile
     result["block_value_payments"] = (m_blockchain == Blockchain::DASH) ? payment_amount : block_value;
+    // The burn split out of payments, so the card's arithmetic is auditable
+    // against the real coinbase: payments == masternode-lane outputs + burn.
+    if (m_blockchain == Blockchain::DASH)
+        result["block_value_burn"] = burn_amount;
 
     // Node fee amounts per block: fee% × (local_hashrate / pool_hashrate) × block_value
     // Matches p2pool: operator gets fee% of THIS node's contribution, not the whole block.
@@ -3955,6 +4085,15 @@ nlohmann::json MiningInterface::rest_local_stats()
     }
     result["donation_proportion"] = m_pool_fee_percent / 100.0;
     result["fee"] = m_pool_fee_percent;  // percentage (e.g. 1.0)
+    // UNITS, stated (hotel, 2026-08-05: the operator could not tell from the
+    // payload whether fee=1.0 meant 1% or a proportion of 1.0 = 100%, because
+    // the sibling donation_proportion IS a proportion where 1.0 would mean
+    // 100%). `fee` and /fee stay p2pool-compat percent; these two name their
+    // unit in the key so no consumer has to guess again. Same value, no
+    // semantic change.
+    result["fee_percent"]      = m_pool_fee_percent;          // 1.0 == 1%
+    result["donation_percent"] = m_pool_fee_percent;          // same 1% restated
+    result["fee_units"]        = "percent";
 
     // attempts_to_{share,block} — estimate from difficulty
     double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
@@ -4824,7 +4963,14 @@ nlohmann::json MiningInterface::rest_luck_stats()
 
     nlohmann::json blocks = nlohmann::json::array();
     for (const auto& b : m_found_blocks) {
-        blocks.push_back({{"ts", b.ts}, {"hash", b.hash}, {"luck", b.luck}});
+        // luck==0 is "never computed" (relay-learned row, or recorded with
+        // no network difficulty), not "0% lucky". The chart previously drew
+        // those as 0-value points, which is exactly the wrong-luck-trend the
+        // hotel dashboards showed on 2026-08-05: emit null so the trend
+        // SKIPS them instead of plotting a fabricated catastrophe.
+        blocks.push_back({{"ts", b.ts}, {"hash", b.hash},
+                          {"luck", b.luck > 0.0 ? nlohmann::json(b.luck)
+                                                : nlohmann::json(nullptr)}});
     }
     result["blocks"] = blocks;
 
@@ -7105,6 +7251,9 @@ void MiningInterface::update_stat_log()
 void MiningInterface::save_stat_log()
 {
     if (m_stat_log_path.empty()) return;
+    // Piggyback on the existing 100 s stat-log cadence (plus the clean-
+    // shutdown save): the all-time best share rides to disk with it.
+    save_best_share_all_time();
     try {
         // Snapshot under brief lock — copies a compact std::vector of structs.
         // The expensive part is the JSON expansion + serialization, which we
@@ -7199,6 +7348,64 @@ void MiningInterface::load_stat_log()
         LOG_INFO << "[StatLog] Loaded " << m_stat_log.size() << " entries from " << m_stat_log_path;
     } catch (const std::exception& ex) {
         LOG_WARNING << "[StatLog] Load failed: " << ex.what();
+    }
+    load_best_share_all_time();
+}
+
+// ── ALL-TIME best share: survives restarts ──────────────────────────────
+// Measured (hotel primary, 2026-08-05, uptime 36 min): /local_stats
+// best_share reported all_time == session == round because the all-time leg
+// lived only in memory — every restart re-founded "all time", and the card
+// silently redefined the word. Only the all-time leg is persisted: session
+// and round are honestly per-process / per-round and must reset.
+void MiningInterface::save_best_share_all_time()
+{
+    const std::string path = best_share_db_path();
+    if (path.empty()) return;
+    nlohmann::json j;
+    {
+        std::lock_guard<std::mutex> lock(m_best_diff_mutex);
+        if (m_best_difficulty.all_time <= 0.0) return;   // nothing measured
+        j = {{"difficulty", m_best_difficulty.all_time},
+             {"miner", m_best_difficulty.all_time_miner},
+             {"hash", m_best_difficulty.all_time_hash},
+             {"ts", m_best_difficulty.all_time_ts}};
+    }
+    try {
+        const std::string tmp = path + ".new";
+        { std::ofstream f(tmp, std::ios::trunc); f << j.dump(); }
+        std::rename(tmp.c_str(), path.c_str());
+    } catch (const std::exception& ex) {
+        LOG_WARNING << "[BestShare] Save failed: " << ex.what();
+    }
+}
+
+void MiningInterface::load_best_share_all_time()
+{
+    const std::string path = best_share_db_path();
+    if (path.empty()) return;
+    try {
+        std::ifstream f(path);
+        if (!f) return;
+        auto j = nlohmann::json::parse(std::string(
+            (std::istreambuf_iterator<char>(f)),
+            std::istreambuf_iterator<char>()));
+        const double d = j.value("difficulty", 0.0);
+        if (d <= 0.0) return;
+        std::lock_guard<std::mutex> lock(m_best_diff_mutex);
+        // Only ever RAISE: a persisted record must never overwrite a better
+        // share found before the load ran.
+        if (d > m_best_difficulty.all_time) {
+            m_best_difficulty.all_time       = d;
+            m_best_difficulty.all_time_miner = j.value("miner", std::string());
+            m_best_difficulty.all_time_hash  = j.value("hash", std::string());
+            m_best_difficulty.all_time_ts    = j.value("ts", uint64_t(0));
+            LOG_INFO << "[BestShare] all-time best RESTORED: difficulty=" << d
+                     << " miner=" << m_best_difficulty.all_time_miner
+                     << " — the card's 'all time' now actually spans restarts";
+        }
+    } catch (const std::exception& ex) {
+        LOG_WARNING << "[BestShare] Load failed: " << ex.what();
     }
 }
 

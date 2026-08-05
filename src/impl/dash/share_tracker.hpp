@@ -371,7 +371,11 @@ public:
     std::function<void(const uint256&, const uint256&)> m_on_merged_block_check;
     // Callback fired for every verified share with its difficulty + miner script.
     // Used to track best share difficulty for dashboard display.
-    std::function<void(double difficulty, const std::string& miner)> m_on_share_difficulty;
+    /// (difficulty, miner-as-pubkey-hash-hex, share hash). DASH-only shape:
+    /// the hash parameter lets the dashboard attribute its best-share record
+    /// to a concrete share instead of an empty string. Display hook only.
+    std::function<void(double difficulty, const std::string& miner,
+                       const uint256& share_hash)> m_on_share_difficulty;
 
     // Scan the verified best chain for block solutions after startup.
     // Uses cached pow_hash from index (stored during original attempt_verify).
@@ -578,7 +582,14 @@ public:
             m_on_block_found(share_hash);
         }
 
-        // Report share difficulty for best-share dashboard tracking
+        // Report share difficulty for best-share dashboard tracking.
+        // The SHARE HASH rides along (display fix, 2026-08-05): the hotel's
+        // best_share card showed hash="" because this hook never carried the
+        // identity of the very share it was reporting — the dashboard had a
+        // record difficulty with no way to say WHICH share set it. The miner
+        // string stays the raw pubkey-hash hex here (this header does not
+        // know the address version bytes); the main_dash binding encodes it
+        // to a presentable address, where testnet-ness is known.
         if (m_on_share_difficulty) {
             share_var.invoke([&](auto* s) {
                 double diff = chain::target_to_difficulty(chain::bits_to_target(s->m_bits));
@@ -587,7 +598,7 @@ public:
                     miner = s->m_pubkey_hash.GetHex();
                 else if constexpr (requires { s->m_address; })
                     miner = HexStr(s->m_address.m_data);
-                m_on_share_difficulty(diff, miner);
+                m_on_share_difficulty(diff, miner, share_hash);
             });
         }
 

@@ -401,6 +401,13 @@ public:
     /// live template (display only; never drives coinbase or consensus).
     std::shared_ptr<const coin::DashWorkData> peek_template() const;
 
+    /// Seconds since the cached template was sourced, -1 when none / unknown.
+    /// Display only (the dashboard's block_value_age_sec): a template that is
+    /// an hour old renders exactly like a live one without this, which is how
+    /// the hotel primary (0 local miners, nothing refreshing the cache)
+    /// presented a stale block_value as current on 2026-08-05.
+    int64_t peek_template_age_sec() const;
+
 private:
     /// Template cache resolve: return the cached DashWorkData snapshot when it
     /// is still fresh (same work_generation AND younger than the staleness

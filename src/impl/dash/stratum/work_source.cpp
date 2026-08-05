@@ -302,6 +302,15 @@ std::shared_ptr<const coin::DashWorkData> DASHWorkSource::peek_template() const
     return template_cache_;   // last-sourced snapshot; no refresh triggered
 }
 
+int64_t DASHWorkSource::peek_template_age_sec() const
+{
+    std::lock_guard<std::mutex> lk(template_mutex_);
+    if (!template_cache_) return -1;
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::steady_clock::now() - template_cache_at_)
+        .count();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // IWorkSource: work generation -- Stage 4c (the template trio).
 // ─────────────────────────────────────────────────────────────────────────────
