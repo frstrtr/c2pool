@@ -689,7 +689,18 @@ if (BUILD_TESTING AND GTest_FOUND)
     # over the SimplifiedMNList leaf (#309). Last absent header before the
     # embedded_gbt capstone. Header-only over core/uint256 + core/pack +
     # core/hash; no ltc/pool SCC dependency.
-    add_executable(test_dash_mn_state test_dash_mn_state.cpp)
+    # Second TU (W1, dash/replay): test_dash_replay_fold.cpp — the DML fold
+    # engine (replay_fold_engine.hpp): dashd RebuildListFromBlock transcription
+    # KAT'd against REAL mainnet chain bytes (the h=2516756 PoSe REVIVE, the
+    # h=2516412 case-D punish/ban, 4-block quiet sequence), the per-block
+    # committed-cbTx-root self-check hard stop, and the versioned full-state
+    # snapshot v3 (save/load/resume/fail-loud). FOLDED into this EXISTING
+    # allowlisted target on purpose — a new add_executable would not be in the
+    # build.yml --target list and would silently report "Not Run" (#143
+    # NOT_BUILT trap). Needs dash_x11 for the block-identity hash — already in
+    # this target's link set.
+    add_executable(test_dash_mn_state test_dash_mn_state.cpp
+                   test_dash_replay_fold.cpp)
     target_link_libraries(test_dash_mn_state PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -1050,13 +1061,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     # (never-re-arm defect fix): saturating exponential backoff schedule/floor/
     # overflow, the single-latch re-entry guard (N ticks -> one re-arm), and the
     # recovery reset. Same target, no new allowlist entry.
+    # Seventh TU: test_dash_replay_bulk_fetch.cpp — the W2 FULL-HISTORY REPLAY
+    # bulk block-fetch lane (coin/replay_bulk_fetch.hpp): multi-peer range
+    # partitioning, timeout/notfound/peer-loss re-request, in-order
+    # deliver-then-PRUNE into the W1 consumer seam, merkle-bind rejection,
+    # tip-lane strict priority, resumable cursor (verified hash, fail-closed
+    # mismatch), genesis→anchor header-backfill join, capture segment cache.
+    # Same target, no new allowlist entry.
     # DASH_FIXTURE_DIR: the wire suite replays the real 602'189-byte testnet capture.
-    # test_dash_spork.cpp: SPORK listener (registry-membership gate per the
-    # qrinfo #1077 rule + signature verification vs the chainparams spork key +
-    # assume-active SporkState). Folded here per the same #769 rule as the
-    # other TUs on this line: this target IS in the build.yml "Build tests"
-    # --target allowlist, and a standalone target would be a NOT_BUILT sentinel.
-    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp test_dash_coin_p2p_pool.cpp test_dash_qrinfo_wire.cpp test_dash_coin_peer_rearm.cpp test_dash_spork.cpp)
+    # Eighth TU: test_dash_spork.cpp — the SPORK listener (registry-membership
+    # gate per the qrinfo #1077 rule + signature verification vs the
+    # chainparams spork key + assume-active SporkState). Folded here for the
+    # same #769 reason as every TU above: this target IS in the build.yml
+    # "Build tests" --target allowlist, and a standalone target would be a
+    # NOT_BUILT sentinel.
+    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp test_dash_coin_p2p_pool.cpp test_dash_qrinfo_wire.cpp test_dash_coin_peer_rearm.cpp test_dash_replay_bulk_fetch.cpp test_dash_spork.cpp)
     target_compile_definitions(test_dash_p2p_node PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_p2p_node PRIVATE
