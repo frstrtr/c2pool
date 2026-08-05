@@ -256,6 +256,13 @@ std::string g_replay_fold_prestate;           // --replay-fold-prestate FILE
 bool        g_replay_fold_quorums = false;    // --replay-fold-quorums
 std::string g_replay_fold_qsnapshot;          // --replay-fold-qsnapshot FILE
 std::string g_replay_fold_worklists;          // --replay-fold-worklists FILE
+// --embedded-no-dashd-mn-seed: cut the PAYEE axis off from dashd while KEEPING
+// the dashd RPC for the OBSERVE-only shadow-compare. The E2c `protx list` seed
+// and the E2d checkpoint bridge are both skipped, so the root-checked replay
+// fold is the only thing that can populate the payee queue. Exists to make a
+// parity run measurable: a run that was dashd-seeded proves the fold and the
+// serve are both fine WITHOUT proving the serve is daemonless.
+bool        g_no_dashd_mn_seed = false;       // --embedded-no-dashd-mn-seed
 
 // Report the requested sharechain peering topology at run-loop bring-up. Honest
 // about the deferred live bind: a won/seen share does NOT yet cross the wire
@@ -304,6 +311,7 @@ void print_banner(const char* argv0)
         << "           [--replay-bulk] [--replay-bulk-capture DIR] [--replay-bulk-start H]\n"
         << "           [--replay-fold-prestate FILE] [--replay-fold-quorums]\n"
         << "           [--replay-fold-qsnapshot FILE] [--replay-fold-worklists FILE]\n"
+        << "           [--embedded-no-dashd-mn-seed]\n"
         << "           [--oracle-graduation-blocks N] [--oracle-class-coverage K]\n"
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
         << "           [--redistribute pplns|fee|boost|donate]\n"
@@ -418,7 +426,19 @@ void print_banner(const char* argv0)
         << "        without any anchor-supplied member set;\n"
         << "        --replay-fold-qsnapshot FILE seeds ONLY the pre-anchor\n"
         << "        rotated-cycle snapshots a Phase-1 run cannot have produced.\n"
-        << "        None of this changes serving.\n"
+        << "        THE SERVE SEAM: once the fold is PROVEN CURRENT (not\n"
+        << "        poisoned, DIVERGED=none, roots_matched == folded, the list\n"
+        << "        re-hashes to the root its last block committed, cursor AT\n"
+        << "        the header tip) it publishes that list into the PAYEE queue\n"
+        << "        as source=replay-fold, which is what flips the serve gate's\n"
+        << "        have_mn on a node with no dashd. Anything short of the full\n"
+        << "        guard WITHHOLDS and names the blocking condition; the dashd\n"
+        << "        seed and the checkpoint bridge are unchanged.\n"
+        << "        --embedded-no-dashd-mn-seed cuts the PAYEE axis off from a\n"
+        << "        configured dashd (no `protx list` seed, no checkpoint\n"
+        << "        bridge) while KEEPING the RPC for --embedded-shadow-compare:\n"
+        << "        the posture in which a serve-vs-dashd parity run actually\n"
+        << "        measures a DAEMONLESS serve instead of a dashd-seeded one.\n"
         << "        PRUNED (bodies never persisted). Strictly lower priority than\n"
         << "        the tip lane; resumable (high-water cursor); [BULK] telemetry.\n"
         << "        OBSERVE-only in W2 (counting consumer stands in for the W1 fold);\n"
@@ -4305,7 +4325,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // bad-cb-payee class #746 fixed). Synchronous-before-ioc.run() is safe:
         // NodeRPC::Send self-connects via the blocking sync_reconnect fallback
         // (the same property --submit-block relies on).
-        if (rpc) {
+        if (rpc && !g_no_dashd_mn_seed) {
             // Reusable authoritative seed fetch: invoked once at startup AND
             // re-invoked by the maintainer's payee-desync fail-closed path
             // (set_on_mn_reseed below) after it wiped a desynced payee queue.
@@ -4408,6 +4428,37 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 seed_mn_set_from_rpc("payee-desync re-seed");
             };
             maintainer->set_on_mn_reseed(mn_reseed_fallback);
+        } else if (rpc) {
+            // ── --embedded-no-dashd-mn-seed: THE PROOF POSTURE ─────────────
+            // A dashd RPC IS configured, but the payee axis is deliberately
+            // cut off from it. Nothing else changes: the shadow-compare
+            // diagnostic keeps asking dashd for its template so the two can
+            // be diffed — which is the entire point. Without this switch a
+            // parity run cannot separate "the replay serves correctly" from
+            // "dashd seeded the queue and the replay watched": the LAN run on
+            // .211 served in 7 minutes off
+            //   [run] E2c MN-set seed LOADED (startup): 2971/2971 registered
+            //         MNs as-of h=2516893 FROM DASHD `protx list registered
+            //         true`
+            // and that is NOT a daemonless serve, however daemonless the fold
+            // beside it was.
+            //
+            // The E2d checkpoint bridge is skipped too: this posture exists to
+            // leave the ROOT-CHECKED REPLAY FOLD as the only thing that can
+            // populate the payee queue. If the fold does not get there, the
+            // node does not serve — which is the honest outcome to measure.
+            std::cout << "[run] --embedded-no-dashd-mn-seed: the E2c dashd"
+                         " `protx list` MN-set seed is DISABLED and the E2d"
+                         " checkpoint bridge is NOT armed.\n"
+                         "      The PAYEE queue can now be populated by ONE"
+                         " thing only: the root-checked replay fold"
+                         " (source=replay-fold).\n"
+                         "      The dashd RPC stays available to the"
+                         " OBSERVE-only shadow-compare, which is what makes"
+                         " this a parity measurement rather than a\n"
+                         "      daemon-assisted serve. Until the fold"
+                         " publishes, the embedded arm will not serve and no"
+                         " masternode payee will be guessed.\n";
         } else {
             // ── E2d (#738): PURE DAEMONLESS MN-SET SEED ────────────────────
             // No dashd RPC, so no `protx list`. The set comes from a
@@ -5968,6 +6019,10 @@ int main(int argc, char** argv)
             g_replay_fold_qsnapshot = argv[++i];
         else if (std::strcmp(argv[i], "--replay-fold-worklists") == 0 && i + 1 < argc)
             g_replay_fold_worklists = argv[++i];
+        // THE PROOF POSTURE: keep the dashd RPC (shadow-compare) but cut the
+        // PAYEE axis off from it — see g_no_dashd_mn_seed.
+        else if (std::strcmp(argv[i], "--embedded-no-dashd-mn-seed") == 0)
+            g_no_dashd_mn_seed = true;
         else if (std::strcmp(argv[i], "--oracle-graduation-blocks") == 0 && i + 1 < argc)
             oracle_grad_blocks = std::strtoull(argv[++i], nullptr, 10);
         else if (std::strcmp(argv[i], "--oracle-class-coverage") == 0 && i + 1 < argc)
