@@ -1131,6 +1131,22 @@ private:
         }
         if (commitment_is_null(qc.commitment)) return {};
 
+        // dashd's punish loop (specialtxman.cpp:159-174) touches ONLY
+        // invalid-marked members. When every bit of the bitset is set the
+        // loop is a provable no-op, so the member list cannot affect the
+        // fold — demanding a resolver there would fail the fold closed on a
+        // block that mutates nothing. The test is bounded by
+        // validMembers.size() rather than members.size() on purpose: that is
+        // the CONSERVATIVE direction (a thin member list can only shorten
+        // dashd's loop), so no punish that dashd would apply is ever skipped.
+        // Measured on mainnet 2513001-2516851: 470 of the 595 non-null
+        // commitments are all-valid — the difference between a replay that
+        // stalls at the first commitment (h=2513003) and one that needs
+        // membership only where membership actually changes state.
+        if (qc.commitment.CountValidMembers()
+                == qc.commitment.validMembers.size())
+            return {};
+
         // Member resolution: index-aligned with the validMembers bitset.
         // W1 injects (captured sets); W4 derives from the replayed list.
         if (!m_members_fn)
@@ -1148,9 +1164,16 @@ private:
                  + " quorumHash="
                  + qc.commitment.quorumHash.GetHex().substr(0, 16)
                  + " — failing closed";
-        if (members->size() != qc.commitment.validMembers.size())
+        // dashd HandleQuorumCommitment (specialtxman.cpp:159-174) iterates
+        // members.size() and indexes validMembers[i]. GetAllQuorumMembers may
+        // return FEWER than params.size members on a thin list, so the real
+        // invariant is a BOUND, not equality: members must not overrun the
+        // bitset. W4's engine returns the true member-list length; the strict
+        // equality check was W1's to relax at integration (W4 note,
+        // replay_quorum_engine.hpp "INTERFACE RECONCILIATION POINT").
+        if (members->size() > qc.commitment.validMembers.size())
             return "quorum member set size " + std::to_string(members->size())
-                 + " != validMembers bitset size "
+                 + " OVERRUNS validMembers bitset size "
                  + std::to_string(qc.commitment.validMembers.size())
                  + " for quorumHash "
                  + qc.commitment.quorumHash.GetHex().substr(0, 16);

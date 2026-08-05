@@ -737,6 +737,21 @@ public:
         m_height_by_hash[hash]   = height;
     }
 
+    /// Seed a PRE-ANCHOR work block's cbTx bestCLSignature (or its absence).
+    /// GetHashModifier reads exactly this plus the work block hash, both of
+    /// which are chain data; without it the modifier at a cycle whose work
+    /// block predates the anchor is underivable and the cycle is skipped by
+    /// name. Post-anchor work blocks register the same fields by OBSERVATION
+    /// — this seam exists only for the ≤3 pre-anchor cycles a Phase-1 rotated
+    /// lane cannot reach (replay_quorum_bridge.hpp header note).
+    void seed_work_block_cl(
+        uint32_t height,
+        const std::optional<std::array<uint8_t, vendor::CCbTx::BLS_SIG_SIZE>>& cl)
+    {
+        if (cl) m_cl_by_height[height] = *cl;
+        m_cl_known.insert(height);
+    }
+
     /// Seed one ACTIVE commitment (the anchor's active set — for mainnet
     /// that includes the frozen LLMQ_50_60 commitments; see header note).
     /// `base_height` is the quorum base block height (consensus-known from
