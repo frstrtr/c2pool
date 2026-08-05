@@ -52,6 +52,7 @@
 
 #include <impl/dash/coin/node_coin_state.hpp>   // coin::NodeCoinState, coin::DashWorkData seam
 #include <impl/dash/coin/serve_gate_journal.hpp> // coin::ServeGateJournal — decline rate policy (DEFECT-3)
+#include <impl/dash/coin/embedded_shadow_compare.hpp> // coin::EmbeddedShadowCompare — OBSERVE-only serve-vs-dashd diff
 #include <impl/dash/stratum/get_work.hpp>       // dash::stratum::get_work() fused capstone
 
 #include <atomic>
@@ -318,6 +319,18 @@ public:
     /// independent seed-height + pre-emit gates.
     void set_gbt_xcheck(bool v) { gbt_xcheck_ = v; }
 
+    /// Embedded-vs-dashd SHADOW-COMPARE DIAGNOSTIC (--embedded-shadow-compare).
+    /// OBSERVE-ONLY: on every template re-source the just-resolved template is
+    /// handed (by copy) to this probe, which best-effort field-compares it against
+    /// dashd's getblocktemplate on a WORKER THREAD and logs a [SHADOW] line. It
+    /// NEVER selects, blocks, delays, or alters the served template — the serve
+    /// path only ENQUEUES and returns. Unset (default) => strict no-op. Distinct
+    /// from set_gbt_xcheck (a reward-safety GATE that can swap the served arm);
+    /// this one can never change what is served.
+    void set_shadow_compare(std::shared_ptr<coin::EmbeddedShadowCompare> s) {
+        shadow_compare_ = std::move(s);
+    }
+
     /// Set the current share-target bits (compact-target encoding).
     /// `max_bits` is the easiest the share target can be. Both atomically
     /// visible to stratum sessions.
@@ -443,6 +456,12 @@ private:
     bool is_testnet_{false};
     bool embedded_mainnet_{false};   // gate-lift opt-in: daemonless embedded arm on mainnet
     bool gbt_xcheck_{false};         // reward-safety backstop: cross-check embedded creditPool vs dashd
+
+    // OBSERVE-only serve-vs-dashd shadow-compare (--embedded-shadow-compare).
+    // Unset (default / pure-daemonless) => strict no-op. Never on the hot path:
+    // on_serve() only enqueues a copy for a worker thread. Held by shared_ptr so
+    // the driver's worker thread outlives no dangling reference at teardown.
+    std::shared_ptr<coin::EmbeddedShadowCompare> shadow_compare_;
 
     // Slow heartbeat for an UNCHANGED decline cause. The transition and any
     // change of cause are emitted immediately regardless; this only bounds how

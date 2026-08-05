@@ -464,6 +464,14 @@ void DASHWorkSource::resource_template_now() const
             // the EMBEDDED->fallback transition and any change of cause emit
             // immediately; an unchanged cause emits on a slow heartbeat.
             note_arm_decision(work_is_embedded, sel.decline, sel.work.m_height);
+            // OBSERVE-only serve-vs-dashd SHADOW-COMPARE (--embedded-shadow-compare).
+            // Hand the JUST-RESOLVED template (by const-ref; on_serve copies) to
+            // the diagnostic probe. This is ENQUEUE-ONLY: the dashd oracle fetch +
+            // field-compare + [SHADOW] log all run on the probe's WORKER THREAD, so
+            // nothing here waits on dashd and the served bytes below are untouched.
+            // No-op when the probe is unset (default / pure-daemonless).
+            if (shadow_compare_)
+                shadow_compare_->on_serve(sel.source, sel.work);
             work = std::move(sel.work);
         } catch (const std::exception& e) {
             LOG_WARNING << "[DASH-STRATUM] template sourcing threw: " << e.what();

@@ -81,6 +81,7 @@
 #include <impl/dash/coin/mempool_ingest.hpp>     // wire_mempool_ingest (leg 1)
 #include <impl/dash/coin/tip_ingest.hpp>         // wire_tip_ingest (leg 2)
 #include <impl/dash/coin/embedded_oracle_shadow.hpp> // dash::coin::EmbeddedOracleShadow — per-block dashd cross-check (OBSERVE-only)
+#include <impl/dash/coin/embedded_shadow_compare.hpp> // dash::coin::EmbeddedShadowCompare — serve-vs-dashd template diff (OBSERVE-only, NOT a gate)
 #include <impl/dash/coin/block_connect_ingest.hpp>   // wire_block_connect_ingest (leg 3)
 #include <impl/dash/coin/mn_list_ingest.hpp>     // wire_mn_list_ingest (leg 4)
 #include <impl/dash/coin/govsync_ingest.hpp>     // wire_govobject_ingest / wire_govvote_ingest (E-SUPERBLOCK)
@@ -264,6 +265,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-utxo-immature-serve-empty]\n"
         << "           [--bestcl-policy freshness|consensus-exact]\n"
         << "           [--embedded-oracle-shadow]\n"
+        << "           [--embedded-shadow-compare]\n"
         << "           [--oracle-graduation-blocks N] [--oracle-class-coverage K]\n"
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
         << "           [--redistribute pplns|fee|boost|donate]\n"
@@ -344,6 +346,13 @@ void print_banner(const char* argv0)
         << "        ledger + /embedded_oracle verdict signal when the embedded arm is\n"
         << "        proven equivalent (safe to disable dashd, served domain). Needs the\n"
         << "        dashd RPC arm; never changes serving. N/K tune the graduation gate.\n"
+        << "        --embedded-shadow-compare is a SEPARATE, simpler OBSERVE-only\n"
+        << "        diagnostic (NOT a serve gate, no graduation state): on every\n"
+        << "        template SERVE it best-effort field-compares the served template\n"
+        << "        against dashd getblocktemplate at the same height on a WORKER\n"
+        << "        thread (off the miner hot path) and logs one [SHADOW] line\n"
+        << "        (MATCH / MISMATCH / SERVED-MISMATCH / no-oracle) + counters. Needs\n"
+        << "        a reachable dashd RPC arm; a strict no-op in pure-daemonless mode.\n"
         << "        Live sharechain tip/stats, pool hashrate and per-share difficulty\n"
         << "        are bound to the REAL DASH tracker; local hashrate comes from the\n"
         << "        DASH stratum acceptor. If stratum and web ports collide the web\n"
@@ -547,7 +556,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // nothing to overstate. Default false = REFUSE the window (p2pool
              // semantics: an unsynced node does not serve templates; the dashd
              // fallback serves full ones where armed) -- the pre-policy behaviour.
-             bool embedded_utxo_immature_serve_empty = false)
+             bool embedded_utxo_immature_serve_empty = false,
+             // --embedded-shadow-compare: OBSERVE-only serve-vs-dashd block-
+             // template field diff (diagnostic; NOT a serve gate). Off the hot
+             // path (worker-thread dashd fetch). Default false; only meaningful
+             // when a dashd RPC oracle is reachable — a strict no-op otherwise.
+             bool embedded_shadow_compare = false)
 {
     namespace io = boost::asio;
 
@@ -1931,6 +1945,40 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         std::cout << "[DASH-STRATUM-GBT] GBT cross-check DISABLED: dashd RPC "
                      "arm UNARMED (pure-daemonless) -- the embedded arm relies "
                      "on the independent seed-height + pre-emit gates\n";
+    }
+
+    // ── Embedded-vs-dashd SHADOW-COMPARE DIAGNOSTIC (--embedded-shadow-compare) ──
+    // A pure OBSERVABILITY probe, DISTINCT from set_gbt_xcheck above: gbt_xcheck
+    // is a reward-safety GATE that can SWAP the served arm on a creditPool
+    // mismatch; this probe can NEVER change what is served. On every template
+    // re-source it hands the just-resolved template (by copy) to a WORKER THREAD
+    // that best-effort fetches dashd's getblocktemplate for the SAME height,
+    // field-compares (payee / merkleRootMNList / merkleRootQuorums / cbTx
+    // height+version / scriptSig height) and logs one [SHADOW] line. The oracle
+    // fetch is entirely off the miner-facing path; a slow/absent dashd just logs
+    // `no-oracle`. Only meaningful when a dashd RPC arm is ARMED — pure-daemonless
+    // (no rpc) leaves it a strict no-op.
+    if (embedded_shadow_compare) {
+        if (rpc) {
+            auto shadow = std::make_shared<dash::coin::EmbeddedShadowCompare>(
+                // OracleFn: dashd getblocktemplate -> DashWorkData, or nullopt on
+                // any failure/absence (so the probe degrades to `no-oracle`,
+                // never a stall). rp is valid for the probe's lifetime: work_source
+                // (which owns this probe) is destroyed before rpc at scope exit,
+                // and the probe's dtor joins the worker before returning.
+                [rp = rpc.get()]() -> std::optional<dash::coin::DashWorkData> {
+                    try { return rp->getwork(); }
+                    catch (...) { return std::nullopt; }
+                });
+            work_source->set_shadow_compare(std::move(shadow));
+            std::cout << "[run] --embedded-shadow-compare ARMED: OBSERVE-only "
+                         "serve-vs-dashd template diff (worker-thread dashd fetch; "
+                         "NOT a serve gate; [SHADOW] log lines + counters)\n";
+        } else {
+            std::cout << "[run] --embedded-shadow-compare given but no dashd RPC "
+                         "arm is armed (pure-daemonless) -- no oracle to compare "
+                         "against; probe NOT armed (no-op)\n";
+        }
     }
 
     // ── Mint slice 3/3: run-loop share minting wiring ─────────────────────
@@ -5017,6 +5065,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // otherwise outlive it. ioc.run() has returned, so no further new_tip fires.
     if (oracle_shadow) oracle_shadow.reset();
 
+    // Join the shadow-compare worker BEFORE rpc unwinds: its worker thread
+    // dereferences rpc (getwork oracle). Dropping work_source's ref here runs the
+    // probe's dtor (which joins the worker) while rpc is still alive. ioc.run()
+    // has returned, so no further template re-source can enqueue a new job.
+    if (work_source) work_source->set_shadow_compare(nullptr);
+
     // Stop the dashboard BEFORE p2p_node unwinds: its callbacks hold a raw
     // dash::Node* and the HTTP thread must be joined while that is still valid.
     if (web_server) {
@@ -5221,6 +5275,7 @@ int main(int argc, char** argv)
     bool embedded_utxo_immature_serve_empty = false;
     std::string bestcl_policy = "freshness";   // --bestcl-policy: freshness (default, conservative proxy) | consensus-exact (dashcore's actual CheckCbTxBestChainlock rule)
     bool embedded_oracle_shadow = false;       // --embedded-oracle-shadow: per-block dashd cross-check (OBSERVE-only)
+    bool embedded_shadow_compare = false;      // --embedded-shadow-compare: serve-vs-dashd template diff (OBSERVE-only, NOT a gate)
     uint64_t oracle_grad_blocks = 5000;        // --oracle-graduation-blocks N (consecutive clean)
     uint64_t oracle_class_coverage = 20;       // --oracle-class-coverage K (per height class)
     double dev_donation = 0.1;                 // --give-author (donation_percentage; README default 0.1%)
@@ -5305,6 +5360,8 @@ int main(int argc, char** argv)
             coinbase_text = argv[++i];
         else if (std::strcmp(argv[i], "--embedded-oracle-shadow") == 0)
             embedded_oracle_shadow = true;
+        else if (std::strcmp(argv[i], "--embedded-shadow-compare") == 0)
+            embedded_shadow_compare = true;
         else if (std::strcmp(argv[i], "--oracle-graduation-blocks") == 0 && i + 1 < argc)
             oracle_grad_blocks = std::strtoull(argv[++i], nullptr, 10);
         else if (std::strcmp(argv[i], "--oracle-class-coverage") == 0 && i + 1 < argc)
@@ -5455,7 +5512,8 @@ int main(int argc, char** argv)
                         operator_message_blob_hex, embedded_superblock,
                         embedded_oracle_shadow, oracle_grad_blocks,
                         oracle_class_coverage, coin_p2p_peers, bestcl_policy,
-                        embedded_utxo_immature_serve_empty);
+                        embedded_utxo_immature_serve_empty,
+                        embedded_shadow_compare);
     }
     return run_selftest();
 }
