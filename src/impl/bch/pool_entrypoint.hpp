@@ -742,6 +742,22 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
 
     // Drive the shared io_context: pool node + embedded daemon + stratum run together.
     ioc.run();
+
+    // LTC-parity site 3/3 (the TRUE third, missing until now): save the stat log
+    // on clean shutdown. load-on-start (site 1) + periodic-100s (site 2) only
+    // persist at tick boundaries, so without this every clean restart drops
+    // whatever accumulated since the last 100s tick. Mirrors BTC #1100
+    // (main_btc.cpp) / main_ltc.cpp:7456-7457 (\"Save stats on shutdown\").
+    // web_server (declared above, outside the http_port block) is still alive
+    // here -- the reset()/teardown happens when this function returns, after this
+    // flush. mi is block-local to the standup block, so re-fetch it through the
+    // still-live web_server. Precondition: GRACEFUL stop (ioc.stop() from the
+    // signal handler unwinds ioc.run()); SIGKILL flushes neither lane. Display-
+    // only stat log; p2pool-merged-v36 surface: NONE.
+    if (web_server) {
+        if (auto* mi = web_server->get_mining_interface())
+            mi->save_stat_log();
+    }
 }
 
 } // namespace bch
