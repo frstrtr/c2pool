@@ -335,6 +335,14 @@ jobs:
             conan --version   # pre-provisioned at /usr/local/bin on self-hosted
           fi
 
+      # Prefer the LAN Conan mirror when it answers the probe; conancenter stays
+      # as the fallback and is never removed, so an unreachable mirror is a
+      # no-op. Cuts a fresh runner's cold bootstrap from a measured 1554 s
+      # (170.7 MB Boost tarball over the WAN + from-source build) to ~2 s.
+      - if: matrix.build-mode == 'manual'
+        name: Prefer LAN Conan remote
+        run: bash ci/conan/lan-remote.sh
+
       - if: matrix.build-mode == 'manual' && runner.environment == 'github-hosted'
         name: Restore Conan package cache (github-hosted only)
         uses: actions/cache@v5

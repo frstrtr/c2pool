@@ -130,6 +130,13 @@ jobs:
             conan --version   # pre-provisioned at /usr/local/bin on self-hosted
           fi
 
+      # Prefer the LAN Conan mirror when it answers the probe; conancenter stays
+      # as the fallback and is never removed, so an unreachable mirror is a
+      # no-op. Cuts a fresh runner's cold bootstrap from a measured 1554 s
+      # (170.7 MB Boost tarball over the WAN + from-source build) to ~2 s.
+      - name: Prefer LAN Conan remote
+        run: bash ci/conan/lan-remote.sh
+
       - name: Show committed Conan profile
         run: conan profile show -pr:a=ci/conan/linux-gcc13.profile
 
@@ -490,6 +497,13 @@ jobs:
             conan --version   # pre-provisioned at /usr/local/bin on self-hosted
           fi
 
+      # Prefer the LAN Conan mirror when it answers the probe; conancenter stays
+      # as the fallback and is never removed, so an unreachable mirror is a
+      # no-op. Cuts a fresh runner's cold bootstrap from a measured 1554 s
+      # (170.7 MB Boost tarball over the WAN + from-source build) to ~2 s.
+      - name: Prefer LAN Conan remote
+        run: bash ci/conan/lan-remote.sh
+
       - name: Detect Conan profile
         run: |
           conan profile detect --force
@@ -669,6 +683,13 @@ jobs:
             conan --version   # pre-provisioned at /usr/local/bin on self-hosted
           fi
 
+      # Prefer the LAN Conan mirror when it answers the probe; conancenter stays
+      # as the fallback and is never removed, so an unreachable mirror is a
+      # no-op. Cuts a fresh runner's cold bootstrap from a measured 1554 s
+      # (170.7 MB Boost tarball over the WAN + from-source build) to ~2 s.
+      - name: Prefer LAN Conan remote
+        run: bash ci/conan/lan-remote.sh
+
       - name: Detect Conan profile
         run: |
           conan profile detect --force
@@ -804,6 +825,13 @@ jobs:
           else
             conan --version   # pre-provisioned at /usr/local/bin on self-hosted
           fi
+
+      # Prefer the LAN Conan mirror when it answers the probe; conancenter stays
+      # as the fallback and is never removed, so an unreachable mirror is a
+      # no-op. Cuts a fresh runner's cold bootstrap from a measured 1554 s
+      # (170.7 MB Boost tarball over the WAN + from-source build) to ~2 s.
+      - name: Prefer LAN Conan remote
+        run: bash ci/conan/lan-remote.sh
 
       - name: Detect Conan profile
         run: |
@@ -1471,6 +1499,13 @@ jobs:
             conan --version   # pre-provisioned at /usr/local/bin on self-hosted
           fi
 
+      # Prefer the LAN Conan mirror when it answers the probe; conancenter stays
+      # as the fallback and is never removed, so an unreachable mirror is a
+      # no-op. Cuts a fresh runner's cold bootstrap from a measured 1554 s
+      # (170.7 MB Boost tarball over the WAN + from-source build) to ~2 s.
+      - name: Prefer LAN Conan remote
+        run: bash ci/conan/lan-remote.sh
+
       - name: Detect Conan profile
         run: |
           conan profile detect --force
@@ -1597,6 +1632,13 @@ jobs:
           else
             conan --version   # pre-provisioned at /usr/local/bin on self-hosted
           fi
+
+      # Prefer the LAN Conan mirror when it answers the probe; conancenter stays
+      # as the fallback and is never removed, so an unreachable mirror is a
+      # no-op. Cuts a fresh runner's cold bootstrap from a measured 1554 s
+      # (170.7 MB Boost tarball over the WAN + from-source build) to ~2 s.
+      - name: Prefer LAN Conan remote
+        run: bash ci/conan/lan-remote.sh
 
       - name: Restore Conan cache (github-hosted only)
         if: runner.environment == 'github-hosted'
