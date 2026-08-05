@@ -4,6 +4,7 @@
 #include <leveldb/write_batch.h>
 #include <leveldb/filter_policy.h>
 #include <leveldb/cache.h>
+#include <cstring>
 #include <filesystem>
 #include <sstream>
 
@@ -244,6 +245,46 @@ std::vector<std::string> LevelDBStore::list_keys(const std::string& prefix, size
     }
 
     return keys;
+}
+
+bool LevelDBStore::for_each_prefix(const std::string& prefix,
+                                   const std::function<bool(const std::string& key,
+                                                            const std::vector<uint8_t>& value)>& fn)
+{
+    if (!m_db) {
+        LOG_ERROR << "LevelDB store not open";
+        return false;
+    }
+
+    std::unique_ptr<leveldb::Iterator> it(m_db->NewIterator(leveldb::ReadOptions()));
+
+    if (prefix.empty()) {
+        it->SeekToFirst();
+    } else {
+        it->Seek(prefix);
+    }
+
+    std::vector<uint8_t> value;
+    for (; it->Valid(); it->Next()) {
+        leveldb::Slice key = it->key();
+        if (!prefix.empty() &&
+            (key.size() < prefix.size() ||
+             std::memcmp(key.data(), prefix.data(), prefix.size()) != 0)) {
+            break;  // past the prefix range — done
+        }
+        leveldb::Slice val = it->value();
+        value.assign(reinterpret_cast<const uint8_t*>(val.data()),
+                     reinterpret_cast<const uint8_t*>(val.data()) + val.size());
+        if (!fn(key.ToString(), value))
+            return true;  // caller-requested early stop is not an error
+    }
+
+    if (!it->status().ok()) {
+        LOG_ERROR << "Error scanning prefix: " << it->status().ToString();
+        return false;
+    }
+
+    return true;
 }
 
 void LevelDBStore::compact()
