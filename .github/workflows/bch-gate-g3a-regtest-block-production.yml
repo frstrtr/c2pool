@@ -37,11 +37,7 @@ env:
 jobs:
   g3a-regtest-block-production:
     name: BCH gate G3a — populated-regtest block production
-    # PHASE 2 (blocked on g++-13 on the c2pool-heavy host): builds with the
-    # committed ci/conan/linux-gcc13.profile (pins CXX=g++-13), which the heavy
-    # host lacks today. Stays on c2pool-build; flip to c2pool-heavy once g++-13
-    # is installed there. The ccache env below applies on either host.
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-heavy"]') || 'ubuntu-24.04' }}
     # ccache for the gate's from-source c2pool build: cmake reads
     # CMAKE_<LANG>_COMPILER_LAUNCHER from the env as cache-var defaults, so the
     # tests/gates/*.sh entrypoint stays untouched. Cache = runner-persistent

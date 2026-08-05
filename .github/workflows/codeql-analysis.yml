@@ -53,16 +53,7 @@ jobs:
     # STEP cap on the analyze phase below keeps the wedged-tracer fast-red
     # property unchanged.
     timeout-minutes: 150
-    # PHASE 2 (blocked on g++-13 on the c2pool-heavy host): this leg builds with
-    # the committed ci/conan/linux-gcc13.profile, which pins CXX=g++-13. The
-    # heavy host (Ubuntu 26.04) has gcc-13 but NOT g++-13 yet, so this leg stays
-    # on c2pool-build until that package lands. Safe to leave here: its flock
-    # counterpart (Linux x86_64 AsAN+UBSan) has ALREADY moved to c2pool-heavy,
-    # so the two #1105 lock holders now sit on disjoint hosts and no longer
-    # contend. Flip to c2pool-heavy once g++-13 is installed.
-    # Deliberately NO ccache launcher on this leg — a ccache hit skips the real
-    # compiler exec and starves the CodeQL tracer (empty database).
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-heavy"]') || 'ubuntu-24.04' }}
     permissions:
       security-events: write
       packages: read
