@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -69,6 +70,22 @@ public:
 
     size_t count();
     std::vector<std::string> list_keys(const std::string& prefix = "", size_t limit = 1000);
+
+    /// Ordered scan over every (key, value) pair whose key starts with
+    /// `prefix`, in LevelDB's byte-lexicographic key order. The callback
+    /// returns false to stop early (that is NOT an error). Returns false only
+    /// when the store is closed or the iterator reports a corruption/IO error
+    /// — callers doing consensus-bearing folds over the scan (e.g. the DASH
+    /// replay UTXO hash_serialized_2 gate) must treat a false return as
+    /// fail-closed, never as "empty".
+    ///
+    /// Unlike list_keys() this streams values and has no result cap, so it is
+    /// the seam for multi-million-row scans that must not materialize the key
+    /// set in memory.
+    bool for_each_prefix(const std::string& prefix,
+                         const std::function<bool(const std::string& key,
+                                                  const std::vector<uint8_t>& value)>& fn);
+
     void compact();
 
     BatchWriter create_batch();
