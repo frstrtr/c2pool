@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master, btc-embedded, dash-spv-embedded, dgb/**, windows-build, service-update]
+    branches: [master, btc-embedded, dash-spv-embedded, dgb/**, windows-build, service-update, v37-dev]
     tags: ['v*']
   pull_request:
     branches: [master, btc-embedded, dash-spv-embedded, dgb/**, v37-dev]

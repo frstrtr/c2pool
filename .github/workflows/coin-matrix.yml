@@ -13,7 +13,7 @@ name: Coin matrix
 
 on:
   push:
-    branches: [master, btc-embedded, dash-spv-embedded, dgb/pool-pillars-port, windows-build, service-update]
+    branches: [master, btc-embedded, dash-spv-embedded, dgb/pool-pillars-port, windows-build, service-update, v37-dev]
   pull_request:
     branches: [master, btc-embedded, dash-spv-embedded, dgb/slice4-skeleton, dgb/pool-pillars-port, v37-dev]
 
