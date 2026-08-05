@@ -289,10 +289,12 @@ jobs:
     #     it could not link at all (undefined reference to
     #     `std::ostream::_Disable_exceptions', a libstdc++/dep ABI mismatch);
     #     that is history, not a live constraint.
-    #   * CodeQL cannot run on the heavy host: staging its ~700 MB CLI bundle
-    #     fails there ("Unable to download and extract CodeQL CLI: the process
-    #     '/usr/bin/tar' failed with exit code 2"), 4/4 attempts, on a link that
-    #     also truncates other large downloads. So CodeQL stays on c2pool-build.
+    #   * CodeQL stays on c2pool-build: staging its ~823 MB CLI bundle failed
+    #     on the heavy host 4/4 ("'/usr/bin/tar' failed with exit code 2") —
+    #     a THROUGHPUT problem (that host's egress swings ~258 KB/s..1 MB/s, so
+    #     fixed timeouts cut large transfers short), not corruption and not
+    #     PMTU. See the note in codeql-analysis.yml; it is revisitable, but
+    #     flock separation would still keep these two on different hosts.
     # Do not consolidate these two onto one label.
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-heavy"]') || 'ubuntu-24.04' }}
     continue-on-error: true

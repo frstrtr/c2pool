@@ -53,19 +53,24 @@ jobs:
     # STEP cap on the analyze phase below keeps the wedged-tracer fast-red
     # property unchanged.
     timeout-minutes: 150
-    # STAYS on c2pool-build — MEASURED, do not route this to c2pool-heavy.
-    # Two independent reasons:
-    #  1. Staging the ~700 MB CodeQL CLI bundle FAILS on the heavy host:
-    #       "Unable to download and extract CodeQL CLI: the process
-    #        '/usr/bin/tar' failed with exit code 2"
-    #     4 attempts, 4 failures, 0 successes — that host's uplink truncates
-    #     large downloads (it also truncated a 215 MB runner tarball to 108 MB).
-    #  2. Flock separation. This job and build.yml's linux-asan are the ONLY
-    #     two holders of the per-host reap-guard flock (#1105); linux-asan runs
-    #     on c2pool-heavy, so this one must stay here or the two serialize
-    #     (measured: second holder blocked in `flock -x -w 3600`).
-    # Revisit (1) only if a LAN-local mirror makes the bundle fetch reliable —
-    # (2) would still require the two holders to stay on different hosts.
+    # STAYS on c2pool-build — MEASURED, and revisitable (see below).
+    # Two reasons, one temporary and one structural:
+    #  1. TEMPORARY — staging the ~823 MB CodeQL CLI bundle failed on the heavy
+    #     host ("Unable to download and extract CodeQL CLI: the process
+    #     '/usr/bin/tar' failed with exit code 2", 4 attempts / 4 failures).
+    #     Root cause is THROUGHPUT, not corruption: that host's egress varies
+    #     ~258 KB/s..1 MB/s, so a fixed step timeout cuts a large transfer
+    #     mid-flight and leaves a short tarball. Measured directly — the same
+    #     226 MB artifact fetched INTACT once (gzip OK, 1 MB/s) and truncated at
+    #     108 MB on the next attempt purely by timing out at 258 KB/s. Not PMTU:
+    #     TCP completes fine when given time. The bundle has since been cached
+    #     on that host, so this blocker is expected to clear — re-test before
+    #     assuming it still applies.
+    #  2. STRUCTURAL — flock separation. This job and build.yml's linux-asan are
+    #     the ONLY two holders of the per-host reap-guard flock (#1105), and
+    #     linux-asan runs on c2pool-heavy, so these two must stay on different
+    #     hosts or they serialize (measured: the second holder sat blocked in
+    #     `flock -x -w 3600`). Reason 2 stands even after reason 1 clears.
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     permissions:
       security-events: write
