@@ -53,7 +53,17 @@ jobs:
     # STEP cap on the analyze phase below keeps the wedged-tracer fast-red
     # property unchanged.
     timeout-minutes: 150
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-heavy"]') || 'ubuntu-24.04' }}
+    # DELIBERATE SPLIT — this leg stays on c2pool-build while build.yml's
+    # linux-asan leg runs on c2pool-heavy. The reap-guard flock is per-host and
+    # these two jobs are its ONLY holders, so keeping them on DIFFERENT hosts
+    # means neither ever waits on the other: the lock is uncontended on both
+    # sides and the 60-min acquire timeout can no longer fire.
+    # Measured on the heavy host when BOTH were routed there: one holder held
+    # the lock while the second sat blocked in `flock -x -w 3600` — i.e. moving
+    # both merely relocates the contention. Do not "consolidate" these two onto
+    # one label; the split is the fix. The non-locking gate legs (BCH G3a/G3b,
+    # DOGE AuxPoW) do go to c2pool-heavy, which is what unloads VM905.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     permissions:
       security-events: write
       packages: read
