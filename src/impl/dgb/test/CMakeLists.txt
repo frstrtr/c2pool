@@ -7,7 +7,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # F1 retention + F2/F3 broadcast-gate KATs are actually compiled and run;
     # a fresh target would need a build.yml entry and would otherwise report
     # the silently-passing NOT_BUILT sentinel.
-    add_executable(dgb_share_test share_test.cpp known_txs_retention_test.cpp broadcast_gate_test.cpp)
+    add_executable(dgb_share_test share_test.cpp known_txs_retention_test.cpp broadcast_gate_test.cpp race913_lock_guard_test.cpp)
     target_link_libraries(dgb_share_test PRIVATE
         GTest::gtest_main GTest::gtest
         core dgb
@@ -20,6 +20,10 @@ if (BUILD_TESTING AND GTest_FOUND)
     include(GoogleTest)
     include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
     gtest_add_tests(dgb_share_test "" AUTO)
+
+    # D-DGB.RACE913 lock-scope guard reads the shipped node.cpp source.
+    target_compile_definitions(dgb_share_test PRIVATE
+        DGB_NODE_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../node.cpp")
 
     # --- #905 tx-relay dead-probe regression (port of btc #880) ------------
     # Pins coin/share_tx_relay_refs.hpp: append_share_tx_refs, the SSOT
