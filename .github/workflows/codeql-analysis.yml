@@ -133,7 +133,7 @@ jobs:
             case "$(ps -o comm= -p "$_p" 2>/dev/null || true)" in
               Runner.Worker*) WORKER="$_p"; break ;;
             esac
-            _p="$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ')"
+            _p="$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ' || true)"
             [ -z "${_p:-}" ] && break
           done
 
