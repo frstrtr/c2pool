@@ -205,6 +205,10 @@ TEST(DashReceptionWire, RelayedTxReachesEmbeddedTemplateThenInvalidateDemotes) {
     dash::interfaces::Node node;
     NodeCoinState st;
     st.mempool().set_utxo(&utxo);
+    // This KAT pins the FEE-CARRYING flow — the --embedded-serve-mempool-txs
+    // OPT-IN (default OFF = coinbase-only; pinned in test_dash_node_coin_state
+    // DashMempoolTxServing).
+    st.set_serve_mempool_txs(true);
     CoinStateMaintainer m(st);
     auto sub = wire_mempool_ingest(node, m);
 

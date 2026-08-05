@@ -155,6 +155,10 @@ TEST(DashNodeEmbeddedWire, MaintainerPublishesNodeBundleRoutesEmbeddedByteEqual)
 
     dash::NodeImpl node;
     node.coin_state().mempool().set_utxo(&utxo);
+    // This KAT pins the FEE-CARRYING flow — the --embedded-serve-mempool-txs
+    // OPT-IN (default OFF = coinbase-only; pinned in test_dash_node_coin_state
+    // DashMempoolTxServing).
+    node.coin_state().set_serve_mempool_txs(true);
 
     // Drive the bundle purely through the node's maintainer accessor -- the exact
     // surface the reception/think slices call. MN then tip; readiness gate flips

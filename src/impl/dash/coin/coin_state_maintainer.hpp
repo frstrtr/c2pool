@@ -820,12 +820,32 @@ public:
     /// mempool yields a valid coinbase-only template -- so this never gates
     /// publication; it only enriches the next assembled template. Returns the
     /// mempool's accept verdict (false = rejected: bad utxo ref / already in).
+    ///
+    /// ██ SOLE-INGESTION-PATH INVARIANT ██ This method (fed exclusively by
+    /// wire_mempool_ingest <- interfaces::Node::new_tx <- dashd-peer relay)
+    /// is the ONLY route into Mempool::add_tx. The audit's two
+    /// N-A-BY-SOURCE-INVARIANT rows (bad-txns-nonfinal, mandatory-script-
+    /// verify-flag; DASH_CONNECTBLOCK_REJECT_SURFACE_AUDIT.md §6) hold only
+    /// while that stays true -- see the invariant block atop mempool.hpp
+    /// before adding any other caller.
     bool on_mempool_tx(const MutableTransaction& tx) {
         // Mempool relay is the highest-cadence event through the maintainer,
         // so it doubles as the clock the tip-body-overdue bound is checked on
         // (the maintainer owns no timer; see check_tip_body_overdue).
         check_tip_body_overdue();
         return m_state.mempool().add_tx(tx);
+    }
+
+    /// G4 seam (audit conflict-tx-lock): fold a relayed InstantSend lock into
+    /// the mempool's islock-conflict tracking -- evicts a conflicting pool
+    /// entry immediately and keeps the outpoints excluded from template
+    /// selection (Mempool::add_islock, incl. the documented residual race).
+    /// FEED: the coin-P2P isdlock parse leg (dashd-peer relay, same source
+    /// invariant as on_mempool_tx); until that leg lands nothing calls this
+    /// in a live node and selection behaviour is unchanged (empty map).
+    void on_islock(const uint256& locked_txid,
+                   const std::vector<std::pair<uint256, uint32_t>>& inputs) {
+        m_state.mempool().add_islock(locked_txid, inputs);
     }
 
     /// Header / think path: the chain tip advanced. Stash the params the
