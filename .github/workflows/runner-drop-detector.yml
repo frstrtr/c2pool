@@ -9,12 +9,14 @@ name: runner-drop-detector
 #
 # BACKSTOP (reap-guard): a "failure"-conclusion steps=0 drop is auto-reran
 # ONCE (gh run rerun --failed) so a host-reaped leg self-heals instead of
-# blocking a queue. The rerun is the NET, not the fix -- the host-keyed
-# concurrency cap (c2pool-heavy-leg group) is the fix. A one-line reap-rerun
-# marker is emitted so a rerun-green is never mistaken for a first-pass green.
-# Guards against a rerun-storm: only conclusion==failure (not cancelled --
-# steps=0 is ambiguous, concurrency-cancels also show steps=0) and only when
-# the run is still on its FIRST attempt (live .run_attempt==1).
+# blocking a queue. The rerun is the NET, not the fix -- the per-host
+# heavy-leg flock (build.yml linux-asan + codeql-analysis.yml c-cpp, an
+# exclusive /tmp lock shared by all runner processes on one physical host)
+# is the fix. A one-line reap-rerun marker is emitted so a rerun-green is
+# never mistaken for a first-pass green. Guards against a rerun-storm: only
+# conclusion==failure (not cancelled -- steps=0 is ambiguous, workflow
+# concurrency-cancels also show steps=0) and only when the run is still on
+# its FIRST attempt (live .run_attempt==1).
 
 on:
   schedule:
