@@ -4996,17 +4996,26 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     replay_live_tail =
                         std::make_unique<rp::FoldLiveTail>(
                             *replay_fold_consumer, *replay_fold_engine,
-                            // EXCLUSIVE floor: every height the bulk lane has
-                            // delivered or still intends to fetch stays the
-                            // bulk lane's, because the W4 quorum lane derives
-                            // membership from that ordering. Before the lane
-                            // exists the floor is "everything" — the tail must
-                            // never get in first.
+                            // EXCLUSIVE floor: the bulk lane's DELIVERED
+                            // high-water, and nothing more aspirational than
+                            // that. The first attempt used
+                            // max(delivered, target_end) and orphaned every
+                            // height in between: the lane raises its ceiling
+                            // as headers arrive, so live blocks 2516933..42
+                            // were refused as "the lane's" and then never
+                            // fetched, leaving the fold 12 short again with
+                            //   [REPLAY-TAIL] held=2 lowest_held=2516943
+                            //                 bulk_floor=2516932
+                            // A ceiling is an intention; only `delivered` is a
+                            // fact. Above it the tail may hold, and it still
+                            // only ever folds engine.height()+1 — the exact
+                            // height and order the lane itself would have
+                            // delivered, with the same block hash — so the W4
+                            // quorum lane sees no difference. Before the lane
+                            // exists the floor is "everything".
                             [&replay_lane]() -> uint32_t {
                                 if (!replay_lane) return UINT32_MAX;
-                                return std::max(
-                                    replay_lane->delivered(),
-                                    replay_lane->scheduler().target_end());
+                                return replay_lane->delivered();
                             });
                     coin_feed_subs.push_back(
                         coin_state.block_connected.subscribe(
