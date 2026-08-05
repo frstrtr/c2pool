@@ -23,7 +23,7 @@
 ///       wire messages (message_version / message_verack round-tripped
 ///       through make_raw -> Handler::parse, the same path live socket bytes
 ///       take): peer metadata capture, handshake completion, the
-///       on_handshake_complete seam, unknown-command tolerance (dashd spork/
+///       on_handshake_complete seam, unknown-command tolerance (dashd CoinJoin/
 ///       governance traffic), and teardown-on-error resetting the session.
 ///
 ///   (d) Read-loop preservation — a subscriber that THROWS out of a message
@@ -497,16 +497,18 @@ TEST(DashCoinP2PClient, client_ignores_stray_verack_without_session)
 
 TEST(DashCoinP2PClient, client_tolerates_unknown_commands)
 {
-    // dashd pushes spork/governance/quorum commands outside our Handler set;
-    // the client must ignore them without tearing the session down.
+    // dashd pushes CoinJoin/quorum commands outside our Handler set (senddsq,
+    // qsendrecsigs, ...); the client must ignore them without tearing the
+    // session down. ("spork" no longer qualifies: it is REGISTERED and handled
+    // — see test_dash_spork.cpp.)
     ClientRig rig;
     rig.wire_connected();
     rig.deliver(rig.peer_version(70230, 1, 100, "/Dash Core:21.1.0/"));
     rig.deliver(dash::coin::p2p::message_verack::make_raw());
     ASSERT_TRUE(rig.client.is_handshake_complete());
 
-    auto spork = std::make_unique<RawMessage>("spork", PackStream{});
-    rig.deliver(std::move(spork));                       // must not throw
+    auto senddsq = std::make_unique<RawMessage>("senddsq", PackStream{});
+    rig.deliver(std::move(senddsq));                     // must not throw
     EXPECT_TRUE(rig.client.is_handshake_complete());     // session survives
     EXPECT_TRUE(rig.client.is_connected());
 }

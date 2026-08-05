@@ -1051,7 +1051,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # overflow, the single-latch re-entry guard (N ticks -> one re-arm), and the
     # recovery reset. Same target, no new allowlist entry.
     # DASH_FIXTURE_DIR: the wire suite replays the real 602'189-byte testnet capture.
-    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp test_dash_coin_p2p_pool.cpp test_dash_qrinfo_wire.cpp test_dash_coin_peer_rearm.cpp)
+    # test_dash_spork.cpp: SPORK listener (registry-membership gate per the
+    # qrinfo #1077 rule + signature verification vs the chainparams spork key +
+    # assume-active SporkState). Folded here per the same #769 rule as the
+    # other TUs on this line: this target IS in the build.yml "Build tests"
+    # --target allowlist, and a standalone target would be a NOT_BUILT sentinel.
+    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp test_dash_coin_p2p_pool.cpp test_dash_qrinfo_wire.cpp test_dash_coin_peer_rearm.cpp test_dash_spork.cpp)
     target_compile_definitions(test_dash_p2p_node PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_p2p_node PRIVATE
