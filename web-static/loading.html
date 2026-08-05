@@ -37,8 +37,12 @@ h1 { font-size: 2rem; margin-bottom: 8px; color: #58a6ff; }
         <div class="row"><span class="label">Sharechain</span><span class="val" id="d-shares">...</span></div>
         <div class="row"><span class="label">Verified</span><span class="val" id="d-verified">...</span></div>
         <div class="row"><span class="label">Best share</span><span class="val" id="d-best">...</span></div>
-        <div class="row"><span class="label">LTC SPV</span><span class="val" id="d-ltc-spv">...</span></div>
-        <div class="row"><span class="label">DOGE SPV</span><span class="val" id="d-doge-spv">...</span></div>
+        <!-- SPV rows are topology-driven: parent label comes from
+             currency_info.symbol; the merged-child row appears only when the
+             node advertises a merged child (or reports child SPV progress).
+             A standalone coin (DASH/BTC/DGB) must not show LTC/DOGE rows. -->
+        <div class="row" id="row-parent-spv" style="display:none"><span class="label" id="l-parent-spv">SPV</span><span class="val" id="d-ltc-spv">...</span></div>
+        <div class="row" id="row-child-spv" style="display:none"><span class="label" id="l-child-spv">SPV</span><span class="val" id="d-doge-spv">...</span></div>
         <div class="row"><span class="label">Uptime</span><span class="val" id="d-uptime">...</span></div>
     </div>
     <div class="note">This page auto-refreshes. You will be redirected to the dashboard when ready.</div>
@@ -62,8 +66,23 @@ function poll() {
         // In embedded mode, currency_info doesn't have block_value/pool_hash_rate
         // (those come from getwork which requires stratum), so use the ready flag.
         var dashReady = d.ready && d.verified_size > 0 && d.has_work;
-        // SPV progress with ETA
+        // SPV progress with ETA — rows are shown only when the node actually
+        // reports SPV sync state; labels are topology-driven, never hardcoded.
         if (d.spv) {
+            // Each row appears only when the node reports THAT chain's SPV
+            // fields (e.g. DGB reports dgb_* keys: neither row applies).
+            var hasParentSpv = (d.spv.ltc_need !== undefined);
+            var childSym = ci && ci.merged_child_symbol;
+            var hasChildSpv = (d.spv.doge_need !== undefined) && (childSym || d.spv.doge_need > 0);
+            if (hasParentSpv) {
+                document.getElementById('row-parent-spv').style.display = '';
+                document.getElementById('l-parent-spv').textContent = ((ci && ci.symbol) || 'LTC') + ' SPV';
+            }
+            if (hasChildSpv) {
+                document.getElementById('row-child-spv').style.display = '';
+                document.getElementById('l-child-spv').textContent = (childSym || 'DOGE') + ' SPV';
+            }
+            if (hasParentSpv) {
             var ltcDone = d.spv.ltc_blocks >= d.spv.ltc_need;
             var ltcTxt = ltcDone ? 'ready' : d.spv.ltc_blocks + '/' + d.spv.ltc_need;
             if (!ltcDone && d.spv.ltc_blocks > 1 && d.uptime_seconds > 10) {
@@ -73,15 +92,18 @@ function poll() {
             }
             document.getElementById('d-ltc-spv').textContent = ltcTxt;
             document.getElementById('d-ltc-spv').className = 'val ' + (ltcDone ? 'ok' : 'wait');
-            var dogeDone = d.spv.doge_blocks >= d.spv.doge_need;
-            var dogeTxt = dogeDone ? 'ready' : d.spv.doge_blocks + '/' + d.spv.doge_need;
-            if (!dogeDone && d.spv.doge_blocks > 1 && d.uptime_seconds > 10) {
-                var dr = d.spv.doge_blocks / d.uptime_seconds;
-                var drem = Math.ceil((d.spv.doge_need - d.spv.doge_blocks) / Math.max(dr, 0.01));
-                dogeTxt += ' (~' + (drem > 60 ? Math.ceil(drem/60) + 'min' : drem + 's') + ')';
             }
-            document.getElementById('d-doge-spv').textContent = dogeTxt;
-            document.getElementById('d-doge-spv').className = 'val ' + (dogeDone ? 'ok' : 'wait');
+            if (hasChildSpv) {
+                var dogeDone = d.spv.doge_blocks >= d.spv.doge_need;
+                var dogeTxt = dogeDone ? 'ready' : d.spv.doge_blocks + '/' + d.spv.doge_need;
+                if (!dogeDone && d.spv.doge_blocks > 1 && d.uptime_seconds > 10) {
+                    var dr = d.spv.doge_blocks / d.uptime_seconds;
+                    var drem = Math.ceil((d.spv.doge_need - d.spv.doge_blocks) / Math.max(dr, 0.01));
+                    dogeTxt += ' (~' + (drem > 60 ? Math.ceil(drem/60) + 'min' : drem + 's') + ')';
+                }
+                document.getElementById('d-doge-spv').textContent = dogeTxt;
+                document.getElementById('d-doge-spv').className = 'val ' + (dogeDone ? 'ok' : 'wait');
+            }
         }
         var m = Math.floor((d.uptime_seconds || 0) / 60);
         var s = (d.uptime_seconds || 0) % 60;

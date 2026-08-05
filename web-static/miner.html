@@ -637,13 +637,15 @@
                 </div>
             </div>
             
-            <!-- Merged Mining Blocks Table -->
-            <div class="section-header" id="merged_blocks_header">
+            <!-- Merged Mining Blocks Table — hidden by default; revealed only
+                 when currency_info advertises a merged child (topology-driven,
+                 #896). Standalone parents (DASH/BTC/DGB) never show it. -->
+            <div class="section-header" id="merged_blocks_header" style="display: none;">
                 <h2>🔗 Merged Mining Blocks Found</h2>
             </div>
-            
+
             <!-- Merged Payout Summary Stats -->
-            <div class="stats-grid" style="margin-bottom: 20px;">
+            <div class="stats-grid" id="merged_summary_grid" style="display: none; margin-bottom: 20px;">
                 <div class="stat-card">
                     <h3>Merged Blocks Found</h3>
                     <div class="stat-value success" id="merged_blocks_found">0</div>
@@ -666,7 +668,7 @@
                 </div>
             </div>
             
-            <div class="chart-container">
+            <div class="chart-container" id="merged_blocks_panel" style="display: none;">
                 <div id="merged_blocks_loading" class="loading" style="padding: 20px;">
                     <div class="loading-spinner"></div>
                     <div>Loading merged blocks data...</div>
@@ -1524,6 +1526,14 @@
             var symbol = currency_info.symbol || 'COIN';
             document.getElementById('currency_symbol').textContent = symbol;
             document.getElementById('payout_label').textContent = symbol + ' on next block';
+            // Merged-mining cards are topology-driven: only a merged parent
+            // (currency_info.merged_child_symbol present) shows them. A
+            // standalone coin (DASH/BTC/DGB) keeps them hidden.
+            if (info && info.merged_child_symbol) {
+                document.getElementById('merged_blocks_header').style.display = '';
+                document.getElementById('merged_summary_grid').style.display = '';
+                document.getElementById('merged_blocks_panel').style.display = '';
+            }
             if (info && info.explorer_enabled && info.explorer_url) {
                 var nav = document.querySelector('nav');
                 var _old = document.getElementById('nav-explorer'); if (_old) _old.remove();
