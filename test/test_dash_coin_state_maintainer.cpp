@@ -1706,3 +1706,126 @@ TEST(DashCoinStateMaintainer, BodyFirstSnapshotPromotionFiresStateDirty) {
     EXPECT_GT(dirty, dirty_before)
         << "snapshot promotion must fire the re-issue sink (bump + notify)";
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// DIP-0027 asset-unlock FEE term — KAT from real mainnet block 2,166,498.
+//
+// dashd (evo/creditpool.cpp) removes the GROSS unlock amount from the credit
+// pool for every type-9 tx: payload.fee + Σ(tx.vout.value). The fee reaches
+// the miner through the coinbase, but it still LEAVES the pool. An accrual
+// that subtracts only Σvout runs HIGH by Σfee at every unlock block, so the
+// per-block cross-check against the committed cbTx creditPoolBalance trips
+// ACCRUAL DRIFT (fail-closed: freshness seed not advanced) at each of the
+// ~5k historical unlock blocks — and an embedded template built from the
+// drifted balance commits a wrong cbTx creditPool field (bad-cbtx class).
+//
+// Known answers, re-verified against a mainnet dashd (dash-cli getblock ×2,
+// 2026-08-05):
+//   cbTx(2,166,497).creditPoolBalance = 1,366,727,881,775
+//   block 2,166,498: 4 type-9 unlocks (indexes 156..159), each fee = 190;
+//                    Σvout = 100e6 + 100e6 + 1000e6 + 100e6 = 1,300,000,000
+//   platform reward at 2,166,498 (mainnet MN_RR active)   =    53,617,393
+//   cbTx(2,166,498).creditPoolBalance = 1,365,481,498,408
+//     = 1,366,727,881,775 + 53,617,393 − 1,300,000,000 − 760
+// Omitting the fee computes 1,365,481,499,168 — exactly 760 high.
+// ════════════════════════════════════════════════════════════════════════
+
+static std::vector<unsigned char> encode_unlock_payload(
+    const dash::coin::vendor::CAssetUnlockPayload& p)
+{
+    auto stream = ::pack(p);
+    auto sp = stream.get_span();
+    return std::vector<unsigned char>(
+        reinterpret_cast<const unsigned char*>(sp.data()),
+        reinterpret_cast<const unsigned char*>(sp.data()) + sp.size());
+}
+
+// A structurally-real type-9 asset-unlock tx: no vin (credit-pool mint),
+// withdrawal vout, and a well-formed CAssetUnlockPayload carrying the fee.
+static MutableTransaction make_asset_unlock(uint64_t index, uint32_t fee,
+                                            uint32_t requested_height,
+                                            int64_t out_value, uint8_t salt)
+{
+    MutableTransaction tx;
+    tx.version  = 3;
+    tx.type     = dash::coin::vendor::CAssetUnlockPayload::SPECIALTX_TYPE;
+    tx.locktime = 0;
+    TxOut o;
+    o.value = out_value;
+    o.scriptPubKey.m_data = p2pkh_script(salt);
+    tx.vout.push_back(o);
+    dash::coin::vendor::CAssetUnlockPayload p;
+    p.nVersion        = dash::coin::vendor::CAssetUnlockPayload::CURRENT_VERSION;
+    p.index           = index;
+    p.fee             = fee;
+    p.requestedHeight = requested_height;
+    p.quorumHash      = raw256(salt);   // structural only — not verified here
+    tx.extra_payload  = encode_unlock_payload(p);
+    return tx;
+}
+
+// The four unlocks of mainnet 2,166,498, appended to a type-5 CbTx coinbase
+// committing `committed_balance` at the block's own height.
+static BlockType make_unlock_block_2166498(int64_t committed_balance)
+{
+    BlockType blk = make_cbtx_block(2'166'498u, committed_balance,
+                                    p2pkh_script(0x30));
+    blk.m_txs.push_back(make_asset_unlock(156, 190, 2'166'497u,
+                                          1'000'000'000LL, 0x10));
+    blk.m_txs.push_back(make_asset_unlock(157, 190, 2'166'497u,
+                                          100'000'000LL, 0x20));
+    blk.m_txs.push_back(make_asset_unlock(158, 190, 2'166'497u,
+                                          100'000'000LL, 0x21));
+    blk.m_txs.push_back(make_asset_unlock(159, 190, 2'166'497u,
+                                          100'000'000LL, 0x22));
+    bind_block(blk);   // re-bind: the tx set changed after make_cbtx_block
+    return blk;
+}
+
+// Pure state-machine KAT. FAILS-ON-MASTER: apply_block subtracted only Σvout,
+// yielding 1,365,481,499,168 (760 high) instead of the committed
+// 1,365,481,498,408.
+TEST(DashCreditPool, MainnetBlock2166498UnlockFeeKAT) {
+    // Independent pin of the platform-reward term used below (mainnet MN_RR).
+    const int64_t reward =
+        dash::coin::compute_dash_platform_reward_post_v20_mn_rr(2'166'498u);
+    ASSERT_EQ(reward, 53'617'393LL);
+
+    dash::coin::CreditPool sm;
+    sm.seed(1'366'727'881'775LL, 2'166'497u);
+
+    auto blk = make_unlock_block_2166498(1'365'481'498'408LL);
+    auto delta = sm.apply_block(blk, 2'166'498u, reward);
+    ASSERT_TRUE(delta.has_value());
+    EXPECT_EQ(*delta, 53'617'393LL - 1'300'000'000LL - 760LL)
+        << "unlock delta must be −(Σvout + Σfee) + platform reward";
+    EXPECT_EQ(sm.balance(), 1'365'481'498'408LL)
+        << "credit-pool balance must match the committed cbTx value "
+           "(off-by-Σfee = the omitted payload.fee term)";
+    EXPECT_EQ(sm.height(), 2'166'498u);
+}
+
+// Maintainer wire-path KAT: a CONTIGUOUS advance through the real unlock
+// block must verify against the committed balance and advance the freshness
+// seed. FAILS-ON-MASTER: the fee-less accrual disagreed with the wire value,
+// tripping ACCRUAL DRIFT — fail-closed, seed held at 2,166,497.
+TEST(DashCoinStateMaintainer, UnlockBlockContiguousAdvanceNoAccrualDrift) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+
+    // Cold bootstrap at 2,166,497 off the block's own committed balance.
+    m.on_block_connected(make_cbtx_block(2'166'497u, 1'366'727'881'775LL,
+                                         p2pkh_script(0x30)),
+                         2'166'497u);
+    ASSERT_EQ(st.credit_pool_height(), 2'166'497);
+    ASSERT_EQ(st.credit_pool(), 1'366'727'881'775LL);
+
+    // Contiguous next block: the independent accrual (platform reward
+    // + Σlocks − Σunlocks-incl-fee) must equal the committed balance.
+    m.on_block_connected(make_unlock_block_2166498(1'365'481'498'408LL),
+                         2'166'498u);
+    EXPECT_EQ(st.credit_pool_height(), 2'166'498)
+        << "ACCRUAL DRIFT fired on a correct block: the unlock fee term is "
+           "missing from the credit-pool delta";
+    EXPECT_EQ(st.credit_pool(), 1'365'481'498'408LL);
+}

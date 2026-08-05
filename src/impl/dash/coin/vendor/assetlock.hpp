@@ -17,12 +17,17 @@
 //                         Mints UTXO from the credit pool. The tx has
 //                         NO regular inputs (treasury-class spend
 //                         secured by the LLMQ signature in payload).
-//                         Pool balance changes by -sum(tx.vouts.value).
+//                         Pool balance changes by
+//                         -(payload.fee + sum(tx.vouts.value)).
 //                         (The 'fee' field in the payload is the
 //                         miner fee deducted from the unlock total —
-//                         it goes to the miner's coinbase, NOT into
-//                         the credit pool, so it doesn't appear in
-//                         the credit-pool delta.)
+//                         it goes to the miner's coinbase, not back
+//                         into the pool, so it IS part of the amount
+//                         that leaves the pool and MUST be included
+//                         in the credit-pool delta. Verified against
+//                         mainnet block 2,166,498: the committed
+//                         cbTx creditPoolBalance steps by
+//                         −(Σvout + Σfee).)
 //
 // Adaptations from upstream:
 //   1. CBLSSignature (96-byte BLS sig) → std::array<uint8_t, 96>.
