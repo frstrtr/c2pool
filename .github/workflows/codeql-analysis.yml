@@ -27,6 +27,18 @@ env:
 
 jobs:
   analyze:
+    # Reap-guard: the c-cpp leg takes a HOST-SIDE exclusive flock (see
+    # "Acquire per-host heavy-leg lock" below) shared with build.yml
+    # linux-asan, so CodeQL c-cpp and the ASan build are never co-resident
+    # on one physical host: runner processes on one host share /tmp, so
+    # the flock is exactly per-host mutual exclusion -- a second heavy leg
+    # on the same host WAITS (nothing is ever cancelled) while different
+    # hosts run in parallel. The python leg (build-mode: none) is light
+    # and does not take the lock. A workflow-level concurrency group is
+    # deliberately NOT used: GitHub keeps at most 1 running + 1 pending
+    # per group and CANCELS older pending entries, so a shared repo-global
+    # group deterministically self-cancelled one of each run's own jobs
+    # and serialized all heavy legs repo-wide.
     name: Analyze (${{ matrix.language }})
     # Hard cap: the analyze job had no timeout-minutes, so a wedged
     # CodeQL tracer build (uncapped, not the orphan-reap class of #1027/
@@ -35,8 +47,12 @@ jobs:
     # legit 59.2); the only longer sample was the 600 min runaway this
     # cap targets. 90 min sits above p95 with cold-cache headroom and
     # well under the ~2h death point, converting the hang to a
-    # deterministic red without touching any legitimate run.
-    timeout-minutes: 90
+    # deterministic red without touching any legitimate run. +60 min on
+    # top of that budget for the per-host heavy-leg lock wait (worst case:
+    # queued behind one full ASan leg on the same host) => 150; the 60-min
+    # STEP cap on the analyze phase below keeps the wedged-tracer fast-red
+    # property unchanged.
+    timeout-minutes: 150
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     permissions:
       security-events: write
@@ -54,6 +70,41 @@ jobs:
             build-mode: none
 
     steps:
+      # Reap-guard: host-scoped exclusivity vs build.yml linux-asan (the
+      # other RAM-heavy leg). c-cpp (build-mode: manual) only -- the python
+      # leg is light. Held by a disowned holder process so it spans every
+      # step of this job (the heavy "Perform CodeQL Analysis" phase is an
+      # action step that cannot be wrapped in a shell flock). Released by
+      # the always() step at the end of the job; the holder also has a 4 h
+      # TTL so a host-reaped job can never wedge the lock, and the
+      # runner's end-of-job orphan cleanup is a second net.
+      - name: Acquire per-host heavy-leg lock (reap-guard)
+        if: matrix.build-mode == 'manual' && runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOCK=/tmp/c2pool-heavy-leg.lock
+          ACQ="$(mktemp -u /tmp/c2pool-heavy-acq.XXXXXX)"
+          # Holder: waits up to 60 min for the lock, then holds it with a
+          # 4 h TTL (self-expires so a reaped job cannot wedge the host).
+          # fds redirected so the step does not hang on the open pipe;
+          # disowned so it survives this step's shell (NOT setsid: setsid
+          # forks, orphaning $!; and the runner's end-of-job cleanup
+          # SHOULD reap the holder if the release step never runs).
+          bash -c "exec 9>'$LOCK' && flock -x -w 3600 9 && touch '$ACQ' && exec sleep 14400" </dev/null >/dev/null 2>&1 &
+          HOLDER=$!
+          disown "$HOLDER"
+          echo "HEAVY_LEG_LOCK_HOLDER=$HOLDER" >> "$GITHUB_ENV"
+          while kill -0 "$HOLDER" 2>/dev/null && [ ! -e "$ACQ" ]; do
+            sleep 2
+          done
+          if [ ! -e "$ACQ" ]; then
+            echo "::error::per-host heavy-leg lock not acquired within 60 min on $RUNNER_NAME"
+            exit 1
+          fi
+          rm -f "$ACQ"
+          echo "heavy-leg lock acquired on $RUNNER_NAME (holder pid $HOLDER)"
+
       - name: Checkout repository
         uses: actions/checkout@v6
 
@@ -229,3 +280,11 @@ jobs:
       - name: Prune runner workspace
         if: always()
         uses: ./.github/actions/prune-runner-workspace
+
+      - name: Release per-host heavy-leg lock
+        if: always() && matrix.build-mode == 'manual' && runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          if [ -n "${HEAVY_LEG_LOCK_HOLDER:-}" ]; then
+            kill "$HEAVY_LEG_LOCK_HOLDER" 2>/dev/null || true
+          fi

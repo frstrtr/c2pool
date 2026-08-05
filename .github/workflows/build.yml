@@ -262,12 +262,59 @@ jobs:
   # Will flip to required once known UAFs are fixed (Phase 7).
   # ════════════════════════════════════════════════════════════════════════════
   linux-asan:
+    # Reap-guard (#1027/#1031 class): host co-residency of two RAM-heavy legs
+    # (this ASan/UBSan build + CodeQL c-cpp analyze) is what produced the
+    # steps=0 reaps on 198 and 145. Exclusion is enforced HOST-SIDE via an
+    # exclusive flock on /tmp (the "Acquire per-host heavy-leg lock" step
+    # below): runner processes on one physical host (905/905-2..905-8,
+    # 198-2/198-3) share /tmp, so the flock is exactly per-host mutual
+    # exclusion -- a second heavy leg on the same host WAITS (nothing is
+    # ever cancelled) while heavy legs on different hosts run in parallel.
+    # A workflow-level concurrency group is deliberately NOT used: GitHub
+    # keeps at most 1 running + 1 pending run per group and CANCELS older
+    # pending entries, so a shared repo-global group self-cancels sibling
+    # jobs of the same run and serializes/starves all heavy legs repo-wide.
     name: Linux x86_64 (AsAN+UBSan)
     # dash bring-up slices may opt out of sanitizers via dash-skip-sanitizers; KEEP for consensus/payout slices (default = on)
     if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-skip-sanitizers')) }}
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     continue-on-error: true
     steps:
+      # Reap-guard: host-scoped exclusivity vs the other RAM-heavy leg
+      # (CodeQL c-cpp analyze). The lock is held by a disowned holder
+      # process so it spans every step of this job (the CodeQL sibling's
+      # heavy phase is an action step that cannot be wrapped in a shell
+      # flock, hence the cross-step holder shape on both sides). Released
+      # by the always() step at the end of the job; the holder also has a
+      # 4 h TTL so a host-reaped job can never wedge the lock, and the
+      # runner's end-of-job orphan cleanup is a second net.
+      - name: Acquire per-host heavy-leg lock (reap-guard)
+        if: runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOCK=/tmp/c2pool-heavy-leg.lock
+          ACQ="$(mktemp -u /tmp/c2pool-heavy-acq.XXXXXX)"
+          # Holder: waits up to 60 min for the lock, then holds it with a
+          # 4 h TTL (self-expires so a reaped job cannot wedge the host).
+          # fds redirected so the step does not hang on the open pipe;
+          # disowned so it survives this step's shell (NOT setsid: setsid
+          # forks, orphaning $!; and the runner's end-of-job cleanup
+          # SHOULD reap the holder if the release step never runs).
+          bash -c "exec 9>'$LOCK' && flock -x -w 3600 9 && touch '$ACQ' && exec sleep 14400" </dev/null >/dev/null 2>&1 &
+          HOLDER=$!
+          disown "$HOLDER"
+          echo "HEAVY_LEG_LOCK_HOLDER=$HOLDER" >> "$GITHUB_ENV"
+          while kill -0 "$HOLDER" 2>/dev/null && [ ! -e "$ACQ" ]; do
+            sleep 2
+          done
+          if [ ! -e "$ACQ" ]; then
+            echo "::error::per-host heavy-leg lock not acquired within 60 min on $RUNNER_NAME"
+            exit 1
+          fi
+          rm -f "$ACQ"
+          echo "heavy-leg lock acquired on $RUNNER_NAME (holder pid $HOLDER)"
+
       - uses: actions/checkout@v6
 
       # Per-job Conan home under $RUNNER_TEMP so concurrent jobs on the shared
@@ -413,6 +460,14 @@ jobs:
       - name: Prune runner workspace
         if: always()
         uses: ./.github/actions/prune-runner-workspace
+
+      - name: Release per-host heavy-leg lock
+        if: always() && runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          if [ -n "${HEAVY_LEG_LOCK_HOLDER:-}" ]; then
+            kill "$HEAVY_LEG_LOCK_HOLDER" 2>/dev/null || true
+          fi
 
   # ════════════════════════════════════════════════════════════════════════════
   # COIN_BCH leg — Bitcoin Cash (SHA256d standalone parent, V36)
