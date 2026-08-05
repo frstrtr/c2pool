@@ -98,6 +98,13 @@ TEST(RelayBlockHonesty, LocallyFoundBlockKeepsRealTiming) {
     EXPECT_NE(blk["luck_method"].get<std::string>(), "relayed")
         << "a locally-found block must carry a real timing label, not 'relayed'";
 
-    EXPECT_TRUE(blk["luck"].is_number())
-        << "locally-found luck is a genuine measured number, not null";
+    // 2026-08-05 revision: this block is the FIRST in its ledger, so no
+    // time_to_find exists and no luck was ever computed. The original
+    // assertion pinned that fabricated 0.0 as "a genuine measured number" —
+    // and the hotel's luck-trend chart faithfully drew those zeros as a
+    // catastrophe. An uncomputed luck is honest-absent null on found blocks
+    // too; luck_method=first_block is the label that says why.
+    EXPECT_TRUE(blk["luck"].is_null())
+        << "a first block has no luck measurement; 0 would be a fabricated one";
+    EXPECT_EQ(blk["luck_method"].get<std::string>(), "first_block");
 }

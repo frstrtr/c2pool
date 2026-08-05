@@ -628,6 +628,22 @@ public:
         uint64_t coinbase_value_sat = 0;      // "coinbasevalue"
         uint64_t payment_amount_sat = 0;      // masternode+treasury share
         uint64_t height = 0;                  // template height
+        // TOTAL of every coinbase output that does NOT go to miners, in
+        // template order: masternode payee + operator split + superblock +
+        // the DIP-0027 platform OP_RETURN burn. Measured on the hotel
+        // (2026-08-05, DASH mainnet h=2516911): payment_amount_sat carried
+        // only the MN payee (0.8298), so the dashboard's "miner" share read
+        // 53% of the block when the ACCEPTED coinbase paid miners 25% -- the
+        // 0.4979 platform burn was silently counted as miner money. 0 =
+        // producer did not fill it; consumers then fall back to
+        // payment_amount_sat (pre-existing behaviour, LTC unchanged).
+        uint64_t payments_total_sat = 0;
+        // Of payments_total_sat, the OP_RETURN burn portion (display split).
+        uint64_t burn_sat = 0;
+        // Wall-clock seconds since this template was sourced (0 = unknown).
+        // A stale template renders as a legitimate-looking block_value; the
+        // age is what lets the dashboard say "this number is N minutes old".
+        int64_t  template_age_sec = -1;
     };
     void set_coin_work_fn(std::function<CoinWorkInfo()> fn) { m_coin_work_fn = thread_safe_wrap(std::move(fn)); }
 
@@ -1524,6 +1540,19 @@ private:
     };
     BestDifficulty m_best_difficulty;
     mutable std::mutex m_best_diff_mutex;
+    // ── ALL-TIME best-share persistence ─────────────────────────────────
+    // Measured (hotel primary, 2026-08-05, uptime 36 min): /local_stats
+    // best_share showed all_time == session == round — the "all-time" leg
+    // reset on every restart because it lived only in memory, so the card
+    // was quietly lying about what "all time" means. Persisted as a small
+    // sidecar JSON next to the stat log (all_time leg ONLY: session and
+    // round are honestly per-process/per-round). Display only.
+    std::string best_share_db_path() const {
+        return m_stat_log_path.empty() ? std::string()
+                                       : m_stat_log_path + ".best.json";
+    }
+    void save_best_share_all_time();
+    void load_best_share_all_time();
 
     // Per-miner rolling hashrate ring populated by
     // record_share_difficulty; consumed by rest_pplns_current

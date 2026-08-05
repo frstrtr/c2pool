@@ -335,3 +335,41 @@ TEST(DashDashboardFoundBlock, RecordFoundBlockDedupsOnBlockHash)
                           "Xminer", block_b.GetHex(), 1.0, 2.0, 3.0, SUBSIDY);
     EXPECT_EQ(mi.rest_recent_blocks().size(), 2u);
 }
+
+// 6) FINDER ATTRIBUTION IS THE SHARE'S OWN COMMITTED PAYOUT — pinned against
+//    the 2026-08-05 h=2516911 incident. The reserve dashboard showed
+//    miner=XghFtkZ8W3vhEHejUBbD3n387hemVJ6Pt4 for our pool's block and the
+//    operator read it as a wrong pick of a coinbase output (the MN payee or
+//    the operator split). It is neither: row_from_share() reads
+//    s.m_pubkey_hash — the payout identity the winning share itself commits
+//    to, i.e. the FINDER, who can be any pool participant on any node — and
+//    never inspects a coinbase output. The accepted coinbase paying that
+//    same address a small PPLNS slice (output 1, 0.0407 DASH) is what
+//    CONFIRMS the finder was a genuine (small) participant. This KAT builds
+//    a share committing to XghF…'s real hash160 while the coinbase
+//    scriptSig-side data carries a DIFFERENT (miner_pubkey_hash) identity
+//    everywhere else in this file, and pins that the row encodes exactly the
+//    share's committed payout.
+TEST(DashDashboardFoundBlock, MinerIsTheSharesCommittedPayoutNotACoinbaseOutput)
+{
+    dash::DashShare s;
+    s.m_hash      = hash_from_byte(0x66);
+    s.m_min_header.m_timestamp = HEADER_TIME;
+    s.m_bits      = SHARE_BITS;
+    s.m_subsidy   = 177109977;   // the real h=2516911 coinbase total
+    s.m_coinbase.m_data = bip34_scriptsig();
+    // XghFtkZ8W3vhEHejUBbD3n387hemVJ6Pt4 == P2PKH(version 76) over hash160
+    // 41e4d6d8971a735946494cdbc5e8602c5209b98e (decoded from the address;
+    // the accepted block's output 1 pays the same script). SetHex parses a
+    // big-endian NUMBER into little-endian storage, and the P2PKH script is
+    // built from the INTERNAL bytes — so the hex is fed reversed to land the
+    // script bytes in wire order.
+    s.m_pubkey_hash.SetHex("8eb909522c60e8c5db4c494659731a97d8d6e441");
+
+    const auto row = dash::dashboard::row_from_share(
+        s.m_hash, s, /*testnet=*/false);
+
+    EXPECT_EQ(row.miner, "XghFtkZ8W3vhEHejUBbD3n387hemVJ6Pt4")
+        << "the row's miner must be the share's committed payout address";
+    EXPECT_EQ(row.subsidy, 177109977u);
+}

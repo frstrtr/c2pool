@@ -7150,8 +7150,11 @@
                 
                 // Check if block is within selected time window (exact range for alignment)
                 if (blockTime >= minTime && blockTime <= maxTime) {
-                    // For luck trend, collect blocks with luck data within time window
-                    if (b.luck !== undefined && b.luck !== null) {
+                    // For luck trend, collect blocks with luck data within time window.
+                    // luck <= 0 means "never computed" (relay-learned row, or a row
+                    // recorded before the netdiff-at-find fix), NOT 0% luck -- plotting
+                    // it drew the 2026-08-05 hotel chart down to zero. Skip, don't draw.
+                    if (b.luck !== undefined && b.luck !== null && b.luck > 0) {
                         luckTrendData.push([blockTime, b.luck]);
                         validLucks.push(b.luck);
                     }
@@ -7803,8 +7806,11 @@
                 
                 // Check if block is within selected time window (exact range for alignment)
                 if (blockTime >= minTime && blockTime <= maxTime) {
-                    // For luck trend, collect blocks with luck data within time window
-                    if (b.luck !== undefined && b.luck !== null) {
+                    // For luck trend, collect blocks with luck data within time window.
+                    // luck <= 0 means "never computed" (relay-learned row, or a row
+                    // recorded before the netdiff-at-find fix), NOT 0% luck -- plotting
+                    // it drew the 2026-08-05 hotel chart down to zero. Skip, don't draw.
+                    if (b.luck !== undefined && b.luck !== null && b.luck > 0) {
                         luckTrendData.push([blockTime, b.luck]);
                         validLucks.push(b.luck);
                     }

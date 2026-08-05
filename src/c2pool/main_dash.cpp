@@ -1317,8 +1317,33 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         {
             core::WebServer* ws = web_server.get();
             p2p_node.tracker().m_on_share_difficulty =
-                [ws](double diff, const std::string& miner) {
-                    ws->get_mining_interface()->record_share_difficulty(diff, miner);
+                [ws, testnet](double diff, const std::string& miner,
+                              const uint256& share_hash) {
+                    // ── ENCODE THE MINER (hotel primary, 2026-08-05) ──────
+                    // The tracker reports the share's committed payout as a
+                    // RAW hash160 hex, and the best_share card rendered it
+                    // verbatim ("cfc7a034…3b8d") while the reserve — whose
+                    // record came via stratum usernames — showed a proper
+                    // address. Same entity, two spellings, read as a bug.
+                    // Encode here, where testnet-ness is known, with the
+                    // exact version bytes dashboard_found_block.hpp uses.
+                    std::string shown = miner;
+                    if (miner.size() == 40) {
+                        uint160 h160;
+                        h160.SetHex(miner);
+                        std::string addr = core::script_to_address(
+                            dash::pubkey_hash_to_script2(h160),
+                            /*bech32_hrp=*/"",
+                            testnet ? dash::dashboard::P2PKH_VERSION_TESTNET
+                                    : dash::dashboard::P2PKH_VERSION_MAINNET,
+                            testnet ? dash::dashboard::P2SH_VERSION_TESTNET
+                                    : dash::dashboard::P2SH_VERSION_MAINNET);
+                        if (!addr.empty()) shown = std::move(addr);
+                    }
+                    // The share hash rides through so best_share.hash names
+                    // the record share instead of rendering "".
+                    ws->get_mining_interface()->record_share_difficulty(
+                        diff, shown, share_hash.GetHex());
                 };
         }
 
@@ -1365,7 +1390,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             row.chain, row.miner, row.share_hash,
                             mi->get_network_difficulty(),
                             row.share_difficulty,
-                            mi->get_local_hashrate(),
+                            // pool_hashrate_at_find: 0 routes the core to the
+                            // real POOL estimator (m_pool_hashrate_fn); this
+                            // site passed get_local_hashrate(), which is only
+                            // the pool rate when every rig sits on this node.
+                            /*pool_hashrate=*/0.0,
                             row.subsidy);
                         // Arm the post-broadcast confirm/orphan poller so this
                         // peer-found block flips off "pending" (main_ltc.cpp:6315
@@ -2145,10 +2174,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 [ws](uint32_t height, const uint256& block_hash,
                      const std::string& miner, bool reached_network) {
                     auto* mi = ws->get_mining_interface();
-                    // Enrich the recorded win with the block reward + real pool
-                    // hashrate so the dashboard shows a truthful value instead of
-                    // 0 (main_ltc.cpp:2988 parity). Display only.
-                    double pool_hr = mi->get_local_hashrate();
+                    // Subsidy: the WebServer-held template is empty on the
+                    // embedded arm (row 2516914 recorded subsidy=0 from it on
+                    // 2026-08-05); record_found_block now falls back to the
+                    // live coin template itself, so 0 here means "let the
+                    // core ask the template". Same for pool hashrate: this
+                    // site passed get_local_hashrate() into a field named
+                    // pool_hashrate_at_find — correct only while every rig
+                    // in the pool happens to sit on this node. 0 routes the
+                    // core to m_pool_hashrate_fn (the real pool estimator),
+                    // which is the rate expected_time/luck are defined over.
                     uint64_t subsidy = 0;
                     {
                         auto tmpl = mi->get_current_work_template();
@@ -2161,7 +2196,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         "DASH", miner, block_hash.GetHex(),
                         mi->get_network_difficulty(),
                         /*share_difficulty=*/0.0,
-                        pool_hr,
+                        /*pool_hashrate=*/0.0,
                         subsidy);
                     // Arm the post-broadcast confirm/orphan poller so this local
                     // win flips off "pending" (main_ltc.cpp:4258 parity).
@@ -2615,6 +2650,30 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         info.coinbase_value_sat = t->m_coinbase_value;
                         info.payment_amount_sat = t->m_payment_amount;
                         info.height             = t->m_height;
+                        info.template_age_sec   = wsrc->peek_template_age_sec();
+                        // ── EVERY non-miner output, not just the MN payee ─
+                        // m_payment_amount rides in share serialization and
+                        // on the embedded arm carries ONLY the projected MN
+                        // payment — it must keep that meaning. The dashboard
+                        // needs the ACCEPTED-coinbase truth: miner share =
+                        // coinbasevalue − ALL protocol outputs. Measured on
+                        // our own accepted h=2516911: MN 0.8304 + platform
+                        // burn 0.4979 leave miners 0.4428 (25%), while the
+                        // card computed 0.9404 (53%) by subtracting the MN
+                        // payee alone. Summing m_packed_payments — which
+                        // both the RPC and embedded builders fill in real
+                        // coinbase-output order — closes that gap. Display
+                        // only; no share/consensus field is touched.
+                        uint64_t total = 0, burn = 0;
+                        for (const auto& pp : t->m_packed_payments) {
+                            total += pp.amount;
+                            // "!6a" is the normalized OP_RETURN platform
+                            // burn (rpc.cpp / embedded_gbt.hpp both use it).
+                            if (pp.payee.rfind("!6a", 0) == 0)
+                                burn += pp.amount;
+                        }
+                        info.payments_total_sat = total;
+                        info.burn_sat           = burn;
                         if (t->m_bits != 0)
                             info.network_difficulty = chain::target_to_difficulty(
                                 dash::coin::target_from_nbits(t->m_bits));
