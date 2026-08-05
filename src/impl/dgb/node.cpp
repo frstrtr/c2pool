@@ -910,14 +910,19 @@ void NodeImpl::notify_local_share(const uint256& share_hash)
 {
     // p2pool: set_best_share() → think() synchronously on the reactor thread.
     // Use think() for ALL best_share decisions, as p2pool does.
-    if (share_hash.IsNull() || !m_tracker.chain.contains(share_hash))
+    if (share_hash.IsNull())
         return;
 
-    // Try inline verify — if think() holds the mutex, defer to next think() cycle.
-    // The share is already in the chain; think() will verify + score it.
+    // Both the chain.contains() read AND attempt_verify() run UNDER the tracker
+    // lock (BTC origin btc/node.cpp:1054; LTC mirrored f445db8e). A bare
+    // m_tracker.chain.contains() here (the prior code) raced the compute-thread
+    // clean_tracker() exclusive prune freeing chain nodes -> SIGSEGV (kr1z1s
+    // LTC/DGB). try_to_lock keeps the IO thread non-blocking; if think()/clean
+    // holds the lock we skip the inline verify — the share is already in-chain
+    // and run_think() below will score it next cycle.
     {
         std::unique_lock lock(m_tracker_mutex, std::try_to_lock);
-        if (lock.owns_lock())
+        if (lock.owns_lock() && m_tracker.chain.contains(share_hash))
             m_tracker.attempt_verify(share_hash);
     }
 
