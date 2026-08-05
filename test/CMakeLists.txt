@@ -899,7 +899,15 @@ if (BUILD_TESTING AND GTest_FOUND)
     # NodeCoinState: node-held embedded coin-state holder over the
     # work_source selector link set (mn_state_machine + mempool header-only);
     # no ltc/pool SCC dependency. Mirrors the test_dash_work_source link set.
-    add_executable(test_dash_node_coin_state test_dash_node_coin_state.cpp)
+    # D-DASH.ORACLE-OWNERSHIP rides this EXISTING allowlisted target rather than
+    # a new add_executable — a fresh target absent from the build.yml --target
+    # allowlist becomes the silently-passing NOT_BUILT sentinel (#143). It is a
+    # source-structural guard over embedded_oracle_shadow.hpp + main_dash.cpp,
+    # so it needs no link deps of its own; the compile definitions hand it the
+    # paths to the SHIPPED sources.
+    add_executable(test_dash_node_coin_state
+        test_dash_node_coin_state.cpp
+        test_dash_oracle_shadow_ownership.cpp)
     target_link_libraries(test_dash_node_coin_state PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -907,6 +915,9 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_node_coin_state PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    target_compile_definitions(test_dash_node_coin_state PRIVATE
+        DASH_ORACLE_SHADOW_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/impl/dash/coin/embedded_oracle_shadow.hpp"
+        DASH_MAIN_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/c2pool/main_dash.cpp")
     gtest_add_tests(test_dash_node_coin_state "" AUTO)
 
     # bestCL template gate: dashcore's CheckCbTxBestChainlock rule (consensus-
