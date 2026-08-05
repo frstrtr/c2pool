@@ -5142,6 +5142,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 : (g_replay_bulk_start != 0
                        ? g_replay_bulk_start
                        : (testnet ? 1 : rp::MAINNET_DIP3_HEIGHT));
+            // ── THE EXCLUSION BAND (found by the third live seam run) ──────
+            // The lane's default fetch ceiling is tip − 12: the live edge
+            // "belongs to the tip lane" (priority invariant 3). For an
+            // OBSERVE-only throughput lane that is exactly right. For a fold
+            // whose whole purpose is to BE current it is a permanent
+            // 12-block deficit — and nobody else fetches that band, because
+            // the tip lane only pulls the tip's own body. Three runs in a row
+            // parked on it, to the block:
+            //   [REPLAY-PAYEE] WITHHELD: G7 fold is BEHIND the tip:
+            //                  fold h=2516939, tip h=2516951 (12 blocks to go)
+            //
+            // With the fold armed the band is closed. The priority invariant
+            // that actually matters is preserved: the lane still issues no
+            // request while a tracked tip body is outstanding (the tip_busy
+            // guard in BulkFetchLane::tick), so the tip lane keeps winning
+            // every race — it simply no longer wins a band it never enters.
+            // Unarmed (--replay-bulk alone) the default 12 is untouched.
+            if (replay_fold_consumer) rcfg.tip_exclusion = 0;
             replay_lane = std::make_unique<rp::BulkFetchLane>(
                 std::move(seams), rcfg, replay_backfill.get(),
                 replay_consumer, replay_cursor.get());
