@@ -185,7 +185,15 @@ inline DashWorkData build_embedded_workdata(
     // one path that does not depend on it at all.
     //
     // Default false => every existing positional caller is byte-unchanged.
-    bool suppress_mempool_txs = false)
+    bool suppress_mempool_txs = false,
+    // NAME-THE-STATE seam for the suppressed body: WHY this template is
+    // coinbase-only. Two producers exist: the UTXO-immature serving window
+    // (the historical default, kept as the default string so every existing
+    // positional caller is byte-unchanged) and the --embedded-serve-mempool-txs
+    // default-OFF posture ("mempool-txs-disabled", node_coin_state.hpp). The
+    // cause rides the template (m_txset_empty_cause) + the log line, so soaks
+    // can tell the two coinbase-only modes apart.
+    const char* txset_empty_cause = "utxo-immature-serving")
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
@@ -211,11 +219,16 @@ inline DashWorkData build_embedded_workdata(
     // mempool is not even consulted for selection (only, below, for the forgone-
     // fee report), so no partially-warm UTXO view can price anything into this
     // template.
+    // next_height threads the G3 coinbase-maturity check into selection: a
+    // vin spending a UTXO coinbase younger than 100 confs AT THIS HEIGHT is
+    // refused (bad-txns-premature-spend-of-coinbase). Selection is also
+    // topological (G1) and sigop-capped (G2) — see mempool.hpp.
     auto [selected, total_fees] =
         suppress_mempool_txs
             ? std::pair<std::vector<Mempool::SelectedTx>, uint64_t>{{}, 0ull}
             : mempool.get_sorted_txs_with_fees(MAX_BLOCK_BYTES,
-                                               /*exclude_special=*/true);
+                                               /*exclude_special=*/true,
+                                               /*next_height=*/w.m_height);
     // MN-collateral spend filter (sml_projection.hpp, FINDING-2). The C-3
     // special-tx cut above is NOT sufficient: dashd's verifier removes a
     // masternode from the list when ANY block tx — special or not — spends
@@ -344,11 +357,11 @@ inline DashWorkData build_embedded_workdata(
         // log, with the price attached. A soak greps this to answer both "how
         // long did the node run coinbase-only" and "what did that cost".
         const uint64_t mempool_fees = mempool.total_known_fees();
-        w.m_txset_empty_cause  = "utxo-immature-serving";
+        w.m_txset_empty_cause  = txset_empty_cause;
         w.m_txset_forgone_fees = mempool_fees;
         if (underfill_tripped) *underfill_tripped = false;
         LOG_INFO << "[GBT-EMB] arm=EMBEDDED txset=empty"
-                 << " cause=utxo-immature-serving"
+                 << " cause=" << txset_empty_cause
                  << " h=" << w.m_height
                  << " mempool_tx=" << mempool.size()
                  << " forgone_fees<=" << mempool_fees

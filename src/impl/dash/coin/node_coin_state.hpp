@@ -403,6 +403,24 @@ public:
         return m_utxo_immature_policy;
     }
 
+    /// ── Mempool-tx serving switch (--embedded-serve-mempool-txs) ─────────
+    /// DEFAULT OFF: the embedded arm serves a COINBASE-ONLY body even with a
+    /// mature UTXO lane (suppress_mempool_txs=true, cause
+    /// "mempool-txs-disabled"). Consensus never requires a mempool tx, and
+    /// with zero txs every committed value (subsidy, MN payment, creditPool)
+    /// is exact — the same argument as the utxo-immature serving mode.
+    ///
+    /// Turning it ON puts the whole mempool-tx body path in the block
+    /// production lane: topological selection (G1), sigop caps (G2),
+    /// coinbase-maturity (G3) and islock-conflict (G4) guards all live in
+    /// Mempool::get_sorted_txs_with_fees (see
+    /// DASH_CONNECTBLOCK_REJECT_SURFACE_AUDIT.md). Fees ride the coinbase.
+    /// The switch exists so the fee-carrying path is an explicit operator
+    /// decision, soak-gated like every other production posture — not an
+    /// implicit consequence of the UTXO lane maturing.
+    void set_serve_mempool_txs(bool on) { m_serve_mempool_txs = on; }
+    bool serve_mempool_txs() const { return m_serve_mempool_txs; }
+
     /// Superblock-height guard. On a Dash superblock height the coinbase MUST
     /// pay the governance/treasury (superblock) outputs; the embedded template
     /// does not compute those, so emitting a normal coinbase there is a
@@ -1022,9 +1040,19 @@ public:
         // serving policy we DO serve, but only a coinbase-only body. The
         // builder marks the template (m_txset_empty_cause) and logs the
         // forgone fees, so this degraded-but-valid mode is never silent.
+        // Two suppressed-body producers, most-specific cause first: the
+        // utxo-immature serving window names itself; otherwise the default-OFF
+        // --embedded-serve-mempool-txs posture does. Fee-carrying templates
+        // require BOTH a mature UTXO lane AND the explicit operator opt-in.
         e.suppress_mempool_txs =
-            utxo_immature
-            && m_utxo_immature_policy == UtxoImmaturePolicy::ServeEmptyTxSet;
+            (utxo_immature
+             && m_utxo_immature_policy == UtxoImmaturePolicy::ServeEmptyTxSet)
+            || !m_serve_mempool_txs;
+        e.suppress_cause =
+            (utxo_immature
+             && m_utxo_immature_policy == UtxoImmaturePolicy::ServeEmptyTxSet)
+                ? "utxo-immature-serving"
+                : "mempool-txs-disabled";
         if (m_require_resolvable_payee && !payee_resolvable) {
             LOG_WARNING << "[EMBED-GATE] h=" << (m_prev_height + 1)
                         << " REFUSE embedded template: MN payment due but payee"
@@ -1402,6 +1430,10 @@ private:
     // ServeEmptyTxSet is the pure-daemonless opt-in (subsidy-only block beats
     // no block when there is no fallback). See set_utxo_immature_policy().
     UtxoImmaturePolicy m_utxo_immature_policy{UtxoImmaturePolicy::Refuse};
+    // --embedded-serve-mempool-txs: DEFAULT OFF — coinbase-only serving; the
+    // fee-carrying mempool-tx body path is an explicit operator opt-in (see
+    // set_serve_mempool_txs).
+    bool m_serve_mempool_txs{false};
     std::function<bool()> m_chain_synced_fn; // optional ABSOLUTE header-sync gate (never serve a stale tip)
     std::function<bool(uint32_t)> m_is_superblock_fn;  // superblock-height predicate
     // E-SUPERBLOCK: daemonless governance-sourced superblock schedule provider

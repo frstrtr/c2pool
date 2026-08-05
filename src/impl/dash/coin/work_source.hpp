@@ -152,6 +152,13 @@ struct EmbeddedWorkInputs {
     // a statement about WHAT is served.
     bool                             suppress_mempool_txs{false};
 
+    // NAME-THE-STATE for the suppressed body: WHY it is coinbase-only.
+    // "utxo-immature-serving" (the historical producer) or
+    // "mempool-txs-disabled" (--embedded-serve-mempool-txs default-OFF
+    // posture; see NodeCoinState::set_serve_mempool_txs). String literal
+    // lifetime only — never a computed string.
+    const char*                      suppress_cause{"utxo-immature-serving"};
+
     bool viable() const {
         return has_state && mnstates != nullptr && mempool != nullptr;
     }
@@ -227,8 +234,11 @@ inline WorkSelection select_dash_work(
                                                 : &emb.superblock_payments,
                 // confirmedHash rollover projection threshold (sml_projection.hpp).
                 emb.mn_min_confirmations,
-                // UTXO-immature serving: coinbase-only body, fees exactly 0.
-                emb.suppress_mempool_txs);
+                // Coinbase-only serving: body suppressed, fees exactly 0;
+                // the cause names WHICH suppressed mode this is
+                // (utxo-immature-serving vs mempool-txs-disabled).
+                emb.suppress_mempool_txs,
+                emb.suppress_cause);
         },
         dashd_fallback);
 }

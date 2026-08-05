@@ -141,6 +141,10 @@ TEST(DashNodeCoinState, PopulatedRoutesEmbeddedByteEqualToDirectBuild) {
     st.mempool().set_utxo(&utxo);
     ASSERT_TRUE(st.mempool().add_tx(make_spend(prev, 0, 90'000, /*salt=*/1)));  // fee 10'000
     st.set_tip(H - 1, prev_hash, bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, curtime, version);
+    // This KAT pins the FEE-CARRYING flow; tx-carrying templates are the
+    // --embedded-serve-mempool-txs OPT-IN (default OFF = coinbase-only; the
+    // default posture is pinned by the DashMempoolTxServing suite below).
+    st.set_serve_mempool_txs(true);
 
     ASSERT_TRUE(st.populated());
     ASSERT_TRUE(st.make_embedded_work_inputs().viable());
@@ -1030,7 +1034,10 @@ TEST(DashUtxoImmatureServing, DefaultRefusesTheImmatureWindowExactlyAsBefore) {
     EXPECT_EQ(e.decline.value, "utxo_ready=false");
     EXPECT_EQ(e.decline.threshold, "utxo_ready=true");
     EXPECT_EQ(st.classify_decline(), "utxo-immature");
-    EXPECT_FALSE(e.suppress_mempool_txs)
+    // (With mempool-tx serving armed, the refusing arm suppresses nothing —
+    // the suppress bit belongs to WHAT is served, and nothing is.)
+    st.set_serve_mempool_txs(true);
+    EXPECT_FALSE(st.make_embedded_work_inputs().suppress_mempool_txs)
         << "a refusing arm serves nothing, so it suppresses nothing";
 }
 
@@ -1066,6 +1073,9 @@ TEST(DashUtxoImmatureServing, MatureLaneNeverSuppresses) {     // negative twin
     NodeCoinState st;
     seed_healthy_armed(st);
     st.set_utxo_ready_fn([] { return true; });
+    // Mempool-tx serving armed (--embedded-serve-mempool-txs; without it the
+    // default-OFF posture suppresses regardless — DashMempoolTxServing suite).
+    st.set_serve_mempool_txs(true);
     // Even WITH the opt-in policy, a mature lane builds normal templates.
     st.set_utxo_immature_policy(
         dash::coin::UtxoImmaturePolicy::ServeEmptyTxSet);
@@ -1076,7 +1086,52 @@ TEST(DashUtxoImmatureServing, MatureLaneNeverSuppresses) {     // negative twin
     // …and neither does a bundle with no UTXO lane armed at all.
     NodeCoinState unarmed;
     seed_healthy_armed(unarmed);
+    unarmed.set_serve_mempool_txs(true);
     EXPECT_FALSE(unarmed.make_embedded_work_inputs().suppress_mempool_txs);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// --embedded-serve-mempool-txs (default OFF): fee-carrying templates are an
+// explicit operator opt-in; the shipped default serves coinbase-only bodies
+// with the cause named on the template. Audit:
+// DASH_CONNECTBLOCK_REJECT_SURFACE_AUDIT.md (mempool-tx body path G1-G4).
+// ════════════════════════════════════════════════════════════════════════
+TEST(DashMempoolTxServing, DefaultOffSuppressesBodyWithNamedCause) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_utxo_ready_fn([] { return true; });   // even a MATURE lane
+    EXPECT_FALSE(st.serve_mempool_txs()) << "the shipped default is OFF";
+    const auto e = st.make_embedded_work_inputs();
+    EXPECT_TRUE(e.has_state) << "coinbase-only serving is not a refusal";
+    EXPECT_TRUE(e.suppress_mempool_txs)
+        << "default OFF: the body must be coinbase-only";
+    EXPECT_STREQ(e.suppress_cause, "mempool-txs-disabled")
+        << "the state must say its own name";
+}
+
+TEST(DashMempoolTxServing, OptInCarriesMempoolTxs) {           // negative twin
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_utxo_ready_fn([] { return true; });
+    st.set_serve_mempool_txs(true);
+    const auto e = st.make_embedded_work_inputs();
+    EXPECT_TRUE(e.has_state);
+    EXPECT_FALSE(e.suppress_mempool_txs)
+        << "the opt-in with a mature lane serves fee-carrying templates";
+}
+
+TEST(DashMempoolTxServing, UtxoImmatureCauseWinsOverDisabled) {
+    // Both suppressed-body producers active: the more specific state name
+    // (utxo-immature-serving) must win so soak greps attribute the window
+    // correctly.
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_utxo_ready_fn([] { return false; });
+    st.set_utxo_immature_policy(
+        dash::coin::UtxoImmaturePolicy::ServeEmptyTxSet);
+    const auto e = st.make_embedded_work_inputs();
+    EXPECT_TRUE(e.suppress_mempool_txs);
+    EXPECT_STREQ(e.suppress_cause, "utxo-immature-serving");
 }
 
 // The opt-in relaxes ONLY this clause. Every other gate must still refuse —

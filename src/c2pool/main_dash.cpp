@@ -262,7 +262,7 @@ void print_banner(const char* argv0)
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
         << "           [--external-ip ADDR]\n"
         << "           [--embedded-utxo] [--embedded-mainnet] [--embedded-mn-bridge-max N]\n"
-        << "           [--embedded-utxo-immature-serve-empty]\n"
+        << "           [--embedded-utxo-immature-serve-empty] [--embedded-serve-mempool-txs]\n"
         << "           [--bestcl-policy freshness|consensus-exact]\n"
         << "           [--embedded-oracle-shadow]\n"
         << "           [--embedded-shadow-compare]\n"
@@ -557,6 +557,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // semantics: an unsynced node does not serve templates; the dashd
              // fallback serves full ones where armed) -- the pre-policy behaviour.
              bool embedded_utxo_immature_serve_empty = false,
+             // --embedded-serve-mempool-txs: OPT-IN fee-carrying embedded
+             // templates. Default false = coinbase-only body even with a
+             // mature UTXO lane (cause "mempool-txs-disabled"); the mempool-tx
+             // body path (G1-G4 guards, mempool.hpp) only enters block
+             // production when the operator explicitly arms it.
+             bool embedded_serve_mempool_txs = false,
              // --embedded-shadow-compare: OBSERVE-only serve-vs-dashd block-
              // template field diff (diagnostic; NOT a serve gate). Off the hot
              // path (worker-thread dashd fetch). Default false; only meaningful
@@ -1614,6 +1620,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // references it (reverse destruction order at scope exit).
     dash::coin::UtxoLane utxo_lane;
     dash::coin::NodeCoinState node_coin_state;
+
+    // ── Mempool-tx serving switch (--embedded-serve-mempool-txs) ────────────
+    // DEFAULT OFF: embedded templates carry a coinbase-only body even once the
+    // UTXO lane matures (suppress cause "mempool-txs-disabled" on the template
+    // + log). The fee-carrying mempool-tx body path — topological selection
+    // (G1), sigop cap (G2), coinbase-maturity (G3), islock-conflict (G4)
+    // guards, mempool.hpp — is an explicit soak-gated operator opt-in, not an
+    // implicit consequence of UTXO maturity. Audit:
+    // DASH_CONNECTBLOCK_REJECT_SURFACE_AUDIT.md §1. The dashd fallback arm is
+    // unaffected (its GBT bodies come from dashd itself).
+    node_coin_state.set_serve_mempool_txs(embedded_serve_mempool_txs);
+    std::cout << "[run] embedded mempool-tx serving: "
+              << (embedded_serve_mempool_txs
+                      ? "ON (--embedded-serve-mempool-txs: fee-carrying "
+                        "templates once the UTXO lane matures)"
+                      : "OFF (default: coinbase-only body, cause="
+                        "mempool-txs-disabled; fees forgone, values exact)")
+              << "\n";
 
     // ── E2b (#738): the embedded UTXO/fee lane -- OPT-IN via --embedded-utxo.
     // Transliterated from the PROVEN LTC wiring (main_ltc.cpp ~1750-1801 con-
@@ -5273,6 +5297,12 @@ int main(int argc, char** argv)
     // body instead -- consensus-valid, fees exactly 0, nothing to overstate
     // (see NodeCoinState::set_utxo_immature_policy).
     bool embedded_utxo_immature_serve_empty = false;
+    // --embedded-serve-mempool-txs: OPT-IN fee-carrying embedded templates.
+    // Default OFF = coinbase-only serving (values exact, fees forgone); the
+    // mempool-tx body path with its G1-G4 guards (mempool.hpp; audit
+    // DASH_CONNECTBLOCK_REJECT_SURFACE_AUDIT.md) arms only on explicit
+    // operator decision.
+    bool embedded_serve_mempool_txs = false;
     std::string bestcl_policy = "freshness";   // --bestcl-policy: freshness (default, conservative proxy) | consensus-exact (dashcore's actual CheckCbTxBestChainlock rule)
     bool embedded_oracle_shadow = false;       // --embedded-oracle-shadow: per-block dashd cross-check (OBSERVE-only)
     bool embedded_shadow_compare = false;      // --embedded-shadow-compare: serve-vs-dashd template diff (OBSERVE-only, NOT a gate)
@@ -5354,6 +5384,8 @@ int main(int argc, char** argv)
             embedded_utxo = true;
         else if (std::strcmp(argv[i], "--embedded-utxo-immature-serve-empty") == 0)
             embedded_utxo_immature_serve_empty = true;
+        else if (std::strcmp(argv[i], "--embedded-serve-mempool-txs") == 0)
+            embedded_serve_mempool_txs = true;
         else if (std::strcmp(argv[i], "--bestcl-policy") == 0 && i + 1 < argc)
             bestcl_policy = argv[++i];
         else if (std::strcmp(argv[i], "--coinbase-text") == 0 && i + 1 < argc)
@@ -5513,6 +5545,7 @@ int main(int argc, char** argv)
                         embedded_oracle_shadow, oracle_grad_blocks,
                         oracle_class_coverage, coin_p2p_peers, bestcl_policy,
                         embedded_utxo_immature_serve_empty,
+                        embedded_serve_mempool_txs,
                         embedded_shadow_compare);
     }
     return run_selftest();
