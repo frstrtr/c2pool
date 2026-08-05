@@ -4736,6 +4736,38 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 (core::filesystem::config_path() / net_subdir
                     / "dash_replay_cursor").string());
 
+            // ── cursor/fold reconciliation (found by the first live run) ──
+            // The lane's cursor is PERSISTENT and the fold's anchor seed is
+            // re-read at every start, so the two are independent: a restart
+            // resumed the lane at the stored height (h=2513098) while the
+            // fold sat at the anchor (h=2513000), and the forward-contiguous
+            // fold refused the very first delivery. When a fold is armed the
+            // FOLD's cursor is authoritative — it is the thing carrying
+            // consensus state — so the lane is pinned back to it. Resuming a
+            // fold mid-range needs a snapshot v3 at the cursor height, not a
+            // prestate at the anchor; until that path exists this refuses to
+            // half-resume rather than silently skipping blocks.
+            if (replay_fold_anchor != 0) {
+                const auto stored = replay_cursor->load();
+                if (stored && stored->height != replay_fold_anchor) {
+                    LOG_WARNING
+                        << "[BULK] persisted replay cursor is at h="
+                        << stored->height << " but the armed DML fold is "
+                           "seeded at anchor h=" << replay_fold_anchor
+                        << " — pinning the lane back to the anchor so the "
+                           "forward-contiguous fold starts at h="
+                        << (replay_fold_anchor + 1)
+                        << " (a mid-range resume needs a snapshot v3 at the "
+                           "cursor height, not a prestate at the anchor)";
+                }
+                if (!stored || stored->height != replay_fold_anchor) {
+                    rp::ReplayCursorStore::Cursor c;
+                    c.height = replay_fold_anchor;
+                    c.hash   = replay_fold_engine->block_hash();
+                    replay_cursor->store(c);
+                }
+            }
+
             rp::BulkFetchLane::Seams seams;
             // Height→hash: pre-anchor from the (join-checked) backfill,
             // anchor→tip from the main header chain.
