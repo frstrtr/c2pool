@@ -168,6 +168,9 @@ tools/*
 tools/dash/*
 !tools/dash/gen_mn_checkpoint.py
 !tools/dash/test_gen_mn_checkpoint.py
+# W1 replay-fold KAT fixture generator — tracked source: the fixture .inc
+# headers under test/data/ name it as their reproduction path.
+!tools/dash/gen_replay_kat.py
 
 # CMake out-of-source build trees (any name starting with `build-`).
 # Catches build-spv/, build-qt/, build-relwithdebinfo/, etc.
