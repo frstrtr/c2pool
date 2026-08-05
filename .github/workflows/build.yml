@@ -277,7 +277,26 @@ jobs:
     name: Linux x86_64 (AsAN+UBSan)
     # dash bring-up slices may opt out of sanitizers via dash-skip-sanitizers; KEEP for consensus/payout slices (default = on)
     if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-skip-sanitizers')) }}
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    # RUNS ON c2pool-heavy — and CodeQL analyze deliberately does NOT.
+    # This job and CodeQL analyze are the ONLY two holders of the per-host
+    # reap-guard flock (#1105), so they must sit on DIFFERENT hosts or they
+    # serialize (measured: one held the lock while the second sat blocked in
+    # `flock -x -w 3600`). Which one moves is decided by where each is PROVEN:
+    #   * this leg builds with `conan profile detect --force` (HOST DEFAULT
+    #     compiler). The heavy host now defaults to gcc-13 and a from-scratch
+    #     ASan+UBSan build there — purged conan cache, every dep rebuilt —
+    #     links clean ([100%], 0 link errors). Earlier, under a gcc-15 default,
+    #     it could not link at all (undefined reference to
+    #     `std::ostream::_Disable_exceptions', a libstdc++/dep ABI mismatch);
+    #     that is history, not a live constraint.
+    #   * CodeQL stays on c2pool-build: staging its ~823 MB CLI bundle failed
+    #     on the heavy host 4/4 ("'/usr/bin/tar' failed with exit code 2") —
+    #     a THROUGHPUT problem (that host's egress swings ~258 KB/s..1 MB/s, so
+    #     fixed timeouts cut large transfers short), not corruption and not
+    #     PMTU. See the note in codeql-analysis.yml; it is revisitable, but
+    #     flock separation would still keep these two on different hosts.
+    # Do not consolidate these two onto one label.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-heavy"]') || 'ubuntu-24.04' }}
     continue-on-error: true
     steps:
       # Reap-guard: host-scoped exclusivity vs the other RAM-heavy leg
@@ -586,7 +605,7 @@ jobs:
             for MF in "${HEAVY_LEG_HOLDERFILE:-/tmp/c2pool-heavy-leg.holder}".*; do
               [ -f "$MF" ] || continue
               read -r _mh _ < "$MF" 2>/dev/null || true
-              [ "${_mh:-}" = "$H" ] && rm -f "$MF"
+              [ "${_mh:-}" = "$H" ] && rm -f "$MF" || true
             done
           fi
   # ════════════════════════════════════════════════════════════════════════════
@@ -1004,7 +1023,10 @@ jobs:
     name: Qt WebEngine leak gate
     needs: changes
     if: ${{ needs.changes.outputs.qt == 'true' || github.event_name != 'pull_request' }}
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    # Pinned to draft-release (persistent 145/198/905 pool: NOPASSWD sudo +
+    # Qt6/xvfb). Excludes transient c2pool-heavy hosts (oplex7020) that lack
+    # Qt6 and NOPASSWD sudo. #1122 routing fix.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","draft-release"]') || 'ubuntu-24.04' }}
     # Hard ceiling: orphaned QtWebEngine/Chromium helper children survive
     # the inner `timeout 180`, holding the xvfb pipe open and hanging the
     # job to the 360-min runner default. Cap it so a hung leak gate is
