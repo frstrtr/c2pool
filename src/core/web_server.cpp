@@ -2498,7 +2498,19 @@ nlohmann::json MiningInterface::rest_recent_blocks()
     nlohmann::json arr = nlohmann::json::array();
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
     for (const auto& b : m_found_blocks) {
-        std::string method = (b.time_to_find > 0 && b.luck > 0) ? "simple_avg" : "first_block";
+        // Node-role honesty (#942): a block with no local share_hash AND no
+        // miner address is one this node did NOT find -- it was learned from a
+        // peer over P2P relay. A relay node therefore has no local timing for
+        // it, so luck_method must not fabricate a computed-luck label
+        // ("first_block" wrongly implied a luck computation was attempted), and
+        // the timing-derived fields are honest-absent (null) rather than a
+        // real-looking 0. found_locally is the explicit node-role signal the
+        // dashboard reads to render relay-learned blocks as such.
+        const bool found_locally = !(b.share_hash.empty() && b.miner.empty());
+        std::string method;
+        if (!found_locally)                        method = "relayed";
+        else if (b.time_to_find > 0 && b.luck > 0) method = "simple_avg";
+        else                                       method = "first_block";
         arr.push_back({
             {"ts", b.ts},
             {"hash", b.hash},
@@ -2511,13 +2523,14 @@ nlohmann::json MiningInterface::rest_recent_blocks()
             {"confirmations", b.confirmations},
             {"miner", b.miner},
             {"share", b.share_hash},
+            {"found_locally", found_locally},
             {"network_difficulty", b.network_difficulty},
             {"share_difficulty", b.share_difficulty},
             {"pool_hashrate_at_find", b.pool_hashrate},
             {"subsidy", b.subsidy},
-            {"expected_time", b.expected_time},
-            {"time_to_find", b.time_to_find},
-            {"luck", b.luck},
+            {"expected_time", found_locally ? nlohmann::json(b.expected_time) : nlohmann::json(nullptr)},
+            {"time_to_find", found_locally ? nlohmann::json(b.time_to_find) : nlohmann::json(nullptr)},
+            {"luck", found_locally ? nlohmann::json(b.luck) : nlohmann::json(nullptr)},
             {"luck_method", method}
         });
     }
