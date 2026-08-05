@@ -53,19 +53,20 @@ jobs:
     # STEP cap on the analyze phase below keeps the wedged-tracer fast-red
     # property unchanged.
     timeout-minutes: 150
-    # DELIBERATE SPLIT — this leg runs on c2pool-heavy while build.yml's
-    # linux-asan leg stays on c2pool-build. The reap-guard flock is per-host and
-    # these two jobs are its ONLY holders, so keeping them on DIFFERENT hosts
-    # means neither ever waits on the other: the lock is uncontended on both
-    # sides and the 60-min acquire timeout can no longer fire.
-    # Measured when BOTH were routed to the heavy host: one holder held the lock
-    # while the second sat blocked in `flock -x -w 3600` — moving both merely
-    # RELOCATES the contention. Do not "consolidate" these two onto one label.
-    # CodeQL is the holder that moves (not ASan) because this leg builds with
-    # the committed ci/conan/linux-gcc13.profile, which is proven on the heavy
-    # host, whereas linux-asan builds with the host-default compiler and fails
-    # to link there under gcc-15 (see the note in build.yml).
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-heavy"]') || 'ubuntu-24.04' }}
+    # STAYS on c2pool-build — MEASURED, do not route this to c2pool-heavy.
+    # Two independent reasons:
+    #  1. Staging the ~700 MB CodeQL CLI bundle FAILS on the heavy host:
+    #       "Unable to download and extract CodeQL CLI: the process
+    #        '/usr/bin/tar' failed with exit code 2"
+    #     4 attempts, 4 failures, 0 successes — that host's uplink truncates
+    #     large downloads (it also truncated a 215 MB runner tarball to 108 MB).
+    #  2. Flock separation. This job and build.yml's linux-asan are the ONLY
+    #     two holders of the per-host reap-guard flock (#1105); linux-asan runs
+    #     on c2pool-heavy, so this one must stay here or the two serialize
+    #     (measured: second holder blocked in `flock -x -w 3600`).
+    # Revisit (1) only if a LAN-local mirror makes the bundle fetch reliable —
+    # (2) would still require the two holders to stay on different hosts.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     permissions:
       security-events: write
       packages: read
