@@ -262,6 +262,15 @@ jobs:
   # Will flip to required once known UAFs are fixed (Phase 7).
   # ════════════════════════════════════════════════════════════════════════════
   linux-asan:
+    # Reap-guard (#1027/#1031 class): host co-residency of two RAM-heavy legs
+    # (this ASan/UBSan build + CodeQL) is what produced the steps=0 reaps on
+    # 198 and 145. A single cross-workflow group with cancel-in-progress:false
+    # admits at most ONE heavy leg fleet-wide, so a second is QUEUED, never
+    # co-resident. (Per-host granularity would need per-host runner labels;
+    # this pure-workflow group is a strict superset of that invariant.)
+    concurrency:
+      group: c2pool-heavy-leg
+      cancel-in-progress: false
     name: Linux x86_64 (AsAN+UBSan)
     # dash bring-up slices may opt out of sanitizers via dash-skip-sanitizers; KEEP for consensus/payout slices (default = on)
     if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-skip-sanitizers')) }}

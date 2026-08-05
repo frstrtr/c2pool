@@ -27,6 +27,11 @@ env:
 
 jobs:
   analyze:
+    # Reap-guard: shares the c2pool-heavy-leg group with build.yml linux-asan so
+    # CodeQL and the ASan build are never co-resident on one physical host.
+    concurrency:
+      group: c2pool-heavy-leg
+      cancel-in-progress: false
     name: Analyze (${{ matrix.language }})
     # Hard cap: the analyze job had no timeout-minutes, so a wedged
     # CodeQL tracer build (uncapped, not the orphan-reap class of #1027/

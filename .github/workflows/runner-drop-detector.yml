@@ -6,6 +6,15 @@ name: runner-drop-detector
 # (job-setup failure / session-conflict / cgroup mem-pin), which is a
 # runner-health signal, not a code failure. Runs on a gh-hosted runner on
 # purpose: a detector must not depend on the fleet it monitors.
+#
+# BACKSTOP (reap-guard): a "failure"-conclusion steps=0 drop is auto-reran
+# ONCE (gh run rerun --failed) so a host-reaped leg self-heals instead of
+# blocking a queue. The rerun is the NET, not the fix -- the host-keyed
+# concurrency cap (c2pool-heavy-leg group) is the fix. A one-line reap-rerun
+# marker is emitted so a rerun-green is never mistaken for a first-pass green.
+# Guards against a rerun-storm: only conclusion==failure (not cancelled --
+# steps=0 is ambiguous, concurrency-cancels also show steps=0) and only when
+# the run is still on its FIRST attempt (live .run_attempt==1).
 
 on:
   schedule:
@@ -17,7 +26,7 @@ on:
         default: "120"
 
 permissions:
-  actions: read
+  actions: write   # write: needed for gh run rerun (auto-rerun backstop)
   issues: write
 
 jobs:
@@ -35,10 +44,11 @@ jobs:
           echo "Scanning jobs since $since (window ${WINDOW_MIN}m)"
           : > drops.tsv
           # Recent runs in window, then their jobs; flag completed, non-skipped, steps=0.
+          # Columns: runner  conclusion  url  name  run_id  run_attempt
           for rid in $(gh api "repos/$REPO/actions/runs?per_page=60&created=>$since" \
                 --jq '.workflow_runs[].id'); do
             gh api "repos/$REPO/actions/runs/$rid/jobs?per_page=100" --jq \
-              ".jobs[] | select((.runner_name!=null) and (.runner_name!=\"\") and .status==\"completed\" and .conclusion!=\"skipped\" and (.steps|length)==0) | [(.runner_name // \"<none>\"), .conclusion, (.html_url), .name] | @tsv" \
+              ".jobs[] | select((.runner_name!=null) and (.runner_name!=\"\") and .status==\"completed\" and .conclusion!=\"skipped\" and (.steps|length)==0) | [(.runner_name // \"<none>\"), .conclusion, (.html_url), .name, (.run_id|tostring), (.run_attempt|tostring)] | @tsv" \
               2>/dev/null || true
           done >> drops.tsv
           n=$(wc -l < drops.tsv | tr -d ' ')
@@ -51,10 +61,31 @@ jobs:
           body="Automated detector found ${n} completed job(s) with steps=0 (runner accepted but never ran the body) in the last ${WINDOW_MIN} min.\n\nBy runner:\n"
           body+=$(cut -f1 drops.tsv | sort | uniq -c | sort -rn | sed 's/^/    /')
           body+="\n\nJobs:\n"
-          while IFS=$'\t' read -r runner concl url name; do
+          while IFS=$'\t' read -r runner concl url name run_id run_attempt; do
             echo "::error title=steps=0 drop on ${runner}::${name} (${concl}) ${url}"
             body+="- ${runner}: ${name} (${concl}) ${url}\n"
           done < drops.tsv
+
+          # --- Auto-rerun backstop -------------------------------------------
+          # Rerun each reaped (failure) leg ONCE. Guard on the LIVE run attempt
+          # (not the stale job record) so a leg already reran is not reran again
+          # when its old attempt-1 record re-appears in a later scan window.
+          reran=""
+          while IFS=$'\t' read -r runner concl url name run_id run_attempt; do
+            [ "$concl" = "failure" ] || continue
+            live_attempt=$(gh api "repos/$REPO/actions/runs/$run_id" --jq '.run_attempt' 2>/dev/null || echo 99)
+            [ "$live_attempt" = "1" ] || continue
+            if gh run rerun "$run_id" --failed --repo "$REPO" 2>/dev/null; then
+              # One-line marker: a resulting green is a REAP-RERUN, not first-pass.
+              echo "::notice title=reap-rerun::run ${run_id} (${name} on ${runner}) was host-reaped [steps=0]; auto-reran --failed. A green on attempt 2 is a REAP-RERUN, NOT a first-pass green."
+              reran="${reran}\n- run ${run_id}: ${name} on ${runner} -> auto-reran (attempt 2 green = reap-rerun, not first-pass)"
+            fi
+          done < drops.tsv
+          if [ -n "$reran" ]; then
+            body+="\n\nAuto-rerun backstop fired (rerun-green != first-pass green):${reran}\n"
+          fi
+          # -------------------------------------------------------------------
+
           title="runner steps=0 drops detected"
           existing=$(gh issue list --repo "$REPO" --state open --search "$title in:title" --json number --jq ".[0].number" 2>/dev/null || true)
           if [ -n "$existing" ]; then
