@@ -392,14 +392,27 @@ public:
             // to. Fail closed and say so: the queue keeps the snapshot's own
             // authoritative isValid, and the next mnlistdiff reconciles it
             // for real once the SML has caught up.
-            if (as_of_height != 0 && vh < as_of_height) {
+            // Two ways an SML fails to speak to this snapshot: it is DATED
+            // and older, or it cannot be dated at all. sml_height_paired() is
+            // false after a warm restart and whenever a diff advanced the list
+            // without a parseable cbTx — and the maintainer's own rule for
+            // that case is already written down: a height of 0 means "the SML
+            // covers NOTHING", not "covers everything". An undatable
+            // attestation cannot adjudicate a dated authoritative list either.
+            const bool sml_undatable = !m_sml_height_paired;
+            if (as_of_height != 0 && (sml_undatable || vh < as_of_height)) {
                 LOG_WARNING
-                    << "[SML->PAYEE] seed reconcile REFUSED: the SML is at h="
-                    << vh << " but the snapshot is as-of h=" << as_of_height
-                    << " (" << (as_of_height - vh) << " blocks STALE) — an"
-                       " older attestation cannot adjudicate a newer"
-                       " authoritative list; the snapshot's own isValid"
-                       " stands until the SML catches up";
+                    << "[SML->PAYEE] seed reconcile REFUSED: "
+                    << (sml_undatable
+                            ? std::string("the SML cannot be dated"
+                                          " (sml_height_paired=false)")
+                            : "the SML is at h=" + std::to_string(vh) + " ("
+                              + std::to_string(as_of_height - vh)
+                              + " blocks STALE)")
+                    << " but the snapshot is as-of h=" << as_of_height
+                    << " — an attestation that cannot speak to that height is"
+                       " not evidence; the snapshot's own isValid stands until"
+                       " the SML catches up";
             } else {
                 const auto vr = m_state.mnstates().sync_validity_from_sml(
                     m_state.sml(), vh);
