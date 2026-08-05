@@ -891,6 +891,16 @@ public:
     // Per-chain verify function: register additional verifiers for merged chains
     void add_chain_verify_fn(const std::string& chain, block_verify_fn_t fn);
 
+    // Test/introspection seam: run ONE verification pass for a recorded found
+    // block synchronously (no io_context timer) and return the resulting
+    // verdict — >0 confirmations (confirmed), <0 orphaned, 0 pending,
+    // INT_MIN if the hash is not a recorded found block. This drives the exact
+    // production status-transition code (verify_found_block); the async
+    // schedule_block_verification() above is the live driver. Added for the
+    // DASH orphan-lane tests so the pending→confirmed / pending→orphaned flips
+    // can be asserted deterministically without waiting on real timers.
+    int run_block_verification_now(const std::string& block_hash);
+
     /// Read-only access to found blocks (for sharechain window grid).
     std::vector<FoundBlock> get_found_blocks() const {
         std::lock_guard<std::mutex> lock(m_blocks_mutex);

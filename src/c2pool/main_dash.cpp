@@ -72,6 +72,7 @@
 #include <impl/dash/coin/quorum_member_source.hpp>  // E1 Phase-L: daemonless member-set sourcing (the provider)
 #include <impl/dash/coin/utxo_lane.hpp>    // dash::coin::UtxoLane — embedded UTXO/fee lane (E2b, #738)
 #include <impl/dash/coin/header_chain.hpp>       // dash::coin::HeaderChain — SPV header/tip authority (E2a)
+#include <impl/dash/coin/block_confirm.hpp>      // dash::coin::block_confirm — post-broadcast confirm/orphan verdict
 #include <impl/dash/coin/chain_rpc.hpp>          // dash::coin::chain_rpc — daemonless getbestblockhash/getblockhash/getblockchaininfo
 #include <impl/dash/coin/coin_state_maintainer.hpp>  // dash::coin::CoinStateMaintainer — populate ordering gate (E2a)
 #include <impl/dash/coin/sml_quorum_db.hpp>      // dash::coin::SMLDb / QuorumDb — SML+quorum persistence (incremental restart)
@@ -1278,6 +1279,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             row.share_difficulty,
                             mi->get_local_hashrate(),
                             row.subsidy);
+                        // Arm the post-broadcast confirm/orphan poller so this
+                        // peer-found block flips off "pending" (main_ltc.cpp:6315
+                        // parity). Telemetry only; never gates a broadcast.
+                        mi->schedule_block_verification(row.block_hash.GetHex());
                     });
         }
 
@@ -2018,6 +2023,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         /*share_difficulty=*/0.0,
                         pool_hr,
                         subsidy);
+                    // Arm the post-broadcast confirm/orphan poller so this local
+                    // win flips off "pending" (main_ltc.cpp:4258 parity).
+                    // Telemetry only; runs after dispatch, never gates it.
+                    mi->schedule_block_verification(block_hash.GetHex());
                     if (!reached_network)
                         LOG_WARNING << "[DASH] recorded found block height="
                                     << height << " that reached NO network sink";
@@ -4855,6 +4864,87 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         };
         stats_timer->expires_after(std::chrono::seconds(100));
         stats_timer->async_wait(*stats_tick);
+
+        // ── Post-broadcast found-block confirmation / orphan lane ──────────
+        // WHY: DASH wired NONE of set_block_verify_fn / schedule_block_
+        // verification (LTC wires both, main_ltc.cpp:2105/3013/4258/6315), so a
+        // DASH found block sat "pending" on the dashboard forever and orphans
+        // (e.g. hotel 2508008) were found by humans, not the board. This arms
+        // the poller: verify_found_block fires the verdict fn at +30/+150/… s
+        // and flips the row to confirmed/orphaned.
+        //
+        // TELEMETRY ONLY. Runs strictly AFTER submission; touches no submit,
+        // mint, target or payout path. The pre-broadcast payee guard
+        // (work_source.cpp) remains the sole consensus gate — a wrong verdict
+        // here can only mislabel a dashboard row, never a broadcast.
+        //
+        // DAEMONLESS-FIRST (rule 4): the embedded X11+DGW header chain answers
+        // "which block won height h" from its own best branch, so orphan/confirm
+        // resolve with NO dashd. dashd getblockheader is used only as a fallback
+        // when the header chain is absent (pure --coin-rpc arm). The found block
+        // height comes from our own record (get_found_blocks) — authoritative
+        // even for an orphan whose header peers never relayed to us.
+        cache_mi->set_block_verify_fn(
+            [hc = header_chain.get(), rp = rpc.get(), mi = cache_mi](
+                const std::string& hash_hex) -> int {
+                uint256 h;
+                h.SetHex(hash_hex);
+
+                // Recorded mint height for this hash (authoritative for orphans).
+                uint32_t found_height = 0;
+                bool have_height = false;
+                for (const auto& b : mi->get_found_blocks()) {
+                    if (b.hash == hash_hex) {
+                        found_height = static_cast<uint32_t>(b.height);
+                        have_height = true;
+                        break;
+                    }
+                }
+
+                // Daemonless arm: resolve against the embedded header chain.
+                if (hc) {
+                    if (!have_height) {
+                        if (auto e = hc->get_header(h)) {
+                            found_height = e->height;
+                            have_height = true;
+                        }
+                    }
+                    if (have_height) {
+                        auto winner_at =
+                            [hc](uint32_t hh) -> std::optional<uint256> {
+                                if (auto e = hc->get_header_by_height(hh))
+                                    return e->hash;
+                                return std::nullopt;
+                            };
+                        return dash::coin::block_confirm::resolve_status(
+                            winner_at, hc->height(), h, found_height);
+                    }
+                    // header chain present but height unknown → still pending
+                    return 0;
+                }
+
+                // Fallback arm (no embedded chain): dashd getblockheader.
+                // dashd reports confirmations = -1 for a block off the active
+                // chain (orphaned), >=1 while it is on the best chain.
+                if (rp) {
+                    try {
+                        auto j = rp->getblockheader(h, /*verbose=*/true);
+                        if (j.contains("confirmations") &&
+                            j["confirmations"].is_number()) {
+                            int c = j["confirmations"].get<int>();
+                            if (c < 0) return -1;   // off active chain → orphaned
+                            if (c >= static_cast<int>(
+                                    dash::coin::block_confirm::kDefaultConfirmDepth))
+                                return c;           // buried enough → confirmed
+                        }
+                    } catch (...) { /* unreachable/unknown → pending */ }
+                }
+                return 0;
+            });
+        std::cout << "[run] found-block confirmation/orphan lane ARMED "
+                     "(daemonless header-chain verdict"
+                  << (rpc ? " + dashd getblockheader fallback" : "")
+                  << ")\n";
     }
 
     std::cout << "[run] run-loop up (Ctrl-C to stop); won blocks relay DUAL-PATH:\n"
