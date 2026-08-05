@@ -1460,6 +1460,200 @@ TEST(DashLlmqTypeReconciler, ReadsTheProductionQuorumManagerSource)
     EXPECT_EQ(d[0].verdict, LlmqTypeVerdict::NeverObserved);
 }
 
+namespace {
+
+// One entry per required mainnet type, so every reconciler test below is
+// corroborated and no REQUIRED-type finding contaminates the axis under
+// test (the MINED-BUT-NOT-REQUIRED side).
+void add_required_mainnet_entries(QuorumManager& qmgr, uint8_t seed)
+{
+    vendor::QuorumTail tail;
+    tail.newQuorums.push_back(
+        real_commitment(kLlmq60_75,  h256(seed + 0), 0, seed + 0));
+    tail.newQuorums.push_back(
+        real_commitment(kLlmq400_60, h256(seed + 1), 0, seed + 1));
+    tail.newQuorums.push_back(
+        real_commitment(kLlmq400_85, h256(seed + 2), 0, seed + 2));
+    tail.newQuorums.push_back(
+        real_commitment(kLlmq100_67, h256(seed + 3), 0, seed + 3));
+    qmgr.apply(tail);
+}
+
+} // namespace
+
+TEST(DashLlmqTypeReconciler, ZeroWidthWindowCannotIndictAMinedButNotRequiredType)
+{
+    // kMinObservations observe() calls accumulate at a SINGLE tip in
+    // production (one call per template build, many builds per block), so the
+    // observation-count gate alone is satisfiable before any observation
+    // window exists. A zero-width window proves nothing about any type: the
+    // unexpected side must demand the same thing the required side always
+    // has — a window at least one DKG cycle wide — before it indicts.
+    LlmqTypeReconciler r(LlmqNetwork::Mainnet);
+    auto stream = healthy_types(LlmqNetwork::Mainnet);
+    stream.push_back(7);            // a type we do not require
+    for (uint32_t i = 0; i < LlmqTypeReconciler::kMinObservations + 4u; ++i)
+        r.observe(1'950'000u, stream);          // SAME tip every time: span 0
+
+    EXPECT_EQ(r.span_heights(), 0u);
+    EXPECT_TRUE(r.defects().empty())
+        << "zero-width window must not indict: " << r.format_defects();
+    auto f = finding_for(r.reconcile(), 7);
+    ASSERT_TRUE(f.has_value());
+    EXPECT_EQ(f->verdict, LlmqTypeVerdict::Unevaluated);
+    EXPECT_STREQ(f->pending_reason, "span-shorter-than-one-dkg-cycle");
+    EXPECT_EQ(r.format_defects().find("MINED-BUT-NOT-REQUIRED"),
+              std::string::npos);
+
+    // The gate DELAYS the verdict, it does not destroy it: once a real
+    // window exists (>= one cycle; type 7 is unknown to the params table so
+    // the conservative largest-known cycle, 576, applies) the same evidence
+    // convicts.
+    for (uint32_t h = 1'950'001u; h <= 1'950'000u + 600u; ++h)
+        r.observe(h, stream);
+    auto d = r.defects();
+    ASSERT_EQ(d.size(), 1u);
+    EXPECT_EQ(d[0].llmq_type, 7);
+    EXPECT_EQ(d[0].verdict, LlmqTypeVerdict::UnexpectedType);
+}
+
+TEST(DashLlmqTypeReconciler, StaleDatedEntryIsNeverSightedAtAll)
+{
+    // The 2026-08-04 soak defect, DATABLE variant. A local active-set entry
+    // whose quorum was mined far outside its type's retention window
+    // (dkgInterval x signingActiveQuorumCount — the span the chain itself
+    // keeps a quorum active) cannot be a currently-active quorum. Observing
+    // it must register NOTHING: the defect was stamping such an entry with
+    // the CURRENT TIP at every sample, which made one stale entry ring
+    // MINED-BUT-NOT-REQUIRED forever with sightings == observations.
+    constexpr uint32_t kT0 = 1'950'000u;
+    QuorumManager qmgr;
+    add_required_mainnet_entries(qmgr, 0x40);
+    qmgr.find_mutable(5, h256(0x40))->mining_height = kT0;   // llmq_60_75
+    qmgr.find_mutable(2, h256(0x41))->mining_height = kT0;   // llmq_400_60
+    qmgr.find_mutable(3, h256(0x42))->mining_height = kT0;   // llmq_400_85
+    qmgr.find_mutable(4, h256(0x43))->mining_height = kT0;   // llmq_100_67
+    // The stale entry: type 1 (LLMQ_50_60 — mainnet cannot even mine it),
+    // dated 2000 blocks before our window; retention for type 1 is
+    // 24 x 24 = 576.
+    vendor::QuorumTail tail;
+    tail.newQuorums.push_back(real_commitment(kLlmq50_60, h256(0x51), 0, 0x51));
+    qmgr.apply(tail);
+    qmgr.find_mutable(1, h256(0x51))->mining_height = kT0 - 2'000u;
+
+    LlmqTypeReconciler r(LlmqNetwork::Mainnet);
+    for (uint32_t h = kT0; h <= kT0 + 700u; ++h) r.observe(h, qmgr);
+
+    // The stale entry never registers a sighting, so type 1 produces no
+    // finding at all — and in particular no defect.
+    EXPECT_TRUE(r.defects().empty()) << r.format_defects();
+    auto f = finding_for(r.reconcile(), 1);
+    EXPECT_FALSE(f.has_value())
+        << "a stale entry must not manufacture sightings; got sightings="
+        << (f ? f->sightings : 0u) << " of " << r.observations()
+        << " observations";
+}
+
+TEST(DashLlmqTypeReconciler, UndatableStaleEntryAgesOutAndTheAlarmClears)
+{
+    // The 2026-08-04 soak defect, EXACT measured shape. The stale type-1
+    // entry has mining_height 0 (the [QC-MINED] scanner never saw a type-1
+    // qfcommit — none exists), so it cannot be dated better than "when WE
+    // first saw it". Both soaks measured sightings == observations EXACTLY
+    // (1408==1408, 895==895) over ~12 h with zero type-1 qfcommits on chain:
+    // the entry re-registered as fresh at every sample, so the alarm could
+    // never decay and carried no information. Post-fix the entry dates from
+    // first sight, ages out of retention (576 blocks for type 1), sightings
+    // FREEZE, and one DKG cycle later the verdict decays to the named
+    // non-defect StaleSightings — the alarm CLEARS.
+    constexpr uint32_t kT0 = 1'950'000u;
+    QuorumManager qmgr;
+    add_required_mainnet_entries(qmgr, 0x60);   // mining_height 0: undatable
+    vendor::QuorumTail tail;
+    tail.newQuorums.push_back(real_commitment(kLlmq50_60, h256(0x71), 0, 0x71));
+    qmgr.apply(tail);                            // mining_height stays 0
+
+    LlmqTypeReconciler r(LlmqNetwork::Mainnet);
+    for (uint32_t h = kT0; h <= kT0 + 300u; ++h) r.observe(h, qmgr);
+
+    // While the undatable entry is inside the retention window measured from
+    // first sight it is INDISTINGUISHABLE from a freshly mined quorum, and
+    // the honest verdict is the alarm. This is not a regression — it is the
+    // backstop refusing to be blinded by a missing datum.
+    {
+        auto f = finding_for(r.reconcile(), 1);
+        ASSERT_TRUE(f.has_value());
+        EXPECT_EQ(f->verdict, LlmqTypeVerdict::UnexpectedType);
+    }
+
+    // ...but past first-sight + retention the entry ages out: sightings stop.
+    for (uint32_t h = kT0 + 301u; h <= kT0 + 601u; ++h) r.observe(h, qmgr);
+    auto f = finding_for(r.reconcile(), 1);
+    ASSERT_TRUE(f.has_value());
+    EXPECT_EQ(f->verdict, LlmqTypeVerdict::StaleSightings);
+    EXPECT_STREQ(llmq_type_verdict_name(f->verdict),
+                 "stale-sightings-aged-out");
+    EXPECT_FALSE(is_llmq_type_defect(f->verdict));
+    EXPECT_TRUE(r.defects().empty())
+        << "the alarm must CLEAR once every sighting aged out: "
+        << r.format_defects();
+    // The measured self-refresh signature — sightings == observations — is
+    // structurally impossible now: sightings froze at first-sight+retention.
+    EXPECT_LT(f->sightings, r.observations());
+    EXPECT_EQ(f->sightings, 577u);              // kT0 .. kT0+576 inclusive
+    EXPECT_EQ(f->last_height, kT0 + 576u);
+}
+
+TEST(DashLlmqTypeReconciler, GenuinelyMinedUnexpectedTypeStillAlarms)
+{
+    // THE BACKSTOP MUST KEEP WORKING — a fix that silences the stale echo by
+    // silencing the alarm would trade a false positive for a false negative,
+    // and the false negative is worse (bad-qc-missing loses blocks). A type
+    // upstream genuinely mines keeps producing NEW quorums with current
+    // mined heights; those entries are always inside retention, sightings
+    // ride the tip, and the indictment must stand. Same zero-width
+    // discipline applies first: no verdict from a one-tip pileup.
+    constexpr uint32_t kT0 = 1'950'000u;
+    QuorumManager qmgr;
+    add_required_mainnet_entries(qmgr, 0x20);
+    const LlmqParamsView fake7{7, 50, 40, 30, 24, 10, 18, 24, false};
+
+    LlmqTypeReconciler r(LlmqNetwork::Mainnet);
+    // A template-build pileup at one tip: enough CALLS, zero-width WINDOW.
+    {
+        vendor::QuorumTail tail;
+        tail.newQuorums.push_back(real_commitment(fake7, h256(0x80), 0, 0x80));
+        qmgr.apply(tail);
+        qmgr.find_mutable(7, h256(0x80))->mining_height = kT0;
+    }
+    for (uint32_t i = 0; i < LlmqTypeReconciler::kMinObservations + 4u; ++i)
+        r.observe(kT0, qmgr);
+    EXPECT_TRUE(r.defects().empty()) << r.format_defects();
+
+    // The chain keeps mining the type: a new quorum every 24 blocks, each
+    // stamped with ITS OWN mined height.
+    uint8_t fill = 0x81;
+    for (uint32_t h = kT0 + 1u; h <= kT0 + 600u; ++h) {
+        if (h % 24u == 0u) {
+            vendor::QuorumTail tail;
+            tail.newQuorums.push_back(
+                real_commitment(fake7, h256(fill), 0, fill));
+            qmgr.apply(tail);
+            qmgr.find_mutable(7, h256(fill))->mining_height = h;
+            ++fill;
+        }
+        r.observe(h, qmgr);
+    }
+
+    auto d = r.defects();
+    ASSERT_EQ(d.size(), 1u);
+    EXPECT_EQ(d[0].llmq_type, 7);
+    EXPECT_EQ(d[0].verdict, LlmqTypeVerdict::UnexpectedType);
+    const auto said = r.format_defects();
+    EXPECT_NE(said.find("type=7"), std::string::npos) << said;
+    EXPECT_NE(said.find("MINED-BUT-NOT-REQUIRED"), std::string::npos) << said;
+}
+
 // ── qc_pose_pass_provably_noop: the interim PoSe serve predicate ───────────
 //
 // dashd PoSe-punishes every member a NON-NULL in-block commitment marks

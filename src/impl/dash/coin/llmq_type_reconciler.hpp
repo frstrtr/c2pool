@@ -27,7 +27,7 @@
 ///
 /// SO THIS CHECK IS BUILT TO BE ABLE TO FAIL. A check that cannot produce a
 /// negative is not evidence. `reconcile()` returns a verdict PER required
-/// type, and two of the four verdicts are defects:
+/// type, and two of the five verdicts are defects:
 ///
 ///   * NeverObserved — we require it, the observation window covers a full
 ///     DKG cycle of that type, other required types WERE observed mined in
@@ -39,12 +39,14 @@
 ///     re-enables one) and is the half a one-directional check would miss:
 ///     the symptom there is bad-qc-missing on a block we thought was complete.
 ///
-/// and two are not:
+/// and three are not:
 ///
 ///   * Observed — required and seen. The healthy state.
 ///   * Unevaluated — not enough observation yet. The HONEST value for a
 ///     bootstrap that has not run long enough. It is never silently rendered
 ///     as "fine"; `defects()` excludes it and `verdict_name()` prints it.
+///   * StaleSightings — a non-required type that WAS sighted but whose every
+///     sighting has aged out of its retention window. See mode 2 below.
 ///
 /// FALSE-POSITIVE DISCIPLINE. Slandering a type would be as bad as missing
 /// one, so promoting silence to NeverObserved requires POSITIVE proof that the
@@ -69,6 +71,40 @@
 /// enabled type. One sample would therefore be enough — except during our own
 /// SML bootstrap, when the set is legitimately partial. `kMinObservations`
 /// plus the corroboration rule buy that distinction cheaply.
+///
+/// TWO FALSE-POSITIVE MODES THE FIRST SHIP CARRIED (both on the
+/// MINED-BUT-NOT-REQUIRED side; both fixed here, both regression-pinned in
+/// test_dash_dkg_commitments.cpp):
+///
+///   1. ZERO-WIDTH WINDOW. observe() runs once per template build, which is
+///      MANY times per block, so kMinObservations calls accumulate at a
+///      single tip height and the UnexpectedType branch — which gated only on
+///      the observation COUNT, never the window WIDTH — could indict before
+///      any real observation window existed. The required-side verdicts
+///      always demanded a full DKG cycle of span; the unexpected side now
+///      demands the same (its own cycle when the type is in the known params
+///      table, the largest known cycle otherwise).
+///
+///   2. SELF-REFRESHING STALE ENTRY (measured 2026-08-04, two independent
+///      soaks): `[LLMQ-TYPE-RECONCILE] type=1 MINED-BUT-NOT-REQUIRED` rang
+///      continuously with sightings == observations EXACTLY (1408==1408,
+///      895==895) while ZERO type-1 qfcommits existed in ~12 h of chain —
+///      impossible for real evidence, guaranteed for a bookkeeping loop.
+///      observe() stamped every entry PRESENT in the local active set with
+///      the CURRENT TIP height, never the quorum's own height, so one stale
+///      local entry (type 1 — a set mainnet cannot even mine, see
+///      reference above) re-registered as a fresh sighting at every sample,
+///      forever. An alarm that cannot decay carries no information. Now each
+///      entry is dated by ITS OWN height — mining_height when the [QC-MINED]
+///      scanner has seen the qfcommit tx, else the height at which WE first
+///      saw that (type, quorumHash) — and an entry older than its type's
+///      active-quorum retention window (dkgInterval ×
+///      signingActiveQuorumCount, the span the chain itself keeps a quorum
+///      active) is NOT a sighting. A stale entry therefore ages OUT, the
+///      per-type last-sighting height freezes, and once it trails the tip by
+///      more than one DKG cycle the verdict decays to StaleSightings — a
+///      named non-defect — and the alarm CLEARS. A genuinely mined type
+///      keeps producing in-retention entries, so its alarm never decays.
 
 #include <impl/dash/coin/dkg_commitments.hpp>
 #include <impl/dash/coin/quorum_manager.hpp>
@@ -78,6 +114,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace dash {
@@ -87,7 +124,14 @@ enum class LlmqTypeVerdict : uint8_t {
     Unevaluated = 0,   // insufficient observation — the honest "don't know"
     Observed,          // required AND seen in mined commitments
     NeverObserved,     // required, span sufficient, corroborated, ZERO sightings
-    UnexpectedType,    // mined on-chain but NOT in our required set
+    UnexpectedType,    // mined on-chain but NOT in our required set — LIVE
+                       // evidence: sighted within the last DKG cycle
+    StaleSightings,    // NOT required, WAS sighted, but every sighting has
+                       // aged out: no in-retention entry for over one DKG
+                       // cycle. Either a stale local cache entry that aged
+                       // out (the measured 2026-08-04 mode) or a type the
+                       // chain genuinely stopped mining. NOT a defect —
+                       // stale evidence must not keep an alarm ringing.
 };
 
 inline const char* llmq_type_verdict_name(LlmqTypeVerdict v)
@@ -97,6 +141,7 @@ inline const char* llmq_type_verdict_name(LlmqTypeVerdict v)
         case LlmqTypeVerdict::Observed:       return "observed";
         case LlmqTypeVerdict::NeverObserved:  return "REQUIRED-BUT-NEVER-OBSERVED";
         case LlmqTypeVerdict::UnexpectedType: return "MINED-BUT-NOT-REQUIRED";
+        case LlmqTypeVerdict::StaleSightings: return "stale-sightings-aged-out";
     }
     return "unevaluated";
 }
@@ -113,13 +158,32 @@ struct LlmqTypeFinding {
     uint8_t         llmq_type{0};
     LlmqTypeVerdict verdict{LlmqTypeVerdict::Unevaluated};
     bool            required{false};      // present in enabled_llmqs(net)
-    uint64_t        sightings{0};         // observations in which it appeared
+    /// Observations in which the type appeared via at least one entry INSIDE
+    /// its retention window. An entry whose quorum aged out of retention is
+    /// NOT a sighting — that is the whole difference between evidence and a
+    /// stale cache echo (see header, mode 2).
+    uint64_t        sightings{0};
     uint32_t        first_height{0};      // 0 == never observed anything
     uint32_t        last_height{0};
     uint32_t        span_heights{0};      // last - first
     uint32_t        dkg_interval{0};      // 0 for a non-required type
     /// Why a verdict stayed Unevaluated — never guessed, never blank.
     const char*     pending_reason{"n/a"};
+};
+
+/// One active-set entry as the reconciler consumes it. The quorum's OWN
+/// height is the load-bearing field: stamping sightings with the current tip
+/// instead of it is exactly the self-refreshing-stale-entry defect (header,
+/// mode 2).
+struct LlmqEntryObservation {
+    uint8_t  llmq_type{0};
+    /// Identity for first-seen dating. Null == no identity: the caller is
+    /// asserting the type is mined as of the observed tip (test feeds).
+    uint256  quorum_hash{};
+    /// The quorum's own mined height. 0 == unknown (mnlistdiff delivered the
+    /// entry but the [QC-MINED] scanner has not seen its qfcommit tx) — the
+    /// entry is then dated by when WE first saw this (type, quorumHash).
+    uint32_t mined_height{0};
 };
 
 class LlmqTypeReconciler {
@@ -135,21 +199,92 @@ public:
     /// ...and only if at least one OTHER required type was observed, proving
     /// the channel was live. See FALSE-POSITIVE DISCIPLINE above.
     static constexpr bool kCorroborationRequired = true;
+    /// DKG cycle assumed for a type ABSENT from the known params table (an
+    /// upstream-added type we have no row for): the largest known interval
+    /// (llmq_400_85, 576), so the unexpected-side span gate errs toward
+    /// waiting, never toward a premature indictment.
+    static constexpr uint32_t kFallbackDkgInterval = 576;
+    /// Retention assumed for a type absent from the table: the largest
+    /// dkgInterval x signingActiveQuorumCount product among known types
+    /// (llmq_60_75, 288 x 32). Overestimating retention only delays aging —
+    /// it can never fabricate a sighting.
+    static constexpr uint32_t kFallbackRetention = 9216;
+
+    /// Full params row for ANY type dashcore defines at this pin — including
+    /// types the runtime predicate disables (enabled_llmqs() would not have
+    /// them; the 2026-08-04 stale entry was exactly such a type).
+    static const LlmqParamsView* known_llmq_params(uint8_t t)
+    {
+        static const LlmqParamsView kAll[] = {
+            kLlmq50_60, kLlmq60_75, kLlmq400_60, kLlmq400_85,
+            kLlmq100_67, kLlmq25_67};
+        for (const auto& p : kAll)
+            if (p.type == t) return &p;
+        return nullptr;
+    }
+
+    static uint32_t dkg_interval_for(uint8_t t)
+    {
+        const auto* p = known_llmq_params(t);
+        return p ? p->dkg_interval : kFallbackDkgInterval;
+    }
+
+    /// The chain's own active-quorum retention window for a type: a mined
+    /// quorum stays in the active set for signingActiveQuorumCount DKG cycles
+    /// before newer quorums push it out. An entry older than this cannot be
+    /// a currently-active quorum — it is a stale local cache echo.
+    static uint32_t retention_for(uint8_t t)
+    {
+        const auto* p = known_llmq_params(t);
+        return p ? p->dkg_interval * p->signing_active_quorum_count
+                 : kFallbackRetention;
+    }
 
     explicit LlmqTypeReconciler(LlmqNetwork net) : m_net(net) {}
 
-    /// Record the set of llmqTypes present in MINED commitments as of `tip`.
-    /// Duplicate types within one call count once (this is a set observation,
-    /// not a count of quorums).
-    void observe(uint32_t tip_height, const std::vector<uint8_t>& mined_types)
+    /// Record the active-set entries as of `tip`. A type registers ONE
+    /// sighting per call (set semantics, not a quorum count) and ONLY via
+    /// entries whose own height is inside the type's retention window —
+    /// an entry the chain would already have aged out is a stale local echo,
+    /// not evidence (header, mode 2). Entry dating, most-truthful-first:
+    ///   1. mined_height when known (the [QC-MINED] scanner saw the qfcommit);
+    ///   2. else the tip at which WE first saw this (type, quorumHash) — a
+    ///      stale leftover dates from our first sample and can only age;
+    ///   3. else (no identity at all) the observed tip — the caller asserts
+    ///      freshness, which is what the types-only test feed means.
+    void observe(uint32_t tip_height,
+                 const std::vector<LlmqEntryObservation>& entries)
     {
         ++m_observations;
         if (m_first_height == 0 || tip_height < m_first_height)
             m_first_height = tip_height;
         if (tip_height > m_last_height) m_last_height = tip_height;
 
-        std::set<uint8_t> uniq(mined_types.begin(), mined_types.end());
-        for (uint8_t t : uniq) {
+        std::set<uint8_t> present;   // types with >=1 IN-RETENTION entry
+        std::map<std::pair<uint8_t, uint256>, uint32_t> first_seen_next;
+        for (const auto& e : entries) {
+            uint32_t own_h = e.mined_height;
+            if (own_h == 0 && !e.quorum_hash.IsNull()) {
+                const auto key = std::make_pair(e.llmq_type, e.quorum_hash);
+                auto it = m_first_seen.find(key);
+                own_h = (it != m_first_seen.end()) ? it->second : tip_height;
+                // Keep the record even for an aged-out entry — dropping it
+                // while the entry is still served would re-date the entry
+                // as fresh and resurrect the self-refresh loop cyclically.
+                first_seen_next.emplace(key, own_h);
+            }
+            if (own_h == 0) own_h = tip_height;   // no identity: asserted fresh
+            if (tip_height > own_h
+                && tip_height - own_h > retention_for(e.llmq_type))
+                continue;                          // aged out — NOT a sighting
+            present.insert(e.llmq_type);
+        }
+        // Records for entries no longer served are dropped here, bounding the
+        // map by the live active-set size. If such an entry ever reappears it
+        // is a NEW mnlistdiff insertion and fresh dating is the honest read.
+        m_first_seen.swap(first_seen_next);
+
+        for (uint8_t t : present) {
             auto& s = m_seen[t];
             ++s.sightings;
             if (s.first_height == 0 || tip_height < s.first_height)
@@ -158,15 +293,31 @@ public:
         }
     }
 
+    /// Types-only feed (tests, hand-built streams). No entry identity, so
+    /// each listed type is asserted mined as of `tip` — staleness cannot be
+    /// judged and is not: that is the CALLER'S claim to get right.
+    void observe(uint32_t tip_height, const std::vector<uint8_t>& mined_types)
+    {
+        std::vector<LlmqEntryObservation> es;
+        es.reserve(mined_types.size());
+        for (uint8_t t : mined_types)
+            es.push_back(LlmqEntryObservation{t, uint256{}, tip_height});
+        observe(tip_height, es);
+    }
+
     /// The production overload: the mnlistdiff-fed active set IS dashd's
     /// mined-and-active commitment set (dkg_commitments.hpp header note).
+    /// Each entry carries its own (type, quorumHash, mining_height) so the
+    /// core observe() can date it — passing types alone is what let a stale
+    /// entry re-register forever (header, mode 2).
     void observe(uint32_t tip_height, const QuorumManager& qmgr)
     {
-        std::vector<uint8_t> types;
-        types.reserve(qmgr.active_entries().size());
+        std::vector<LlmqEntryObservation> es;
+        es.reserve(qmgr.active_entries().size());
         for (const auto& e : qmgr.active_entries())
-            types.push_back(e.key.llmqType);
-        observe(tip_height, types);
+            es.push_back(LlmqEntryObservation{
+                e.key.llmqType, e.key.quorumHash, e.mining_height});
+        observe(tip_height, es);
     }
 
     uint32_t observations() const { return m_observations; }
@@ -231,6 +382,12 @@ public:
         }
 
         // The other direction: a type the chain mines that we do not require.
+        // The indictment discipline mirrors the required side: enough
+        // observations AND a real window at least one DKG cycle wide (a
+        // zero-width window — many samples at one tip — proves nothing,
+        // header mode 1) AND the evidence must be LIVE — sighted within the
+        // last cycle. Sightings that all aged out decay to StaleSightings
+        // and the alarm clears (header, mode 2).
         for (const auto& [t, s] : m_seen) {
             if (out.count(t) != 0) continue;   // required, already handled
             LlmqTypeFinding f;
@@ -240,9 +397,21 @@ public:
             f.first_height = s.first_height;
             f.last_height  = s.last_height;
             f.span_heights = span_heights();
+            const uint32_t cycle = dkg_interval_for(t);
             if (m_observations < kMinObservations) {
                 f.verdict = LlmqTypeVerdict::Unevaluated;
                 f.pending_reason = "too-few-observations";
+            } else if (f.span_heights < cycle * kMinCyclesCovered) {
+                f.verdict = LlmqTypeVerdict::Unevaluated;
+                f.pending_reason = "span-shorter-than-one-dkg-cycle";
+            } else if (m_last_height - s.last_height > cycle) {
+                // A genuinely mined type has in-retention entries at EVERY
+                // sample, so its last sighting rides the tip. A last
+                // sighting more than one full cycle behind means every
+                // entry aged out of retention: stale evidence, not a
+                // current disagreement with the chain.
+                f.verdict = LlmqTypeVerdict::StaleSightings;
+                f.pending_reason = "n/a";
             } else {
                 f.verdict = LlmqTypeVerdict::UnexpectedType;
                 f.pending_reason = "n/a";
@@ -308,6 +477,7 @@ public:
     void reset()
     {
         m_seen.clear();
+        m_first_seen.clear();
         m_observations = 0;
         m_first_height = 0;
         m_last_height  = 0;
@@ -322,6 +492,10 @@ private:
 
     LlmqNetwork m_net;
     std::map<uint8_t, Sighting> m_seen;
+    /// First tip at which each identity-bearing, mined_height-unknown entry
+    /// was observed — the dating proxy for entries the [QC-MINED] scanner has
+    /// not dated. Pruned every observe() to the entries currently served.
+    std::map<std::pair<uint8_t, uint256>, uint32_t> m_first_seen;
     uint32_t m_observations{0};
     uint32_t m_first_height{0};
     uint32_t m_last_height{0};
