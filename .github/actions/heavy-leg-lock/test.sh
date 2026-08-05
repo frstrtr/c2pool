@@ -4,28 +4,31 @@
 #
 # Extracts the ACTUAL "Acquire per-host heavy-leg lock (reap-guard)" run: script
 # out of build.yml (the shipped bytes, not a copy) and drives it in isolation
-# via the HEAVY_LEG_* env overrides, proving the reap is load-bearing:
+# via the HEAVY_LEG_* env overrides, proving the reap is load-bearing across ALL
+# HEAVY_LEG_SLOTS concurrent slots (not just one):
 #
-#   FIXED  (HEAVY_LEG_SWEEP=1): an orphaned holder whose owning job is already
-#          dead is REAPED at acquire -> the lock is acquired -> exit 0 (GREEN).
-#   LEAKED (HEAVY_LEG_SWEEP=0): the same orphan is NOT swept -> it blocks ->
-#          acquire times out at the -w budget -> exit 1 (RED).
+#   FIXED  (HEAVY_LEG_SWEEP=1): EVERY slot is saturated with an orphaned holder
+#          whose owning job is already dead -> all are REAPED at acquire -> a
+#          free slot opens -> the lock is acquired -> exit 0 (GREEN).
+#   LEAKED (HEAVY_LEG_SWEEP=0): the same orphans are NOT swept -> every slot
+#          stays busy -> acquire times out at the -w budget -> exit 1 (RED).
 #
 # If restoring the leak did NOT turn it red the test FAILS: that would mean the
-# guard acquired despite a live orphan -- a hollow (non-load-bearing) sweep.
-# Perturb -> green, restore leak -> red. No hollow pass.
+# guard acquired despite live orphans on every slot -- a hollow sweep. Saturating
+# all SLOTS is what keeps this load-bearing under the multi-slot semaphore: a
+# single free slot would let acquire pass without reaping anything.
 # ============================================================================
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 WF="$ROOT/.github/workflows/build.yml"
 STEP="Acquire per-host heavy-leg lock (reap-guard)"
+SLOTS="${SLOTS:-2}"   # must match the guard's production HEAVY_LEG_SLOTS default
 
 TMP="$(mktemp -d)"
 cleanup() {
   [ "${BASHPID:-$$}" = "$$" ] || return 0   # never run inside a $(...) subshell
-  # reap anything we spawned that still holds a case lock
-  for lk in "$TMP"/case*.lock; do
+  for lk in "$TMP"/case*.lock.*; do
     [ -e "$lk" ] && fuser -k "$lk" 2>/dev/null || true
   done
   rm -rf "$TMP"
@@ -50,13 +53,12 @@ echo "===== acquire script under test (extracted from build.yml) ====="
 cat "$ACQ_SH"
 echo "================================================================"
 
-# Plant a holder whose owning job is already dead: a marker pointing at a
-# worker PID that no longer exists (exactly what a host-reaped job leaves).
-# Single process (exec sleep) holding the exclusive flock, so a kill of it
-# frees the lock at once -- same shape as the old `exec sleep 14400` holder.
-plant_orphan() {  # $1 lockpath  $2 holderpath
+# Plant a holder whose owning job is already dead on ONE slot: a marker pointing
+# at a worker PID that no longer exists (exactly what a host-reaped job leaves).
+# Single process (exec sleep) holding the exclusive flock, so a kill of it frees
+# the slot at once -- same shape as the old `exec sleep 14400` holder.
+plant_orphan() {  # $1 slot-lockpath  $2 slot-markerpath
   local lock="$1" marker="$2"
-  # a guaranteed-dead worker PID: a subshell that exits immediately, then reaped
   ( exit 0 ) & local deadworker=$!
   wait "$deadworker" 2>/dev/null || true
   setsid bash -c 'exec 9>"'"$lock"'"; flock -x 9 || exit 1; exec sleep 300' \
@@ -64,46 +66,56 @@ plant_orphan() {  # $1 lockpath  $2 holderpath
   local orphan=$!
   printf '%s %s\n' "$orphan" "$deadworker" > "$marker"
   local i
-  local i
   for ((i=0;i<100;i++)); do
     flock -n -x "$lock" -c true 2>/dev/null || return 0   # held -> orphan is up
     sleep 0.1
   done
-  echo "FATAL: orphan never took the lock"; return 1
+  echo "FATAL: orphan never took the lock $lock"; return 1
 }
 
-run_guard() {  # $1 sweep(0/1)  $2 wait(s)  $3 lockpath  $4 holderpath
+# Saturate every slot: ${base}.1 .. ${base}.SLOTS with a dead-owner orphan each.
+saturate() {  # $1 lock-base  $2 marker-base
+  local s
+  for ((s=1;s<=SLOTS;s++)); do
+    plant_orphan "$1.$s" "$2.$s" || return 1
+  done
+}
+
+run_guard() {  # $1 sweep(0/1)  $2 wait(s)  $3 lock-base  $4 marker-base
   HEAVY_LEG_LOCK="$3" HEAVY_LEG_HOLDERFILE="$4" \
-  HEAVY_LEG_WAIT="$2" HEAVY_LEG_TTL=3 HEAVY_LEG_SWEEP="$1" \
+  HEAVY_LEG_WAIT="$2" HEAVY_LEG_TTL=3 HEAVY_LEG_SWEEP="$1" HEAVY_LEG_SLOTS="$SLOTS" \
   RUNNER_NAME="honesty-test" GITHUB_ENV="$TMP/genv" \
   bash "$ACQ_SH"
 }
 
-reap() {
-  [ -f "$2" ] && awk '{print $1}' "$2" | xargs -r kill 2>/dev/null || true
-  fuser -k "$1" 2>/dev/null || true
+reap() {  # $1 lock-base  $2 marker-base
+  local s
+  for ((s=1;s<=SLOTS;s++)); do
+    [ -f "$2.$s" ] && awk '{print $1}' "$2.$s" | xargs -r kill 2>/dev/null || true
+    fuser -k "$1.$s" 2>/dev/null || true
+  done
   sleep 0.3 || true
 }
 
 fail=0
 
-echo; echo "### CASE 1  FIXED (sweep on): orphan must be reaped -> GREEN"
+echo; echo "### CASE 1  FIXED (sweep on): all $SLOTS slots saturated -> orphans reaped -> GREEN"
 L1="$TMP/case1.lock"; H1="$TMP/case1.holder"
-plant_orphan "$L1" "$H1" || exit 1
+saturate "$L1" "$H1" || exit 1
 if run_guard 1 20 "$L1" "$H1"; then
-  echo "-> PASS: guard reaped the stale holder and acquired the lock"
+  echo "-> PASS: guard reaped the stale holders on every slot and acquired the lock"
 else
-  echo "-> FAIL: guard did NOT recover from a reapable orphan"; fail=1
+  echo "-> FAIL: guard did NOT recover from reapable orphans saturating all slots"; fail=1
 fi
 reap "$L1" "$H1"
 
-echo; echo "### CASE 2  LEAKED (sweep off): same orphan must block -> RED"
+echo; echo "### CASE 2  LEAKED (sweep off): same saturation must block -> RED"
 L2="$TMP/case2.lock"; H2="$TMP/case2.holder"
-plant_orphan "$L2" "$H2" || exit 1
+saturate "$L2" "$H2" || exit 1
 if run_guard 0 5 "$L2" "$H2"; then
-  echo "-> FAIL: guard acquired despite a live orphan -- sweep is not load-bearing (hollow)"; fail=1
+  echo "-> FAIL: guard acquired despite live orphans on every slot -- sweep is not load-bearing (hollow)"; fail=1
 else
-  echo "-> PASS: orphan blocked acquire and it failed red, as it must without the sweep"
+  echo "-> PASS: orphans blocked every slot and acquire failed red, as it must without the sweep"
 fi
 reap "$L2" "$H2"
 
