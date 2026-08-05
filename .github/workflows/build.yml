@@ -293,28 +293,97 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          LOCK=/tmp/c2pool-heavy-leg.lock
+          # Per-host heavy-leg lock (VM905: 8 runners, 1 heavy slot -> constant
+          # contention). Two defects this guard fixes vs. the old sleep-holder:
+          #  (1) the holder must die WITH the job. The old `exec sleep 14400`
+          #      outlived a reaped/cancelled job and wedged the host for up to the
+          #      TTL while every waiter hard-failed at its own 60 min -w. The holder
+          #      below waits on the runner-worker PID and exits (freeing the lock)
+          #      the instant that worker dies; the TTL is only a ceiling.
+          #  (2) a stale holder from an already-dead job is REAPED at acquire time,
+          #      not blocked on: a recorded holder whose worker is gone, or a
+          #      markerless PPID-1 legacy orphan, is by definition dead.
+          # HEAVY_LEG_* env overrides exist ONLY for the honesty-gate test
+          # (.github/actions/heavy-leg-lock/test.sh); production uses the defaults.
+          LOCK="${HEAVY_LEG_LOCK:-/tmp/c2pool-heavy-leg.lock}"
+          HOLDERFILE="${HEAVY_LEG_HOLDERFILE:-/tmp/c2pool-heavy-leg.holder}"
+          WAIT="${HEAVY_LEG_WAIT:-3600}"
+          TTL="${HEAVY_LEG_TTL:-14400}"
+          SWEEP="${HEAVY_LEG_SWEEP:-1}"
           ACQ="$(mktemp -u /tmp/c2pool-heavy-acq.XXXXXX)"
-          # Holder: waits up to 60 min for the lock, then holds it with a
-          # 4 h TTL (self-expires so a reaped job cannot wedge the host).
-          # fds redirected so the step does not hang on the open pipe;
-          # disowned so it survives this step's shell (NOT setsid: setsid
-          # forks, orphaning $!; and the runner's end-of-job cleanup
-          # SHOULD reap the holder if the release step never runs).
-          bash -c "exec 9>'$LOCK' && flock -x -w 3600 9 && touch '$ACQ' && exec sleep 14400" </dev/null >/dev/null 2>&1 &
+
+          # --- stale-holder sweep: reap the dead instead of blocking on them ---
+          if [ "$SWEEP" = 1 ]; then
+            if [ -f "$HOLDERFILE" ]; then
+              read -r MH MW _ < "$HOLDERFILE" 2>/dev/null || true
+              if [ -n "${MW:-}" ] && [ "${MW:-0}" != 0 ] && ! kill -0 "$MW" 2>/dev/null; then
+                echo "heavy-leg sweep: reaping holder pid ${MH:-?} (worker $MW dead)"
+                [ -n "${MH:-}" ] && kill "$MH" 2>/dev/null || true
+                rm -f "$HOLDERFILE"
+              fi
+            fi
+            # Markerless PPID-1 orphan = a pre-guard `sleep 14400` holder: our live
+            # holders always keep a marker, and a still-waiting new holder has a live
+            # parent (its acquire step), so PPID==1 + no marker is unambiguously dead.
+            if [ ! -f "$HOLDERFILE" ] && command -v fuser >/dev/null 2>&1; then
+              for _q in $(fuser "$LOCK" 2>/dev/null | tr -d ' '); do
+                _qp="$(ps -o ppid= -p "$_q" 2>/dev/null | tr -d ' ')"
+                if [ "${_qp:-0}" = 1 ]; then
+                  echo "heavy-leg sweep: reaping markerless PPID-1 orphan pid $_q"
+                  kill "$_q" 2>/dev/null || true
+                fi
+              done
+            fi
+          fi
+
+          # --- find the runner-worker so the holder can die with the job ---
+          WORKER=""
+          _p=$$
+          while [ "${_p:-1}" -gt 1 ]; do
+            case "$(ps -o comm= -p "$_p" 2>/dev/null || true)" in
+              Runner.Worker*) WORKER="$_p"; break ;;
+            esac
+            _p="$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ')"
+            [ -z "${_p:-}" ] && break
+          done
+
+          # --- spawn the holder: holds fd 9 for the job's life ---
+          # Children get fd 9 closed (9>&-) so a kill of this bash frees the lock at
+          # once. It exits when the runner-worker dies, or at TTL, whichever is first;
+          # if the worker could not be found it falls back to a pure TTL ceiling.
+          env LOCK="$LOCK" HOLDERFILE="$HOLDERFILE" ACQ="$ACQ" WAIT="$WAIT" TTL="$TTL" WORKER="$WORKER" \
+          bash -c '
+            exec 9>"$LOCK" || exit 1
+            flock -x -w "$WAIT" 9 || exit 1
+            printf "%s %s\n" "$$" "${WORKER:-0}" > "$HOLDERFILE"
+            touch "$ACQ"
+            _end=$(( SECONDS + TTL ))
+            while [ "$SECONDS" -lt "$_end" ]; do
+              if [ -n "$WORKER" ] && ! kill -0 "$WORKER" 2>/dev/null; then break; fi
+              sleep 15 9>&-
+            done
+            rm -f "$HOLDERFILE"
+          ' </dev/null >/dev/null 2>&1 &
           HOLDER=$!
-          disown "$HOLDER"
-          echo "HEAVY_LEG_LOCK_HOLDER=$HOLDER" >> "$GITHUB_ENV"
+          disown "$HOLDER" 2>/dev/null || true
+          echo "HEAVY_LEG_LOCK_HOLDER=$HOLDER" >> "${GITHUB_ENV:-/dev/null}"
+
+          # --- wait for the acquire handshake ---
           while kill -0 "$HOLDER" 2>/dev/null && [ ! -e "$ACQ" ]; do
             sleep 2
           done
           if [ ! -e "$ACQ" ]; then
-            echo "::error::per-host heavy-leg lock not acquired within 60 min on $RUNNER_NAME"
+            echo "::error::per-host heavy-leg lock not acquired within $((WAIT/60)) min on ${RUNNER_NAME:-?} -- blocked by a stale holder, not this diff"
+            if command -v fuser >/dev/null 2>&1; then
+              for _q in $(fuser "$LOCK" 2>/dev/null | tr -d ' '); do
+                echo "  current holder: $(ps -o pid=,ppid=,etimes=,comm= -p "$_q" 2>/dev/null | tr -s ' ')"
+              done
+            fi
+            [ -f "$HOLDERFILE" ] && echo "  holder marker: $(cat "$HOLDERFILE" 2>/dev/null)"
             exit 1
           fi
           rm -f "$ACQ"
-          echo "heavy-leg lock acquired on $RUNNER_NAME (holder pid $HOLDER)"
-
+          echo "heavy-leg lock acquired on ${RUNNER_NAME:-?} (holder pid $HOLDER, worker ${WORKER:-none})"
       - uses: actions/checkout@v6
 
       # Per-job Conan home under $RUNNER_TEMP so concurrent jobs on the shared
@@ -465,10 +534,15 @@ jobs:
         if: always() && runner.environment != 'github-hosted'
         shell: bash
         run: |
-          if [ -n "${HEAVY_LEG_LOCK_HOLDER:-}" ]; then
-            kill "$HEAVY_LEG_LOCK_HOLDER" 2>/dev/null || true
+          H="${HEAVY_LEG_LOCK_HOLDER:-}"
+          if [ -n "$H" ]; then
+            kill "$H" 2>/dev/null || true
+            MF=/tmp/c2pool-heavy-leg.holder
+            if [ -f "$MF" ]; then
+              read -r _mh _ < "$MF" 2>/dev/null || true
+              [ "${_mh:-}" = "$H" ] && rm -f "$MF"
+            fi
           fi
-
   # ════════════════════════════════════════════════════════════════════════════
   # COIN_BCH leg — Bitcoin Cash (SHA256d standalone parent, V36)
   #
