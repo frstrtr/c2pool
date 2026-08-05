@@ -1,0 +1,35 @@
+# Honesty gate for the per-host heavy-leg reap-guard used by build.yml and
+# codeql-analysis.yml. Runs the ACTUAL acquire script (extracted from build.yml)
+# against a planted orphan and asserts: with the sweep it recovers (green),
+# without the sweep the orphan blocks (red). Pure shell on a gh-hosted runner --
+# no self-hosted host, no build. See .github/actions/heavy-leg-lock/test.sh.
+name: heavy-leg-lock-test
+
+on:
+  push:
+    branches: [master, v37-dev]
+    paths:
+      - .github/workflows/build.yml
+      - .github/workflows/codeql-analysis.yml
+      - .github/workflows/heavy-leg-lock-test.yml
+      - .github/actions/heavy-leg-lock/**
+  pull_request:
+    paths:
+      - .github/workflows/build.yml
+      - .github/workflows/codeql-analysis.yml
+      - .github/workflows/heavy-leg-lock-test.yml
+      - .github/actions/heavy-leg-lock/**
+
+permissions:
+  contents: read
+
+jobs:
+  reap-guard-honesty:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Ensure fuser (psmisc) for the guard's diagnostics
+        run: command -v fuser >/dev/null || sudo apt-get install -y -q psmisc
+      - name: Run heavy-leg reap-guard honesty gate
+        run: bash .github/actions/heavy-leg-lock/test.sh

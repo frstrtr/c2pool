@@ -32,6 +32,7 @@
 
 #include <gtest/gtest.h>
 
+#include <impl/dash/coin/replay_bulk_fetch.hpp>  // W2 (merged): IReplayBlockConsumer
 #include <impl/dash/coin/replay_utxo_fold.hpp>
 
 #include <core/hash.hpp>
@@ -635,6 +636,53 @@ TEST(ReplayUtxoFoldTest, ConsumerCallbackMirrorsSeamShape)
     auto cb = make_coinbase(1, {{100, p2pkh(0x01)}});
     EXPECT_TRUE(consume(1, fake_block_hash(1), make_block({cb})));
     EXPECT_EQ(fold.best_height(), 1u);
+}
+
+// The W2 bulk lane's REAL consumer interface (replay_bulk_fetch.hpp, merged):
+// this adapter is the entire W5 wiring for the UTXO fold. It exists in the
+// test rather than the module so replay_utxo_fold.hpp stays standalone — but
+// it is compiled against the real header, so any drift in
+// IReplayBlockConsumer::on_replay_block breaks THIS build, loudly, instead of
+// surfacing at integration time.
+class UtxoFoldConsumer final
+    : public dash::coin::replay::IReplayBlockConsumer {
+    ReplayUtxoFold* m_fold;
+
+public:
+    explicit UtxoFoldConsumer(ReplayUtxoFold* f) : m_fold(f) {}
+    bool on_replay_block(uint32_t height, const uint256& hash,
+                         const BlockType& block) override
+    {
+        return m_fold->on_replay_block(height, hash, block);
+    }
+};
+
+TEST(ReplayUtxoFoldTest, DrivesW2BulkLaneConsumerInterface)
+{
+    TmpDir tmp;
+    ReplayUtxoFold fold;
+    ASSERT_TRUE(fold.open(tmp.sub("db")));
+
+    UtxoFoldConsumer adapter(&fold);
+    dash::coin::replay::IReplayBlockConsumer* sink = &adapter;
+
+    auto cb1 = make_coinbase(1, {{100, p2pkh(0x01)}});
+    const uint256 cb1_id = dash_txid(cb1);
+    ASSERT_TRUE(sink->on_replay_block(1, fake_block_hash(1), make_block({cb1})))
+        << fold.refusal();
+    auto cb2 = make_coinbase(2, {{100, p2pkh(0x02)}});
+    auto sp = make_spend({{cb1_id, 0}}, {{90, p2pkh(0x03)}});
+    ASSERT_TRUE(
+        sink->on_replay_block(2, fake_block_hash(2), make_block({cb2, sp})))
+        << fold.refusal();
+    EXPECT_EQ(fold.best_height(), 2u);
+    EXPECT_FALSE(fold.have_coin({cb1_id, 0}));
+
+    // The lane's fail-closed contract: a refusal must return false THROUGH
+    // the interface (the lane stops fetching on it), not throw or swallow.
+    auto cb4 = make_coinbase(4, {{100, p2pkh(0x04)}});
+    EXPECT_FALSE(sink->on_replay_block(4, fake_block_hash(4), make_block({cb4})));
+    EXPECT_NE(fold.refusal().find("gap"), std::string::npos);
 }
 
 TEST(ReplayUtxoFoldTest, EmptySetHashIsHashBlockOnly)

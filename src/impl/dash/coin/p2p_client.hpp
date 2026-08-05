@@ -732,6 +732,33 @@ private:
     using QrInfoConsumer = std::function<void(const vendor::CQuorumRotationInfo&)>;
     std::vector<QrInfoConsumer> m_qrinfo_consumers;
 
+    // ── W2 replay bulk-fetch demux seams (replay_bulk_fetch.hpp) ─────────
+    // Registered ONLY under --replay-bulk; unset (the default and every
+    // released posture) both are null and the handlers below behave
+    // byte-identically to before.
+    //
+    //   * headers filter: a `headers` batch CLAIMED by the genesis→anchor
+    //     backfill walker is consumed BEFORE the new_headers event — the main
+    //     HeaderChain must never see pre-anchor batches (they orphan-reject
+    //     and pollute the CP2 accepted==0 diagnostic), and the tip lane's
+    //     header ingest must never be re-pointed at 2012-era headers.
+    //   * block-body filter: a body the bulk scheduler has in flight is
+    //     consumed BEFORE the full_block event — bulk bodies must never
+    //     enter the live ingest legs (whose deferral buffers assume tip-rate
+    //     traffic), and tip bodies must never be swallowed by the bulk lane
+    //     (the filter only claims hashes it requested itself).
+    //   * block notfound callback: lets the bulk lane requeue an archival
+    //     gap on a different peer instead of waiting out its timeout.
+    using HeadersFilter =
+        std::function<bool(const std::string& peer_key,
+                           const std::vector<BlockType>&)>;
+    HeadersFilter m_headers_filter;
+    using BlockBodyFilter =
+        std::function<bool(const uint256&, const BlockType&)>;
+    BlockBodyFilter m_block_body_filter;
+    using BlockNotFoundCallback = std::function<void(const uint256&)>;
+    BlockNotFoundCallback m_on_block_notfound;
+
     // Commands already reported as dropped-unhandled, so the WARNING fires
     // once per distinct command instead of once per message. See handle().
     std::set<std::string> m_unhandled_seen;
@@ -1089,6 +1116,67 @@ public:
         m_qrinfo_consumers.push_back(std::move(c));
     }
     size_t qrinfo_consumer_count() const { return m_qrinfo_consumers.size(); }
+    // ── W2 replay bulk-fetch seams (see the member-block rationale) ──────
+    /// Register the backfill headers demux (single slot: exactly one bulk
+    /// lane exists per client; --replay-bulk wiring only).
+    void set_headers_filter(HeadersFilter f) { m_headers_filter = std::move(f); }
+    /// Register the bulk block-body demux (single slot, same rationale).
+    void set_block_body_filter(BlockBodyFilter f) { m_block_body_filter = std::move(f); }
+    /// Fired for every notfound(block) inv AFTER the reply matchers complete
+    /// (tip-lane semantics unchanged); the bulk lane requeues off this.
+    void set_on_block_notfound(BlockNotFoundCallback cb) { m_on_block_notfound = std::move(cb); }
+
+    /// Handshaked peer keys, pool order — the bulk scheduler's peer universe.
+    std::vector<std::string> handshaked_peer_keys() const
+    {
+        std::vector<std::string> out;
+        out.reserve(m_pool.size());
+        for (const auto& p : m_pool)
+            if (p->handshake.complete()) out.push_back(p->key);
+        return out;
+    }
+    /// The PRIMARY's key ("" when none) — the peer the bulk lane must NOT
+    /// load while any other handshaked peer exists (it carries every
+    /// request/response leg).
+    std::string primary_peer_key() const
+    {
+        return m_primary ? m_primary->key : std::string{};
+    }
+
+    /// getheaders to a NAMED peer (bulk header backfill: the walker rotates
+    /// its own peer cursor and must not disturb the primary-bound tip legs).
+    /// Returns false when the peer is unknown/not handshaked.
+    bool send_getheaders_to(const std::string& peer_key, uint32_t version,
+                            const std::vector<uint256>& locator,
+                            const uint256& stop)
+    {
+        PeerSession* p = find_peer(peer_key);
+        if (!p || !p->handshake.complete()) return false;
+        auto msg = message_getheaders::make_raw(version, locator, stop);
+        p->write(msg);
+        return true;
+    }
+
+    /// One getdata(MSG_BLOCK…) carrying `hashes` to a NAMED peer — the bulk
+    /// lane's pipelined batch pull. UNTRACKED by the tip-body watchdog by
+    /// design: bulk volume would defeat PENDING_BODY_CAP, and the bulk
+    /// scheduler owns its own timeout/re-request loop. Returns false when
+    /// the peer is unknown/not handshaked (the scheduler's service() pass
+    /// then requeues the batch off the live-peer set).
+    bool request_blocks_from(const std::string& peer_key,
+                             const std::vector<uint256>& hashes)
+    {
+        if (hashes.empty()) return true;
+        PeerSession* p = find_peer(peer_key);
+        if (!p || !p->handshake.complete()) return false;
+        std::vector<inventory_type> invs;
+        invs.reserve(hashes.size());
+        for (const auto& h : hashes)
+            invs.emplace_back(inventory_type::block, h);
+        auto msg = message_getdata::make_raw(invs);
+        p->write(msg);
+        return true;
+    }
     /// Fired on socket connect (before handshake) with the peer endpoint — the
     /// DashCoinPeerManager scores the connect + tracks anchors off this.
     void set_on_peer_connected(PeerLifecycleCallback cb) { m_on_peer_connected = std::move(cb); }
@@ -2118,6 +2206,21 @@ private:
         for (auto it = m_pending_bodies.begin();
              it != m_pending_bodies.end(); ++it)
             if (it->hash == blockhash) { m_pending_bodies.erase(it); break; }
+        // W2 bulk demux: a body the replay bulk lane has in flight is consumed
+        // HERE (verified + folded + pruned by the lane) and never fires
+        // full_block — the live ingest legs are tip-rate consumers and must
+        // not see 1.49M historical bodies. The filter claims ONLY hashes the
+        // bulk scheduler itself requested, so a tip body can never be
+        // swallowed. DEBUG, not INFO: bulk arrival rate would flood the
+        // journal (the [BULK] telemetry line is the throughput surface).
+        if (m_block_body_filter && m_block_body_filter(blockhash, msg->m_block))
+        {
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] bulk body from "
+                            << p->key << ": "
+                            << blockhash.GetHex().substr(0, 16)
+                            << "... (consumed by replay bulk lane)";
+            return;
+        }
         LOG_INFO << "[" << m_chain_label << "] block received from " << p->key
                  << ": " << blockhash.GetHex().substr(0, 16) << "...";
         m_coin->full_block.happened(msg->m_block);
@@ -2138,6 +2241,19 @@ private:
         // the tip authority driving the embedded template's next-work/MTP.
         PeerSession* p = m_active;
         if (!p) return;
+        // W2 bulk demux: a batch extending the genesis→anchor backfill walk
+        // is consumed here — the main HeaderChain fast-starts at the anchor
+        // and would orphan-reject every pre-anchor header (CP2 accepted==0
+        // noise), and the tip-lane matchers below have nothing waiting on
+        // 2012-era headers. Unclaimed batches (the tip sync) fall through
+        // unchanged.
+        if (m_headers_filter && m_headers_filter(p->key, msg->m_headers))
+        {
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] headers batch ("
+                            << msg->m_headers.size()
+                            << ") consumed by replay backfill";
+            return;
+        }
         std::vector<BlockHeaderType> vheaders;
         for (auto& block : msg->m_headers)
         {
@@ -2368,6 +2484,10 @@ private:
                 // cancel this peer's still-pending request.
                 try { p->conn->get_block(inv.m_hash, BlockType{}); } catch (...) {}
                 try { p->conn->get_header(inv.m_hash, BlockHeaderType{}); } catch (...) {}
+                // W2 bulk lane: an archival gap answered notfound is requeued
+                // on a DIFFERENT peer immediately instead of waiting out the
+                // scheduler timeout. No-op unless --replay-bulk registered it.
+                if (m_on_block_notfound) m_on_block_notfound(inv.m_hash);
             }
         }
     }
