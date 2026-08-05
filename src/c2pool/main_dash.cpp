@@ -90,6 +90,7 @@
 #include <impl/dash/coin/mn_seed.hpp>            // E2c: RPC protx-list MN-set seed (parse_protx_list_seed)
 #include <impl/dash/coin/mn_checkpoint.hpp>      // E2d: pinned MN-set checkpoint format + fail-closed parser
 #include <impl/dash/coin/mn_checkpoint_lane.hpp> // E2d: checkpoint -> forward-replay bridge -> leg-4 publish
+#include <impl/dash/coin/replay_utxo_fold.hpp>   // W3: full-history replay standalone UTXO fold (--replay-utxo-*)
 #include <impl/dash/node.hpp>          // dash::Node — sharechain pool-node (NodeBridge<NodeImpl,Legacy,Actual>)
 #include <impl/dash/config.hpp>        // dash::Config (PoolConfig/CoinConfig)
 #include <impl/dash/config_pool.hpp>   // dash::SharechainConfig — P2P_PORT / PREFIX / min-proto SSOT
@@ -128,6 +129,7 @@
 #include <boost/asio/post.hpp>
 
 #include <cstdint>
+#include <cctype>       // std::tolower (--replay-utxo-expect normalize)
 #include <cstdlib>      // std::getenv
 #include <cstring>
 #include <fstream>
@@ -272,7 +274,14 @@ void print_banner(const char* argv0)
         << "           [--coin-zmq-hashblock tcp://HOST:PORT]\n"
         << "           [--message-blob-hex HEX] [--coinbase-text TEXT]\n"
         << "       " << argv0 << " --mine-block [--coin-rpc H:P] [--coin-rpc-auth PATH]\n"
-        << "           [--testnet] [--payout-pubkey-hash HEX] [--max-nonce N]\n\n"
+        << "           [--testnet] [--payout-pubkey-hash HEX] [--max-nonce N]\n"
+        << "       " << argv0 << " --replay-utxo-db PATH [--replay-utxo-hash]\n"
+        << "           [--replay-utxo-expect HEX]\n"
+        << "        FULL-HISTORY REPLAY (W3) standalone UTXO-fold utility: names the\n"
+        << "        fold store's resume cursor; with --replay-utxo-hash computes the\n"
+        << "        dashd-compatible gettxoutsetinfo hash_serialized_2 over the whole\n"
+        << "        set and, with --replay-utxo-expect, exits 0 only on a byte-exact\n"
+        << "        match (the Tier-B gate). Runs and exits; never serves.\n\n"
         << "Status: consensus layer live (X11 PoW, subsidy, oracle CoinParams).\n"
         << "        --run stands up the run-loop and ARMS the external-dashd\n"
         << "        submitblock fallback (creds from dash.conf, never on argv).\n"
@@ -5325,6 +5334,14 @@ int main(int argc, char** argv)
     // Optional encrypted authority message_data blob for local v36 shares +
     // dashboard transition-notice display (EMIT side, mirror of main_ltc.cpp).
     std::string operator_message_blob_hex;     // --message-blob-hex / --transition-message
+    // ── FULL-HISTORY REPLAY W3: standalone UTXO fold utility surface ──────
+    // Feature-flagged and serve-path-inert: when --replay-utxo-db is absent
+    // nothing constructs the fold. Present, the process runs the standalone
+    // status/hash utility and EXITS before any node/serve path starts (the
+    // fold's block feed is the W2 bulk lane; wiring them is W5).
+    std::string replay_utxo_db;        // --replay-utxo-db PATH (fold store)
+    bool replay_utxo_hash = false;     // --replay-utxo-hash: compute hash_serialized_2
+    std::string replay_utxo_expect;    // --replay-utxo-expect HEX (gate compare, exit code)
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
             std::cout << "c2pool-dash " << C2POOL_VERSION << "\n";
@@ -5386,6 +5403,12 @@ int main(int argc, char** argv)
             embedded_utxo_immature_serve_empty = true;
         else if (std::strcmp(argv[i], "--embedded-serve-mempool-txs") == 0)
             embedded_serve_mempool_txs = true;
+        else if (std::strcmp(argv[i], "--replay-utxo-db") == 0 && i + 1 < argc)
+            replay_utxo_db = argv[++i];
+        else if (std::strcmp(argv[i], "--replay-utxo-hash") == 0)
+            replay_utxo_hash = true;
+        else if (std::strcmp(argv[i], "--replay-utxo-expect") == 0 && i + 1 < argc)
+            replay_utxo_expect = argv[++i];
         else if (std::strcmp(argv[i], "--bestcl-policy") == 0 && i + 1 < argc)
             bestcl_policy = argv[++i];
         else if (std::strcmp(argv[i], "--coinbase-text") == 0 && i + 1 < argc)
@@ -5452,6 +5475,75 @@ int main(int argc, char** argv)
             }
         }
         // --selftest is the default; accepted explicitly for symmetry.
+    }
+
+    // ── FULL-HISTORY REPLAY W3: --replay-utxo-* standalone utility ──────────
+    // Runs and EXITS: opens the fold store, names its resume cursor, and with
+    // --replay-utxo-hash computes the dashd-compatible hash_serialized_2 over
+    // the whole set (the Tier-B gate: expect
+    // 3d14913768a9d492bfa7a42fe9b111cff625b80e35bb4133e1d60cf3991c2319 at
+    // h=2,516,758 once a genesis→tip replay has been folded). Never touches
+    // the serve path — no node, no stratum, no RPC is constructed here.
+    if (!replay_utxo_db.empty()) {
+        dash::coin::replay::ReplayUtxoFold fold;
+        if (!fold.open(replay_utxo_db)) {
+            std::cout << "[REPLAY-UTXO] FAILED to open fold store at "
+                      << replay_utxo_db << " (see log; version mismatch is"
+                         " fail-loud by design)\n";
+            return 1;
+        }
+        if (fold.have_cursor()) {
+            std::cout << "[REPLAY-UTXO] db=" << replay_utxo_db
+                      << " format=v" << dash::coin::replay::REPLAY_UTXO_FORMAT_VERSION
+                      << " best_height=" << fold.best_height()
+                      << " best_block=" << fold.best_hash().GetHex()
+                      << " resume_height=" << fold.resume_height()
+                      << " undo_window=" << fold.undo_window() << "\n";
+        } else {
+            std::cout << "[REPLAY-UTXO] db=" << replay_utxo_db
+                      << " EMPTY (no cursor; the fold expects height 0 or 1"
+                         " first — a UTXO fold starts at genesis)\n";
+        }
+        if (replay_utxo_hash) {
+            std::cout << "[REPLAY-UTXO] computing hash_serialized_2 (full set"
+                         " scan; ~4.5M coins at mainnet tip takes a few"
+                         " minutes)...\n";
+            auto res = fold.hash_serialized_2();
+            if (!res) {
+                std::cout << "[REPLAY-UTXO] hash REFUSED: " << fold.refusal()
+                          << "\n";
+                return 1;
+            }
+            std::cout << "[REPLAY-UTXO] hash_serialized_2=" << res->hash.GetHex()
+                      << " height=" << res->best_height
+                      << " best_block=" << res->best_block.GetHex()
+                      << " coins=" << res->coins
+                      << " tx_groups=" << res->tx_groups << "\n";
+            if (!replay_utxo_expect.empty()) {
+                std::string want = replay_utxo_expect;
+                for (auto& c : want) c = static_cast<char>(std::tolower(c));
+                if (res->hash.GetHex() == want) {
+                    std::cout << "[REPLAY-UTXO] GATE PASS: set matches the"
+                                 " expected dashd hash_serialized_2\n";
+                    return 0;
+                }
+                std::cout << "[REPLAY-UTXO] GATE MISMATCH: got "
+                          << res->hash.GetHex() << " want " << want
+                          << " — fold state MUST NOT feed any serving"
+                             " decision\n";
+                return 1;
+            }
+        } else if (!replay_utxo_expect.empty()) {
+            std::cout << "[REPLAY-UTXO] --replay-utxo-expect given without"
+                         " --replay-utxo-hash — nothing was compared\n";
+            return 2;
+        }
+        return 0;
+    }
+    if (replay_utxo_hash || !replay_utxo_expect.empty()) {
+        std::cout << "[REPLAY-UTXO] --replay-utxo-hash/--replay-utxo-expect"
+                     " require --replay-utxo-db PATH\n";
+        return 2;
     }
 
     // ── --coinbase-text: resolve ONCE, here, before any coinbase is built ────

@@ -523,7 +523,16 @@ if (BUILD_TESTING AND GTest_FOUND)
     # double-spend conflict removal + feerate-sorted selection. Header-only over
     # block/transaction/utxo_adapter + core/coin; no ltc/pool SCC dependency.
     # Direct prerequisite for the embedded_gbt template builder (S7 main).
-    add_executable(test_dash_mempool test_dash_mempool.cpp)
+    # Second TU: test_dash_replay_utxo_fold.cpp — the W3 FULL-HISTORY REPLAY
+    # standalone UTXO fold (coin/replay_utxo_fold.hpp): dashd WriteVarInt /
+    # CompactSize primitive KATs, the hash_serialized_2 stream vs an
+    # independently hand-assembled preimage (incl. the v23.1.x ApplyHash
+    # ternary quirk, pinned), strict fold rules (zero-value coins kept,
+    # OP_RETURN excluded, missing-input/gap/BIP30/cold-start fail-closed,
+    # genesis short-circuit), resumable cursor across reopen, versioned-format
+    # fail-loud, 100-block undo window retention, disconnect/reconnect set-
+    # hash identity. Same target, no new allowlist entry.
+    add_executable(test_dash_mempool test_dash_mempool.cpp test_dash_replay_utxo_fold.cpp)
     target_link_libraries(test_dash_mempool PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
