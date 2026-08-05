@@ -51,6 +51,12 @@
 #include "data/dash_replay_block_2516758.inc"
 #include "data/dash_replay_block_2516759.inc"
 #include "data/dash_replay_block_2516760.inc"
+// The h=2516956 regression pair: dashd's own full-state list at h=2516955
+// (which re-derives merkleRootMNList 1fc56eca…1ab4 — the SAME root the live
+// replay fold published on both hosts) and the real body of h=2516956, the
+// block the contabo run desynced on.
+#include "data/dash_replay_prestate_2516955.inc"
+#include "data/dash_replay_block_2516956.inc"
 
 using dash::coin::BlockType;
 using dash::coin::MNState;
@@ -753,4 +759,157 @@ TEST(DashReplayPayeePublish, RevivedMasternodeArrivesEligibleInThePayeeQueue)
         EXPECT_FALSE(mn.scriptPayout.m_data.empty());
     }
     EXPECT_TRUE(seen) << "the revived masternode never reached the queue";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KAT 10 / 11 — THE PAYEE CROSS-CHECK, pinned to the real h=2516956 event
+//
+// THE POINT, stated once: merkleRootMNList commits the DIP-4 SML entry. It
+// does NOT commit nLastPaidHeight — and that is the field GetMNPayee orders
+// the payment queue by. So a fold can produce a byte-exact root chain and
+// still hold a wrong payment order, and its own proof cannot see it.
+//
+// These two tests are the same real chain data with ONE field moved:
+//
+//   KAT 10 (green) — dashd's list at h=2516955, real block h=2516956: the
+//       projection is paid by the block's own coinbase, payee_paid_verified.
+//   KAT 11 (red on master) — the SAME list with the true payee's
+//       nLastPaidHeight bumped so it loses the queue front. The fold now
+//       projects a masternode the coinbase does NOT pay. THE COMMITTED ROOT
+//       STILL MATCHES — asserted explicitly, because that equality IS the
+//       blindness this guard exists to close. Master folds it happily and
+//       reports ok; with pass 0b the fold fails closed and poisons.
+//
+// Real event: contabo, 2026-08-05. The fold reported 4755/4755 byte-exact
+// roots and DIVERGED=none, the seam published, and the next block said
+//     [MNS-SM] PAYEE DESYNC h=2516956: coinbase does not pay projected MN
+//              8ef71d8296c6e516
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// The scriptPayout block h=2516956's coinbase actually pays the masternode
+// share to (P2PKH XshfZjCw2Ar1vT7uSpHWCmtF1pE7pvJt4c), read off the block.
+const char* const kPaidScript2516956 =
+    "76a914baa1fbb7462cacb7c512baa05bd45946d843f36b88ac";
+
+std::string script_hex(const std::vector<unsigned char>& v)
+{
+    static const char* h = "0123456789abcdef";
+    std::string out;
+    out.reserve(v.size() * 2);
+    for (auto b : v) { out.push_back(h[(b >> 4) & 0xf]); out.push_back(h[b & 0xf]); }
+    return out;
+}
+
+} // namespace
+
+TEST(DashReplayPayeePublish, RealBlock2516956ProjectionIsPaidByItsOwnCoinbase)
+{
+    auto fx = pp_parse_prestate(kDashReplayPrestate2516955);
+    ASSERT_EQ(fx.height, 2516955u);
+    ASSERT_EQ(fx.entries.size(), 2971u);
+    uint256 anchor;
+    anchor.SetHex(fx.blockhash_display);
+    Rig rig(fx.entries, fx.height, anchor);
+    // The fixture is dashd's own list, and it reproduces the root the LIVE
+    // replay fold published on .211 and contabo — the two agree byte for byte
+    // on the masternode SET at this height.
+    ASSERT_EQ(rig.engine.compute_sml_root().GetHex(), fx.mnroot_display);
+    EXPECT_EQ(fx.mnroot_display,
+              "1fc56ecaa16e033fdadb32b864d9f05b83f1739da9de43be5b82c506ea9d1ab4");
+
+    auto blk = pp_parse_block(kDashReplayBlock2516956);
+    const auto r = rig.engine.fold_block(blk, 2516956);
+    ASSERT_TRUE(r.ok) << r.error;
+    EXPECT_EQ(r.computed_root, r.committed_root);
+
+    // THE NEW GUARANTEE: the projection was checked against the block's own
+    // coinbase, not merely asserted.
+    ASSERT_TRUE(r.payee.has_value());
+    EXPECT_TRUE(r.payee_paid_verified);
+
+    const ReplayMNState* paid = rig.engine.find(*r.payee);
+    ASSERT_NE(paid, nullptr);
+    EXPECT_EQ(script_hex(paid->scriptPayout.m_data), kPaidScript2516956);
+}
+
+TEST(DashReplayPayeePublish, WrongPayeeOrderFoldsToTheRightRootAndIsStillRefused)
+{
+    auto fx = pp_parse_prestate(kDashReplayPrestate2516955);
+    ASSERT_EQ(fx.entries.size(), 2971u);
+
+    // Find the masternode the real coinbase pays, exactly as KAT 10 does.
+    uint256 anchor;
+    anchor.SetHex(fx.blockhash_display);
+    uint256 true_payee;
+    {
+        Rig probe(fx.entries, fx.height, anchor);
+        auto blk0 = pp_parse_block(kDashReplayBlock2516956);
+        const auto r0 = probe.engine.fold_block(blk0, 2516956);
+        ASSERT_TRUE(r0.ok) << r0.error;
+        ASSERT_TRUE(r0.payee.has_value());
+        true_payee = *r0.payee;
+    }
+
+    // THE DRIFT, one field: pay it "already", so it falls out of the queue
+    // front and the projection moves to whoever is next. This is precisely
+    // the corruption class pass 5 can introduce on its own — it writes
+    // nLastPaidHeight onto the masternode the engine PROJECTED, so one wrong
+    // projection permanently mis-dates two entries.
+    for (auto& [protx, st] : fx.entries)
+        if (protx == true_payee) st.nLastPaidHeight = 2516955;
+
+    Rig rig(fx.entries, fx.height, anchor);
+    // ── THE WHOLE POINT ──────────────────────────────────────────────────
+    // nLastPaidHeight is not in the SML entry, so the list STILL hashes to
+    // the root the chain committed. Every root-based check is blind here.
+    EXPECT_EQ(rig.engine.compute_sml_root().GetHex(), fx.mnroot_display)
+        << "moving nLastPaidHeight must NOT change merkleRootMNList — if this "
+           "ever fails, the premise of this test has changed";
+
+    auto blk = pp_parse_block(kDashReplayBlock2516956);
+    const auto r = rig.engine.fold_block(blk, 2516956);
+
+    // On master this fold SUCCEEDS (root matches, nobody looks at the
+    // coinbase) and the wrong nLastPaidHeight is carried forward forever.
+    // With pass 0b it fails closed, names itself, and poisons the engine.
+    EXPECT_FALSE(r.ok);
+    EXPECT_FALSE(r.payee_paid_verified);
+    EXPECT_NE(r.error.find("PAYEE MISMATCH"), std::string::npos) << r.error;
+    EXPECT_NE(r.error.find("2516956"), std::string::npos) << r.error;
+    EXPECT_TRUE(rig.engine.poisoned());
+
+    // And a poisoned fold can never become the payee queue: G1 blocks it.
+    rig.tip = 2516956;
+    auto pub = rig.make_publisher();
+    const auto g = pub.evaluate();
+    EXPECT_FALSE(g.ok);
+    EXPECT_EQ(g.blocker.substr(0, 2), "G1") << g.blocker;
+    EXPECT_FALSE(pub.maybe_publish());
+    EXPECT_TRUE(rig.sink.calls.empty());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KAT 12 — G9 audits the payee axis independently of the root axis
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashReplayPayeePublish, G9RefusesAFoldWhosePayeesWereNotAllVerified)
+{
+    auto rig = make_clean_rig();
+    ASSERT_TRUE(rig.fold_through(kLastBody));
+    const FoldConsumerStats good = rig.consumer.stats();
+    // Every one of the five real blocks had its payee proven paid.
+    EXPECT_EQ(good.payees_verified, good.blocks_folded);
+    ASSERT_TRUE(evaluate_payee_guard(rig.engine, good, kLastBody).ok);
+
+    // One block folded whose payee was not proven: the SET proof is untouched
+    // (roots_matched still equals folded) and the queue is STILL refused,
+    // because the two axes are different proofs of different fields.
+    FoldConsumerStats s = good;
+    s.payees_verified -= 1;
+    const auto g = evaluate_payee_guard(rig.engine, s, kLastBody);
+    EXPECT_FALSE(g.ok);
+    EXPECT_EQ(g.blocker.substr(0, 2), "G9") << g.blocker;
+    EXPECT_NE(g.blocker.find("nLastPaidHeight"), std::string::npos) << g.blocker;
+    EXPECT_EQ(s.roots_matched, s.blocks_folded);   // the SML axis still clean
 }

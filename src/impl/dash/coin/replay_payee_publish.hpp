@@ -54,11 +54,29 @@
 //   G7  the fold cursor is AT the header-chain tip. A list that is behind the
 //       tip is a list that has not seen the registrations, bans and payments
 //       of the blocks in between — the queue front would be stale.
-//   G8  the list is non-empty and every entry carries a payout script.
+//   G8  the list is non-empty and every entry carries a payout script
+//   G9  every folded block's projected payee was PAID by that block's own
+//       coinbase (payees_verified == folded)
 //
-// G1..G6 are the fold's own proof; G7 is currency; G8 is usability. Anything
-// short of all eight WITHHOLDS, the two existing lanes keep their jobs, and
-// the log says which condition blocked.
+// G1..G6 and G9 are the fold's own proof; G7 is currency; G8 is usability.
+// Anything short of all nine WITHHOLDS, the two existing lanes keep their
+// jobs, and the log says which condition blocked.
+//
+// ── WHAT THE ROOT CHECK DOES AND DOES NOT COVER (read before quoting it) ──
+//
+// G4/G6 rest on merkleRootMNList, which commits the DIP-4 SML entry:
+// proRegTxHash, confirmedHash, netInfo, pubKeyOperator, keyIDVoting, isValid,
+// nType, platform ports. It does NOT commit nLastPaidHeight — and that is the
+// field GetMNPayee ORDERS THE PAYMENT QUEUE BY. So "4753/4753 byte-exact
+// roots, DIVERGED=none" is a real proof of the masternode SET and says
+// NOTHING about payment order. It has been quoted as if it said both.
+//
+// G9 is the missing half. Every block also carries the answer key for its own
+// payee — its coinbase, which dashd built from the list at H-1 — and the fold
+// now checks it there (replay_fold_engine.hpp pass 0b) and fails closed on a
+// mismatch exactly as it does on a root mismatch. G9 is the counter audit of
+// that check at the publish boundary: a fold may not become the authoritative
+// payee queue unless EVERY block it folded had its projected payee paid.
 
 #include <impl/dash/coin/mn_state_db.hpp>            // dash::coin::MNState
 #include <impl/dash/coin/replay_fold_engine.hpp>
@@ -164,6 +182,7 @@ struct ReplayPayeeGuard
     uint32_t    tip_height{0};
     uint64_t    folded{0};
     uint64_t    roots_matched{0};
+    uint64_t    payees_verified{0};
     size_t      mns{0};
     std::string root;           // display hex of the re-derived root
 };
@@ -259,6 +278,21 @@ inline ReplayPayeeGuard evaluate_payee_guard(const DmlFoldEngine&     engine,
             return g;
         }
     }
+    // G9 — THE PAYEE AXIS. G4 audits the SML-root counter; this audits the
+    // coinbase counter. They are different proofs of different fields and
+    // neither implies the other: a fold can match every committed
+    // merkleRootMNList and still have paid the wrong masternode in its own
+    // bookkeeping, because no block commits nLastPaidHeight. A block whose
+    // payee could not be verified is not a block this queue may be built on.
+    if (s.payees_verified != s.blocks_folded) {
+        g.blocker = "G9 payees_verified=" + std::to_string(s.payees_verified)
+                  + " != folded=" + std::to_string(s.blocks_folded)
+                  + " (a block whose projected payee was not proven paid by"
+                    " its own coinbase cannot back a payment queue —"
+                    " merkleRootMNList does not commit nLastPaidHeight)";
+        return g;
+    }
+    g.payees_verified = s.payees_verified;
 
     g.ok = true;
     return g;
@@ -367,11 +401,17 @@ private:
                  << " operator_split=" << with_split
                  << " root=" << g.root
                  << " (" << why << ")";
-        LOG_INFO << "[REPLAY-PAYEE]   PROOF: " << g.roots_matched << "/"
-                 << g.folded << " byte-exact merkleRootMNList self-checks,"
-                    " DIVERGED=none, list re-hashes to the root block h="
-                 << g.fold_height << " commits, fold cursor == header tip"
-                    " — G1..G8 all passed";
+        LOG_INFO << "[REPLAY-PAYEE]   PROOF (SET axis): " << g.roots_matched
+                 << "/" << g.folded << " byte-exact merkleRootMNList"
+                    " self-checks, DIVERGED=none, list re-hashes to the root"
+                    " block h=" << g.fold_height << " commits";
+        LOG_INFO << "[REPLAY-PAYEE]   PROOF (PAYEE axis): " << g.payees_verified
+                 << "/" << g.folded << " blocks whose projected payee was PAID"
+                    " by that block's own coinbase — the axis merkleRootMNList"
+                    " does NOT commit (nLastPaidHeight), so the count above"
+                    " proves the SET and this one proves the ORDER";
+        LOG_INFO << "[REPLAY-PAYEE]   fold cursor == header tip"
+                    " — G1..G9 all passed";
 
         m_publish(std::move(out), g.fold_height, kPayeeSourceReplayFold);
         m_published_height = g.fold_height;

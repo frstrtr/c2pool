@@ -64,7 +64,13 @@ namespace replay {
 struct FoldConsumerStats
 {
     uint64_t blocks_folded{0};      // folds that completed without error
-    uint64_t roots_matched{0};      // THE proof counter
+    uint64_t roots_matched{0};      // THE proof counter — the SML axis
+    // The SECOND proof counter — the PAYEE axis. Blocks whose projected payee
+    // was found in that block's own coinbase. Separate from roots_matched on
+    // purpose: merkleRootMNList does not commit nLastPaidHeight, so a run of
+    // byte-exact roots proves NOTHING about payment-queue order. Two counters,
+    // two proofs, and the difference between them is legible.
+    uint64_t payees_verified{0};
     uint64_t blocks_skipped{0};     // below the anchor, already folded
     uint32_t first_height{0};       // first height actually folded
     uint32_t last_height{0};        // highest height folded
@@ -210,6 +216,7 @@ public:
         ++m_stats.blocks_folded;
         ++m_stats.roots_matched;
         m_stats.last_height       = height;
+        if (r.payee_paid_verified) ++m_stats.payees_verified;
         // Recorded from the OBSERVED equality above, so it is the block's own
         // committed root and our own computed root at once.
         m_stats.last_matched_root = r.committed_root;
@@ -234,6 +241,7 @@ public:
             const auto secs = elapsed_seconds();
             LOG_INFO << "[REPLAY-FOLD] h=" << height
                      << " roots-matched=" << m_stats.roots_matched
+                     << " payees-verified=" << m_stats.payees_verified
                      << " mns=" << m_engine.size()
                      << " reg=" << m_stats.registered
                      << " ban=" << m_stats.banned
@@ -265,6 +273,7 @@ public:
         std::string s =
             "[REPLAY-FOLD SUMMARY] folded=" + std::to_string(m_stats.blocks_folded)
             + " roots_matched=" + std::to_string(m_stats.roots_matched)
+            + " payees_verified=" + std::to_string(m_stats.payees_verified)
             + " range=" + std::to_string(m_stats.first_height) + ".."
             + std::to_string(m_stats.last_height)
             + " mns=" + std::to_string(m_engine.size())
