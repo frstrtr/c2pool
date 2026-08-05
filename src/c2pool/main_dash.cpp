@@ -91,6 +91,9 @@
 #include <impl/dash/coin/mn_checkpoint.hpp>      // E2d: pinned MN-set checkpoint format + fail-closed parser
 #include <impl/dash/coin/mn_checkpoint_lane.hpp> // E2d: checkpoint -> forward-replay bridge -> leg-4 publish
 #include <impl/dash/coin/replay_bulk_fetch.hpp>  // W2: full-history replay bulk block-fetch lane (--replay-bulk)
+#include <impl/dash/coin/replay_prestate.hpp>    // W5: anchor prestate loader (--replay-fold-prestate)
+#include <impl/dash/coin/replay_fold_consumer.hpp> // W5: bulk lane -> W1 DML fold + per-block root check
+#include <impl/dash/coin/replay_quorum_bridge.hpp> // SEAM: W4 quorum lane <-> W1 MembersFn
 #include <impl/dash/node.hpp>          // dash::Node — sharechain pool-node (NodeBridge<NodeImpl,Legacy,Actual>)
 #include <impl/dash/config.hpp>        // dash::Config (PoolConfig/CoinConfig)
 #include <impl/dash/config_pool.hpp>   // dash::SharechainConfig — P2P_PORT / PREFIX / min-proto SSOT
@@ -232,6 +235,25 @@ bool        g_replay_bulk = false;            // --replay-bulk: arm the lane
 std::string g_replay_bulk_capture_dir;        // --replay-bulk-capture DIR (implies --replay-bulk)
 uint32_t    g_replay_bulk_start = 0;          // --replay-bulk-start H (0 = network default: mainnet DIP3 1028160)
 
+// ── W5 INTEGRATION: drive the W1 DML fold from the W2 bulk lane ───────────
+// --replay-fold-prestate FILE seeds the W1 fold engine from a full-state
+// anchor prestate (tools/dash/gen_replay_kat.py prestate) and installs the
+// FoldReplayConsumer, so every bulk-delivered body is folded and its computed
+// merkleRootMNList compared byte-exact against that block's own committed cbTx
+// root. Implies --replay-bulk, and pins the lane's start to anchor+1 (the fold
+// is forward-contiguous -- a gap refuses the whole fold).
+std::string g_replay_fold_prestate;           // --replay-fold-prestate FILE
+// ── THE SEAM: --replay-fold-quorums arms W4's QuorumReplayEngine and hands
+// its DERIVED member sets to the fold's MembersFn (replay_quorum_bridge.hpp),
+// so a commitment that marks members invalid no longer needs anchor-supplied
+// member sets. --replay-fold-qsnapshot FILE seeds the three PRE-ANCHOR
+// rotated-cycle snapshots a Phase-1 run cannot have produced yet (skip-list
+// bitsets, NOT member sets); every cycle from the anchor forward is produced
+// by the replay itself.
+bool        g_replay_fold_quorums = false;    // --replay-fold-quorums
+std::string g_replay_fold_qsnapshot;          // --replay-fold-qsnapshot FILE
+std::string g_replay_fold_worklists;          // --replay-fold-worklists FILE
+
 // Report the requested sharechain peering topology at run-loop bring-up. Honest
 // about the deferred live bind: a won/seen share does NOT yet cross the wire
 // until the sharechain pool-node leaf lands.
@@ -277,6 +299,8 @@ void print_banner(const char* argv0)
         << "           [--embedded-oracle-shadow]\n"
         << "           [--embedded-shadow-compare]\n"
         << "           [--replay-bulk] [--replay-bulk-capture DIR] [--replay-bulk-start H]\n"
+        << "           [--replay-fold-prestate FILE] [--replay-fold-quorums]\n"
+        << "           [--replay-fold-qsnapshot FILE] [--replay-fold-worklists FILE]\n"
         << "           [--oracle-graduation-blocks N] [--oracle-class-coverage K]\n"
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
         << "           [--redistribute pplns|fee|boost|donate]\n"
@@ -373,6 +397,18 @@ void print_banner(const char* argv0)
         << "        header backfill join-checked against the fast-start anchor, then\n"
         << "        pipelined multi-peer body fetch from DIP3 (h=1028160) forward,\n"
         << "        merkle-verified, handed IN ORDER to the replay consumer and\n"
+        << "        --replay-fold-prestate FILE seeds the W1 DML fold from a\n"
+        << "        full-state anchor prestate and makes the bulk lane DRIVE it:\n"
+        << "        every delivered body is folded and its computed\n"
+        << "        merkleRootMNList compared byte-exact with that block's own\n"
+        << "        committed cbTx root (implies --replay-bulk; pins the lane to\n"
+        << "        anchor+1). --replay-fold-quorums additionally arms the W4\n"
+        << "        quorum lane and hands its DERIVED member sets to the fold's\n"
+        << "        resolver, so commitments that mark members invalid fold\n"
+        << "        without any anchor-supplied member set;\n"
+        << "        --replay-fold-qsnapshot FILE seeds ONLY the pre-anchor\n"
+        << "        rotated-cycle snapshots a Phase-1 run cannot have produced.\n"
+        << "        None of this changes serving.\n"
         << "        PRUNED (bodies never persisted). Strictly lower priority than\n"
         << "        the tip lane; resumable (high-water cursor); [BULK] telemetry.\n"
         << "        OBSERVE-only in W2 (counting consumer stands in for the W1 fold);\n"
@@ -2642,6 +2678,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     std::unique_ptr<dash::coin::replay::ReplayCursorStore>     replay_cursor;
     std::unique_ptr<dash::coin::replay::BulkFetchLane>         replay_lane;
     std::unique_ptr<core::Timer>                               replay_timer;
+    // W5 integration: the fold engine the lane drives, and its consumer.
+    std::unique_ptr<dash::coin::replay::DmlFoldEngine>         replay_fold_engine;
+    std::unique_ptr<dash::coin::replay::FoldReplayConsumer>    replay_fold_consumer;
+    // THE SEAM: W4's quorum lane and the bridge that closes the loop.
+    std::unique_ptr<dash::coin::replay::QuorumReplayEngine>    replay_quorum_engine;
+    std::unique_ptr<dash::coin::replay::ReplayQuorumBridge>    replay_quorum_bridge;
     if (coin_p2p) {
         const auto dash_params = testnet
             ? dash::coin::make_dash_chain_params_testnet()
@@ -4660,14 +4702,180 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             }
             replay_counter = std::make_unique<rp::CountingReplayConsumer>();
             rp::IReplayBlockConsumer* replay_consumer = replay_counter.get();
+
+            // ── W5: seed the DML fold and let the lane DRIVE it ───────────
+            // Without a prestate the lane keeps W2's counting stub (pure
+            // OBSERVE). With one, every delivered body is folded and its
+            // computed merkleRootMNList checked byte-exact against that
+            // block's own committed cbTx root — the per-block proof.
+            uint32_t replay_fold_anchor = 0;
+            if (!g_replay_fold_prestate.empty()) {
+                auto ps = rp::load_prestate_file(g_replay_fold_prestate);
+                if (!ps.ok) {
+                    std::cerr << "[run] FATAL: --replay-fold-prestate "
+                              << g_replay_fold_prestate << ": " << ps.error
+                              << "\n";
+                    return 1;
+                }
+                dash::coin::replay::FoldConfig fcfg;
+                fcfg.enabled = true;   // W1 feature flag, explicit opt-in
+                replay_fold_engine =
+                    std::make_unique<rp::DmlFoldEngine>(fcfg);
+                const std::string serr =
+                    rp::seed_engine_from_prestate(*replay_fold_engine, ps);
+                if (!serr.empty()) {
+                    std::cerr << "[run] FATAL: " << serr << "\n";
+                    return 1;
+                }
+                replay_fold_anchor = ps.height;
+                replay_fold_consumer =
+                    std::make_unique<rp::FoldReplayConsumer>(
+                        *replay_fold_engine);
+                replay_consumer = replay_fold_consumer.get();
+                std::cout << "[run] W5 REPLAY FOLD ARMED: anchor h="
+                          << ps.height << " mns=" << replay_fold_engine->size()
+                          << " root="
+                          << replay_fold_engine->compute_sml_root().GetHex()
+                          << " (reproduces the anchor block's committed cbTx"
+                             " merkleRootMNList)\n";
+
+                // ── THE SEAM ─────────────────────────────────────────────
+                // W4's engine derives member sets from the SAME replayed
+                // blocks the fold consumes; the bridge installs both
+                // directions and nothing else is supplied.
+                if (g_replay_fold_quorums) {
+                    dash::coin::replay::QuorumReplayConfig qcfg;
+                    qcfg.enabled = true;   // W4 feature flag, explicit opt-in
+                    qcfg.network = testnet
+                        ? dash::coin::LlmqNetwork::Testnet
+                        : dash::coin::LlmqNetwork::Mainnet;
+                    if (testnet) qcfg.v20_floor = 905'100u;
+                    replay_quorum_engine =
+                        std::make_unique<rp::QuorumReplayEngine>(qcfg);
+                    replay_quorum_engine->seed_cursor(
+                        ps.height, replay_fold_engine->block_hash());
+                    dash::coin::replay::QuorumBridgeConfig bcfg;
+                    bcfg.network = qcfg.network;
+                    replay_quorum_bridge =
+                        std::make_unique<rp::ReplayQuorumBridge>(
+                            *replay_fold_engine, *replay_quorum_engine, bcfg);
+                    // Pre-anchor height->hash from the PoW-verified header
+                    // chain, so a commitment mined just after the anchor
+                    // whose quorum BASE predates it still resolves instead
+                    // of poisoning the lane on an "unknown base".
+                    size_t seeded_hashes = 0;
+                    const uint32_t back = 3u * 576u + 64u;
+                    for (uint32_t h = (ps.height > back ? ps.height - back : 1);
+                         h < ps.height; ++h) {
+                        auto e = header_chain->get_header_by_height(h);
+                        if (!e) continue;
+                        replay_quorum_bridge->seed_block_hash(h, e->hash);
+                        ++seeded_hashes;
+                    }
+                    size_t seeded_snaps = 0;
+                    if (!g_replay_fold_qsnapshot.empty()) {
+                        auto qs = rp::load_qsnapshot_seed_file(
+                            g_replay_fold_qsnapshot);
+                        std::string qerr;
+                        if (!replay_quorum_bridge->seed_snapshots(
+                                qs, ps.height, qerr)) {
+                            std::cerr << "[run] FATAL: "
+                                         "--replay-fold-qsnapshot "
+                                      << g_replay_fold_qsnapshot << ": "
+                                      << qerr << "\n";
+                            return 1;
+                        }
+                        seeded_snaps =
+                            replay_quorum_bridge->seeded_snapshot_count();
+                    }
+                    size_t seeded_works = 0;
+                    if (!g_replay_fold_worklists.empty()) {
+                        auto wl = rp::load_work_list_seed_file(
+                            g_replay_fold_worklists);
+                        std::string werr;
+                        if (!replay_quorum_bridge->seed_work_lists(
+                                wl, ps.height, werr)) {
+                            std::cerr << "[run] FATAL: "
+                                         "--replay-fold-worklists "
+                                      << g_replay_fold_worklists << ": "
+                                      << werr << "\n";
+                            return 1;
+                        }
+                        seeded_works =
+                            replay_quorum_bridge->seeded_work_list_count();
+                    }
+                    replay_quorum_bridge->prime_at_anchor();
+                    replay_fold_consumer->set_pre_fold(
+                        [br = replay_quorum_bridge.get()](
+                            uint32_t h, const uint256& bh,
+                            const dash::coin::BlockType& blk) {
+                            return br->observe(h, bh, blk);
+                        });
+                    replay_fold_consumer->set_post_fold(
+                        [br = replay_quorum_bridge.get()](uint32_t h) {
+                            br->after_fold(h);
+                        });
+                    std::cout << "[run] REPLAY QUORUM SEAM ARMED: W4 member"
+                                 " derivation feeds the W1 MembersFn"
+                                 " (pre-anchor header hashes seeded="
+                              << seeded_hashes
+                              << ", pre-anchor cycle snapshots seeded="
+                              << seeded_snaps
+                              << ", pre-anchor work lists seeded="
+                              << seeded_works
+                              << "; rotated membership reads NOTHING seeded "
+                                 "from cycle base h="
+                              << replay_quorum_bridge->self_contained_from(
+                                     5, ps.height)
+                              << " onward)\n";
+                } else {
+                    std::cout << "[run] --replay-fold-quorums NOT given: the"
+                                 " fold has no member resolver, so the first"
+                                 " commitment that marks a member invalid"
+                                 " will fail closed (by design).\n";
+                }
+            }
+
             if (!g_replay_bulk_capture_dir.empty()) {
                 replay_capture = std::make_unique<rp::CaptureReplayConsumer>(
-                    g_replay_bulk_capture_dir, replay_counter.get());
+                    g_replay_bulk_capture_dir, replay_consumer);
                 replay_consumer = replay_capture.get();
             }
             replay_cursor = std::make_unique<rp::ReplayCursorStore>(
                 (core::filesystem::config_path() / net_subdir
                     / "dash_replay_cursor").string());
+
+            // ── cursor/fold reconciliation (found by the first live run) ──
+            // The lane's cursor is PERSISTENT and the fold's anchor seed is
+            // re-read at every start, so the two are independent: a restart
+            // resumed the lane at the stored height (h=2513098) while the
+            // fold sat at the anchor (h=2513000), and the forward-contiguous
+            // fold refused the very first delivery. When a fold is armed the
+            // FOLD's cursor is authoritative — it is the thing carrying
+            // consensus state — so the lane is pinned back to it. Resuming a
+            // fold mid-range needs a snapshot v3 at the cursor height, not a
+            // prestate at the anchor; until that path exists this refuses to
+            // half-resume rather than silently skipping blocks.
+            if (replay_fold_anchor != 0) {
+                const auto stored = replay_cursor->load();
+                if (stored && stored->height != replay_fold_anchor) {
+                    LOG_WARNING
+                        << "[BULK] persisted replay cursor is at h="
+                        << stored->height << " but the armed DML fold is "
+                           "seeded at anchor h=" << replay_fold_anchor
+                        << " — pinning the lane back to the anchor so the "
+                           "forward-contiguous fold starts at h="
+                        << (replay_fold_anchor + 1)
+                        << " (a mid-range resume needs a snapshot v3 at the "
+                           "cursor height, not a prestate at the anchor)";
+                }
+                if (!stored || stored->height != replay_fold_anchor) {
+                    rp::ReplayCursorStore::Cursor c;
+                    c.height = replay_fold_anchor;
+                    c.hash   = replay_fold_engine->block_hash();
+                    replay_cursor->store(c);
+                }
+            }
 
             rp::BulkFetchLane::Seams seams;
             // Height→hash: pre-anchor from the (join-checked) backfill,
@@ -4710,9 +4918,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             };
 
             rp::BulkFetchLane::Config rcfg;
-            rcfg.start_height = g_replay_bulk_start != 0
-                ? g_replay_bulk_start
-                : (testnet ? 1 : rp::MAINNET_DIP3_HEIGHT);
+            // A seeded fold pins the lane to anchor+1: the fold is
+            // forward-contiguous, so a gap or an out-of-order delivery
+            // refuses the WHOLE fold rather than silently skipping state.
+            rcfg.start_height = replay_fold_anchor != 0
+                ? replay_fold_anchor + 1
+                : (g_replay_bulk_start != 0
+                       ? g_replay_bulk_start
+                       : (testnet ? 1 : rp::MAINNET_DIP3_HEIGHT));
             replay_lane = std::make_unique<rp::BulkFetchLane>(
                 std::move(seams), rcfg, replay_backfill.get(),
                 replay_consumer, replay_cursor.get());
@@ -4733,10 +4946,34 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 });
 
             replay_timer = std::make_unique<core::Timer>(&ioc, /*repeat=*/true);
-            replay_timer->start(1, [ln = replay_lane.get()] {
+            replay_timer->start(1, [ln = replay_lane.get(),
+                                    fc = replay_fold_consumer.get(),
+                                    br = replay_quorum_bridge.get(),
+                                    tick = std::make_shared<uint64_t>(0)] {
                 ln->tick(std::chrono::duration_cast<std::chrono::seconds>(
                     std::chrono::steady_clock::now().time_since_epoch())
                         .count());
+                // The run's deliverable is a COUNT of byte-exact root checks;
+                // print it on a cadence so a run that is killed, wedged or
+                // watched from another terminal still reports what it proved.
+                if (fc && ++*tick % 30 == 0) {
+                    LOG_INFO << fc->summary();
+                    if (br) {
+                        const auto& bs = br->stats();
+                        LOG_INFO << "[REPLAY-SEAM] member_cycles_derived="
+                                 << bs.member_cycles_derived
+                                 << " skipped=" << bs.member_cycles_skipped
+                                 << " members_answered=" << bs.members_answered
+                                 << " members_missing=" << bs.members_missing
+                                 << " lists_retained=" << br->retained_lists()
+                                 << " quorum_root_match/differ="
+                                 << bs.quorum_roots_matched << "/"
+                                 << bs.quorum_roots_differed
+                                 << (bs.last_skip_reason.empty()
+                                        ? std::string()
+                                        : " last_skip=\"" + bs.last_skip_reason + "\"");
+                    }
+                }
             });
 
             std::cout << "[run] W2 REPLAY BULK lane ARMED: start_h="
@@ -4749,9 +4986,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                       << (g_replay_bulk_capture_dir.empty()
                               ? ""
                               : " capture=" + g_replay_bulk_capture_dir)
-                      << " consumer=" << (g_replay_bulk_capture_dir.empty()
-                                              ? "counting-stub(W1 seam)"
-                                              : "capture+counting-stub")
+                      << " consumer="
+                      << (replay_fold_consumer
+                              ? (g_replay_bulk_capture_dir.empty()
+                                     ? "W1-DML-FOLD(root-checked)"
+                                     : "capture+W1-DML-FOLD(root-checked)")
+                              : (g_replay_bulk_capture_dir.empty()
+                                     ? "counting-stub(W1 seam)"
+                                     : "capture+counting-stub"))
+                      << (replay_quorum_bridge
+                              ? " members=W4-DERIVED"
+                              : " members=none")
                       << " (OBSERVE-only; tip lane strictly prioritized)\n";
         }
     }
@@ -5569,6 +5814,18 @@ int main(int argc, char** argv)
         else if (std::strcmp(argv[i], "--replay-bulk-start") == 0 && i + 1 < argc)
             g_replay_bulk_start = static_cast<uint32_t>(
                 std::strtoul(argv[++i], nullptr, 10));
+        // W5: anchor-seeded DML fold driven by the bulk lane.
+        else if (std::strcmp(argv[i], "--replay-fold-prestate") == 0 && i + 1 < argc) {
+            g_replay_fold_prestate = argv[++i];
+            g_replay_bulk = true;   // the fold has nothing to fold without it
+        }
+        // THE SEAM: W4 member derivation feeds the fold's MembersFn.
+        else if (std::strcmp(argv[i], "--replay-fold-quorums") == 0)
+            g_replay_fold_quorums = true;
+        else if (std::strcmp(argv[i], "--replay-fold-qsnapshot") == 0 && i + 1 < argc)
+            g_replay_fold_qsnapshot = argv[++i];
+        else if (std::strcmp(argv[i], "--replay-fold-worklists") == 0 && i + 1 < argc)
+            g_replay_fold_worklists = argv[++i];
         else if (std::strcmp(argv[i], "--oracle-graduation-blocks") == 0 && i + 1 < argc)
             oracle_grad_blocks = std::strtoull(argv[++i], nullptr, 10);
         else if (std::strcmp(argv[i], "--oracle-class-coverage") == 0 && i + 1 < argc)

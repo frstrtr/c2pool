@@ -363,6 +363,120 @@ def cmd_quorum(args):
     print("wrote %s (%d members)" % (args.out, len(members)))
 
 
+def cmd_seamwork(args):
+    """Emit the WORK-BLOCK masternode lists a rotated-cycle derivation consumes.
+
+    DIP-0024 membership at cycle base B is computed over the masternode list at
+    each contributing cycle's WORK block (base - 8), scored under that cycle's
+    hash modifier. This packs the four work blocks of one cycle (B, B-C, B-2C,
+    B-3C) into a single fixture so the KAT can DERIVE the member sets instead
+    of being handed them.
+
+    Per work block the capture is `protx diff 1 <workHeight>` (whose mnList is
+    the full SML at that height) plus the block's own hash and cbTx
+    bestCLSignature (the post-V20 hash-modifier input, chain data).
+
+    An SML-fed list carries no collateral outpoint, so the upstream score
+    TIEBREAK is undecidable and the derivation fails closed on a tie -- the
+    same posture as the W4 KATs. A replay-fed list (the live path) carries it.
+
+        for h in <B-8> <B-C-8> <B-2C-8> <B-3C-8>; do
+            dash-cli protx diff 1 $h > diff_$h.json
+            dash-cli getblock $(dash-cli getblockhash $h) 2 > blk_$h.json
+        done
+        python3 tools/dash/gen_replay_kat.py seamwork --llmq-type 5 \
+            --cycle-base 2513088 --interval 288 \
+            --work <B-8>:diff_<B-8>.json:blk_<B-8>.json ... --out work.txt
+    """
+    lines = ["c2pool-dash-replay-seam-workblocks/1",
+             "network %s" % args.network,
+             "llmqType %d" % args.llmq_type,
+             "cycleBase %d" % args.cycle_base,
+             "interval %d" % args.interval]
+    for spec in args.work:
+        parts = spec.split(":")
+        if len(parts) != 3:
+            die("--work wants <workHeight>:<protx-diff.json>:<getblock2.json>")
+        work_h = int(parts[0])
+        with open(parts[1]) as f:
+            diff = json.load(f)
+        with open(parts[2]) as f:
+            blk = json.load(f)
+        if blk.get("height") != work_h:
+            die("--work %d: getblock capture is at height %r"
+                % (work_h, blk.get("height")))
+        cycle_base = work_h + 8
+        cb = blk["tx"][0].get("cbTx", {})
+        clsig = (cb.get("bestCLSignature") or "-")
+        mns = diff.get("mnList", [])
+        if not mns:
+            die("--work %d: protx diff carries no mnList" % work_h)
+        lines.append("work %d %d %s %s %d"
+                     % (cycle_base, work_h, blk["hash"].lower(),
+                        clsig.lower(), len(mns)))
+        for e in mns:
+            lines.append("mn %s %s %d %d"
+                         % (rev_hex(e["proRegTxHash"]),
+                            rev_hex(e["confirmedHash"]),
+                            1 if e.get("isValid") else 0,
+                            int(e.get("nType", 0))))
+        print("work h=%d (cycle base %d): %d MNs, cl=%s"
+              % (work_h, cycle_base, len(mns), clsig[:16]))
+    with open(args.out, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print("wrote %s" % args.out)
+
+
+def cmd_qsnapshot(args):
+    """Emit the PRE-ANCHOR rotated-cycle snapshot seed a Phase-1 replay needs.
+
+    Rotated (DIP-0024) membership at cycle base B is built from the new
+    quarter at B plus the three PREVIOUS cycles' CQuorumSnapshots. A replay
+    produces those itself from its anchor forward, but the first three cycles
+    after an anchor have no produced predecessor — this seeds exactly those,
+    and nothing else (the C++ loader REFUSES any cycle base at or after the
+    fold anchor, so a seed cannot mask a derivation that stopped working).
+
+    A CQuorumSnapshot is a skip-list mode + an active-member bitset. It is NOT
+    a member set: the member lists are computed by the replay.
+
+        dash-cli quorum rotationinfo $(dash-cli getblockhash <cycleBase>) \
+            > rot_<cycleBase>.json
+        python3 tools/dash/gen_replay_kat.py qsnapshot \
+            --rotationinfo rot_<cycleBase>.json --llmq-type 5 \
+            --cycle-base <cycleBase> --interval 288 --out qsnap.txt
+    """
+    with open(args.rotationinfo) as f:
+        rot = json.load(f)
+    keys = [("quorumSnapshotAtHMinusC", 1),
+            ("quorumSnapshotAtHMinus2C", 2),
+            ("quorumSnapshotAtHMinus3C", 3)]
+    lines = ["c2pool-dash-replay-qsnapshot/1", "network %s" % args.network]
+    for key, mult in keys:
+        snap = rot.get(key)
+        if not isinstance(snap, dict):
+            die("--rotationinfo carries no %s" % key)
+        base = args.cycle_base - mult * args.interval
+        if base <= 0:
+            die("cycle base %d - %d*%d is not a positive height"
+                % (args.cycle_base, mult, args.interval))
+        mode = snap.get("mnSkipListMode")
+        active = snap.get("activeQuorumMembers")
+        skips = snap.get("mnSkipList", [])
+        if not isinstance(mode, int) or not isinstance(active, list) \
+                or not isinstance(skips, list):
+            die("%s is not a CQuorumSnapshot (mode/bitset/skiplist)" % key)
+        bits = "".join("1" if bool(b) else "0" for b in active) or "-"
+        lines.append("snapshot %d %d %d %s %d%s"
+                     % (args.llmq_type, base, mode, bits, len(skips),
+                        ("".join(" %d" % int(x) for x in skips))))
+        print("%s -> cycle base %d: mode=%d active=%d skips=%d"
+              % (key, base, mode, len(active), len(skips)))
+    with open(args.out, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print("wrote %s (%d snapshots)" % (args.out, len(keys)))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -380,6 +494,28 @@ def main():
     p.add_argument("--symbol", required=True)
     p.add_argument("--out", required=True)
     p.set_defaults(fn=cmd_block)
+
+    p = sub.add_parser("seamwork")
+    p.add_argument("--llmq-type", type=int, required=True)
+    p.add_argument("--cycle-base", type=int, required=True)
+    p.add_argument("--interval", type=int, required=True)
+    p.add_argument("--work", action="append", required=True,
+                   help="<workHeight>:<protx-diff.json>:<getblock-verbosity2.json>")
+    p.add_argument("--network", default="mainnet")
+    p.add_argument("--out", required=True)
+    p.set_defaults(fn=cmd_seamwork)
+
+    p = sub.add_parser("qsnapshot")
+    p.add_argument("--rotationinfo", required=True,
+                   help="dash-cli quorum rotationinfo <cycleBase blockhash>")
+    p.add_argument("--llmq-type", type=int, required=True)
+    p.add_argument("--cycle-base", type=int, required=True,
+                   help="the cycle base the rotationinfo was requested at")
+    p.add_argument("--interval", type=int, required=True,
+                   help="the type's dkgInterval (mainnet llmq_60_75: 288)")
+    p.add_argument("--network", default="mainnet")
+    p.add_argument("--out", required=True)
+    p.set_defaults(fn=cmd_qsnapshot)
 
     p = sub.add_parser("quorum")
     p.add_argument("--info", required=True)
