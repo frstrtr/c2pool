@@ -1024,10 +1024,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     # add_executable would not be in the build.yml --target list and would
     # silently report "Not Run" (#143 NOT_BUILT trap). No #ifdef guards in that
     # TU either, so every registered case actually executes (#895).
+    # Fifth TU: test_dash_lane_diag.cpp — the embedded/replay DIAGNOSTIC
+    # primitives (coin/lane_diag.hpp) plus the two lane-level properties they
+    # exist for: the progress throttle never degenerates to a per-block flood,
+    # and the stall watchdog fires from a path pump() CANNOT skip (the
+    # 2026-08-04 11-12 minute silent freeze on .211 and contabo, where the
+    # probe sat below the early-return that the freeze itself produced). Also
+    # pins masternode-list SOURCE attribution end-to-end through the leg-4
+    # event. FOLDED into this EXISTING allowlisted target for the same reason
+    # the E2d TU was: a new add_executable would not be in the build.yml
+    # --target list and would silently report "Not Run" (#143 NOT_BUILT trap).
     add_executable(test_dash_node_reception_wire test_dash_node_reception_wire.cpp
                    test_dash_live_feed_bridge.cpp
                    test_dash_mn_seed.cpp
-                   test_dash_mn_checkpoint.cpp)
+                   test_dash_mn_checkpoint.cpp
+                   test_dash_lane_diag.cpp)
     target_link_libraries(test_dash_node_reception_wire PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

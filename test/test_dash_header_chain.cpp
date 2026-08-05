@@ -612,3 +612,52 @@ TEST(DashChainRpc, ChainQueryRefusesMethodsTheHeaderChainDoesNotOwn) {
     EXPECT_TRUE(ok.is_string()) << ok.dump();
     EXPECT_EQ(ok.get<std::string>(), mc.hashes.back().GetHex());
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HEADER-BACKFILL PROGRESS TELEMETRY
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The old line was `[DASH] Header sync: N/M (P%)`, throttled on HEIGHT ALONE
+// by a function-local `static` — i.e. one counter shared by every HeaderChain
+// in the process. On 2026-08-04 that cost real time twice: a backfill that
+// slowed to a crawl went silent for as long as it took to cover 2000 blocks,
+// and rate/ETA had to be reconstructed by diffing log timestamps by hand.
+//
+// What is pinned here: the FIRST batch establishes a baseline and reports
+// nothing (a rate cannot be measured from one sample — reporting one would be
+// a fabricated number), and a LATER batch past the throttle emits the line.
+TEST(DashHeaderChainDiag, BackfillProgressBaselinesThenReports) {
+    auto params = make_easy_test_params();
+    HeaderChain hc(params, /*db_path=*/"");
+    ASSERT_TRUE(hc.init());
+    hc.set_peer_tip_height(100);
+    // Tight throttle so the KAT need not mine 2000 headers to prove the line.
+    hc.set_progress_throttle(/*headers=*/2, /*ms=*/60'000);
+
+    const uint32_t bits = params.pow_limit.GetCompact();
+    uint256  prev = params.genesis_hash;
+    uint32_t t    = 1'800'000'000u;
+
+    auto mine_batch = [&](int n) {
+        std::vector<BlockHeaderType> batch;
+        for (int i = 0; i < n; ++i) {
+            t += 150u;
+            auto h = mine_header(prev, t, bits, params.pow_limit);
+            prev = x11_hash(h);
+            batch.push_back(h);
+        }
+        return batch;
+    };
+
+    // First batch: accepted, and it BASELINES the reporter.
+    auto b1 = mine_batch(3);
+    EXPECT_EQ(hc.add_headers(b1), 3);
+    EXPECT_EQ(hc.height(), 3u);
+
+    // Second batch: three more headers is past the 2-header throttle, so the
+    // progress line is due. The assertion available to a KAT is the state the
+    // line reports — the cursor and the peer target it prints.
+    auto b2 = mine_batch(3);
+    EXPECT_EQ(hc.add_headers(b2), 3);
+    EXPECT_EQ(hc.height(), 6u);
+}

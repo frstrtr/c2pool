@@ -33,6 +33,7 @@
 #include <impl/dash/coin/governance_object.hpp>  // parse_superblock_trigger, govvote_signature_hash
 #include <impl/dash/coin/superblock.hpp>         // get_superblock_payments (R6 cross-check + provider)
 #include <impl/dash/coin/mn_state_machine.hpp>   // MNState
+#include <impl/dash/coin/lane_diag.hpp>          // diag::MnSource (population attribution)
 #include <impl/dash/coin/block.hpp>            // BlockType
 #include <impl/dash/coin/transaction.hpp>        // MutableTransaction
 #include <impl/dash/coin/vendor/smldiff.hpp>     // vendor::CSimplifiedMNListDiff + apply_diff
@@ -336,6 +337,24 @@ public:
                  << " as_of_h=" << as_of_height
                  << " mns=" << mnstates.size()
                  << (mnstates.empty() ? " (EMPTY -> set-gap, demoting)" : "");
+        // ── DAEMONLESS CLASSIFICATION (the 2026-08-04 misreading) ────────
+        // #1128's line above names the lane; this states the CONSEQUENCE, and
+        // it is the half that actually cost the day: we read a run as proof of
+        // a daemonless serve when its payee half had come from dashd, and only
+        // an A/B with --coin-rpc removed exposed it. The predicate is derived
+        // from the very string #1128 passed in — never inferred from which
+        // flags were on the command line — and it rides the standing
+        // [EMBED-STATUS] line so the question is answerable at any moment, not
+        // only at the instant a snapshot lands.
+        LOG_INFO << "[PAYEE-QUEUE] daemonless="
+                 << (mn_source_daemonless() ? 1 : 0)
+                 << " (source=" << m_mn_source
+                 << " => " << (mn_source_daemonless()
+                                   ? "no daemon supplied this payee queue"
+                                   : "a daemon (or an un-named caller) supplied"
+                                     " this payee queue; a run using it has NOT"
+                                     " proven a daemonless serve")
+                 << ")";
         // With the anti-mint latch on, a snapshot with NO height cannot arm
         // MN-readiness either: an unheighted set leaves the apply cursor at 0,
         // which disables apply_block's contiguity guard — the exact condition
@@ -425,7 +444,20 @@ public:
         // BODY-FIRST: an authoritative snapshot loaded as-of the pending tip
         // completes the payee axis — the last promotion precondition when the
         // credit-pool seed already reached the tip (diff-before-seed order).
+        // Kept AHEAD of the telemetry below so the logged state is the state
+        // after promotion, and so `promoted` reaches its use at the tail.
         const bool promoted = maybe_promote_pending_tip();
+        // POST-STATE, which #1128's [PAYEE-QUEUE] line above cannot carry:
+        // that one fires at entry, before the load, the SML reconcile and the
+        // promotion. This is the same snapshot AFTER all of them, so "the
+        // queue was replaced" and "the queue is now usable" stop being the
+        // same sentence.
+        LOG_INFO << "[PAYEE-QUEUE] applied source=" << m_mn_source
+                 << " eligible=" << m_state.mnstates().eligible_size()
+                 << " as_of=" << as_of_height
+                 << " have_mn=" << (m_have_mn ? 1 : 0)
+                 << " reseed_latch=" << (m_mn_needs_reseed ? 1 : 0)
+                 << " tip_promoted=" << (promoted ? 1 : 0);
         if (!m_have_mn)
             demote();
         else
@@ -437,6 +469,26 @@ public:
         // cache until an unrelated signal lands.
         if (promoted)
             notify_state_dirty();
+    }
+
+    /// ── STANDING-STATE READOUTS (telemetry only) ─────────────────────────
+    /// The two halves of populated(), the snapshot cursor and the authoritative
+    /// population source, exposed so the periodic [EMBED-STATUS] line can name
+    /// each precondition instead of an operator grepping four markers to
+    /// reconstruct them. Read-only; nothing here is consulted by a gate.
+    bool     have_tip() const { return m_have_tip; }
+    bool     have_mn()  const { return m_have_mn; }
+    uint32_t mn_snapshot_height() const { return m_mn_snapshot_height; }
+    bool     mn_needs_reseed_latched() const { return m_mn_needs_reseed; }
+    /// Is the CURRENT payee queue backed by a lane that needs no daemon?
+    /// Classified from the source string #1128's publishers pass in (its
+    /// kPayeeSource* constants are exactly these tokens) — never inferred
+    /// from configuration. mn_source() itself is #1128's accessor and is
+    /// unchanged; this is the consequence the string alone does not state.
+    bool mn_source_daemonless() const
+    {
+        return diag::mn_source_is_daemonless(
+            diag::mn_source_from_name(m_mn_source));
     }
 
     /// Reception path (mnlistdiff, SML axis — DAEMONLESS CCbTx source): apply a
@@ -1178,6 +1230,12 @@ private:
             m_state.mnstates().load({});
             m_mn_snapshot_height = 0;
             m_have_mn = false;
+            // The wiped queue has NO source any more. Leaving the last
+            // lane's name standing would make [PAYEE-QUEUE]/[EMBED-STATUS]
+            // keep claiming a backing that no longer exists — and, worse,
+            // keep claiming it was DAEMONLESS. Same class of misreading the
+            // source field exists to end.
+            m_mn_source.clear();
             // Latch: only an authoritative on_mn_list_update resync may re-arm
             // MN-readiness. Without this, a stray ProRegTx observed in a later
             // block would register into the wiped set and republish a 1-MN

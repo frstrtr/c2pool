@@ -638,6 +638,17 @@ public:
         return {};
     }
 
+    /// Whether the engine's root SELF-CHECK is armed. Diagnostics only, and
+    /// it is the difference between two opposite readings of the SAME
+    /// counters: armed, quorum_roots_differed is a real divergence count;
+    /// UNARMED (no production caller has ever invoked arm_self_check(), and a
+    /// Tier-A anchor seeds no active quorum set) the computed root is a
+    /// warm-up artefact that differs at essentially every height by
+    /// construction — which is how a `0/4684` line came to read as a
+    /// 4684-block divergence when the SERVED root was correct at 154/154
+    /// shadow matches. The reporting site MUST say which of the two it is.
+    bool self_check_armed() const { return m_quorum.self_check_armed(); }
+
     /// Step 3 of the per-block order. Retains the replayed list at H when H
     /// is a work block for some enabled type, and prunes the cache.
     void after_fold(uint32_t height)
