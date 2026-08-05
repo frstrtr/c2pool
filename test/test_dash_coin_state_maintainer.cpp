@@ -1622,3 +1622,83 @@ TEST(DashCoinStateMaintainer, ReorgWithinBufferReplaysCreditPoolUndoFromRetained
         << "beyond the buffer the existing wipe + cold-resync path stays";
     EXPECT_EQ(st2.credit_pool(), 0);
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// Tip-transition fallback leak: EVERY serve-tip promotion site must fire the
+// state-dirty re-issue sink (bump + notify), not only the body-fold one —
+// otherwise the work source rides a fallback decision cached during the (now
+// closed) pending window until the next unrelated signal, and fallback serves
+// leak for seconds after the fold. Latency only: no gate is weakened.
+// ════════════════════════════════════════════════════════════════════════
+
+// Body raced AHEAD of the header event (block message processed before the
+// header-chain tip callback): on_new_tip promotes immediately — and must
+// re-issue work. FAILS-ON-MASTER: that branch republished and returned
+// without firing the sink.
+TEST(DashCoinStateMaintainer, BodyFirstRacedBodyPromotionOnHeaderFiresStateDirty) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    m.set_body_first_serve_tip(true);
+    st.set_require_fresh_credit_pool(true);
+    int dirty = 0;
+    m.set_on_state_dirty([&] { ++dirty; });
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)));
+
+    auto b1 = make_cbtx_block(H - 1, 111'000'000LL, p2pkh_script(0x30));
+    m.on_new_tip(H - 1, block_hash_of(b1), BITS, MTP,
+                 DASH_PUBKEY_VER, DASH_P2SH_VER, CURTIME, VERSION);
+    m.on_block_connected(b1, H - 1);
+    ASSERT_TRUE(m.live());
+
+    // The BODY of H arrives first: the seed advances to H, but no pending
+    // window is open, so the serve tip holds at the parsed H-1.
+    auto b2 = make_cbtx_block(H, next_balance(st, 111'000'000LL, H),
+                              p2pkh_script(0x30));
+    m.on_block_connected(b2, H);
+    ASSERT_EQ(st.credit_pool_height(), static_cast<int32_t>(H));
+    ASSERT_EQ(m.serve_tip_height(), H - 1);
+
+    // The header event lands: promotion is immediate (inputs already parsed)
+    // and MUST re-issue work event-driven.
+    const int dirty_before = dirty;
+    m.on_new_tip(H, block_hash_of(b2), BITS, MTP,
+                 DASH_PUBKEY_VER, DASH_P2SH_VER, CURTIME, VERSION);
+    EXPECT_EQ(m.serve_tip_height(), H)
+        << "body raced ahead: the header event must promote immediately";
+    EXPECT_FALSE(m.tip_body_pending());
+    EXPECT_GT(dirty, dirty_before)
+        << "immediate promotion must fire the re-issue sink (bump + notify)";
+}
+
+// Cold-start diff-before-seed order: the authoritative snapshot as-of the
+// pending tip completes the payee axis — the LAST promotion precondition —
+// and that promotion must re-issue work too. FAILS-ON-MASTER: the
+// on_mn_list_update promotion ended in republish() with no sink fire.
+TEST(DashCoinStateMaintainer, BodyFirstSnapshotPromotionFiresStateDirty) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    m.set_body_first_serve_tip(true);
+    st.set_require_fresh_credit_pool(true);
+    int dirty = 0;
+    m.set_on_state_dirty([&] { ++dirty; });
+    // Payee cursor one behind the pending tip: the tip-targeted diff may NOT
+    // promote (payee-stale hold, pinned elsewhere)...
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)), /*as_of_height=*/H - 1);
+    const uint256 tip_hash = raw256(0x54);
+    m.on_new_tip(H, tip_hash, BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER,
+                 CURTIME, VERSION);
+    m.on_mnlistdiff(diff_with_seed(uint256::ZERO, tip_hash, H,
+                                   111'000'000LL, sml_entry(0x40)));
+    ASSERT_TRUE(m.tip_body_pending());
+    ASSERT_EQ(m.serve_tip_height(), 0u);
+
+    // ...then the authoritative snapshot as-of the tip lands: promotion — and
+    // the event-driven re-issue with it.
+    const int dirty_before = dirty;
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)), /*as_of_height=*/H);
+    EXPECT_EQ(m.serve_tip_height(), H)
+        << "snapshot as-of the tip completes the payee axis and promotes";
+    EXPECT_FALSE(m.tip_body_pending());
+    EXPECT_GT(dirty, dirty_before)
+        << "snapshot promotion must fire the re-issue sink (bump + notify)";
+}

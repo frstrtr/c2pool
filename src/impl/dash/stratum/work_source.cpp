@@ -493,10 +493,33 @@ void DASHWorkSource::resource_template_now() const
     }
     // Tip moved since the last snapshot? Bump work_generation_ so sessions
     // detect stale work between their timer firings and re-push.
-    if (template_cache_ && template_cache_->m_previous_block != work.m_previous_block)
+    uint64_t self_bumps = 0;
+    if (template_cache_ && template_cache_->m_previous_block != work.m_previous_block) {
         work_generation_.fetch_add(1, std::memory_order_relaxed);
+        self_bumps = 1;
+    }
     template_cache_ = std::make_shared<const coin::DashWorkData>(std::move(work));
-    template_cache_gen_ = work_generation_.load(std::memory_order_relaxed);
+    // ── Tip-transition fallback leak (serve-tip promotion) ──────────────────
+    // Stamp the snapshot with the generation observed BEFORE sourcing began
+    // (gen_at_source, same discipline the negative cache already uses), not a
+    // load() taken here at store time. The difference is exactly the events
+    // that landed WHILE this (blocking — the fallback arm is a dashd GBT RPC)
+    // source was in flight: on every new block the serve-tip promotion's
+    // state-dirty bump (body fold, ~0.1-0.4 s after the header tip) routinely
+    // races the pending-window re-source, and a store-time stamp swallowed it
+    // — the dashd-fallback template read as CURRENT for the full kStaleAfter
+    // (30 s) window and several fallback serves leaked per block after the
+    // embedded arm was already viable. With the pre-source stamp a racing
+    // bump leaves the stored snapshot one generation behind, so the very next
+    // template request re-evaluates the arm gates (event-driven resume, the
+    // same break-through semantics as the soak0804e negative-cache fix). The
+    // own tip-moved bump above is accounted for (self_bumps): when NOTHING
+    // external raced, the stamp equals today's load() and behaviour is
+    // byte-identical — no re-source storm on ordinary tip rotation.
+    const uint64_t gen_now = work_generation_.load(std::memory_order_relaxed);
+    template_cache_gen_ = (gen_now == gen_at_source + self_bumps)
+                              ? gen_now
+                              : gen_at_source;
     template_cache_at_  = now;
     template_cache_is_embedded_ = work_is_embedded;
     template_last_fail_at_ = {};
