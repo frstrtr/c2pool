@@ -54,7 +54,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # carries a source KAT pinning the is_wire_advertisable() guard into all ten
     # per-coin getaddrs handlers. Same reasoning as above: FOLDED into the
     # EXISTING allowlisted core_test target, never a new add_executable.
-    add_executable(core_test pack_test.cpp events_test.cpp chain_test.cpp packet_test.cpp block_broadcast_test.cpp broadcast_convergence_matrix_test.cpp core_merkle_branches_test.cpp version_gate_test.cpp filesystem_test.cpp web_server_submitblock_test.cpp web_server_current_payouts_test.cpp known_txs_eviction_test.cpp tx_advertiser_test.cpp socket_write_queue_test.cpp known_txs_backing_test.cpp random_choice_guard_test.cpp p2p_message_stats_test.cpp netaddress_resolution_test.cpp)
+    add_executable(core_test pack_test.cpp events_test.cpp chain_test.cpp packet_test.cpp block_broadcast_test.cpp broadcast_convergence_matrix_test.cpp core_merkle_branches_test.cpp version_gate_test.cpp filesystem_test.cpp web_server_submitblock_test.cpp web_server_current_payouts_test.cpp web_server_local_hashps_test.cpp known_txs_eviction_test.cpp tx_advertiser_test.cpp socket_write_queue_test.cpp known_txs_backing_test.cpp random_choice_guard_test.cpp p2p_message_stats_test.cpp netaddress_resolution_test.cpp)
     target_compile_definitions(core_test PRIVATE C2POOL_SRC_ROOT="${CMAKE_SOURCE_DIR}/src")
     target_link_libraries(core_test PRIVATE GTest::gtest_main core c2pool_merged_mining GTest::gtest)
     target_link_libraries(core_test PRIVATE c2pool_payout c2pool_hashrate ltc_coin)  # OBJECT-lib SCC direct-naming (#22/#39)
