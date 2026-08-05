@@ -1050,8 +1050,15 @@ if (BUILD_TESTING AND GTest_FOUND)
     # (never-re-arm defect fix): saturating exponential backoff schedule/floor/
     # overflow, the single-latch re-entry guard (N ticks -> one re-arm), and the
     # recovery reset. Same target, no new allowlist entry.
+    # Seventh TU: test_dash_replay_bulk_fetch.cpp — the W2 FULL-HISTORY REPLAY
+    # bulk block-fetch lane (coin/replay_bulk_fetch.hpp): multi-peer range
+    # partitioning, timeout/notfound/peer-loss re-request, in-order
+    # deliver-then-PRUNE into the W1 consumer seam, merkle-bind rejection,
+    # tip-lane strict priority, resumable cursor (verified hash, fail-closed
+    # mismatch), genesis→anchor header-backfill join, capture segment cache.
+    # Same target, no new allowlist entry.
     # DASH_FIXTURE_DIR: the wire suite replays the real 602'189-byte testnet capture.
-    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp test_dash_coin_p2p_pool.cpp test_dash_qrinfo_wire.cpp test_dash_coin_peer_rearm.cpp)
+    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp test_dash_coin_p2p_pool.cpp test_dash_qrinfo_wire.cpp test_dash_coin_peer_rearm.cpp test_dash_replay_bulk_fetch.cpp)
     target_compile_definitions(test_dash_p2p_node PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_p2p_node PRIVATE
