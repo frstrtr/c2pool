@@ -2715,7 +2715,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     std::unique_ptr<dash::coin::replay::QuorumReplayEngine>    replay_quorum_engine;
     std::unique_ptr<dash::coin::replay::ReplayQuorumBridge>    replay_quorum_bridge;
     // THE SERVE SEAM: the fold's proven-current list -> the payee queue that
-    // gates serving. Constructed only alongside the fold engine.
+    // gates serving, plus the live-tip tail that lets the fold actually REACH
+    // the tip (the bulk lane idles at the height its peers announced).
+    // Constructed only alongside the fold engine.
+    std::unique_ptr<dash::coin::replay::FoldLiveTail>          replay_live_tail;
     std::unique_ptr<dash::coin::replay::ReplayPayeePublisher>  replay_payee_pub;
     if (coin_p2p) {
         const auto dash_params = testnet
@@ -4967,6 +4970,39 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                 up.source       = source;
                                 coin_state.mn_list_update.happened(up);
                             });
+                    // ── THE LAST MILE (found by the first live seam run) ──
+                    // The W2 bulk lane fetches what its peers ANNOUNCED and
+                    // then goes idle: on .211 it parked at
+                    //   [BULK] delivered=2516911/2516911 inflight=0 hdr=joined
+                    // while our own header chain had already advanced to
+                    // h=2516923. The fold therefore sat 12 blocks short of the
+                    // tip, permanently, and the currency guard (G7) could never
+                    // flip — correctly refusing, and never publishing.
+                    //
+                    // The node is ALREADY receiving those blocks: the tip lane
+                    // connects them and fires block_connected. Hand them to the
+                    // fold. The consumer no-ops any height at or below the
+                    // engine's cursor, so a body the bulk lane also delivers is
+                    // counted once; both feeds run on the same io thread, so
+                    // there is no interleaving to guard. And because the fold
+                    // keeps root-checking live blocks after the handover, the
+                    // proof does not stop at the tip — it continues.
+                    //
+                    // A live block that FAILS the fold behaves exactly as a
+                    // replayed one: W1 poisons, the consumer records the
+                    // divergence, and the guard's G1/G2 stop the seam from ever
+                    // publishing again. It cannot un-publish an earlier
+                    // snapshot — but it cannot mint a new one either.
+                    replay_live_tail =
+                        std::make_unique<rp::FoldLiveTail>(
+                            *replay_fold_consumer, *replay_fold_engine);
+                    coin_feed_subs.push_back(
+                        coin_state.block_connected.subscribe(
+                            [lt = replay_live_tail.get()]
+                            (const dash::interfaces::BlockConnected& bc) {
+                                lt->offer(bc.height, bc.block);
+                            }));
+
                     std::cout << "[run] REPLAY SERVE SEAM ARMED: the fold's"
                                  " root-checked masternode list will populate"
                                  " the PAYEE queue (source=replay-fold) the"
@@ -5109,10 +5145,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                     fc = replay_fold_consumer.get(),
                                     br = replay_quorum_bridge.get(),
                                     pp = replay_payee_pub.get(),
+                                    lt = replay_live_tail.get(),
                                     tick = std::make_shared<uint64_t>(0)] {
                 ln->tick(std::chrono::duration_cast<std::chrono::seconds>(
                     std::chrono::steady_clock::now().time_since_epoch())
                         .count());
+                // Drain any live tip block the fold could not take when it
+                // arrived: the bulk lane advances the cursor on its own
+                // schedule, so contiguity can become satisfiable with no new
+                // arrival to trigger it.
+                if (lt) lt->drain();
                 // THE SERVE SEAM, evaluated once a second: the instant the
                 // fold is proven current the payee queue is populated from it
                 // and the gate's have_mn flips. One-shot; the guard is pure
@@ -5137,6 +5179,18 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                  << (bs.last_skip_reason.empty()
                                         ? std::string()
                                         : " last_skip=\"" + bs.last_skip_reason + "\"");
+                    }
+                    if (lt && (lt->held() || lt->folded_live())) {
+                        LOG_INFO << "[REPLAY-TAIL] live tip blocks folded="
+                                 << lt->folded_live()
+                                 << " held=" << lt->held()
+                                 << (lt->held()
+                                        ? " lowest_held=" + std::to_string(lt->lowest_held())
+                                          + " (waiting for the bulk lane to close h="
+                                          + std::to_string(lt->lowest_held() - 1) + ")"
+                                        : std::string())
+                                 << " offered=" << lt->offered()
+                                 << " dropped=" << lt->dropped();
                     }
                     if (pp) {
                         // The serve seam says its own state: either it has

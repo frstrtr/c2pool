@@ -57,6 +57,7 @@ using dash::coin::MNState;
 using dash::coin::replay::DmlFoldEngine;
 using dash::coin::replay::FoldConfig;
 using dash::coin::replay::FoldConsumerStats;
+using dash::coin::replay::FoldLiveTail;
 using dash::coin::replay::FoldReplayConsumer;
 using dash::coin::replay::ReplayMNState;
 using dash::coin::replay::ReplayPayeePublisher;
@@ -590,7 +591,86 @@ TEST(DashReplayPayeePublish, NeverEncodingAndEligibilityConvertFaithfully)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// KAT 7 — the real h=2516756 revive survives the conversion INTO the queue
+// KAT 7 — THE LAST MILE: live tip blocks arriving OUT OF ORDER still reach the
+//         fold, and are what lets it reach the tip at all
+//
+// The first live seam run parked at
+//     [BULK] delivered=2516911/2516911 inflight=0 hdr=joined
+// with our own header chain at h=2516923: the bulk lane fetches what its peers
+// announced when it planned and then idles. The node HAD the missing blocks —
+// the tip lane connected each one — but they arrived while the fold was still
+// thousands of blocks back, and a forward-contiguous fold cannot take a block
+// out of order. Holding them and draining on contiguity is the whole fix.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashReplayPayeePublish, LiveTailHoldsOutOfOrderBlocksAndDrainsOnContiguity)
+{
+    auto rig = make_clean_rig();
+    dash::coin::replay::FoldLiveTail tail(rig.consumer, rig.engine);
+
+    // The tip lane hands us 2516758, 2516759, 2516760 while the fold is still
+    // at the anchor h=2516755. None is foldable yet.
+    for (uint32_t h = 2516758; h <= kLastBody; ++h)
+        tail.offer(h, pp_parse_block(kBodies[h - kFirstBody]));
+    EXPECT_EQ(tail.held(), 3u);
+    EXPECT_EQ(tail.folded_live(), 0u);
+    EXPECT_EQ(tail.lowest_held(), 2516758u);
+    EXPECT_EQ(rig.engine.height(), 2516755u);       // nothing forced through
+
+    // The bulk lane closes 2516756. Still a gap at 2516757 — hold.
+    ASSERT_TRUE(rig.fold_through(kFirstBody));
+    tail.drain();
+    EXPECT_EQ(tail.held(), 3u);
+    EXPECT_EQ(rig.engine.height(), 2516756u);
+
+    // 2516757 arrives late, out of order. NOW the whole tail drains in one go
+    // and the fold lands exactly on the tip.
+    tail.offer(2516757, pp_parse_block(kBodies[2516757 - kFirstBody]));
+    EXPECT_EQ(tail.held(), 0u);
+    EXPECT_EQ(tail.folded_live(), 4u);
+    EXPECT_EQ(rig.engine.height(), kLastBody);
+    EXPECT_EQ(rig.consumer.stats().roots_matched, 5u);   // every one checked
+
+    // A block the bulk lane already folded is a NO-OP, not an error.
+    tail.offer(kFirstBody, pp_parse_block(kBodies[0]));
+    EXPECT_EQ(tail.held(), 0u);
+    EXPECT_EQ(tail.folded_live(), 4u);
+
+    // ... and with the fold now AT the tip, the seam publishes.
+    rig.tip = kLastBody;
+    auto pub = rig.make_publisher();
+    ASSERT_TRUE(pub.evaluate().ok) << pub.evaluate().blocker;
+    EXPECT_TRUE(pub.maybe_publish());
+    EXPECT_EQ(rig.sink.calls.size(), 1u);
+    EXPECT_EQ(rig.sink.calls.front().as_of, kLastBody);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KAT 8 — the live tail's overflow drops the HIGHEST held block, never the
+//         lowest: the lowest is the one contiguity needs next.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashReplayPayeePublish, LiveTailOverflowKeepsTheContiguityFrontier)
+{
+    auto rig = make_clean_rig();
+    dash::coin::replay::FoldLiveTail tail(rig.consumer, rig.engine, /*cap=*/2);
+
+    tail.offer(2516758, pp_parse_block(kBodies[2516758 - kFirstBody]));
+    tail.offer(2516759, pp_parse_block(kBodies[2516759 - kFirstBody]));
+    tail.offer(kLastBody, pp_parse_block(kBodies[kLastBody - kFirstBody]));
+    EXPECT_EQ(tail.held(), 2u);
+    EXPECT_EQ(tail.dropped(), 1u);
+    EXPECT_EQ(tail.lowest_held(), 2516758u);        // the frontier survived
+
+    // The dropped height is a GAP, not a skip: the fold walks up to it and
+    // stops there rather than folding past a block it never saw.
+    ASSERT_TRUE(rig.fold_through(2516757));
+    tail.drain();
+    EXPECT_EQ(rig.engine.height(), 2516759u);
+    EXPECT_EQ(tail.held(), 0u);
+    EXPECT_EQ(rig.consumer.stats().roots_matched, 4u);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KAT 9 — the real h=2516756 revive survives the conversion INTO the queue
 //
 // Ties the seam back to the incident the fixtures were cut for: the
 // masternode revived at h=2516756 must arrive in the payee queue eligible,

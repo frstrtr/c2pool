@@ -377,16 +377,23 @@ private:
         m_published_height = g.fold_height;
         ++m_publishes;
         m_last_blocker.clear();
+        m_last_blocker_code.clear();
     }
 
-    /// Say WHY we are still withholding, but do not flood: only when the
-    /// blocking condition CHANGES, plus a heartbeat every 60 asks so a run
-    /// parked on one condition still shows it.
+    /// Say WHY we are still withholding, but do not flood. Dedup on the GUARD
+    /// CODE (G1..G8), not on the whole sentence: the G7 text carries the live
+    /// fold height, so a full-text compare would log every single tick while
+    /// the fold catches up — thousands of near-identical lines that bury the
+    /// one transition a reader is looking for. The code changes when the
+    /// SITUATION changes; a 30-ask heartbeat keeps a run parked on one
+    /// condition (and the catch-up progress) visible.
     void note_withheld(const ReplayPayeeGuard& g)
     {
-        const bool changed = (g.blocker != m_last_blocker);
-        m_last_blocker = g.blocker;
-        if (changed || ++m_withheld_since_log >= 60) {
+        const std::string code = g.blocker.substr(0, 2);
+        const bool changed = (code != m_last_blocker_code);
+        m_last_blocker      = g.blocker;
+        m_last_blocker_code = code;
+        if (changed || ++m_withheld_since_log >= 30) {
             m_withheld_since_log = 0;
             LOG_INFO << "[REPLAY-PAYEE] WITHHELD source="
                      << kPayeeSourceReplayFold << ": " << g.blocker
@@ -404,6 +411,7 @@ private:
     uint64_t    m_publishes{0};
     uint64_t    m_reseeds{0};
     std::string m_last_blocker;
+    std::string m_last_blocker_code;   // "G1".."G8" — the dedup key
     uint32_t    m_withheld_since_log{0};
 };
 
