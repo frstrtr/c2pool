@@ -644,6 +644,18 @@ private:
     uint64_t m_body_rerequests_total{0};
     uint64_t m_body_rerequests_exhausted{0};
 
+    // ── tip-body announcer routing (#1082 pool + #1094 body-first) ───────
+    // A block `inv` names a peer that HOLDS the block. The tip-body getdata
+    // (and the getheaders that must precede its connect) is fetched from THAT
+    // peer — not from an arbitrary primary that, on a WARM node, may be behind
+    // or wedged and silently never delivers (no notfound, so the watchdog just
+    // exhausts). This mirrors the qfcommit/clsig pull, which already asks the
+    // announcer. Bounded FIFO; the announcer is resolved LIVE (never a cached
+    // pointer), so pool churn just falls back to the primary.
+    struct BlockAnnouncer { uint256 hash; std::string key; };
+    std::vector<BlockAnnouncer> m_block_announcers;
+    static constexpr std::size_t ANNOUNCER_CAP = 64;
+
     std::unique_ptr<core::Timer> m_reconnect_timer;
     // ONE repeating tick for the whole pool (liveness, handshake deadlines,
     // dial-slot reclamation, status log). Per-peer STATE stays per-peer.
@@ -1112,6 +1124,23 @@ public:
         m_primary->write(msg);
     }
 
+    /// getheaders targeted at the peer that announced `block_hash`. The
+    /// tip-follow header pull must reach the peer that HAS the new tip — the
+    /// same #1082 announcer!=primary hazard as the body pull: routing it to an
+    /// arbitrary (possibly behind/wedged) primary is exactly why the warm-node
+    /// header tip could stall while a neighbour was announcing past it. Falls
+    /// back to the primary via block_source().
+    void send_getheaders_from_block_source(const uint256& block_hash,
+                                           uint32_t version,
+                                           const std::vector<uint256>& locator,
+                                           const uint256& stop)
+    {
+        PeerSession* p = block_source(block_hash);
+        if (!p) return;
+        auto msg = message_getheaders::make_raw(version, locator, stop);
+        p->write(msg);
+    }
+
     /// Send getaddr to request peer addresses (feeds set_addr_callback).
     ///
     /// BROADCAST, deliberately: an addr reply carries no per-peer matching
@@ -1142,12 +1171,16 @@ public:
     }
 
     /// Request a full block via plain MSG_BLOCK getdata (E2 pull seam).
+    /// Routed to the peer that ANNOUNCED this block (block_source), which holds
+    /// it by definition; falls back to the primary when the announcer is
+    /// unknown (bulk/historical legs) or has churned out.
     void request_block(const uint256& block_hash)
     {
-        if (!m_primary) return;
+        PeerSession* p = block_source(block_hash);
+        if (!p) return;
         auto msg = message_getdata::make_raw(
             {inventory_type(inventory_type::block, block_hash)});
-        m_primary->write(msg);
+        p->write(msg);
     }
 
     /// Request a full block AND arm the lost-body watchdog for it (tip-follow
@@ -1167,7 +1200,10 @@ public:
         pb.hash      = block_hash;
         pb.first_req = now;
         pb.last_req  = now;
-        pb.last_peer = m_primary ? m_primary->key : std::string{};
+        // The announcer just got the initial getdata; record it so the watchdog
+        // rotates AWAY from it (to a neighbour) if it does not answer in time.
+        PeerSession* src = block_source(block_hash);
+        pb.last_peer = src ? src->key : std::string{};
         m_pending_bodies.push_back(std::move(pb));
     }
 
@@ -1419,6 +1455,33 @@ private:
     {
         for (auto& p : m_pool) if (p->key == key) return p.get();
         return nullptr;
+    }
+
+    /// Record which peer announced a block, so its body/headers pull can be
+    /// routed back to it. Bounded FIFO (block invs arrive ~1 / 2.5 min).
+    void record_block_announcer(const uint256& hash, const std::string& key)
+    {
+        for (auto& a : m_block_announcers)
+            if (a.hash == hash) { a.key = key; return; }
+        if (m_block_announcers.size() >= ANNOUNCER_CAP)
+            m_block_announcers.erase(m_block_announcers.begin());
+        m_block_announcers.push_back(BlockAnnouncer{hash, key});
+    }
+
+    /// The peer to fetch a block from: the one that ANNOUNCED it (it holds it
+    /// by definition and its reply routes back to its own session), falling
+    /// back to the primary when the announcer is unknown or has since churned
+    /// out of the pool. Never returns a stale pointer — resolved live.
+    PeerSession* block_source(const uint256& hash)
+    {
+        for (auto& a : m_block_announcers)
+            if (a.hash == hash)
+            {
+                PeerSession* p = find_peer(a.key);
+                if (p && p->handshake.complete()) return p;
+                break;
+            }
+        return m_primary;
     }
 
     bool holds_key(const std::string& key) const
@@ -1769,10 +1832,17 @@ private:
             }
             // Rotate through the handshaked peers, preferring one we did not
             // just ask; a single-peer pool re-asks the same peer (still
-            // strictly better than the 600 s inv-TTL wait).
+            // strictly better than the 600 s inv-TTL wait). The ANNOUNCER goes
+            // first — it holds the block by definition — so a re-request tries
+            // it before any neighbour that may not have it yet (the fixed-
+            // subset-that-never-has-it rotation was the #1082 warm-node bug).
             std::vector<PeerSession*> cands;
+            if (PeerSession* src = block_source(pb.hash))
+                if (src->handshake.complete()) cands.push_back(src);
             for (auto& up : m_pool)
-                if (up->handshake.complete()) cands.push_back(up.get());
+                if (up->handshake.complete() &&
+                    (cands.empty() || up.get() != cands.front()))
+                    cands.push_back(up.get());
             if (cands.empty()) { ++it; continue; }   // retry when the pool refills
             PeerSession* target =
                 cands[static_cast<size_t>(pb.rerequests) % cands.size()];
@@ -2014,6 +2084,10 @@ private:
             }
             LOG_INFO << "[" << m_chain_label << "] block inv "
                      << inv.m_hash.GetHex().substr(0, 16) << "... from " << p->key;
+            // Remember WHO announced it: the body/headers pull the new_block
+            // subscriber fires next must be routed back to this peer, which
+            // holds the block, not to an arbitrary primary (block_source).
+            record_block_announcer(inv.m_hash, p->key);
             m_coin->new_block.happened(inv.m_hash);
         }
     }

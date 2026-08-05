@@ -3930,7 +3930,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         coin_feed_subs.push_back(
             coin_state.new_block.subscribe(
                 [cp = coin_p2p.get(), hc = header_chain.get()](const uint256& hash) {
-                    cp->send_getheaders(70230, hc->get_locator(), uint256::ZERO);
+                    // Route BOTH the header pull and the body pull to the peer
+                    // that ANNOUNCED this block (#1082 pool: announcer != the
+                    // primary). Sending them to an arbitrary primary that is
+                    // behind/wedged is why a WARM node's tip-body never folded
+                    // and body-first serve-tip stayed at have_tip=0.
+                    cp->send_getheaders_from_block_source(
+                        hash, 70230, hc->get_locator(), uint256::ZERO);
                     // TRACKED: this is the tip-body pull, the one request the
                     // serve tip now waits on (body-first). The lost-body
                     // watchdog re-requests it from a rotated peer after 10 s

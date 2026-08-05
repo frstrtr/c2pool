@@ -1015,4 +1015,47 @@ TEST(DashCoinP2PPool, body_arrival_disarms_the_watchdog)
     EXPECT_EQ(rig.client.body_rerequests_total(), 0u);
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// (H) TIP-BODY ROUTING — the body-fetch getdata goes to the peer that
+// ANNOUNCED the block, which holds it by definition, NOT to an arbitrary
+// primary. On a WARM node (pool of 8, announcer usually != primary) the block
+// body announced by peer B was fetched from primary A; when A was behind or
+// wedged it silently never delivered (no notfound), the watchdog rotated
+// through a fixed subset that also lacked the block, and body-first serve-tip
+// stayed at have_tip=0 forever — the embedded arm never served. The fresh
+// soak's sequential catch-up (getheaders->getdata to the primary it was
+// syncing from) never exercised the inv-driven announcer!=primary path, which
+// is why only the warm hotel node surfaced it.
+//
+// FAILS-ON-MASTER: request_block writes unconditionally to m_primary, so the
+// getdata lands on peer 1 (primary), never on the announcing peer 3.
+// ══════════════════════════════════════════════════════════════════════════
+
+TEST(DashCoinP2PPool, tip_body_getdata_targets_the_announcing_peer_not_the_primary)
+{
+    PoolRig rig;
+    for (int i = 1; i <= 3; ++i) rig.handshake(i);   // peer 1 handshakes first
+    ASSERT_TRUE(rig.session(1) && rig.session(1)->primary)
+        << "peer 1 must be the primary for this test to isolate the routing";
+
+    const uint256 h = hash_n(0xB0D9);
+
+    // Peer 3 — NOT the primary — announces the new block via inv.
+    rig.deliver(3, PoolRig::block_inv(h));
+
+    const uint64_t p1_before = rig.session(1)->msgs_sent;
+    const uint64_t p3_before = rig.session(3)->msgs_sent;
+
+    // The tip-follow body pull for that block (what the new_block subscriber
+    // fires in production).
+    rig.client.request_block_tracked(h);
+
+    EXPECT_EQ(rig.session(3)->msgs_sent, p3_before + 1)
+        << "the body getdata must go to the peer that ANNOUNCED the block "
+           "(it holds it by definition)";
+    EXPECT_EQ(rig.session(1)->msgs_sent, p1_before)
+        << "the body getdata must NOT be routed to an arbitrary primary that, "
+           "on a warm node, may be behind/wedged and never deliver";
+}
+
 } // namespace
