@@ -96,6 +96,7 @@ static std::vector<std::pair<uint256, MNState>> single_mn(const std::vector<unsi
     s.nRegisteredHeight = 2'300'000;
     s.nLastPaidHeight = 0;
     s.scriptPayout.m_data = payout;
+    s.payoutSplitProvenance = MNState::SPLIT_KNOWN;   // fixture: proven zero split (h=2516595 gate)
     return {{raw256(0x01), s}};
 }
 

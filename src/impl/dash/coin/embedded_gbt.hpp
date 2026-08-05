@@ -366,38 +366,63 @@ inline DashWorkData build_embedded_workdata(
         w.m_packed_payments.push_back(std::move(burn));
     }
 
-    // MN payee → packed_payment. dashcore GBT returns "payee" as a
+    // MN payee → packed_payment(s). dashcore GBT returns "payee" as a
     // base58 address. We use script_to_address() to produce the same
     // wire form for standard P2PKH/P2SH scripts. Unrecognized script
     // types fall back to the c2pool "!hex" raw-script convention from
     // share_check.hpp::decode_payee_script — preserves bytes for
     // share_check verification while keeping the GBT API clean.
+    auto script_to_payee_token = [&](const std::vector<unsigned char>& script) {
+        // Dash mainnet has no bech32 (P2WPKH/P2WSH inactive); pass
+        // empty hrp so script_to_address() falls through cleanly.
+        std::string addr = ::core::script_to_address(
+            script, /*bech32_hrp=*/"",
+            address_version, address_p2sh_version);
+        if (!addr.empty()) return addr;
+        // Non-standard script: fall back to !hex.
+        std::string hex_script;
+        hex_script.reserve(script.size() * 2 + 1);
+        hex_script.push_back('!');
+        static const char* digits = "0123456789abcdef";
+        for (uint8_t b : script) {
+            hex_script.push_back(digits[(b >> 4) & 0xF]);
+            hex_script.push_back(digits[b & 0xF]);
+        }
+        return hex_script;
+    };
     auto expected = mnstates.find_expected_payee();
     if (expected) {
         auto it = mnstates.entries().find(*expected);
         if (it != mnstates.entries().end() && mn_payment > 0) {
-            const auto& script = it->second.scriptPayout.m_data;
-            // Dash mainnet has no bech32 (P2WPKH/P2WSH inactive); pass
-            // empty hrp so script_to_address() falls through cleanly.
-            std::string addr = ::core::script_to_address(
-                script, /*bech32_hrp=*/"",
-                address_version, address_p2sh_version);
-            PackedPayment pp;
-            if (!addr.empty()) {
-                pp.payee = std::move(addr);
-            } else {
-                // Non-standard script: fall back to !hex.
-                std::string hex_script;
-                hex_script.reserve(script.size() * 2);
-                static const char* digits = "0123456789abcdef";
-                for (uint8_t b : script) {
-                    hex_script.push_back(digits[(b >> 4) & 0xF]);
-                    hex_script.push_back(digits[b & 0xF]);
-                }
-                pp.payee = "!" + hex_script;
+            const auto& st = it->second;
+            // ── Operator-reward split (incident h=2516595 bad-cb-payee) ──
+            // dashd masternode/payments.cpp GetBlockTxOuts pays the MN
+            // share as a SET: when the scheduled MN registered an operator
+            // share (nOperatorReward bps, ProRegTx) AND its operator set a
+            // payout script (ProUpServTx), the coinbase carries
+            //   owner   : mnShare - floor(mnShare * bps / 10000)
+            //   operator: floor(mnShare * bps / 10000)
+            // in that order, and CheckMasternodePayments validates scripts
+            // AND amounts. h=2516595 (mn 0037c2c5…, bps=800) was rejected
+            // bad-cb-payee precisely because this builder paid the whole
+            // share to the owner. The truncating division is dashd's own;
+            // do NOT "fix" the rounding.
+            const int64_t operator_payment = st.operator_payment_of(mn_payment);
+            const int64_t owner_payment    = mn_payment - operator_payment;
+            if (owner_payment > 0) {
+                PackedPayment pp;
+                pp.payee  = script_to_payee_token(st.scriptPayout.m_data);
+                pp.amount = static_cast<uint64_t>(owner_payment);
+                w.m_packed_payments.push_back(std::move(pp));
             }
-            pp.amount = static_cast<uint64_t>(mn_payment);
-            w.m_packed_payments.push_back(std::move(pp));
+            // dashd: `if (operatorReward > 0) emplace_back(...)` — a split
+            // whose floor rounds to zero emits NO operator output.
+            if (operator_payment > 0) {
+                PackedPayment pp;
+                pp.payee  = script_to_payee_token(st.scriptOperatorPayout.m_data);
+                pp.amount = static_cast<uint64_t>(operator_payment);
+                w.m_packed_payments.push_back(std::move(pp));
+            }
         }
     }
 

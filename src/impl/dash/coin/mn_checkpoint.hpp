@@ -507,6 +507,15 @@ inline MnCheckpoint parse_mn_checkpoint(const std::string& payload,
             // DERIVED, never stored — same projection mn_seed.hpp makes.
             mn.isValid = (mn.nPoSeBanHeight == 0);
 
+            // The checkpoint format is generated from `protx list registered
+            // true` and carries the payout split EXPLICITLY (field 11 = bps,
+            // field 13 = operator script, `-` = provably unset). A row that
+            // reaches here has both fields validated above — the payout SET
+            // is proven (incident h=2516595: this very anchor carried mn
+            // 0037c2c5… bps=800 + its operator script; the omission was in
+            // the consumer, not the data).
+            mn.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+
             if (!seen_protx.insert(protx).second)
                 return fail("duplicate proTxHash " + protx.GetHex().substr(0, 16)
                             + " on line " + std::to_string(lineno));

@@ -107,6 +107,7 @@ void make_state(NodeCoinState& st) {
     s.nRegisteredHeight = 2'300'000;
     s.nLastPaidHeight   = 0;
     s.scriptPayout.m_data = p2pkh_script(0x30);
+    s.payoutSplitProvenance = MNState::SPLIT_KNOWN;   // fixture: proven zero split (h=2516595 gate)
     st.mnstates().load(std::vector<std::pair<uint256, MNState>>{{raw256(0x01), s}});
 
     st.sml().mnList = {sml_entry(0x40), sml_entry(0x60)};

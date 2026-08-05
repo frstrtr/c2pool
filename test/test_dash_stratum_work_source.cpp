@@ -1734,6 +1734,7 @@ void seed_resolvable_mn(dash::coin::NodeCoinState& cs)
     mn.collateralOutpoint.hash.SetHex(std::string(64, '9'));
     mn.collateralOutpoint.index = 0;
     mn.scriptPayout.m_data = fixture_miner_script();   // standard P2PKH payout
+    mn.payoutSplitProvenance = dash::coin::MNState::SPLIT_KNOWN;   // fixture: proven zero split (h=2516595 gate)
     uint256 protx;
     protx.SetHex(std::string(64, 'a'));
     cs.mnstates().load({{protx, mn}}, /*as_of_height=*/kEmbeddedPrevHeight);

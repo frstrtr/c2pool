@@ -114,6 +114,9 @@ static MnStateMachine mn_set_with_collateral(const uint256& collat_hash,
     payee.isValid = true;
     payee.nRegisteredHeight = 2'300'000;
     payee.scriptPayout.m_data = p2pkh_script(0x30);
+    // Hand-seeded fixture: zero operator split, declared PROVEN as every
+    // real ingest path does (h=2516595 serve gate).
+    payee.payoutSplitProvenance = MNState::SPLIT_KNOWN;
     payee.collateralOutpoint.hash  = raw256(0xE0);  // unrelated outpoint
     payee.collateralOutpoint.index = 0;
 
@@ -121,6 +124,7 @@ static MnStateMachine mn_set_with_collateral(const uint256& collat_hash,
     victim.isValid = true;
     victim.nRegisteredHeight = 2'310'000;
     victim.scriptPayout.m_data = p2pkh_script(0x40);
+    victim.payoutSplitProvenance = MNState::SPLIT_KNOWN;   // h=2516595 serve gate
     victim.collateralOutpoint.hash  = collat_hash;
     victim.collateralOutpoint.index = collat_index;
 

@@ -686,6 +686,9 @@ std::vector<std::pair<uint256, MNState>> single_mn(
     s.nRegisteredHeight = 1'519'000;
     s.nLastPaidHeight = 0;
     s.scriptPayout.m_data = payout;
+    // Hand-seeded fixture: zero operator split, declared PROVEN as every
+    // real ingest path does (h=2516595 serve gate).
+    s.payoutSplitProvenance = MNState::SPLIT_KNOWN;
     return {{raw256(0x01), s}};
 }
 

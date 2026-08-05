@@ -103,6 +103,7 @@ static void seed_single_mn(NodeCoinState& st, const std::vector<unsigned char>& 
     s.nRegisteredHeight = 2'300'000;
     s.nLastPaidHeight = 0;
     s.scriptPayout.m_data = payout;
+    s.payoutSplitProvenance = MNState::SPLIT_KNOWN;   // fixture: proven zero split (h=2516595 gate)
     st.mnstates().load(std::vector<std::pair<uint256, MNState>>{{raw256(0x01), s}});
 }
 
@@ -398,6 +399,7 @@ TEST(DashNodeCoinState, UnresolvablePayeeFailsClosedToDashd) {
     banned.isValid          = false;
     banned.nRegisteredHeight = 2'300'000;
     banned.scriptPayout.m_data = p2pkh_script(0x30);
+    banned.payoutSplitProvenance = MNState::SPLIT_KNOWN;   // fixture: proven zero split (h=2516595 gate)
     st.mnstates().load(std::vector<std::pair<uint256, MNState>>{
         {raw256(0x01), banned}});
     st.set_tip(H - 1, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
@@ -742,6 +744,7 @@ TEST(DashNodeCoinState, MaintainerOnMnlistdiffPopulatesSmlAndEmitsPayload) {
     // (leg 1), then the SML diff (new leg), then the tip (leg 2).
     MNState pm; pm.isValid = true; pm.nRegisteredHeight = 2'300'000;
     pm.nLastPaidHeight = 0; pm.scriptPayout.m_data = p2pkh_script(0x30);
+    pm.payoutSplitProvenance = MNState::SPLIT_KNOWN;   // fixture: proven zero split (h=2516595 gate)
     maint.on_mn_list_update(
         std::vector<std::pair<uint256, MNState>>{{raw256(0x01), pm}}, 0);
     st.mempool().set_utxo(&utxo);
@@ -821,6 +824,7 @@ static void seed_healthy_armed(NodeCoinState& st) {
         s.nRegisteredHeight = 2'300'000;
         s.nLastPaidHeight = 0;
         s.scriptPayout.m_data = p2pkh_script(0x30);
+        s.payoutSplitProvenance = MNState::SPLIT_KNOWN;   // fixture: proven zero split (h=2516595 gate)
         st.mnstates().load(
             std::vector<std::pair<uint256, MNState>>{{raw256(0x01), s}}, H - 1);
     }
@@ -884,6 +888,7 @@ TEST(DashServeGateNamesRefusal, PayeeStaleNamesValueAndThreshold) {
     s.isValid = true;
     s.nRegisteredHeight = 2'300'000;
     s.scriptPayout.m_data = p2pkh_script(0x30);
+    s.payoutSplitProvenance = MNState::SPLIT_KNOWN;   // fixture: proven zero split (h=2516595 gate)
     st.mnstates().load(
         std::vector<std::pair<uint256, MNState>>{{raw256(0x01), s}}, H - 3);
     const DeclineReport d = st.describe_decline();
@@ -1277,6 +1282,7 @@ TEST(DashServeGateNamesRefusal, SelfConsistentStaleTipPassesEveryRelativeGate) {
         s.isValid = true;
         s.nRegisteredHeight = 1'000'000;
         s.scriptPayout.m_data = p2pkh_script(0x30);
+        s.payoutSplitProvenance = MNState::SPLIT_KNOWN;   // fixture: proven zero split (h=2516595 gate)
         st.mnstates().load(
             std::vector<std::pair<uint256, MNState>>{{raw256(0x01), s}}, ancient);
     }
