@@ -106,6 +106,9 @@ static MNState mn_state(uint32_t reg_height,
     s.nRegisteredHeight  = reg_height;
     s.nLastPaidHeight    = 0;
     s.scriptPayout.m_data = payout;
+    // Hand-seeded fixture: zero operator split, declared PROVEN as every
+    // real ingest path does (h=2516595 serve gate).
+    s.payoutSplitProvenance = MNState::SPLIT_KNOWN;
     return s;
 }
 

@@ -171,8 +171,8 @@ inline BlockBroadcast broadcast_won_block(const P2pRelaySink& p2p_relay,
                          "block NOT relayed!";
         else
             LOG_INFO << "[EMB-DASH] height-race won-block broadcast: rpc="
-                     << (r.rpc_ok ? "ok" : "off") << " p2p="
-                     << (r.p2p_sent ? "sent" : "off")
+                     << (r.rpc_ok ? "ok" : (rpc_submit ? "no-ack" : "unarmed"))
+                     << " p2p=" << (r.p2p_sent ? "sent" : "off")
                      << " landed_first=" << r.landed_first << ".";
         return r;
     }
@@ -236,8 +236,13 @@ inline BlockBroadcast broadcast_won_block(const P2pRelaySink& p2p_relay,
     if (!r.any())
         LOG_ERROR << "[EMB-DASH] won-block reached NEITHER sink -- block NOT relayed!";
     else
+        // rpc= is a TRI-state: "off" used to mean both "arm never wired"
+        // and "arm fired, dashd did NOT ack" — on the h=2516595 incident
+        // (bad-cb-payee) the summary read rpc=off while ARM B had in fact
+        // fired and carried the rejection verdict. Name the two states
+        // apart so a no-ack is read as the consensus verdict it is.
         LOG_INFO << "[EMB-DASH] won-block broadcast: p2p=" << (r.p2p_sent ? "sent" : "off")
-                 << " rpc=" << (r.rpc_ok ? "ok" : "off")
+                 << " rpc=" << (r.rpc_ok ? "ok" : (rpc_submit ? "no-ack" : "unarmed"))
                  << " landed_first=" << r.landed_first << ".";
     return r;
 }

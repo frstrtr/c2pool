@@ -103,6 +103,20 @@ struct MnSeedStats {
     // ZERO here on mainnet means the source was `valid`-filtered, so no
     // ProUpServTx revive can ever find an entry to revive.
     size_t pose_banned{0};
+    // ── Payout-split provenance (incident h=2516595 bad-cb-payee) ────────
+    // Entries whose operator-reward split could NOT be proven from this
+    // seed. Each lands as SPLIT_UNKNOWN and the serve gate refuses the
+    // height it is scheduled at (cause=mn-payout-split-unprovable) until a
+    // canonical payment reveals the split (pass-3 adoption, ~one payment
+    // cycle worst case). dashd's protx ToJson ALWAYS emits operatorReward,
+    // so a nonzero split_unproven on a real `protx list` seed means the
+    // source was filtered/reshaped — a seed-quality defect made visible,
+    // not a statistic.
+    size_t split_unproven{0};      // operatorReward key absent
+    size_t operator_addr_undecodable{0};  // address present, decode failed
+    // MNs seeded with a >0 operator share (mainnet ~6.8%: 203 of 2974 at
+    // anchor 2513000) — the population the h=2516595 class lives in.
+    size_t with_operator_split{0};
 };
 
 namespace detail {
@@ -245,9 +259,23 @@ inline std::vector<std::pair<uint256, MNState>> parse_protx_list_seed(
         }
         // JSON reports operatorReward as a percentage double (dashd ToJson:
         // nOperatorReward / 100.0); recover the internal 0..10000 fixed-point.
-        if (e.contains("operatorReward") && e["operatorReward"].is_number())
+        //
+        // PROVENANCE (incident h=2516595): dashd's ToJson emits the
+        // operatorReward key unconditionally, so its ABSENCE means this seed
+        // was filtered/reshaped and the split cannot be proven from it. Such
+        // an entry is seeded SPLIT_UNKNOWN — present, payable in the queue
+        // projection, but the serve gate refuses the height it is scheduled
+        // at (cause=mn-payout-split-unprovable) rather than build a coinbase
+        // dashd deterministically rejects (bad-cb-payee).
+        if (e.contains("operatorReward") && e["operatorReward"].is_number()) {
             mn.nOperatorReward = static_cast<uint16_t>(
                 std::llround(e["operatorReward"].get<double>() * 100.0));
+            mn.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+            if (mn.nOperatorReward > 0) ++st.with_operator_split;
+        } else {
+            mn.payoutSplitProvenance = MNState::SPLIT_UNKNOWN;
+            ++st.split_unproven;
+        }
         const std::string type_str = e.value("type", "Regular");
         mn.nType = (type_str == "Evo" || type_str == "HighPerformance")
                        ? vendor::MnType::EVO
@@ -290,13 +318,31 @@ inline std::vector<std::pair<uint256, MNState>> parse_protx_list_seed(
             if (stats) *stats = st;
             return {};
         }
-        // Operator payout (optional, best-effort — not payee-critical today;
-        // operator-payout coinbase matching is a documented non-goal of the
-        // state machine).
+        // Operator payout script. PAYEE-CRITICAL since incident h=2516595:
+        // when nOperatorReward > 0 and this script is set, dashd's coinbase
+        // pays TWO MN outputs (owner + floor(mnShare*bps/10000) to the
+        // operator) and CheckMasternodePayments validates the full set —
+        // an omitted operator output is a deterministically rejected block.
+        // Consensus (bad-protx-operator-payee) only admits P2PKH/P2SH here,
+        // so a present address that fails to decode is OUR defect, not an
+        // exotic script: fail the ENTRY closed (SPLIT_UNKNOWN, the serve
+        // gate refuses its heights) instead of silently seeding an empty
+        // script that would build a single-output coinbase.
         const std::string op_addr = s.value("operatorPayoutAddress", "");
-        if (!op_addr.empty())
+        if (!op_addr.empty()) {
             mn.scriptOperatorPayout.m_data = detail::payout_address_to_script(
                 op_addr, address_version, address_p2sh_version);
+            if (mn.scriptOperatorPayout.m_data.empty()) {
+                ++st.operator_addr_undecodable;
+                mn.payoutSplitProvenance = MNState::SPLIT_UNKNOWN;
+                LOG_WARNING << "[MN-SEED] undecodable operatorPayoutAddress '"
+                            << op_addr << "' for proTx "
+                            << proTxHash.GetHex().substr(0, 16)
+                            << " -- entry seeded SPLIT_UNKNOWN (serve gate"
+                               " refuses its scheduled heights;"
+                               " cause=mn-payout-split-unprovable)";
+            }
+        }
 
         // Governance keys (best-effort; not consumed by payee projection).
         mn.keyIDOwner  = detail::hash160_hex_to_uint160(

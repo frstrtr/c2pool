@@ -743,7 +743,12 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_embedded_oracle_shadow.cpp
         test_dash_embedded_shadow_compare.cpp
         test_dash_mn_confirm_rollover.cpp
-        test_dash_collateral_spend_filter.cpp)
+        test_dash_collateral_spend_filter.cpp
+        # test_dash_operator_split.cpp: incident h=2516595 bad-cb-payee — the
+        # MN operator-reward split KATs (builder dual-output + serve-gate
+        # cause=mn-payout-split-unprovable + ResetOperatorFields mirror +
+        # pass-3 split observation). Folded here per the same #769 rule.
+        test_dash_operator_split.cpp)
     target_compile_definitions(test_dash_embedded_gbt PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_embedded_gbt PRIVATE

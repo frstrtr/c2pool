@@ -240,6 +240,7 @@ public:
     /// template-SERVE refusal (free), never a block-SUBMIT refusal. Exposed
     /// for the negative-pass test.
     void set_require_resolvable_payee(bool v) { m_require_resolvable_payee = v; }
+    void set_require_provable_payout_split(bool v) { m_require_provable_payout_split = v; }
 
     /// creditPool freshness gate (soak fix). dashcore CheckCreditPoolDiffForBlock
     /// rejects a block whose committed creditPoolBalance is off by a block's
@@ -412,7 +413,13 @@ public:
     /// The predicate takes the NEXT block height (prev_height + 1). Unset
     /// (default) preserves prior behaviour exactly.
     void set_is_superblock_fn(std::function<bool(uint32_t)> fn) {
-        m_is_superblock_fn = std::move(fn);
+        m_is_superblock_fn = fn;
+        // Same cycle for the payee machine's pass-3 payout-split
+        // observation: a lone treasury payee at a superblock height
+        // presents the same 2-output shape as an operator split, so
+        // adoption there is ambiguous and must be skipped (h=2516595
+        // split-provenance lane).
+        m_mnstates.set_superblock_height_fn(std::move(fn));
     }
 
     /// Daemonless superblock provider (E-SUPERBLOCK). When enabled (see
@@ -824,6 +831,60 @@ public:
                               ? std::to_string(m_mnstates.last_applied_height())
                               : std::string("n/a"),
                           std::to_string(m_prev_height));
+        // Incident h=2516595 (bad-cb-payee) mirror of the viability clause:
+        // a template whose scheduled MN has an UNPROVEN operator-reward
+        // split must never reach a miner, even via a cached template or a
+        // viability bypass.
+        if (m_require_provable_payout_split) {
+            if (auto protx = mn_payout_split_unprovable_at_tip())
+                return reject("emit-mn-payout-split-unprovable",
+                              "protx=" + protx->GetHex().substr(0, 12),
+                              "payout-set-known");
+            // Structural re-derivation (defence in depth against a builder
+            // that ignores the split — the exact h=2516595 defect): the
+            // BUILT template's MN payment amounts must be dashd's
+            // GetBlockTxOuts split of ITS OWN m_payment_amount —
+            //   operator = floor(mn_payment * bps / 10000), owner = rest —
+            // whenever the scheduled entry says a split is due. Amount
+            // presence is checked (not scripts: the packed payee is an
+            // address token; the builder KATs pin script identity).
+            const auto expected = m_mnstates.find_expected_payee();
+            if (expected && w.m_payment_amount > 0) {
+                const auto it = m_mnstates.entries().find(*expected);
+                if (it != m_mnstates.entries().end()) {
+                    const int64_t mn_payment =
+                        static_cast<int64_t>(w.m_payment_amount);
+                    const int64_t op_due =
+                        it->second.operator_payment_of(mn_payment);
+                    if (op_due > 0) {
+                        // Occurrence-counted so a 50/50 split (owner amount
+                        // == operator amount) needs TWO outputs, not one
+                        // double-matched.
+                        const uint64_t own_amt =
+                            static_cast<uint64_t>(mn_payment - op_due);
+                        const uint64_t op_amt = static_cast<uint64_t>(op_due);
+                        size_t own_n = 0, op_n = 0;
+                        for (const auto& p : w.m_packed_payments) {
+                            if (p.payee == "!6a") continue;
+                            if (p.amount == own_amt) ++own_n;
+                            if (p.amount == op_amt)  ++op_n;
+                        }
+                        const bool owner_ok =
+                            own_amt == op_amt ? own_n >= 2 : own_n >= 1;
+                        const bool op_ok =
+                            own_amt == op_amt ? op_n >= 2 : op_n >= 1;
+                        if (!owner_ok || !op_ok)
+                            return reject(
+                                "emit-mn-payout-split-drift",
+                                "owner=" + std::to_string(mn_payment - op_due)
+                                    + (owner_ok ? "-present" : "-MISSING")
+                                    + ",operator=" + std::to_string(op_due)
+                                    + (op_ok ? "-present" : "-MISSING"),
+                                "both-split-amounts-in-template");
+                    }
+                }
+            }
+        }
         // FINDING-2 defence in depth: no template tx may spend a known MN
         // collateral outpoint. dashd's verifier removes that MN from the list
         // for THIS block (specialtxman.cpp:457-464, ALL txs, no special-tx
@@ -1166,6 +1227,18 @@ private:
                        std::to_string(m_mnstates.entries().size())
                            + "-entries-none-payable",
                        "expected-payee-in-SML@h=" + std::to_string(next_h));
+        else if (m_require_provable_payout_split) {
+            // Incident h=2516595 (bad-cb-payee): serving a height whose
+            // scheduled MN carries an UNPROVEN operator-reward split builds
+            // a coinbase dashd deterministically rejects — the won block is
+            // lost. The value names the masternode so the operator can see
+            // WHICH entry is starving the arm (a fresh checkpoint reseed or
+            // one canonical payment of that MN clears it).
+            if (auto protx = mn_payout_split_unprovable_at_tip())
+                d = refuse("mn-payout-split-unprovable",
+                           "protx=" + protx->GetHex().substr(0, 12),
+                           "payout-set-known");
+        }
 
         if (d.viable) return d;
 
@@ -1248,6 +1321,35 @@ private:
         return m_mnstates.entries().find(*expected) != m_mnstates.entries().end();
     }
 
+    // Incident h=2516595 (bad-cb-payee): the scheduled payee's operator-
+    // reward split must be PROVEN before the embedded arm may build the
+    // height. dashd pays the MN share as a SET (owner + optional operator
+    // output, masternode/payments.cpp GetBlockTxOuts) and validates scripts
+    // AND amounts; the SML wire can never prove the split
+    // (CSimplifiedMNListEntry keeps the payout scripts mem-only), so
+    // provenance comes from checkpoint/seed rows, ProTx replay, or observed
+    // canonical payouts — see MNState::payoutSplitProvenance. Returns the
+    // scheduled proRegTxHash when the height must be REFUSED
+    // (cause=mn-payout-split-unprovable), nullopt when serving is safe.
+    // Follows mn_payee_resolvable_at_tip()'s no-payment-due carve-outs so
+    // it can never over-refuse a height with no MN payment.
+    std::optional<uint256> mn_payout_split_unprovable_at_tip() const {
+        if (m_mnstates.entries().empty()) return std::nullopt;
+        const uint32_t next_h = m_prev_height + 1;
+        const int64_t reward = compute_dash_block_reward_post_v20(next_h);
+        const int64_t platform_reward =
+            compute_dash_platform_reward_post_v20_mn_rr(next_h, m_mn_rr_height);
+        const int64_t mn_payment_floor =
+            compute_dash_mn_payment_post_v20(reward) - platform_reward;
+        if (mn_payment_floor <= 0) return std::nullopt;
+        const auto expected = m_mnstates.find_expected_payee();
+        if (!expected) return std::nullopt;   // payee-unresolvable owns this
+        const auto it = m_mnstates.entries().find(*expected);
+        if (it == m_mnstates.entries().end()) return std::nullopt; // ditto
+        if (it->second.payout_split_provable()) return std::nullopt;
+        return *expected;
+    }
+
     /// Superblock disposition for a candidate next height. ok=false => refuse
     /// (fail closed). payments empty+ok => normal block; non-empty+ok => emit.
     struct SuperblockDisposition {
@@ -1323,6 +1425,7 @@ private:
     // no external freshness wiring, and guards a money path, so unlike the
     // freshness gates above it defaults ON.
     bool     m_require_resolvable_payee{true};   // refuse embedded when a due MN payee is unresolvable (#996)
+    bool     m_require_provable_payout_split{true}; // refuse embedded when the scheduled MN's operator-reward split is unproven (h=2516595 bad-cb-payee)
     int      m_mn_rr_height{DASH_MN_RR_HEIGHT_MAINNET}; // network MN_RR activation height (platform-share gate)
     int      m_mn_min_confirmations{DASH_MN_MIN_CONFIRMATIONS_MAINNET}; // network nMasternodeMinimumConfirmations (rollover projection)
     uint256  m_credit_pool_current_hash;     // block hash the credit-pool seed is current at

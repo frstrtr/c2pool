@@ -88,6 +88,59 @@ struct MNState
     uint16_t                                       platformP2PPort{0};
     uint16_t                                       platformHTTPPort{0};
 
+    // ── Payout-split provenance (incident h=2516595 bad-cb-payee) ──────
+    // dashd's coinbase pays the MN share as a SET: owner scriptPayout plus,
+    // when nOperatorReward>0 AND scriptOperatorPayout is set, an operator
+    // output of floor(mnShare * nOperatorReward / 10000) duffs
+    // (masternode/payments.cpp GetBlockTxOuts). CheckMasternodePayments
+    // validates the FULL set — scripts AND amounts — so building from a
+    // state whose split fields are not PROVEN correct is a deterministic
+    // bad-cb-payee rejection of a WON block. The SML wire can never prove
+    // them (CSimplifiedMNListEntry keeps scriptPayout/scriptOperatorPayout
+    // "mem-only", evo/simplifiedmns.h), so provenance is tracked per entry:
+    //
+    //   SPLIT_UNKNOWN — no ingest path has proven the split fields. The
+    //       serve gate REFUSES to serve a height whose scheduled payee
+    //       carries this (cause=mn-payout-split-unprovable); fallback
+    //       serves. Entries land here only via a seed that omitted the
+    //       operator fields (filtered/legacy source) or an observed
+    //       canonical payout that CONTRADICTED our fields (demotion —
+    //       the chain is authoritative, our knowledge was stale).
+    //   SPLIT_KNOWN — fields are authoritative: checkpoint row (format
+    //       carries bps + operator script explicitly), dashd protx-list
+    //       seed row with the operatorReward key present, a ProRegTx we
+    //       parsed from a block body (bps is immutable after
+    //       registration; the operator script may only be set later by a
+    //       ProUpServTx, which we also parse), or an observed canonical
+    //       coinbase whose 2-output MN payment uniquely determines bps
+    //       (interval width 10000/mnShare << 1).
+    //
+    // NOTE: (nOperatorReward>0, scriptOperatorPayout empty, SPLIT_KNOWN)
+    // is a VALID single-output state — consensus (bad-protx-operator-payee)
+    // only admits setting the operator script when a reward share exists,
+    // and dashd pays a single owner output while it is unset.
+    static constexpr uint8_t SPLIT_UNKNOWN = 0;
+    static constexpr uint8_t SPLIT_KNOWN   = 1;
+    uint8_t                                        payoutSplitProvenance{SPLIT_UNKNOWN};
+
+    bool payout_split_provable() const
+    {
+        return payoutSplitProvenance == SPLIT_KNOWN;
+    }
+
+    /// dashd masternode/payments.cpp GetBlockTxOuts, bit-exact:
+    ///   operatorReward = (masternodeReward * nOperatorReward) / 10000
+    ///   masternodeReward -= operatorReward   (owner keeps the remainder)
+    /// gated on nOperatorReward != 0 && scriptOperatorPayout non-empty;
+    /// the operator output is only emitted when its amount > 0.
+    int64_t operator_payment_of(int64_t mn_payment) const
+    {
+        if (nOperatorReward == 0 || nOperatorReward > 10000) return 0;
+        if (scriptOperatorPayout.m_data.empty()) return 0;
+        if (mn_payment <= 0) return 0;
+        return (mn_payment * static_cast<int64_t>(nOperatorReward)) / 10000;
+    }
+
     C2POOL_SERIALIZE_METHODS(MNState)
     {
         READWRITE(obj.nVersion,
@@ -109,7 +162,8 @@ struct MNState
                   obj.isValid,
                   obj.platformNodeID,
                   obj.platformP2PPort,
-                  obj.platformHTTPPort);
+                  obj.platformHTTPPort,
+                  obj.payoutSplitProvenance);
     }
 
     bool operator==(const MNState& r) const
@@ -131,7 +185,8 @@ struct MNState
             && scriptOperatorPayout.m_data == r.scriptOperatorPayout.m_data
             && platformNodeID == r.platformNodeID
             && platformP2PPort == r.platformP2PPort
-            && platformHTTPPort == r.platformHTTPPort;
+            && platformHTTPPort == r.platformHTTPPort
+            && payoutSplitProvenance == r.payoutSplitProvenance;
     }
 };
 
@@ -142,9 +197,32 @@ public:
                        const ::core::LevelDBOptions& opts = {})
         : m_store(db_path, opts) {}
 
+    // Store format version. v2 appended MNState.payoutSplitProvenance
+    // (incident h=2516595 bad-cb-payee). A v1 store's entries would fail
+    // to deserialize one by one and be silently SKIPPED by load_all —
+    // leaving a partial set under a believed best_height cursor. Make the
+    // migration explicit instead: on format mismatch wipe the store and
+    // let the normal checkpoint/seed reseed rebuild it (the same
+    // fail-closed path a payee desync takes).
+    static constexpr uint32_t kFormatVersion = 2;
+
     bool open()
     {
         if (!m_store.open()) return false;
+        const uint32_t stored = load_format_version();
+        if (stored != kFormatVersion) {
+            const bool had_rows =
+                !m_store.list_keys(std::string(1, 'M'), /*limit=*/1).empty();
+            if (had_rows || stored != 0) {
+                LOG_INFO << "[MNS-DB] format v" << stored << " -> v"
+                         << kFormatVersion
+                         << " migration: clearing store (payout-split "
+                            "provenance added); the checkpoint/seed reseed "
+                            "rebuilds it";
+                if (!clear()) return false;
+            }
+            store_format_version();
+        }
         load_best_state();
         LOG_INFO << "[MNS-DB] opened best_height=" << m_best_height
                  << " best_hash=" << m_best_hash.GetHex().substr(0, 16);
@@ -273,6 +351,29 @@ private:
     }
 
     static std::string make_state_key() { return std::string(1, 'B'); }
+
+    static std::string make_format_key() { return std::string(1, 'F'); }
+
+    // 0 = no format key (a v1 store, or a fresh directory).
+    uint32_t load_format_version()
+    {
+        std::vector<uint8_t> data;
+        if (!m_store.get(make_format_key(), data) || data.size() < 4) return 0;
+        return uint32_t(data[0])
+             | (uint32_t(data[1]) <<  8)
+             | (uint32_t(data[2]) << 16)
+             | (uint32_t(data[3]) << 24);
+    }
+
+    void store_format_version()
+    {
+        std::vector<uint8_t> out(4);
+        out[0] = static_cast<uint8_t>( kFormatVersion        & 0xFF);
+        out[1] = static_cast<uint8_t>((kFormatVersion >>  8) & 0xFF);
+        out[2] = static_cast<uint8_t>((kFormatVersion >> 16) & 0xFF);
+        out[3] = static_cast<uint8_t>((kFormatVersion >> 24) & 0xFF);
+        m_store.put(make_format_key(), out);
+    }
 
     static std::vector<uint8_t> encode_best_state(const uint256& hash,
                                                   uint32_t height)

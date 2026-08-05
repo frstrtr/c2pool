@@ -243,6 +243,28 @@ public:
         // disagreed with the coinbase AND the SML proved the disagreement was
         // a post-anchor consensus PoSe ban rather than a real desync.
         size_t sml_recovered{0};
+        // ── Operator-reward split observation (incident h=2516595) ───────
+        // The canonical coinbase is the network's own attestation of the
+        // paid MN's CURRENT payout set. When the projected payee matched,
+        // pass 3 also reads the split it was paid with:
+        //
+        // split_adopted: this MN's split provenance was UNKNOWN (filtered/
+        //          legacy seed) and the observed payment proved it — a
+        //          2-output MN payment uniquely determines the bps
+        //          (interval width 10000/mnShare << 1: bps =
+        //          ceil(op*10000/(own+op)), floor-verified), a
+        //          single-output payment proves the operator script is
+        //          currently unset. The entry was promoted to SPLIT_KNOWN.
+        // split_desync: the observed payout set CONTRADICTED a SPLIT_KNOWN
+        //          entry (stale operator script / wrong bps — the exact
+        //          bad-cb-payee class of h=2516595). The entry was demoted
+        //          to SPLIT_UNKNOWN, so the serve gate refuses it
+        //          (cause=mn-payout-split-unprovable) until a fresh
+        //          observation or ProTx re-proves it. NON-ZERO MEANS THIS
+        //          MACHINE WOULD HAVE BUILT A REJECTED COINBASE — a
+        //          defect signature, not a statistic.
+        size_t split_adopted{0};
+        size_t split_desync{0};
     };
 
     /// ─────────────────────────────────────────────────────────────────────
@@ -300,6 +322,22 @@ public:
     using SmlValidityFn = std::function<std::optional<bool>(const uint256&)>;
 
     void set_sml_validity_fn(SmlValidityFn fn) { m_sml_validity = std::move(fn); }
+
+    /// Optional superblock-height predicate (same cycle the serve path
+    /// uses). When set, pass-3 payout-split ADOPTION and the 2-output-shape
+    /// demotion are SKIPPED at superblock heights: a funded superblock with
+    /// exactly one treasury payee presents the same unambiguous-looking
+    /// 2-output coinbase shape as an operator split, and a lone treasury
+    /// amount CAN floor-verify against a plausible bps (observed in the
+    /// superblock KATs: a 50/50 payee adopts as bps=5000). The exact-pair
+    /// presence cross-check for KNOWN splits stays active at all heights
+    /// (extra treasury outputs cannot un-match a pair that is present).
+    /// NULL (default) keeps the shape guards only — correct for callers
+    /// that never fold superblock-height coinbases.
+    void set_superblock_height_fn(std::function<bool(uint32_t)> fn)
+    {
+        m_is_superblock_height = std::move(fn);
+    }
     bool has_sml_validity_fn() const { return static_cast<bool>(m_sml_validity); }
 
     /// Cumulative budget for SML-attested exclusions over the lifetime of
@@ -1135,6 +1173,11 @@ public:
                 st.nOperatorReward   = ptx.nOperatorReward;
                 st.scriptPayout.m_data = ptx.scriptPayout.m_data;
                 st.netInfo           = ptx.netInfo;
+                // The ProRegTx IS the split's registration: nOperatorReward
+                // is immutable from here on and scriptOperatorPayout is
+                // provably unset until a ProUpServTx (which we also parse)
+                // sets it. The payout set is PROVEN by construction.
+                st.payoutSplitProvenance = MNState::SPLIT_KNOWN;
                 if (ptx.nType == vendor::MnType::EVO) {
                     st.platformNodeID    = ptx.platformNodeID;
                     st.platformP2PPort   = ptx.platformP2PPort;
@@ -1188,6 +1231,26 @@ public:
                 it->second.netInfo = ptx.netInfo;
                 it->second.scriptOperatorPayout.m_data =
                     ptx.scriptOperatorPayout.m_data;
+                // Consensus (bad-protx-operator-payee) only ACCEPTS a
+                // ProUpServTx carrying an operator payout script when the
+                // MN's registered nOperatorReward != 0. If we hold bps==0
+                // while the chain just proved bps>0, our bps is a
+                // filtered/legacy-seed zero — the split is UNPROVEN until
+                // the next canonical payment reveals it (pass-3 adoption).
+                if (!ptx.scriptOperatorPayout.m_data.empty()
+                    && it->second.nOperatorReward == 0
+                    && it->second.payoutSplitProvenance
+                           == MNState::SPLIT_KNOWN) {
+                    it->second.payoutSplitProvenance = MNState::SPLIT_UNKNOWN;
+                    LOG_WARNING
+                        << "[MNS-SM] ProUpServTx h=" << height << " mn="
+                        << ptx.proTxHash.GetHex().substr(0, 16)
+                        << " sets an operator payout script while this state"
+                           " holds nOperatorReward=0 — consensus proves the"
+                           " real bps>0. Split demoted to SPLIT_UNKNOWN"
+                           " (cause=mn-payout-split-unprovable when"
+                           " scheduled) until observed.";
+                }
                 if (ptx.nType == vendor::MnType::EVO) {
                     it->second.platformNodeID = ptx.platformNodeID;
                     if (ptx.nVersion < vendor::ProTxVersion::EXT_ADDR) {
@@ -1259,9 +1322,24 @@ public:
                 it->second.keyIDVoting      = ptx.keyIDVoting;
                 it->second.scriptPayout.m_data = ptx.scriptPayout.m_data;
                 if (key_changed) {
-                    // dashcore: ResetOperatorFields + BanIfNotBanned.
+                    // dashcore: ResetOperatorFields + BanIfNotBanned
+                    // (deterministicmns.cpp; dmnstate.h ResetOperatorFields
+                    // clears addr, scriptOperatorPayout, nRevocationReason,
+                    // platformNodeID — the new operator must ProUpServTx its
+                    // own service + payout script). The old code banned but
+                    // KEPT the previous operator's payout script; had the MN
+                    // been revalidated (SML fold) and scheduled, the builder
+                    // would have paid a script dashd no longer pays —
+                    // the h=2516595 bad-cb-payee class. The split itself
+                    // stays PROVEN: bps is immutable, and the operator
+                    // script is now provably unset.
                     it->second.nPoSeBanHeight = height;
                     it->second.isValid        = false;
+                    it->second.netInfo        = vendor::LegacyNetService{};
+                    it->second.scriptOperatorPayout.m_data.clear();
+                    it->second.nRevocationReason =
+                        vendor::CProUpRevTx::REASON_NOT_SPECIFIED;
+                    it->second.platformNodeID = uint160{};
                 }
                 ++r.updated;
                 break;
@@ -1277,9 +1355,15 @@ public:
                 it->second.nPoSeBanHeight   = height;
                 it->second.isValid          = false;
                 it->second.nRevocationReason = ptx.nReason;
-                // Operator key reset (until a future ProUpServTx
-                // provides a new operator key + revives).
+                // dashcore ResetOperatorFields (dmnstate.h): the revoked
+                // operator's service AND payout script go with the key —
+                // a revived MN's new operator sets its own via
+                // ProUpServTx. Keeping the stale script was the same
+                // pay-a-script-dashd-does-not class as the type-3 case.
                 it->second.pubKeyOperator.fill(0);
+                it->second.netInfo          = vendor::LegacyNetService{};
+                it->second.scriptOperatorPayout.m_data.clear();
+                it->second.platformNodeID   = uint160{};
                 ++r.revoked;
                 break;
               }
@@ -1339,6 +1423,10 @@ public:
             if (it != m_entries.end()) {
                 if (paid_in_cb(it->second.scriptPayout.m_data)) {
                     mark_paid(it);
+                    // The accepted coinbase also attests the paid MN's
+                    // CURRENT operator-reward split — cross-check a KNOWN
+                    // split / prove an UNKNOWN one (incident h=2516595).
+                    observe_payout_split(it, block, height, r);
                 } else if (!recover_from_sml_ban(ranked, height, paid_in_cb,
                                                  mark_paid, r)) {
                     r.payee_desync = true;
@@ -1364,6 +1452,159 @@ public:
     }
 
 private:
+    // ─────────────────────────────────────────────────────────────────────
+    // observe_payout_split — read the paid MN's split off the canonical
+    // coinbase (incident h=2516595 bad-cb-payee)
+    // ─────────────────────────────────────────────────────────────────────
+    //
+    // Precondition: pass 3 verified the coinbase pays `it`'s scriptPayout —
+    // the projection matched, so the coinbase's MN payment outputs describe
+    // THIS MN's current payout set as dashd computed it
+    // (masternode/payments.cpp GetBlockTxOuts: owner output, then — iff
+    // nOperatorReward != 0 and scriptOperatorPayout is set — an operator
+    // output of floor(mnShare * bps / 10000)).
+    //
+    // Superblock safety WITHOUT knowing the superblock cycle: the demotion
+    // checks are pure presence/consistency scans over ALL coinbase outputs
+    // (extra treasury outputs cannot un-match a pair that is present), and
+    // the adoption paths require an UNAMBIGUOUS output shape — exactly one
+    // (single-owner proof) or exactly two (split derivation, floor-verified:
+    // an unrelated output passes floor-consistency for a ceil-derived bps
+    // only with probability ~(own+op)/10000 per duff-exactness, ~1e-4) non-
+    // OP_RETURN outputs — which a funded superblock coinbase (many treasury
+    // outputs) never presents.
+    void observe_payout_split(Entries::iterator it, const BlockType& block,
+                              uint32_t height, ApplyResult& r)
+    {
+        MNState& st = it->second;
+        if (st.scriptPayout.m_data.empty()) return;
+        const auto& outs = block.m_txs[0].vout;
+
+        // Shape scan: non-OP_RETURN outputs; owner-script matches.
+        std::vector<size_t> owner_idx, other_idx;
+        for (size_t i = 0; i < outs.size(); ++i) {
+            const auto& sc = outs[i].scriptPubKey.m_data;
+            if (sc.empty() || sc[0] == 0x6a) continue;   // credit-pool burn / OP_RETURN
+            if (sc == st.scriptPayout.m_data) owner_idx.push_back(i);
+            else                              other_idx.push_back(i);
+        }
+        if (owner_idx.empty()) return;   // unreachable: paid_in_cb passed
+
+        const auto floor_split = [](int64_t total, uint16_t bps) -> int64_t {
+            return (total * static_cast<int64_t>(bps)) / 10000;
+        };
+
+        const bool expect_operator_out =
+            st.nOperatorReward > 0 && st.nOperatorReward <= 10000
+            && !st.scriptOperatorPayout.m_data.empty();
+
+        // Superblock heights: a lone treasury payee presents the same
+        // 2-output shape as an operator split and can floor-verify against
+        // a plausible bps — adoption/shape-demotion are ambiguous there.
+        const bool ambiguous_height =
+            m_is_superblock_height && m_is_superblock_height(height);
+
+        if (st.payoutSplitProvenance == MNState::SPLIT_KNOWN) {
+            if (expect_operator_out) {
+                // The exact (owner, operator) pair must be present and
+                // floor-consistent with OUR bps. Presence-scan is valid at
+                // any height class.
+                // NOTE the operator script MAY equal the owner script (an
+                // operator paid to the owner's address): scan ALL non-burn
+                // outputs as operator candidates, excluding only the output
+                // standing as owner in the current pairing.
+                bool consistent = false;
+                for (size_t oi : owner_idx) {
+                    for (size_t pj = 0; pj < outs.size() && !consistent; ++pj) {
+                        if (pj == oi) continue;
+                        if (outs[pj].scriptPubKey.m_data
+                            != st.scriptOperatorPayout.m_data) continue;
+                        const int64_t total = outs[oi].value + outs[pj].value;
+                        if (floor_split(total, st.nOperatorReward)
+                            == outs[pj].value) consistent = true;
+                    }
+                    if (consistent) break;
+                }
+                if (!consistent) {
+                    ++r.split_desync;
+                    st.payoutSplitProvenance = MNState::SPLIT_UNKNOWN;
+                    LOG_WARNING
+                        << "[MNS-SM] payout-split DESYNC h=" << height
+                        << " mn=" << it->first.GetHex().substr(0, 16)
+                        << ": coinbase does not pay the (owner,operator) set"
+                           " this state predicts (bps=" << st.nOperatorReward
+                        << ") — a template built from it is the h=2516595"
+                           " bad-cb-payee class. Demoted to"
+                           " SPLIT_UNKNOWN (serve gate refuses this payee"
+                           " until re-proven).";
+                }
+            } else if (st.nOperatorReward > 0 && !ambiguous_height
+                       && owner_idx.size() == 1 && other_idx.size() == 1) {
+                // We predict a SINGLE owner output (bps registered but no
+                // operator script known) yet the unambiguous 2-output shape
+                // floor-verifies against OUR bps: the network is paying an
+                // operator script we do not hold — stale knowledge.
+                const int64_t total =
+                    outs[owner_idx[0]].value + outs[other_idx[0]].value;
+                if (floor_split(total, st.nOperatorReward)
+                    == outs[other_idx[0]].value) {
+                    ++r.split_desync;
+                    st.payoutSplitProvenance = MNState::SPLIT_UNKNOWN;
+                    LOG_WARNING
+                        << "[MNS-SM] payout-split DESYNC h=" << height
+                        << " mn=" << it->first.GetHex().substr(0, 16)
+                        << ": coinbase pays an operator output (bps="
+                        << st.nOperatorReward << ") but this state holds no"
+                           " operator script. Demoted to SPLIT_UNKNOWN.";
+                }
+            }
+            return;
+        }
+
+        // SPLIT_UNKNOWN → adoption from the chain's own attestation.
+        if (ambiguous_height) return;   // never adopt off a superblock coinbase
+        if (owner_idx.size() == 1 && other_idx.empty()) {
+            // Exactly one non-burn output and it is the owner: the operator
+            // script is provably unset RIGHT NOW. bps stays as-held; if a
+            // later ProUpServTx sets a script while we hold bps==0, the
+            // type-2 handler re-demotes (consensus proves the real bps>0).
+            st.scriptOperatorPayout.m_data.clear();
+            st.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+            ++r.split_adopted;
+            LOG_INFO << "[MNS-SM] payout-split ADOPTED h=" << height
+                     << " mn=" << it->first.GetHex().substr(0, 16)
+                     << " set=single-owner (observed canonical payout)";
+        } else if (owner_idx.size() == 1 && other_idx.size() == 1) {
+            // Unambiguous 2-output shape: derive bps. A 2-output MN payment
+            // uniquely determines it — bps = ceil(op*10000/total) and the
+            // truncating recomputation must reproduce the operator amount
+            // exactly (interval width 10000/total << 1).
+            const int64_t own   = outs[owner_idx[0]].value;
+            const int64_t op    = outs[other_idx[0]].value;
+            const int64_t total = own + op;
+            if (total > 0 && op > 0) {
+                const int64_t bps = (op * 10000 + total - 1) / total; // ceil
+                if (bps >= 1 && bps <= 10000
+                    && floor_split(total, static_cast<uint16_t>(bps)) == op) {
+                    st.nOperatorReward = static_cast<uint16_t>(bps);
+                    st.scriptOperatorPayout.m_data =
+                        outs[other_idx[0]].scriptPubKey.m_data;
+                    st.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+                    ++r.split_adopted;
+                    LOG_INFO << "[MNS-SM] payout-split ADOPTED h=" << height
+                             << " mn=" << it->first.GetHex().substr(0, 16)
+                             << " bps=" << bps
+                             << " (derived from observed canonical payout,"
+                                " floor-verified)";
+                }
+                // floor-verify failed: the second output is not this MN's
+                // operator payment (e.g. lone treasury payee) — stay
+                // UNKNOWN, adopt nothing.
+            }
+        }
+        // >2-output shapes (funded superblock): ambiguous — stay UNKNOWN.
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // recover_from_sml_ban — the ONLY licensed alternative to payee_desync
     // ─────────────────────────────────────────────────────────────────────
@@ -1593,6 +1834,10 @@ private:
     }
 
     SmlValidityFn m_sml_validity;
+
+    // Optional superblock-height predicate (see set_superblock_height_fn).
+    // NULL by default: shape guards only.
+    std::function<bool(uint32_t)> m_is_superblock_height;
     uint32_t      m_sml_height{0};
     bool          m_sml_height_known{false};
     size_t        m_sml_recovery_cap{0};

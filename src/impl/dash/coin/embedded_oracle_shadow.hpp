@@ -220,6 +220,33 @@ inline uint64_t platform_burn_amount(const std::vector<PackedPayment>& pps) {
     for (const auto& p : pps) if (p.payee == "!6a") return p.amount;
     return 0;
 }
+/// Incident h=2516595 (bad-cb-payee): FEE-INVARIANT digest of the MN payout
+/// SET — owner payee, operator payee, and the operator-reward bps derived
+/// from this side's own amounts (bps = ceil(op*10000/(own+op)), emitted only
+/// when dashd's truncating recomputation floor((own+op)*bps/10000) == op
+/// reproduces the amount exactly; a non-split second output practically
+/// never passes that round-trip). Raw amounts differ across sides whenever
+/// the selected tx sets differ (that is why payee_amounts is Informational),
+/// but the SPLIT — payees and ratio — must be identical, so this field is
+/// counted Equality without fee flap. The owner-address-only compare this
+/// widens is exactly what let h=2516595's missing operator output through.
+inline std::string mn_payout_split_shape_str(const std::vector<PackedPayment>& pps) {
+    std::vector<const PackedPayment*> nb;
+    for (const auto& p : pps) if (p.payee != "!6a") nb.push_back(&p);
+    std::string s = "n=" + std::to_string(nb.size());
+    if (nb.empty()) return s + ";owner=-";
+    s += ";owner=" + nb[0]->payee + ";operator=";
+    if (nb.size() < 2) return s + "-;bps=-";
+    const int64_t own   = static_cast<int64_t>(nb[0]->amount);
+    const int64_t op    = static_cast<int64_t>(nb[1]->amount);
+    const int64_t total = own + op;
+    if (total > 0 && op > 0) {
+        const int64_t bps = (op * 10000 + total - 1) / total;   // ceil
+        if (bps >= 1 && bps <= 10000 && (total * bps) / 10000 == op)
+            return s + nb[1]->payee + ";bps=" + std::to_string(bps);
+    }
+    return s + "-;bps=-";   // 2nd output is not an operator split
+}
 inline uint64_t sum_fees(const std::vector<uint64_t>& fees) {
     uint64_t s = 0; for (auto f : fees) s += f; return s;
 }
@@ -267,6 +294,12 @@ inline std::vector<FieldResult> compare_templates(
     eq("mintime",  Regime::Equality, true, std::to_string(emb.m_mintime),std::to_string(dashd.m_mintime));
     eq("payee_identities", Regime::Equality, true,
        payee_identity_str(emb.m_packed_payments), payee_identity_str(dashd.m_packed_payments));
+    // Incident h=2516595: the FULL MN payout SET (owner + operator + ratio),
+    // not the owner address alone. Fee-invariant by construction, so it may
+    // count as Equality even when the two sides selected different tx sets.
+    eq("mn_payout_split_shape", Regime::Equality, true,
+       mn_payout_split_shape_str(emb.m_packed_payments),
+       mn_payout_split_shape_str(dashd.m_packed_payments));
     eq("platform_burn_amount", Regime::Equality, true,
        std::to_string(e.platform_reward), std::to_string(d.platform_reward));
     // Normalized subsidy core = coinbasevalue − own fees (fees stripped) — this

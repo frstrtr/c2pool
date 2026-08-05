@@ -172,6 +172,9 @@ static MnStateMachine single_mn(const std::vector<unsigned char>& payout) {
     s.nRegisteredHeight = 2'300'000;
     s.nLastPaidHeight = 0;
     s.scriptPayout.m_data = payout;
+    // Hand-seeded fixtures declare their (zero) operator split PROVEN, as
+    // every real ingest path does (h=2516595 serve gate).
+    s.payoutSplitProvenance = MNState::SPLIT_KNOWN;
     MnStateMachine m;
     m.load(std::vector<std::pair<uint256, MNState>>{{raw256(0x01), s}});
     return m;
@@ -713,6 +716,7 @@ e2_mn_pairs(const std::vector<unsigned char>& payout) {
     s.nRegisteredHeight = 2'300'000;
     s.nLastPaidHeight = 0;
     s.scriptPayout.m_data = payout;
+    s.payoutSplitProvenance = MNState::SPLIT_KNOWN;   // h=2516595 serve gate
     return std::vector<std::pair<uint256, MNState>>{{raw256(0x01), s}};
 }
 
