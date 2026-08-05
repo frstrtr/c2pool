@@ -748,7 +748,16 @@ if (BUILD_TESTING AND GTest_FOUND)
         # MN operator-reward split KATs (builder dual-output + serve-gate
         # cause=mn-payout-split-unprovable + ResetOperatorFields mirror +
         # pass-3 split observation). Folded here per the same #769 rule.
-        test_dash_operator_split.cpp)
+        test_dash_operator_split.cpp
+        # test_dash_replay_quorum_engine.cpp: W4 of the FULL-HISTORY REPLAY
+        # mode (replay_quorum_engine.hpp) — quorum state from replayed mined
+        # qfcommits: 3101-block mainnet merkleRootQuorums byte-parity replay
+        # (dash_mainnet_quorum_scan_* + dash_mainnet_active_quorums_*),
+        # rotated-member + snapshot-PRODUCER KATs against a real mainnet
+        # qrinfo (dash_mainnet_qrinfo_2516785.bin) and dashd's own `quorum
+        # info` member lists. Folded here per the same #769 rule; reads
+        # DASH_FIXTURE_DIR.
+        test_dash_replay_quorum_engine.cpp)
     target_compile_definitions(test_dash_embedded_gbt PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_embedded_gbt PRIVATE
