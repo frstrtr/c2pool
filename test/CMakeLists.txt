@@ -1487,5 +1487,18 @@ if (BUILD_TESTING AND GTest_FOUND)
         # (miners/miner/loading) for standalone-coin merged-UI gating.
         WEB_STATIC_DIR="${CMAKE_SOURCE_DIR}/web-static")
 
+
+    # L-KR1Z1S drop_tails release-order race guard (self-contained ASan stand-in,
+    # #759 pattern). Compiles + runs its own harness in three modes under
+    # AddressSanitizer: green PASS (fixed discipline survives concurrent prune),
+    # deadcode RED (models the main_ltc.cpp:5011 caller-unlock revert), uaf RED
+    # (models the node.cpp:1038 under-lock-deref revert). It does NOT link
+    # NodeImpl/main_ltc. Script-based add_test => no build target, so it stays off
+    # the build.yml --target allowlist (#143) and needs no link into the suite.
+    add_test(NAME LtcKr1z1sDropTailGuard
+             COMMAND ${CMAKE_COMMAND} -E env CXX=${CMAKE_CXX_COMPILER}
+                     bash ${CMAKE_CURRENT_SOURCE_DIR}/kr1z1s/kr1z1s_droptail_guard.sh)
+    set_tests_properties(LtcKr1z1sDropTailGuard PROPERTIES
+        TIMEOUT 180 LABELS "ltc;threading;asan-stand-in")
 endif()
 
