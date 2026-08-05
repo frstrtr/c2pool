@@ -209,3 +209,146 @@ TEST(DashShadowCompare, DriverAsyncServedMismatchSurfacesCounter) {
     EXPECT_EQ(j["shadow-served-mismatch"], 1u);
     EXPECT_EQ(j["mode"], "embedded-shadow-compare");
 }
+
+// ═════════════════════════════════════════════════════════════════════════
+// TX-SET NORMALIZATION of merkleRootMNList — the h=2516756 false-positive
+// class. The consensus rule derives the committed root from the MN list AFTER
+// folding the block's OWN ProTx txs (types 1-4), so an embedded coinbase-only
+// template and a dashd template carrying a mempool ProTx commit to DIFFERENT
+// tx sets: both roots are correct for their own blocks, and comparing them as
+// answers to the same question was the false SERVED-MISMATCH. Roots may only
+// be commitment-compared under the SAME ProTx fold; a divergence under
+// different folds is the benign MATCH-MODULO-MEMPOOL-PROTX verdict with its
+// own counter.
+// ═════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// A template tx with a given Dash special-tx type + a distinct txid, appended
+// with the parallel m_tx_hashes entry the GBT parser maintains.
+void add_tx(DashWorkData& w, uint16_t type, uint8_t id_seed) {
+    MutableTransaction m;
+    m.type = type;
+    w.m_txs.emplace_back(m);
+    w.m_tx_hashes.push_back(hashn(id_seed));
+}
+
+} // namespace
+
+// THE 2516756 REPRODUCTION: embedded serves coinbase-only; dashd's template
+// carries a mempool ProUpServTx (type 2 — the revive) plus a normal type-0
+// payment tx; the two merkleRootMNList values diverge (each correct for its
+// own tx set). VERIFIED TO FAIL ON THE PRE-FIX TREE: shadow_evaluate flags
+// SERVED-MISMATCH field=merkleRootMNList and bumps shadow-served-mismatch —
+// the exact false positive observed live at h=2516756.
+TEST(DashShadowCompare, MempoolProUpServTxRootDivergenceIsMatchModulo2516756) {
+    auto emb_cb  = make_cbtx(2516756, /*mn_seed=*/1,  /*q_seed=*/100);
+    auto dref_cb = make_cbtx(2516756, /*mn_seed=*/9,  /*q_seed=*/100); // root differs
+    auto emb  = make_wd(2516756, emb_cb,  "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2516756, dref_cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    // embedded: coinbase-only (no txs). dashd: mempool ProUpServTx revive +
+    // an ordinary payment tx (which must NOT matter — only ProTx types fold).
+    add_tx(dref, /*type=*/2, /*id_seed=*/0x21);
+    add_tx(dref, /*type=*/0, /*id_seed=*/0x22);
+
+    auto o = shadow_evaluate(WorkSource::Embedded, emb, dref);
+
+    // The core fails-on-master assertions: NOT a served-mismatch, and no
+    // SERVED-MISMATCH line — the roots answered different questions.
+    EXPECT_FALSE(o.served_mismatch)
+        << "coinbase-only vs mempool-ProTx tx sets flagged as a served root "
+           "bug — the h=2516756 false positive";
+    EXPECT_FALSE(has_line_with(o.log_lines, "SERVED-MISMATCH"));
+
+    // And the benign verdict names itself, with its own counter.
+    EXPECT_EQ(o.kind, ShadowOutcome::Kind::MatchModuloMempoolProTx);
+    EXPECT_TRUE(has_line_with(o.log_lines,
+        "[SHADOW] h=2516756 MATCH-MODULO-MEMPOOL-PROTX field=merkleRootMNList"));
+
+    ShadowCounters c;
+    c.apply(o);
+    EXPECT_EQ(c.shadow_served_mismatch, 0u);
+    EXPECT_EQ(c.shadow_match_modulo_mempool_protx, 1u);
+    EXPECT_EQ(c.shadow_mismatch_by_field.count("merkleRootMNList"), 0u);
+    EXPECT_EQ(c.shadow_match, 0u) << "benign-modulo must not hide in MATCH";
+    auto j = c.to_json();
+    EXPECT_EQ(j["shadow-match-modulo-mempool-protx"], 1u);
+}
+
+// A REAL root bug must still SERVED-MISMATCH: the SAME tx set on both sides
+// (identical ProTx fold — here literally the same ProUpServTx) with diverging
+// roots means the validator rule was run over the same inputs and disagreed.
+TEST(DashShadowCompare, RealRootBugUnderSameTxSetStillServedMismatch) {
+    auto emb_cb  = make_cbtx(2516756, /*mn_seed=*/1);
+    auto dref_cb = make_cbtx(2516756, /*mn_seed=*/9); // root differs
+    auto emb  = make_wd(2516756, emb_cb,  "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2516756, dref_cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    // IDENTICAL ProTx fold on both sides: same ProUpServTx txid.
+    add_tx(emb,  /*type=*/2, /*id_seed=*/0x21);
+    add_tx(dref, /*type=*/2, /*id_seed=*/0x21);
+
+    auto o = shadow_evaluate(WorkSource::Embedded, emb, dref);
+    EXPECT_EQ(o.kind, ShadowOutcome::Kind::Mismatch);
+    EXPECT_TRUE(o.served_mismatch)
+        << "a root divergence under the SAME tx set is a real bug and must "
+           "still fire SERVED-MISMATCH";
+    EXPECT_TRUE(has_line_with(o.log_lines, "SERVED-MISMATCH field=merkleRootMNList"));
+
+    ShadowCounters c;
+    c.apply(o);
+    EXPECT_EQ(c.shadow_served_mismatch, 1u);
+    EXPECT_EQ(c.shadow_match_modulo_mempool_protx, 0u);
+}
+
+// Coinbase-only on BOTH sides is also the SAME tx set (empty fold == empty
+// fold): the pre-existing served-mismatch semantics are unchanged there.
+TEST(DashShadowCompare, CoinbaseOnlyBothSidesRootDivergenceStillServedMismatch) {
+    auto emb_cb  = make_cbtx(2516756, /*mn_seed=*/1);
+    auto dref_cb = make_cbtx(2516756, /*mn_seed=*/9);
+    auto emb  = make_wd(2516756, emb_cb,  "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2516756, dref_cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+
+    auto o = shadow_evaluate(WorkSource::Embedded, emb, dref);
+    EXPECT_TRUE(o.served_mismatch);
+    EXPECT_TRUE(has_line_with(o.log_lines, "SERVED-MISMATCH field=merkleRootMNList"));
+}
+
+// The modulo verdict must not MASK an unrelated commitment divergence riding
+// in the same sample: differing ProTx folds excuse ONLY merkleRootMNList —
+// a payee divergence alongside stays a SERVED-MISMATCH.
+TEST(DashShadowCompare, ModuloDoesNotMaskOtherCommitmentDivergence) {
+    auto emb_cb  = make_cbtx(2516756, /*mn_seed=*/1);
+    auto dref_cb = make_cbtx(2516756, /*mn_seed=*/9);          // root differs
+    auto emb  = make_wd(2516756, emb_cb,  "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2516756, dref_cb, "yMNaddrBBBBBBBBBBBBBBBBBBBBB"); // payee differs
+    add_tx(dref, /*type=*/2, /*id_seed=*/0x21);   // folds differ
+
+    auto o = shadow_evaluate(WorkSource::Embedded, emb, dref);
+    EXPECT_EQ(o.kind, ShadowOutcome::Kind::Mismatch);
+    EXPECT_TRUE(o.served_mismatch) << "the payee divergence is still real";
+    EXPECT_TRUE(has_line_with(o.log_lines, "SERVED-MISMATCH field=payee"));
+    // The root line keeps its benign marker; it must not read SERVED-MISMATCH.
+    EXPECT_TRUE(has_line_with(o.log_lines,
+        "MATCH-MODULO-MEMPOOL-PROTX field=merkleRootMNList"));
+    EXPECT_FALSE(has_line_with(o.log_lines, "SERVED-MISMATCH field=merkleRootMNList"));
+
+    ShadowCounters c;
+    c.apply(o);
+    EXPECT_EQ(c.shadow_served_mismatch, 1u);
+    EXPECT_EQ(c.shadow_match_modulo_mempool_protx, 1u);
+    EXPECT_EQ(c.shadow_mismatch_by_field["payee"], 1u);
+    EXPECT_EQ(c.shadow_mismatch_by_field.count("merkleRootMNList"), 0u);
+}
+
+// Matching roots stay a plain MATCH even when the tx sets differ — the modulo
+// verdict exists only to explain a DIVERGENCE, never to relabel agreement.
+TEST(DashShadowCompare, MatchingRootsWithDifferentTxSetsIsStillMatch) {
+    auto cb = make_cbtx(2516756);
+    auto emb  = make_wd(2516756, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2516756, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    add_tx(dref, /*type=*/2, /*id_seed=*/0x21);
+
+    auto o = shadow_evaluate(WorkSource::Embedded, emb, dref);
+    EXPECT_EQ(o.kind, ShadowOutcome::Kind::Match);
+    EXPECT_FALSE(o.served_mismatch);
+}

@@ -375,6 +375,37 @@ BEGIN_MESSAGE(govsync)
     }
 END_MESSAGE()
 
+// ── SPORK listener ────────────────────────────────────────────────────────
+// "spork" — CSporkMessage (dashd src/spork.h SERIALIZE_METHODS): nSporkID(i32)
+// + nValue(i64) + nTimeSigned(i64) + vchSig (LIMITED_VECTOR, 65-byte compact
+// sig). dashd serves its FULL spork set in reply to "getsporks" (which the
+// client sends once per completed handshake) and relays every new spork
+// unsolicited. The signature is verified in the handler against the hardcoded
+// mainnet spork key (spork.hpp) before any state is touched — an arbitrary
+// peer must not be able to flip a spork by just sending the message.
+BEGIN_MESSAGE(spork)
+    MESSAGE_FIELDS
+    (
+        (int32_t,              m_spork_id),
+        (int64_t,              m_value),
+        (int64_t,              m_time_signed),
+        (std::vector<uint8_t>, m_sig)
+    )
+    {
+        READWRITE(obj.m_spork_id);
+        READWRITE(obj.m_value);
+        READWRITE(obj.m_time_signed);
+        READWRITE(obj.m_sig);
+    }
+END_MESSAGE()
+
+// "getsporks" — empty-payload request; dashd answers with its full spork set.
+// We SEND this on every completed handshake; a peer may also send it to us
+// (masternode sync does), which we acknowledge and do not serve.
+BEGIN_MESSAGE(getsporks)
+    WITHOUT_MESSAGE_FIELDS() { }
+END_MESSAGE()
+
 using Handler = MessageHandler<
     message_version,
     message_verack,
@@ -418,7 +449,13 @@ using Handler = MessageHandler<
     message_qrinfo,
     message_govobj,
     message_govobjvote,
-    message_govsync
+    message_govsync,
+    // ⚠ SPORK lane — same registry rule as the DIP-24 pair above (#1077): a
+    // handler that exists but whose message type is absent from this list can
+    // never run; the payload dies on the unhandled-command path at DEBUG.
+    // test_dash_spork.cpp gates the registry membership directly.
+    message_spork,
+    message_getsporks
 >;
 
 } // namespace p2p

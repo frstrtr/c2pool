@@ -85,6 +85,7 @@
 #include "node_interface.hpp"
 #include "block.hpp"
 #include "transaction.hpp"
+#include "spork.hpp"
 
 #include <impl/dash/crypto/hash_x11.hpp>   // block identity on Dash = X11(header)
 #include <impl/dash/coin/governance_object.hpp> // govobject_hash / govvote_signature_hash (dashcore-exact digests)
@@ -629,6 +630,14 @@ private:
     // Collapses the N-peer inv fan-in to one getdata. Bounded + expiring.
     InvDedup m_inv_dedup;
 
+    // ── SPORK listener (state + telemetry ONLY — nothing gates on it) ────
+    // Seeded with the assume-active mainnet defaults (7/7 active, matching
+    // dashd's hardened mainnet spork values), refined by VERIFIED spork
+    // messages from peers. Verification key defaults to the mainnet spork key
+    // ID from dashd chainparams; overridable only by the test seam below.
+    SporkState m_spork_state;
+    std::array<uint8_t, 20> m_spork_pubkey_id{MAINNET_SPORK_PUBKEY_ID};
+
     // ── Lost-body watchdog state (see BODY_REREQUEST_* above) ────────────
     // One slot per tracked outstanding getdata(block); disarmed by the block
     // handler on receipt (from ANY peer), serviced by the pool tick.
@@ -953,6 +962,19 @@ public:
     void configure_inv_dedup(std::size_t capacity, int64_t ttl_sec)
     {
         m_inv_dedup.configure(capacity, ttl_sec);
+    }
+
+    /// Active-spork map + listener counters (assume-active seed + verified
+    /// refinements). Read-only: nothing outside the spork handler mutates it.
+    const SporkState& spork_state() const { return m_spork_state; }
+    nlohmann::json spork_json() const { return m_spork_state.to_json(now_sec()); }
+
+    /// TEST-ONLY: swap the spork verification key ID so KATs can exercise the
+    /// accept path with a synthetic signer. Production always verifies against
+    /// the hardcoded mainnet spork key (chainparams vSporkAddresses[0]).
+    void set_spork_pubkey_id_for_test(const std::array<uint8_t, 20>& key_id)
+    {
+        m_spork_pubkey_id = key_id;
     }
 
     /// The peer the single-peer-shaped accessors below describe: the PRIMARY
@@ -1458,9 +1480,9 @@ public:
             return;
         } catch (const std::out_of_range&)
         {
-            // Command outside our Handler set — dashd peers push spork/
-            // governance/quorum traffic (spork, senddsq, qsendrecsigs, ...)
-            // unsolicited; ignoring them is protocol-legal for a light client.
+            // Command outside our Handler set — dashd peers push CoinJoin/
+            // quorum traffic (senddsq, qsendrecsigs, ...) unsolicited;
+            // ignoring them is protocol-legal for a light client.
             // A DROPPED REPLY TO A REQUEST WE SENT is not benign, and this path
             // used to be indistinguishable from it: the DIP-24 rotated lane sent
             // getqrinfo, dashd answered, and the qrinfo landed here because the
@@ -2064,6 +2086,15 @@ private:
         p->liveness.start(now_sec());
         ensure_pool_timer();
 
+        // SPORK SYNC: ask THIS peer for its full spork set (dashd answers
+        // "getsporks" with every spork it holds, and relays new ones
+        // unsolicited from here on). Per-peer and idempotent — a duplicate
+        // spork is verified, found stale, and dropped by the state machine, so
+        // asking every handshaked peer costs one tiny message each and buys
+        // N-witness refinement of the assume-active seed.
+        auto msg_getsporks = message_getsporks::make_raw();
+        p->write(msg_getsporks);
+
         if (!m_primary)
         {
             // First peer to become answerable carries the request/response legs
@@ -2454,6 +2485,53 @@ private:
     }
 
     ADD_P2P_HANDLER(govsync)   { /* inbound sync request — we don't serve governance */ }
+
+    // ── SPORK listener (state + telemetry only; NO serve-gate consults this) ─
+
+    ADD_P2P_HANDLER(spork)
+    {
+        // A spork is operator policy, so it is only evidence once the 65-byte
+        // compact signature recovers to the chainparams spork key. Verification
+        // FIRST, state second: an unverifiable spork is counted + WARNed and
+        // never touches the map — the assume-active mainnet seed (7/7 active)
+        // stays authoritative, which is the posture that is RIGHT today even if
+        // this listener never hears a single valid message.
+        PeerSession* p = m_active;
+        const int32_t id = msg->m_spork_id;
+        const bool sig_ok = verify_spork_signature(
+            id, msg->m_value, msg->m_time_signed, msg->m_sig, m_spork_pubkey_id);
+        const SporkIngest outcome =
+            m_spork_state.on_spork(id, msg->m_value, msg->m_time_signed, sig_ok);
+        const std::string peer_key = p ? p->key : std::string("?");
+        switch (outcome)
+        {
+        case SporkIngest::Applied:
+            LOG_INFO << "[SPORK] " << spork_name(id) << " id=" << id
+                     << " value=" << msg->m_value
+                     << " signed=" << msg->m_time_signed
+                     << " from " << peer_key << " — applied (verified); active "
+                     << m_spork_state.active_count(now_sec()) << "/"
+                     << m_spork_state.known_count() << ", listener-refined "
+                     << m_spork_state.listener_refined_count();
+            break;
+        case SporkIngest::Stale:
+            LOG_DEBUG_COIND << "[SPORK] " << spork_name(id) << " id=" << id
+                            << " value=" << msg->m_value
+                            << " signed=" << msg->m_time_signed
+                            << " from " << peer_key
+                            << " — stale (not newer than held entry), kept ours";
+            break;
+        case SporkIngest::BadSignature:
+            LOG_WARNING << "[SPORK] REJECTED cause=bad-signature id=" << id
+                        << " (" << spork_name(id) << ") value=" << msg->m_value
+                        << " signed=" << msg->m_time_signed
+                        << " sig=" << msg->m_sig.size() << "B from " << peer_key
+                        << " — state untouched (assume-active seed stands)";
+            break;
+        }
+    }
+
+    ADD_P2P_HANDLER(getsporks) { /* we don't serve sporks */ }
 
     // ── tolerated / ignored peer traffic ─────────────────────────────────
 

@@ -45,12 +45,25 @@
 ///   (2) dashd's template can legitimately differ in TX SELECTION (separate
 ///       mempool), which perturbs fee-dependent amounts and the tx-set. Those are
 ///       NOT validity-bearing for the coinbase-commitment fields.
+///   (3) merkleRootMNList is TX-SET-DEPENDENT (the h=2516756 false-positive
+///       class): the consensus rule (dashcore CalcCbTxMerkleRootMNList) derives
+///       the committed root from the MN list AFTER folding in the block's OWN
+///       ProTx special txs (types 1-4: ProReg/ProUpServ/ProUpReg/ProUpRev).
+///       When the embedded arm serves coinbase-only and dashd's template carries
+///       a mempool ProTx (at 2516756: a ProUpServTx revive), the two templates
+///       are committing to DIFFERENT tx sets, so their roots legitimately
+///       diverge — each is correct FOR ITS OWN BLOCK. Comparing them as if they
+///       answered the same question is the false positive. The compare below
+///       therefore only treats a merkleRootMNList divergence as
+///       commitment-bearing when both templates fold the SAME ProTx set; a
+///       divergence under DIFFERENT ProTx folds is surfaced as the benign
+///       verdict MATCH-MODULO-MEMPOOL-PROTX with its own counter.
 /// The single high-value signal — the ONLY combination that would indicate a real
 /// validity problem — is: the embedded arm was SERVED (not refused) at height H
-/// AND a CONSENSUS-COMMITMENT field (coinbase payee, merkleRootMNList, or
-/// merkleRootQuorums) diverged from dashd. That combination is surfaced
-/// distinctly as `[SHADOW] h=H SERVED-MISMATCH ...` so it stands out from the
-/// benign mismatch noise.
+/// AND a CONSENSUS-COMMITMENT field (coinbase payee, merkleRootMNList under the
+/// SAME ProTx fold, or merkleRootQuorums) diverged from dashd. That combination
+/// is surfaced distinctly as `[SHADOW] h=H SERVED-MISMATCH ...` so it stands out
+/// from the benign mismatch noise.
 ///
 /// STRICTLY single-coin: src/impl/dash/coin/ only. Header-only so the pure
 /// evaluate()/diff logic is KAT-pinnable without a live node or a thread.
@@ -63,7 +76,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -84,16 +99,25 @@ namespace coin {
 /// One diverging field. `commitment` marks the consensus-commitment trio
 /// (payee / merkleRootMNList / merkleRootQuorums) whose divergence — when the
 /// embedded arm was SERVED — is the real-validity-problem signal.
+/// `modulo_mempool_protx` marks a merkleRootMNList divergence that is explained
+/// by the two templates folding DIFFERENT ProTx sets (semantic note (3)): the
+/// roots answer different questions, so the divergence is benign-by-derivation
+/// and is deliberately NOT commitment-bearing.
 struct ShadowFieldDiff {
     std::string field;
     std::string embedded;
     std::string dashd;
     bool        commitment{false};
+    bool        modulo_mempool_protx{false};
 };
 
-/// The verdict for one served height.
+/// The verdict for one served height. MatchModuloMempoolProTx is the benign
+/// verdict for "every divergence is the tx-set-dependent merkleRootMNList case"
+/// — distinct from Match (nothing diverged) and from Mismatch (something else
+/// did), each with its own counter, so the h=2516756 class stops masquerading
+/// as SERVED-MISMATCH without becoming invisible.
 struct ShadowOutcome {
-    enum class Kind { NoOracle, Match, Mismatch };
+    enum class Kind { NoOracle, Match, MatchModuloMempoolProTx, Mismatch };
     Kind                        kind{Kind::NoOracle};
     uint32_t                    height{0};
     bool                        served{false};   // source == WorkSource::Embedded
@@ -110,14 +134,26 @@ struct ShadowCounters {
     uint64_t shadow_match{0};
     uint64_t shadow_no_oracle{0};
     uint64_t shadow_served_mismatch{0};
+    // The h=2516756 benign class: merkleRootMNList diverged ONLY because the
+    // two templates fold different ProTx sets. Its own tally — benign must not
+    // hide in shadow_match, and must never inflate served-mismatch.
+    uint64_t shadow_match_modulo_mempool_protx{0};
     std::map<std::string, uint64_t> shadow_mismatch_by_field;   // field -> count
 
     void apply(const ShadowOutcome& o) {
         switch (o.kind) {
         case ShadowOutcome::Kind::NoOracle: shadow_no_oracle++; break;
         case ShadowOutcome::Kind::Match:    shadow_match++;     break;
+        case ShadowOutcome::Kind::MatchModuloMempoolProTx:
+            shadow_match_modulo_mempool_protx++;
+            break;
         case ShadowOutcome::Kind::Mismatch:
-            for (const auto& d : o.diffs) shadow_mismatch_by_field[d.field]++;
+            // A modulo diff riding along in a genuine Mismatch is still the
+            // benign class — count it under its own key, not as a mismatch.
+            for (const auto& d : o.diffs) {
+                if (d.modulo_mempool_protx) shadow_match_modulo_mempool_protx++;
+                else                        shadow_mismatch_by_field[d.field]++;
+            }
             if (o.served_mismatch) shadow_served_mismatch++;
             break;
         }
@@ -127,6 +163,7 @@ struct ShadowCounters {
         j["shadow-match"]           = shadow_match;
         j["shadow-no-oracle"]       = shadow_no_oracle;
         j["shadow-served-mismatch"] = shadow_served_mismatch;
+        j["shadow-match-modulo-mempool-protx"] = shadow_match_modulo_mempool_protx;
         nlohmann::json byf = nlohmann::json::object();
         for (const auto& kv : shadow_mismatch_by_field)
             byf["shadow-mismatch-" + kv.first] = kv.second;
@@ -134,6 +171,31 @@ struct ShadowCounters {
         return j;
     }
 };
+
+/// The ProTx FOLD of a template's tx set: a canonical (sorted) fingerprint of
+/// the MN-list-affecting special txs (types 1-4) the template commits to.
+/// merkleRootMNList is derived from the MN list AFTER these are applied
+/// (dashcore CalcCbTxMerkleRootMNList), so two templates' roots are only
+/// comparable when their folds are EQUAL — equal folds means the validator
+/// rule was run over the same inputs, and a divergence is then a real root
+/// bug. Identified by txid when the parallel m_tx_hashes vector is aligned;
+/// the type+index fallback (mis-populated WorkData) deliberately errs toward
+/// folds-DIFFER, i.e. toward the benign verdict, never toward a false
+/// SERVED-MISMATCH.
+inline std::vector<std::string> shadow_protx_fold(const DashWorkData& wd) {
+    std::vector<std::string> fold;
+    const bool hashes_aligned = (wd.m_tx_hashes.size() == wd.m_txs.size());
+    for (std::size_t i = 0; i < wd.m_txs.size(); ++i) {
+        const uint16_t t = wd.m_txs[i].type;
+        if (t < 1 || t > 4) continue;   // only ProTx types feed the MN-list fold
+        if (hashes_aligned)
+            fold.push_back(wd.m_tx_hashes[i].GetHex());
+        else
+            fold.push_back("type" + std::to_string(t) + "#" + std::to_string(i));
+    }
+    std::sort(fold.begin(), fold.end());
+    return fold;
+}
 
 /// First non-platform-burn payee ("!6a" is the DASH platform credit-pool
 /// OP_RETURN burn, not a real payee) — the masternode payee identity.
@@ -187,8 +249,34 @@ inline ShadowOutcome shadow_evaluate(WorkSource source,
     const bool eok = vendor::parse_cbtx(embedded.m_coinbase_payload, ecb);
     const bool dok = vendor::parse_cbtx(dashd.m_coinbase_payload, dcb);
     if (eok && dok) {
-        add("merkleRootMNList",  /*commitment=*/true,
-            ecb.merkleRootMNList.GetHex(),  dcb.merkleRootMNList.GetHex());
+        // merkleRootMNList is TX-SET-DEPENDENT (semantic note (3), the
+        // h=2516756 false-positive class): the validator derives it from the
+        // MN list AFTER folding the block's own ProTx txs, so the two roots
+        // only answer the SAME question when both templates fold the same
+        // ProTx set. Equal folds + diverging roots = real root bug
+        // (commitment-bearing, SERVED-MISMATCH eligible). Different folds
+        // (e.g. embedded coinbase-only vs dashd carrying a mempool
+        // ProUpServTx revive) = each root correct for its own block —
+        // benign, marked modulo_mempool_protx, never commitment-bearing.
+        // merkleRootMNList is TX-SET-DEPENDENT (semantic note (3), the
+        // h=2516756 false-positive class): the validator derives it from the
+        // MN list AFTER folding the block's own ProTx txs, so the two roots
+        // only answer the SAME question when both templates fold the same
+        // ProTx set. Equal folds + diverging roots = real root bug
+        // (commitment-bearing, SERVED-MISMATCH eligible). Different folds
+        // (e.g. embedded coinbase-only vs dashd carrying a mempool
+        // ProUpServTx revive) = each root correct for its own block —
+        // benign, marked modulo_mempool_protx, never commitment-bearing.
+        if (ecb.merkleRootMNList != dcb.merkleRootMNList) {
+            const bool same_protx_fold =
+                shadow_protx_fold(embedded) == shadow_protx_fold(dashd);
+            ShadowFieldDiff d{"merkleRootMNList",
+                              ecb.merkleRootMNList.GetHex(),
+                              dcb.merkleRootMNList.GetHex(),
+                              /*commitment=*/same_protx_fold,
+                              /*modulo_mempool_protx=*/!same_protx_fold};
+            o.diffs.push_back(std::move(d));
+        }
         add("merkleRootQuorums", /*commitment=*/true,
             ecb.merkleRootQuorums.GetHex(), dcb.merkleRootQuorums.GetHex());
         add("cbtx_version", /*commitment=*/false,
@@ -216,18 +304,41 @@ inline ShadowOutcome shadow_evaluate(WorkSource source,
         return o;
     }
 
+    // When EVERY divergence is the tx-set-dependent merkleRootMNList case the
+    // whole sample is the benign verdict, by its own name — the two templates
+    // agree on everything that answers the same question.
+    const bool all_modulo = std::all_of(
+        o.diffs.begin(), o.diffs.end(),
+        [](const ShadowFieldDiff& d) { return d.modulo_mempool_protx; });
+    if (all_modulo) {
+        o.kind = ShadowOutcome::Kind::MatchModuloMempoolProTx;
+        for (const auto& d : o.diffs)
+            o.log_lines.push_back(
+                std::string("[SHADOW] h=") + std::to_string(o.height)
+                + " MATCH-MODULO-MEMPOOL-PROTX field=" + d.field
+                + " embedded=" + d.embedded
+                + " dashd=" + d.dashd
+                + " (roots fold different ProTx sets — each correct for its own block)");
+        return o;
+    }
+
     o.kind = ShadowOutcome::Kind::Mismatch;
     for (const auto& d : o.diffs)
         if (d.commitment && o.served) o.served_mismatch = true;
 
     // One line per diverging field. The served + commitment combination is the
     // ONLY real-validity-problem signal, so it gets the distinct SERVED-MISMATCH
-    // marker; every other divergence is benign-until-proven and gets MISMATCH.
+    // marker; a tx-set-dependent root divergence riding along keeps its benign
+    // MATCH-MODULO marker; every other divergence is benign-until-proven and
+    // gets MISMATCH.
     for (const auto& d : o.diffs) {
         const bool served_bad = o.served && d.commitment;
+        const char* marker = d.modulo_mempool_protx ? " MATCH-MODULO-MEMPOOL-PROTX"
+                           : served_bad             ? " SERVED-MISMATCH"
+                                                    : " MISMATCH";
         o.log_lines.push_back(
             std::string("[SHADOW] h=") + std::to_string(o.height)
-            + (served_bad ? " SERVED-MISMATCH" : " MISMATCH")
+            + marker
             + " field=" + d.field
             + " embedded=" + d.embedded
             + " dashd=" + d.dashd);

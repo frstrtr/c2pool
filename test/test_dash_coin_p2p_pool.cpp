@@ -271,15 +271,15 @@ TEST(DashCoinP2PPool, unhandled_command_set_is_per_peer)
     rig.handshake(1);
     rig.handshake(2);
 
-    rig.deliver(1, std::make_unique<RawMessage>("spork", PackStream{}));
-    rig.deliver(1, std::make_unique<RawMessage>("spork", PackStream{}));
+    rig.deliver(1, std::make_unique<RawMessage>("senddsq", PackStream{}));
+    rig.deliver(1, std::make_unique<RawMessage>("senddsq", PackStream{}));
     ASSERT_NE(rig.session(1), nullptr);
     EXPECT_EQ(rig.session(1)->unhandled_seen.size(), 1u);
     ASSERT_NE(rig.session(2), nullptr);
     EXPECT_EQ(rig.session(2)->unhandled_seen.size(), 0u)
         << "peer 1's unhandled-command set leaked into peer 2";
 
-    rig.deliver(2, std::make_unique<RawMessage>("spork", PackStream{}));
+    rig.deliver(2, std::make_unique<RawMessage>("senddsq", PackStream{}));
     EXPECT_EQ(rig.session(2)->unhandled_seen.size(), 1u);
     // Both sessions survive unknown traffic.
     EXPECT_EQ(rig.client.connected_peer_count(), 2u);
@@ -372,7 +372,7 @@ TEST(DashCoinP2PPool, inbound_traffic_to_one_peer_does_not_refresh_another)
 
     // Hammer peer 1 with inbound traffic.
     for (int i = 0; i < 5; ++i)
-        rig.deliver(1, std::make_unique<RawMessage>("spork", PackStream{}));
+        rig.deliver(1, std::make_unique<RawMessage>("senddsq", PackStream{}));
 
     EXPECT_EQ(p2->liveness.last_recv(), p2_before)
         << "peer 1's inbound traffic refreshed peer 2's liveness deadline";
