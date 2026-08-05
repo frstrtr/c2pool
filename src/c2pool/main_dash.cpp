@@ -4821,9 +4821,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                       << (g_replay_bulk_capture_dir.empty()
                               ? ""
                               : " capture=" + g_replay_bulk_capture_dir)
-                      << " consumer=" << (g_replay_bulk_capture_dir.empty()
-                                              ? "counting-stub(W1 seam)"
-                                              : "capture+counting-stub")
+                      << " consumer="
+                      << (replay_fold_consumer
+                              ? (g_replay_bulk_capture_dir.empty()
+                                     ? "W1-DML-FOLD(root-checked)"
+                                     : "capture+W1-DML-FOLD(root-checked)")
+                              : (g_replay_bulk_capture_dir.empty()
+                                     ? "counting-stub(W1 seam)"
+                                     : "capture+counting-stub"))
                       << " (OBSERVE-only; tip lane strictly prioritized)\n";
         }
     }
