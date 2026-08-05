@@ -708,8 +708,15 @@ if (BUILD_TESTING AND GTest_FOUND)
     # build.yml --target list and would silently report "Not Run" (#143
     # NOT_BUILT trap). Needs dash_x11 for the block-identity hash — already in
     # this target's link set.
+    # Third TU (W5, dash/replay): test_dash_replay_run.cpp — the Phase-1
+    # replay PROVING harness. Data-driven and SKIPPED unless
+    # C2POOL_REPLAY_PRESTATE + C2POOL_REPLAY_CORPUS are set, so it is inert in
+    # CI; pointed at an anchor prestate and a contiguous block corpus it folds
+    # the range and asserts the committed-cbTx-root equality at every block.
+    # Folded into this SAME allowlisted target for the #143 NOT_BUILT reason.
     add_executable(test_dash_mn_state test_dash_mn_state.cpp
-                   test_dash_replay_fold.cpp)
+                   test_dash_replay_fold.cpp
+                   test_dash_replay_run.cpp)
     target_link_libraries(test_dash_mn_state PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

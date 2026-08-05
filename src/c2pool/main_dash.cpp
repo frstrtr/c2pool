@@ -92,6 +92,8 @@
 #include <impl/dash/coin/mn_checkpoint_lane.hpp> // E2d: checkpoint -> forward-replay bridge -> leg-4 publish
 #include <impl/dash/coin/replay_bulk_fetch.hpp>  // W2: full-history replay bulk block-fetch lane (--replay-bulk)
 #include <impl/dash/coin/replay_utxo_fold.hpp>   // W3: full-history replay standalone UTXO fold (--replay-utxo-*)
+#include <impl/dash/coin/replay_prestate.hpp>    // W5: anchor prestate loader (--replay-fold-prestate)
+#include <impl/dash/coin/replay_fold_consumer.hpp> // W5: bulk lane -> W1 DML fold + per-block root check
 #include <impl/dash/node.hpp>          // dash::Node — sharechain pool-node (NodeBridge<NodeImpl,Legacy,Actual>)
 #include <impl/dash/config.hpp>        // dash::Config (PoolConfig/CoinConfig)
 #include <impl/dash/config_pool.hpp>   // dash::SharechainConfig — P2P_PORT / PREFIX / min-proto SSOT
@@ -233,6 +235,16 @@ uint32_t g_mn_bridge_max_blocks =
 bool        g_replay_bulk = false;            // --replay-bulk: arm the lane
 std::string g_replay_bulk_capture_dir;        // --replay-bulk-capture DIR (implies --replay-bulk)
 uint32_t    g_replay_bulk_start = 0;          // --replay-bulk-start H (0 = network default: mainnet DIP3 1028160)
+
+// -- W5 INTEGRATION: drive the W1 DML fold from the W2 bulk lane -----------
+// --replay-fold-prestate FILE seeds the W1 fold engine from a full-state
+// anchor prestate (tools/dash/gen_replay_kat.py prestate) and installs the
+// FoldReplayConsumer, so every bulk-delivered body is folded and its computed
+// merkleRootMNList compared byte-exact against that block's own committed cbTx
+// root. Implies --replay-bulk, and pins the lane's start to anchor+1 (the fold
+// is forward-contiguous -- a gap refuses the whole fold).
+std::string g_replay_fold_prestate;           // --replay-fold-prestate FILE
+bool        g_replay_fold_quorums = false;    // --replay-fold-quorums (W4 members)
 
 // Report the requested sharechain peering topology at run-loop bring-up. Honest
 // about the deferred live bind: a won/seen share does NOT yet cross the wire
@@ -2651,6 +2663,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     std::unique_ptr<dash::coin::replay::ReplayCursorStore>     replay_cursor;
     std::unique_ptr<dash::coin::replay::BulkFetchLane>         replay_lane;
     std::unique_ptr<core::Timer>                               replay_timer;
+    // W5 integration: the fold engine the lane drives, and its consumer.
+    std::unique_ptr<dash::coin::replay::DmlFoldEngine>         replay_fold_engine;
+    std::unique_ptr<dash::coin::replay::FoldReplayConsumer>    replay_fold_consumer;
     if (coin_p2p) {
         const auto dash_params = testnet
             ? dash::coin::make_dash_chain_params_testnet()
@@ -4669,9 +4684,52 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             }
             replay_counter = std::make_unique<rp::CountingReplayConsumer>();
             rp::IReplayBlockConsumer* replay_consumer = replay_counter.get();
+
+            // ── W5: seed the DML fold and let the lane DRIVE it ───────────
+            // Without a prestate the lane keeps W2's counting stub (pure
+            // OBSERVE). With one, every delivered body is folded and its
+            // computed merkleRootMNList checked byte-exact against that
+            // block's own committed cbTx root — the per-block proof.
+            uint32_t replay_fold_anchor = 0;
+            if (!g_replay_fold_prestate.empty()) {
+                auto ps = rp::load_prestate_file(g_replay_fold_prestate);
+                if (!ps.ok) {
+                    std::cerr << "[run] FATAL: --replay-fold-prestate "
+                              << g_replay_fold_prestate << ": " << ps.error
+                              << "\n";
+                    return 1;
+                }
+                dash::coin::replay::FoldConfig fcfg;
+                fcfg.enabled = true;   // W1 feature flag, explicit opt-in
+                replay_fold_engine =
+                    std::make_unique<rp::DmlFoldEngine>(fcfg);
+                const std::string serr =
+                    rp::seed_engine_from_prestate(*replay_fold_engine, ps);
+                if (!serr.empty()) {
+                    std::cerr << "[run] FATAL: " << serr << "\n";
+                    return 1;
+                }
+                replay_fold_anchor = ps.height;
+                replay_fold_consumer =
+                    std::make_unique<rp::FoldReplayConsumer>(
+                        *replay_fold_engine);
+                replay_consumer = replay_fold_consumer.get();
+                std::cout << "[run] W5 REPLAY FOLD ARMED: anchor h="
+                          << ps.height << " mns=" << replay_fold_engine->size()
+                          << " root="
+                          << replay_fold_engine->compute_sml_root().GetHex()
+                          << " (reproduces the anchor block's committed cbTx"
+                             " merkleRootMNList)\n";
+                if (g_replay_fold_quorums)
+                    std::cout << "[run] --replay-fold-quorums: W4 membership"
+                                 " derivation is NOT yet wired to the fold's"
+                                 " MembersFn; commitments that mark members"
+                                 " invalid will fail closed until it is.\n";
+            }
+
             if (!g_replay_bulk_capture_dir.empty()) {
                 replay_capture = std::make_unique<rp::CaptureReplayConsumer>(
-                    g_replay_bulk_capture_dir, replay_counter.get());
+                    g_replay_bulk_capture_dir, replay_consumer);
                 replay_consumer = replay_capture.get();
             }
             replay_cursor = std::make_unique<rp::ReplayCursorStore>(
@@ -4719,9 +4777,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             };
 
             rp::BulkFetchLane::Config rcfg;
-            rcfg.start_height = g_replay_bulk_start != 0
-                ? g_replay_bulk_start
-                : (testnet ? 1 : rp::MAINNET_DIP3_HEIGHT);
+            // A seeded fold pins the lane to anchor+1: the fold is
+            // forward-contiguous, so a gap or an out-of-order delivery
+            // refuses the WHOLE fold rather than silently skipping state.
+            rcfg.start_height = replay_fold_anchor != 0
+                ? replay_fold_anchor + 1
+                : (g_replay_bulk_start != 0
+                       ? g_replay_bulk_start
+                       : (testnet ? 1 : rp::MAINNET_DIP3_HEIGHT));
             replay_lane = std::make_unique<rp::BulkFetchLane>(
                 std::move(seams), rcfg, replay_backfill.get(),
                 replay_consumer, replay_cursor.get());
@@ -5592,6 +5655,13 @@ int main(int argc, char** argv)
         else if (std::strcmp(argv[i], "--replay-bulk-start") == 0 && i + 1 < argc)
             g_replay_bulk_start = static_cast<uint32_t>(
                 std::strtoul(argv[++i], nullptr, 10));
+        // W5: anchor-seeded DML fold driven by the bulk lane.
+        else if (std::strcmp(argv[i], "--replay-fold-prestate") == 0 && i + 1 < argc) {
+            g_replay_fold_prestate = argv[++i];
+            g_replay_bulk = true;   // the fold has nothing to fold without it
+        }
+        else if (std::strcmp(argv[i], "--replay-fold-quorums") == 0)
+            g_replay_fold_quorums = true;
         else if (std::strcmp(argv[i], "--oracle-graduation-blocks") == 0 && i + 1 < argc)
             oracle_grad_blocks = std::strtoull(argv[++i], nullptr, 10);
         else if (std::strcmp(argv[i], "--oracle-class-coverage") == 0 && i + 1 < argc)
