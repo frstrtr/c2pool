@@ -368,12 +368,46 @@ public:
         if (m_have_mn && m_have_mn_sml) {
             const uint32_t vh = m_sml_current_height ? m_sml_current_height
                                                      : as_of_height;
-            const auto vr = m_state.mnstates().sync_validity_from_sml(
-                m_state.sml(), vh);
-            if (vr.flipped_to_invalid || vr.flipped_to_valid)
-                LOG_INFO << "[SML->PAYEE] seed reconcile: -"
-                         << vr.flipped_to_invalid << " banned +"
-                         << vr.flipped_to_valid << " revived @ h=" << vh;
+            // ── FRESHNESS GATE (contabo, 2026-08-05, h=2516956) ───────────
+            // An SML OLDER than the snapshot cannot speak to the snapshot's
+            // height. The snapshot already reflects every ban and revive up
+            // to as_of_height; an older attestation can only undo them.
+            //
+            // MEASURED. A replay-fold snapshot as-of h=2516955 — byte-exact
+            // with dashd's list at that height, independently re-derived —
+            // was reconciled 13 ms after publication against an SML dated
+            // h=2478000, ~39,000 blocks stale:
+            //     [SML->PAYEE] seed reconcile: -6 banned +21 revived @ h=2478000
+            // Twenty-one masternodes the chain had banned were revived in the
+            // payee queue, one of them went to the front, and the very next
+            // block disagreed:
+            //     [MNS-SM] PAYEE DESYNC h=2516956: coinbase does not pay
+            //              projected MN 8ef71d8296c6e516
+            // (dashd's own list at 2516955 carries that masternode with
+            // PoSeBanHeight=2485482 — banned. So did ours. The reconcile
+            // un-banned it.)
+            //
+            // This was always wrong; it only became REACHABLE when a lane
+            // started publishing snapshots newer than the SML sync had got
+            // to. Fail closed and say so: the queue keeps the snapshot's own
+            // authoritative isValid, and the next mnlistdiff reconciles it
+            // for real once the SML has caught up.
+            if (as_of_height != 0 && vh < as_of_height) {
+                LOG_WARNING
+                    << "[SML->PAYEE] seed reconcile REFUSED: the SML is at h="
+                    << vh << " but the snapshot is as-of h=" << as_of_height
+                    << " (" << (as_of_height - vh) << " blocks STALE) — an"
+                       " older attestation cannot adjudicate a newer"
+                       " authoritative list; the snapshot's own isValid"
+                       " stands until the SML catches up";
+            } else {
+                const auto vr = m_state.mnstates().sync_validity_from_sml(
+                    m_state.sml(), vh);
+                if (vr.flipped_to_invalid || vr.flipped_to_valid)
+                    LOG_INFO << "[SML->PAYEE] seed reconcile: -"
+                             << vr.flipped_to_invalid << " banned +"
+                             << vr.flipped_to_valid << " revived @ h=" << vh;
+            }
         }
         // BODY-FIRST: an authoritative snapshot loaded as-of the pending tip
         // completes the payee axis — the last promotion precondition when the
