@@ -277,22 +277,24 @@ jobs:
     name: Linux x86_64 (AsAN+UBSan)
     # dash bring-up slices may opt out of sanitizers via dash-skip-sanitizers; KEEP for consensus/payout slices (default = on)
     if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-skip-sanitizers')) }}
-    # STAYS on c2pool-build — MEASURED, do not "optimize" this onto c2pool-heavy.
-    # Unlike every other heavy leg, this job builds with `conan profile detect
-    # --force`, i.e. the HOST DEFAULT compiler, not ci/conan/linux-gcc13.profile.
-    # The c2pool-heavy host is Ubuntu 26.04 (gcc-15), and c2pool fails to LINK
-    # there under that toolchain:
+    # STAYS on c2pool-build — this is FLOCK SEPARATION; do not "optimize" it
+    # onto c2pool-heavy. This job and CodeQL analyze are the ONLY two holders of
+    # the per-host reap-guard flock (#1105), and CodeQL runs on c2pool-heavy, so
+    # this one must stay here. Two holders on one host serialize: moving both
+    # merely RELOCATES the contention (measured — one holder held the lock while
+    # the second sat blocked in `flock -x -w 3600`).
+    #
+    # Historical, NO LONGER a constraint: this is also the only heavy leg built
+    # with `conan profile detect --force` (the HOST DEFAULT compiler) rather
+    # than ci/conan/linux-gcc13.profile. While the heavy host defaulted to
+    # gcc-15 it could not link c2pool at all:
     #     undefined reference to `std::ostream::_Disable_exceptions::...'
     #     (/usr/include/c++/15/bits/ostream.h) -> collect2: ld returned 1
-    # It is not a code fault and not a broken sanitizer: the same tree links
-    # fine under gcc-13, and a minimal -fsanitize=address,undefined program
-    # links fine under gcc-15 on that host. It is a libstdc++/dependency ABI
-    # mismatch specific to the conan dep set built under gcc-15.
-    # Flock separation is preserved by moving CodeQL (the OTHER and only other
-    # lock holder) to c2pool-heavy instead — see codeql-analysis.yml. That keeps
-    # the two holders on disjoint hosts AND keeps every leg on a proven
-    # toolchain. Revisit only if the heavy host gains a gcc-13 default or the
-    # ASan leg is pinned to the committed gcc13 profile.
+    # — a libstdc++/dependency ABI mismatch in the gcc-15-built conan dep set,
+    # not a code fault (a minimal -fsanitize=address,undefined program linked
+    # fine there). The heavy host has since been switched to a gcc-13 default
+    # and re-verified from a PURGED conan cache: that build now links clean.
+    # So the toolchain objection is gone; only flock separation keeps this here.
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     continue-on-error: true
     steps:
