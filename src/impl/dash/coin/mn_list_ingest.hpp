@@ -58,7 +58,9 @@ wire_mn_list_ingest(::dash::interfaces::Node& node,
         {
             // as_of_height rides along (E2c): the maintainer uses it to fence
             // off re-application of blocks the snapshot already reflects.
-            maint.on_mn_list_update(u.mnstates, u.as_of_height);
+            // source rides along so the populate log line NAMES the lane that
+            // won (dashd-seed / mn-ckpt / replay-fold).
+            maint.on_mn_list_update(u.mnstates, u.as_of_height, u.source);
         });
 }
 

@@ -721,10 +721,17 @@ if (BUILD_TESTING AND GTest_FOUND)
     # through the derived member sets.
     # Both folded into this SAME allowlisted target for the #143 NOT_BUILT
     # reason.
+    # Fifth TU (THE SERVE SEAM): test_dash_replay_payee_publish.cpp — the
+    # fold's root-checked masternode list feeding the PAYEE queue that gates
+    # serving (coin/replay_payee_publish.hpp): the proven-current publish, the
+    # ReplayMNState->MNState dialect change, and the fail-closed guard — a
+    # diverged, poisoned, unchecked or behind-the-tip fold must NOT publish.
+    # Same allowlisted target, same #143 NOT_BUILT reason.
     add_executable(test_dash_mn_state test_dash_mn_state.cpp
                    test_dash_replay_fold.cpp
                    test_dash_replay_run.cpp
-                   test_dash_replay_quorum_seam.cpp)
+                   test_dash_replay_quorum_seam.cpp
+                   test_dash_replay_payee_publish.cpp)
     target_link_libraries(test_dash_mn_state PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

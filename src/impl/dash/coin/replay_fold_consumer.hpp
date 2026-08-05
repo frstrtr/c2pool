@@ -67,6 +67,14 @@ struct FoldConsumerStats
     uint32_t first_height{0};       // first height actually folded
     uint32_t last_height{0};        // highest height folded
 
+    // The merkleRootMNList of the LAST block whose self-check passed — the
+    // root the folded list hashed to at `last_height`, as committed by that
+    // block's own cbTx. Retained so a downstream consumer of the folded list
+    // can RE-DERIVE the root from the state it is about to use and compare it
+    // against the chain's answer key, rather than trusting the counters above.
+    // Null until the first match.
+    uint256 last_matched_root;
+
     // Aggregated transition counters (diagnostics, not consensus).
     uint64_t registered{0};
     uint64_t updated{0};
@@ -199,7 +207,10 @@ public:
         if (m_stats.blocks_folded == 0) m_stats.first_height = height;
         ++m_stats.blocks_folded;
         ++m_stats.roots_matched;
-        m_stats.last_height = height;
+        m_stats.last_height       = height;
+        // Recorded from the OBSERVED equality above, so it is the block's own
+        // committed root and our own computed root at once.
+        m_stats.last_matched_root = r.committed_root;
         m_stats.registered       += r.registered;
         m_stats.updated          += r.updated;
         m_stats.revoked          += r.revoked;

@@ -320,8 +320,22 @@ public:
     /// payoutAddress (live-observed: E2b's 288-block UTXO bootstrap replay
     /// scrambled the seeded queue and the embedded template projected the
     /// wrong payee).
+    ///
+    /// `source` NAMES the lane that produced this snapshot — "dashd-seed"
+    /// (E2c protx-list RPC), "mn-ckpt" (E2d compiled-in anchor replayed
+    /// forward) or "replay-fold" (the root-checked full-history DML fold).
+    /// Logged verbatim, because the three are NOT interchangeable and a bare
+    /// "populated" cannot tell an RPC-seeded payee queue from a daemonlessly
+    /// derived one — the ambiguity that let a LAN run be read as proof of a
+    /// daemonless serve when its payee half had come from dashd.
     void on_mn_list_update(std::vector<std::pair<uint256, MNState>> mnstates,
-                           uint32_t as_of_height = 0) {
+                           uint32_t as_of_height = 0,
+                           const std::string& source = std::string()) {
+        m_mn_source = source.empty() ? std::string("unnamed") : source;
+        LOG_INFO << "[PAYEE-QUEUE] snapshot source=" << m_mn_source
+                 << " as_of_h=" << as_of_height
+                 << " mns=" << mnstates.size()
+                 << (mnstates.empty() ? " (EMPTY -> set-gap, demoting)" : "");
         // With the anti-mint latch on, a snapshot with NO height cannot arm
         // MN-readiness either: an unheighted set leaves the apply cursor at 0,
         // which disables apply_block's contiguity guard — the exact condition
@@ -1275,6 +1289,11 @@ public:
     /// being adjudicated. See MnCheckpointLane::maybe_fold_sml().
     uint32_t sml_current_height() const { return m_sml_current_height; }
 
+    /// The lane that last populated the payee queue — "dashd-seed",
+    /// "mn-ckpt", "replay-fold", "unnamed", or empty when nothing has ever
+    /// populated it. Diagnostic; the serve gate does not branch on it.
+    const std::string& mn_source() const { return m_mn_source; }
+
     /// Whether m_sml_current_height actually describes the SML currently held.
     /// FALSE after a diff advanced the list without a parseable type-5 cbTx to
     /// advance the height with it (F2). A consumer that pairs the two — the
@@ -1750,6 +1769,11 @@ private:
     bool m_have_mn{false};
     bool m_have_tip{false};
     bool m_have_mn_sml{false};   // a non-empty SML has been applied (CCbTx source)
+    // Which lane last populated the payee queue ("dashd-seed" / "mn-ckpt" /
+    // "replay-fold" / "unnamed"). Diagnostic only — nothing branches on it —
+    // but it is the difference between "this node serves" and "this node
+    // serves WITHOUT a daemon", which no other field records.
+    std::string m_mn_source;
     // E2d anti-mint latch — see set_require_seeded_mn_set(). Default FALSE so
     // every existing construction site (the KATs, the dashd-RPC posture) keeps
     // byte-identical behaviour; main_dash opts the embedded arm in.
