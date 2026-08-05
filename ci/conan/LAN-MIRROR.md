@@ -19,6 +19,11 @@ compiling job. Measured on the `c2pool-heavy` host from an empty `CONAN_HOME`,
 | host-default `conan profile detect` (ASan / BCH / DGB) | 1554 s | **2.2 s** |
 | fully offline (binary remote down, seed archive only) | — | **17.9 s** idle host / **77 s** under full CI load |
 
+The "after" column is an idle host. Re-measured on the same host while it was
+running four concurrent CI jobs the same two resolves cost 8.4 s and 5.6 s —
+still three orders of magnitude off the cold bootstrap, but quote the range,
+not the best case.
+
 The 1554 s row is the one that matters: conancenter ships prebuilt binaries for
 gcc-13 but **not** for gcc-15, so on a gcc-15 host conan fell back to fetching
 170.7 MB of `boost_1_90_0.tar.bz2` over the WAN (~90% of the wall time) and
