@@ -90,6 +90,7 @@
 #include <impl/dash/coin/mn_seed.hpp>            // E2c: RPC protx-list MN-set seed (parse_protx_list_seed)
 #include <impl/dash/coin/mn_checkpoint.hpp>      // E2d: pinned MN-set checkpoint format + fail-closed parser
 #include <impl/dash/coin/mn_checkpoint_lane.hpp> // E2d: checkpoint -> forward-replay bridge -> leg-4 publish
+#include <impl/dash/coin/replay_bulk_fetch.hpp>  // W2: full-history replay bulk block-fetch lane (--replay-bulk)
 #include <impl/dash/node.hpp>          // dash::Node — sharechain pool-node (NodeBridge<NodeImpl,Legacy,Actual>)
 #include <impl/dash/config.hpp>        // dash::Config (PoolConfig/CoinConfig)
 #include <impl/dash/config_pool.hpp>   // dash::SharechainConfig — P2P_PORT / PREFIX / min-proto SSOT
@@ -222,6 +223,15 @@ const char* const kDashMnCheckpointTestnet =
 uint32_t g_mn_bridge_max_blocks =
     dash::coin::MnCheckpointLane::kDefaultMaxBridgeBlocks;
 
+// ── W2 FULL-HISTORY REPLAY bulk-fetch flags (replay_bulk_fetch.hpp) ─────────
+// Same file-scope posture (and the same rationale) as g_mn_bridge_max_blocks:
+// written once during argument parsing, read once at wiring. All default OFF —
+// absent, no replay object is constructed, no CoinClient filter is registered,
+// and the serve path is byte-identical to the released posture.
+bool        g_replay_bulk = false;            // --replay-bulk: arm the lane
+std::string g_replay_bulk_capture_dir;        // --replay-bulk-capture DIR (implies --replay-bulk)
+uint32_t    g_replay_bulk_start = 0;          // --replay-bulk-start H (0 = network default: mainnet DIP3 1028160)
+
 // Report the requested sharechain peering topology at run-loop bring-up. Honest
 // about the deferred live bind: a won/seen share does NOT yet cross the wire
 // until the sharechain pool-node leaf lands.
@@ -266,6 +276,7 @@ void print_banner(const char* argv0)
         << "           [--bestcl-policy freshness|consensus-exact]\n"
         << "           [--embedded-oracle-shadow]\n"
         << "           [--embedded-shadow-compare]\n"
+        << "           [--replay-bulk] [--replay-bulk-capture DIR] [--replay-bulk-start H]\n"
         << "           [--oracle-graduation-blocks N] [--oracle-class-coverage K]\n"
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
         << "           [--redistribute pplns|fee|boost|donate]\n"
@@ -357,6 +368,18 @@ void print_banner(const char* argv0)
         << "        are bound to the REAL DASH tracker; local hashrate comes from the\n"
         << "        DASH stratum acceptor. If stratum and web ports collide the web\n"
         << "        port moves to stratum+1.\n"
+        << "        --replay-bulk (needs --coin-p2p-connect/--coin-p2p-discover) arms\n"
+        << "        the FULL-HISTORY REPLAY bulk block-fetch lane (W2): full-genesis\n"
+        << "        header backfill join-checked against the fast-start anchor, then\n"
+        << "        pipelined multi-peer body fetch from DIP3 (h=1028160) forward,\n"
+        << "        merkle-verified, handed IN ORDER to the replay consumer and\n"
+        << "        PRUNED (bodies never persisted). Strictly lower priority than\n"
+        << "        the tip lane; resumable (high-water cursor); [BULK] telemetry.\n"
+        << "        OBSERVE-only in W2 (counting consumer stands in for the W1 fold);\n"
+        << "        NEVER changes serving. --replay-bulk-capture DIR additionally\n"
+        << "        caches raw bodies into append-only segment files (fleet re-fold\n"
+        << "        cache; implies --replay-bulk). --replay-bulk-start H overrides\n"
+        << "        the first fetched height (default: mainnet DIP3 1028160).\n"
         << "        --external-ip ADDR (alias --stratum-advertise / --public-host)\n"
         << "        overrides the miner-facing host shown in the dashboard Stratum\n"
         << "        URL -- for NAT / port-mapped nodes whose outbound IP is not the\n"
@@ -2609,6 +2632,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // subscriptions -> lane -> maintainer -> header_chain.
     std::unique_ptr<dash::coin::MnCheckpointLane> mn_ckpt_lane;
     std::vector<std::shared_ptr<EventDisposable>> coin_feed_subs;
+    // ── W2 replay bulk-fetch locals (--replay-bulk; replay_bulk_fetch.hpp) ──
+    // Declared AFTER header_chain (they read it) so they unwind FIRST at
+    // return; the timer is last so its callbacks stop before the lane dies.
+    // All null unless the flag armed them — zero construction otherwise.
+    std::unique_ptr<dash::coin::replay::HeaderBackfill>        replay_backfill;
+    std::unique_ptr<dash::coin::replay::CountingReplayConsumer> replay_counter;
+    std::unique_ptr<dash::coin::replay::CaptureReplayConsumer> replay_capture;
+    std::unique_ptr<dash::coin::replay::ReplayCursorStore>     replay_cursor;
+    std::unique_ptr<dash::coin::replay::BulkFetchLane>         replay_lane;
+    std::unique_ptr<core::Timer>                               replay_timer;
     if (coin_p2p) {
         const auto dash_params = testnet
             ? dash::coin::make_dash_chain_params_testnet()
@@ -4602,6 +4635,131 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // the anchor from a previous run's persisted header DB.
             mn_ckpt_lane->pump();
         }
+
+        // ── W2: FULL-HISTORY REPLAY bulk block-fetch lane (--replay-bulk) ──
+        // OBSERVE-only transport slice: fetches DIP3→tip bodies across the
+        // peer pool, verifies, hands them IN ORDER to the (W2 counting stub)
+        // consumer and PRUNES them. Registers the two CoinClient demux
+        // filters + the notfound seam; nothing here touches serving, gating
+        // or the tip lane's request paths (priority invariants are in
+        // replay_bulk_fetch.hpp's header comment).
+        if (g_replay_bulk) {
+            namespace rp = dash::coin::replay;
+            const auto& rparams = header_chain->params();
+            if (rparams.fast_start_checkpoint.has_value()) {
+                // Extend the fast-start anchor to GENESIS: the backfill walks
+                // genesis→anchor and must JOIN the anchor hash exactly
+                // (fail-closed otherwise). Without a fast-start (testnet) the
+                // main header chain already syncs from genesis — no backfill.
+                const auto& cpk = rparams.fast_start_checkpoint.value();
+                replay_backfill = std::make_unique<rp::HeaderBackfill>(
+                    rparams.genesis_hash, cpk.height, cpk.hash,
+                    rparams.pow_limit,
+                    (core::filesystem::config_path() / net_subdir
+                        / "dash_replay_headers").string());
+            }
+            replay_counter = std::make_unique<rp::CountingReplayConsumer>();
+            rp::IReplayBlockConsumer* replay_consumer = replay_counter.get();
+            if (!g_replay_bulk_capture_dir.empty()) {
+                replay_capture = std::make_unique<rp::CaptureReplayConsumer>(
+                    g_replay_bulk_capture_dir, replay_counter.get());
+                replay_consumer = replay_capture.get();
+            }
+            replay_cursor = std::make_unique<rp::ReplayCursorStore>(
+                (core::filesystem::config_path() / net_subdir
+                    / "dash_replay_cursor").string());
+
+            rp::BulkFetchLane::Seams seams;
+            // Height→hash: pre-anchor from the (join-checked) backfill,
+            // anchor→tip from the main header chain.
+            seams.hash_at = [bf = replay_backfill.get(),
+                             hc = header_chain.get()]
+                (uint32_t h) -> std::optional<uint256> {
+                if (bf) { auto x = bf->hash_at(h); if (x) return x; }
+                auto e = hc->get_header_by_height(h);
+                if (!e) return std::nullopt;
+                return e->hash;
+            };
+            seams.chain_height = [hc = header_chain.get()] {
+                return hc->height();
+            };
+            // Priority invariant 1: the PRIMARY carries every stateful
+            // request/response leg — bulk loads it only when it is the sole
+            // handshaked peer.
+            seams.eligible_peers = [cp = coin_p2p.get()] {
+                auto keys = cp->handshaked_peer_keys();
+                const auto prim = cp->primary_peer_key();
+                if (keys.size() > 1 && !prim.empty())
+                    keys.erase(std::remove(keys.begin(), keys.end(), prim),
+                               keys.end());
+                return keys;
+            };
+            seams.send_getdata = [cp = coin_p2p.get()](
+                const std::string& peer, const std::vector<uint256>& hashes) {
+                cp->request_blocks_from(peer, hashes);
+            };
+            seams.send_getheaders = [cp = coin_p2p.get()](
+                const std::string& peer, const uint256& locator_hash,
+                const uint256& stop) {
+                cp->send_getheaders_to(peer, 70230, {locator_hash}, stop);
+            };
+            // Priority invariant 2: no new bulk getdata while a tracked tip
+            // body is outstanding.
+            seams.tip_busy = [cp = coin_p2p.get()] {
+                return cp->pending_body_count() > 0;
+            };
+
+            rp::BulkFetchLane::Config rcfg;
+            rcfg.start_height = g_replay_bulk_start != 0
+                ? g_replay_bulk_start
+                : (testnet ? 1 : rp::MAINNET_DIP3_HEIGHT);
+            replay_lane = std::make_unique<rp::BulkFetchLane>(
+                std::move(seams), rcfg, replay_backfill.get(),
+                replay_consumer, replay_cursor.get());
+
+            coin_p2p->set_headers_filter(
+                [ln = replay_lane.get()](const std::string& key,
+                                         const std::vector<dash::coin::BlockType>& b) {
+                    return ln->on_headers(key, b);
+                });
+            coin_p2p->set_block_body_filter(
+                [ln = replay_lane.get()](const uint256& h,
+                                         const dash::coin::BlockType& blk) {
+                    return ln->on_block_body(h, blk);
+                });
+            coin_p2p->set_on_block_notfound(
+                [ln = replay_lane.get()](const uint256& h) {
+                    ln->on_notfound(h);
+                });
+
+            replay_timer = std::make_unique<core::Timer>(&ioc, /*repeat=*/true);
+            replay_timer->start(1, [ln = replay_lane.get()] {
+                ln->tick(std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                        .count());
+            });
+
+            std::cout << "[run] W2 REPLAY BULK lane ARMED: start_h="
+                      << rcfg.start_height
+                      << (replay_backfill
+                              ? " backfill=genesis->"
+                                + std::to_string(replay_backfill->anchor_height())
+                                + (replay_backfill->complete() ? " (joined)" : "")
+                              : " backfill=none")
+                      << (g_replay_bulk_capture_dir.empty()
+                              ? ""
+                              : " capture=" + g_replay_bulk_capture_dir)
+                      << " consumer=" << (g_replay_bulk_capture_dir.empty()
+                                              ? "counting-stub(W1 seam)"
+                                              : "capture+counting-stub")
+                      << " (OBSERVE-only; tip lane strictly prioritized)\n";
+        }
+    }
+    if (g_replay_bulk && !coin_p2p) {
+        // Name the unmet dependency instead of silently not arming.
+        std::cout << "[run] --replay-bulk given but no coin-P2P client "
+                     "(needs --coin-p2p-connect/--coin-p2p-discover) — "
+                     "replay bulk lane NOT armed\n";
     }
 
     // ── Fallback-arm event-driven tip refresh ────────────────────────────
@@ -5052,6 +5210,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         }
     }
 
+    // W2 replay lane: force-persist the delivered high-water cursor so a
+    // clean shutdown resumes exactly where it stopped (a crash costs at most
+    // cursor_persist_every blocks of re-fetch). Timer callbacks no longer
+    // fire — ioc.run() has returned.
+    if (replay_timer) replay_timer->stop();
+    if (replay_lane) replay_lane->flush();
+
     // Save stats on shutdown (main_ltc.cpp:7457 parity): flush the final
     // stat_log so the last window survives the restart. mi still valid here —
     // run() has returned but web_server/mining-interface teardown is below.
@@ -5394,6 +5559,16 @@ int main(int argc, char** argv)
             embedded_oracle_shadow = true;
         else if (std::strcmp(argv[i], "--embedded-shadow-compare") == 0)
             embedded_shadow_compare = true;
+        // W2 full-history replay bulk-fetch lane (replay_bulk_fetch.hpp).
+        else if (std::strcmp(argv[i], "--replay-bulk") == 0)
+            g_replay_bulk = true;
+        else if (std::strcmp(argv[i], "--replay-bulk-capture") == 0 && i + 1 < argc) {
+            g_replay_bulk_capture_dir = argv[++i];
+            g_replay_bulk = true;   // capture is a decoration of the lane
+        }
+        else if (std::strcmp(argv[i], "--replay-bulk-start") == 0 && i + 1 < argc)
+            g_replay_bulk_start = static_cast<uint32_t>(
+                std::strtoul(argv[++i], nullptr, 10));
         else if (std::strcmp(argv[i], "--oracle-graduation-blocks") == 0 && i + 1 < argc)
             oracle_grad_blocks = std::strtoull(argv[++i], nullptr, 10);
         else if (std::strcmp(argv[i], "--oracle-class-coverage") == 0 && i + 1 < argc)
