@@ -460,6 +460,22 @@ public:
     using Entries = std::map<uint256, ReplayMNState>;
     const Entries& entries() const { return m_entries; }
 
+    /// Dash block identity = X11(80-byte header) — same as header_chain.hpp.
+    /// PUBLIC because a feeder that hands blocks to fold_block must be able to
+    /// name them the SAME way: the quorum lane keys derived member cycles by
+    /// block hash, and a caller that passed a null placeholder there made W4
+    /// lose the cycle and the fold fail closed at the next punishing
+    /// commitment (live-observed, h=2512821 llmqType=2).
+    static uint256 block_header_hash(const dash::coin::BlockType& block)
+    {
+        const bitcoin_family::coin::BlockHeaderType& hdr = block;
+        ::PackStream s;
+        s << hdr;
+        auto sp = s.get_span();
+        return dash::crypto::hash_x11(
+            reinterpret_cast<const unsigned char*>(sp.data()), sp.size());
+    }
+
     const ReplayMNState* find(const uint256& proTxHash) const
     {
         auto it = m_entries.find(proTxHash);
@@ -922,17 +938,6 @@ private:
                 reinterpret_cast<const unsigned char*>(sp.data()), sp.size()))
             .Finalize(std::span<unsigned char>(h.data(), 32));
         return h;
-    }
-
-    // Dash block identity = X11(80-byte header) — same as header_chain.hpp.
-    static uint256 block_header_hash(const dash::coin::BlockType& block)
-    {
-        const bitcoin_family::coin::BlockHeaderType& hdr = block;
-        ::PackStream s;
-        s << hdr;
-        auto sp = s.get_span();
-        return dash::crypto::hash_x11(
-            reinterpret_cast<const unsigned char*>(sp.data()), sp.size());
     }
 
     // ── Special-tx folds. Return "" on success, an error sentence on the ─

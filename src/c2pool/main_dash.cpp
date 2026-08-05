@@ -4995,7 +4995,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     // snapshot — but it cannot mint a new one either.
                     replay_live_tail =
                         std::make_unique<rp::FoldLiveTail>(
-                            *replay_fold_consumer, *replay_fold_engine);
+                            *replay_fold_consumer, *replay_fold_engine,
+                            // EXCLUSIVE floor: every height the bulk lane has
+                            // delivered or still intends to fetch stays the
+                            // bulk lane's, because the W4 quorum lane derives
+                            // membership from that ordering. Before the lane
+                            // exists the floor is "everything" — the tail must
+                            // never get in first.
+                            [&replay_lane]() -> uint32_t {
+                                if (!replay_lane) return UINT32_MAX;
+                                return std::max(
+                                    replay_lane->delivered(),
+                                    replay_lane->scheduler().target_end());
+                            });
                     coin_feed_subs.push_back(
                         coin_state.block_connected.subscribe(
                             [lt = replay_live_tail.get()]
@@ -5190,7 +5202,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                           + std::to_string(lt->lowest_held() - 1) + ")"
                                         : std::string())
                                  << " offered=" << lt->offered()
-                                 << " dropped=" << lt->dropped();
+                                 << " dropped=" << lt->dropped()
+                                 << " bulk_floor=" << lt->bulk_floor();
                     }
                     if (pp) {
                         // The serve seam says its own state: either it has

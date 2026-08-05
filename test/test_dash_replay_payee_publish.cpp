@@ -605,7 +605,9 @@ TEST(DashReplayPayeePublish, NeverEncodingAndEligibilityConvertFaithfully)
 TEST(DashReplayPayeePublish, LiveTailHoldsOutOfOrderBlocksAndDrainsOnContiguity)
 {
     auto rig = make_clean_rig();
-    dash::coin::replay::FoldLiveTail tail(rig.consumer, rig.engine);
+    // floor 0: in the KAT there is no bulk lane, so the tail owns everything
+    dash::coin::replay::FoldLiveTail tail(rig.consumer, rig.engine,
+                                          []() { return 0u; });
 
     // The tip lane hands us 2516758, 2516759, 2516760 while the fold is still
     // at the anchor h=2516755. None is foldable yet.
@@ -651,7 +653,8 @@ TEST(DashReplayPayeePublish, LiveTailHoldsOutOfOrderBlocksAndDrainsOnContiguity)
 TEST(DashReplayPayeePublish, LiveTailOverflowKeepsTheContiguityFrontier)
 {
     auto rig = make_clean_rig();
-    dash::coin::replay::FoldLiveTail tail(rig.consumer, rig.engine, /*cap=*/2);
+    dash::coin::replay::FoldLiveTail tail(rig.consumer, rig.engine,
+                                          []() { return 0u; }, /*cap=*/2);
 
     tail.offer(2516758, pp_parse_block(kBodies[2516758 - kFirstBody]));
     tail.offer(2516759, pp_parse_block(kBodies[2516759 - kFirstBody]));
@@ -667,6 +670,47 @@ TEST(DashReplayPayeePublish, LiveTailOverflowKeepsTheContiguityFrontier)
     EXPECT_EQ(rig.engine.height(), 2516759u);
     EXPECT_EQ(tail.held(), 0u);
     EXPECT_EQ(rig.consumer.stats().roots_matched, 4u);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KAT 8b — THE FLOOR: the tail must never fold a height the bulk lane owns
+//
+// The first live-tail run had no floor and took whatever arrived on
+// block_connected — which also carries the MN checkpoint bridge's own
+// historical replay. The fold advanced through heights the bulk lane had not
+// delivered, the W4 quorum lane lost the cycles it derives from that ordering,
+// and the run died:
+//
+//   [REPLAY-FOLD SUMMARY] folded=620 ... DIVERGED_AT=2512821
+//     reason="fold FAILED at h=2512821 tx[1]: quorum-member resolver has no
+//             member set for llmqType=2 quorumHash=000000000000002a"
+//   [REPLAY-TAIL] folded=103 held=512 offered=5487 dropped=4866
+//
+// The tail closes the gap the bulk lane LEAVES. It never races it.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashReplayPayeePublish, LiveTailNeverFoldsAHeightTheBulkLaneStillOwns)
+{
+    auto rig = make_clean_rig();
+    uint32_t bulk_floor = kLastBody;      // the lane claims the whole range
+    dash::coin::replay::FoldLiveTail tail(
+        rig.consumer, rig.engine, [&bulk_floor]() { return bulk_floor; });
+
+    for (uint32_t h = kFirstBody; h <= kLastBody; ++h)
+        tail.offer(h, pp_parse_block(kBodies[h - kFirstBody]));
+    // Not held, not folded, not counted: they were never the tail's to take.
+    EXPECT_EQ(tail.held(), 0u);
+    EXPECT_EQ(tail.offered(), 0u);
+    EXPECT_EQ(tail.folded_live(), 0u);
+    EXPECT_EQ(rig.engine.height(), 2516755u);
+
+    // The lane delivers the first four itself, then stops (its peers announced
+    // no more) and lowers its claim. Only THEN may the tail take the last one.
+    ASSERT_TRUE(rig.fold_through(kLastBody - 1));
+    bulk_floor = kLastBody - 1;
+    tail.offer(kLastBody, pp_parse_block(kBodies[kLastBody - kFirstBody]));
+    EXPECT_EQ(tail.folded_live(), 1u);
+    EXPECT_EQ(rig.engine.height(), kLastBody);
+    EXPECT_EQ(rig.consumer.stats().roots_matched, 5u);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -329,9 +329,25 @@ public:
     /// would break the contiguity that makes the drain safe. A fold far enough
     /// behind to overflow is a fold that must keep failing its currency check
     /// anyway — that is the honest outcome, not a reason to skip blocks.
+    /// `bulk_floor` is an EXCLUSIVE floor: the highest height the bulk lane
+    /// still owns (its delivered high-water and its fetch ceiling, whichever
+    /// is greater). The tail touches NOTHING at or below it.
+    ///
+    /// That floor is not politeness, it is correctness. The first attempt had
+    /// no floor and folded whatever arrived on block_connected — which also
+    /// carries the checkpoint bridge's own historical replay. The fold then
+    /// advanced through heights the bulk lane had not delivered, the W4 quorum
+    /// lane lost the cycles it derives from the bulk ordering, and the run
+    /// died at h=2512821 with "quorum-member resolver has no member set".
+    /// The tail exists to close the gap the bulk lane LEAVES, never to race it.
+    using HeightFn = std::function<uint32_t()>;
+
     FoldLiveTail(FoldReplayConsumer& consumer, const DmlFoldEngine& engine,
-                 size_t cap = 512)
-        : m_consumer(consumer), m_engine(engine), m_cap(cap ? cap : 512)
+                 HeightFn bulk_floor, size_t cap = 512)
+        : m_consumer(consumer)
+        , m_engine(engine)
+        , m_bulk_floor(std::move(bulk_floor))
+        , m_cap(cap ? cap : 512)
     {}
 
     /// Offer a connected block. Heights at or below the fold cursor are a
@@ -340,6 +356,7 @@ public:
     void offer(uint32_t height, const BlockType& block)
     {
         if (height <= m_engine.height()) return;
+        if (height <= floor()) return;      // the bulk lane still owns it
         ++m_offered;
         auto [it, inserted] = m_held.emplace(height, block);
         if (!inserted) return;                       // already holding it
@@ -361,10 +378,15 @@ public:
                 m_held.erase(m_held.begin());
             if (m_held.empty()) return;
             const uint32_t want = m_engine.height() + 1;
+            // Never fold a height the bulk lane is still going to deliver:
+            // its ordering is what the W4 quorum lane derives membership from.
+            if (want <= floor()) return;
             auto it = m_held.find(want);
             if (it == m_held.end()) return;          // still a gap; wait
-            const bool ok = m_consumer.on_replay_block(want, uint256{},
-                                                       it->second);
+            // The REAL block hash, not a placeholder: the quorum lane keys
+            // derived member cycles by it.
+            const bool ok = m_consumer.on_replay_block(
+                want, DmlFoldEngine::block_header_hash(it->second), it->second);
             m_held.erase(it);
             ++m_folded_live;
             if (!ok) {
@@ -380,6 +402,7 @@ public:
         }
     }
 
+    uint32_t bulk_floor()  const { return floor(); }
     size_t   held()        const { return m_held.size(); }
     uint64_t folded_live() const { return m_folded_live; }
     uint64_t offered()     const { return m_offered; }
@@ -390,8 +413,11 @@ public:
     }
 
 private:
+    uint32_t floor() const { return m_bulk_floor ? m_bulk_floor() : 0u; }
+
     FoldReplayConsumer&               m_consumer;
     const DmlFoldEngine&              m_engine;
+    HeightFn                          m_bulk_floor;
     size_t                            m_cap;
     std::map<uint32_t, BlockType>     m_held;
     uint64_t m_folded_live{0};
