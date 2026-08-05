@@ -11,11 +11,19 @@
 ///     - Type 8 (TRANSACTION_ASSET_LOCK):
 ///         pool += sum(payload.creditOutputs.value)
 ///     - Type 9 (TRANSACTION_ASSET_UNLOCK):
-///         pool -= sum(tx.vout.value)   // gross withdrawal; the
-///                                      // payload.fee is paid to the
-///                                      // miner from the unlock total
-///                                      // and does NOT come back into
-///                                      // the pool
+///         pool -= payload.fee + sum(tx.vout.value)
+///                                      // dashd unlocks the GROSS amount:
+///                                      // the withdrawal vouts PLUS the
+///                                      // payload.fee. The fee is paid to
+///                                      // the miner via the coinbase, but
+///                                      // it still LEAVES the pool, so it
+///                                      // is part of the deduction.
+///                                      // Verified against mainnet
+///                                      // 2,166,498 (4 unlocks, fee=190
+///                                      // each): cbTx creditPoolBalance
+///                                      // steps by −(Σvout + Σfee), not
+///                                      // −Σvout. See the KAT in
+///                                      // test_dash_coin_state_maintainer.
 ///
 /// Bootstrap: seed from the first observed CCbTx.creditPoolBalance
 /// before applying any deltas (similar pattern to MnStateMachine
@@ -77,19 +85,32 @@ public:
                 }
                 // parse failures already log; skip the tx for accounting
             } else if (tx.type == vendor::CAssetUnlockPayload::SPECIALTX_TYPE) {
-                // For unlocks, the deduction is sum of vout values
-                // (gross withdrawal). Payload parse is informational —
-                // not strictly required for the balance math, but we
-                // do it to keep the [ASSETUNLOCK] log consistent and
-                // catch wire-format drift early.
+                // For unlocks, the deduction is payload.fee + sum of vout
+                // values: dashd's DiffFromBlock removes the GROSS unlock
+                // amount from the pool — the withdrawal vouts plus the
+                // miner fee carried in the payload (the fee reaches the
+                // miner through the coinbase, not back into the pool).
+                // The payload parse is therefore REQUIRED for the balance
+                // math, not just diagnostics: without the fee term the
+                // running balance drifts by Σfee at every unlock block
+                // (mainnet 2,166,498 KAT: 4 unlocks × fee 190 = 760).
                 int64_t out_sum = 0;
                 for (const auto& v : tx.vout) out_sum += v.value;
                 delta -= out_sum;
                 ++unlocks;
-                // Optional payload parse for diagnostics.
-                if (!tx.extra_payload.empty()) {
-                    vendor::CAssetUnlockPayload up;
-                    vendor::parse_assetunlock_payload(tx.extra_payload, up);
+                vendor::CAssetUnlockPayload up;
+                if (!tx.extra_payload.empty()
+                    && vendor::parse_assetunlock_payload(tx.extra_payload, up)) {
+                    delta -= static_cast<int64_t>(up.fee);
+                } else {
+                    // Fee unknown → our balance will run HIGH by that fee.
+                    // Log loudly; the maintainer's per-block cross-check
+                    // against the cbTx-committed balance (ACCRUAL DRIFT,
+                    // fail-closed re-seed) is the backstop.
+                    LOG_WARNING << "[CREDITPOOL] h=" << height
+                                << " type-9 unlock payload unparseable — "
+                                   "fee term missing from delta (balance "
+                                   "may drift high until re-seed)";
                 }
             }
         }
