@@ -277,11 +277,23 @@ jobs:
     name: Linux x86_64 (AsAN+UBSan)
     # dash bring-up slices may opt out of sanitizers via dash-skip-sanitizers; KEEP for consensus/payout slices (default = on)
     if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-skip-sanitizers')) }}
-    # Heavy leg → dedicated c2pool-heavy runner host(s), disjoint from the
-    # c2pool-build fleet so the per-host heavy-leg flock (#1105) stops
-    # contending with the ASan+CodeQL pair on VM905. ccache is already wired
-    # into this job's cmake configure below (COMPILER_LAUNCHER=ccache).
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-heavy"]') || 'ubuntu-24.04' }}
+    # STAYS on c2pool-build — MEASURED, do not "optimize" this onto c2pool-heavy.
+    # Unlike every other heavy leg, this job builds with `conan profile detect
+    # --force`, i.e. the HOST DEFAULT compiler, not ci/conan/linux-gcc13.profile.
+    # The c2pool-heavy host is Ubuntu 26.04 (gcc-15), and c2pool fails to LINK
+    # there under that toolchain:
+    #     undefined reference to `std::ostream::_Disable_exceptions::...'
+    #     (/usr/include/c++/15/bits/ostream.h) -> collect2: ld returned 1
+    # It is not a code fault and not a broken sanitizer: the same tree links
+    # fine under gcc-13, and a minimal -fsanitize=address,undefined program
+    # links fine under gcc-15 on that host. It is a libstdc++/dependency ABI
+    # mismatch specific to the conan dep set built under gcc-15.
+    # Flock separation is preserved by moving CodeQL (the OTHER and only other
+    # lock holder) to c2pool-heavy instead — see codeql-analysis.yml. That keeps
+    # the two holders on disjoint hosts AND keeps every leg on a proven
+    # toolchain. Revisit only if the heavy host gains a gcc-13 default or the
+    # ASan leg is pinned to the committed gcc13 profile.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     continue-on-error: true
     steps:
       # Reap-guard: host-scoped exclusivity vs the other RAM-heavy leg
