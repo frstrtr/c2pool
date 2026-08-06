@@ -108,3 +108,82 @@ TEST(RelayBlockHonesty, LocallyFoundBlockKeepsRealTiming) {
         << "a first block has no luck measurement; 0 would be a fabricated one";
     EXPECT_EQ(blk["luck_method"].get<std::string>(), "first_block");
 }
+
+// ─── actual_hash_difficulty: quality of the found hash (#1137) ───────────────
+//
+// = diff1 / block_hash (p2pool-dash web.py:1754). The dashboard reads it 12x
+// (drawDiffRatioBars, diamond elevation, the Hash Difficulty column, two
+// tooltip branches) and NO backend emitted it, so those visuals were dead on
+// every lane. It is only correct where the BLOCK HASH IS the PoW hash: DASH
+// (X11) and BTC (SHA256d). Scrypt lanes (LTC/DOGE) and multi-algo DGB must
+// emit null -- diff1/block_hash there describes the wrong hash.
+
+// diff1 target itself -> difficulty exactly 1.0.
+static const char* kDiff1Hash =
+    "00000000ffff0000000000000000000000000000000000000000000000000000";
+// A much smaller hash (more leading zeroes) -> a large difficulty.
+static const char* kDeepHash =
+    "000000000000000f000000000000000000000000000000000000000000000000";
+
+TEST(ActualHashDifficulty, DashLaneEmitsDiff1OverHash) {
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::DASH);
+    mi.record_found_block(/*height=*/2500000, uint256S(kDiff1Hash),
+                          /*ts=*/1750000000, /*chain=*/"DASH",
+                          /*miner=*/"XhK2example", /*share_hash=*/"beef");
+
+    auto blk = find_block(mi.rest_recent_blocks(), kDiff1Hash);
+    ASSERT_TRUE(blk.is_object());
+    ASSERT_TRUE(blk.contains("actual_hash_difficulty"));
+    ASSERT_TRUE(blk["actual_hash_difficulty"].is_number())
+        << "DASH block hash IS the X11 PoW hash -- the field must be emitted";
+    // hash == diff1 target -> difficulty 1.0.
+    EXPECT_NEAR(blk["actual_hash_difficulty"].get<double>(), 1.0, 1e-6);
+}
+
+TEST(ActualHashDifficulty, DeeperHashGivesHigherDifficulty) {
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::DASH);
+    mi.record_found_block(/*height=*/2500001, uint256S(kDeepHash),
+                          /*ts=*/1750000100, /*chain=*/"DASH",
+                          /*miner=*/"XhK2example", /*share_hash=*/"beef");
+
+    auto blk = find_block(mi.rest_recent_blocks(), kDeepHash);
+    ASSERT_TRUE(blk.is_object());
+    ASSERT_TRUE(blk["actual_hash_difficulty"].is_number());
+    // A hash far below the diff1 target is a much "better" (rarer) hash.
+    EXPECT_GT(blk["actual_hash_difficulty"].get<double>(), 1e6)
+        << "a hash with many more leading zeroes than target implies high diff";
+}
+
+TEST(ActualHashDifficulty, BtcLaneAlsoEmits) {
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::BITCOIN);
+    mi.record_found_block(/*height=*/800000, uint256S(kDiff1Hash),
+                          /*ts=*/1750000000, /*chain=*/"BTC",
+                          /*miner=*/"1BtcExample", /*share_hash=*/"beef");
+
+    auto blk = find_block(mi.rest_recent_blocks(), kDiff1Hash);
+    ASSERT_TRUE(blk.is_object());
+    ASSERT_TRUE(blk["actual_hash_difficulty"].is_number())
+        << "BTC block hash IS the SHA256d PoW hash -- the field must be emitted";
+    EXPECT_NEAR(blk["actual_hash_difficulty"].get<double>(), 1.0, 1e-6);
+}
+
+TEST(ActualHashDifficulty, ScryptLaneEmitsNullNotAWrongNumber) {
+    // LTC: block identity hash is SHA256d, PoW is scrypt. diff1/block_hash
+    // would describe the SHA256d hash, which is NOT what won the block. That
+    // is a fabricated measurement, so the lane emits null until a pow_hash is
+    // captured at find time (scoped out -- FoundBlock field + mint plumbing).
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::LITECOIN);
+    mi.record_found_block(/*height=*/2600000, uint256S(kDiff1Hash),
+                          /*ts=*/1750000000, /*chain=*/"LTC",
+                          /*miner=*/"LhK2example", /*share_hash=*/"beef");
+
+    auto blk = find_block(mi.rest_recent_blocks(), kDiff1Hash);
+    ASSERT_TRUE(blk.is_object());
+    ASSERT_TRUE(blk.contains("actual_hash_difficulty"));
+    EXPECT_TRUE(blk["actual_hash_difficulty"].is_null())
+        << "scrypt lane must NOT emit diff1/block_hash -- that is the wrong hash";
+}

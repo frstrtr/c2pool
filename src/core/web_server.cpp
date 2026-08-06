@@ -2497,6 +2497,33 @@ nlohmann::json MiningInterface::rest_recent_blocks()
 {
     static const char* status_str[] = {"pending", "confirmed", "orphaned", "stale"};
     nlohmann::json arr = nlohmann::json::array();
+
+    // actual_hash_difficulty: how far below target the WINNING hash landed,
+    // = diff1 / block_hash (the p2pool-dash formula, web.py:1754). It is the
+    // "quality of the found hash" the dashboard's drawDiffRatioBars / diamond
+    // elevation / Hash Difficulty column all read, and which no backend has
+    // ever emitted (#1137) -- so those visuals have been dead on every lane.
+    //
+    // It is ONLY meaningful where the BLOCK HASH IS the PoW hash: DASH (X11)
+    // and BTC (SHA256d). On scrypt lanes (LTC/DOGE) and multi-algo DGB the
+    // block identity hash is SHA256d while the PoW is a different function, so
+    // diff1/block_hash would describe the WRONG hash. Those lanes emit null
+    // here until a pow_hash is captured at find time -- a larger change,
+    // deliberately scoped out (it needs a FoundBlock field + mint-path plumbing
+    // on every scrypt lane). Emitting a plausible-but-wrong number would be the
+    // exact fabricated-value defect the honest-null rule above exists to stop.
+    const bool block_hash_is_pow_hash =
+        (m_blockchain == Blockchain::DASH || m_blockchain == Blockchain::BITCOIN);
+    auto actual_hash_difficulty = [&](const std::string& hash_hex) -> nlohmann::json {
+        if (!block_hash_is_pow_hash || hash_hex.size() != 64)
+            return nlohmann::json(nullptr);
+        uint256 h;
+        h.SetHex(hash_hex);
+        if (h.IsNull()) return nlohmann::json(nullptr);
+        double d = chain::target_to_difficulty(h);   // diff1 / hash
+        return d > 0.0 ? nlohmann::json(d) : nlohmann::json(nullptr);
+    };
+
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
     for (const auto& b : m_found_blocks) {
         // Node-role honesty (#942): a block with no local share_hash AND no
@@ -2537,6 +2564,7 @@ nlohmann::json MiningInterface::rest_recent_blocks()
             {"share", b.share_hash},
             {"found_locally", found_locally},
             {"network_difficulty", num_or_null(b.network_difficulty)},
+            {"actual_hash_difficulty", actual_hash_difficulty(b.hash)},
             {"share_difficulty", num_or_null(b.share_difficulty)},
             {"pool_hashrate_at_find", num_or_null(b.pool_hashrate)},
             {"subsidy", b.subsidy != 0 ? nlohmann::json(b.subsidy)
