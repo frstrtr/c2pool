@@ -262,25 +262,39 @@ jobs:
           set -uo pipefail
           dest="$HOME/codeql-bundles/$CODEQL_BUNDLE_VERSION"
           tarball="$dest/codeql-bundle-linux64.tar.gz"
-          if [ -f "$dest/.complete" ]; then
-            echo "Reusing cached bundle $tarball"
+          # INTEGRITY GATE: a bare .complete marker does not prove the cached
+          # tarball is intact. A resumed (-C -) or truncated fetch can leave a
+          # corrupt .tar.gz that is then reused forever, so every job dies at
+          # "Initialize CodeQL" with tar exit 2 (observed on .196 and
+          # oplex7020-heavy-3). Trust the bytes, not the marker: gzip -t before
+          # reuse, and re-verify before marking a fresh fetch complete.
+          if [ -f "$dest/.complete" ] && gzip -t "$tarball" 2>/dev/null; then
+            echo "Reusing verified cached bundle $tarball"
             echo "CODEQL_TOOLS=$tarball" >> "$GITHUB_ENV"
           else
+            if [ -f "$dest/.complete" ]; then
+              echo "::warning::cached CodeQL bundle failed gzip integrity check; purging corrupt cache and re-fetching"
+            fi
+            rm -f "$tarball" "$dest/.complete"
             mkdir -p "$dest"
             url="https://github.com/github/codeql-action/releases/download/$CODEQL_BUNDLE_VERSION/codeql-bundle-linux64.tar.gz"
             echo "Fetching $url"
             if curl -fL -C - --retry 8 --retry-all-errors --retry-delay 5 \
                     --connect-timeout 20 --speed-limit 1024 --speed-time 60 \
                     -o "$tarball.tmp" "$url"; then
-              mv "$tarball.tmp" "$tarball"
-              touch "$dest/.complete"
-              echo "Staged $tarball"
-              echo "CODEQL_TOOLS=$tarball" >> "$GITHUB_ENV"
+              if gzip -t "$tarball.tmp" 2>/dev/null; then
+                mv "$tarball.tmp" "$tarball"
+                touch "$dest/.complete"
+                echo "Staged and verified $tarball"
+                echo "CODEQL_TOOLS=$tarball" >> "$GITHUB_ENV"
+              else
+                rm -f "$tarball.tmp"
+                echo "::warning::codeql bundle arrived corrupt (gzip -t failed); discarded so Initialize CodeQL uses its own download"
+              fi
             else
               echo "::warning::codeql bundle prestage fetch failed over lossy uplink; leaving CODEQL_TOOLS empty so Initialize CodeQL uses its own bundle download (partial .tmp kept for -C - resume)"
             fi
           fi
-
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
