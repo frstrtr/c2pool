@@ -66,6 +66,7 @@
 #include <boost/asio.hpp>
 
 #include <cstdint>
+#include <span>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -533,6 +534,17 @@ int run_node(const core::CoinParams& params, bool testnet,
     };
     auto bcast_telem = std::make_shared<DgbBroadcasterTelemetry>();
 
+    // ── #995 DGB arm: found-block dashboard/verdict reporter slot ─────────
+    // m_on_block_found is bound here, BEFORE the WebServer/MiningInterface is
+    // stood up (below, under --http), so the record_found_block + schedule_
+    // block_verification producer is injected via this shared slot: the http
+    // block assigns the real lambda once `mi` exists; until then (or with the
+    // dashboard off) it stays empty and a won block still broadcasts, just
+    // unrecorded. TELEMETRY ONLY -- never on any broadcast/mint/payout path.
+    auto found_block_report = std::make_shared<
+        std::function<void(const uint256&, const std::vector<unsigned char>&,
+                           const std::string&)>>();
+
     auto dgb_on_block_found = dgb::coin::make_on_block_found(
         /*reconstruct=*/std::move(faithful_reconstruct),
         /*p2p_relay=*/[&ioc, &coin_p2p, no_p2p_relay](const std::vector<unsigned char>& block_bytes) {
@@ -558,7 +570,14 @@ int run_node(const core::CoinParams& params, bool testnet,
                 if (coin_p2p) coin_p2p->submit_block_p2p_raw(bytes);
             });
         },
-        /*seam=*/&coin_node);                     // external-digibyted submitblock fallback
+        /*seam=*/&coin_node,                       // external-digibyted submitblock fallback
+        /*on_found=*/[found_block_report](const uint256& sh,
+                                          const std::vector<unsigned char>& bytes,
+                                          const std::string& hex) {
+            // Forward to the dashboard/verdict producer once it is bound (below,
+            // under --http). No-op while unbound. Telemetry only.
+            if (*found_block_report) (*found_block_report)(sh, bytes, hex);
+        });
 
     // ARM A dispatch counter — wrap the closure so every won-block dispatch is
     // counted before it runs; a stalled P2P-relay arm shows dispatches==0.
@@ -1348,6 +1367,73 @@ int run_node(const core::CoinParams& params, bool testnet,
         //     surface: NONE (dashboard reporting, not share/PPLNS bytes).
         mi->set_peer_info_fn([&p2p_node]() { return p2p_node.get_peer_info_json(); });
 
+        // ── #995 DGB arm: found-block record + chain-sourced confirm/orphan ──
+        // Wire the won-block reporter slot (declared above, fired by
+        // m_on_block_found after a successful reconstruct) to record_found_block
+        // + schedule_block_verification, and install the verdict fn that resolves
+        // a recorded block against the live chain. Mirrors the DASH shape
+        // (main_dash.cpp record sites + set_block_verify_fn) -- SHAPE reference
+        // only, no DASH code copied. Isolation: constructs core classes / calls
+        // core MI methods, ZERO src/core edits. p2pool-merged-v36 surface: NONE
+        // (dashboard telemetry, not share/PPLNS/coinbase bytes).
+        //
+        // PRODUCER. The reconstructed parent block bytes carry the 80-byte header
+        // first; the coin block IDENTITY hash is params.block_hash_func over that
+        // header (sha256d) -- distinct from the scrypt PoW digest AND from the
+        // share hash, and it is the key digibyted getblockheader answers on.
+        // Runs strictly AFTER both broadcast arms; never gates a broadcast.
+        *found_block_report =
+            [mi, &header_chain, block_id = params.block_hash_func](
+                const uint256& /*share_hash*/,
+                const std::vector<unsigned char>& block_bytes,
+                const std::string& /*block_hex*/) {
+                if (block_bytes.size() < 80) return;   // no header -> nothing to key on
+                uint256 block_hash = block_id(
+                    std::span<const unsigned char>(block_bytes.data(), 80));
+                // Height of the block we just won == the pool tip + 1. header_chain
+                // is not yet fed (M3), so this is base (0) until the embedded
+                // header-ingest lands -- display only; the RPC verdict keys on the
+                // hash, not the height.
+                uint64_t height = header_chain.next_block_height();
+                mi->record_found_block(
+                    height, block_hash, static_cast<uint64_t>(std::time(nullptr)),
+                    /*chain=*/"DGB", /*miner=*/"", /*share_hash=*/block_hash.GetHex(),
+                    mi->get_network_difficulty(), /*share_difficulty=*/0.0,
+                    mi->get_local_hashrate(), /*subsidy=*/0);
+                // Arm the post-broadcast confirm/orphan poller. Telemetry only.
+                mi->schedule_block_verification(block_hash.GetHex());
+                std::cout << "[DGB] recorded found block hash="
+                          << block_hash.GetHex().substr(0, 16)
+                          << " -- confirm/orphan poller armed" << std::endl;
+            };
+
+        // VERDICT. Resolve a recorded found block against the chain: >0 accepted
+        // (best-chain depth / confirmations), <0 orphaned (off the active chain),
+        // 0 pending (not yet buried, or the chain cannot answer). DAEMONLESS-first
+        // (embedded HeaderChain) is DEFERRED to M3: header_chain is not yet fed
+        // (block_hash stays 0, tip_hash()==nullopt), so a header-chain arm could
+        // only ever return pending today and would be inert-until-fed -- it lands
+        // with the header-ingest slice, not as dead code now. The LIVE verdict
+        // source is the external digibyted getblockheader RPC (rpc.cpp).
+        mi->set_block_verify_fn(
+            [rp = rpc.get()](const std::string& hash_hex) -> int {
+                if (!rp) return 0;   // no digibyted RPC -> cannot ask the chain -> pending
+                uint256 h; h.SetHex(hash_hex);
+                try {
+                    auto j = rp->getblockheader(h, /*verbose=*/true);
+                    if (j.contains("confirmations") && j["confirmations"].is_number()) {
+                        int c = j["confirmations"].get<int>();
+                        if (c < 0) return -1;      // off the active chain -> orphaned
+                        if (c >= 1) return c;      // on the best chain -> accepted
+                    }
+                } catch (...) { /* unknown to daemon / transport error -> pending */ }
+                return 0;
+            });
+        std::cout << "[DGB] found-block confirm/orphan lane ARMED "
+                  << (rpc ? "(digibyted getblockheader verdict)"
+                          : "(no digibyted RPC -> verdicts stay pending until --coin-rpc)")
+                  << std::endl;
+
         // graph_db stats persistence — survives restarts (LTC-parity site 2/3).
         // DGB-namespaced sub-dir isolates the per-coin stat log under config_path().
         {
@@ -1414,6 +1500,7 @@ int run_node(const core::CoinParams& params, bool testnet,
     // objects it references (header_chain / mempool / coin_node) are still
     // alive — explicit reset keeps destruction order safe (stratum_server was
     // declared first, so it would otherwise outlive them).
+    if (found_block_report) *found_block_report = nullptr;  // #995: unbind before mi dies
     stratum_server.reset();
     web_server.reset();
 
