@@ -204,7 +204,28 @@ inline WorkSelection select_dash_work(
                       + "," + (emb.mempool ? "mempool=ok" : "mempool=null");
         why.threshold = "mnstates!=null,mempool!=null";
     }
-    return WorkSelection{dashd_fallback(), WorkSource::DashdFallback, std::move(why)};
+    WorkSelection out{dashd_fallback(), WorkSource::DashdFallback, std::move(why)};
+    // PINNED LOCAL TX on the SERVED-dashd arm (option B, donation lane): the
+    // dashd mempool cannot carry the >100KB zero-fee consolidation (policy
+    // standardness), so the pin rides OUR served copy of dashd's template
+    // instead. Same shared gate as the embedded arm (splice_pinned_tx);
+    // coinbase value untouched (fee 0) — stratum merkle branches and the
+    // submitblock body both derive from the appended tx vectors. Fail-closed:
+    // without the verify view (mempool+mnstates, i.e. --embedded-utxo) the
+    // pin is EXCLUDED with a named cause, never included unverified.
+    if (emb.pinned_local_tx != nullptr) {
+        if (emb.mempool == nullptr || emb.mnstates == nullptr) {
+            LOG_INFO << "[dashd-splice] pinned tx EXCLUDED h="
+                     << out.work.m_height << " cause=no-verify-view ("
+                     << (emb.mempool ? "mempool=ok" : "mempool=null") << ","
+                     << (emb.mnstates ? "mnstates=ok" : "mnstates=null")
+                     << ") — enable --embedded-utxo to verify the pin";
+        } else {
+            splice_pinned_tx(out.work, *emb.pinned_local_tx,
+                             *emb.mempool, *emb.mnstates, "dashd-splice");
+        }
+    }
+    return out;
 }
 
 /// Production entry point: builds the embedded template from `emb` when viable,

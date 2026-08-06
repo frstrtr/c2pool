@@ -136,6 +136,59 @@ TEST(DashWorkSource, NullMempoolRoutesFallback)
     EXPECT_TRUE(fb_ran);
 }
 
+// ─── Option B: pinned-tx splice on the SERVED-dashd arm ──────────────────────
+// The donation consolidation (>100KB, fee 0) cannot enter dashd's mempool
+// (policy standardness), so when the dashd arm serves, the pin must ride OUR
+// copy of the template — gated by the SAME splice_pinned_tx the embedded arm
+// uses. Fail-closed contract: no verify view (mempool/mnstates null) → the
+// template is byte-identical to no-pin; never an unverified inclusion.
+TEST(DashWorkSource, PinnedTxExcludedOnFallbackWithoutVerifyView)
+{
+    EmbeddedWorkInputs emb;            // has_state=false → fallback arm
+    dash::coin::MutableTransaction pin;
+    pin.vin.resize(1);
+    emb.pinned_local_tx = &pin;        // pin present, but no mempool/mnstates
+
+    bool emb_ran = false, fb_ran = false;
+    WorkSelection sel = select_dash_work(
+        emb,
+        [&] { return embedded_stub(emb_ran); },
+        [&] { return dashd_stub(fb_ran); });
+
+    EXPECT_EQ(sel.source, WorkSource::DashdFallback);
+    EXPECT_TRUE(fb_ran);
+    // Byte-identical to the no-pin shape: nothing appended anywhere.
+    EXPECT_TRUE(sel.work.m_txs.empty());
+    EXPECT_TRUE(sel.work.m_tx_hashes.empty());
+    EXPECT_TRUE(sel.work.m_tx_fees.empty());
+    EXPECT_TRUE(sel.work.m_tx_data_hex.empty());
+}
+
+TEST(DashWorkSource, PinnedTxOnFallbackFailsClosedWithoutUtxoView)
+{
+    // Verify view POINTERS present but the mempool has no UTXO view wired:
+    // pinned_tx_admissible returns UtxoViewUnset and the pin must be EXCLUDED
+    // (the primary without --embedded-utxo lands exactly here).
+    MnStateMachine mn;
+    dash::coin::Mempool mp;
+    EmbeddedWorkInputs emb;            // has_state=false → fallback arm
+    emb.mnstates = &mn;
+    emb.mempool  = &mp;
+    dash::coin::MutableTransaction pin;
+    pin.vin.resize(1);
+    emb.pinned_local_tx = &pin;
+
+    bool emb_ran = false, fb_ran = false;
+    WorkSelection sel = select_dash_work(
+        emb,
+        [&] { return embedded_stub(emb_ran); },
+        [&] { return dashd_stub(fb_ran); });
+
+    EXPECT_EQ(sel.source, WorkSource::DashdFallback);
+    EXPECT_TRUE(sel.work.m_txs.empty());
+    EXPECT_TRUE(sel.work.m_tx_data_hex.empty());
+}
+
 // ─── Firmware-grid vardiff quantization KAT (retention fix) ──────────────────
 // HashrateTracker::set_difficulty_from_hashrate must advertise ONLY power-of-two
 // difficulties, rounded DOWN from the estimator's ideal D. Many ASIC firmwares
