@@ -105,6 +105,21 @@
 ///      more than one DKG cycle the verdict decays to StaleSightings — a
 ///      named non-defect — and the alarm CLEARS. A genuinely mined type
 ///      keeps producing in-retention entries, so its alarm never decays.
+///
+///   3. RESTART RESURRECTION OF AN UNDATED ENTRY (measured 2026-08-06, hotel
+///      reserve node, issue #1164): mode 2's first-seen dating lives in
+///      memory, so a process restart re-dates every scanner-undated entry as
+///      fresh — and a bogus never-mined entry that mnlistdiff/qrinfo keeps
+///      delivering (a full-span chain sweep showed ZERO type-1 commitments
+///      on-chain while the alarm cited that exact span) rings for a whole
+///      retention window (576 blocks for type 1) after EVERY restart,
+///      indefinitely. The fix is evidentiary, not another timer: the
+///      UnexpectedType indictment now requires at least one sighting whose
+///      entry the [QC-MINED] scanner actually dated (mined_height known).
+///      DELIVERY IS NOT MINING. A genuinely upstream-added type is mined
+///      every cycle and gets scanner-dated within one, so the real defect
+///      still fires; an entry no one can date stays Unevaluated with reason
+///      "delivered-but-never-scanner-dated" — visible, never alarming.
 
 #include <impl/dash/coin/dkg_commitments.hpp>
 #include <impl/dash/coin/quorum_manager.hpp>
@@ -261,9 +276,11 @@ public:
         if (tip_height > m_last_height) m_last_height = tip_height;
 
         std::set<uint8_t> present;   // types with >=1 IN-RETENTION entry
+        std::set<uint8_t> confirmed; // ...of which >=1 is scanner-dated
         std::map<std::pair<uint8_t, uint256>, uint32_t> first_seen_next;
         for (const auto& e : entries) {
             uint32_t own_h = e.mined_height;
+            const bool scanner_dated = (own_h != 0);
             if (own_h == 0 && !e.quorum_hash.IsNull()) {
                 const auto key = std::make_pair(e.llmq_type, e.quorum_hash);
                 auto it = m_first_seen.find(key);
@@ -278,6 +295,7 @@ public:
                 && tip_height - own_h > retention_for(e.llmq_type))
                 continue;                          // aged out — NOT a sighting
             present.insert(e.llmq_type);
+            if (scanner_dated) confirmed.insert(e.llmq_type);
         }
         // Records for entries no longer served are dropped here, bounding the
         // map by the live active-set size. If such an entry ever reappears it
@@ -290,6 +308,11 @@ public:
             if (s.first_height == 0 || tip_height < s.first_height)
                 s.first_height = tip_height;
             if (tip_height > s.last_height) s.last_height = tip_height;
+            if (confirmed.count(t)) {
+                ++s.scanner_confirmed;
+                if (tip_height > s.last_confirmed_height)
+                    s.last_confirmed_height = tip_height;
+            }
         }
     }
 
@@ -412,6 +435,21 @@ public:
                 // current disagreement with the chain.
                 f.verdict = LlmqTypeVerdict::StaleSightings;
                 f.pending_reason = "n/a";
+            } else if (s.scanner_confirmed == 0) {
+                // MODE 3 (measured 2026-08-06, hotel reserve node): the entry
+                // is SERVED (mnlistdiff/qrinfo delivered it) but the
+                // [QC-MINED] scanner has never dated its qfcommit, and a
+                // full-span chain sweep showed ZERO commitments of the type
+                // on-chain. Delivery is not mining. Without one scanner-dated
+                // entry the "MINED"-but-not-required indictment has no mined
+                // evidence at all — and because this reconciler is in-memory,
+                // every restart re-dated the undated entry as fresh and the
+                // alarm resurrected for a whole retention window (576 blocks
+                // for type 1), surviving restarts indefinitely. A genuinely
+                // upstream-added type is mined every cycle, so the scanner
+                // dates it within one cycle and the indictment still fires.
+                f.verdict = LlmqTypeVerdict::Unevaluated;
+                f.pending_reason = "delivered-but-never-scanner-dated";
             } else {
                 f.verdict = LlmqTypeVerdict::UnexpectedType;
                 f.pending_reason = "n/a";
@@ -515,6 +553,11 @@ private:
         uint64_t sightings{0};
         uint32_t first_height{0};
         uint32_t last_height{0};
+        /// Sightings backed by an entry whose qfcommit the [QC-MINED] scanner
+        /// actually dated (mined_height known). Only these can indict an
+        /// UnexpectedType — see mode 3 in the header.
+        uint64_t scanner_confirmed{0};
+        uint32_t last_confirmed_height{0};
     };
 
     LlmqNetwork m_net;

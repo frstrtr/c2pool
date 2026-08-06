@@ -1576,14 +1576,19 @@ TEST(DashLlmqTypeReconciler, UndatableStaleEntryAgesOutAndTheAlarmClears)
     LlmqTypeReconciler r(LlmqNetwork::Mainnet);
     for (uint32_t h = kT0; h <= kT0 + 300u; ++h) r.observe(h, qmgr);
 
-    // While the undatable entry is inside the retention window measured from
-    // first sight it is INDISTINGUISHABLE from a freshly mined quorum, and
-    // the honest verdict is the alarm. This is not a regression — it is the
-    // backstop refusing to be blinded by a missing datum.
+    // SEMANTICS SHARPENED for issue #1164 (mode 3): while the undatable entry
+    // is inside the retention window it is served but the [QC-MINED] scanner
+    // has never dated ANY commitment of its type — delivery is not mining, so
+    // the honest verdict is now Unevaluated with the reason named, NOT the
+    // alarm. (The old in-retention alarm survived every RESTART indefinitely
+    // in production, because first-seen dating is in-memory — see the
+    // RestartCannotResurrect test below.)
     {
         auto f = finding_for(r.reconcile(), 1);
         ASSERT_TRUE(f.has_value());
-        EXPECT_EQ(f->verdict, LlmqTypeVerdict::UnexpectedType);
+        EXPECT_EQ(f->verdict, LlmqTypeVerdict::Unevaluated);
+        EXPECT_STREQ(f->pending_reason, "delivered-but-never-scanner-dated");
+        EXPECT_TRUE(r.defects().empty()) << r.format_defects();
     }
 
     // ...but past first-sight + retention the entry ages out: sightings stop.
@@ -1602,6 +1607,47 @@ TEST(DashLlmqTypeReconciler, UndatableStaleEntryAgesOutAndTheAlarmClears)
     EXPECT_LT(f->sightings, r.observations());
     EXPECT_EQ(f->sightings, 577u);              // kT0 .. kT0+576 inclusive
     EXPECT_EQ(f->last_height, kT0 + 576u);
+}
+
+TEST(DashLlmqTypeReconciler, RestartCannotResurrectAnUndatedEntryAlarm)
+{
+    // MODE 3 — the shape MEASURED on the hotel reserve node (issue #1164).
+    // The reconciler is in-memory: a restart empties first-seen dating, so a
+    // never-mined entry that mnlistdiff keeps delivering was re-dated fresh
+    // by every NEW process and rang MINED-BUT-NOT-REQUIRED for a whole
+    // retention window after EVERY restart — the alarm survived restarts
+    // indefinitely while a full-span chain sweep showed ZERO commitments of
+    // the type on-chain. With the scanner-confirmation gate the indictment
+    // needs at least one scanner-dated entry, which a never-mined type can
+    // never produce — in the first process, or any process after it.
+    constexpr uint32_t kT0 = 1'950'000u;
+    QuorumManager qmgr;
+    add_required_mainnet_entries(qmgr, 0x60);   // undated (mining_height 0)
+    vendor::QuorumTail tail;
+    tail.newQuorums.push_back(real_commitment(kLlmq50_60, h256(0x91), 0, 0x91));
+    qmgr.apply(tail);                            // type 1, never scanner-dated
+
+    // Process 1: a full retention window of observation. No defect, and the
+    // reason is named rather than silently fine.
+    {
+        LlmqTypeReconciler r(LlmqNetwork::Mainnet);
+        for (uint32_t h = kT0; h <= kT0 + 600u; ++h) r.observe(h, qmgr);
+        EXPECT_TRUE(r.defects().empty()) << r.format_defects();
+    }
+
+    // "Restart": a fresh reconciler over the SAME still-served entry, at the
+    // heights where the next process would resume. Pre-fix this rang for
+    // another 576 blocks; now it must stay silent, with the same named
+    // reason, for as many restarts as ever happen.
+    LlmqTypeReconciler r2(LlmqNetwork::Mainnet);
+    for (uint32_t h = kT0 + 601u; h <= kT0 + 1'200u; ++h) r2.observe(h, qmgr);
+    EXPECT_TRUE(r2.defects().empty())
+        << "restart resurrected the undated-entry alarm: "
+        << r2.format_defects();
+    auto f = finding_for(r2.reconcile(), 1);
+    ASSERT_TRUE(f.has_value());
+    EXPECT_EQ(f->verdict, LlmqTypeVerdict::Unevaluated);
+    EXPECT_STREQ(f->pending_reason, "delivered-but-never-scanner-dated");
 }
 
 TEST(DashLlmqTypeReconciler, GenuinelyMinedUnexpectedTypeStillAlarms)
