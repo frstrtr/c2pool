@@ -4529,7 +4529,28 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             " getheaders + mempool + mnlistdiff(cold)"
                          << (discover ? " + getaddr (peer crawl)" : "");
                 cp->send_getheaders(70230, hc->get_locator(), uint256::ZERO);
-                cp->send_mempool();
+                // ── BIP35 AND THE SOLE-INGESTION-PATH INVARIANT ──────────
+                // mempool.hpp names "BIP35 sync drain" as one of the seams
+                // that turns two ConnectBlock reject rows (bad-txns-nonfinal,
+                // mandatory-script-verify-flag) from N/A into GAPs. Those rows
+                // are argued N/A because every tx was RELAY-admitted: a peer
+                // validated it against the current tip and chose to announce
+                // it. A BIP35 drain is different in kind — it dumps the peer's
+                // whole pool, including entries admitted long ago under
+                // policy we cannot date.
+                //
+                // Before the MSG_TX pull existed this call was harmless: the
+                // inv handler discarded the announcements, so the drain was a
+                // no-op (its own comment said so). Arming the pull would make
+                // it live, and would silently convert those two rows into gaps
+                // without the re-audit the invariant demands.
+                //
+                // So when ingest is armed we do NOT drain: the pool fills from
+                // relay only, exactly the path the invariant is written about.
+                // The cost is cold-start latency (we learn a transaction when
+                // it is next announced, not retroactively) — minutes on a
+                // 2.5-minute chain, and it buys the audit staying true.
+                if (!cp->tx_pull_enabled()) cp->send_mempool();
                 // Peer-crawl: getaddr feeds set_addr_callback -> the isolated
                 // peer manager (addr-crawl source, +50 scored) so the diverse
                 // independent peer set grows off live wire discovery.
