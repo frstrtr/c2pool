@@ -1323,9 +1323,29 @@ public:
     uint64_t body_rerequests_exhausted() const { return m_body_rerequests_exhausted; }
 
     /// Send a getmnlistd (SML diff request) — E2/E3 masternode-list sync seam.
+    ///
+    /// OBSERVABILITY (2026-08-06). This used to return SILENTLY when there was
+    /// no primary peer, and logged nothing on the way out either. That made a
+    /// whole class of stall undiagnosable: when the hotel node's SML sat behind
+    /// the tip for 156 s there was no way to tell from the log whether the
+    /// request had been sent and gone unanswered, or had never been sent at
+    /// all. Those two have completely different fixes, and the absence of this
+    /// one line is what made the question unanswerable.
+    ///
+    /// Full hashes, not a prefix: at mainnet difficulty the leading ~14 nibbles
+    /// of a block hash are difficulty padding and carry no information, and
+    /// this line fires about once per tip so it can afford the bytes.
     void send_getmnlistd(const uint256& base_block_hash, const uint256& block_hash)
     {
-        if (!m_primary) return;
+        if (!m_primary) {
+            LOG_WARNING << "[COIN-P2P] getmnlistd DROPPED (no primary peer):"
+                        << " base=" << base_block_hash.GetHex()
+                        << " target=" << block_hash.GetHex()
+                        << " — the SML cannot advance until a peer is up";
+            return;
+        }
+        LOG_INFO << "[COIN-P2P] getmnlistd -> base=" << base_block_hash.GetHex()
+                 << " target=" << block_hash.GetHex();
         auto msg = message_getmnlistd::make_raw(base_block_hash, block_hash);
         m_primary->write(msg);
     }
