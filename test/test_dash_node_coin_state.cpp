@@ -907,14 +907,121 @@ TEST(DashServeGateNamesRefusal, PayeeFreshIsViable) {        // negative twin
     EXPECT_TRUE(st.describe_decline().viable);
 }
 
-TEST(DashServeGateNamesRefusal, DmnStaleNamesSmlHashAndTipHash) {
+// A REALISTIC DASH mainnet block hash. raw256() above is NOT one: its bytes are
+// base+i, so its display hex has no leading zeros and any rendering of it looks
+// discriminating. A real block hash carries the DIFFICULTY PADDING — at mainnet
+// difficulty the display hex opens with ~14 zero nibbles (measured on the hotel
+// node 2026-08-06: 000000000000000e, 000000000000001c, 0000000000000018).
+// Zeroing the top 7 bytes reproduces exactly that shape.
+//
+// This helper exists because THE FIXTURE IS WHAT HID THE DEFECT: the old
+// DmnStaleNamesSmlHashAndTipHash asserted GetHex().substr(0, 12) and passed,
+// while in production both sides of that comparison rendered as twelve zeros
+// on 114 of 114 refusals.
+static uint256 pow256(uint8_t entropy) {
+    uint256 h;
+    std::array<uint8_t, 32> p{};
+    for (size_t i = 0; i < 25; ++i) p[i] = static_cast<uint8_t>(entropy + i);
+    // p[25..31] left ZERO -> 14 leading zero nibbles in GetHex().
+    std::memcpy(h.data(), p.data(), 32);
+    return h;
+}
+
+// Guard the helper itself: if it ever stops producing a padded hash, the tests
+// below would silently stop testing anything.
+TEST(DashServeGateNamesRefusal, PowFixtureActuallyCarriesDifficultyPadding) {
+    EXPECT_EQ(pow256(0x11).GetHex().substr(0, 12), std::string(12, '0'));
+    EXPECT_EQ(pow256(0x22).GetHex().substr(0, 12), std::string(12, '0'))
+        << "two DIFFERENT mainnet-shaped hashes must share their leading "
+           "nibbles — that is the whole reason the old rendering was blind";
+}
+
+TEST(DashServeGateNamesRefusal, DmnStaleNamesSmlHeightAndTipHeight) {
     NodeCoinState st;
     seed_healthy_armed(st);
     st.set_sml_current_hash(raw256(0xCD));   // SML current at a DIFFERENT block
+    st.set_sml_current_height(static_cast<int64_t>(H - 4));
     const DeclineReport d = st.describe_decline();
     EXPECT_EQ(d.cause, "dmn-stale");
-    EXPECT_EQ(d.value, raw256(0xCD).GetHex().substr(0, 12));
-    EXPECT_EQ(d.threshold, raw256(0xAB).GetHex().substr(0, 12));
+    // HEIGHT first (how far behind), discriminating hash TAIL second (which
+    // block — and same-height forks, which the height alone cannot express).
+    EXPECT_EQ(d.value, "h=" + std::to_string(H - 4) + ",..."
+                           + dash::coin::discriminating_hash_tail(raw256(0xCD)));
+    EXPECT_EQ(d.threshold, "h=" + std::to_string(H - 1) + ",..."
+                               + dash::coin::discriminating_hash_tail(raw256(0xAB)));
+}
+
+// THE DEFECT, as production actually presents it. Both hashes are mainnet-
+// shaped, so the pre-fix rendering collapses them onto the same twelve zeros
+// and the refusal reports value == threshold — on a refusal whose entire
+// meaning is that the two DIFFER.
+TEST(DashServeGateNamesRefusal, DmnStaleDistinguishesTwoMainnetPowHashes) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    // Re-stamp the tip with a mainnet-SHAPED hash. set_tip is the last thing
+    // seed_healthy_armed does, so this simply replaces it; the height is
+    // unchanged, so every height-keyed clause above dmn-stale stays satisfied.
+    st.set_tip(H - 1, pow256(0x11), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u);
+    st.set_sml_current_hash(pow256(0x22));
+
+    const DeclineReport d = st.describe_decline();
+    ASSERT_EQ(d.cause, "dmn-stale");
+    EXPECT_NE(d.value, d.threshold)
+        << "dmn-stale refuses BECAUSE the SML hash differs from the tip hash, "
+           "so a report whose value EQUALS its threshold cannot be read at all. "
+           "Measured on the hotel node 2026-08-06: 114 of 114 refusals printed "
+           "value=000000000000 threshold=000000000000, because both sides were "
+           "GetHex().substr(0, 12) of a PROOF-OF-WORK hash and those nibbles "
+           "are the difficulty padding. Report the discriminating TAIL.";
+    EXPECT_EQ(d.value.find(std::string(12, '0')), std::string::npos)
+        << "the reported value is still (or contains) the all-zero difficulty "
+           "padding — it carries no information about which block the SML is at";
+}
+
+// The height half, which is what turns "different" into "how far behind".
+// Uses the diagnostic height seam the maintainer publishes beside the hash.
+TEST(DashServeGateNamesRefusal, DmnStaleNamesHowFarBehindTheDmlIs) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_tip(H - 1, pow256(0x11), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u);
+    st.set_sml_current_hash(pow256(0x22));
+    st.set_sml_current_height(static_cast<int64_t>(H - 3));
+
+    const DeclineReport d = st.describe_decline();
+    ASSERT_EQ(d.cause, "dmn-stale");
+    EXPECT_NE(d.value.find("h=" + std::to_string(H - 3)), std::string::npos)
+        << "the report must say HOW FAR BEHIND the DML is — the only quantity "
+           "an operator can act on. A hash says THAT it differs, never by how "
+           "much, and every long dmn-stale episode measured in production was "
+           "closed by the next block arriving rather than by the SML catching "
+           "up at the same tip.";
+    EXPECT_NE(d.threshold.find("h=" + std::to_string(H - 1)), std::string::npos);
+}
+
+// Never reported (cold maintainer) must read as n/a, not as height 0 — the
+// #1039 discipline: do not print a measurement that was never taken.
+TEST(DashServeGateNamesRefusal, DmnStaleUnreportedHeightIsNotZero) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_sml_current_hash(raw256(0xCD));   // height never published
+    const DeclineReport d = st.describe_decline();
+    ASSERT_EQ(d.cause, "dmn-stale");
+    EXPECT_NE(d.value.find("h=n/a"), std::string::npos);
+    EXPECT_EQ(d.value.find("h=0,"), std::string::npos)
+        << "0 would read as 'we measured the SML height and it was genesis'";
+}
+
+// A cold / reorg-wiped SML is a DIFFERENT operator situation from a lagging
+// one, and "000000000000" could express neither.
+TEST(DashServeGateNamesRefusal, DmnStaleColdSmlSaysColdNotZeros) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_sml_current_hash(uint256::ZERO);
+    const DeclineReport d = st.describe_decline();
+    ASSERT_EQ(d.cause, "dmn-stale");
+    EXPECT_EQ(d.value, "cold/wiped");
 }
 
 TEST(DashServeGateNamesRefusal, DmnCurrentAtTipIsViable) {   // negative twin

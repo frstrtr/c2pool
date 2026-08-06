@@ -526,9 +526,15 @@ public:
         // be papered over by a later clean incremental. Reject + keep prior state.
         const uint256 have_at = m_state.sml_current_hash();
         if (!diff.baseBlockHash.IsNull() && diff.baseBlockHash != have_at) {
-            LOG_WARNING << "[SML] REJECT diff: base "
-                        << diff.baseBlockHash.GetHex().substr(0, 16)
-                        << " != SML-current " << have_at.GetHex().substr(0, 16)
+            // Discriminating TAILs: these two hashes are compared for
+            // INEQUALITY, so rendering the difficulty padding they share made
+            // the line unable to show the very difference it reports.
+            LOG_WARNING << "[SML] REJECT diff: base ..."
+                        << discriminating_hash_tail(diff.baseBlockHash)
+                        << " != SML-current ..." << discriminating_hash_tail(have_at)
+                        << " @ h=" << (m_sml_height_paired
+                                           ? std::to_string(m_sml_current_height)
+                                           : std::string("n/a"))
                         << " (base-continuity guard) — awaiting a full/base-matched diff";
             return;
         }
@@ -705,7 +711,24 @@ public:
         // (NodeCoinState::make_embedded_work_inputs) compares this to the tip
         // we build on, and the next incremental diff's base must match it.
         m_state.set_sml_current_hash(diff.blockHash);
-        LOG_INFO << "[SML] applied diff: SML +" << sml_r.added_or_updated
+        // Publish the HEIGHT beside the hash, from the same statement, so the
+        // freshness pair can never disagree about which block it describes.
+        // Diagnostic only — no gate reads it; it exists so a `dmn-stale`
+        // refusal can say HOW FAR behind the DML is instead of only THAT it
+        // differs (see NodeCoinState::set_sml_current_height).
+        m_state.set_sml_current_height(
+            m_sml_height_paired ? static_cast<int64_t>(m_sml_current_height)
+                                : static_cast<int64_t>(-1));
+        LOG_INFO << "[SML] applied diff @ h="
+                 << (m_sml_height_paired
+                         ? std::to_string(m_sml_current_height)
+                         : std::string("n/a"))
+                 // The discriminating TAIL, not the difficulty padding: this
+                 // line is the corroborating evidence for every dmn-stale
+                 // episode, and printing the leading nibbles of a PoW hash left
+                 // it unable to corroborate anything.
+                 << " ..." << discriminating_hash_tail(diff.blockHash)
+                 << ": SML +" << sml_r.added_or_updated
                  << " -" << sml_r.deleted << " => " << m_state.sml().size()
                  << " MNs; quorums +" << q_added << " -" << q_deleted
                  << " => " << m_state.qmgr().active_count()

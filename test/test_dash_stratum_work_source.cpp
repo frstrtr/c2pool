@@ -2339,6 +2339,67 @@ TEST(DashRunArmResolution, NoMainnetCombinationWithoutOptInEverEnablesTheArm)
 using dash::coin::ServeGateJournal;
 using Trig = dash::coin::ServeGateJournal::Trigger;
 
+// ── Episode DURATION: the metric that actually ranks the causes ─────────────
+// Measured on the hotel node over 5h33m (2026-08-06): 109 `dmn-stale` episodes
+// vs 3 `qc-plan-underivable`. BY COUNT dmn-stale is 97% of the problem. BY TIME
+// OFF THE EMBEDDED ARM, 104 of those 109 lasted under a second (~54 ms each,
+// 5.6 s in total — the ordinary tip-change -> getmnlistd round trip) while the
+// 3 qc-plan episodes cost 351 s. The two readings rank the work in OPPOSITE
+// orders, and the journal could only ever emit the misleading one.
+TEST(DashServeGateJournal, ResumeReportsHowLongTheArmWasDown) {
+    ServeGateJournal j(300);
+    j.observe(true,  "", 1000);                    // serving
+    j.observe(false, "dmn-stale", 1010);           // episode starts
+    auto d = j.observe(true, "", 1130);            // resumes 120 s later
+    ASSERT_EQ(d.trigger, Trig::Resumed);
+    EXPECT_EQ(d.episode_sec, 120)
+        << "the RESUMED line must carry the cost of the episode in seconds; a "
+           "decline COUNT cannot distinguish a 54 ms tip-change round trip from "
+           "a four-minute outage, and those need opposite responses";
+}
+
+// A cause change mid-episode must NOT restart the clock: the arm never came
+// back, so "how long have we been off?" is answered from the FIRST decline,
+// not from the last relabelling.
+TEST(DashServeGateJournal, CauseChangeDoesNotRestartTheEpisodeClock) {
+    ServeGateJournal j(300);
+    j.observe(true,  "", 1000);
+    j.observe(false, "qc-plan-underivable", 1010); // episode starts here
+    j.observe(false, "dmn-stale", 1100);           // cause changes, still down
+    auto d = j.observe(true, "", 1160);
+    ASSERT_EQ(d.trigger, Trig::Resumed);
+    EXPECT_EQ(d.episode_sec, 150)
+        << "measured from the FIRST decline (1010), not the cause change "
+           "(1100) — otherwise every long episode that changes cause reports "
+           "only its final segment and the true loss is understated";
+}
+
+// The decline lines carry it too, so an episode still in flight is readable
+// without waiting for it to end.
+TEST(DashServeGateJournal, DeclineLinesCarryTheRunningEpisodeAge) {
+    ServeGateJournal j(10);
+    j.observe(true,  "", 1000);
+    auto first = j.observe(false, "dmn-stale", 1005);
+    ASSERT_EQ(first.trigger, Trig::Transition);
+    EXPECT_EQ(first.episode_sec, 0);
+    auto beat = j.observe(false, "dmn-stale", 1065);   // heartbeat
+    ASSERT_EQ(beat.trigger, Trig::Heartbeat);
+    EXPECT_EQ(beat.episode_sec, 60)
+        << "a heartbeat that cannot say how long the arm has already been down "
+           "reads identically at 1 s and at 4 min";
+}
+
+// While the arm is serving there is no episode; the field must stay absent
+// rather than report a stale or zero duration.
+TEST(DashServeGateJournal, ServingArmHasNoEpisodeDuration) {
+    ServeGateJournal j(300);
+    j.observe(false, "dmn-stale", 1000);
+    j.observe(true,  "", 1030);
+    auto d = j.observe(true, "", 1090);   // still serving, nothing emitted
+    EXPECT_FALSE(d.emit());
+    EXPECT_EQ(d.episode_sec, -1);
+}
+
 TEST(DashServeGateJournal, FirstObservationEverIsAlwaysEmitted) {
     ServeGateJournal j(300);
     auto d = j.observe(false, "dmn-stale", 1000);
