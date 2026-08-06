@@ -1903,6 +1903,8 @@
                         <div class="legend-item" data-series="connected" onclick="toggleSeries('connected', this)" title="Click to toggle connected miners (all connections)"><span class="legend-color" style="background: #e91e63;"></span><span>Connected</span></div>
                         <div class="legend-item" data-series="lucktrend" onclick="toggleSeries('lucktrend', this)" title="Click to toggle luck trend line"><span class="legend-color" style="background: #ffc107;"></span><span>Luck</span></div>
                         <div class="legend-item disabled" data-series="netdiff" onclick="toggleSeries('netdiff', this)" title="Click to toggle network difficulty"><span class="legend-color" style="background: #8b5cf6;"></span><span>Net Diff</span></div>
+                        <div class="legend-item" data-series="local" onclick="toggleSeries('local', this)" title="Click to toggle THIS node's own hashrate (as distinct from the pool total)"><span class="legend-color" style="background: #00d4ff;"></span><span>Local</span></div>
+                        <div class="legend-item disabled" data-series="localdoa" onclick="toggleSeries('localdoa', this)" title="Click to toggle this node's dead-on-arrival hashrate"><span class="legend-color" style="background: #ff8800;"></span><span>Local DOA</span></div>
                     </div>
                     <div class="graph-container compact" id="hashrate-graph"></div>
                     <div class="graph-stats compact">
@@ -1934,6 +1936,8 @@
                     <div class="legend-item" data-series="miners" onclick="toggleSeries('miners', this)" title="Click to toggle unique miner addresses" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #673ab7; width: 14px; height: 14px;"></span><span>Miners</span></div>
                     <div class="legend-item" data-series="lucktrend" onclick="toggleSeries('lucktrend', this)" title="Click to toggle luck trend line" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #ffc107; width: 14px; height: 14px;"></span><span>Luck</span></div>
                     <div class="legend-item disabled" data-series="netdiff" onclick="toggleSeries('netdiff', this)" title="Click to toggle network difficulty" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #8b5cf6; width: 14px; height: 14px;"></span><span>Net Diff</span></div>
+                    <div class="legend-item" data-series="local" onclick="toggleSeries('local', this)" title="Click to toggle THIS node's own hashrate (as distinct from the pool total)" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #00d4ff; width: 14px; height: 14px;"></span><span>Local</span></div>
+                    <div class="legend-item disabled" data-series="localdoa" onclick="toggleSeries('localdoa', this)" title="Click to toggle this node's dead-on-arrival hashrate" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #ff8800; width: 14px; height: 14px;"></span><span>Local DOA</span></div>
                 </div>
                 <button class="fullscreen-close" onclick="toggleGraphFullscreen()">✕ Close</button>
             </div>
@@ -6901,9 +6905,11 @@
         var graphUniqueMinersData = [];
         var graphBlocks = [];
         var graphNetworkDiffData = [];
+        var graphLocalData = [];
+        var graphLocalDeadData = [];
         var isFullscreen = false;
         var fullscreenChart = null;
-        var seriesVisibility = { good: true, doa: true, blocks: true, workers: false, miners: true, connected: true, lucktrend: true, netdiff: false };
+        var seriesVisibility = { good: true, doa: true, blocks: true, workers: false, miners: true, connected: true, lucktrend: true, netdiff: false, local: true, localdoa: false };
         
         function toggleSeries(seriesName, element) {
             seriesVisibility[seriesName] = !seriesVisibility[seriesName];
@@ -6917,8 +6923,8 @@
                 }
             });
             
-            // Map series names to indices (order: good, doa, blocks, workers, miners, connected, lucktrend, netdiff)
-            var seriesIndexMap = { good: 0, doa: 1, blocks: 2, workers: 3, miners: 4, connected: 5, lucktrend: 6, netdiff: 7 };
+            // Map series names to indices (order: good, doa, blocks, workers, miners, connected, lucktrend, netdiff, local, localdoa)
+            var seriesIndexMap = { good: 0, doa: 1, blocks: 2, workers: 3, miners: 4, connected: 5, lucktrend: 6, netdiff: 7, local: 8, localdoa: 9 };
             var seriesIndex = seriesIndexMap[seriesName];
             
             if (hashrateChart && hashrateChart.series[seriesIndex]) {
@@ -6946,7 +6952,7 @@
                 overlay.classList.add('active');
                 document.body.style.overflow = 'hidden';
                 // Render fullscreen chart
-                renderFullscreenGraph(graphData, graphMinerData, graphUniqueMinersData, graphConnectedMinersData, graphBlocks, graphNetworkDiffData);
+                renderFullscreenGraph(graphData, graphMinerData, graphUniqueMinersData, graphConnectedMinersData, graphBlocks, graphNetworkDiffData, graphLocalData, graphLocalDeadData);
                 // Update button states
                 updatePeriodButtons();
             } else {
@@ -6990,17 +6996,21 @@
             var connectedMinersData = null;
             var blocksData = [];
             var networkDiffData = [];
+            var localData = [];
+            var localDeadData = [];
             
             function tryRender() {
                 loadCount++;
-                if (loadCount === 6) {  // Loading 6 resources: hashrate, worker_count, unique_miner_count, connected_miners, blocks, network_difficulty
+                if (loadCount === 8) {  // hashrate, worker_count, unique_miner_count, connected_miners, blocks, network_difficulty, local_hash_rate, local_dead_hash_rate
                     graphData = hashrateData;
                     graphMinerData = minerCountData;
                     graphUniqueMinersData = uniqueMinerCountData;
                     graphConnectedMinersData = connectedMinersData;
                     graphBlocks = blocksData;
                     graphNetworkDiffData = networkDiffData;
-                    renderHashrateGraph(hashrateData, minerCountData, uniqueMinerCountData, connectedMinersData, blocksData, networkDiffData);
+                    graphLocalData = localData;
+                    graphLocalDeadData = localDeadData;
+                    renderHashrateGraph(hashrateData, minerCountData, uniqueMinerCountData, connectedMinersData, blocksData, networkDiffData, localData, localDeadData);
                 }
             }
             
@@ -7061,6 +7071,36 @@
             
             d3.json('../network_difficulty?period=' + currentGraphPeriod, function(data) {
                 networkDiffData = data || [];
+                tryRender();
+            });
+            
+            // This node's OWN hashrate, as distinct from the pool total.
+            // Both sources are already served by rest_web_graph_data() and are
+            // populated on every coin -- see web-static/graphs.html, which has
+            // plotted them on a separate legacy page since the p2pool port.
+            var localEndpoints = {
+                'hour': '../web/graph_data/local_hash_rate/last_hour',
+                'day': '../web/graph_data/local_hash_rate/last_day',
+                'week': '../web/graph_data/local_hash_rate/last_week',
+                'month': '../web/graph_data/local_hash_rate/last_month',
+                'year': '../web/graph_data/local_hash_rate/last_year'
+            };
+            
+            var localDeadEndpoints = {
+                'hour': '../web/graph_data/local_dead_hash_rate/last_hour',
+                'day': '../web/graph_data/local_dead_hash_rate/last_day',
+                'week': '../web/graph_data/local_dead_hash_rate/last_week',
+                'month': '../web/graph_data/local_dead_hash_rate/last_month',
+                'year': '../web/graph_data/local_dead_hash_rate/last_year'
+            };
+            
+            d3.json(localEndpoints[currentGraphPeriod], function(data) {
+                localData = data || [];
+                tryRender();
+            });
+            
+            d3.json(localDeadEndpoints[currentGraphPeriod], function(data) {
+                localDeadData = data || [];
                 tryRender();
             });
         }
@@ -7153,7 +7193,7 @@
             });
         }
 
-        function renderHashrateGraph(data, minerData, uniqueMinersData, connectedData, blocks, networkDiffSamples) {
+        function renderHashrateGraph(data, minerData, uniqueMinersData, connectedData, blocks, networkDiffSamples, localSamples, localDeadSamples) {
             var container = document.getElementById('hashrate-graph');
             blocks = blocks || [];
             minerData = minerData || [];
@@ -7230,6 +7270,26 @@
                 if (timestamp >= minTime && timestamp <= maxTime) {
                     var count = d[1] || 0;
                     connectedCount.push([timestamp, count]);
+                }
+            });
+            
+            // Parse this node's OWN hashrate. Scalar H/s, the same unit as the
+            // pool series, so it shares yAxis 0 -- a node contributing a small
+            // slice of the pool legitimately draws a low line. Both sources are
+            // already served by rest_web_graph_data() on every coin; only the
+            // main chart never asked for them (#919).
+            var localRate = [];
+            var localDeadRate = [];
+            (localSamples || []).forEach(function(d) {
+                var timestamp = d[0] * 1000;
+                if (timestamp >= minTime && timestamp <= maxTime) {
+                    localRate.push([timestamp, d[1] || 0]);
+                }
+            });
+            (localDeadSamples || []).forEach(function(d) {
+                var timestamp = d[0] * 1000;
+                if (timestamp >= minTime && timestamp <= maxTime) {
+                    localDeadRate.push([timestamp, d[1] || 0]);
                 }
             });
             
@@ -7814,16 +7874,36 @@
                     },
                     visible: seriesVisibility.netdiff,
                     yAxis: 0
+                }, {
+                    type: 'spline',
+                    name: 'Local',
+                    data: localRate,
+                    color: '#00d4ff',
+                    lineWidth: 2,
+                    dashStyle: 'ShortDot',
+                    marker: { enabled: false },
+                    visible: seriesVisibility.local,
+                    yAxis: 0
+                }, {
+                    type: 'spline',
+                    name: 'Local DOA',
+                    data: localDeadRate,
+                    color: '#ff8800',
+                    lineWidth: 1,
+                    dashStyle: 'ShortDot',
+                    marker: { enabled: false },
+                    visible: seriesVisibility.localdoa,
+                    yAxis: 0
                 }]
             });
             
             // Also update fullscreen if open
             if (isFullscreen) {
-                renderFullscreenGraph(data, minerData, uniqueMinersData, connectedData, blocks, networkDiffSamples);
+                renderFullscreenGraph(data, minerData, uniqueMinersData, connectedData, blocks, networkDiffSamples, localSamples, localDeadSamples);
             }
         }
         
-        function renderFullscreenGraph(data, minerData, uniqueMinersData, connectedData, blocks, networkDiffSamples) {
+        function renderFullscreenGraph(data, minerData, uniqueMinersData, connectedData, blocks, networkDiffSamples, localSamples, localDeadSamples) {
             var container = document.getElementById('fullscreen-graph');
             blocks = blocks || graphBlocks || [];
             minerData = minerData || [];
@@ -7889,6 +7969,26 @@
                 var timestamp = d[0] * 1000;
                 var count = d[1] || 0;
                 connectedCount.push([timestamp, count]);
+            });
+            
+            // Parse this node's OWN hashrate. Scalar H/s, the same unit as the
+            // pool series, so it shares yAxis 0 -- a node contributing a small
+            // slice of the pool legitimately draws a low line. Both sources are
+            // already served by rest_web_graph_data() on every coin; only the
+            // main chart never asked for them (#919).
+            var localRate = [];
+            var localDeadRate = [];
+            (localSamples || []).forEach(function(d) {
+                var timestamp = d[0] * 1000;
+                if (timestamp >= minTime && timestamp <= maxTime) {
+                    localRate.push([timestamp, d[1] || 0]);
+                }
+            });
+            (localDeadSamples || []).forEach(function(d) {
+                var timestamp = d[0] * 1000;
+                if (timestamp >= minTime && timestamp <= maxTime) {
+                    localDeadRate.push([timestamp, d[1] || 0]);
+                }
             });
             
             // Process blocks - filter to exact time range for proper data alignment
@@ -8436,6 +8536,26 @@
                         symbol: 'circle'
                     },
                     visible: seriesVisibility.netdiff,
+                    yAxis: 0
+                }, {
+                    type: 'spline',
+                    name: 'Local',
+                    data: localRate,
+                    color: '#00d4ff',
+                    lineWidth: 2,
+                    dashStyle: 'ShortDot',
+                    marker: { enabled: false },
+                    visible: seriesVisibility.local,
+                    yAxis: 0
+                }, {
+                    type: 'spline',
+                    name: 'Local DOA',
+                    data: localDeadRate,
+                    color: '#ff8800',
+                    lineWidth: 1,
+                    dashStyle: 'ShortDot',
+                    marker: { enabled: false },
+                    visible: seriesVisibility.localdoa,
                     yAxis: 0
                 }]
             });
