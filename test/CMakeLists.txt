@@ -926,10 +926,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     # D-DASH.WORKSOURCE-OWNERSHIP (#1134) is its SERVE-path sibling and rides the
     # same target for the same reason — it guards stratum/work_source.{cpp,hpp}
     # by source text, so it adds no link deps either.
+    # D-DASH.SML-RESYNC rides it too (#143): the watchdog is header-only over
+    # core/uint256.hpp, so it adds no link deps either.
     add_executable(test_dash_node_coin_state
         test_dash_node_coin_state.cpp
         test_dash_oracle_shadow_ownership.cpp
-        test_dash_work_source_ownership.cpp)
+        test_dash_work_source_ownership.cpp
+        test_dash_sml_resync_watchdog.cpp)
     target_link_libraries(test_dash_node_coin_state PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
