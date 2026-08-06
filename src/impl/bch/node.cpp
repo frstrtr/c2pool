@@ -2156,6 +2156,16 @@ void NodeImpl::clean_tracker()
                      << " heads=" << m_tracker.chain.get_heads().size();
     }
 
+    // Step 3b: bounded known_txs eviction (B-BCH.EVICT). m_known_txs is the
+    // tx-forward cache, recency-ordered by m_known_txs_order (push-only on learn
+    // in protocol_{legacy,actual}.cpp). Its cap was only ever enforced inside the
+    // dead lockless prune_shares() (zero callers), so m_known_txs grew unbounded.
+    // Enforce it here on the live periodic clean pass, under the exclusive tracker
+    // lock, mirroring btc/ltc/dgb. Tx-forward cache only â no consensus/mint/
+    // payout state is read or written.
+    if (m_known_txs.size() > m_max_known_txs)
+        core::evict_known_txs_to_cap(m_known_txs, m_known_txs_order, m_max_known_txs);
+
     // Step 4: re-score after pruning (inline, already holding lock)
     {
         auto block_rel_height = m_block_rel_height_fn
