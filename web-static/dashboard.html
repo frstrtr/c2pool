@@ -1914,6 +1914,7 @@
                         <div class="graph-stat" title="Worker connections / Unique payout addresses"><div class="graph-stat-label">Workers/Miners</div><div class="graph-stat-value" id="graph-miners">-</div></div>
                         <div class="graph-stat"><div class="graph-stat-label">Avg Luck</div><div class="graph-stat-value" id="graph-luck">-</div></div>
                     </div>
+                    <div class="graph-diagnostic" id="hashrate-diagnostic" style="margin: 6px 0 2px; font-size: 12px; color: var(--text-muted);" title="Effective hashrate the pool's found blocks imply (Bayesian 95% credible interval on block rate), versus the hashrate the miners report. If reported sits outside the interval, the rigs are not delivering what they claim.">-</div>
                 </div>
             </div>
         </div>
@@ -1949,6 +1950,7 @@
                 <div class="fullscreen-stat" title="Worker connections / Unique payout addresses"><div class="fullscreen-stat-label">Workers/Miners</div><div class="fullscreen-stat-value" id="fs-graph-miners">-</div></div>
                 <div class="fullscreen-stat"><div class="fullscreen-stat-label">Avg Luck</div><div class="fullscreen-stat-value" id="fs-graph-luck">-</div></div>
             </div>
+            <div class="fullscreen-diagnostic" id="fs-hashrate-diagnostic" style="margin: 8px 16px; font-size: 13px; color: var(--text-muted);">-</div>
         </div>
         
         <!-- Active Miners -->
@@ -7193,6 +7195,77 @@
             });
         }
 
+        // ── CI95 "Effective vs reported" hashrate diagnostic ──────────────────
+        // Ported from our p2pool-dash fork's updateHashrateDiagnostic, WITH its
+        // verdict logic corrected.
+        //
+        // MODEL. Block finding is a Poisson process with rate lambda
+        // (blocks/sec). Gamma is conjugate to Poisson, so with a prior
+        // Gamma(a0, b0) centred on the REPORTED hashrate and k blocks found over
+        // windowSec seconds, the posterior is Gamma(a0+k, b0+windowSec) in
+        // closed form. The 95% band is the normal approximation mean +/- 1.96 sd
+        // clipped at 0, converted back to H/s via netDiff * 2^32.
+        //
+        // The reported hashrate is what the miners CLAIM; the band is what the
+        // blocks they actually found IMPLY. It answers "are the rigs delivering
+        // the hashrate they claim?" -- a misconfiguration / fraud detector. A
+        // 95% band on LUCK would be [~27%, ~3950%] and useless; a band on
+        // effective hashrate over shares/blocks is tight enough to act on.
+        //
+        // Every input is already fetched by the dashboard (bucket-a).
+        function updateHashrateDiagnostic(containerId, avgHashrate, blocksInWindow, windowSec, netDiff, labelPrefix) {
+            var el = document.getElementById(containerId);
+            if (!el) return;
+            if (!netDiff || netDiff <= 0 || !windowSec || windowSec <= 0) {
+                el.textContent = labelPrefix + 'Not enough data yet';
+                el.style.color = 'var(--text-muted)';
+                return;
+            }
+            var blockHashes = netDiff * 4294967296; // 2^32 expected hashes/block
+            var reported = avgHashrate || 0;
+            var k = blocksInWindow;
+            var expectedLambdaPrior = (reported > 0) ? (reported / blockHashes) : 0.0000001;
+            var alpha0 = 5;                                  // prior strength ~5 blocks
+            var beta0  = (expectedLambdaPrior > 0) ? (alpha0 / expectedLambdaPrior) : 1e9;
+            var alpha  = alpha0 + k;
+            var beta   = beta0 + windowSec;
+            var meanLambda = alpha / beta;
+            var stdLambda  = Math.sqrt(alpha / (beta * beta));
+            var z = 1.96;
+            var effLow  = Math.max(0, meanLambda - z * stdLambda) * blockHashes;
+            var effHigh = (meanLambda + z * stdLambda) * blockHashes;
+
+            var statusText = labelPrefix + 'CI95 ' + format_hashrate(effLow) + ' \u2013 ' +
+                             format_hashrate(effHigh) + ' vs reported ' + format_hashrate(reported);
+
+            // VERDICT FIX. The fork tested effHigh against reported*0.8 ONE-SIDEDLY
+            // and printed "OK" while reported sat OUTSIDE the interval (operator
+            // screenshot: reported 51.70 outside [14.18, 45.38], still "OK"). The
+            // honest test is interval MEMBERSHIP.
+            var color, verdict;
+            if (k < 3) {
+                // REPLACE the verdict, never append to it -- the fork appended
+                // "Low evidence" AFTER "OK", asserting a call it then withdrew.
+                verdict = 'Low evidence (' + k + ' block' + (k === 1 ? '' : 's') + ' in window, need 3)';
+                color = 'var(--text-muted)';
+            } else if (reported >= effLow && reported <= effHigh) {
+                verdict = 'OK (reported within CI95)';
+                color = 'var(--success)';
+            } else if (reported > effHigh) {
+                var critical = effHigh < reported * 0.6;
+                verdict = critical ? 'Critical: effective far below reported'
+                                   : 'Warning: reported above CI95';
+                color = critical ? 'var(--danger)' : 'var(--warning)';
+            } else {
+                // reported < effLow: more blocks than the reported rate predicts,
+                // usually a reported-hashrate undercount rather than a problem.
+                verdict = 'Note: reported below CI95';
+                color = 'var(--warning)';
+            }
+            el.textContent = statusText + ' \u2022 ' + verdict;
+            el.style.color = color;
+        }
+
         function renderHashrateGraph(data, minerData, uniqueMinersData, connectedData, blocks, networkDiffSamples, localSamples, localDeadSamples) {
             var container = document.getElementById('hashrate-graph');
             blocks = blocks || [];
@@ -7524,6 +7597,24 @@
             } else {
                 document.getElementById('graph-luck').textContent = '-';
             }
+            // CI95 effective-vs-reported band. lastNetDiff read defensively so
+            // this is agnostic to the netdiff sample shape; k counts blocks WE
+            // found in the window regardless of whether luck was computable --
+            // that sidesteps the #1138 undercount (a DASH block recorded with
+            // network_difficulty 0 has null luck but is still a real find) and
+            // excludes relay-learned blocks (found_locally === false).
+            var lastNetDiff = 0;
+            for (var _i = (networkDiffSamples || []).length - 1; _i >= 0; _i--) {
+                var _sm = networkDiffSamples[_i];
+                var _v = Array.isArray(_sm) ? _sm[1] : (_sm && _sm.network_diff);
+                if (_v && _v > 0) { lastNetDiff = _v; break; }
+            }
+            var kBlocks = blockMarkers.filter(function(m) {
+                return m.block && m.block.found_locally !== false;
+            }).length;
+            updateHashrateDiagnostic('hashrate-diagnostic', avg, kBlocks,
+                (maxTime - minTime) / 1000, lastNetDiff, 'Effective vs reported: ');
+
             
             // Create Highcharts chart (regular chart for better pan support)
             var isCompact = container.classList.contains('compact');
@@ -8192,6 +8283,24 @@
             } else {
                 document.getElementById('fs-graph-luck').textContent = '-';
             }
+            // CI95 effective-vs-reported band. lastNetDiff read defensively so
+            // this is agnostic to the netdiff sample shape; k counts blocks WE
+            // found in the window regardless of whether luck was computable --
+            // that sidesteps the #1138 undercount (a DASH block recorded with
+            // network_difficulty 0 has null luck but is still a real find) and
+            // excludes relay-learned blocks (found_locally === false).
+            var lastNetDiff = 0;
+            for (var _i = (networkDiffSamples || []).length - 1; _i >= 0; _i--) {
+                var _sm = networkDiffSamples[_i];
+                var _v = Array.isArray(_sm) ? _sm[1] : (_sm && _sm.network_diff);
+                if (_v && _v > 0) { lastNetDiff = _v; break; }
+            }
+            var kBlocks = blockMarkers.filter(function(m) {
+                return m.block && m.block.found_locally !== false;
+            }).length;
+            updateHashrateDiagnostic('fs-hashrate-diagnostic', avg, kBlocks,
+                (maxTime - minTime) / 1000, lastNetDiff, 'Effective vs reported: ');
+
             
             fullscreenChart = Highcharts.chart('fullscreen-graph', {
                 chart: {
