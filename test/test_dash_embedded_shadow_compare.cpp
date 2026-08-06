@@ -370,12 +370,19 @@ namespace {
 void with_txs(DashWorkData& w, const std::vector<uint8_t>& seeds) {
     w.m_txs.clear();
     w.m_tx_hashes.clear();
+    w.m_tx_fees.clear();
     for (uint8_t sd : seeds) {
         MutableTransaction t;
         t.version = 2;
         w.m_txs.emplace_back(t);
         w.m_tx_hashes.push_back(hashn(sd));
+        w.m_tx_fees.push_back(1000ull * sd);      // deterministic per-txid fee
     }
+}
+// Same set, but our side prices one tx differently from dashd.
+void reprice(DashWorkData& w, uint8_t seed, uint64_t fee) {
+    for (size_t i = 0; i < w.m_tx_hashes.size(); ++i)
+        if (w.m_tx_hashes[i] == hashn(seed)) w.m_tx_fees[i] = fee;
 }
 } // namespace
 
@@ -460,4 +467,100 @@ TEST(DashShadowCompare, UnalignedTxHashesMeasureNothingRatherThanGuess) {
         << "and must never manufacture the dangerous direction";
     EXPECT_EQ(d.theirs, 3u);
     EXPECT_EQ(d.dashd_only, 3u);
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PER-TX FEE AGREEMENT — the VALUATION half of the gate
+//
+// Membership proves we HAVE the transaction. It says nothing about whether we
+// priced it right, and pricing is the half that can cost a block: a coinbase
+// may claim at most subsidy + fees, so OVERSTATING is bad-cb-amount and the
+// block is rejected, while understating merely forfeits the difference.
+//
+// This is also the cheap maturity proof for the UTXO lane: agreement on the
+// coins a template actually spends is strictly less than, and far cheaper
+// than, proving the whole chainstate with hash_serialized_2.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashShadowCompare, PerTxFeeAgreementIsCountedForSharedTxs) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    with_txs(emb,  {1, 2, 3});
+    with_txs(dref, {1, 2, 3, 4});
+
+    const auto d = shadow_tx_set_diff(emb, dref);
+    EXPECT_EQ(d.both, 3u);
+    EXPECT_EQ(d.fee_agree, 3u);         // identical pricing on all shared txs
+    EXPECT_EQ(d.fee_overstated, 0u);
+    EXPECT_EQ(d.fee_understated, 0u);
+
+    const auto o = shadow_evaluate(WorkSource::Embedded, emb,
+                                   std::optional<DashWorkData>(dref));
+    EXPECT_TRUE(has_line_with(o.log_lines, "fee_agree=3"));
+    EXPECT_TRUE(has_line_with(o.log_lines, "fee_over=0"));
+}
+
+// UNDERSTATING forfeits money and keeps the block valid — counted, not alarmed.
+TEST(DashShadowCompare, UnderstatedFeeIsCountedButNotAlarmed) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    with_txs(emb,  {1, 2});
+    with_txs(dref, {1, 2});
+    reprice(emb, 2, 500);               // dashd says 2000, we say 500
+
+    const auto d = shadow_tx_set_diff(emb, dref);
+    EXPECT_EQ(d.fee_understated, 1u);
+    EXPECT_EQ(d.fee_overstated, 0u);
+
+    const auto o = shadow_evaluate(WorkSource::Embedded, emb,
+                                   std::optional<DashWorkData>(dref));
+    EXPECT_TRUE(has_line_with(o.log_lines, "fee_under=1"));
+    EXPECT_FALSE(has_line_with(o.log_lines, "FEE OVERSTATED"))
+        << "understating is a revenue loss, not a block loss — do not cry wolf";
+}
+
+// OVERSTATING is the block-losing direction and the line must say so, with the
+// txid and the magnitude, because that is what an operator acts on.
+TEST(DashShadowCompare, OverstatedFeeIsTheBlockLosingDirectionAndSaysSo) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    with_txs(emb,  {1, 2});
+    with_txs(dref, {1, 2});
+    reprice(emb, 2, 9000);              // dashd says 2000, we claim 9000
+
+    const auto d = shadow_tx_set_diff(emb, dref);
+    EXPECT_EQ(d.fee_overstated, 1u);
+    EXPECT_EQ(d.worst_overstatement, 7000);
+    EXPECT_EQ(d.worst_overstated_txid, hashn(2).GetHex());
+
+    const auto o = shadow_evaluate(WorkSource::Embedded, emb,
+                                   std::optional<DashWorkData>(dref));
+    EXPECT_TRUE(has_line_with(o.log_lines, "fee_over=1"));
+    EXPECT_TRUE(has_line_with(o.log_lines, "FEE OVERSTATED"));
+    EXPECT_TRUE(has_line_with(o.log_lines, "+7000 duffs"));
+    EXPECT_TRUE(has_line_with(o.log_lines, "bad-cb-amount"));
+    EXPECT_TRUE(has_line_with(o.log_lines,
+                              "do NOT enable --embedded-serve-mempool-txs"));
+}
+
+// A MISSING fee must never read as a fee of zero — zero would look like
+// perfect agreement on a free transaction and hide the very gap we are
+// measuring.
+TEST(DashShadowCompare, MissingFeeIsUnknownNotZero) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    with_txs(emb,  {1, 2});
+    with_txs(dref, {1, 2});
+    emb.m_tx_fees.pop_back();           // we have the tx but priced nothing
+
+    const auto d = shadow_tx_set_diff(emb, dref);
+    EXPECT_EQ(d.both, 2u);
+    EXPECT_EQ(d.fee_unknown, 1u);
+    EXPECT_EQ(d.fee_agree, 1u);
+    EXPECT_EQ(d.fee_overstated, 0u)
+        << "an absent fee must not be scored as agreement OR as overstatement";
 }

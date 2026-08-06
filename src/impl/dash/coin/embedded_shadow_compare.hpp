@@ -133,6 +133,25 @@ struct ShadowTxSetDiff
     size_t both{0};
     size_t dashd_only{0};   // revenue we are leaving on the table
     size_t ours_only{0};    // the dangerous direction
+
+    // ── PER-TX FEE AGREEMENT — the VALUATION half ────────────────────────
+    // Membership (above) proves we HAVE the transaction. It says nothing
+    // about whether we priced it correctly, and valuation is the half that
+    // can cost a block: the coinbase may claim at most subsidy + fees, so
+    // OVERSTATING a fee is `bad-cb-amount` and the whole block is rejected,
+    // while understating merely forfeits the difference.
+    //
+    // For every tx in BOTH sets we compare our fee against dashd's. That is a
+    // direct, free, per-height proof that the prevout VALUES our UTXO view
+    // holds are right for exactly the coins a template actually spends —
+    // which is strictly less than, and much cheaper than, proving the whole
+    // chainstate with hash_serialized_2.
+    size_t fee_agree{0};
+    size_t fee_understated{0};   // ours < dashd's: forfeits money, block valid
+    size_t fee_overstated{0};    // ours > dashd's: BLOCK-LOSING. must stay 0.
+    size_t fee_unknown{0};       // a side did not report a fee for a shared tx
+    int64_t worst_overstatement{0};   // duffs, max(ours - theirs)
+    std::string worst_overstated_txid;
     /// theirs == 0 means dashd's own template was coinbase-only: there was no
     /// fee to capture at this height, so the coverage ratio is undefined
     /// rather than 0% (counting it as a miss would slander the ingest lane).
@@ -147,23 +166,43 @@ struct ShadowTxSetDiff
 inline ShadowTxSetDiff shadow_tx_set_diff(const DashWorkData& embedded,
                                           const DashWorkData& dashd)
 {
-    auto ids = [](const DashWorkData& w) {
-        std::set<std::string> out;
-        // Identify by txid when the parallel hash vector is aligned. When it is
-        // not, report EMPTY rather than guessing: an unaligned WorkData would
-        // otherwise manufacture a coverage number out of nothing, and a
-        // fabricated measurement is worse than a missing one.
+    // txid -> fee, but ONLY when the parallel vectors are aligned. When they
+    // are not, report EMPTY rather than guessing: an unaligned WorkData would
+    // otherwise manufacture a coverage number out of nothing, and a fabricated
+    // measurement is worse than a missing one. A fee is carried as optional
+    // separately from membership, because m_tx_fees may legitimately be
+    // shorter (e.g. a builder that pushed hashes but no fee for a class it
+    // does not price) and a MISSING fee must never read as a fee of zero —
+    // zero would silently look like perfect agreement on a free transaction.
+    auto index = [](const DashWorkData& w) {
+        std::map<std::string, std::optional<uint64_t>> out;
         if (w.m_tx_hashes.size() != w.m_txs.size()) return out;
-        for (const auto& h : w.m_tx_hashes) out.insert(h.GetHex());
+        for (size_t i = 0; i < w.m_tx_hashes.size(); ++i) {
+            std::optional<uint64_t> fee;
+            if (i < w.m_tx_fees.size()) fee = w.m_tx_fees[i];
+            out.emplace(w.m_tx_hashes[i].GetHex(), fee);
+        }
         return out;
     };
-    const auto e = ids(embedded);
-    const auto d = ids(dashd);
+    const auto e = index(embedded);
+    const auto d = index(dashd);
     ShadowTxSetDiff r;
     r.ours = e.size();
     r.theirs = d.size();
-    for (const auto& t : e) {
-        if (d.count(t)) ++r.both; else ++r.ours_only;
+    for (const auto& [txid, our_fee] : e) {
+        auto it = d.find(txid);
+        if (it == d.end()) { ++r.ours_only; continue; }
+        ++r.both;
+        if (!our_fee || !it->second) { ++r.fee_unknown; continue; }
+        const uint64_t ours_f = *our_fee, theirs_f = *it->second;
+        if (ours_f == theirs_f) { ++r.fee_agree; continue; }
+        if (ours_f < theirs_f) { ++r.fee_understated; continue; }
+        ++r.fee_overstated;
+        const int64_t over = static_cast<int64_t>(ours_f - theirs_f);
+        if (over > r.worst_overstatement) {
+            r.worst_overstatement    = over;
+            r.worst_overstated_txid  = txid;
+        }
     }
     r.dashd_only = r.theirs - r.both;
     return r;
@@ -313,9 +352,23 @@ inline ShadowOutcome shadow_evaluate(WorkSource source,
                  ? " coverage=" + std::to_string(
                        static_cast<int>(o.tx_set.coverage_pct() + 0.5)) + "%"
                  : " coverage=n/a(dashd-template-was-coinbase-only)";
+        // The VALUATION half, always reported alongside membership: a soak
+        // that compares only tx SETS proves membership, not pricing, and
+        // pricing is the half that can cost a block.
+        l += " fee_agree=" + std::to_string(o.tx_set.fee_agree)
+           + " fee_under=" + std::to_string(o.tx_set.fee_understated)
+           + " fee_over=" + std::to_string(o.tx_set.fee_overstated)
+           + " fee_unknown=" + std::to_string(o.tx_set.fee_unknown);
         if (o.tx_set.ours_only)
             l += " ⚠ OURS-ONLY txs present — do NOT enable"
                  " --embedded-serve-mempool-txs until this is zero";
+        if (o.tx_set.fee_overstated)
+            l += " ⚠⚠ FEE OVERSTATED on " + std::to_string(o.tx_set.fee_overstated)
+               + " tx (worst +" + std::to_string(o.tx_set.worst_overstatement)
+               + " duffs, " + o.tx_set.worst_overstated_txid.substr(0, 16)
+               + ") — a coinbase claiming more than subsidy+fees is"
+                 " bad-cb-amount and the block is REJECTED; do NOT enable"
+                 " --embedded-serve-mempool-txs";
         o.log_lines.push_back(std::move(l));
     }
 
