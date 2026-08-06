@@ -6,6 +6,7 @@
 /// Persistence via LevelDB for fast restarts.
 
 #include "block.hpp"
+#include "lane_diag.hpp"        // ProgressReporter / LogSuppressor (backfill telemetry)
 #include <impl/bitcoin_family/coin/chain_params.hpp>
 #include <impl/dash/crypto/hash_x11.hpp>
 
@@ -393,17 +394,59 @@ public:
             if (offset + BATCH_SIZE < headers.size())
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
+        // WIRE BYTES. Each entry in a DASH `headers` message is an 80-byte
+        // header plus a CompactSize(0) tx-count byte, so this is the exact
+        // payload size for the batch (the message's own count varint aside) —
+        // not an estimate. Counted for RECEIVED, not accepted: bytes are what
+        // came off the wire whether or not the header was new.
+        static constexpr uint64_t kWireBytesPerHeader = 81;
+        m_hdr_wire_bytes += static_cast<uint64_t>(headers.size())
+                            * kWireBytesPerHeader;
+        m_hdr_received   += static_cast<uint64_t>(headers.size());
+        m_hdr_accepted   += static_cast<uint64_t>(accepted);
         if (accepted > 0) {
             std::lock_guard<std::mutex> lock(m_mutex);
             persist_tip();
             uint32_t peer_tip = m_peer_tip_height.load(std::memory_order_relaxed);
             if (peer_tip > 0 && m_tip_height > 0) {
-                double pct = 100.0 * m_tip_height / peer_tip;
-                static uint32_t s_last_logged = 0;
-                if (m_tip_height - s_last_logged >= 2000 || pct >= 99.9) {
-                    s_last_logged = m_tip_height;
-                    LOG_INFO << "[DASH] Header sync: " << m_tip_height << "/" << peer_tip
-                             << " (" << std::fixed << std::setprecision(1) << pct << "%)";
+                // ── THE HEADER-BACKFILL PROGRESS LINE ────────────────────
+                // Replaces the old `[DASH] Header sync: N/M (P%)`, which had
+                // three defects that each cost time on 2026-08-04: no RATE and
+                // no ETA (both had to be reconstructed by diffing log
+                // timestamps by hand), no BYTES, and a throttle on height
+                // ALONE — so a backfill that slowed to a crawl went quiet for
+                // as long as it took to cover 2000 blocks, which is exactly
+                // when an operator most needs a line. The new throttle is
+                // 2000 headers OR 15 s, whichever comes FIRST.
+                //
+                // The old throttle also used a function-local `static`, i.e.
+                // ONE counter shared by every HeaderChain in the process; the
+                // member below is per-instance.
+                const int64_t now = diag::steady_now_ms();
+                if (!m_hdr_progress.started())
+                    m_hdr_progress.start(m_tip_height, now);
+                auto s = m_hdr_progress.sample(m_tip_height, now);
+                const bool finishing = (100.0 * m_tip_height / peer_tip) >= 99.9;
+                if (!s && finishing) s = m_hdr_progress.flush(m_tip_height, now);
+                if (s) {
+                    const uint64_t remaining =
+                        peer_tip > m_tip_height ? (peer_tip - m_tip_height) : 0;
+                    LOG_INFO
+                        << "[REPLAY-PROGRESS] lane=hdr-backfill"
+                        << " cursor=" << m_tip_height
+                        << " target=" << peer_tip
+                        << " done="
+                        << diag::fmt1(diag::ProgressReporter::done_pct(
+                               m_tip_height, peer_tip))
+                        << "%"
+                        << " rate=" << diag::fmt1(s->rate_per_s) << "hdr/s"
+                        << " eta="
+                        << diag::fmt_eta(diag::ProgressReporter::eta_s(
+                               *s, remaining))
+                        << " fetched=" << diag::fmt_bytes(m_hdr_wire_bytes)
+                        << " received=" << m_hdr_received
+                        << " accepted=" << m_hdr_accepted
+                        << " elapsed=" << (s->total_ms / 1000) << "s";
                 }
             }
         }
@@ -414,8 +457,20 @@ public:
         // genesis stub is not seeded, so headers served from block 1 orphan-
         // reject invisibly. Log the first header's prev hash so orphan-vs-PoW
         // is distinguishable.
-        LOG_INFO << "[DASH] CP2 validate add_headers: received=" << headers.size()
-                 << " accepted=" << accepted;
+        // THROTTLED (was one line per message, unbounded). During tip-follow
+        // this fires per header message forever and buries everything else;
+        // the suppressor collapses it to one line per 30 s and CARRIES the
+        // dropped count, so a storm is summarised rather than silently lost.
+        // The accepted==0 corner below is deliberately NOT suppressed: it is
+        // the diagnostic, not the noise.
+        {
+            const int64_t now = diag::steady_now_ms();
+            static const std::string kKey = "hdr-cp2";
+            if (m_hdr_cp2_log.allow(kKey, now))
+                LOG_INFO << "[DASH] CP2 validate add_headers: received="
+                         << headers.size() << " accepted=" << accepted
+                         << " suppressed=" << m_hdr_cp2_log.take_suppressed(kKey);
+        }
         if (accepted == 0 && !headers.empty())
             LOG_INFO << "[DASH] CP2 validate: accepted==0 first_prev_block="
                      << headers.front().m_previous_block.GetHex();
@@ -437,6 +492,16 @@ public:
     }
 
     void set_peer_tip_height(uint32_t height) { m_peer_tip_height.store(height); }
+
+    /// Backfill progress line throttle: at most one line per `headers` of
+    /// forward progress OR per `ms` of wall clock, whichever comes first.
+    /// Telemetry only; exposed so a KAT can prove the line fires without
+    /// mining 2000 headers, and so an operator can tighten it during a debug
+    /// session without a rebuild-and-redeploy.
+    void set_progress_throttle(uint64_t headers, int64_t ms)
+    {
+        m_hdr_progress = diag::ProgressReporter(headers, ms);
+    }
 
     void set_dynamic_checkpoint(uint32_t height, const uint256& hash) {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -757,6 +822,16 @@ private:
     std::set<uint256> m_dirty_headers;
 
     TipChangedCallback m_on_tip_changed;
+
+    // ─── Backfill telemetry (no lock: touched only on the ingest thread) ──
+    /// 2000 headers OR 15 s, whichever comes first. Per-INSTANCE, unlike the
+    /// function-local `static` this replaced.
+    diag::ProgressReporter m_hdr_progress{2000, 15000};
+    /// One CP2 line per 30 s, with the dropped count carried on the next.
+    diag::LogSuppressor    m_hdr_cp2_log{30000};
+    uint64_t m_hdr_wire_bytes{0};
+    uint64_t m_hdr_received{0};
+    uint64_t m_hdr_accepted{0};
 
     struct PendingTipChange {
         bool fired{false};

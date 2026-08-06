@@ -474,6 +474,33 @@ public:
         return s;
     }
 
+    /// The DEFECT SHAPE — the finding set with every volatile counter
+    /// stripped: type + verdict + required, and nothing else.
+    ///
+    /// WHY THIS EXISTS. format_defects() embeds `observations=`, `span=`,
+    /// `heights=[first,last]` and per-type `sightings=`, ALL of which move on
+    /// every template build. A caller that dedups on "has the sentence
+    /// changed" therefore re-logs on EVERY observation even when the finding
+    /// is identical — the sentence cannot help but change. Measured
+    /// 2026-08-04: 205k+ [LLMQ-TYPE-RECONCILE] lines in a single run, which
+    /// buried every other diagnostic in the log. Keying on this shape dedups
+    /// on the thing an operator actually cares about (WHICH types are wrong),
+    /// while a genuinely new offending type still changes the key and is
+    /// reported immediately. Empty when there is nothing wrong.
+    std::string defect_shape() const
+    {
+        auto d = defects();
+        if (d.empty()) return {};
+        std::string k;
+        for (const auto& f : d) {
+            k += std::to_string(static_cast<int>(f.llmq_type));
+            k += ':';
+            k += llmq_type_verdict_name(f.verdict);
+            k += f.required ? ":req;" : ":opt;";
+        }
+        return k;
+    }
+
     void reset()
     {
         m_seen.clear();

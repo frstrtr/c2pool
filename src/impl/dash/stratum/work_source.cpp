@@ -1110,6 +1110,50 @@ nlohmann::json DASHWorkSource::mining_submit(
                     << " height~=" << height
                     << " pow_hash=" << pow_hash.GetHex().substr(0, 16)
                     << " job=" << job_id;
+        // ── THE SAME FACTS THE LEDGER TRACKS, AT FIND TIME ────────────────
+        // 2026-08-05: block h=2516911 was won and accepted and neither hotel
+        // node's log could prove it — and separately, the h=2516595 incident
+        // turned on the MASTERNODE PAYOUT OUTPUT COUNT (1 = no operator split,
+        // 2 = split), which was invisible without pulling the raw transaction.
+        // Every fact below is already in hand here; not printing them was the
+        // whole cost. One line per won block — won blocks are rare by
+        // construction, so this needs no throttle.
+        {
+            size_t mn_outs = 0, burn_outs = 0;
+            // The arm bits are written under serve_gate_mutex_ by
+            // note_arm_decision(); read them the same way. A torn read here
+            // would mislabel which arm produced the template we just won on —
+            // the one attribution this line exists to make.
+            bool arm_seen = false, arm_embedded = false;
+            {
+                std::lock_guard<std::mutex> lk(serve_gate_mutex_);
+                arm_seen     = arm_ever_observed_;
+                arm_embedded = last_arm_embedded_;
+            }
+            if (wd) {
+                for (const auto& pp : wd->m_packed_payments) {
+                    // dashd surfaces the platform credit-pool burn as a
+                    // masternode[] entry with an EMPTY payee; counting it as a
+                    // masternode payout would mis-report the split.
+                    if (pp.payee.empty() || pp.payee.rfind("!", 0) == 0) ++burn_outs;
+                    else ++mn_outs;
+                }
+            }
+            LOG_WARNING
+                << "[BLOCK-LEDGER] event=found h=" << height
+                << " hash=" << pow_hash.GetHex().substr(0, 16)
+                << " miner=" << username
+                << " arm=" << (arm_seen ? (arm_embedded ? "EMBEDDED"
+                                                        : "dashd-fallback")
+                                        : "unobserved")
+                << " coinbase_bytes=" << coinbase.size()
+                << " mn_payout_outputs=" << mn_outs
+                << " split=" << (mn_outs >= 2 ? "operator" : "none")
+                << " burn_outputs=" << burn_outs
+                << " txs=" << (job->tx_data ? job->tx_data->size() : 0)
+                << " subsidy=" << (wd ? wd->m_coinbase_value : 0)
+                << " job=" << job_id;
+        }
 
         // Full block = header || CompactSize(1+ntx) || coinbase || txs -- the
         // exact --mine-block serialization (coin/block_producer.hpp; DASH has

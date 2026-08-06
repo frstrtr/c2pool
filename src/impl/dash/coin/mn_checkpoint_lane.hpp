@@ -209,6 +209,7 @@
 #include <impl/dash/coin/mn_checkpoint.hpp>
 #include <impl/dash/coin/mn_state_machine.hpp>
 #include <impl/dash/coin/historical_sml.hpp>   // authenticate_historical_snapshot
+#include <impl/dash/coin/lane_diag.hpp>        // ProgressReporter / StallWatchdog / MnSource
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
 #include <impl/dash/coin/vendor/smldiff.hpp>    // CSimplifiedMNListDiff
 #include <impl/dash/coin/vendor/cbtx.hpp>       // CCbTx
@@ -380,6 +381,118 @@ public:
     /// anchor, or run with a coin RPC).
     void set_max_bridge_blocks(uint32_t n) { m_max_bridge = n; }
     uint32_t max_bridge_blocks() const     { return m_max_bridge; }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // DIAGNOSTIC SEAMS (telemetry only — no serve/arm/consensus effect)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Monotonic clock. Injectable so a KAT can drive the progress throttle and
+    /// the stall watchdog deterministically instead of sleeping.
+    void set_clock_fn(std::function<int64_t()> fn) { m_now = std::move(fn); }
+
+    /// Wire size of a replayed block, for the `fetched=` field of the progress
+    /// line. OPTIONAL: unwired, the line prints `fetched=n/a` rather than a
+    /// fabricated number. Kept as a seam rather than serialising inline so the
+    /// lane stays free of a codec dependency it does not otherwise need.
+    void set_wire_size_fn(std::function<size_t(const BlockType&)> fn)
+    {
+        m_wire_size = std::move(fn);
+    }
+
+    /// Emit at most one progress line per `blocks` of replay OR per `ms` of
+    /// wall clock, whichever comes first. Defaults are sized so a full
+    /// 20000-block bridge costs ~40 lines, not 20000.
+    void set_progress_throttle(uint64_t blocks, int64_t ms)
+    {
+        m_progress = diag::ProgressReporter(blocks, ms);
+    }
+
+    /// Silence after which watchdog_tick() calls this lane FROZEN, and how
+    /// often it repeats while the freeze lasts.
+    void set_watchdog(int64_t stall_ms, int64_t repeat_ms)
+    {
+        m_watchdog = diag::StallWatchdog(stall_ms, repeat_ms);
+    }
+
+    /// ── THE WATCHDOG. Call from a WALL-CLOCK TIMER, never from pump() ─────
+    ///
+    /// 2026-08-04, mainnet, BOTH .211 and contabo: the bridge froze right
+    /// after a COMPLETED on-demand PoSe fold (cursors h=2514874 and h=2516862)
+    /// and stayed frozen 11-12 minutes with NO warning of any kind. The only
+    /// symptom available to an operator was "the arm never arms".
+    ///
+    /// The reason is structural, and it is the reason this function exists
+    /// SEPARATELY from pump(): the old stall probe lived INSIDE pump(), below
+    /// several early returns — including the pending-snapshot return — so the
+    /// detector could be skipped by the very condition it was meant to detect.
+    /// And pump() is driven by tip changes (~2.5 min on mainnet) while the
+    /// probe needed FIVE consecutive stalled pumps before it said anything:
+    /// ~12 minutes of guaranteed silence even when it did run.
+    ///
+    /// watchdog_tick() has neither property. It is driven by a timer that the
+    /// lane cannot influence, it reads a last-progress TIMESTAMP rather than
+    /// counting drives, and "the lane stopped being driven entirely" is
+    /// therefore the case it reports FASTEST instead of the case it misses.
+    /// It emits nothing but a log line.
+    void watchdog_tick()
+    {
+        const int64_t now = m_now();
+        auto due = m_watchdog.due(now);
+        if (!due) return;
+        LOG_WARNING << "[LANE-WATCHDOG] lane=mn-ckpt state=" << state_name()
+                    << " cursor=" << m_next
+                    << " target=" << m_replay_target
+                    << " frozen_for=" << (*due / 1000) << "s"
+                    << " waiting_for=" << waiting_for()
+                    << " snapshot_pending=" << (m_snapshot_pending ? 1 : 0)
+                    << " ondemand_pending=" << (m_ondemand_pending ? 1 : 0)
+                    << " requested_through=" << m_requested_through
+                    << " applied=" << m_applied
+                    << " folds=" << m_folds
+                    << " warn=" << m_watchdog.warnings()
+                    << " — the payee queue is NOT advancing; the embedded arm"
+                       " cannot arm until it does";
+    }
+
+    /// What the lane is blocked on, as ONE greppable token. This is the field
+    /// that was missing: a frozen lane published a cursor but never said what
+    /// it was waiting for, so "peer dropped our getdata" and "peer never
+    /// answered the fold" looked identical from outside.
+    std::string waiting_for() const
+    {
+        if (m_state == State::FailedClosed) return "nothing(failed-closed)";
+        if (m_state == State::Published)    return "nothing(published)";
+        if (m_snapshot_pending)
+            return std::string(m_ondemand_pending ? "ondemand-mnlist-reply@h="
+                                                  : "fold-mnlist-reply@h=")
+                   + std::to_string(m_snapshot_height);
+        if (!m_position_verified)
+            return "header-tip-to-reach-anchor@h="
+                   + std::to_string(m_anchor_height);
+        if (m_requested_through >= m_next)
+            return "block-bodies@h=" + std::to_string(m_next) + ".."
+                   + std::to_string(m_requested_through);
+        return "tip-advance";
+    }
+
+    static const char* state_name(State s)
+    {
+        switch (s) {
+            case State::Unarmed:      return "unarmed";
+            case State::Waiting:      return "waiting";
+            case State::Bridging:     return "bridging";
+            case State::Published:    return "published";
+            case State::FailedClosed: return "failed-closed";
+        }
+        return "unknown";
+    }
+    const char* state_name() const { return state_name(m_state); }
+
+    /// Whether this lane's replay cursor was RESTORED from persisted work or is
+    /// starting COLD. Today it is ALWAYS cold — there is no cursor persistence
+    /// — and the point of surfacing it is that the log said nothing at all
+    /// about discarding a completed 3913-block replay on every process start.
+    bool cursor_restored() const { return m_cursor_restored; }
 
     /// Load a parsed checkpoint. A !ok checkpoint arms the lane in the
     /// terminal FailedClosed state so the refusal is visible in status()
@@ -1160,6 +1273,33 @@ public:
             LOG_INFO << "[MN-CKPT] bridge START: replaying h=" << m_next
                      << ".." << tip << " (" << (tip - m_next + 1)
                      << " blocks) onto the anchored set";
+            // ── PERSISTENCE VISIBILITY ────────────────────────────────────
+            // This lane has NO cursor persistence: every process start throws
+            // away the previous run's completed replay and re-walks the whole
+            // window from the pinned anchor. That is a real cost (3913 blocks
+            // on 2026-08-04) and the log said NOTHING about it — "bridge
+            // START: replaying h=2513001..2516913" reads exactly the same
+            // whether prior work was resumed or discarded. Name it.
+            m_replay_target = tip;
+            m_replay_base   = m_next;
+            m_replay_bytes  = 0;
+            LOG_INFO << "[MN-CKPT] cursor "
+                     << (m_cursor_restored ? "RESTORED" : "COLD")
+                     << " lane=mn-ckpt from="
+                     << (m_cursor_restored ? "persisted-cursor"
+                                           : "pinned-anchor@h="
+                                                 + std::to_string(m_anchor_height))
+                     << " cursor=" << m_next << " target=" << tip
+                     << " to_replay=" << (tip - m_next + 1)
+                     << " rearms=" << m_rearms
+                     << (m_cursor_restored
+                             ? ""
+                             : " — there is no replay-cursor persistence in"
+                               " this build, so ANY replay work done by a"
+                               " previous process was DISCARDED and this window"
+                               " is being walked from scratch");
+            m_progress.start(0, m_now());
+            m_watchdog.arm(m_now());
         }
 
         // ── ANCHOR FOLD (F4). Two separate fixes meet on this line and BOTH
@@ -1274,6 +1414,7 @@ public:
 
         m_next = height + 1;
         ++m_applied;
+        note_replay_advance(block);
         // ── PER-HEIGHT PoSe fold. The cursor is now exactly `height`; if
         // this is a fold point, request the list AS OF it and pause.
         if (m_tip_height) {
@@ -1888,6 +2029,10 @@ private:
         // applied — only its attribution was withheld until now.
         m_next = height + 1;
         ++m_applied;
+        // The on-demand path is where BOTH nodes froze on 2026-08-04, right
+        // after this line. Recording progress here is what gives the watchdog a
+        // truthful last-progress timestamp to measure that freeze from.
+        note_replay_advance(m_ondemand_block);
         m_sml_recovered += m_ondemand_r.sml_recovered;
         m_registered    += m_ondemand_r.registered;
         m_spent         += m_ondemand_r.spent;
@@ -2143,8 +2288,62 @@ public:
         return s;
     }
 
+    /// ── THE PROGRESS/RATE TICK ────────────────────────────────────────────
+    /// Called on EVERY cursor advance; emits at most one line per throttle
+    /// window. Two jobs, and they must not be separated: it stamps the
+    /// watchdog's last-progress timestamp (so a freeze is measured from the
+    /// last real advance, not from the last time anything called us) and it
+    /// feeds the throttled progress line.
+    ///
+    /// Before this existed, rate and ETA for a 3913-block replay had to be
+    /// reconstructed by diffing log timestamps by hand.
+    void note_replay_advance(const BlockType& block)
+    {
+        const int64_t now = m_now();
+        m_watchdog.progress(now);
+        if (m_wire_size) {
+            m_replay_bytes += static_cast<uint64_t>(m_wire_size(block));
+            m_have_bytes = true;
+        }
+        auto s = m_progress.sample(m_applied, now);
+        if (s) emit_progress(*s);
+    }
+
+    void emit_progress(const diag::ProgressReporter::Sample& s)
+    {
+        const uint64_t total =
+            m_replay_target >= m_replay_base
+                ? (m_replay_target - m_replay_base + 1)
+                : 0;
+        const uint64_t remaining = total > s.units ? total - s.units : 0;
+        LOG_INFO << "[REPLAY-PROGRESS] lane=mn-ckpt"
+                 // cursor_height() (the LAST APPLIED height), not m_next: a
+                 // cursor printed one past the target reads like an overrun.
+                 << " cursor=" << cursor_height()
+                 << " target=" << m_replay_target
+                 << " done=" << diag::fmt1(diag::ProgressReporter::done_pct(
+                                    s.units, total))
+                 << "%"
+                 << " rate=" << diag::fmt1(s.rate_per_s) << "blk/s"
+                 << " eta=" << diag::fmt_eta(
+                                    diag::ProgressReporter::eta_s(s, remaining))
+                 << " fetched=" << (m_have_bytes ? diag::fmt_bytes(m_replay_bytes)
+                                                 : std::string("n/a"))
+                 << " applied=" << m_applied
+                 << " payee_ok=" << m_applied
+                 << " diverged=" << m_ondemand_abandoned
+                 << " folds=" << m_folds
+                 << " ondemand=" << m_ondemand_folds
+                 << " eligible=" << m_machine.eligible_size()
+                 << " elapsed=" << (s.total_ms / 1000) << "s";
+    }
+
     void request_window(uint32_t tip)
     {
+        // Keep the progress line's denominator honest: the tip moves under a
+        // long replay, so a target captured only at bridge START would make
+        // `done=` drift upward past 100%.
+        if (tip > m_replay_target) m_replay_target = tip;
         // Never rewrite the status of a lane that has already finished or
         // refused — that status is the only record of WHY.
         if (m_state != State::Bridging) return;
@@ -2208,6 +2407,12 @@ public:
                                " publish");
         }
         m_state  = State::Published;
+        m_watchdog.disarm();
+        // FINAL, unthrottled progress line. The last window of a replay is the
+        // one an operator most wants (it carries the achieved rate for the
+        // whole run in `elapsed=`), and the throttle would usually eat it.
+        if (m_replay_base != 0)
+            if (auto s = m_progress.flush(m_applied, m_now())) emit_progress(*s);
         // The full delta rides on BOTH the status string and the log line. A
         // degradation that is only visible in scrollback is half-silent, and
         // this lane exists to make degradation loud. `eligible` is directly
@@ -2273,6 +2478,14 @@ public:
         const uint32_t cursor = m_next;
         m_state  = State::FailedClosed;
         m_status = why;
+        // A failed-closed lane is DONE, not frozen. Saying "stalled" about it
+        // would be the noise that trains an operator to ignore the tag.
+        m_watchdog.disarm();
+        // Only if the bridge ever STARTED. A lane that fails closed before the
+        // Waiting->Bridging edge has no target and no baseline, and a
+        // `target=0 done=0.0%` line would be a measurement of nothing.
+        if (m_replay_base != 0)
+            if (auto s = m_progress.flush(m_applied, m_now())) emit_progress(*s);
         // Deliberately ERROR, not WARNING: the operator's embedded arm will
         // not arm, and the only thing worse than saying so is not saying so.
         LOG_ERROR << "[MN-CKPT] FAIL-CLOSED: " << why;
@@ -2456,6 +2669,18 @@ public:
         m_rerequest_from_cursor = false;
         m_last_wait_log         = 0;
         m_position_verified     = false;
+        // Diagnostics, reset for the same reason every other counter here is:
+        // a re-armed bridge that inherited the previous run's progress baseline
+        // would report a negative delta and an absurd rate, and one that
+        // inherited its watchdog timestamp would either cry stall immediately
+        // or sit silent through a fresh freeze.
+        m_replay_base    = 0;
+        m_replay_target  = 0;
+        m_replay_bytes   = 0;
+        m_have_bytes     = false;
+        m_cursor_restored = false;   // no cursor persistence exists to restore
+        m_progress.start(0, m_now());
+        m_watchdog.disarm();         // re-armed at the Waiting->Bridging edge
         m_anchor_eligible   = m_machine.eligible_size();
         m_anchor_ineligible = m_machine.ineligible_size();
         m_next  = cp.height + 1;
@@ -2548,6 +2773,30 @@ public:
     bool     m_rerequest_from_cursor{false};
     uint32_t m_last_wait_log{0};
     bool     m_position_verified{false};
+
+    // ── DIAGNOSTICS (telemetry only; nothing below is read by a gate) ──────
+    /// Injectable monotonic clock — a KAT drives the throttle and the watchdog
+    /// deterministically instead of sleeping.
+    std::function<int64_t()> m_now{&diag::steady_now_ms};
+    std::function<size_t(const BlockType&)> m_wire_size;
+    /// 500 blocks OR 15 s, whichever first. A 20000-block bridge therefore
+    /// costs ~40 lines, and a bridge crawling at 1 blk/s still reports every
+    /// 15 s instead of going quiet for an hour.
+    diag::ProgressReporter m_progress{500, 15000};
+    /// 90 s of NO cursor movement is a freeze worth naming, repeated every
+    /// 120 s. Sized against the 2026-08-04 incident (11-12 min of silence) and
+    /// against DASH's ~150 s block spacing: a bridge mid-replay should advance
+    /// far faster than one block per 90 s, and a bridge that has caught the tip
+    /// is Published (disarmed), so this cannot fire on a healthy idle lane.
+    diag::StallWatchdog m_watchdog{90000, 120000};
+    uint32_t m_replay_base{0};      // cursor at bridge START (progress denominator)
+    uint32_t m_replay_target{0};    // tip the replay is chasing
+    uint64_t m_replay_bytes{0};     // wire bytes of replayed block bodies
+    bool     m_have_bytes{false};   // ...only when set_wire_size_fn is wired
+    /// Whether the replay cursor came from persisted work. ALWAYS false today:
+    /// this build has no cursor persistence, and the field exists so the log
+    /// says so out loud rather than leaving the discard invisible.
+    bool     m_cursor_restored{false};
 
     // ── RE-ARM bookkeeping. Survives reset_for_arm() by design: if a re-arm
     // cleared its own counters the cap could never fire and the "recovery"

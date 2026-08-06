@@ -316,6 +316,15 @@ public:
     /// carry its own name instead of masquerading as a header-sync fault.
     /// Never read by any serve or reward path.
     void set_tip_body_pending_dbg(bool v) { m_tip_body_pending_dbg = v; }
+    bool tip_body_pending_dbg() const { return m_tip_body_pending_dbg; }
+
+    /// The same two bits, READABLE. They existed only inside the decline
+    /// string, so the standing state ("why would this node not serve RIGHT
+    /// NOW, before anyone asks it for work") could not be printed at all — an
+    /// operator had to provoke a decline to learn it. -1 == never reported.
+    /// Telemetry only; no serve or reward path reads these.
+    int have_tip_dbg() const { return m_have_tip_dbg; }
+    int have_mn_dbg()  const { return m_have_mn_dbg; }
 
     /// Enable the SML-required viability gate. main_dash.cpp turns this on for
     /// the embedded coin-P2P arm so a template is only served once the CCbTx

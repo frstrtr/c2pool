@@ -264,6 +264,71 @@ std::string g_replay_fold_worklists;          // --replay-fold-worklists FILE
 // serve are both fine WITHOUT proving the serve is daemonless.
 bool        g_no_dashd_mn_seed = false;       // --embedded-no-dashd-mn-seed
 
+// ───────────────────────────────────────────────────────────────────────────
+// [BLOCK-LEDGER] — our own block accounting, from PERSISTENT state
+// ───────────────────────────────────────────────────────────────────────────
+//
+// 2026-08-05, hotel: block h=2516911 was WON by the pool and ACCEPTED by the
+// chain (our exact PPLNS payout structure), and NEITHER node's log showed a
+// "BLOCK FOUND" line for it — the primary's log had been rotated that morning
+// and the reserve had restarted mid-evening. Counting our own blocks by
+// grepping the log produced two wrong answers in ten minutes.
+//
+// The defect is not the missing line, it is the SOURCE. This reads the
+// found-blocks LevelDB (loaded at startup, 107 entries that day) rather than
+// log history, so rotation and restart cost scrollback but not truth: the next
+// ledger line still prints the real totals. Emitted at standup and every 300 s.
+//
+// Telemetry only — it reads the ledger, it never writes it.
+void log_block_ledger(core::MiningInterface* mi)
+{
+    if (!mi) return;
+    using BS = core::MiningInterface::BlockStatus;
+    size_t   total = 0, accepted = 0, orphan = 0, stale = 0, pending = 0;
+    size_t   attributed = 0;
+    uint64_t last_found = 0, last_accepted = 0, last_found_ts = 0;
+    for (const auto& b : mi->get_found_blocks()) {
+        if (b.chain != "DASH") continue;
+        ++total;
+        // SAME ROW SEMANTICS AS /recent_blocks (#1127): a row with neither a
+        // local share hash nor a miner address was NOT found by this node —
+        // it was learned over relay, or it is a legacy row the enrichment
+        // path has not upgraded yet. Counting those into a bare "found_total"
+        // would overstate our own wins, which is the class of error this line
+        // exists to end; they are counted separately instead of silently.
+        if (!b.share_hash.empty() || !b.miner.empty()) ++attributed;
+        switch (b.status) {
+            case BS::confirmed: ++accepted; break;
+            case BS::orphaned:  ++orphan;   break;
+            case BS::stale:     ++stale;    break;
+            case BS::pending:   ++pending;  break;
+        }
+        if (b.height >= last_found) { last_found = b.height; last_found_ts = b.ts; }
+        if (b.status == BS::confirmed && b.height > last_accepted)
+            last_accepted = b.height;
+    }
+    const auto now = static_cast<uint64_t>(std::time(nullptr));
+    LOG_INFO << "[BLOCK-LEDGER] chain=DASH"
+             << " found_total=" << total
+             << " attributed=" << attributed
+             << " relay_or_unenriched=" << (total - attributed)
+             << " accepted=" << accepted
+             << " orphan=" << orphan
+             << " stale=" << stale
+             << " pending=" << pending
+             << " last_found=" << (last_found ? "h=" + std::to_string(last_found)
+                                              : std::string("n/a"))
+             << " last_found_age="
+             << (last_found_ts && now > last_found_ts
+                     ? std::to_string(now - last_found_ts) + "s"
+                     : std::string("n/a"))
+             << " last_accepted="
+             << (last_accepted ? "h=" + std::to_string(last_accepted)
+                               : std::string("n/a"))
+             << " source=found_blocks_db"
+             << " rotation_safe=1";
+}
+
 // Report the requested sharechain peering topology at run-loop bring-up. Honest
 // about the deferred live bind: a won/seen share does NOT yet cross the wire
 // until the sharechain pool-node leaf lands.
@@ -3840,22 +3905,48 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             auto qc_type_recon =
                 std::make_shared<dash::coin::LlmqTypeReconciler>(qc_net);
             auto qc_recon_said = std::make_shared<std::string>();
+            // 5-minute re-assert floor for a STANDING defect; a shape CHANGE
+            // gets its own key so it is never held back by the floor.
+            auto qc_recon_log =
+                std::make_shared<dash::coin::diag::LogSuppressor>(300000);
             node_coin_state.set_qc_plan_fn(
                 [&node_coin_state, hc = header_chain.get(), qc_net, qc_cache,
                  qc_gap_logged_h, qc_first_plan_h, qc_cold_note_done,
-                 qc_type_recon, qc_recon_said, qc_episode]
+                 qc_type_recon, qc_recon_said, qc_recon_log, qc_episode]
                 (uint32_t next_h) -> std::optional<dash::coin::QcBlockPlan> {
                     if (*qc_first_plan_h == 0u) *qc_first_plan_h = next_h;
                     // Observe the MINED set at the tip we are building on.
                     if (next_h > 0)
                         qc_type_recon->observe(next_h - 1u,
                                                node_coin_state.qmgr());
-                    // Log only when the SENTENCE CHANGES — a new offending
-                    // type must never be swallowed by dedup on an old one.
-                    if (auto said = qc_type_recon->format_defects();
-                        !said.empty() && said != *qc_recon_said) {
-                        *qc_recon_said = said;
-                        LOG_WARNING << said;
+                    // Log when the DEFECT SHAPE changes — a new offending
+                    // type must never be swallowed by dedup on an old one —
+                    // and otherwise at most once per 5 minutes, carrying the
+                    // count it stood in for.
+                    //
+                    // THE FLOOD THIS FIXES (measured 2026-08-04): the dedup
+                    // above compared the whole SENTENCE, and that sentence
+                    // embeds observations=/span=/heights=/sightings=, every
+                    // one of which moves on every template build. So "has it
+                    // changed" was always true and the guard was inert:
+                    // 205k+ identical-in-substance [LLMQ-TYPE-RECONCILE]
+                    // lines in one run, burying everything else. Keying on
+                    // defect_shape() (types + verdicts only) dedups on what
+                    // an operator acts on, while the periodic re-assert keeps
+                    // a standing defect from going silent.
+                    if (auto shape = qc_type_recon->defect_shape();
+                        !shape.empty()) {
+                        const int64_t now_ms = dash::coin::diag::steady_now_ms();
+                        const bool changed = (shape != *qc_recon_said);
+                        if (changed) *qc_recon_said = shape;
+                        if (qc_recon_log->allow(changed ? shape + "#new" : shape,
+                                                now_ms)) {
+                            LOG_WARNING
+                                << qc_type_recon->format_defects()
+                                << " suppressed="
+                                << qc_recon_log->take_suppressed(
+                                       changed ? shape + "#new" : shape);
+                        }
                     }
                     dash::coin::RequiredQcSlot gap{};
                     auto plan = dash::coin::build_daemonless_qc_plan(
@@ -4597,6 +4688,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 });
             mn_ckpt_lane->set_tip_height_fn(
                 [hc = header_chain.get()]() { return hc->height(); });
+            // DIAGNOSTIC seam: wire byte size of each replayed block, so the
+            // progress line can print `fetched=` instead of `fetched=n/a`.
+            // Telemetry only — the lane never branches on it.
+            mn_ckpt_lane->set_wire_size_fn(
+                [](const dash::coin::BlockType& b) -> size_t {
+                    return pack(b).size();
+                });
             mn_ckpt_lane->set_header_hash_at_fn(
                 [hc = header_chain.get()](uint32_t h) -> std::optional<uint256> {
                     auto e = hc->get_header_by_height(h);
@@ -5271,9 +5369,36 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                  << " members_answered=" << bs.members_answered
                                  << " members_missing=" << bs.members_missing
                                  << " lists_retained=" << br->retained_lists()
-                                 << " quorum_root_match/differ="
+                                 // ── SCOPED COUNTER (was mis-read) ──────
+                                 // Printed as `quorum_root_match/differ`
+                                 // this read as a 4684-block divergence. It
+                                 // is not: arm_self_check() has NO production
+                                 // caller, so the comparison runs UNARMED —
+                                 // a Tier-A anchor seeds no active quorum
+                                 // set, the folded root is a warm-up artefact
+                                 // and differs at essentially every height by
+                                 // construction, while the SERVED root was
+                                 // correct (154/154 shadow matches). The name
+                                 // now says which comparison it is and the
+                                 // line states the arming, so the number can
+                                 // no longer be read as divergence evidence.
+                                 // Scoping the COUNTER itself stays with the
+                                 // W4 task; this is the logging half.
+                                 << " fold_root_vs_committed="
                                  << bs.quorum_roots_matched << "/"
                                  << bs.quorum_roots_differed
+                                 << " self_check="
+                                 << (br->self_check_armed() ? "armed"
+                                                            : "UNARMED")
+                                 << (br->self_check_armed()
+                                        ? std::string()
+                                        : std::string(
+                                              " (unarmed: no quorum-set seed —"
+                                              " a differ here is warm-up, NOT"
+                                              " divergence; the SERVED root is"
+                                              " measured by the shadow"
+                                              " comparison, not by this"
+                                              " counter)"))
                                  << (bs.last_skip_reason.empty()
                                         ? std::string()
                                         : " last_skip=\"" + bs.last_skip_reason + "\"");
@@ -5758,6 +5883,165 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                      "(daemonless header-chain verdict"
                   << (rpc ? " + dashd getblockheader fallback" : "")
                   << ")\n";
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // DIAGNOSTIC TICK — telemetry only, no serve/arm/consensus effect
+    // ════════════════════════════════════════════════════════════════════════
+    //
+    // Everything below exists because of a specific incident on 2026-08-04/05
+    // where the answer was in the node's head and not in its log:
+    //
+    //   • [LANE-WATCHDOG] — the MN-CKPT bridge froze on BOTH .211 and contabo
+    //     right after a completed on-demand PoSe fold (h=2514874, h=2516862)
+    //     for 11-12 minutes with NO warning, because the stall probe lived
+    //     inside pump() below its own early returns and was driven by tip
+    //     changes. THIS timer is the independent path: it cannot be skipped by
+    //     the condition it is watching.
+    //   • [EMBED-STATUS] — "why is this node not serving?" took grepping four
+    //     different markers. The gate names its cause when it DECLINES a
+    //     template (#1038/#1039); this is the standing-state complement, so the
+    //     question is answerable without provoking a decline.
+    //   • [BLOCK-LEDGER] — block h=2516911 was won and accepted by the chain,
+    //     and NEITHER hotel node's log showed it: the primary's log had been
+    //     rotated that morning and the reserve had restarted. Counting our own
+    //     blocks by grepping a rotated, restart-truncated log produced two
+    //     wrong answers in ten minutes. This line is sourced from the found-
+    //     blocks DB (persistent) instead of from log history, so a rotated log
+    //     loses the scrollback and the NEXT line still prints the true totals.
+    {
+        namespace ddiag = dash::coin::diag;
+        auto* diag_mi = web_server ? web_server->get_mining_interface() : nullptr;
+
+        // ── WON-BLOCK VERDICT: ALREADY WIRED ON MASTER ─────────────────────
+        // An earlier revision of this branch wired add_chain_verify_fn("DASH")
+        // here, because main_dash had never called set_block_verify_fn /
+        // schedule_block_verification and every DASH block ever won sat at
+        // status=pending forever. That gap is now CLOSED ON MASTER by the
+        // post-broadcast block-confirm lane (block_confirm::resolve_status +
+        // its KAT), which resolves orphan/confirm off the embedded header
+        // chain and falls back to dashd getblockheader. Re-adding a
+        // per-chain verifier here would SHADOW it — verify_found_block
+        // prefers m_chain_verify_fns[chain] over m_block_verify_fn — so this
+        // branch deliberately wires NOTHING on that path and keeps only the
+        // ledger telemetry below. The verdicts themselves are logged by that
+        // lane; the periodic line here is the rotation-proof standing count.
+
+        auto diag_timer = std::make_shared<io::steady_timer>(ioc);
+        auto diag_tick =
+            std::make_shared<std::function<void(const boost::system::error_code&)>>();
+        auto ticks   = std::make_shared<uint64_t>(0);
+        // Shape-keyed suppressor: [EMBED-STATUS] is emitted whenever the SHAPE
+        // of the state changes (arm, cause, the precondition bits, the MN
+        // source) and otherwise once per heartbeat, carrying suppressed=N. The
+        // numeric cursors ride the line but are NOT part of the key — they move
+        // every block, and keying on them would turn a status line into a
+        // flood. Same policy the serve-gate journal (#1038) already applies.
+        auto embed_shape = std::make_shared<std::string>();
+        auto embed_since = std::make_shared<uint64_t>(0);
+        auto embed_last  = std::make_shared<int64_t>(0);
+
+        *diag_tick = [diag_timer, diag_tick, ticks, diag_mi, embed_shape,
+                      embed_since, embed_last, &node_coin_state, &maintainer,
+                      &header_chain, &mn_ckpt_lane](
+                         const boost::system::error_code& ec) {
+            if (ec) return;   // cancelled at shutdown
+            ++*ticks;
+
+            // ── 1. LANE WATCHDOG (every tick) ───────────────────────────
+            if (mn_ckpt_lane) mn_ckpt_lane->watchdog_tick();
+
+            // ── 2. EMBED-STATUS (every 2nd tick = 60 s) ─────────────────
+            if ((*ticks % 2) == 0) {
+                const auto d = node_coin_state.describe_decline();
+                const int  ht = node_coin_state.have_tip_dbg();
+                const int  hm = node_coin_state.have_mn_dbg();
+                const char* src =
+                    maintainer && !maintainer->mn_source().empty()
+                        ? maintainer->mn_source().c_str()
+                        : "n/a";
+                const bool dmnless =
+                    maintainer
+                    && maintainer->mn_source_daemonless();
+                const int32_t bcl = node_coin_state.best_cl_height();
+                const int32_t cp  = node_coin_state.credit_pool_height();
+                std::ostringstream shape;
+                shape << (d.viable ? "serve" : "decline") << '|' << d.cause
+                      << '|' << ht << hm << '|' << src << '|'
+                      << (node_coin_state.have_sml() ? 1 : 0) << '|'
+                      << (node_coin_state.mn_needs_reseed() ? 1 : 0) << '|'
+                      << (node_coin_state.tip_body_pending_dbg() ? 1 : 0) << '|'
+                      << (mn_ckpt_lane ? mn_ckpt_lane->state_name() : "none");
+                const int64_t now = ddiag::steady_now_ms();
+                const bool changed = shape.str() != *embed_shape;
+                // 5-minute heartbeat: an UNCHANGED state must still prove it is
+                // being observed, or "quiet" and "dead" look the same again.
+                const bool heartbeat = (now - *embed_last) >= 300000;
+                if (changed || heartbeat) {
+                    LOG_INFO
+                        << "[EMBED-STATUS]"
+                        << " arm=" << (d.viable ? "would-serve" : "would-decline")
+                        << " cause=" << (d.viable ? std::string("none") : d.cause)
+                        << " value=" << d.value << " threshold=" << d.threshold
+                        << " populated=" << (node_coin_state.populated() ? 1 : 0)
+                        << " have_tip=" << (ht < 0 ? std::string("n/a")
+                                                   : std::to_string(ht))
+                        << " have_mn=" << (hm < 0 ? std::string("n/a")
+                                                  : std::to_string(hm))
+                        << " mn_source=" << src
+                        << " mn_daemonless=" << (dmnless ? 1 : 0)
+                        << " payee_cursor="
+                        << node_coin_state.mnstates().last_applied_height() << "/"
+                        << (header_chain ? header_chain->height() : 0)
+                        << " mn_entries=" << node_coin_state.mnstates().size()
+                        << " sml=" << (node_coin_state.have_sml() ? "ok" : "absent")
+                        << " sml_h="
+                        << (maintainer ? maintainer->sml_current_height() : 0)
+                        << " quorums=" << node_coin_state.qmgr().active_count()
+                        << " bestcl=" << (bcl > 0 ? std::to_string(bcl)
+                                                  : std::string("n/a"))
+                        << " creditpool=" << (cp >= 0 ? std::to_string(cp)
+                                                      : std::string("n/a"))
+                        << " reseed_latch="
+                        << (node_coin_state.mn_needs_reseed() ? 1 : 0)
+                        // Body-first transient (landed on master after this
+                        // branch point): a known-newer header tip whose block
+                        // body / tip-targeted cbTx has not been parsed yet. It
+                        // is the normal ~1-2 s propagation window, and naming
+                        // it here stops a refusal inside it reading as a
+                        // header-sync fault.
+                        << " tip_body_pending="
+                        << (node_coin_state.tip_body_pending_dbg() ? 1 : 0)
+                        << " bridge="
+                        << (mn_ckpt_lane ? mn_ckpt_lane->state_name() : "none")
+                        << " bridge_cursor="
+                        << (mn_ckpt_lane ? mn_ckpt_lane->cursor_height() : 0)
+                        << " bridge_wait="
+                        << (mn_ckpt_lane ? mn_ckpt_lane->waiting_for()
+                                         : std::string("n/a"))
+                        << " hdr_tip=" << (header_chain ? header_chain->height() : 0)
+                        << " trigger=" << (changed ? "shape-change" : "heartbeat")
+                        << " suppressed=" << *embed_since;
+                    *embed_shape = shape.str();
+                    *embed_last  = now;
+                    *embed_since = 0;
+                } else {
+                    ++*embed_since;
+                }
+            }
+
+            // ── 3. BLOCK-LEDGER (every 10th tick = 300 s) ───────────────
+            if (diag_mi && (*ticks % 10) == 0) log_block_ledger(diag_mi);
+
+            diag_timer->expires_after(std::chrono::seconds(30));
+            diag_timer->async_wait(*diag_tick);
+        };
+        // ONE ledger line immediately at standup, so a freshly rotated or
+        // freshly restarted log carries the true persistent totals from its
+        // first minute rather than only after five.
+        if (diag_mi) log_block_ledger(diag_mi);
+        diag_timer->expires_after(std::chrono::seconds(30));
+        diag_timer->async_wait(*diag_tick);
     }
 
     std::cout << "[run] run-loop up (Ctrl-C to stop); won blocks relay DUAL-PATH:\n"
