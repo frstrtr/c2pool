@@ -135,6 +135,62 @@ public:
 
     void set_utxo(::core::coin::UTXOViewCache* u) { m_utxo.store(u); }
 
+    /// ── PINNED-LOCAL-TX include gate (donation-dust consolidation lane) ────
+    /// A pinned tx is an operator-supplied, externally-signed, ZERO-fee
+    /// transaction that rides OUR OWN block template (relay rejects 0-fee, so
+    /// self-mining is its only chain-ward path). A bad pinned tx would make
+    /// the whole found block invalid — a lost block — so admission is checked
+    /// against the live UTXO view on EVERY template build and the tx is
+    /// EXCLUDED (never the template refused) on any failure:
+    ///   * every input must exist unspent in our UTXO view;
+    ///   * a coinbase-output input must be MATURE at the template height
+    ///     (100 confs — donation outputs ARE coinbase outputs, so the newest
+    ///     ones are immature for ~4.5 h after their block; the tx self-heals
+    ///     into templates once they mature);
+    ///   * inputs minus outputs must equal EXACTLY ZERO — this lane's
+    ///     contract. Nonzero means the snapshot the tx was built from has
+    ///     drifted (or the wrong tx was pinned); negative would be
+    ///     consensus-invalid (bad-txns-in-belowout) outright.
+    /// Once mined, the inputs leave the UTXO set and the gate excludes the tx
+    /// forever after — no explicit "done" state is needed.
+    enum class PinnedTxGate : uint8_t {
+        Ok = 0,
+        UtxoViewUnset,          // no UTXO view wired yet (cold start)
+        InputMissingOrSpent,    // an input is not an unspent coin we know
+        ImmatureCoinbaseInput,  // a coinbase-output input below 100 confs
+        FeeNotZero,             // sum(in) - sum(out) != 0: snapshot drift
+    };
+    static const char* pinned_gate_name(PinnedTxGate g) {
+        switch (g) {
+            case PinnedTxGate::Ok:                    return "ok";
+            case PinnedTxGate::UtxoViewUnset:         return "utxo-view-unset";
+            case PinnedTxGate::InputMissingOrSpent:   return "input-missing-or-spent";
+            case PinnedTxGate::ImmatureCoinbaseInput: return "immature-coinbase-input";
+            case PinnedTxGate::FeeNotZero:            return "fee-not-zero";
+        }
+        return "ok";
+    }
+    PinnedTxGate pinned_tx_admissible(const MutableTransaction& tx,
+                                      uint32_t next_height) const {
+        auto* utxo = m_utxo.load();
+        if (utxo == nullptr) return PinnedTxGate::UtxoViewUnset;
+        constexpr uint32_t kCoinbaseMaturity = 100;
+        int64_t in_value = 0;
+        for (const auto& vin : tx.vin) {
+            ::core::coin::Coin coin;
+            ::core::coin::Outpoint op{vin.prevout.hash, vin.prevout.index};
+            if (!utxo->get_coin(op, coin) || coin.is_spent())
+                return PinnedTxGate::InputMissingOrSpent;
+            if (coin.coinbase && next_height < coin.height + kCoinbaseMaturity)
+                return PinnedTxGate::ImmatureCoinbaseInput;
+            in_value += coin.value;
+        }
+        int64_t out_value = 0;
+        for (const auto& vout : tx.vout) out_value += vout.value;
+        if (in_value - out_value != 0) return PinnedTxGate::FeeNotZero;
+        return PinnedTxGate::Ok;
+    }
+
     // ── Mutation ────────────────────────────────────────────────────
 
     /// Add a transaction. Returns false if already known. When `utxo`

@@ -478,6 +478,18 @@ public:
     void set_serve_mempool_txs(bool on) { m_serve_mempool_txs = on; }
     bool serve_mempool_txs() const { return m_serve_mempool_txs; }
 
+    /// PINNED LOCAL TX (--pin-local-tx-hex, donation-dust consolidation): an
+    /// operator-supplied, externally-signed, zero-fee tx that can only reach
+    /// the chain through OUR OWN block. Stored by value; the work-inputs
+    /// bundle hands the builder a pointer, and the builder re-gates admission
+    /// against the live UTXO view on every template
+    /// (Mempool::pinned_tx_admissible) — exclusion-only failure, never a
+    /// template refusal. Call on the io thread before serving starts.
+    void set_pinned_local_tx(MutableTransaction tx) {
+        m_pinned_local_tx = std::move(tx);
+        m_have_pinned_local_tx = true;
+    }
+
     /// Superblock-height guard. On a Dash superblock height the coinbase MUST
     /// pay the governance/treasury (superblock) outputs; the embedded template
     /// does not compute those, so emitting a normal coinbase there is a
@@ -1130,6 +1142,10 @@ public:
         e.version              = m_version;
         e.mn_rr_height         = m_mn_rr_height;
         e.mn_min_confirmations = m_mn_min_confirmations;
+        // Pinned local tx: pointer into this state (same lifetime discipline
+        // as mnstates/mempool); the builder gates admission per template.
+        e.pinned_local_tx      = m_have_pinned_local_tx
+                                     ? &m_pinned_local_tx : nullptr;
         // E-SUPERBLOCK: hand the resolved treasury schedule to the builder.
         // Empty at non-superblock heights and confidently-unfunded superblocks
         // (normal block); the winning trigger's payees at a funded superblock.
@@ -1506,6 +1522,10 @@ private:
     // fee-carrying mempool-tx body path is an explicit operator opt-in (see
     // set_serve_mempool_txs).
     bool m_serve_mempool_txs{false};
+    // Pinned local tx (set_pinned_local_tx): held by value for the lifetime of
+    // this state; the bundle exposes a pointer only when the flag is set.
+    MutableTransaction m_pinned_local_tx;
+    bool               m_have_pinned_local_tx{false};
     std::function<bool()> m_chain_synced_fn; // optional ABSOLUTE header-sync gate (never serve a stale tip)
     std::function<bool(uint32_t)> m_is_superblock_fn;  // superblock-height predicate
     // E-SUPERBLOCK: daemonless governance-sourced superblock schedule provider

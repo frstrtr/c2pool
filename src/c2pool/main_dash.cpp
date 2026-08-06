@@ -384,6 +384,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-utxo] [--embedded-mainnet] [--embedded-mn-bridge-max N]\n"
         << "           [--embedded-mn-bridge-no-cursor]\n"
         << "           [--embedded-utxo-immature-serve-empty] [--embedded-serve-mempool-txs]\n"
+        << "           [--pin-local-tx-hex FILE]  (zero-fee self-mined tx, e.g. donation consolidation)\n"
         << "           [--bestcl-policy freshness|consensus-exact]\n"
         << "           [--embedded-oracle-shadow]\n"
         << "           [--embedded-shadow-compare]\n"
@@ -755,7 +756,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // itself put a single transaction into a served template — that
              // remains --embedded-serve-mempool-txs' decision, gated on the
              // [SHADOW-TXSET] coverage series.
-             bool embedded_mempool_ingest = false)
+             bool embedded_mempool_ingest = false,
+             // --pin-local-tx-hex <file>: PINNED LOCAL TX (donation-dust
+             // consolidation). File holds the hex of an externally-signed,
+             // ZERO-fee tx spending our own P2PKH outputs; it rides OUR OWN
+             // embedded template (relay rejects 0-fee, so self-mining is its
+             // only chain-ward path). Parsed once here; per-template admission
+             // (inputs unspent + coinbase-mature + fee exactly 0) is re-gated
+             // in the builder against the live UTXO view — a bad or already-
+             // mined pin is EXCLUDED, never a refused template, never a lost
+             // block. Empty (default) = no pin, byte-unchanged.
+             const std::string& pin_local_tx_hex_path = std::string())
 {
     namespace io = boost::asio;
 
@@ -1996,6 +2007,49 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                       : "OFF (default: coinbase-only body, cause="
                         "mempool-txs-disabled; fees forgone, values exact)")
               << "\n";
+
+    // ── Pinned local tx (--pin-local-tx-hex): parse + park in NodeCoinState.
+    if (!pin_local_tx_hex_path.empty()) {
+        std::ifstream pf(pin_local_tx_hex_path);
+        std::string pin_hex((std::istreambuf_iterator<char>(pf)),
+                            std::istreambuf_iterator<char>());
+        // strip whitespace/newlines
+        pin_hex.erase(std::remove_if(pin_hex.begin(), pin_hex.end(),
+                                     [](unsigned char c) { return std::isspace(c); }),
+                      pin_hex.end());
+        bool pin_ok = !pin_hex.empty() && pin_hex.size() % 2 == 0;
+        MutableTransaction pin_tx;
+        if (pin_ok) {
+            try {
+                auto raw = ParseHex(pin_hex);
+                PackStream ps(raw);
+                ps >> pin_tx;
+                // classic tx only: a special-type (extra_payload) pin would
+                // interact with the CbTx roots the template commits — refuse
+                // at load, loudly, rather than gate per template.
+                pin_ok = pin_tx.type == 0
+                         && !pin_tx.vin.empty() && !pin_tx.vout.empty();
+            } catch (const std::exception& e) {
+                std::cout << "[run] --pin-local-tx-hex PARSE FAILED (" << e.what()
+                          << ") — pin DISABLED\n";
+                pin_ok = false;
+            }
+        }
+        if (pin_ok) {
+            node_coin_state.set_pinned_local_tx(pin_tx);
+            std::cout << "[run] pinned local tx ARMED: "
+                      << dash::coin::dash_txid(pin_tx).GetHex()
+                      << " vin=" << pin_tx.vin.size()
+                      << " vout=" << pin_tx.vout.size()
+                      << " (admission re-gated per template: inputs unspent,"
+                      << " coinbase-mature, fee==0; excluded-not-refused on"
+                      << " failure; auto-retires once mined)\n";
+        } else {
+            std::cout << "[run] --pin-local-tx-hex: file empty/unreadable/"
+                      << "invalid (" << pin_local_tx_hex_path
+                      << ") — pin DISABLED\n";
+        }
+    }
 
     // ── E2b (#738): the embedded UTXO/fee lane -- OPT-IN via --embedded-utxo.
     // Transliterated from the PROVEN LTC wiring (main_ltc.cpp ~1750-1801 con-
@@ -6626,6 +6680,7 @@ int main(int argc, char** argv)
     // DASH_CONNECTBLOCK_REJECT_SURFACE_AUDIT.md) arms only on explicit
     // operator decision.
     bool embedded_serve_mempool_txs = false;
+    std::string pin_local_tx_hex_path;
     // --embedded-mempool-ingest: arm the coin-P2P MSG_TX pull (phase 1).
     // SEPARATE from --embedded-serve-mempool-txs on purpose: this only makes
     // the mempool FILL. Whether its contents ever reach a served template is
@@ -6725,6 +6780,8 @@ int main(int argc, char** argv)
             embedded_serve_mempool_txs = true;
         else if (std::strcmp(argv[i], "--embedded-mempool-ingest") == 0)
             embedded_mempool_ingest = true;
+        else if (std::strcmp(argv[i], "--pin-local-tx-hex") == 0 && i + 1 < argc)
+            pin_local_tx_hex_path = argv[++i];
         else if (std::strcmp(argv[i], "--replay-utxo-db") == 0 && i + 1 < argc)
             replay_utxo_db = argv[++i];
         else if (std::strcmp(argv[i], "--replay-utxo-hash") == 0)
@@ -6990,7 +7047,8 @@ int main(int argc, char** argv)
                         embedded_utxo_immature_serve_empty,
                         embedded_serve_mempool_txs,
                         embedded_shadow_compare,
-                        embedded_mempool_ingest);
+                        embedded_mempool_ingest,
+                        pin_local_tx_hex_path);
     }
     return run_selftest();
 }

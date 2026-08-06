@@ -159,6 +159,13 @@ struct EmbeddedWorkInputs {
     // lifetime only — never a computed string.
     const char*                      suppress_cause{"utxo-immature-serving"};
 
+    // PINNED LOCAL TX (donation-dust consolidation lane): non-null when the
+    // operator supplied --pin-local-tx-hex and NodeCoinState holds the parsed
+    // tx. The builder gates admission per template; a null pointer is the
+    // byte-unchanged legacy shape. Points into NodeCoinState (same lifetime
+    // discipline as mnstates/mempool).
+    const MutableTransaction*        pinned_local_tx{nullptr};
+
     bool viable() const {
         return has_state && mnstates != nullptr && mempool != nullptr;
     }
@@ -238,7 +245,10 @@ inline WorkSelection select_dash_work(
                 // the cause names WHICH suppressed mode this is
                 // (utxo-immature-serving vs mempool-txs-disabled).
                 emb.suppress_mempool_txs,
-                emb.suppress_cause);
+                emb.suppress_cause,
+                // Pinned local tx (donation consolidation): admission gated
+                // inside the builder per template; null => byte-unchanged.
+                emb.pinned_local_tx);
         },
         dashd_fallback);
 }
