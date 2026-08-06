@@ -110,6 +110,141 @@ struct ShadowFieldDiff {
     bool        commitment{false};
     bool        modulo_mempool_protx{false};
 };
+/// Which set on OUR side the measurement used.
+///   Served    — the transactions actually in the template.
+///   Candidate — what selection WOULD have chosen, recorded while the served
+///               body is deliberately coinbase-only. This is the mode the
+///               enable-the-flag gate must be evaluated in, because a
+///               measurement over the served set reads 0% by construction
+///               while the flag is off.
+enum class ShadowTxSetMode { Served, Candidate, None };
+
+inline const char* shadow_txset_mode_name(ShadowTxSetMode m)
+{
+    switch (m) {
+        case ShadowTxSetMode::Served:    return "served";
+        case ShadowTxSetMode::Candidate: return "candidate";
+        default:                         return "none";
+    }
+}
+
+/// ── THE MEMPOOL COVERAGE MEASUREMENT (phase-1 mempool ingest) ────────────
+///
+/// While dashd is still present, its template's tx set is a free, per-block
+/// answer key for our own mempool. This is the cheapest possible proof that
+/// our ingest is working and, more importantly, the gate for ever turning
+/// --embedded-serve-mempool-txs on: a wrong tx set costs a whole block, and a
+/// shadow run costs nothing.
+///
+/// The two directions are NOT symmetric:
+///   * dashd-only  — transactions dashd had and we did not. Pure REVENUE loss;
+///     the coverage number the whole mempool project is trying to move.
+///   * ours-only   — transactions WE selected and dashd did not. The dangerous
+///     direction: it means we would have built a block on something dashd's
+///     mempool rejected, did not know about, or had already seen conflict. Any
+///     sustained non-zero here BLOCKS enabling the serve flag.
+/// Diagnostic only — nothing in the served decision reads this.
+struct ShadowTxSetDiff
+{
+    ShadowTxSetMode mode{ShadowTxSetMode::None};
+    size_t ours{0};
+    size_t theirs{0};
+    size_t both{0};
+    size_t dashd_only{0};   // revenue we are leaving on the table
+    size_t ours_only{0};    // the dangerous direction
+
+    // ── PER-TX FEE AGREEMENT — the VALUATION half ────────────────────────
+    // Membership (above) proves we HAVE the transaction. It says nothing
+    // about whether we priced it correctly, and valuation is the half that
+    // can cost a block: the coinbase may claim at most subsidy + fees, so
+    // OVERSTATING a fee is `bad-cb-amount` and the whole block is rejected,
+    // while understating merely forfeits the difference.
+    //
+    // For every tx in BOTH sets we compare our fee against dashd's. That is a
+    // direct, free, per-height proof that the prevout VALUES our UTXO view
+    // holds are right for exactly the coins a template actually spends —
+    // which is strictly less than, and much cheaper than, proving the whole
+    // chainstate with hash_serialized_2.
+    size_t fee_agree{0};
+    size_t fee_understated{0};   // ours < dashd's: forfeits money, block valid
+    size_t fee_overstated{0};    // ours > dashd's: BLOCK-LOSING. must stay 0.
+    size_t fee_unknown{0};       // a side did not report a fee for a shared tx
+    int64_t worst_overstatement{0};   // duffs, max(ours - theirs)
+    std::string worst_overstated_txid;
+    /// theirs == 0 means dashd's own template was coinbase-only: there was no
+    /// fee to capture at this height, so the coverage ratio is undefined
+    /// rather than 0% (counting it as a miss would slander the ingest lane).
+    bool coverage_defined() const { return theirs != 0; }
+    double coverage_pct() const
+    {
+        return coverage_defined() ? (100.0 * static_cast<double>(both)
+                                     / static_cast<double>(theirs)) : 0.0;
+    }
+};
+
+inline ShadowTxSetDiff shadow_tx_set_diff(const DashWorkData& embedded,
+                                          const DashWorkData& dashd)
+{
+    // txid -> fee, but ONLY when the parallel vectors are aligned. When they
+    // are not, report EMPTY rather than guessing: an unaligned WorkData would
+    // otherwise manufacture a coverage number out of nothing, and a fabricated
+    // measurement is worse than a missing one. A fee is carried as optional
+    // separately from membership, because m_tx_fees may legitimately be
+    // shorter (e.g. a builder that pushed hashes but no fee for a class it
+    // does not price) and a MISSING fee must never read as a fee of zero —
+    // zero would silently look like perfect agreement on a free transaction.
+    auto index = [](const DashWorkData& w) {
+        std::map<std::string, std::optional<uint64_t>> out;
+        if (w.m_tx_hashes.size() != w.m_txs.size()) return out;
+        for (size_t i = 0; i < w.m_tx_hashes.size(); ++i) {
+            std::optional<uint64_t> fee;
+            if (i < w.m_tx_fees.size()) fee = w.m_tx_fees[i];
+            out.emplace(w.m_tx_hashes[i].GetHex(), fee);
+        }
+        return out;
+    };
+    // OUR side: the served set when there is one, otherwise the candidate set.
+    // Preference order matters — a template that actually served transactions
+    // must be measured on what it served, never on what it might have chosen.
+    auto our_index = [&index](const DashWorkData& w) {
+        auto served = index(w);
+        if (!served.empty()) return std::make_pair(served, ShadowTxSetMode::Served);
+        std::map<std::string, std::optional<uint64_t>> cand;
+        for (size_t i = 0; i < w.m_txset_candidates.size(); ++i) {
+            std::optional<uint64_t> fee;
+            if (i < w.m_txset_candidate_fees.size())
+                fee = w.m_txset_candidate_fees[i];
+            cand.emplace(w.m_txset_candidates[i].GetHex(), fee);
+        }
+        return std::make_pair(cand, cand.empty() ? ShadowTxSetMode::None
+                                                 : ShadowTxSetMode::Candidate);
+    };
+    const auto [e, e_mode] = our_index(embedded);
+    const auto d = index(dashd);
+    ShadowTxSetDiff r;
+    r.mode = e_mode;
+    r.ours = e.size();
+    r.theirs = d.size();
+    for (const auto& [txid, our_fee] : e) {
+        auto it = d.find(txid);
+        if (it == d.end()) { ++r.ours_only; continue; }
+        ++r.both;
+        if (!our_fee || !it->second) { ++r.fee_unknown; continue; }
+        const uint64_t ours_f = *our_fee, theirs_f = *it->second;
+        if (ours_f == theirs_f) { ++r.fee_agree; continue; }
+        if (ours_f < theirs_f) { ++r.fee_understated; continue; }
+        ++r.fee_overstated;
+        const int64_t over = static_cast<int64_t>(ours_f - theirs_f);
+        if (over > r.worst_overstatement) {
+            r.worst_overstatement    = over;
+            r.worst_overstated_txid  = txid;
+        }
+    }
+    r.dashd_only = r.theirs - r.both;
+    return r;
+}
+
+
 
 /// The verdict for one served height. MatchModuloMempoolProTx is the benign
 /// verdict for "every divergence is the tx-set-dependent merkleRootMNList case"
@@ -124,6 +259,9 @@ struct ShadowOutcome {
     std::string                 no_oracle_reason;
     std::vector<ShadowFieldDiff> diffs;          // diverging fields only
     bool                        served_mismatch{false}; // served && a commitment field diverged
+    /// Mempool coverage vs dashd for this height (phase-1 ingest measurement).
+    /// Zeroed on the no-oracle paths, where there is nothing to compare.
+    ShadowTxSetDiff             tx_set;
     std::vector<std::string>    log_lines;        // the [SHADOW] lines, ready to emit
 };
 
@@ -233,6 +371,62 @@ inline ShadowOutcome shadow_evaluate(WorkSource source,
         o.log_lines.push_back("[SHADOW] h=" + std::to_string(o.height)
                               + " no-oracle reason=" + o.no_oracle_reason);
         return o;
+    }
+
+    // ── MEMPOOL COVERAGE, measured against dashd's own set ───────────────
+    // Emitted for every compared height, whether or not anything diverges:
+    // the number only means something as a series.
+    //
+    // ⚠ THE "ours" SIDE IS ONLY OURS WHEN THE EMBEDDED ARM PRODUCED IT.
+    // `embedded` here is the SERVED template. When the gate declined and the
+    // node served the dashd-fallback arm, that argument IS dashd's template,
+    // and diffing it against a fresh dashd template compares dashd with
+    // itself — which reports a flawless ours=11 dashd=11 coverage=100%
+    // fee_agree=11 while our own mempool holds one transaction. Live-observed
+    // on the first soak run (h=2517157, gate cause=utxo-immature), and it is
+    // exactly the kind of self-confirming number that gets quoted as evidence.
+    // Membership and fee agreement are therefore measured ONLY when the
+    // embedded arm actually built the thing being measured; otherwise the line
+    // says why there is no measurement, and the counters stay zero.
+    if (!o.served) {
+        o.log_lines.push_back(
+            "[SHADOW-TXSET] h=" + std::to_string(o.height)
+            + " no-measurement reason=served-by-dashd-fallback"
+              " (the 'ours' side would be dashd's own template — comparing it"
+              " with dashd would report a fabricated 100%)");
+    } else {
+    o.tx_set = shadow_tx_set_diff(embedded, dashd);
+    {
+        std::string l = "[SHADOW-TXSET] h=" + std::to_string(o.height)
+                      + " mode=" + shadow_txset_mode_name(o.tx_set.mode)
+                      + " ours=" + std::to_string(o.tx_set.ours)
+                      + " dashd=" + std::to_string(o.tx_set.theirs)
+                      + " both=" + std::to_string(o.tx_set.both)
+                      + " dashd_only=" + std::to_string(o.tx_set.dashd_only)
+                      + " ours_only=" + std::to_string(o.tx_set.ours_only);
+        l += o.tx_set.coverage_defined()
+                 ? " coverage=" + std::to_string(
+                       static_cast<int>(o.tx_set.coverage_pct() + 0.5)) + "%"
+                 : " coverage=n/a(dashd-template-was-coinbase-only)";
+        // The VALUATION half, always reported alongside membership: a soak
+        // that compares only tx SETS proves membership, not pricing, and
+        // pricing is the half that can cost a block.
+        l += " fee_agree=" + std::to_string(o.tx_set.fee_agree)
+           + " fee_under=" + std::to_string(o.tx_set.fee_understated)
+           + " fee_over=" + std::to_string(o.tx_set.fee_overstated)
+           + " fee_unknown=" + std::to_string(o.tx_set.fee_unknown);
+        if (o.tx_set.ours_only)
+            l += " ⚠ OURS-ONLY txs present — do NOT enable"
+                 " --embedded-serve-mempool-txs until this is zero";
+        if (o.tx_set.fee_overstated)
+            l += " ⚠⚠ FEE OVERSTATED on " + std::to_string(o.tx_set.fee_overstated)
+               + " tx (worst +" + std::to_string(o.tx_set.worst_overstatement)
+               + " duffs, " + o.tx_set.worst_overstated_txid.substr(0, 16)
+               + ") — a coinbase claiming more than subsidy+fees is"
+                 " bad-cb-amount and the block is REJECTED; do NOT enable"
+                 " --embedded-serve-mempool-txs";
+        o.log_lines.push_back(std::move(l));
+    }
     }
 
     auto add = [&](const char* field, bool commitment,

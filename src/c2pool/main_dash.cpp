@@ -747,7 +747,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // template field diff (diagnostic; NOT a serve gate). Off the hot
              // path (worker-thread dashd fetch). Default false; only meaningful
              // when a dashd RPC oracle is reachable — a strict no-op otherwise.
-             bool embedded_shadow_compare = false)
+             bool embedded_shadow_compare = false,
+             // --embedded-mempool-ingest: arm the coin-P2P MSG_TX pull so the
+             // mempool actually FILLS. Phase 1 of c2pool's own DASH mempool
+             // (the/docs/DASH-OWN-MEMPOOL-DESIGN.md). Default false: turning it
+             // on changes what this node asks its peers for. It does NOT by
+             // itself put a single transaction into a served template — that
+             // remains --embedded-serve-mempool-txs' decision, gated on the
+             // [SHADOW-TXSET] coverage series.
+             bool embedded_mempool_ingest = false)
 {
     namespace io = boost::asio;
 
@@ -3009,6 +3017,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     std::unique_ptr<dash::coin::replay::ReplayCursorStore>     replay_cursor;
     std::unique_ptr<dash::coin::replay::BulkFetchLane>         replay_lane;
     std::unique_ptr<core::Timer>                               replay_timer;
+    // Phase-1 mempool-ingest telemetry (30s); constructed only under
+    // --embedded-mempool-ingest.
+    std::unique_ptr<core::Timer>                               mempool_ingest_timer;
     // W5 integration: the fold engine the lane drives, and its consumer.
     std::unique_ptr<dash::coin::replay::DmlFoldEngine>         replay_fold_engine;
     std::unique_ptr<dash::coin::replay::FoldReplayConsumer>    replay_fold_consumer;
@@ -4579,6 +4590,48 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         coin_p2p->set_on_peer_height(
             [hc = header_chain.get()](uint32_t h) { hc->set_peer_tip_height(h); });
 
+        // ── PHASE-1 MEMPOOL INGEST: arm the MSG_TX pull ──────────────────
+        // Every embedded template we build today is EMPTY, and the reason is
+        // one line of policy: inv_type_is_pulled() admits only
+        // quorum_final_commitment and clsig, so a peer's inv(MSG_TX) never
+        // earned a getdata and the tx handler that feeds
+        // Mempool::add_tx was unreachable from the network. Everything below
+        // that handler already shipped in #1110.
+        //
+        // send_mempool() below has ALWAYS asked peers to announce their pool —
+        // its own comment says "our inv handler currently only pulls block
+        // invs" — so before this the prime was answered with announcements we
+        // then threw away.
+        //
+        // OFF by default. Budgeted, and strictly lower priority than the tip
+        // body. See the/docs/DASH-OWN-MEMPOOL-DESIGN.md.
+        if (embedded_mempool_ingest) {
+            coin_p2p->set_tx_pull(true, /*cap=*/64);
+            // Say what the lane is doing on a cadence: what we were offered,
+            // what we asked for, what arrived, and what the pool now holds.
+            // received==0 with getdata>0 sustained is the signature of a peer
+            // set that will not serve us transactions — a diagnosis nobody can
+            // make from an empty template alone.
+            mempool_ingest_timer =
+                std::make_unique<core::Timer>(&ioc, /*repeat=*/true);
+            mempool_ingest_timer->start(30,
+                [cp = coin_p2p.get(), &node_coin_state]() {
+                    LOG_INFO << cp->tx_ingest_status()
+                             << " pool_txs=" << node_coin_state.mempool().size()
+                             << " pool_bytes=" << node_coin_state.mempool().byte_size()
+                             << " priced_fees="
+                             << node_coin_state.mempool().total_known_fees()
+                             << " duffs";
+                });
+            std::cout << "[run] --embedded-mempool-ingest: coin-P2P MSG_TX pull"
+                         " ARMED (budget 64 in flight, yields to the tip body)."
+                         " The mempool will now FILL from the DASH network.\n"
+                      << "      This does NOT put transactions into served"
+                         " templates: that stays --embedded-serve-mempool-txs"
+                         " (default OFF), gated on the [SHADOW-TXSET]"
+                         " coverage series.\n";
+        }
+
         // Kick the initial sync once the version/verack handshake completes:
         // getheaders off our current locator + a mempool prime.
         coin_p2p->set_on_handshake_complete(
@@ -4588,7 +4641,28 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             " getheaders + mempool + mnlistdiff(cold)"
                          << (discover ? " + getaddr (peer crawl)" : "");
                 cp->send_getheaders(70230, hc->get_locator(), uint256::ZERO);
-                cp->send_mempool();
+                // ── BIP35 AND THE SOLE-INGESTION-PATH INVARIANT ──────────
+                // mempool.hpp names "BIP35 sync drain" as one of the seams
+                // that turns two ConnectBlock reject rows (bad-txns-nonfinal,
+                // mandatory-script-verify-flag) from N/A into GAPs. Those rows
+                // are argued N/A because every tx was RELAY-admitted: a peer
+                // validated it against the current tip and chose to announce
+                // it. A BIP35 drain is different in kind — it dumps the peer's
+                // whole pool, including entries admitted long ago under
+                // policy we cannot date.
+                //
+                // Before the MSG_TX pull existed this call was harmless: the
+                // inv handler discarded the announcements, so the drain was a
+                // no-op (its own comment said so). Arming the pull would make
+                // it live, and would silently convert those two rows into gaps
+                // without the re-audit the invariant demands.
+                //
+                // So when ingest is armed we do NOT drain: the pool fills from
+                // relay only, exactly the path the invariant is written about.
+                // The cost is cold-start latency (we learn a transaction when
+                // it is next announced, not retroactively) — minutes on a
+                // 2.5-minute chain, and it buys the audit staying true.
+                if (!cp->tx_pull_enabled()) cp->send_mempool();
                 // Peer-crawl: getaddr feeds set_addr_callback -> the isolated
                 // peer manager (addr-crawl source, +50 scored) so the diverse
                 // independent peer set grows off live wire discovery.
@@ -6552,6 +6626,12 @@ int main(int argc, char** argv)
     // DASH_CONNECTBLOCK_REJECT_SURFACE_AUDIT.md) arms only on explicit
     // operator decision.
     bool embedded_serve_mempool_txs = false;
+    // --embedded-mempool-ingest: arm the coin-P2P MSG_TX pull (phase 1).
+    // SEPARATE from --embedded-serve-mempool-txs on purpose: this only makes
+    // the mempool FILL. Whether its contents ever reach a served template is
+    // still the other flag's decision, and that one stays default-OFF until
+    // the [SHADOW-TXSET] coverage series says it is safe.
+    bool embedded_mempool_ingest = false;
     std::string bestcl_policy = "freshness";   // --bestcl-policy: freshness (default, conservative proxy) | consensus-exact (dashcore's actual CheckCbTxBestChainlock rule)
     bool embedded_oracle_shadow = false;       // --embedded-oracle-shadow: per-block dashd cross-check (OBSERVE-only)
     bool embedded_shadow_compare = false;      // --embedded-shadow-compare: serve-vs-dashd template diff (OBSERVE-only, NOT a gate)
@@ -6643,6 +6723,8 @@ int main(int argc, char** argv)
             embedded_utxo_immature_serve_empty = true;
         else if (std::strcmp(argv[i], "--embedded-serve-mempool-txs") == 0)
             embedded_serve_mempool_txs = true;
+        else if (std::strcmp(argv[i], "--embedded-mempool-ingest") == 0)
+            embedded_mempool_ingest = true;
         else if (std::strcmp(argv[i], "--replay-utxo-db") == 0 && i + 1 < argc)
             replay_utxo_db = argv[++i];
         else if (std::strcmp(argv[i], "--replay-utxo-hash") == 0)
@@ -6907,7 +6989,8 @@ int main(int argc, char** argv)
                         oracle_class_coverage, coin_p2p_peers, bestcl_policy,
                         embedded_utxo_immature_serve_empty,
                         embedded_serve_mempool_txs,
-                        embedded_shadow_compare);
+                        embedded_shadow_compare,
+                        embedded_mempool_ingest);
     }
     return run_selftest();
 }

@@ -127,6 +127,22 @@ struct DashWorkData {
     // special, and MN-collateral-spending txs), so read it as "at most this much".
     std::string m_txset_empty_cause;
     uint64_t    m_txset_forgone_fees{0};
+
+    // ── THE CANDIDATE SET (observe-without-arming) ────────────────────────
+    // What selection WOULD have chosen, recorded when the served body is
+    // deliberately coinbase-only. NEVER served: these ids/fees are not in
+    // m_txs, m_tx_hashes, m_tx_fees or m_tx_data_hex, contribute nothing to
+    // m_coinbase_value, and no consensus path reads them.
+    //
+    // They exist because the gate that must pass BEFORE fee-carrying
+    // templates are enabled cannot be evaluated from templates built while
+    // that flag is OFF: the served set is empty by construction, so a
+    // coverage measurement over it reads 0% forever and the only ways left to
+    // evaluate the gate are to arm the money path first (exactly what the
+    // gate prevents) or to enable on faith. Measuring the candidate set is
+    // what makes the fee lane completable at all.
+    std::vector<uint256>  m_txset_candidates;
+    std::vector<uint64_t> m_txset_candidate_fees;
 };
 
 } // namespace coin

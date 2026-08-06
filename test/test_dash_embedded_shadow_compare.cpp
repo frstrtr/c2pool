@@ -352,3 +352,350 @@ TEST(DashShadowCompare, MatchingRootsWithDifferentTxSetsIsStillMatch) {
     EXPECT_EQ(o.kind, ShadowOutcome::Kind::Match);
     EXPECT_FALSE(o.served_mismatch);
 }
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE-1 MEMPOOL INGEST — the coverage measurement
+//
+// While dashd is present its template's tx set is a free, per-block answer key
+// for our own mempool. This is the gate for ever enabling
+// --embedded-serve-mempool-txs: a wrong tx set costs a whole block, a shadow
+// run costs nothing. The two directions are not symmetric — dashd-only is
+// revenue we are forfeiting, ours-only is a block we might lose.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace {
+// Attach a tx set to a WorkData the way the builder does: m_txs and
+// m_tx_hashes are PARALLEL, and shadow_tx_set_diff refuses to measure when
+// they are not (see the KAT below).
+void with_txs(DashWorkData& w, const std::vector<uint8_t>& seeds) {
+    w.m_txs.clear();
+    w.m_tx_hashes.clear();
+    w.m_tx_fees.clear();
+    for (uint8_t sd : seeds) {
+        MutableTransaction t;
+        t.version = 2;
+        w.m_txs.emplace_back(t);
+        w.m_tx_hashes.push_back(hashn(sd));
+        w.m_tx_fees.push_back(1000ull * sd);      // deterministic per-txid fee
+    }
+}
+// Same set, but our side prices one tx differently from dashd.
+void reprice(DashWorkData& w, uint8_t seed, uint64_t fee) {
+    for (size_t i = 0; i < w.m_tx_hashes.size(); ++i)
+        if (w.m_tx_hashes[i] == hashn(seed)) w.m_tx_fees[i] = fee;
+}
+} // namespace
+
+TEST(DashShadowCompare, TxSetCoverageIsMeasuredAgainstDashd) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    // dashd has five; we ingested three of them.
+    with_txs(emb,  {1, 2, 3});
+    with_txs(dref, {1, 2, 3, 4, 5});
+
+    const auto d = shadow_tx_set_diff(emb, dref);
+    EXPECT_EQ(d.ours, 3u);
+    EXPECT_EQ(d.theirs, 5u);
+    EXPECT_EQ(d.both, 3u);
+    EXPECT_EQ(d.dashd_only, 2u);      // the fees we are still forfeiting
+    EXPECT_EQ(d.ours_only, 0u);       // the safe direction
+    EXPECT_TRUE(d.coverage_defined());
+    EXPECT_NEAR(d.coverage_pct(), 60.0, 1e-9);
+
+    const auto o = shadow_evaluate(WorkSource::Embedded, emb,
+                                   std::optional<DashWorkData>(dref));
+    EXPECT_TRUE(has_line_with(o.log_lines, "[SHADOW-TXSET]"));
+    EXPECT_TRUE(has_line_with(o.log_lines, "coverage=60%"));
+    EXPECT_TRUE(has_line_with(o.log_lines, "dashd_only=2"));
+    // The measurement is a DIAGNOSTIC: a coverage shortfall is not a mismatch.
+    EXPECT_FALSE(o.served_mismatch);
+}
+
+// The dangerous direction is called out in the line itself, because the
+// operator reads the line, not the struct.
+TEST(DashShadowCompare, TxWeHaveThatDashdDoesNotIsFlaggedLoudly) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    with_txs(emb,  {1, 2, 9});        // 9 is ours alone
+    with_txs(dref, {1, 2, 3});
+
+    const auto d = shadow_tx_set_diff(emb, dref);
+    EXPECT_EQ(d.ours_only, 1u);
+    EXPECT_EQ(d.dashd_only, 1u);
+
+    const auto o = shadow_evaluate(WorkSource::Embedded, emb,
+                                   std::optional<DashWorkData>(dref));
+    EXPECT_TRUE(has_line_with(o.log_lines, "ours_only=1"));
+    EXPECT_TRUE(has_line_with(o.log_lines, "OURS-ONLY"));
+    EXPECT_TRUE(has_line_with(o.log_lines,
+                              "do NOT enable --embedded-serve-mempool-txs"));
+}
+
+// A coinbase-only dashd template means there was no fee to capture at this
+// height. Reporting that as 0% coverage would slander a working ingest lane,
+// so coverage is UNDEFINED, and the line says so.
+TEST(DashShadowCompare, CoverageIsUndefinedWhenDashdHadNoTxsEither) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+
+    const auto d = shadow_tx_set_diff(emb, dref);
+    EXPECT_EQ(d.theirs, 0u);
+    EXPECT_FALSE(d.coverage_defined());
+    EXPECT_EQ(d.dashd_only, 0u);
+
+    const auto o = shadow_evaluate(WorkSource::Embedded, emb,
+                                   std::optional<DashWorkData>(dref));
+    EXPECT_TRUE(has_line_with(o.log_lines, "coverage=n/a"));
+}
+
+// An unaligned WorkData must produce NO measurement rather than a fabricated
+// one. A wrong number here would be read as evidence and acted on.
+TEST(DashShadowCompare, UnalignedTxHashesMeasureNothingRatherThanGuess) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    with_txs(dref, {1, 2, 3});
+    with_txs(emb,  {1, 2, 3});
+    emb.m_tx_hashes.pop_back();       // parallel vectors no longer aligned
+
+    const auto d = shadow_tx_set_diff(emb, dref);
+    EXPECT_EQ(d.ours, 0u) << "an unaligned tx set must not be measured";
+    EXPECT_EQ(d.ours_only, 0u)
+        << "and must never manufacture the dangerous direction";
+    EXPECT_EQ(d.theirs, 3u);
+    EXPECT_EQ(d.dashd_only, 3u);
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PER-TX FEE AGREEMENT — the VALUATION half of the gate
+//
+// Membership proves we HAVE the transaction. It says nothing about whether we
+// priced it right, and pricing is the half that can cost a block: a coinbase
+// may claim at most subsidy + fees, so OVERSTATING is bad-cb-amount and the
+// block is rejected, while understating merely forfeits the difference.
+//
+// This is also the cheap maturity proof for the UTXO lane: agreement on the
+// coins a template actually spends is strictly less than, and far cheaper
+// than, proving the whole chainstate with hash_serialized_2.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashShadowCompare, PerTxFeeAgreementIsCountedForSharedTxs) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    with_txs(emb,  {1, 2, 3});
+    with_txs(dref, {1, 2, 3, 4});
+
+    const auto d = shadow_tx_set_diff(emb, dref);
+    EXPECT_EQ(d.both, 3u);
+    EXPECT_EQ(d.fee_agree, 3u);         // identical pricing on all shared txs
+    EXPECT_EQ(d.fee_overstated, 0u);
+    EXPECT_EQ(d.fee_understated, 0u);
+
+    const auto o = shadow_evaluate(WorkSource::Embedded, emb,
+                                   std::optional<DashWorkData>(dref));
+    EXPECT_TRUE(has_line_with(o.log_lines, "fee_agree=3"));
+    EXPECT_TRUE(has_line_with(o.log_lines, "fee_over=0"));
+}
+
+// UNDERSTATING forfeits money and keeps the block valid — counted, not alarmed.
+TEST(DashShadowCompare, UnderstatedFeeIsCountedButNotAlarmed) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    with_txs(emb,  {1, 2});
+    with_txs(dref, {1, 2});
+    reprice(emb, 2, 500);               // dashd says 2000, we say 500
+
+    const auto d = shadow_tx_set_diff(emb, dref);
+    EXPECT_EQ(d.fee_understated, 1u);
+    EXPECT_EQ(d.fee_overstated, 0u);
+
+    const auto o = shadow_evaluate(WorkSource::Embedded, emb,
+                                   std::optional<DashWorkData>(dref));
+    EXPECT_TRUE(has_line_with(o.log_lines, "fee_under=1"));
+    EXPECT_FALSE(has_line_with(o.log_lines, "FEE OVERSTATED"))
+        << "understating is a revenue loss, not a block loss — do not cry wolf";
+}
+
+// OVERSTATING is the block-losing direction and the line must say so, with the
+// txid and the magnitude, because that is what an operator acts on.
+TEST(DashShadowCompare, OverstatedFeeIsTheBlockLosingDirectionAndSaysSo) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    with_txs(emb,  {1, 2});
+    with_txs(dref, {1, 2});
+    reprice(emb, 2, 9000);              // dashd says 2000, we claim 9000
+
+    const auto d = shadow_tx_set_diff(emb, dref);
+    EXPECT_EQ(d.fee_overstated, 1u);
+    EXPECT_EQ(d.worst_overstatement, 7000);
+    EXPECT_EQ(d.worst_overstated_txid, hashn(2).GetHex());
+
+    const auto o = shadow_evaluate(WorkSource::Embedded, emb,
+                                   std::optional<DashWorkData>(dref));
+    EXPECT_TRUE(has_line_with(o.log_lines, "fee_over=1"));
+    EXPECT_TRUE(has_line_with(o.log_lines, "FEE OVERSTATED"));
+    EXPECT_TRUE(has_line_with(o.log_lines, "+7000 duffs"));
+    EXPECT_TRUE(has_line_with(o.log_lines, "bad-cb-amount"));
+    EXPECT_TRUE(has_line_with(o.log_lines,
+                              "do NOT enable --embedded-serve-mempool-txs"));
+}
+
+// A MISSING fee must never read as a fee of zero — zero would look like
+// perfect agreement on a free transaction and hide the very gap we are
+// measuring.
+TEST(DashShadowCompare, MissingFeeIsUnknownNotZero) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    with_txs(emb,  {1, 2});
+    with_txs(dref, {1, 2});
+    emb.m_tx_fees.pop_back();           // we have the tx but priced nothing
+
+    const auto d = shadow_tx_set_diff(emb, dref);
+    EXPECT_EQ(d.both, 2u);
+    EXPECT_EQ(d.fee_unknown, 1u);
+    EXPECT_EQ(d.fee_agree, 1u);
+    EXPECT_EQ(d.fee_overstated, 0u)
+        << "an absent fee must not be scored as agreement OR as overstatement";
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// THE SELF-CONFIRMING MEASUREMENT — caught on the first live soak
+//
+// shadow_evaluate's `embedded` argument is the SERVED template. When the gate
+// declines and the node serves the dashd-fallback arm, that argument IS
+// dashd's template, and diffing it against a fresh dashd template compares
+// dashd with itself. Live at h=2517157 (gate cause=utxo-immature) it reported
+//     ours=11 dashd=11 both=11 coverage=100% fee_agree=11
+// while our own mempool held ONE transaction. A number like that gets quoted.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashShadowCompare, NoCoverageMeasurementWhenServedByTheFallbackArm) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto served = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref   = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    // The fallback case: the served template IS dashd's, so both sides match
+    // perfectly — which is precisely why it must not be reported as coverage.
+    with_txs(served, {1, 2, 3, 4, 5});
+    with_txs(dref,   {1, 2, 3, 4, 5});
+
+    const auto o = shadow_evaluate(WorkSource::DashdFallback, served,
+                                   std::optional<DashWorkData>(dref));
+    EXPECT_TRUE(has_line_with(o.log_lines, "no-measurement"));
+    EXPECT_TRUE(has_line_with(o.log_lines, "served-by-dashd-fallback"));
+    EXPECT_FALSE(has_line_with(o.log_lines, "coverage=100%"))
+        << "dashd compared with itself must never be reported as coverage";
+    EXPECT_EQ(o.tx_set.both, 0u)   << "counters must stay zero, not flattering";
+    EXPECT_EQ(o.tx_set.fee_agree, 0u);
+
+    // ... and the SAME inputs, when the embedded arm really did build it, ARE
+    // measured. The guard keys on provenance, not on the numbers.
+    const auto o2 = shadow_evaluate(WorkSource::Embedded, served,
+                                    std::optional<DashWorkData>(dref));
+    EXPECT_TRUE(has_line_with(o2.log_lines, "coverage=100%"));
+    EXPECT_EQ(o2.tx_set.fee_agree, 5u);
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// THE CANDIDATE SET — measuring the gate from the correct side of it
+//
+// The third trap: a measurement built over the SERVED tx set cannot evaluate
+// the gate that decides whether to serve. With --embedded-serve-mempool-txs
+// OFF the served set is empty BY CONSTRUCTION, so coverage reads 0% forever
+// however full the mempool is, and the only remaining ways to evaluate the
+// gate are to arm the money path first (what the gate exists to prevent) or to
+// enable on faith. Measuring what selection WOULD have chosen fixes that
+// without putting a single byte into a served template.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashShadowCompare, CandidateSetIsMeasuredWhenTheServedBodyIsCoinbaseOnly) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    with_txs(dref, {1, 2, 3, 4});
+    // Served body is coinbase-only (the flag is off) but selection recorded
+    // what it would have taken.
+    emb.m_txset_candidates      = {hashn(1), hashn(2), hashn(3)};
+    emb.m_txset_candidate_fees  = {1000, 2000, 3000};
+    ASSERT_TRUE(emb.m_txs.empty());
+
+    const auto d = shadow_tx_set_diff(emb, dref);
+    EXPECT_EQ(d.mode, ShadowTxSetMode::Candidate);
+    EXPECT_EQ(d.ours, 3u);
+    EXPECT_EQ(d.both, 3u);
+    EXPECT_EQ(d.dashd_only, 1u);
+    EXPECT_EQ(d.ours_only, 0u);
+    EXPECT_EQ(d.fee_agree, 3u);           // priced identically to dashd
+    EXPECT_NEAR(d.coverage_pct(), 75.0, 1e-9);
+
+    const auto o = shadow_evaluate(WorkSource::Embedded, emb,
+                                   std::optional<DashWorkData>(dref));
+    EXPECT_TRUE(has_line_with(o.log_lines, "mode=candidate"));
+    EXPECT_TRUE(has_line_with(o.log_lines, "coverage=75%"));
+}
+
+// A template that ACTUALLY served transactions is measured on what it served,
+// never on what it might have chosen — otherwise a stale candidate list could
+// flatter a template whose real contents were worse.
+TEST(DashShadowCompare, ServedSetWinsOverCandidatesWhenBothArePresent) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    with_txs(emb,  {1});                  // we actually served ONE
+    with_txs(dref, {1, 2, 3, 4});
+    emb.m_txset_candidates     = {hashn(1), hashn(2), hashn(3)};  // flattering
+    emb.m_txset_candidate_fees = {1000, 2000, 3000};
+
+    const auto d = shadow_tx_set_diff(emb, dref);
+    EXPECT_EQ(d.mode, ShadowTxSetMode::Served);
+    EXPECT_EQ(d.ours, 1u) << "the served set is the truth about a served template";
+    EXPECT_EQ(d.dashd_only, 3u);
+
+    const auto o = shadow_evaluate(WorkSource::Embedded, emb,
+                                   std::optional<DashWorkData>(dref));
+    EXPECT_TRUE(has_line_with(o.log_lines, "mode=served"));
+}
+
+// Nothing on either side: mode=none, and no fabricated coverage.
+TEST(DashShadowCompare, NoServedAndNoCandidatesIsModeNone) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    with_txs(dref, {1, 2});
+
+    const auto d = shadow_tx_set_diff(emb, dref);
+    EXPECT_EQ(d.mode, ShadowTxSetMode::None);
+    EXPECT_EQ(d.ours, 0u);
+    EXPECT_EQ(d.dashd_only, 2u);
+    const auto o = shadow_evaluate(WorkSource::Embedded, emb,
+                                   std::optional<DashWorkData>(dref));
+    EXPECT_TRUE(has_line_with(o.log_lines, "mode=none"));
+}
+
+// The candidate path must still refuse the dangerous direction: a candidate we
+// hold that dashd does not is exactly as disqualifying as a served one, because
+// it is what we WOULD have put in a block.
+TEST(DashShadowCompare, CandidateOursOnlyIsStillFlagged) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    with_txs(dref, {1, 2});
+    emb.m_txset_candidates     = {hashn(1), hashn(9)};   // 9 is ours alone
+    emb.m_txset_candidate_fees = {1000, 9000};
+
+    const auto d = shadow_tx_set_diff(emb, dref);
+    EXPECT_EQ(d.mode, ShadowTxSetMode::Candidate);
+    EXPECT_EQ(d.ours_only, 1u);
+
+    const auto o = shadow_evaluate(WorkSource::Embedded, emb,
+                                   std::optional<DashWorkData>(dref));
+    EXPECT_TRUE(has_line_with(o.log_lines, "OURS-ONLY"));
+    EXPECT_TRUE(has_line_with(o.log_lines,
+                              "do NOT enable --embedded-serve-mempool-txs"));
+}
