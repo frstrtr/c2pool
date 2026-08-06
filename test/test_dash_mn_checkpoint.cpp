@@ -40,6 +40,7 @@
 
 #include <impl/dash/coin/mn_checkpoint.hpp>       // parse_mn_checkpoint (DUT)
 #include <impl/dash/coin/mn_checkpoint_lane.hpp>  // MnCheckpointLane (DUT)
+#include <impl/dash/coin/mn_bridge_cursor.hpp>    // MnBridgeCursorStore (DUT, #91)
 #include <impl/dash/coin/vendor/providertx.hpp>   // CProUpServTx (revival leg)
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>// CSimplifiedMNList (attestation source)
 #include <impl/dash/coin/mn_seed.hpp>             // parse_protx_list_seed (E2c cross-check)
@@ -56,7 +57,10 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <span>
@@ -64,6 +68,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <unistd.h>   // getpid — unique temp paths for the #91 cursor KATs
 
 using dash::coin::MNState;
 using dash::coin::MnCheckpoint;
@@ -4898,4 +4904,500 @@ TEST(DashMnPayeeLatch, SeededMaintainerStillFoldsAndStillReportsDivergence)
     EXPECT_TRUE(st.mn_needs_reseed());
     EXPECT_EQ(m.unseeded_payee_folds_skipped(), 0u)
         << "a seeded fold must never be counted as an unseeded skip";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #91 — THE RESUMABLE REPLAY CURSOR
+//
+// THE DEFECT, verbatim from a 2026-08-04 restart that had ALREADY finished
+// exactly this work:
+//
+//     [MN-CKPT] bridge START: replaying h=2513001..2516913 (3913 blocks)
+//
+// The lane is EVENT-BOUND — it re-drives its request window on tip changes,
+// ~2.5 min apart on mainnet — so that discard cost ~26 of the ~34 minutes of
+// a pure-daemonless cold start, on EVERY process start.
+//
+// What is pinned below is not "a file appears on disk". It is the two claims
+// that make the file safe to believe:
+//
+//   1. RESTART-EQUIVALENCE. A bridge interrupted and resumed publishes the
+//      SAME masternode set, at the SAME as-of height, with the SAME lifetime
+//      counters, as one that ran straight through. This is the test that does
+//      not rot: it compares OUTCOMES, so a field added to the lane and
+//      forgotten in the record fails here without anyone maintaining a list.
+//      (mn_checkpoint_lane.hpp's own reset_for_arm() comment names that exact
+//      drift risk for the two reset lists it already has.)
+//   2. REFUSE-TO-HALF-RESUME. Every one of R1..R7 is exercised as a REFUSAL
+//      that lands on a COLD replay and still publishes the right answer —
+//      never on a partial resume, and never on a lane that fails to serve
+//      because its cache was stale.
+//
+// #895: nothing here is #ifdef-guarded.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+using dash::coin::MnBridgeCursor;
+using dash::coin::MnBridgeCursorStore;
+
+/// A deterministic, height-distinct stand-in for a header-chain block hash.
+uint256 synth_block_hash(uint32_t height)
+{
+    uint256 h;
+    for (int i = 0; i < 4; ++i)
+        h.data()[i] = static_cast<unsigned char>((height >> (8 * i)) & 0xFF);
+    h.data()[31] = 0x91;
+    return h;
+}
+
+/// A store rooted in a unique temp path, removed on destruction. Tests that
+/// share a path would resume each other's state, which is exactly the class of
+/// bug this feature must not introduce, so each rig gets its own.
+struct TempCursorStore {
+    std::filesystem::path dir;
+    MnBridgeCursorStore   store;
+
+    explicit TempCursorStore(const std::string& tag)
+        : dir(std::filesystem::temp_directory_path()
+              / ("c2pool-t91-" + tag + "-"
+                 + std::to_string(::getpid()) + "-"
+                 + std::to_string(reinterpret_cast<uintptr_t>(this))))
+        , store((dir / "dash_mn_bridge_cursor.dat").string())
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+    }
+    ~TempCursorStore()
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+    bool exists() const
+    {
+        std::error_code ec;
+        return std::filesystem::exists(store.path(), ec);
+    }
+    std::vector<uint8_t> raw() const
+    {
+        std::ifstream in(store.path(), std::ios::binary);
+        return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)),
+                                     std::istreambuf_iterator<char>());
+    }
+    void write_raw(const std::vector<uint8_t>& b) const
+    {
+        std::ofstream out(store.path(),
+                          std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(b.data()),
+                  static_cast<std::streamsize>(b.size()));
+    }
+};
+
+/// One process's run of the bridge, over a persistent store.
+///
+/// Every height's header is published, because the real header chain holds
+/// them: the write site names the block it folded (it will not claim a height
+/// it cannot name) and R4 checks that name against the chain on the way back
+/// in.
+struct CursorRun {
+    BridgeHarness h;
+
+    CursorRun(const MnBridgeCursorStore* store, uint32_t tip)
+    {
+        h.headers[kAnchorHeight] = uint256S(kAnchorHash);
+        h.blocks[1519544] = block_from_hex(kBlockHex1519544);
+        h.blocks[1519545] = block_from_hex(kBlockHex1519545);
+        h.blocks[1519546] = block_from_hex(kBlockHex1519546);
+        // The lane names the block it folded at each height and checks that
+        // name against the header chain on the way back in (R4). It never
+        // compares that name to the body, so a DISTINCT deterministic hash per
+        // height is exactly as strong here as a real one — and it makes the
+        // reorg test's "the chain now holds something else at h" explicit
+        // rather than a re-derivation.
+        for (const auto& [ht, blk] : h.blocks) h.headers[ht] = synth_block_hash(ht);
+        h.tip = tip;
+        if (store) h.lane.set_cursor_store(store);
+        // Per-block writes: the KATs replay three blocks, and the shipped
+        // 250-block interval would make every one of them a no-op.
+        h.lane.set_persist_every(1);
+    }
+    void run() { h.lane.arm(good_checkpoint()); h.lane.pump(); }
+};
+
+std::map<uint256, MNState> as_map(
+    const std::vector<std::pair<uint256, MNState>>& v)
+{
+    return std::map<uint256, MNState>(v.begin(), v.end());
+}
+
+} // namespace
+
+// ── 1. THE CLAIM: a restart RESUMES ────────────────────────────────────────
+TEST(DashMnBridgeCursor, RestartResumesInsteadOfReplayingTheWindow)
+{
+    TempCursorStore cs("resume");
+
+    // Process 1: replay 1519544..1519545 and publish at that tip.
+    {
+        CursorRun r1(&cs.store, 1519545);
+        r1.run();
+        ASSERT_TRUE(r1.h.published) << r1.h.lane.status();
+        EXPECT_FALSE(r1.h.lane.cursor_restored())
+            << "a first run has nothing to resume from";
+        EXPECT_EQ(r1.h.lane.restored_at(), 0u);
+    }
+    ASSERT_TRUE(cs.exists())
+        << "a completed bridge must leave a record, or the next start pays the"
+           " whole replay again";
+
+    // Process 2: same anchor, same store, one more block on the chain.
+    CursorRun r2(&cs.store, 1519546);
+    r2.run();
+
+    ASSERT_TRUE(r2.h.lane.cursor_restored())
+        << "verdict: " << r2.h.lane.restore_verdict();
+    EXPECT_EQ(r2.h.lane.restored_at(), 1519545u);
+    ASSERT_TRUE(r2.h.published) << r2.h.lane.status();
+    EXPECT_EQ(r2.h.published_as_of, 1519546u);
+
+    // THE SAVING, measured the only way that means anything here: the work
+    // NOT redone. The resumed process must never ask for a block a previous
+    // process already folded.
+    for (uint32_t asked : r2.h.requested) {
+        EXPECT_GT(asked, 1519545u)
+            << "h=" << asked << " was already replayed and persisted; asking"
+               " for it again IS the defect #91 exists to remove";
+    }
+    EXPECT_EQ(r2.h.lane.replay_applied(), 1u)
+        << "only the one new block should have been applied by this process";
+    EXPECT_EQ(r2.h.lane.applied_lifetime(), 3u)
+        << "the LIFETIME span from the anchor is still all three blocks — a"
+           " resumed publish that under-reports its own coverage is a report"
+           " that lies";
+}
+
+// ── 2. THE DRIFT-PROOF TEST: outcome equality ──────────────────────────────
+TEST(DashMnBridgeCursor, ResumedBridgePublishesExactlyWhatAContinuousOneDoes)
+{
+    // Continuous control: no store at all, straight through to the tip.
+    CursorRun cont(nullptr, 1519546);
+    cont.run();
+    ASSERT_TRUE(cont.h.published) << cont.h.lane.status();
+
+    // Interrupted + resumed, same chain, same anchor.
+    TempCursorStore cs("equiv");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+    CursorRun b(&cs.store, 1519546);
+    b.run();
+    ASSERT_TRUE(b.h.lane.cursor_restored()) << b.h.lane.restore_verdict();
+    ASSERT_TRUE(b.h.published) << b.h.lane.status();
+
+    // The published SET must be identical field for field. MNState::operator==
+    // covers every payout-relevant field including nLastPaidHeight — the one
+    // GetMNPayee orders the payment queue by, and the one a wrong resume would
+    // corrupt without changing the set's membership at all.
+    EXPECT_EQ(b.h.published_as_of, cont.h.published_as_of);
+    ASSERT_EQ(b.h.published_set.size(), cont.h.published_set.size());
+    const auto want = as_map(cont.h.published_set);
+    const auto got  = as_map(b.h.published_set);
+    ASSERT_EQ(got.size(), want.size());
+    for (const auto& [hash, st] : want) {
+        ASSERT_TRUE(got.count(hash))
+            << "resumed set is missing " << hash.GetHex().substr(0, 16);
+        EXPECT_TRUE(got.at(hash) == st)
+            << "resumed state differs for " << hash.GetHex().substr(0, 16)
+            << " — nLastPaidHeight " << got.at(hash).nLastPaidHeight
+            << " vs " << st.nLastPaidHeight;
+    }
+
+    // ...and so must the LIFETIME accounting. This is the half that catches a
+    // field added to the lane and forgotten in the record: nobody has to
+    // remember to extend a list, the outcome simply stops matching.
+    EXPECT_EQ(b.h.lane.applied_lifetime(), cont.h.lane.applied_lifetime());
+    EXPECT_EQ(b.h.lane.folds_lifetime(),   cont.h.lane.folds_lifetime());
+    EXPECT_EQ(b.h.lane.replay_registered(), cont.h.lane.replay_registered());
+    EXPECT_EQ(b.h.lane.replay_spent(),      cont.h.lane.replay_spent());
+    EXPECT_EQ(b.h.lane.eligible_size(),     cont.h.lane.eligible_size());
+}
+
+// ── 3. R2: a record from a DIFFERENT anchor is refused ─────────────────────
+TEST(DashMnBridgeCursor, RecordFromADifferentAnchorIsRefusedAndReplayedCold)
+{
+    TempCursorStore cs("lineage");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+    ASSERT_TRUE(cs.exists());
+
+    // Rewrite the record's anchor hash: a release cut from a different anchor,
+    // or a data dir carried across builds. Its SET may be perfectly good — and
+    // that is the point: we cannot TIE it to the trust root this binary
+    // carries, so we do not build a payee queue on it.
+    std::string why;
+    auto rec = cs.store.load(why);
+    ASSERT_TRUE(rec.has_value()) << why;
+    rec->anchor_hash = uint256S(
+        "00000000000000000000000000000000000000000000000000000000deadbeef");
+    ASSERT_TRUE(cs.store.store(*rec));
+
+    CursorRun r(&cs.store, 1519546);
+    r.run();
+    EXPECT_FALSE(r.h.lane.cursor_restored());
+    EXPECT_NE(r.h.lane.restore_verdict().find("R2"), std::string::npos)
+        << r.h.lane.restore_verdict();
+    // COLD is not FAILED: the lane must still do its job, just slowly.
+    ASSERT_TRUE(r.h.published) << r.h.lane.status();
+    EXPECT_EQ(r.h.published_as_of, 1519546u);
+    EXPECT_EQ(r.h.lane.replay_applied(), 3u)
+        << "a refused record must produce a FULL cold replay, not a partial one";
+}
+
+// ── 4. R4: the chain REORGED past the persisted cursor ─────────────────────
+TEST(DashMnBridgeCursor, ReorgPastThePersistedCursorIsRefusedAndReplayedCold)
+{
+    TempCursorStore cs("reorg");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+
+    // Our own PoW-validated header chain now holds a DIFFERENT block at the
+    // persisted height. Every payment attributed after the fork point is
+    // wrong, and resuming would carry that wrongness into a coinbase.
+    // auto_deliver OFF so the cold replay that follows the refusal cannot
+    // immediately write a NEW record: the property under test is that the
+    // STALE one is gone, and a rewrite would mask its removal.
+    CursorRun r(&cs.store, 1519546);
+    r.h.auto_deliver = false;
+    r.h.headers[1519545] = uint256S(
+        "00000000000000000000000000000000000000000000000000000000feedface");
+    r.run();
+
+    EXPECT_FALSE(r.h.lane.cursor_restored());
+    EXPECT_NE(r.h.lane.restore_verdict().find("R4"), std::string::npos)
+        << r.h.lane.restore_verdict();
+    EXPECT_EQ(r.h.lane.state(), MnCheckpointLane::State::Bridging)
+        << "a refused record costs a replay, never the lane: " << r.h.lane.status();
+    EXPECT_EQ(r.h.lane.cursor_height(), kAnchorHeight)
+        << "the cold replay must restart at the ANCHOR, not somewhere in the"
+           " middle of the refused record's range";
+    EXPECT_FALSE(cs.exists())
+        << "a refused record must be REMOVED, not left to be re-adjudicated and"
+           " re-refused on every subsequent start";
+
+    // And the cold replay, once the blocks arrive, still lands on the right
+    // answer over the chain we ACTUALLY hold.
+    r.h.auto_deliver = true;
+    for (uint32_t ht = 1519544; ht <= 1519546; ++ht)
+        r.h.lane.on_block_connected(r.h.blocks.at(ht), ht);
+    ASSERT_TRUE(r.h.published) << r.h.lane.status();
+    EXPECT_EQ(r.h.published_as_of, 1519546u);
+    EXPECT_EQ(r.h.lane.replay_applied(), 3u);
+}
+
+// ── 5. R5: the anti-gap arithmetic ─────────────────────────────────────────
+TEST(DashMnBridgeCursor, ARecordThatSkippedHeightsIsRefusedNotResumed)
+{
+    // THE W1/W2 DEFECT, reproduced deliberately: a cursor that claims a height
+    // it did not contiguously reach. There the bulk lane resumed at h=2513098
+    // while the fold sat at h=2513000; here the record says "I am at 1519545"
+    // while its own applied count proves it folded only one block from an
+    // anchor two below. Resuming would silently skip a height's payments.
+    TempCursorStore cs("gap");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+
+    std::string why;
+    auto rec = cs.store.load(why);
+    ASSERT_TRUE(rec.has_value()) << why;
+    ASSERT_TRUE(rec->contiguous()) << "the writer must only ever emit"
+                                      " contiguous records";
+    rec->applied = rec->applied - 1;          // one height unaccounted for
+    ASSERT_FALSE(rec->contiguous());
+    ASSERT_TRUE(cs.store.store(*rec));
+
+    CursorRun r(&cs.store, 1519546);
+    r.run();
+    EXPECT_FALSE(r.h.lane.cursor_restored());
+    EXPECT_NE(r.h.lane.restore_verdict().find("R5"), std::string::npos)
+        << r.h.lane.restore_verdict();
+    ASSERT_TRUE(r.h.published) << r.h.lane.status();
+    EXPECT_EQ(r.h.lane.replay_applied(), 3u);
+}
+
+// ── 6. R1: a torn, truncated or foreign file is never half-read ────────────
+TEST(DashMnBridgeCursor, CorruptTruncatedAndForeignRecordsAllRefuse)
+{
+    // (a) a flipped byte inside the payload
+    {
+        TempCursorStore cs("bitrot");
+        { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+        auto b = cs.raw();
+        ASSERT_GT(b.size(), 100u);
+        b[b.size() / 2] ^= 0xFF;
+        cs.write_raw(b);
+        std::string why;
+        EXPECT_FALSE(cs.store.load(why).has_value());
+        EXPECT_NE(why.find("digest"), std::string::npos) << why;
+    }
+    // (b) a truncated tail — the classic half-flushed write. The rename(2)
+    //     publish makes this unreachable in practice; it is pinned anyway,
+    //     because "unreachable" is a property of today's write path.
+    {
+        TempCursorStore cs("trunc");
+        { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+        auto b = cs.raw();
+        b.resize(b.size() - 40);
+        cs.write_raw(b);
+        std::string why;
+        EXPECT_FALSE(cs.store.load(why).has_value()) << why;
+    }
+    // (c) something else entirely at that path
+    {
+        TempCursorStore cs("foreign");
+        cs.write_raw(std::vector<uint8_t>(200, 0x41));
+        std::string why;
+        EXPECT_FALSE(cs.store.load(why).has_value());
+        EXPECT_NE(why.find("magic"), std::string::npos) << why;
+    }
+    // (d) a future format version. Discarded WHOLE — the MnStateDb v1->v2
+    //     lesson was that entry-by-entry deserialisation silently SKIPS rows
+    //     and leaves a partial set under a believed cursor.
+    {
+        TempCursorStore cs("version");
+        { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+        auto b = cs.raw();
+        b[24] = static_cast<uint8_t>(MnBridgeCursorStore::kFormatVersion + 7);
+        cs.write_raw(b);
+        std::string why;
+        EXPECT_FALSE(cs.store.load(why).has_value());
+        EXPECT_NE(why.find("format"), std::string::npos) << why;
+    }
+}
+
+// ── 7. A fail-closed bridge must not be resumable ──────────────────────────
+TEST(DashMnBridgeCursor, FailClosedErasesTheRecordSoARestartCannotResumeIntoIt)
+{
+    TempCursorStore cs("failclosed");
+
+    // Replay one good block (which persists), then feed a block whose coinbase
+    // pays nobody the anchored set projects: a terminal payee desync.
+    CursorRun r(&cs.store, 1519546);
+    r.h.auto_deliver = false;
+    r.h.lane.arm(good_checkpoint());
+    r.h.lane.pump();
+    ASSERT_EQ(r.h.lane.state(), MnCheckpointLane::State::Bridging);
+    r.h.lane.on_block_connected(block_from_hex(kBlockHex1519544), 1519544);
+    ASSERT_EQ(r.h.lane.cursor_height(), 1519544u);
+    ASSERT_TRUE(cs.exists()) << "a delivered block must have been persisted";
+
+    auto cp  = good_checkpoint();
+    auto bad = repay_coinbase(block_from_hex(kBlockHex1519545),
+                              payout_of(cp, kQ2), synth_script(0x5a));
+    r.h.lane.on_block_connected(bad, 1519545);
+    ASSERT_EQ(r.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << r.h.lane.status();
+
+    EXPECT_FALSE(cs.exists())
+        << "the persisted state leads INTO this failure. The re-arm ladder's"
+           " deterministic-repeat block is per-PROCESS, so a surviving record"
+           " would turn a deterministic failure into a resume/fail/restart loop"
+           " that nothing is left to see";
+}
+
+// ── 8. A restored set may not publish unfalsified ──────────────────────────
+TEST(DashMnBridgeCursor, RestoredSetIsNotPublishedUntilThisProcessFalsifiesIt)
+{
+    TempCursorStore cs("falsify");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+
+    // Restart with the cursor EXACTLY at the tip and no fold seam wired: there
+    // is nothing this process has verified for itself yet. The set is bytes off
+    // a local disk that passed a lineage check, and this lane's whole claim on
+    // trust is that its data is falsified against real coinbases.
+    CursorRun r(&cs.store, 1519545);
+    r.run();
+    ASSERT_TRUE(r.h.lane.cursor_restored()) << r.h.lane.restore_verdict();
+    EXPECT_TRUE(r.h.lane.resume_verification_pending());
+    EXPECT_FALSE(r.h.published)
+        << "publishing here would hand the maintainer an authoritative payee"
+           " queue on the strength of a local file alone";
+    EXPECT_NE(r.h.lane.waiting_for().find("resume-falsification"),
+              std::string::npos)
+        << "a HOLD that prints 'tip-advance' is indistinguishable from a"
+           " healthy idle lane: " << r.h.lane.waiting_for();
+
+    // The chain moves on. The first applied block runs the coinbase payee
+    // cross-check — the falsification the resume owed — and the hold clears.
+    r.h.tip = 1519546;
+    r.h.lane.pump();
+    EXPECT_FALSE(r.h.lane.resume_verification_pending());
+    ASSERT_TRUE(r.h.published) << r.h.lane.status();
+    EXPECT_EQ(r.h.published_as_of, 1519546u);
+}
+
+// ── 9. Unwired, nothing changes (the --embedded-mn-bridge-no-cursor posture) ─
+TEST(DashMnBridgeCursor, WithNoStoreWiredTheLaneWritesNothingAndAlwaysStartsCold)
+{
+    TempCursorStore cs("nostore");   // path exists; the lane is never told
+    CursorRun a(nullptr, 1519546);
+    a.run();
+    ASSERT_TRUE(a.h.published);
+    EXPECT_FALSE(a.h.lane.has_cursor_store());
+    EXPECT_FALSE(a.h.lane.cursor_restored());
+    EXPECT_FALSE(cs.exists())
+        << "an unwired lane must not touch the filesystem at all";
+
+    CursorRun b(nullptr, 1519546);
+    b.run();
+    EXPECT_FALSE(b.h.lane.cursor_restored());
+    EXPECT_EQ(b.h.lane.replay_applied(), 3u)
+        << "the pre-#91 behaviour, byte for byte: every start replays the whole"
+           " window";
+}
+
+// ── 10. The record's own encoding ──────────────────────────────────────────
+TEST(DashMnBridgeCursor, RecordRoundTripsEveryFieldAndRejectsTrailingBytes)
+{
+    TempCursorStore cs("roundtrip");
+    { CursorRun a(&cs.store, 1519546); a.run(); ASSERT_TRUE(a.h.published); }
+
+    std::string why;
+    auto rec = cs.store.load(why);
+    ASSERT_TRUE(rec.has_value()) << why;
+    EXPECT_EQ(rec->anchor_height, kAnchorHeight);
+    EXPECT_EQ(rec->anchor_hash, uint256S(kAnchorHash));
+    EXPECT_EQ(rec->cursor_height, 1519546u);
+    EXPECT_EQ(rec->applied, 3u);
+    EXPECT_EQ(rec->entries.size(), 6u);
+    EXPECT_TRUE(rec->contiguous());
+
+    // The set survives the round trip field for field — including the payment
+    // ordering key, which is the field a lossy codec would silently flatten.
+    auto by_hash = as_map(rec->entries);
+    EXPECT_EQ(by_hash.at(uint256S(kQ1)).nLastPaidHeight, 1519544u);
+    EXPECT_EQ(by_hash.at(uint256S(kQ2)).nLastPaidHeight, 1519545u);
+    EXPECT_EQ(by_hash.at(uint256S(kQ3)).nLastPaidHeight, 1519546u);
+    for (const auto& [h, st] : by_hash) {
+        EXPECT_FALSE(st.scriptPayout.m_data.empty())
+            << h.GetHex().substr(0, 16) << " lost its payout script";
+    }
+
+    // A payload that decodes a PREFIX and leaves bytes over is a writer and a
+    // reader that disagree about the record's shape. "It parsed" is not the
+    // bar; "it parsed exactly" is.
+    auto b = cs.raw();
+    b.insert(b.end() - 32, 8, 0x00);              // 8 stray bytes in the payload
+    const size_t len_at = 24 + 4;
+    const uint64_t newlen =
+        b.size() - (24 + 4 + 8) - 32;
+    for (int i = 0; i < 8; ++i)
+        b[len_at + i] = static_cast<uint8_t>((newlen >> (8 * i)) & 0xFF);
+    // Re-seal the digest so this probes the SHAPE check and not the checksum.
+    {
+        uint256 d;
+        CHash256()
+            .Write(std::span<const unsigned char>(b.data() + 24 + 4 + 8,
+                                                  static_cast<size_t>(newlen)))
+            .Finalize(std::span<unsigned char>(d.data(), 32));
+        std::memcpy(b.data() + b.size() - 32, d.data(), 32);
+    }
+    cs.write_raw(b);
+    std::string why2;
+    EXPECT_FALSE(cs.store.load(why2).has_value());
+    EXPECT_NE(why2.find("trailing"), std::string::npos) << why2;
 }

@@ -231,6 +231,17 @@ const char* const kDashMnCheckpointTestnet =
 uint32_t g_mn_bridge_max_blocks =
     dash::coin::MnCheckpointLane::kDefaultMaxBridgeBlocks;
 
+// --embedded-mn-bridge-no-cursor (#91): DISABLE the bridge's resumable replay
+// cursor, so every process start replays the whole window from the pinned
+// anchor — exactly the behaviour before #91 existed.
+//
+// This is a CONTROL, and it is here because the claim #91 makes is a TIMING
+// claim ("a restart no longer costs ~26 minutes"), and a timing claim needs an
+// A/B on the same binary, same host, same peers. Same file-scope posture as
+// g_mn_bridge_max_blocks: written once during argument parsing, read once at
+// wiring.
+bool g_mn_bridge_no_cursor = false;
+
 // ── W2 FULL-HISTORY REPLAY bulk-fetch flags (replay_bulk_fetch.hpp) ─────────
 // Same file-scope posture (and the same rationale) as g_mn_bridge_max_blocks:
 // written once during argument parsing, read once at wiring. All default OFF —
@@ -371,6 +382,7 @@ void print_banner(const char* argv0)
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
         << "           [--external-ip ADDR]\n"
         << "           [--embedded-utxo] [--embedded-mainnet] [--embedded-mn-bridge-max N]\n"
+        << "           [--embedded-mn-bridge-no-cursor]\n"
         << "           [--embedded-utxo-immature-serve-empty] [--embedded-serve-mempool-txs]\n"
         << "           [--bestcl-policy freshness|consensus-exact]\n"
         << "           [--embedded-oracle-shadow]\n"
@@ -501,6 +513,18 @@ void print_banner(const char* argv0)
         << "        have_mn on a node with no dashd. Anything short of the full\n"
         << "        guard WITHHOLDS and names the blocking condition; the dashd\n"
         << "        seed and the checkpoint bridge are unchanged.\n"
+        << "        --embedded-mn-bridge-no-cursor DISABLES the MN-CKPT\n"
+        << "        bridge's persistent replay cursor, so every start replays\n"
+        << "        the whole window from the pinned anchor (the pre-#91\n"
+        << "        behaviour). Default ON: the bridge saves the set it has\n"
+        << "        actually folded, with the height and block hash it folded\n"
+        << "        to and the anchor it descends from, and a restart RESUMES\n"
+        << "        there instead of re-walking ~3900 blocks at one window per\n"
+        << "        tip change. A record that cannot be tied to this build's\n"
+        << "        anchor, to our own header chain at that height, and to a\n"
+        << "        contiguous span from the anchor is DISCARDED (cold start,\n"
+        << "        naming the rule) — it is never half-resumed. Use this flag\n"
+        << "        to measure cold-vs-warm on one binary.\n"
         << "        --embedded-no-dashd-mn-seed cuts the PAYEE axis off from a\n"
         << "        configured dashd (no `protx list` seed, no checkpoint\n"
         << "        bridge) while KEEPING the RPC for --embedded-shadow-compare:\n"
@@ -2962,6 +2986,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // node_coin_state / coin_state (declared earlier) they reference.
     std::unique_ptr<dash::coin::HeaderChain> header_chain;
     std::unique_ptr<dash::coin::CoinStateMaintainer> maintainer;
+    // #91: the MN-CKPT bridge's resumable replay cursor. Declared BEFORE the
+    // lane so it is destroyed AFTER it — the lane borrows a raw pointer and
+    // writes through it from on_block_connected/publish, so the store must
+    // outlive every path that can still call into the lane.
+    std::unique_ptr<dash::coin::MnBridgeCursorStore> mn_bridge_cursor;
     // E2d: the daemonless MN-set bridge. Constructed for the whole embedded
     // arm so the tip-changed driver below can pump it unconditionally, but
     // only ARMED on the no-RPC path (an available `protx list` is strictly
@@ -4783,6 +4812,40 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             const std::string net_name = testnet ? "testnet" : "mainnet";
             auto ckpt = dash::coin::parse_mn_checkpoint(payload, net_name);
 
+            // ── #91: THE RESUMABLE REPLAY CURSOR ──────────────────────────
+            //
+            // Wired BEFORE arm(), because arm() is where the persisted record
+            // is read. Rooted in the per-instance data dir alongside every
+            // other piece of DASH state, so --data-dir isolates it exactly
+            // like the header chain, the SML db and the credit pool.
+            //
+            // Without this the bridge threw away a COMPLETED replay on every
+            // process start: "[MN-CKPT] bridge START: replaying
+            // h=2513001..2516913 (3913 blocks)" after a restart that had
+            // already finished that work. The lane is EVENT-BOUND — it
+            // re-drives its window on tip changes, ~2.5 min apart — so that
+            // discard cost ~26 of the ~34 minutes of a pure-daemonless cold
+            // start, every time.
+            //
+            // The lane refuses to half-resume: see try_restore()'s R1..R7. A
+            // record it cannot tie to THIS build's anchor, to our own header
+            // chain at the persisted height, and to a contiguous span from the
+            // anchor is discarded and the bridge starts COLD, naming the rule.
+            if (!g_mn_bridge_no_cursor) {
+                mn_bridge_cursor =
+                    std::make_unique<dash::coin::MnBridgeCursorStore>(
+                        (core::filesystem::config_path() / net_subdir
+                         / "dash_mn_bridge_cursor.dat").string());
+                mn_ckpt_lane->set_cursor_store(mn_bridge_cursor.get());
+            } else {
+                std::cout << "[run] --embedded-mn-bridge-no-cursor: the"
+                             " MN-CKPT bridge will NOT persist or resume its"
+                             " replay cursor. Every start replays the whole"
+                             " window from the pinned anchor — the behaviour"
+                             " before task #91. This exists so a cold-vs-warm"
+                             " measurement has a control.\n";
+            }
+
             // Fail CLOSED and LOUDLY. A wrong payee is a coinbase the network
             // rejects — direct revenue loss — so an unusable anchor must be
             // impossible to mistake for a working one. arm() latches the lane
@@ -6164,6 +6227,18 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         << (mn_ckpt_lane ? mn_ckpt_lane->state_name() : "none")
                         << " bridge_cursor="
                         << (mn_ckpt_lane ? mn_ckpt_lane->cursor_height() : 0)
+                        // #91: is this process finishing a previous one's
+                        // replay, or redoing it? It is the first thing worth
+                        // knowing when a restart is slow, and before this the
+                        // only way to tell was to time it.
+                        << " bridge_cursor_src="
+                        << (!mn_ckpt_lane
+                                ? std::string("none")
+                                : (mn_ckpt_lane->cursor_restored()
+                                       ? "resumed@h="
+                                             + std::to_string(
+                                                   mn_ckpt_lane->restored_at())
+                                       : std::string("cold")))
                         << " bridge_wait="
                         << (mn_ckpt_lane ? mn_ckpt_lane->waiting_for()
                                          : std::string("n/a"))
@@ -6620,6 +6695,9 @@ int main(int argc, char** argv)
                  && i + 1 < argc)
             g_mn_bridge_max_blocks = static_cast<uint32_t>(
                 std::strtoul(argv[++i], nullptr, 10));
+        // #91: the A/B control for the resumable replay cursor.
+        else if (std::strcmp(argv[i], "--embedded-mn-bridge-no-cursor") == 0)
+            g_mn_bridge_no_cursor = true;
         else if ((std::strcmp(argv[i], "--give-author") == 0 ||
                   std::strcmp(argv[i], "--dev-donation") == 0) && i + 1 < argc)
             dev_donation = std::strtod(argv[++i], nullptr);

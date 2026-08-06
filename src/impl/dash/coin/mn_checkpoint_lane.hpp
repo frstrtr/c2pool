@@ -206,6 +206,7 @@
 /// path in main_dash.cpp; the dashd-RPC fallback never touches this file.
 
 #include <impl/dash/coin/block.hpp>
+#include <impl/dash/coin/mn_bridge_cursor.hpp>   // #91: the resumable replay cursor
 #include <impl/dash/coin/mn_checkpoint.hpp>
 #include <impl/dash/coin/mn_state_machine.hpp>
 #include <impl/dash/coin/historical_sml.hpp>   // authenticate_historical_snapshot
@@ -383,6 +384,64 @@ public:
     uint32_t max_bridge_blocks() const     { return m_max_bridge; }
 
     // ─────────────────────────────────────────────────────────────────────
+    // #91: CURSOR PERSISTENCE — a restart RESUMES instead of replaying
+    // ─────────────────────────────────────────────────────────────────────
+    //
+    // WHAT WAS BROKEN, verbatim, on a restart that had ALREADY done the work:
+    //
+    //     [MN-CKPT] bridge START: replaying h=2513001..2516913 (3913 blocks)
+    //
+    // #1126 made that discard VISIBLE (the COLD/RESTORED line below) and
+    // measured its cost: the lane is EVENT-BOUND — it re-drives its request
+    // window only on a tip change, ~2.5 min per mainnet block, bursting at
+    // ~375 blk/s when it does fire — so the bill is ~26 of the ~34 minutes of
+    // a pure-daemonless cold start, paid on EVERY process start.
+    //
+    // ── THE RULE: AUTHORITATIVE, OR COLD. NEVER HALF-RESUMED ─────────────
+    //
+    // This lane's output is the payee queue that gates block templates. A
+    // wrong resume is a wrong payee is a rejected block, so the resume path is
+    // built to make a partial state UNREPRESENTABLE rather than to police one:
+    //
+    //   * ONE record carries the set AND its height AND its provenance
+    //     (mn_bridge_cursor.hpp), written by a single rename(2). There is no
+    //     cursor-without-a-set and no set-without-a-height to pair wrongly.
+    //     That is the direct lesson of the W1/W2 integration, where the bulk
+    //     lane's persistent cursor and the fold's anchor were INDEPENDENT and
+    //     a restart resumed the lane at h=2513098 with the fold at h=2513000.
+    //   * try_restore() enforces R1..R7 below and, if ANY of them cannot be
+    //     shown to hold against what is on disk and on our own header chain
+    //     RIGHT NOW, it discards the record and starts COLD, naming which one.
+    //     It never resumes into a gap and never resumes a lineage it cannot
+    //     tie to the anchor this binary carries.
+    //   * What is persisted is what was DELIVERED — the height apply_block
+    //     actually folded — never m_requested_through and never the replay
+    //     target. #1128's inverse (a floor taken from an aspirational ceiling)
+    //     destroyed derived state; the comment on note_persist() carries the
+    //     write-site argument.
+    //   * A RESTORED set may not publish until it has been FALSIFIED at least
+    //     once by evidence this process fetched itself — see
+    //     resume_verification_pending(). Fail-closed beats fast.
+
+    /// Borrowed, may be nullptr (KATs, and any embedding that does not want a
+    /// resumable bridge). Unwired the lane behaves EXACTLY as it did before
+    /// this seam existed: every start is COLD and nothing is written.
+    void set_cursor_store(const MnBridgeCursorStore* store)
+    {
+        m_cursor_store = store;
+    }
+    bool has_cursor_store() const { return m_cursor_store != nullptr; }
+
+    /// How many applied blocks between checkpoint writes. A record costs one
+    /// ~700 KB rename (≈3000 masternodes), so per-block would be absurd at the
+    /// measured 375 blk/s burst rate, and the WORST case a coarse interval can
+    /// cost is re-replaying fewer than `n` blocks — against the 3913 this
+    /// exists to avoid. Deliberately smaller than kDefaultFoldInterval so a
+    /// resumed cursor is never more than one fold interval from a fold point.
+    static constexpr uint32_t kDefaultPersistEvery = 250;
+    void set_persist_every(uint32_t n) { m_persist_every = n ? n : 1; }
+
+    // ─────────────────────────────────────────────────────────────────────
     // DIAGNOSTIC SEAMS (telemetry only — no serve/arm/consensus effect)
     // ─────────────────────────────────────────────────────────────────────
 
@@ -462,6 +521,9 @@ public:
     {
         if (m_state == State::FailedClosed) return "nothing(failed-closed)";
         if (m_state == State::Published)    return "nothing(published)";
+        // ORDER MATTERS, and it is measured rather than assumed: whatever is
+        // OUTSTANDING is always the more specific answer, so every outstanding
+        // -work case is tested BEFORE the resume debt below.
         if (m_snapshot_pending)
             return std::string(m_ondemand_pending ? "ondemand-mnlist-reply@h="
                                                   : "fold-mnlist-reply@h=")
@@ -472,6 +534,22 @@ public:
         if (m_requested_through >= m_next)
             return "block-bodies@h=" + std::to_string(m_next) + ".."
                    + std::to_string(m_requested_through);
+        // LAST, and that is the whole point. An unfalsified resume is a DEBT,
+        // not a blocker: while a fold reply or a block body is outstanding, the
+        // outstanding thing IS the cause, and this token would mask it.
+        // MEASURED both ways on contabo mainnet 2026-08-06 — placed above the
+        // checks it now sits below, it printed
+        //     waiting_for=resume-falsification@h=2517001
+        // for 330 s while the lane was in fact waiting on
+        // block-bodies@h=2517002..2517065: true, and useless, and it hid the
+        // real cause. Here it means what it says — nothing is outstanding, the
+        // cursor has caught the tip, and the ONLY reason this lane is not
+        // publishing is that this process has not yet falsified what it
+        // restored. Without the token that state prints "tip-advance" and reads
+        // exactly like a healthy idle lane, which is the silent-refusal shape
+        // this whole file is built against.
+        if (resume_verification_pending())
+            return "resume-falsification@h=" + std::to_string(m_restored_at);
         return "tip-advance";
     }
 
@@ -489,10 +567,56 @@ public:
     const char* state_name() const { return state_name(m_state); }
 
     /// Whether this lane's replay cursor was RESTORED from persisted work or is
-    /// starting COLD. Today it is ALWAYS cold — there is no cursor persistence
-    /// — and the point of surfacing it is that the log said nothing at all
-    /// about discarding a completed 3913-block replay on every process start.
+    /// starting COLD. #1126 added this field when the answer was ALWAYS cold,
+    /// so that discarding a completed 3913-block replay stopped being invisible;
+    /// #91 makes RESTORED reachable. COLD remains the answer whenever the
+    /// persisted record could not be shown consistent — see try_restore().
     bool cursor_restored() const { return m_cursor_restored; }
+    /// The height a restored cursor stood at (0 = cold start).
+    uint32_t restored_at() const { return m_restored_at; }
+    /// Why the last restore attempt landed where it did. Always populated once
+    /// the attempt has run — including on success — because "resumed" and
+    /// "refused, and here is which rule" are the same question to an operator.
+    const std::string& restore_verdict() const { return m_restore_verdict; }
+
+    /// TRUE while a RESTORED set is still unfalsified.
+    ///
+    /// A cold bridge earns trust block by block: apply_block projects the
+    /// DIP-3 payee from the set and compares it against that block's REAL
+    /// coinbase, so every replayed block is a live falsification test of the
+    /// anchored data (this file's header calls that "progressively
+    /// falsifiable"). A restored set has had NONE of those tests run in this
+    /// process — it is trusted bytes off a local disk.
+    ///
+    /// So a resume owes at least one piece of evidence THIS process fetched
+    /// over the network before it may publish, and either of these is one:
+    ///
+    ///   * an APPLIED BLOCK - apply_block projects the payee from the restored
+    ///     set and compares it against that block's real coinbase. This is the
+    ///     PAYMENT-ORDER axis (nLastPaidHeight, the key GetMNPayee sorts by),
+    ///     which nothing else here covers, and it costs NO extra round trip:
+    ///     the lane is fetching those bodies anyway. In the normal restart the
+    ///     tip has moved on, so it is paid within seconds of the first body.
+    ///   * an APPLIED PER-HEIGHT FOLD - a getmnlistd the lane requested for a
+    ///     block it names, DIP-4-authenticated against that block's own
+    ///     committed cbTx root. The VALIDITY axis. A resume does not FORCE
+    ///     one (see try_restore() for the measured reason), but if the
+    ///     ordinary fold schedule lands one first it counts.
+    ///
+    /// Worst case - restarted with the cursor already AT the tip - this costs
+    /// one block interval (~2.5 min) waiting for the next block, against the
+    /// hours of replay the resume saves.
+    ///
+    /// HONEST LIMIT, stated because it will be quoted: this is NOT #1128's G6.
+    /// That guard re-hashes the folded list to the block's committed
+    /// merkleRootMNList, and it cannot be run here — MNState is the payee
+    /// dialect and carries no confirmedHash, so the DIP-4 SML entry cannot be
+    /// reconstructed from it. The resume is falsifiable, not proven.
+    bool resume_verification_pending() const
+    {
+        if (!m_cursor_restored) return false;
+        return m_applied == 0 && m_folds == 0;
+    }
 
     /// Load a parsed checkpoint. A !ok checkpoint arms the lane in the
     /// terminal FailedClosed state so the refusal is visible in status()
@@ -508,6 +632,16 @@ public:
             return;
         }
         reset_for_arm(cp);
+        // ── #91. READ the persisted record here, but BELIEVE nothing yet.
+        //
+        // The decisive checks (R4: does our own PoW-validated header chain
+        // hold the block this record was folded at?) need a header chain that
+        // has reached the cursor height, and at arm() time it has usually
+        // reached nothing at all. Deciding early would mean deciding on less
+        // evidence than is about to be available — so the record is parked and
+        // try_restore() adjudicates it from pump(), at the same moment the
+        // anchor's own chain position is verified.
+        load_pending_cursor();
         m_status = "armed at h=" + std::to_string(cp.height) + " ("
                    + std::to_string(m_anchor_count) + " masternodes), waiting"
                      " for headers to reach the anchor";
@@ -726,6 +860,21 @@ public:
         m_last_rearm_at       = at;
         m_last_rearm_at_known = have_tip;
         reset_for_arm(cp);
+        // #91: a re-arm ABANDONS the lineage the persisted record belongs to —
+        // that state produced a payee queue the maintainer rejected, which is
+        // the whole reason we are here. fail_closed() has usually erased it
+        // already; do it again unconditionally rather than reason about which
+        // paths reach rearm() with a record still on disk. Two sources of
+        // truth for "where is this lane" is the defect this design exists to
+        // prevent, and the cheapest way to have one is to leave nothing behind.
+        if (m_cursor_store) m_cursor_store->erase();
+        // ...and settle the adjudication explicitly, so a re-arm that happened
+        // while a restore was still DEFERRING cannot later adopt a record that
+        // describes the lineage this re-arm is walking away from.
+        m_pending_restore.reset();
+        m_restore_settled = true;
+        m_restore_verdict = "COLD (re-arm): the persisted lineage produced the"
+                            " payee desync this re-arm is recovering from";
         m_status = "RE-ARMED " + std::to_string(m_rearms) + "/"
                    + std::to_string(kMaxRearms) + " at h="
                    + std::to_string(cp.height) + " ("
@@ -1198,11 +1347,41 @@ public:
                      << m_anchor_height << " matches our header chain";
         }
 
+        // ── #91. ADJUDICATE the persisted cursor, once, here.
+        //
+        // Here and nowhere else, because this is the first point at which all
+        // the evidence exists: the anchor is verified against our own header
+        // chain, the chain is known to cover at least the anchor height, and
+        // NOTHING has been applied yet — so a refusal costs only a COLD start
+        // and never a rollback. try_restore() may also DEFER (headers have not
+        // reached the persisted cursor yet); deferring re-runs on the next
+        // pump, which the tip-changed callback guarantees.
+        if (!m_restore_settled && !try_restore()) return;
+
         // ── Staleness bound ──────────────────────────────────────────────
-        const uint32_t distance = tip - m_anchor_height;
+        //
+        // Measured from THE CURSOR THIS BRIDGE WILL ACTUALLY START AT, which is
+        // the anchor on a cold arm (unchanged) and the restored cursor on a
+        // resume (#91).
+        //
+        // This bound is about REPLAY DURATION, not about anchor trust — its own
+        // rationale is "the replay would take longer than an operator would
+        // tolerate, and a silently-crawling bridge that never arms is the quiet
+        // degradation this lane exists to avoid". Anchor trust is carried by
+        // the digest and the chain-position check, neither of which this touches.
+        // Keeping it pinned to the anchor would therefore have made #91 a
+        // REGRESSION: a node that had already replayed 19,995 of 20,000 blocks
+        // and persisted them would fail closed on restart with "checkpoint is
+        // STALE" while having essentially no work left to do.
+        const uint32_t replay_from = m_cursor_restored ? m_restored_at
+                                                       : m_anchor_height;
+        const uint32_t distance = tip - replay_from;
         if (distance > m_max_bridge) {
             return fail_closed(
-                "checkpoint is STALE: anchor h=" + std::to_string(m_anchor_height)
+                "checkpoint is STALE: "
+                + std::string(m_cursor_restored ? "the resumed cursor h="
+                                                : "anchor h=")
+                + std::to_string(replay_from)
                 + " is " + std::to_string(distance) + " blocks behind the tip h="
                 + std::to_string(tip) + ", over the "
                 + std::to_string(m_max_bridge) + "-block bridge limit."
@@ -1274,30 +1453,39 @@ public:
                      << ".." << tip << " (" << (tip - m_next + 1)
                      << " blocks) onto the anchored set";
             // ── PERSISTENCE VISIBILITY ────────────────────────────────────
-            // This lane has NO cursor persistence: every process start throws
-            // away the previous run's completed replay and re-walks the whole
-            // window from the pinned anchor. That is a real cost (3913 blocks
-            // on 2026-08-04) and the log said NOTHING about it — "bridge
-            // START: replaying h=2513001..2516913" reads exactly the same
-            // whether prior work was resumed or discarded. Name it.
+            // #1126 added this line when the answer was ALWAYS COLD: every
+            // process start threw away the previous run's completed replay and
+            // re-walked the whole window from the pinned anchor (3913 blocks
+            // on 2026-08-04), and "bridge START: replaying h=2513001..2516913"
+            // read exactly the same whether prior work was resumed or
+            // discarded.
+            //
+            // #91 makes RESTORED reachable, and keeps the line honest in BOTH
+            // directions: a COLD start now says WHY it is cold — no record, a
+            // refused record and which rule refused it, or no store wired at
+            // all — because "cold" with no reason is the same silence in a
+            // different costume.
             m_replay_target = tip;
             m_replay_base   = m_next;
             m_replay_bytes  = 0;
             LOG_INFO << "[MN-CKPT] cursor "
                      << (m_cursor_restored ? "RESTORED" : "COLD")
                      << " lane=mn-ckpt from="
-                     << (m_cursor_restored ? "persisted-cursor"
-                                           : "pinned-anchor@h="
-                                                 + std::to_string(m_anchor_height))
+                     << (m_cursor_restored
+                             ? "persisted-cursor@h=" + std::to_string(m_restored_at)
+                             : "pinned-anchor@h="
+                                   + std::to_string(m_anchor_height))
                      << " cursor=" << m_next << " target=" << tip
                      << " to_replay=" << (tip - m_next + 1)
+                     << " skipped=" << (m_cursor_restored ? m_restored_applied : 0)
                      << " rearms=" << m_rearms
-                     << (m_cursor_restored
-                             ? ""
-                             : " — there is no replay-cursor persistence in"
-                               " this build, so ANY replay work done by a"
-                               " previous process was DISCARDED and this window"
-                               " is being walked from scratch");
+                     << " verdict=\""
+                     << (m_restore_verdict.empty()
+                             ? std::string("no cursor store is wired in this"
+                                           " build/run, so nothing could be"
+                                           " resumed")
+                             : m_restore_verdict)
+                     << "\"";
             m_progress.start(0, m_now());
             m_watchdog.arm(m_now());
         }
@@ -1321,6 +1509,12 @@ public:
         //     catch-up it does not. So the dispatch now REQUESTS the list as of
         //     the anchor rather than hoping the tip one is dated there, and the
         //     anchor fold fires every time instead of by coincidence.
+        //
+        //   • A RESUMED bridge (#91) never reaches this dispatch: its cursor is
+        //     the persisted one, not the anchor, and try_restore() closes the
+        //     latch explicitly. The argument for why a resume does not need its
+        //     own fold — and the measured 7-minute cost of giving it one — is
+        //     written out at that call site.
         if (!m_snapshot_pending && !m_anchor_fold_done
             && m_next == m_anchor_height + 1 && m_request_snapshot) {
             m_anchor_fold_done = true;
@@ -1415,6 +1609,10 @@ public:
         m_next = height + 1;
         ++m_applied;
         note_replay_advance(block);
+        // #91: DELIVERED, and only now. Every guard above had to pass — no
+        // gap, no payee desync, a non-empty set — before this height is a
+        // height a restart may resume from.
+        note_persist(/*force=*/false);
         // ── PER-HEIGHT PoSe fold. The cursor is now exactly `height`; if
         // this is a fold point, request the list AS OF it and pause.
         if (m_tip_height) {
@@ -1463,6 +1661,378 @@ public:
     }
 
 private:
+    // ─────────────────────────────────────────────────────────────────────
+    // #91: LOAD / ADJUDICATE / WRITE
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Parse whatever is on disk into m_pending_restore. Believes nothing.
+    void load_pending_cursor()
+    {
+        m_pending_restore.reset();
+        m_restore_settled = m_cursor_store == nullptr;
+        m_restore_defers  = 0;
+        m_restore_verdict.clear();
+        if (!m_cursor_store) return;
+        std::string why;
+        auto rec = m_cursor_store->load(why);
+        if (!rec) {
+            // Not an error: a first run has no record. It IS worth a line —
+            // "why did this start cold" was unanswerable before #1126.
+            m_restore_settled = true;
+            m_restore_verdict = "COLD: " + why;
+            LOG_INFO << "[MN-CKPT] cursor store: " << why;
+            return;
+        }
+        LOG_INFO << "[MN-CKPT] cursor store: " << why
+                 << " — held for adjudication against our own header chain";
+        m_pending_restore = std::move(rec);
+    }
+
+    /// Refuse to COLD, with a named rule. Never fails the lane: a record we
+    /// cannot vouch for costs a replay, not a refusal to serve.
+    void restore_cold(const std::string& rule, const std::string& detail)
+    {
+        m_pending_restore.reset();
+        m_restore_settled = true;
+        m_cursor_restored = false;
+        m_restored_at     = 0;
+        m_restore_verdict = "COLD (" + rule + "): " + detail;
+        LOG_WARNING << "[MN-CKPT] persisted cursor REFUSED [" << rule << "]: "
+                    << detail
+                    << " — starting COLD from the pinned anchor h="
+                    << m_anchor_height
+                    << ". This costs a full replay; it does NOT risk a wrong"
+                       " payee.";
+        // The record described a lineage this process will not continue.
+        // Leaving it would make the next start re-adjudicate and re-refuse the
+        // same bytes forever, and — worse — a record kept next to a set that
+        // has since been rebuilt from the anchor is exactly the two-sources-
+        // of-truth shape this design exists to avoid.
+        if (m_cursor_store) m_cursor_store->erase();
+    }
+
+    /// Bound on how many pumps a restore may DEFER before it gives up and goes
+    /// COLD. A deferral is a legitimate "the header index has not handed us
+    /// that height yet", but an unbounded one is a wedge with no symptom —
+    /// and the fallback (COLD) always works.
+    static constexpr uint32_t kMaxRestoreDefers = 20;
+
+    /// Returns TRUE when the lane may proceed this pump, FALSE to defer.
+    ///
+    /// R1  the record parses, magic + format version + digest all check out
+    ///     (enforced in MnBridgeCursorStore::load — a partial record cannot be
+    ///     handed to us)
+    /// R2  it descends from THE ANCHOR THIS BINARY CARRIES: height, hash,
+    ///     source string and entry count all identical. A release with a
+    ///     fresher anchor has a different trust root, and silently continuing
+    ///     someone else's lineage under it is the "anchor cut AFTER a
+    ///     divergence began" trap rearm() already refuses.
+    /// R3  the cursor is strictly above the anchor — a record at or below it
+    ///     buys nothing and a record below it is a different lineage.
+    /// R4  OUR OWN PoW-validated header chain holds, at cursor_height, exactly
+    ///     the block the record says was folded there. This is the reorg /
+    ///     fork guard, and it is the reason adjudication waits for the header
+    ///     chain instead of happening at arm().
+    /// R5  applied == cursor_height - anchor_height. THE ANTI-GAP ARITHMETIC:
+    ///     the bridge folds one block per height, contiguously, so a record
+    ///     that does not satisfy this is describing skipped heights — the
+    ///     exact W1/W2 defect. Refuse; never "resume and hope".
+    /// R6  the set is non-empty and has at least one payee-eligible entry —
+    ///     a set that cannot back a payee cannot shorten anything.
+    /// R7  the cursor is not beyond the replay this lane would do anyway
+    ///     (cursor <= tip), and the remaining distance is inside the bridge
+    ///     bound.
+    bool try_restore()
+    {
+        if (m_restore_settled) return true;
+        if (!m_pending_restore) { m_restore_settled = true; return true; }
+        // A COPY, not a reference. restore_cold() and the accept path BOTH
+        // reset m_pending_restore, so a reference into it would dangle the
+        // moment either ran — and every refusal message is built FROM this
+        // record, i.e. the dangling read would be inside the diagnostics that
+        // exist to explain the refusal. One ~700 KB copy, once per process,
+        // removes that hazard by construction rather than by call ordering.
+        const MnBridgeCursor rec = *m_pending_restore;
+
+        // R2 — lineage.
+        if (rec.anchor_height != m_anchor_height
+            || rec.anchor_hash != m_anchor_hash
+            || rec.anchor_source != m_anchor_source
+            || rec.anchor_count != m_anchor_count) {
+            restore_cold(
+                "R2 anchor-lineage",
+                "the record descends from anchor h="
+                    + std::to_string(rec.anchor_height) + " "
+                    + rec.anchor_hash.GetHex().substr(0, 16) + " source='"
+                    + rec.anchor_source + "' count="
+                    + std::to_string(rec.anchor_count)
+                    + ", but this build is armed from h="
+                    + std::to_string(m_anchor_height) + " "
+                    + m_anchor_hash.GetHex().substr(0, 16) + " source='"
+                    + m_anchor_source + "' count="
+                    + std::to_string(m_anchor_count));
+            return true;
+        }
+
+        // R3 / R5 — position and the anti-gap arithmetic, both readable from
+        // the record alone, so the reader never has to trust the writer.
+        if (!rec.contiguous()) {
+            restore_cold(
+                "R5 contiguity",
+                "the record claims cursor h=" + std::to_string(rec.cursor_height)
+                    + " after applying " + std::to_string(rec.applied)
+                    + " blocks from anchor h="
+                    + std::to_string(rec.anchor_height) + ", but a contiguous"
+                      " replay of that range is exactly "
+                    + std::to_string(rec.cursor_height > rec.anchor_height
+                                         ? rec.cursor_height - rec.anchor_height
+                                         : 0)
+                    + " blocks — this state SKIPPED heights and resuming into"
+                      " it would carry a stale payment queue forward");
+            return true;
+        }
+
+        // R6 — usability.
+        if (rec.entries.empty()) {
+            restore_cold("R6 empty-set",
+                         "the record carries no masternodes");
+            return true;
+        }
+
+        // R7 — is this record even about the replay we are here to do?
+        const uint32_t tip = m_tip_height ? m_tip_height() : 0;
+        if (rec.cursor_height > tip) {
+            restore_cold(
+                "R7 cursor-above-tip",
+                "the record's cursor h=" + std::to_string(rec.cursor_height)
+                    + " is ABOVE our own header tip h=" + std::to_string(tip)
+                    + " — we cannot verify at a height we do not have, and a"
+                      " chain that lost ground is not a chain to resume onto");
+            return true;
+        }
+
+        // R4 — the reorg / fork guard. Deferred, not refused, while the header
+        // index is still handing heights out.
+        if (!m_header_hash_at) {
+            restore_cold("R4 no-header-lookup",
+                         "no header-hash lookup is wired, so the record's"
+                         " chain position cannot be verified");
+            return true;
+        }
+        auto have = m_header_hash_at(rec.cursor_height);
+        if (!have) {
+            if (++m_restore_defers > kMaxRestoreDefers) {
+                restore_cold(
+                    "R4 header-unavailable",
+                    "our header chain never produced the block at h="
+                        + std::to_string(rec.cursor_height) + " across "
+                        + std::to_string(kMaxRestoreDefers) + " drive attempts");
+                return true;
+            }
+            LOG_INFO << "[MN-CKPT] persisted cursor h=" << rec.cursor_height
+                     << ": header not retrievable yet (attempt "
+                     << m_restore_defers << "/" << kMaxRestoreDefers
+                     << ") — deferring adjudication, not guessing";
+            return false;   // defer this pump
+        }
+        if (*have != rec.cursor_hash) {
+            restore_cold(
+                "R4 chain-position",
+                "the record was folded at h=" + std::to_string(rec.cursor_height)
+                    + " over block " + rec.cursor_hash.GetHex().substr(0, 16)
+                    + ", but our PoW-validated header chain holds "
+                    + have->GetHex().substr(0, 16)
+                    + " there — the chain REORGED past the persisted cursor and"
+                      " every payment attributed after the fork point is wrong");
+            return true;
+        }
+
+        // ── ACCEPTED. Adopt the record wholesale: the set, the height it is
+        // as-of, and every budget the previous process already spent.
+        //
+        // The budgets are not bookkeeping. Each cap bounds how far the lane
+        // may deviate from a pure replay — the demotion walk, the on-demand
+        // fold round trips, the revive probes. Handing a resumed bridge a
+        // FRESH budget would make a restart strictly LOOSER than a continuous
+        // run, i.e. a node could buy extra overrides by restarting. Carrying
+        // them makes restart-equivalence the default.
+        m_machine.load(rec.entries, rec.cursor_height);
+        m_machine.reset_sml_recovery_budget();
+        m_next              = rec.cursor_height + 1;
+        m_applied           = 0;   // blocks applied BY THIS PROCESS
+        m_restored_applied  = rec.applied;
+        m_folds             = 0;   // folds applied BY THIS PROCESS
+        m_restored_folds    = rec.folds;
+        m_first_fold_height = rec.first_fold_height;
+        m_last_fold_height  = rec.last_fold_height;
+        m_sml_folded        = rec.sml_folded_at != 0;
+        m_sml_folded_at     = rec.sml_folded_at;
+        m_abandoned_folds   = rec.abandoned_folds;
+        m_ondemand_folds    = rec.ondemand_folds;
+        m_ondemand_excluded = rec.ondemand_excluded;
+        m_ondemand_abandoned = rec.ondemand_abandoned;
+        m_revive_probes     = rec.revive_probes;
+        m_revive_unmeasured = rec.revive_unmeasured;
+        m_revive_declined   = rec.revive_declined;
+        m_sml_recovered     = rec.sml_recovered;
+        m_pose_removed      = rec.pose_removed;
+        m_pose_reinstated   = rec.pose_reinstated;
+        m_tx_revived        = rec.tx_revived;
+        m_revive_dropped    = rec.revive_dropped;
+        m_registered        = rec.registered;
+        m_spent             = rec.spent;
+        m_anchor_eligible   = rec.anchor_eligible;
+        m_anchor_ineligible = rec.anchor_ineligible;
+
+        // ── THE FALSIFICATION A RESUME OWES, AND WHY IT IS NOT A FOLD ─────
+        //
+        // The first design re-armed the anchor fold AT the restored cursor, so
+        // a resume proved its set against the list the chain committed there.
+        // MEASURED on contabo mainnet 2026-08-06 and removed for it: on a WARM
+        // restart the header chain loads from LevelDB instantly, so the first
+        // pump fires with ZERO handshaked coin-P2P peers — the getmnlistd goes
+        // nowhere, the replay is PAUSED behind it, and the lane sits on
+        //     [LANE-WATCHDOG] ... waiting_for=fold-mnlist-reply@h=2513251
+        //                         snapshot_pending=1 applied=0
+        // until the kFoldRetryPumps re-ask, which is three TIP CHANGES away —
+        // ~7 minutes of a resume spent not replaying. A cold start never pays
+        // this because its 90 s of header sync brings the peers up first.
+        //
+        // And it bought nothing. The two axes are already covered:
+        //   * PAYMENT ORDER — apply_block cross-checks the projected payee
+        //     against the real coinbase of the very next block, which is the
+        //     falsification publish() actually waits on
+        //     (resume_verification_pending), and it is FREE: no round trip,
+        //     and it happens as soon as one body arrives.
+        //   * VALIDITY / PoSe bans — every ban inside the resumed range was
+        //     already folded by the process that walked it, and R4 has just
+        //     proven the chain under that cursor is the same chain. Re-folding
+        //     the same height over the same set re-derives the same answer.
+        //     From here the ordinary fold schedule and the on-demand fold
+        //     carry it exactly as they do for a cold bridge between fold
+        //     points — which is the pre-existing, measured-good behaviour.
+        //
+        // So the latch is CLOSED, not re-opened: the anchor fold is not this
+        // bridge's job, because this bridge does not stand on the anchor.
+        m_anchor_fold_done = true;
+
+        m_cursor_restored = true;
+        m_restored_at     = rec.cursor_height;
+        m_restore_settled = true;
+        m_restore_verdict =
+            "RESTORED at h=" + std::to_string(rec.cursor_height) + " ("
+            + std::to_string(rec.entries.size()) + " masternodes, "
+            + std::to_string(rec.applied) + " blocks already replayed by a"
+              " previous process)";
+        LOG_INFO << "[MN-CKPT] persisted cursor ACCEPTED: h="
+                 << rec.cursor_height << " " << have->GetHex().substr(0, 16)
+                 << " entries=" << rec.entries.size()
+                 << " eligible=" << m_machine.eligible_size()
+                 << " prior_applied=" << rec.applied
+                 << " prior_folds=" << rec.folds
+                 << " — R2 lineage, R4 chain position and R5 contiguity all"
+                    " check out; skipping "
+                 << rec.applied << " blocks of replay this process would"
+                    " otherwise have redone";
+        // The parsed record has been fully absorbed; ~700 KB of it does not
+        // need to live for the rest of the process.
+        m_pending_restore.reset();
+        return true;
+    }
+
+    /// WRITE SITE. Called ONLY after apply_block has folded a block with no
+    /// gap and no desync, so `m_next - 1` is a height that was DELIVERED, not
+    /// one that was merely requested.
+    ///
+    /// This distinction is the whole of #1128's lesson: a lane's floor taken
+    /// from an aspirational ceiling (`max(delivered, target_end)`) instead of
+    /// the delivered high-water orphaned every height in between and destroyed
+    /// derived state. m_requested_through and m_replay_target are both in scope
+    /// here and neither may ever reach the record.
+    void note_persist(bool force)
+    {
+        if (!m_cursor_store) return;
+        if (m_state != State::Bridging && m_state != State::Published) return;
+        const uint32_t cursor = m_next ? m_next - 1 : 0;
+        if (cursor <= m_anchor_height) return;
+        if (!force && (cursor - m_last_persisted) < m_persist_every) return;
+        if (!m_header_hash_at) return;
+        auto hash = m_header_hash_at(cursor);
+        if (!hash) return;   // cannot name the block we folded; do not claim to
+
+        MnBridgeCursor rec;
+        rec.anchor_height      = m_anchor_height;
+        rec.anchor_hash        = m_anchor_hash;
+        rec.anchor_source      = m_anchor_source;
+        rec.anchor_count       = static_cast<uint32_t>(m_anchor_count);
+        rec.anchor_eligible    = static_cast<uint32_t>(m_anchor_eligible);
+        rec.anchor_ineligible  = static_cast<uint32_t>(m_anchor_ineligible);
+        rec.cursor_height      = cursor;
+        rec.cursor_hash        = *hash;
+        rec.applied            = m_restored_applied + m_applied;
+        rec.folds              = m_restored_folds + m_folds;
+        rec.first_fold_height  = m_first_fold_height;
+        rec.last_fold_height   = m_last_fold_height;
+        rec.sml_folded_at      = m_sml_folded_at;
+        rec.abandoned_folds    = m_abandoned_folds;
+        rec.ondemand_folds     = static_cast<uint32_t>(m_ondemand_folds);
+        rec.ondemand_excluded  = static_cast<uint32_t>(m_ondemand_excluded);
+        rec.ondemand_abandoned = static_cast<uint32_t>(m_ondemand_abandoned);
+        rec.revive_probes      = static_cast<uint32_t>(m_revive_probes);
+        rec.revive_unmeasured  = static_cast<uint32_t>(m_revive_unmeasured);
+        rec.revive_declined    = static_cast<uint32_t>(m_revive_declined);
+        rec.sml_recovered      = static_cast<uint32_t>(m_sml_recovered);
+        rec.pose_removed       = static_cast<uint32_t>(m_pose_removed);
+        rec.pose_reinstated    = static_cast<uint32_t>(m_pose_reinstated);
+        rec.tx_revived         = static_cast<uint32_t>(m_tx_revived);
+        rec.revive_dropped     = static_cast<uint32_t>(m_revive_dropped);
+        rec.registered         = static_cast<uint32_t>(m_registered);
+        rec.spent              = static_cast<uint32_t>(m_spent);
+        rec.entries.reserve(m_machine.entries().size());
+        for (const auto& [h, st] : m_machine.entries())
+            rec.entries.emplace_back(h, st);
+
+        // SELF-CHECK BEFORE PUBLISHING THE RECORD. R5 is the rule a reader
+        // enforces; checking it at the WRITER too means a lane that has
+        // somehow lost contiguity writes NOTHING rather than writing a record
+        // that a future reader will (correctly) refuse — and it turns a silent
+        // arithmetic drift into a line an operator can see today.
+        if (!rec.contiguous()) {
+            if (!m_persist_arith_warned) {
+                m_persist_arith_warned = true;
+                LOG_WARNING << "[MN-CKPT] cursor NOT persisted at h=" << cursor
+                            << ": applied=" << rec.applied
+                            << " does not equal the contiguous span from the"
+                               " anchor ("
+                            << (cursor - m_anchor_height)
+                            << "). Refusing to write a record no restart may"
+                               " resume; the bridge itself is unaffected.";
+            }
+            return;
+        }
+
+        if (!m_cursor_store->store(rec)) {
+            // Loud, once. A bridge that cannot save is CORRECT but slow again,
+            // and the failure mode this must never have is believing it saved.
+            if (!m_persist_io_warned) {
+                m_persist_io_warned = true;
+                LOG_WARNING << "[MN-CKPT] could NOT write the replay cursor to "
+                            << m_cursor_store->path()
+                            << " — the bridge is unaffected, but a restart will"
+                               " replay this window from the anchor again";
+            }
+            return;
+        }
+        m_last_persisted = cursor;
+        ++m_persist_writes;
+        LOG_INFO << "[MN-CKPT] cursor PERSISTED h=" << cursor << " "
+                 << hash->GetHex().substr(0, 16) << " entries="
+                 << rec.entries.size() << " applied=" << rec.applied
+                 << " writes=" << m_persist_writes
+                 << " — a restart resumes here instead of replaying "
+                 << (cursor - m_anchor_height) << " blocks";
+    }
+
     /// Push the SML's current height into the machine so the reactive
     /// demotion walk can refuse a STALE attestation. Cheap; called on every
     /// folded block because the mnlistdiff feed advances underneath us.
@@ -1949,6 +2519,17 @@ public:
 
     bool snapshot_pending() const { return m_snapshot_pending; }
     uint32_t folds_applied() const { return m_folds; }
+    /// LIFETIME totals across the whole span from the anchor, i.e. including
+    /// whatever a previous process contributed before a resume.
+    ///
+    /// The distinction matters in both directions and getting it backwards is
+    /// a report that LIES. Reporting must be lifetime — a resumed bridge whose
+    /// predecessor folded 8 times must not publish "NO per-height fold was
+    /// ever applied", and its "anchor + N replayed blocks" must describe the
+    /// range the set actually covers. The resume's own falsification test must
+    /// be THIS process — see resume_verification_pending().
+    uint32_t folds_lifetime()   const { return m_restored_folds + m_folds; }
+    uint32_t applied_lifetime() const { return m_restored_applied + m_applied; }
     uint32_t abandoned_folds() const { return m_abandoned_folds; }
 
     /// Pumps to wait before re-asking, and before giving up on a fold point.
@@ -2234,7 +2815,8 @@ public:
                  " alone — and the walk's per-bridge budget is sized for"
                  " ISOLATED bans, so a BURST can exhaust it.";
         } else {
-            s += " Per-height PoSe folds applied: " + std::to_string(m_folds)
+            s += " Per-height PoSe folds applied: "
+                 + std::to_string(folds_lifetime())
                  + " (first at h=" + std::to_string(m_first_fold_height)
                  + ", latest at h=" + std::to_string(m_sml_folded_at)
                  + "); each was DIP-4 client-verified and applied with the"
@@ -2393,6 +2975,36 @@ public:
             return fail_closed("no publish seam wired — the bridged masternode"
                                " set has nowhere to go");
         }
+        // ── #91. A RESTORED SET MAY NOT PUBLISH UNFALSIFIED ────────────────
+        //
+        // The bridge's claim on trust has always been "progressively
+        // falsifiable": every replayed block's coinbase is an answer key the
+        // network already agreed on, and a wrong set fails against it. A
+        // resumed set has had none of those tests run in this process — it is
+        // bytes off a local disk that passed a lineage check.
+        //
+        // So publishing waits for ONE piece of network evidence: an applied
+        // block (the payment-ORDER axis) or the fold this resume re-armed at
+        // its own cursor (the VALIDITY axis, DIP-4-authenticated against the
+        // block's committed root). This is a HOLD, not a refusal — pump() is
+        // re-driven on every tip change and the fold reply resumes it — so the
+        // worst case is one block interval (~2.5 min) against the ~26 minutes
+        // the resume saves. Fail-closed beats fast on the lane that decides
+        // what a block template pays.
+        if (resume_verification_pending()) {
+            if (m_restored_at != m_resume_hold_logged) {
+                m_resume_hold_logged = m_restored_at;
+                LOG_INFO << "[MN-CKPT] resume HOLD at h=" << m_restored_at
+                         << ": the restored masternode set has not been"
+                            " falsified by anything this process fetched yet"
+                            " (applied=0 folds=0). Waiting for the fold reply"
+                            " at the restored cursor, or for the next block."
+                            " NOT publishing an unfalsified set.";
+            }
+            m_status = "resume HOLD at h=" + std::to_string(m_restored_at)
+                       + ": restored set awaiting its first falsification";
+            return;
+        }
         // Last chance for the wholesale PoSe fold: this is the cursor ==
         // H_sml case when the SML is current at the bridge target (and the
         // only chance at all for a zero-block bridge). Same one-shot equality
@@ -2431,9 +3043,10 @@ public:
                    + " masternodes (" + std::to_string(m_sml_recovered)
                    + " SML-recovered exclusions) as-of h=" + std::to_string(as_of)
                    + " (anchor h=" + std::to_string(m_anchor_height)
-                   + " + " + std::to_string(m_applied) + " replayed blocks) "
+                   + " + " + std::to_string(applied_lifetime())
+                   + " replayed blocks) "
                    + delta
-                   + " PoSe folds: " + std::to_string(m_folds)
+                   + " PoSe folds: " + std::to_string(folds_lifetime())
                    + " (" + ondemand_report() + " "
                    + revive_probe_report() + ")";
         // A DEGRADED publish must say so. Publishing a set that was assembled
@@ -2447,7 +3060,7 @@ public:
                           " reply, so those intervals were carried by the"
                           " per-mismatch walk alone)";
         }
-        if (m_folds == 0) {
+        if (folds_lifetime() == 0) {
             m_status += " — NO per-height fold was ever applied; this set is"
                         " the additions-only replay plus the walk";
         }
@@ -2460,12 +3073,37 @@ public:
                         + std::to_string(kMaxRearms) + " — this set is a"
                           " recovery from a payee desync, not a cold start]";
         }
+        // A publish that RESUMED must not read like one that walked the whole
+        // window. The saving IS the claim this feature makes, so it is stated
+        // where the claim can be checked, next to the numbers that back it.
+        if (m_cursor_restored) {
+            m_status += " [RESUMED at h=" + std::to_string(m_restored_at)
+                        + " — " + std::to_string(m_restored_applied)
+                        + " of those blocks came from a PREVIOUS process and "
+                        + std::to_string(m_applied) + " from this one;"
+                          " falsified by the coinbase payee cross-check of the"
+                          " blocks this process applied on top of it]";
+        }
         LOG_INFO << "[MN-CKPT] bridge COMPLETE: published " << out.size()
                  << " masternodes (" << m_sml_recovered
                  << " SML-recovered exclusions) as-of h=" << as_of
                  << " (anchor h=" << m_anchor_height << ", replayed "
-                 << m_applied << " blocks, tip h=" << bridged_to
+                 << applied_lifetime() << " blocks"
+                 << (m_cursor_restored
+                         ? " — " + std::to_string(m_restored_applied)
+                               + " RESUMED from the persisted cursor at h="
+                               + std::to_string(m_restored_at) + ", only "
+                               + std::to_string(m_applied)
+                               + " walked by this process"
+                         : std::string())
+                 << ", tip h=" << bridged_to
                  << ") " << delta << " -> publishing to the maintainer";
+        // #91: force a final record at the published height. This is the one
+        // that matters most — it is the state a restart most wants, and
+        // without the force the last partial interval would be lost to the
+        // throttle and every restart would still redo up to kDefaultPersistEvery
+        // blocks for no reason.
+        note_persist(/*force=*/true);
         m_publish(std::move(out), as_of);
     }
 
@@ -2486,6 +3124,26 @@ public:
         // `target=0 done=0.0%` line would be a measurement of nothing.
         if (m_replay_base != 0)
             if (auto s = m_progress.flush(m_applied, m_now())) emit_progress(*s);
+        // ── #91. ERASE THE PERSISTED CURSOR. ──────────────────────────────
+        //
+        // The record sits at some height BELOW the failure, so resuming from
+        // it replays straight back into the same wall. In-process that is
+        // already handled: the re-arm ladder's deterministic-repeat block
+        // spots a second fail-close at the identical cursor and stops. But
+        // those counters are PER-PROCESS — a restart resets them — so a
+        // surviving record would turn a deterministic failure into a
+        // resume/fail/restart loop that the ladder can no longer see and that
+        // burns the shortened window every time.
+        //
+        // Erasing costs a cold replay on the next start, which is exactly the
+        // behaviour before this feature existed. Not regressing beats being
+        // fast into a known-bad state.
+        if (m_cursor_store && m_cursor_store->erase()) {
+            LOG_WARNING << "[MN-CKPT] persisted replay cursor ERASED: the state"
+                           " it describes leads into this failure, and a"
+                           " restart must not resume into it. The next start"
+                           " will replay COLD from the anchor.";
+        }
         // Deliberately ERROR, not WARNING: the operator's embedded arm will
         // not arm, and the only thing worse than saying so is not saying so.
         LOG_ERROR << "[MN-CKPT] FAIL-CLOSED: " << why;
@@ -2678,7 +3336,26 @@ public:
         m_replay_target  = 0;
         m_replay_bytes   = 0;
         m_have_bytes     = false;
-        m_cursor_restored = false;   // no cursor persistence exists to restore
+        // ── #91 cursor-persistence state. A fresh arm is by definition a walk
+        // from the anchor, so every "restored" fact must go — m_cursor_restored
+        // above all, because publish() reads it to decide whether this set still
+        // owes a falsification, and a stale `true` on a cold walk would hold a
+        // legitimate publish behind a debt that was already paid block by block.
+        //
+        // Note what is deliberately NOT done here: the record on disk is not
+        // erased. arm() reads it immediately after this call, and a re-arm
+        // erases it at ITS own call site, where the reason (the previous
+        // lineage is being abandoned) is local and legible.
+        m_cursor_restored  = false;
+        m_restored_at      = 0;
+        m_restored_applied = 0;
+        m_restored_folds   = 0;
+        m_last_persisted   = 0;
+        m_persist_writes   = 0;
+        m_persist_io_warned    = false;
+        m_persist_arith_warned = false;
+        m_resume_hold_logged   = 0;
+        m_restore_defers       = 0;
         m_progress.start(0, m_now());
         m_watchdog.disarm();         // re-armed at the Waiting->Bridging edge
         m_anchor_eligible   = m_machine.eligible_size();
@@ -2793,10 +3470,38 @@ public:
     uint32_t m_replay_target{0};    // tip the replay is chasing
     uint64_t m_replay_bytes{0};     // wire bytes of replayed block bodies
     bool     m_have_bytes{false};   // ...only when set_wire_size_fn is wired
-    /// Whether the replay cursor came from persisted work. ALWAYS false today:
-    /// this build has no cursor persistence, and the field exists so the log
-    /// says so out loud rather than leaving the discard invisible.
+    /// Whether the replay cursor came from persisted work.
     bool     m_cursor_restored{false};
+
+    // ── #91 CURSOR PERSISTENCE STATE ──────────────────────────────────────
+    /// Borrowed; nullptr means no persistence at all (KATs, and the
+    /// --embedded-mn-bridge-no-cursor A/B). Never owned: the store is a path
+    /// wrapper with no state of its own, and giving the lane ownership would
+    /// make the KATs' "no persistence" case a special case instead of the
+    /// default.
+    const MnBridgeCursorStore* m_cursor_store{nullptr};
+    /// Parsed at arm(), adjudicated at the first pump that can see the header
+    /// chain. Holding it across that gap is deliberate — see try_restore().
+    std::optional<MnBridgeCursor> m_pending_restore;
+    bool     m_restore_settled{true};    // true when no adjudication is owed
+    uint32_t m_restore_defers{0};
+    std::string m_restore_verdict;
+    uint32_t m_restored_at{0};           // height a restore resumed from
+    /// Blocks / folds a PREVIOUS process contributed. Kept separate from
+    /// m_applied and m_folds, which count THIS process's work, because the two
+    /// answer different questions: the record needs the lifetime total (R5's
+    /// arithmetic is about the whole span from the anchor) and
+    /// resume_verification_pending() needs "has this process proved anything
+    /// yet". Merging them would make a resumed set look self-verified the
+    /// instant it loaded.
+    uint32_t m_restored_applied{0};
+    uint32_t m_restored_folds{0};
+    uint32_t m_persist_every{kDefaultPersistEvery};
+    uint32_t m_last_persisted{0};
+    uint32_t m_persist_writes{0};
+    bool     m_persist_io_warned{false};
+    bool     m_persist_arith_warned{false};
+    uint32_t m_resume_hold_logged{0};
 
     // ── RE-ARM bookkeeping. Survives reset_for_arm() by design: if a re-arm
     // cleared its own counters the cap could never fire and the "recovery"
