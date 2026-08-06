@@ -109,6 +109,7 @@
 #include <core/uint256.hpp>                    // uint160 payout pubkey hash
 #include <core/target_utils.hpp>              // chain::target_to_difficulty (dashboard net-diff)
 #include <impl/dash/dashboard_found_block.hpp> // any-participant /recent_blocks feed (peer-found blocks)
+#include <impl/dash/dashboard_views.hpp>       // sharechain window / delta / share-detail read-models
 
 #include <core/stratum_server.hpp>             // core::StratumServer — miner-facing accept-loop (run-path caller)
 #include <impl/dash/stratum/work_source.hpp>   // dash::stratum::DASHWorkSource — concrete core::stratum::IWorkSource
@@ -1211,6 +1212,70 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 }
                 return out;
             });
+
+            // ── Sharechain WINDOW / DELTA / SHARE DETAIL (dashboard read-models) ─
+            //
+            // These three seams had exactly ONE caller each repo-wide —
+            // main_ltc.cpp:3730 / :3946 / :4077 — so on the DASH lane core fell
+            // through to its fallback STUBS (web_server.cpp:2907 / :3313 / :6768).
+            // A stub answers HTTP 200 with a well-formed EMPTY document, which is
+            // why this failed silently: no 404, no log line, and the front-end's
+            // `if (!data.shares) return` guard (dashboard.html:5011) sails through
+            // a truthy `[]`. Measured on the live DASH node before this change:
+            // /sharechain/window = 55 bytes, /sharechain/delta = 23 bytes,
+            // /web/share/<hash> = {"error":"share not found"} for a hash that IS
+            // in the tracker. The data was never missing — only the binding.
+            //
+            // The builders live in impl/dash/dashboard_views.hpp (ports of the LTC
+            // lambdas above) so they are KAT-able against a real ShareTracker; the
+            // work here is purely assembling the ViewContext and holding the
+            // tracker read guard.
+            {
+                auto view_ctx = [mi, owner_addr = node_owner_address]() {
+                    dash::dashboard::ViewContext ctx;
+                    ctx.testnet     = dash::SharechainConfig::is_testnet;
+                    ctx.window_size = dash::SharechainConfig::chain_length();
+                    // DASH has no node-level mining address (every miner
+                    // authorizes with its own address over stratum), so the
+                    // closest true "this node" identity is the configured
+                    // node-owner address. Left EMPTY when unset rather than
+                    // guessed — an empty my_address makes the dashboard render
+                    // "None (node not mining)", which is the honest answer.
+                    ctx.my_address  = owner_addr;
+                    if (mi) {
+                        ctx.fee_hash160 = mi->get_node_fee_hash160();
+                        for (const auto& fb : mi->get_found_blocks())
+                            if (!fb.share_hash.empty())
+                                ctx.found_block_short_hashes.push_back(
+                                    fb.share_hash.substr(0, 16));
+                    }
+                    return ctx;
+                };
+
+                mi->set_sharechain_window_fn(
+                    [node_ptr, view_ctx]() -> nlohmann::json {
+                        auto guard = node_ptr->read_tracker();
+                        if (!guard) return nlohmann::json::object();
+                        return dash::dashboard::build_window(*guard, view_ctx());
+                    });
+                // The grid IS the sharechain — refresh it on tip change, not on
+                // the 1 Hz periodic timer (main_ltc.cpp:3908).
+                mi->mark_last_cache_tip_driven();
+
+                mi->set_sharechain_delta_fn(
+                    [node_ptr, view_ctx](const std::string& since_hash) -> nlohmann::json {
+                        auto guard = node_ptr->read_tracker();
+                        if (!guard) return nlohmann::json::object();
+                        return dash::dashboard::build_delta(*guard, since_hash, view_ctx());
+                    });
+
+                mi->set_share_lookup_fn(
+                    [node_ptr, view_ctx](const std::string& hash_hex) -> nlohmann::json {
+                        auto guard = node_ptr->read_tracker();
+                        if (!guard) return nlohmann::json{{"error", "tracker busy"}};
+                        return dash::dashboard::build_share_detail(*guard, hash_hex, view_ctx());
+                    });
+            }
 
             // ── Signed transitional-message feed (DISPLAY + VERIFY) ────────────
             // Reuses the LTC crossing's exact signed-message component: read the

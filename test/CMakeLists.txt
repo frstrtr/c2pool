@@ -334,7 +334,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     # standalone target would need a build.yml --target edit and trip CI's
     # NOT_BUILT sentinel until it had one. Needs exactly this link set (core
     # MiningInterface; the resolver is header-only).
-    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_block_confirm_lane.cpp)
+    # test_dash_dashboard_views.cpp: the sharechain WINDOW / DELTA / SHARE-DETAIL
+    # read-model KATs (dashboard_views.hpp). FOLDED in as another TU for the same
+    # reason as the TUs above — a standalone target would need a build.yml
+    # --target edit and would trip CI's NOT_BUILT sentinel until it had one
+    # (#143/#883/#893). Needs exactly this link set: a real dash::NodeImpl +
+    # ShareTracker, and core's address_utils for the DASH base58 rendering.
+    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp)
     target_link_libraries(test_dash_node PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
