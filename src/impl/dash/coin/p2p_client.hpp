@@ -665,6 +665,7 @@ private:
     bool     m_tx_pull_enabled{false};
     size_t   m_tx_pull_inflight_cap{64};
     std::map<uint256, int64_t> m_tx_pull_inflight;   // txid -> requested-at
+    uint64_t m_tx_inv_offered{0};    // inv(MSG_TX) SEEN on the wire, pre-dedup
     uint64_t m_tx_inv_seen{0};       // inv(MSG_TX) admitted by the dedup
     uint64_t m_tx_pull_sent{0};      // getdata(MSG_TX) issued
     uint64_t m_tx_pull_skipped_budget{0};
@@ -1340,7 +1341,8 @@ public:
     /// signature of a peer set that will not serve us transactions.
     std::string tx_ingest_status() const
     {
-        return "[MEMPOOL-INGEST] tx_inv=" + std::to_string(m_tx_inv_seen)
+        return "[MEMPOOL-INGEST] tx_inv_offered=" + std::to_string(m_tx_inv_offered)
+             + " tx_inv=" + std::to_string(m_tx_inv_seen)
              + " getdata=" + std::to_string(m_tx_pull_sent)
              + " received=" + std::to_string(m_tx_received)
              + " inflight=" + std::to_string(m_tx_pull_inflight.size())
@@ -2238,6 +2240,11 @@ private:
             const bool is_block = (inv.base_type() == inventory_type::block);
             const bool is_tx = (inv.base_type() == inventory_type::tx)
                             && m_tx_pull_enabled;
+            // Offered-vs-admitted (diagnosis, not policy): counted BEFORE the
+            // dedup so "peers are not announcing" can be told apart from "we
+            // are filtering". Same announcement from N peers = N offered, 1
+            // admitted — that gap is the fan-in the pool exists to produce.
+            if (inv.base_type() == inventory_type::tx) ++m_tx_inv_offered;
             if (!pulled && !is_block && !is_tx)
                 continue;   // not actionable — do not spend a dedup slot on it
             if (!m_inv_dedup.admit(static_cast<uint32_t>(inv.m_type), inv.m_hash, now))

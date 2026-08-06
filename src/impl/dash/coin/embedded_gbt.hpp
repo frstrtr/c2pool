@@ -260,6 +260,36 @@ inline DashWorkData build_embedded_workdata(
         }
         selected.resize(kept);
     }
+    // ── CANDIDATE-SET RECORDING (observe-without-arming) ────────────────
+    // When the body is deliberately coinbase-only, run the SAME selection the
+    // serving path would run and record only its identities and fees. Nothing
+    // here can reach the served template: `selected` and `total_fees` above
+    // are untouched, so the coinbase value, the tx vectors and the merkle are
+    // byte-identical to a build with this block deleted.
+    //
+    // The property the original comment asserts — "no partially-warm UTXO view
+    // can price anything into this template" — is preserved exactly: a
+    // candidate priced from a partial UTXO view lands in m_txset_candidates,
+    // which no consensus path reads.
+    if (suppress_mempool_txs) {
+        auto [cand, cand_fees] =
+            mempool.get_sorted_txs_with_fees(MAX_BLOCK_BYTES,
+                                             /*exclude_special=*/true,
+                                             /*next_height=*/w.m_height);
+        (void)cand_fees;
+        w.m_txset_candidates.reserve(cand.size());
+        w.m_txset_candidate_fees.reserve(cand.size());
+        for (const auto& c : cand) {
+            // The SAME MN-collateral exclusion the served path applies: a
+            // candidate set that included them would overstate what we could
+            // actually have served and make the coverage gate too generous.
+            uint256 protx;
+            if (tx_spends_mn_collateral(mnstates, c.tx, &protx)) continue;
+            w.m_txset_candidates.push_back(dash::coin::dash_txid(c.tx));
+            w.m_txset_candidate_fees.push_back(c.fee);
+        }
+    }
+
     int64_t block_value      = reward + static_cast<int64_t>(total_fees);
     int64_t platform_reward  = compute_dash_platform_reward_post_v20_mn_rr(
         w.m_height, mn_rr_height);

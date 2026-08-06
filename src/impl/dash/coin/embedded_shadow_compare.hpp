@@ -110,6 +110,24 @@ struct ShadowFieldDiff {
     bool        commitment{false};
     bool        modulo_mempool_protx{false};
 };
+/// Which set on OUR side the measurement used.
+///   Served    — the transactions actually in the template.
+///   Candidate — what selection WOULD have chosen, recorded while the served
+///               body is deliberately coinbase-only. This is the mode the
+///               enable-the-flag gate must be evaluated in, because a
+///               measurement over the served set reads 0% by construction
+///               while the flag is off.
+enum class ShadowTxSetMode { Served, Candidate, None };
+
+inline const char* shadow_txset_mode_name(ShadowTxSetMode m)
+{
+    switch (m) {
+        case ShadowTxSetMode::Served:    return "served";
+        case ShadowTxSetMode::Candidate: return "candidate";
+        default:                         return "none";
+    }
+}
+
 /// ── THE MEMPOOL COVERAGE MEASUREMENT (phase-1 mempool ingest) ────────────
 ///
 /// While dashd is still present, its template's tx set is a free, per-block
@@ -128,6 +146,7 @@ struct ShadowFieldDiff {
 /// Diagnostic only — nothing in the served decision reads this.
 struct ShadowTxSetDiff
 {
+    ShadowTxSetMode mode{ShadowTxSetMode::None};
     size_t ours{0};
     size_t theirs{0};
     size_t both{0};
@@ -184,9 +203,26 @@ inline ShadowTxSetDiff shadow_tx_set_diff(const DashWorkData& embedded,
         }
         return out;
     };
-    const auto e = index(embedded);
+    // OUR side: the served set when there is one, otherwise the candidate set.
+    // Preference order matters — a template that actually served transactions
+    // must be measured on what it served, never on what it might have chosen.
+    auto our_index = [&index](const DashWorkData& w) {
+        auto served = index(w);
+        if (!served.empty()) return std::make_pair(served, ShadowTxSetMode::Served);
+        std::map<std::string, std::optional<uint64_t>> cand;
+        for (size_t i = 0; i < w.m_txset_candidates.size(); ++i) {
+            std::optional<uint64_t> fee;
+            if (i < w.m_txset_candidate_fees.size())
+                fee = w.m_txset_candidate_fees[i];
+            cand.emplace(w.m_txset_candidates[i].GetHex(), fee);
+        }
+        return std::make_pair(cand, cand.empty() ? ShadowTxSetMode::None
+                                                 : ShadowTxSetMode::Candidate);
+    };
+    const auto [e, e_mode] = our_index(embedded);
     const auto d = index(dashd);
     ShadowTxSetDiff r;
+    r.mode = e_mode;
     r.ours = e.size();
     r.theirs = d.size();
     for (const auto& [txid, our_fee] : e) {
@@ -362,6 +398,7 @@ inline ShadowOutcome shadow_evaluate(WorkSource source,
     o.tx_set = shadow_tx_set_diff(embedded, dashd);
     {
         std::string l = "[SHADOW-TXSET] h=" + std::to_string(o.height)
+                      + " mode=" + shadow_txset_mode_name(o.tx_set.mode)
                       + " ours=" + std::to_string(o.tx_set.ours)
                       + " dashd=" + std::to_string(o.tx_set.theirs)
                       + " both=" + std::to_string(o.tx_set.both)

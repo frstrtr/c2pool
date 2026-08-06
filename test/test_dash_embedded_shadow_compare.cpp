@@ -601,3 +601,101 @@ TEST(DashShadowCompare, NoCoverageMeasurementWhenServedByTheFallbackArm) {
     EXPECT_TRUE(has_line_with(o2.log_lines, "coverage=100%"));
     EXPECT_EQ(o2.tx_set.fee_agree, 5u);
 }
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// THE CANDIDATE SET — measuring the gate from the correct side of it
+//
+// The third trap: a measurement built over the SERVED tx set cannot evaluate
+// the gate that decides whether to serve. With --embedded-serve-mempool-txs
+// OFF the served set is empty BY CONSTRUCTION, so coverage reads 0% forever
+// however full the mempool is, and the only remaining ways to evaluate the
+// gate are to arm the money path first (what the gate exists to prevent) or to
+// enable on faith. Measuring what selection WOULD have chosen fixes that
+// without putting a single byte into a served template.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashShadowCompare, CandidateSetIsMeasuredWhenTheServedBodyIsCoinbaseOnly) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    with_txs(dref, {1, 2, 3, 4});
+    // Served body is coinbase-only (the flag is off) but selection recorded
+    // what it would have taken.
+    emb.m_txset_candidates      = {hashn(1), hashn(2), hashn(3)};
+    emb.m_txset_candidate_fees  = {1000, 2000, 3000};
+    ASSERT_TRUE(emb.m_txs.empty());
+
+    const auto d = shadow_tx_set_diff(emb, dref);
+    EXPECT_EQ(d.mode, ShadowTxSetMode::Candidate);
+    EXPECT_EQ(d.ours, 3u);
+    EXPECT_EQ(d.both, 3u);
+    EXPECT_EQ(d.dashd_only, 1u);
+    EXPECT_EQ(d.ours_only, 0u);
+    EXPECT_EQ(d.fee_agree, 3u);           // priced identically to dashd
+    EXPECT_NEAR(d.coverage_pct(), 75.0, 1e-9);
+
+    const auto o = shadow_evaluate(WorkSource::Embedded, emb,
+                                   std::optional<DashWorkData>(dref));
+    EXPECT_TRUE(has_line_with(o.log_lines, "mode=candidate"));
+    EXPECT_TRUE(has_line_with(o.log_lines, "coverage=75%"));
+}
+
+// A template that ACTUALLY served transactions is measured on what it served,
+// never on what it might have chosen — otherwise a stale candidate list could
+// flatter a template whose real contents were worse.
+TEST(DashShadowCompare, ServedSetWinsOverCandidatesWhenBothArePresent) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    with_txs(emb,  {1});                  // we actually served ONE
+    with_txs(dref, {1, 2, 3, 4});
+    emb.m_txset_candidates     = {hashn(1), hashn(2), hashn(3)};  // flattering
+    emb.m_txset_candidate_fees = {1000, 2000, 3000};
+
+    const auto d = shadow_tx_set_diff(emb, dref);
+    EXPECT_EQ(d.mode, ShadowTxSetMode::Served);
+    EXPECT_EQ(d.ours, 1u) << "the served set is the truth about a served template";
+    EXPECT_EQ(d.dashd_only, 3u);
+
+    const auto o = shadow_evaluate(WorkSource::Embedded, emb,
+                                   std::optional<DashWorkData>(dref));
+    EXPECT_TRUE(has_line_with(o.log_lines, "mode=served"));
+}
+
+// Nothing on either side: mode=none, and no fabricated coverage.
+TEST(DashShadowCompare, NoServedAndNoCandidatesIsModeNone) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    with_txs(dref, {1, 2});
+
+    const auto d = shadow_tx_set_diff(emb, dref);
+    EXPECT_EQ(d.mode, ShadowTxSetMode::None);
+    EXPECT_EQ(d.ours, 0u);
+    EXPECT_EQ(d.dashd_only, 2u);
+    const auto o = shadow_evaluate(WorkSource::Embedded, emb,
+                                   std::optional<DashWorkData>(dref));
+    EXPECT_TRUE(has_line_with(o.log_lines, "mode=none"));
+}
+
+// The candidate path must still refuse the dangerous direction: a candidate we
+// hold that dashd does not is exactly as disqualifying as a served one, because
+// it is what we WOULD have put in a block.
+TEST(DashShadowCompare, CandidateOursOnlyIsStillFlagged) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    with_txs(dref, {1, 2});
+    emb.m_txset_candidates     = {hashn(1), hashn(9)};   // 9 is ours alone
+    emb.m_txset_candidate_fees = {1000, 9000};
+
+    const auto d = shadow_tx_set_diff(emb, dref);
+    EXPECT_EQ(d.mode, ShadowTxSetMode::Candidate);
+    EXPECT_EQ(d.ours_only, 1u);
+
+    const auto o = shadow_evaluate(WorkSource::Embedded, emb,
+                                   std::optional<DashWorkData>(dref));
+    EXPECT_TRUE(has_line_with(o.log_lines, "OURS-ONLY"));
+    EXPECT_TRUE(has_line_with(o.log_lines,
+                              "do NOT enable --embedded-serve-mempool-txs"));
+}
