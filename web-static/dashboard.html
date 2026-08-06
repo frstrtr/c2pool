@@ -1832,6 +1832,10 @@
                         <div class="stat-value success" id="local_rate">-</div>
                         <div class="stat-sub" title="Dead-on-arrival = local dead_hashrate / local hashrate -- the true lost-work / unrewarded fraction. Sourced from live hashrate, not share counts.">DOA: <span id="local_doa">-</span></div>
                         <div class="stat-detail">Expected Share: <span id="time_to_share">-</span></div>
+                        <!-- #expected_payout_amount was written by renderGlobalStats
+                             but had NO element in this page: c2pool computed the
+                             24h expectation and threw it away. -->
+                        <div class="stat-detail" id="expected_payout_line" style="display: none;" title="This node's expected 24h payout = (local share of pool hashrate) x miner block value x (1 - donation) x blocks expected in 24h">Est. 24h: <span id="expected_payout_amount">-</span> <small class="symbol-small">-</small></div>
                     </div>
                     
                     <div class="stat-card" id="shares_card">
@@ -1856,6 +1860,13 @@
                     <div class="stat-value warning"><span id="block_value_miner">-</span> <small class="symbol-small" id="block_value_symbol">-</small></div>
                     <div class="stat-sub merged-child-hint" style="color: #c3a634; font-size: 1.1em; margin-top: -4px;">+<span id="merged_block_value">-</span> <span class="merged-child-symbol-hint">DOGE</span></div>
                     <div class="stat-detail" style="white-space: nowrap;" title="#948: this card shows the GROSS miner share; the pool fee is deducted to give the NET amount the API reports as block_value_miner">Fee: <span id="block_value_fee">-</span> &rarr; net <span id="block_value_miner_net">-</span></div>
+                    <!-- #block_value and #block_value_payments were both written
+                         by renderLocalStats but had NO elements in this page. The
+                         card showed the miner slice with nothing to compare it
+                         against, so on DASH there was no way to see that 1.7702
+                         total minus 1.3277 of protocol outputs is what leaves
+                         miners 0.4426. -->
+                    <div class="stat-detail" style="white-space: nowrap;" title="Full coinbase value of the block being worked on, and the protocol-mandated outputs deducted from it before the miner split (masternode / superblock / platform burn). Shown only on coins that have such a lane.">Block: <span id="block_value">-</span><span id="block_value_payments_part" style="display: none;"> &minus; protocol <span id="block_value_payments">-</span><span id="block_value_burn_part" style="display: none;"> (burn <span id="block_value_burn">-</span>)</span></span></div>
                     <div class="stat-detail" style="white-space: nowrap;">Expected: <span id="time_to_block">-</span> <span class="merged-child-hint"><span style="color: #c3a634;">|</span> <span style="color: #c3a634;"><span id="time_to_merged_block">-</span></span></span></div>
                 </div>
                 
@@ -1865,8 +1876,12 @@
                     <div class="stat-value success"><span id="payout_totamount">-</span> <small class="symbol-small" id="node_payout_symbol">-</small></div>
                     <div class="stat-sub merged-child-hint" id="node_merged_payout" style="color: #c3a634; font-size: 1.1em; margin-top: -4px;">+<span id="node_merged_amount">0</span> <span id="node_merged_symbol" class="merged-child-symbol-hint">DOGE</span></div>
                     <div class="stat-detail">Per block found now</div>
+                    <!-- The operator's TOTAL entitlement in the current PPLNS
+                         window (mining payout + fee). Distinct from the fee
+                         above; it used to overwrite it. -->
+                    <div class="stat-detail" id="node_pplns_total_line" style="display: none;" title="Sum of this node's own addresses (/payout_addrs) in the current PPLNS window — the operator's mining payout AND fee, not the fee alone">PPLNS total: <span id="node_pplns_totamount">-</span> <small class="symbol-small">-</small></div>
                 </div>
-                
+
                 <div class="graph-section compact">
                     <div class="graph-header">
                         <h2>📈 Pool Hashrate</h2>
@@ -3188,7 +3203,16 @@
             var blocks_in_24h = (24 * 3600) / time_to_block;
             var payout_per_block = (local / global_stats.pool_hash_rate) * local_stats.block_value_miner * (1 - local_stats.donation_proportion);
             var expected_24h_payout = payout_per_block * blocks_in_24h;
-            d3.select('#expected_payout_amount').text(isFinite(expected_24h_payout) ? d3.format('.4f')(expected_24h_payout) : '0');
+            // The element for this now exists (Local Hash Rate card). Reveal it
+            // only when the number is real: with no local miners, or before the
+            // first pool-hashrate sample, the expression is NaN/Infinity and a
+            // formatted '0' would read as a genuine "you will earn nothing".
+            if (isFinite(expected_24h_payout)) {
+                d3.select('#expected_payout_amount').text(d3.format('.4f')(expected_24h_payout));
+                d3.select('#expected_payout_line').style('display', null);
+            } else {
+                d3.select('#expected_payout_line').style('display', 'none');
+            }
         }
 
         function renderLocalStats(local_stats) {
@@ -3208,7 +3232,31 @@
                 d3.select('#efficiency').text(local_stats.efficiency != null ? d3.format('.2p')(local_stats.efficiency) : '???');
                 d3.select('#uptime').text(format_dt(local_stats.uptime));
                 d3.select('#block_value').text(d3.format('.4f')(local_stats.block_value));
-                d3.select('#block_value_payments').text(d3.format('.4f')(local_stats.block_value_payments || 0));
+                // block_value_payments is the protocol-mandated output lane
+                // (masternode / superblock / platform burn). The API sets it
+                // EQUAL to block_value on coins that have no such lane
+                // (web_server.cpp: `(DASH) ? payment_amount : block_value`), so
+                // showing it unconditionally would tell an LTC operator the
+                // whole block is "protocol payments". Show it only when it is a
+                // genuine deduction.
+                var _bvp = local_stats.block_value_payments;
+                var _hasProtocolLane = (_bvp != null && _bvp > 0
+                                        && _bvp < local_stats.block_value - 1e-12);
+                var _burn = local_stats.block_value_burn;
+                // Both visibilities are set on EVERY pass, never only inside the
+                // positive branch: these cards re-render in place, so a branch
+                // that can turn a line on but not off leaves a stale line behind
+                // the moment the shape changes (a coin whose payments lane goes
+                // away, or a template that arrives before the burn field does).
+                var _hasBurn = _hasProtocolLane && (_burn != null && _burn > 0);
+                d3.select('#block_value_payments_part')
+                    .style('display', _hasProtocolLane ? null : 'none');
+                d3.select('#block_value_burn_part')
+                    .style('display', _hasBurn ? null : 'none');
+                if (_hasProtocolLane)
+                    d3.select('#block_value_payments').text(d3.format('.4f')(_bvp));
+                if (_hasBurn)
+                    d3.select('#block_value_burn').text(d3.format('.4f')(_burn));
                 // #948: the card headline is the GROSS (pre-fee) miner share so it
                 // matches the API block_value_miner_gross field and the label says so;
                 // the fee and the resulting NET (legacy block_value_miner) are shown below.
@@ -3223,14 +3271,58 @@
                 // Node fee percentage and computed amounts
                 var nodeFee = local_stats.fee != null ? local_stats.fee : 0;
                 d3.select('#node_fee_percent').text(d3.format('.1f')(nodeFee));
-                // Display computed node fee amounts per block
-                if (local_stats.node_fee_ltc != null) {
-                    d3.select('#payout_totamount').text(d3.format('.4f')(local_stats.node_fee_ltc));
-                    d3.select('#node_payout_symbol').text('LTC');
+                // Display computed node fee amounts per block.
+                //
+                // There is ONE shared dashboard.html for every coin, so the
+                // amount can NEVER be read from a hardcoded per-coin key. This
+                // read `local_stats.node_fee_ltc`, which is absent on DASH:
+                // d3.format('.4f')(undefined) renders nothing, so the card sat
+                // at "-" while the backend had the number
+                // (node_fee_dash = 0.00424). The symbol looked right only by
+                // accident — the .symbol-small sweep from currency_info had
+                // already written "DASH", and line :3229's hardcoded 'LTC'
+                // would have stomped it the moment node_fee_ltc appeared.
+                //
+                // Resolution order, most-general first:
+                //   1. node_fee                     coin-neutral, every coin
+                //   2. node_fee_<currency_info.symbol>   old binary, new page
+                //   3. node_fee_ltc                 the original legacy key
+                // (2) is what lets a newer web-static dropped on an already-
+                // running node render without a restart, and it is why LTC/
+                // DOGE/DASH keep working against binaries that predate (1).
+                var localStatsCoinFee = function(stats, sym, legacyKey) {
+                    if (stats.node_fee != null) return stats.node_fee;
+                    if (sym) {
+                        var k = 'node_fee_' + String(sym).toLowerCase();
+                        if (stats[k] != null) return stats[k];
+                    }
+                    if (legacyKey && stats[legacyKey] != null) return stats[legacyKey];
+                    return null;
+                };
+                var _ci = (typeof currency_info !== 'undefined') ? currency_info : {};
+                var _sym = _ci.symbol || '';
+                var nodeFeeAmount = localStatsCoinFee(local_stats, _sym, 'node_fee_ltc');
+                if (nodeFeeAmount != null) {
+                    d3.select('#payout_totamount').text(d3.format('.4f')(nodeFeeAmount));
+                    // Symbol from currency_info, never a literal — same source
+                    // the .symbol-small sweep uses, so the two agree. When
+                    // currency_info has not landed we leave whatever the sweep
+                    // put there rather than stomping it with a placeholder;
+                    // the old code wrote 'LTC' here unconditionally.
+                    if (_sym) d3.select('#node_payout_symbol').text(_sym.toUpperCase());
                 }
-                if (local_stats.node_fee_doge != null) {
-                    d3.select('#node_merged_amount').text(d3.format(',.2f')(local_stats.node_fee_doge));
-                    d3.select('#node_merged_symbol').text((typeof currency_info!=="undefined"&&currency_info.merged_child_symbol)||'DOGE');
+                // Merged-child fee: coin-neutral node_fee_merged first, then
+                // node_fee_<merged_child_symbol>, then the legacy DOGE key.
+                var mergedSym = _ci.merged_child_symbol || '';
+                var mergedFee = (local_stats.node_fee_merged != null)
+                    ? local_stats.node_fee_merged
+                    : (mergedSym && local_stats['node_fee_' + mergedSym.toLowerCase()] != null
+                        ? local_stats['node_fee_' + mergedSym.toLowerCase()]
+                        : (local_stats.node_fee_doge != null ? local_stats.node_fee_doge : null));
+                if (mergedFee != null) {
+                    d3.select('#node_merged_amount').text(d3.format(',.2f')(mergedFee));
+                    d3.select('#node_merged_symbol').text(
+                        local_stats.node_fee_merged_symbol || mergedSym || 'DOGE');
                 }
 
                 // Warnings
@@ -4492,9 +4584,20 @@
                             }
                         }
                     }
-                    // Only overwrite computed estimates if PPLNS has real data
+                    // This sums the operator's own entries in the CURRENT PPLNS
+                    // window (/payout_addrs intersected with
+                    // /current_merged_payouts). That is the operator's total
+                    // entitlement — their mining payout AND the fee — which is
+                    // NOT the node fee the card above is labelled with. It used
+                    // to overwrite #payout_totamount, silently relabelling one
+                    // quantity as the other; it only escaped notice because
+                    // /current_merged_payouts answered {} wherever the seam was
+                    // unbound, so `totamount > 0` was never true. It gets its
+                    // own, correctly-labelled line instead.
+                    d3.select('#node_pplns_total_line')
+                        .style('display', totamount > 0 ? null : 'none');
                     if (totamount > 0)
-                        d3.select('#payout_totamount').text(d3.format('.4f')(totamount));
+                        d3.select('#node_pplns_totamount').text(d3.format('.4f')(totamount));
 
                     // Show merged payout (always show when merged mining is active)
                     if (window.payoutsMergedSymbol && totMergedAmount > 0) {

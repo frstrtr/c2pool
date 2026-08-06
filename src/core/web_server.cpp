@@ -3980,8 +3980,26 @@ nlohmann::json MiningInterface::rest_local_stats()
         double local_hr = m_stratum_hashrate_fn ? m_stratum_hashrate_fn() : 0.0;
         double pool_hr = m_pool_hashrate_fn ? m_pool_hashrate_fn() : 0.0;
         double node_share = (pool_hr > 0 && local_hr > 0) ? local_hr / pool_hr : 0.0;
-        // Use blockchain-appropriate key for backward compatibility
         double primary_fee = miner_subsidy * fee_ratio * node_share;
+
+        // COIN-NEUTRAL key. There is exactly ONE shared web-static/dashboard
+        // .html for every coin, so a per-coin key name is something the page
+        // cannot read without knowing which coin it is serving. The Node Fee
+        // card read `node_fee_ltc` unconditionally, which is absent on DASH —
+        // d3.format('.4f')(undefined) renders nothing, so the card sat at "-"
+        // on a node that had computed the number correctly (measured live:
+        // node_fee_dash = 0.00424, node_fee_ltc absent). This is the key the
+        // dashboard reads first, on every coin.
+        result["node_fee"] = primary_fee;
+        // Merged-child equivalent, likewise coin-neutral. Absent (not zero)
+        // when nothing is merged, so the page can tell "no merged chain" from
+        // "merged chain owes zero".
+        //
+        // The coin-SUFFIXED keys below stay byte-unchanged: they are the
+        // p2pool-compat surface external tooling reads, and the same
+        // keep-the-legacy-key rule #1127 followed for the fee fields. The
+        // dashboard falls back to them so a NEW page dropped on an OLD binary
+        // (e.g. --dashboard-dir pointed at a newer web-static) still renders.
         switch (m_blockchain) {
         case Blockchain::DASH:
             result["node_fee_dash"] = primary_fee; break;
@@ -3993,11 +4011,18 @@ nlohmann::json MiningInterface::rest_local_stats()
         }
         if (m_mm_manager) {
             auto chain_infos = m_mm_manager->get_chain_infos();
+            bool first_merged = true;
             for (const auto& ci : chain_infos) {
                 double merged_bv = ci.coinbase_value / 1e8;
                 std::string sym = ci.symbol;
                 for (auto& c : sym) c = std::tolower(c);
-                result["node_fee_" + sym] = merged_bv * fee_ratio * node_share;
+                double merged_fee = merged_bv * fee_ratio * node_share;
+                result["node_fee_" + sym] = merged_fee;
+                if (first_merged) {
+                    result["node_fee_merged"]        = merged_fee;
+                    result["node_fee_merged_symbol"] = ci.symbol;
+                    first_merged = false;
+                }
             }
         }
     }
