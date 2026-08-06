@@ -340,7 +340,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # --target edit and would trip CI's NOT_BUILT sentinel until it had one
     # (#143/#883/#893). Needs exactly this link set: a real dash::NodeImpl +
     # ShareTracker, and core's address_utils for the DASH base58 rendering.
-    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp)
+    # test_dash_dashboard_pplns.cpp: the PPLNS payout read-model KATs
+    # (dashboard_pplns.hpp) — the pool-wide split behind /current_payouts and
+    # the per-share split on an individual share's page. FOLDED in for the same
+    # reason; needs the same link set plus the header-only mint/producer weight
+    # walk and coinbase allocator, both already reachable from `dash`.
+    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp)
     target_link_libraries(test_dash_node PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

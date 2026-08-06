@@ -110,6 +110,7 @@
 #include <core/target_utils.hpp>              // chain::target_to_difficulty (dashboard net-diff)
 #include <impl/dash/dashboard_found_block.hpp> // any-participant /recent_blocks feed (peer-found blocks)
 #include <impl/dash/dashboard_views.hpp>       // sharechain window / delta / share-detail read-models
+#include <impl/dash/dashboard_pplns.hpp>       // PPLNS payout read-model (pool-wide + per-share)
 
 #include <core/stratum_server.hpp>             // core::StratumServer — miner-facing accept-loop (run-path caller)
 #include <impl/dash/stratum/work_source.hpp>   // dash::stratum::DASHWorkSource — concrete core::stratum::IWorkSource
@@ -825,6 +826,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // processed (an empty pow_func fails every share_init_verify).
     const core::CoinParams mint_params = dash::make_coin_params(testnet);
     p2p_node.tracker().m_coin_params = mint_params;
+    // Live-template source for the dashboard PPLNS view. The WebServer seams
+    // are bound (and web_server->start() runs) well BEFORE DASHWorkSource
+    // exists, so the payout callbacks cannot capture the work source directly
+    // and a bare std::function assigned later would race the already-serving
+    // IO thread. TemplateSource publishes the peek under its own mutex and
+    // copies it out before calling. Until it is bound the PPLNS view answers
+    // an empty document — "no template yet", never a fabricated subsidy.
+    auto dash_tmpl = std::make_shared<dash::dashboard::TemplateSource>();
     // LevelDB sharechain store under the SAME per-net subdir as the rest of
     // the node state (bucket-1 isolation), loading any persisted shares.
     p2p_node.init_storage(net_subdir);
@@ -1317,11 +1326,50 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     return ctx;
                 };
 
-                mi->set_sharechain_window_fn(
-                    [node_ptr, view_ctx]() -> nlohmann::json {
+                // The pool-wide PPLNS split, shared by /current_payouts, the main
+                // dashboard treemap (via /current_merged_payouts) and the
+                // window's own `pplns_current` fallback. best_share_hash() is
+                // read BEFORE the guard: it takes its own try-shared-lock, and
+                // re-entering the same shared_mutex from a thread that already
+                // holds it is exactly the kind of nested acquire that stops
+                // being harmless the moment a writer queues up.
+                auto current_pplns =
+                    [node_ptr, dash_tmpl, mint_params]() -> nlohmann::json {
+                        const uint256 best = node_ptr->best_share_hash();
+                        if (best.IsNull()) return nlohmann::json::object();
                         auto guard = node_ptr->read_tracker();
                         if (!guard) return nlohmann::json::object();
-                        return dash::dashboard::build_window(*guard, view_ctx());
+                        auto v = dash::dashboard::pplns_payouts_current(
+                            guard->chain, mint_params, best, *dash_tmpl,
+                            dash::SharechainConfig::is_testnet);
+                        return v.ok ? v.payouts : nlohmann::json::object();
+                    };
+
+                // #939's direct-source seam. Its only callers repo-wide were in
+                // a unit test (core/test/web_server_current_payouts_test.cpp) —
+                // the seam shipped green and inert, which is why
+                // rest_current_payouts() kept returning {} on a DASH node with
+                // a full window and live balances (web_server.cpp:2375 takes
+                // this branch only when a coin actually wires it). This is that
+                // real, non-test caller.
+                //
+                // It also lights /current_merged_payouts, because
+                // compute_current_merged_payouts() (web_server.cpp:5964) starts
+                // from rest_current_payouts() — and /current_merged_payouts is
+                // what the MAIN dashboard PPLNS treemap fetches
+                // (dashboard.html loadMainPPLNS). /pplns/current's miners[]
+                // array comes off the same cache.
+                mi->set_current_payouts_fn(current_pplns);
+
+                mi->set_sharechain_window_fn(
+                    [node_ptr, view_ctx, current_pplns]() -> nlohmann::json {
+                        auto cur = current_pplns();          // takes + releases the guard
+                        auto guard = node_ptr->read_tracker();
+                        if (!guard) return nlohmann::json::object();
+                        auto w = dash::dashboard::build_window(*guard, view_ctx());
+                        if (cur.is_object() && !cur.empty())
+                            w["pplns_current"] = std::move(cur);
+                        return w;
                     });
                 // The grid IS the sharechain — refresh it on tip change, not on
                 // the 1 Hz periodic timer (main_ltc.cpp:3908).
@@ -1334,11 +1382,41 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         return dash::dashboard::build_delta(*guard, since_hash, view_ctx());
                     });
 
+                // Individual share page + THE PPLNS VIEW FOR THAT SHARE.
+                //
+                // LTC serves per-share PPLNS out of a precomputed cache
+                // (start_pplns_precompute -> m_pplns_per_tip, read back by the
+                // window as `pplns[<short hash>]`). That machinery is gated on
+                // refresh_work() having populated m_cached_template
+                // (web_server.cpp:2947), and refresh_work() never runs on the
+                // DASH lane (:3902) — porting it would have wired green and
+                // stayed empty, which is the exact failure this changeset
+                // exists to remove. DASH computes the share's own window on
+                // demand instead: ONE tracker walk per page view, inside the
+                // guard already held, attached to the share document itself.
                 mi->set_share_lookup_fn(
-                    [node_ptr, view_ctx](const std::string& hash_hex) -> nlohmann::json {
+                    [node_ptr, view_ctx, mint_params](const std::string& hash_hex) -> nlohmann::json {
                         auto guard = node_ptr->read_tracker();
                         if (!guard) return nlohmann::json{{"error", "tracker busy"}};
-                        return dash::dashboard::build_share_detail(*guard, hash_hex, view_ctx());
+                        auto doc = dash::dashboard::build_share_detail(
+                            *guard, hash_hex, view_ctx());
+                        if (doc.contains("error")) return doc;
+
+                        uint256 h;
+                        h.SetHex(hash_hex);
+                        auto v = dash::dashboard::pplns_payouts_for_share(
+                            guard->chain, mint_params, h,
+                            dash::SharechainConfig::is_testnet);
+                        if (v.ok) {
+                            doc["pplns"] = v.payouts;
+                            doc["pplns_meta"] = {
+                                {"subsidy",        static_cast<double>(v.subsidy) / 1e8},
+                                {"payments_total", static_cast<double>(v.payments_total) / 1e8},
+                                {"worker_payout",  static_cast<double>(v.worker_payout) / 1e8},
+                                {"recipients",     v.recipients},
+                            };
+                        }
+                        return doc;
                     });
             }
 
@@ -2194,6 +2272,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // to real dashd (both merkle roots reproduced from the mnlistdiff wire); the
     // SML+quorum freshness + superblock viability gates keep it fail-safe.
     work_source->set_embedded_mainnet(embedded_mainnet);
+    // Publish the live template to the dashboard PPLNS view (declared far above,
+    // where the WebServer seams are bound). peek_template() is the SAME
+    // non-fetching peek the block-value card already uses — it never triggers a
+    // GBT fetch and never touches the coinbase the miners hash.
+    dash_tmpl->bind([wsrc = work_source.get()]() { return wsrc->peek_template(); });
     // Reward-safety backstop: when a dashd fallback is ARMED, cross-check the
     // embedded creditPool against dashd's GBT before serving (catches any seed
     // pool bug the daemonless self-checks miss).
