@@ -241,6 +241,19 @@ public:
     /// gate the pre-v36 finder-fee shape. Left unset => v36-pure (no finder fee).
     void set_author_version_fn(std::function<int64_t()> fn);
 
+    /// Post-submission found-block sink. Fired AFTER a won block has been
+    /// dispatched to the broadcaster (telemetry-only): it records the block to
+    /// the operator dashboard (/recent_blocks) and arms the confirm/orphan
+    /// poller. `reached_network` is the broadcaster's ack. Never gates the
+    /// submit -- it runs strictly downstream of the block dispatch (#995 BCH arm).
+    using OnFoundBlockFn = std::function<void(uint32_t height,
+                                              const uint256& block_hash,
+                                              const std::string& miner,
+                                              bool reached_network)>;
+    /// Wire the post-submission found-block sink. Optional; unset => won blocks
+    /// are broadcast but not recorded to the dashboard. TELEMETRY ONLY.
+    void set_on_found_block_fn(OnFoundBlockFn fn);
+
 private:
     // External dependencies (non-owning references)
     bch::coin::HeaderChain&     chain_;
@@ -249,6 +262,10 @@ private:
 
     // Submission dispatch
     SubmitBlockFn               submit_block_fn_;
+
+    // Found-block telemetry sink (dashboard record + confirm/orphan poller).
+    // Guarded by callback_mutex_ like the other post-construction callbacks.
+    OnFoundBlockFn              on_found_block_fn_;
 
     // Config (held by value; const after construction in MVP)
     core::stratum::StratumConfig config_;

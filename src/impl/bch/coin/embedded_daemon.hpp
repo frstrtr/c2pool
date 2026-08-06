@@ -53,6 +53,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <limits>       // std::numeric_limits (found-block RPC-fallback sentinel)
 #include <string>
 #include <vector>
 
@@ -547,6 +548,24 @@ public:
     HeaderChain&        chain()          { return m_chain; }
     Mempool&            mempool()        { return m_pool; }
     bool                is_wired() const { return m_abla.is_wired(); }
+
+    /// Found-block confirmation depth via the external BCHN-RPC fallback
+    /// (getblockheader "confirmations"). Returns INT_MIN when no external RPC is
+    /// live (embedded-only arm) so the caller falls through to the header-chain
+    /// verdict. TELEMETRY ONLY -- the dashboard found-block verifier's fallback
+    /// arm (#995 BCH arm); never a consensus or broadcast gate. Read-only vs
+    /// VM300 (a getblockheader query issues no qm/control op).
+    int rpc_block_confirmations(const uint256& block_hash)
+    {
+        NodeRPC* r = m_node.rpc();
+        if (!r) return std::numeric_limits<int>::min();
+        try {
+            nlohmann::json j = r->getblockheader(block_hash, /*verbose=*/true);
+            if (j.contains("confirmations") && j["confirmations"].is_number())
+                return j["confirmations"].get<int>();
+        } catch (...) { /* unreachable / unknown -> pending */ }
+        return std::numeric_limits<int>::min();
+    }
 
     // BlockBroadcast result type + the guarded dual-path dispatch live in
     // block_broadcast_guard.hpp (shared single source of guard truth; the
