@@ -28,6 +28,7 @@
 /// safety path and the [GBT-XCHECK] cross-check whenever the bundle is not live.
 
 #include <impl/dash/coin/node_coin_state.hpp>    // NodeCoinState
+#include <impl/dash/coin/sml_resync_watchdog.hpp> // SmlResyncWatchdog (bounded getmnlistd re-request)
 #include <impl/dash/coin/governance_store.hpp>   // GovernanceStore (daemonless superblock)
 #include <impl/dash/coin/govsync_status.hpp>     // GovSyncStatus (R5 completeness determination)
 #include <impl/dash/coin/governance_object.hpp>  // parse_superblock_trigger, govvote_signature_hash
@@ -1495,6 +1496,19 @@ public:
         m_on_sml_clear = std::move(fn);
     }
 
+    /// Wire the bounded getmnlistd re-request (main_dash points this at
+    /// coin_p2p->send_getmnlistd). Fired from check_tip_body_overdue's diff-
+    /// phase sub-threshold when the SML currency is stuck behind the header tip
+    /// — the companion that keeps the fourth-axis conjunct from converting a
+    /// diff outage into a silent doomed-tip window (see check_tip_body_overdue).
+    /// Optional: unset in KATs = no re-request wired, so the conjunct's blocking
+    /// behaviour is testable without a live peer. `base` is the SML's current
+    /// block, `target` the header tip to advance it to.
+    void set_on_sml_rerequest(
+        std::function<void(const uint256& base, const uint256& target)> fn) {
+        m_on_sml_rerequest = std::move(fn);
+    }
+
     /// Wire the credit-pool PERSISTENCE sink (main_dash points this at
     /// CreditPoolDb::write_state). Invoked from on_mnlistdiff after an accepted
     /// diff re-anchors the pool, with the same (blockHash, height) the SML persist
@@ -1746,13 +1760,28 @@ private:
         m_tip_overdue_latched  = false;
     }
 
-    /// Promote the pending header tip to the serve tip iff the credit-pool
-    /// seed is current AT that exact block (hash AND height — the hash match
+    /// Promote the pending header tip to the serve tip iff ALL FOUR derived
+    /// axes are current AT that exact block (hash AND height — the hash match
     /// is what keeps a same-height competing block's body from promoting the
-    /// wrong tip's params). The seed is the witness that the tip block's
-    /// inputs were parsed: the body fold and the mnlistdiff cbTx re-anchor
-    /// both stamp it with the block's own identity. Returns true iff
-    /// promotion happened; caller republishes.
+    /// wrong tip's params). This is the PUBLISH-LAST invariant that makes the
+    /// serve tip atomic in the way dashcore's ConnectBlock is: dashd advances
+    /// DML, quorums, credit pool and ChainLocks together inside one block-
+    /// connect, so its getblocktemplate never sees the tip at height N with a
+    /// derived axis at N-1. We advance each axis on its own network round trip
+    /// (getmnlistd, qrinfo) or local fold, so they CAN momentarily disagree —
+    /// and the gate exists to refuse rather than serve a wrong payee. Gating
+    /// promotion on all four here means the serve tip is only ever published
+    /// once they agree, which makes those refusals structurally unreachable in
+    /// steady state instead of merely rare. The single io thread is the
+    /// atomicity primitive — no lock, no event, no thread is added.
+    ///
+    /// The four axes, each a witness that the tip block's inputs were parsed:
+    ///   1. credit-pool seed  (hash + height)   — body fold / mnlistdiff cbTx
+    ///   2. payee cursor       (height)          — tip-body apply_block
+    ///   3. SML currency       (hash)            — on_mnlistdiff (fourth axis,
+    ///      added here; makes node_coin_state.hpp clause 12 `dmn-stale`
+    ///      structurally unsatisfiable in steady state WITHOUT relaxing it)
+    /// Returns true iff promotion happened; caller republishes.
     bool maybe_promote_pending_tip() {
         if (!m_body_first_serve_tip || !m_tip_body_pending) return false;
         if (!m_have_hdr_tip) return false;
@@ -1769,6 +1798,27 @@ private:
         // MN-readiness half of populated() already gates serving there.
         if (!m_state.mnstates().entries().empty()
             && m_state.mnstates().last_applied_height() != m_hdr_prev_height)
+            return false;
+        // ── FOURTH AXIS: the SML currency (dmn-stale, clause 12) ────────────
+        // Folding the tip body we already hold cannot advance the SML — a cbTx
+        // commits merkleRootMNList, and a root is not a list — so the currency
+        // hash advances ONLY via on_mnlistdiff, on its own getmnlistd round
+        // trip. Promoting before that lands would advance the serve tip into a
+        // dmn-stale refusal, the exact window this conjunct removes.
+        //
+        // ZERO carve-out (cold start AND post-reorg-wipe, which the step-1
+        // audit proved land the IDENTICAL uint256::ZERO sentinel, so they
+        // collapse to one case — mirroring the empty-payee-machine carve-out
+        // above). A ZERO currency hash is "the SML covers nothing", which the
+        // require_sml half of populated() (surfacing as clause 10 no-dmn-set,
+        // evaluated BEFORE clause 12) already gates. It must NOT hold promotion
+        // back, or a cold node would DEADLOCK: the currency hash cannot become
+        // the tip until a full snapshot lands, and nothing drives that if
+        // promotion — and therefore the whole embedded arm — waited on it
+        // first. Test: ColdSmlDoesNotBlockPromotion pins that a future reader
+        // cannot "tighten" this into a cold-start deadlock.
+        if (!m_state.sml_current_hash().IsNull()
+            && m_state.sml_current_hash() != m_hdr_prev_hash)
             return false;
         promote_serve_tip();
         m_state.set_tip_body_pending_dbg(false);
@@ -1789,6 +1839,44 @@ private:
     /// every maintainer event (mempool relay being the high-cadence clock).
     void check_tip_body_overdue() {
         if (!m_body_first_serve_tip || !m_tip_body_pending) return;
+
+        // ── DIFF-PHASE SUB-THRESHOLD (#1153 policy, wired here) ─────────────
+        // LOAD-BEARING COMPANION to the fourth-axis conjunct, NOT an optional
+        // extra: the conjunct now holds the tip body-pending whenever the SML
+        // currency is behind the header tip. If that is because a getmnlistd
+        // was never sent or never answered — p2p_client.hpp drops it SILENTLY
+        // with no primary peer — then without a re-request the tip stays
+        // pending until the 30 s hard demote below, and the conjunct will have
+        // converted what used to be a LOUD instant dmn-stale refusal into up
+        // to 30 s of QUIET H-1 serving. H-1 work solved past the propagation
+        // window orphans, so the conjunct ALONE is a regression in the diff-
+        // outage case; the conjunct + this re-request is the fix.
+        //
+        // Bounded by SmlResyncWatchdog (min_quiet ~4 s « the 30 s demote, so it
+        // fires inside the silent window; geometric backoff; hard cap, after
+        // which the demote takes over exactly as today). Target is the HEADER
+        // tip, base is where the SML actually is — byte-identical to the
+        // getmnlistd main_dash's tip-change path already sends, so the base-
+        // continuity guard accepts the reply. (Deliberately the header tip, not
+        // the serve tip m_prev_hash: we are DRIVING the SML forward to enable
+        // promotion, not gating the current serve — the two diverge during a
+        // body-pending window and only the header tip converges the conjunct.)
+        if (m_on_sml_rerequest && m_have_hdr_tip
+            && !m_state.sml_current_hash().IsNull()
+            && m_state.sml_current_hash() != m_hdr_prev_hash) {
+            if (auto req = m_sml_resync.observe(m_hdr_prev_hash,
+                                                m_state.sml_current_hash(),
+                                                m_now_fn())) {
+                LOG_WARNING << "[EMB-DASH] SML behind tip h=" << m_hdr_prev_height
+                            << " (currency ..."
+                            << discriminating_hash_tail(m_state.sml_current_hash())
+                            << " != tip ..." << discriminating_hash_tail(m_hdr_prev_hash)
+                            << ") — re-requesting getmnlistd (attempt "
+                            << req->attempt << "/3) before the doomed-tip demote";
+                m_on_sml_rerequest(req->base, req->target);
+            }
+        }
+
         if (m_tip_overdue_latched) return;
         if (m_now_fn() - m_tip_pending_since < m_tip_body_overdue_secs) return;
         m_tip_overdue_latched = true;
@@ -1881,6 +1969,12 @@ private:
     std::function<void()> m_on_state_dirty;  // SML/bestCL/reorg -> re-issue work
     std::function<void()> m_on_mn_reseed;    // payee desync -> authoritative protx re-seed
     std::function<void()> m_on_full_resync;  // H-1 heal -> reset sml_base + full re-sync
+    std::function<void(const uint256&, const uint256&)> m_on_sml_rerequest;  // SML-behind-tip -> bounded getmnlistd(base,target)
+    // #1153 policy: bounds the getmnlistd re-request to at most a few attempts
+    // per stuck (tip, sml) pair. min_quiet 4 s « the 30 s doomed-tip demote, so
+    // it fires INSIDE the silent window the conjunct would otherwise open.
+    SmlResyncWatchdog m_sml_resync{SmlResyncWatchdog::Config{
+        /*min_quiet_sec=*/4, /*backoff_mult=*/2, /*max_attempts=*/3}};
     std::function<void(const uint256&)> m_on_sml_persist;  // accepted diff -> SMLDb/QuorumDb write
     std::function<void()> m_on_sml_clear;    // reorg/heal -> SMLDb/QuorumDb wipe (extended to CreditPoolDb)
     // qc-plan-underivable tee: accepted diff's full tail.newQuorums ->

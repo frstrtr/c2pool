@@ -463,6 +463,293 @@ static CSimplifiedMNListEntry sml_entry(uint8_t seed) {
     return e;
 }
 
+// A cold/incremental mnlistdiff carrying a type-5 cbTx seed (creditPool +
+// nHeight @ cb_height), so on_mnlistdiff advances BOTH the currency hash and
+// the paired height. Defined here (moved up from below) because the step-1
+// wipe-audit KATs need it.
+static CSimplifiedMNListDiff diff_with_seed(const uint256& base, const uint256& block,
+                                            int32_t cb_height, int64_t credit_pool,
+                                            CSimplifiedMNListEntry mn) {
+    CSimplifiedMNListDiff d;
+    d.baseBlockHash = base;
+    d.blockHash     = block;
+    d.mnList = {mn};
+    dash::coin::vendor::CCbTx cb;
+    cb.nVersion = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+    cb.nHeight  = cb_height;
+    cb.creditPoolBalance = credit_pool;
+    d.cbTx.version = 3;
+    d.cbTx.type    = 5;
+    d.cbTx.extra_payload = dash::coin::encode_cbtx(cb);
+    return d;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// STEP-1 SML-CURRENCY WIPE AUDIT (gate for the "fourth-axis conjunct" that
+// makes dmn-stale structurally unsatisfiable in steady state). The conjunct
+// blocks tip promotion until sml_current_hash() == the header prev-hash and
+// advances it back to a real value only via on_mnlistdiff. If ANY wipe path
+// could leave m_sml_current_hash STALE-NONZERO, the base-continuity guard
+// (on_mnlistdiff) would then reject every incremental whose base != that
+// stale value, sml_current_hash could never re-reach the tip, and the
+// conjunct would deadlock into an indefinite QUIET stall (no loud refusal,
+// just work that never promotes). So the invariant the conjunct depends on
+// is: every SML wipe leaves the currency hash EXACTLY ZERO, and ZERO is the
+// cold sentinel on_mnlistdiff treats as "accept a full snapshot".
+//
+// The four (and only four) writers of m_sml_current_hash are:
+//   1. on_mnlistdiff        -> diff.blockHash  (advance; paired with the list)
+//   2. on_sml_reorg         -> uint256::ZERO   (wipe)
+//   3. warm restart restore -> get_best_hash() (only inside the root-verified
+//                              `warm` guard, main_dash.cpp; cold leaves ZERO)
+//   4. the setter itself     (plumbing)
+// The SML-LIST wipes are exactly two: the full-snapshot clear inside
+// on_mnlistdiff (:595, which always falls through to writer #1 and lands a
+// REAL hash) and on_sml_reorg (:829, which lands writer #2 = ZERO).
+//
+// FINDING (premise correction): the payee-desync / apply-gap wipe the design
+// note flagged as a suspect (coin_state_maintainer.hpp ~:1224) is NOT an SML
+// wipe at all — it wipes mnstates() (the PAYEE axis) and never touches the
+// SML or its currency hash. So it correctly leaves sml_current_hash intact,
+// and the two KATs below pin BOTH facts: the reorg wipe zeroes it, the payee
+// desync leaves it untouched. No path can leave it stale-nonzero.
+// ════════════════════════════════════════════════════════════════════════
+
+// on_sml_reorg is the header-chain reorg entry (main_dash's reorg hook calls
+// it directly; the malformed-quorum-tail heal reaches the SAME function via
+// on_mnlistdiff, already covered above). It must land the currency hash at
+// EXACTLY ZERO and the paired height at 0 — never a stale block hash.
+TEST(DashCoinStateMaintainer, ReorgWipeZerosSmlCurrencyHashAndHeight) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+
+    // Sync the SML to a real, NON-ZERO currency hash (cold full snapshot
+    // carrying a type-5 cbTx so the paired height advances too).
+    m.on_mnlistdiff(diff_with_seed(uint256::ZERO, raw256(0x54), 1518654,
+                                   111'000'000LL, sml_entry(0x40)));
+    ASSERT_TRUE(st.have_sml());
+    ASSERT_EQ(st.sml_current_hash(), raw256(0x54));
+    ASSERT_NE(st.sml_current_hash(), uint256::ZERO);
+    ASSERT_EQ(m.sml_current_height(), 1518654u);
+    ASSERT_TRUE(m.sml_height_paired());
+
+    m.on_sml_reorg();
+
+    EXPECT_EQ(st.sml_current_hash(), uint256::ZERO)
+        << "an SML wipe MUST leave the currency hash EXACTLY ZERO, never a "
+           "stale block hash — a stale-nonzero value would make on_mnlistdiff "
+           "reject every incremental off it (base != stale), so the currency "
+           "hash could never re-reach the tip and the fourth-axis conjunct "
+           "would deadlock into an indefinite quiet stall";
+    EXPECT_FALSE(st.have_sml());
+    EXPECT_EQ(m.sml_current_height(), 0u)
+        << "the paired height must reset with the hash (R1 freshness tracker)";
+    EXPECT_FALSE(m.sml_height_paired());
+
+    // And ZERO must actually behave as the cold sentinel: only a FULL
+    // snapshot (base=ZERO) is accepted; a clean incremental off the old tip
+    // is refused. This is the property that lets the conjunct recover rather
+    // than wedge — a fresh full diff re-establishes currency.
+    m.on_mnlistdiff(diff_with_seed(raw256(0x54), raw256(0x55), 1518655,
+                                   111'066'966'830LL, sml_entry(0x41)));
+    EXPECT_FALSE(st.have_sml())
+        << "post-wipe, an incremental off the old tip must STILL refuse";
+    EXPECT_EQ(st.sml_current_hash(), uint256::ZERO);
+}
+
+// The payee-desync / apply-gap path (on_block_connected -> wipe) is a PAYEE
+// wipe, not an SML wipe. It must leave the SML currency hash UNTOUCHED — the
+// SML axis stays valid and its hash keeps describing it accurately, so the
+// conjunct is neither falsely satisfied (the SML really is at that block) nor
+// deadlocked (the hash is not corrupted). This KAT pins the premise
+// correction: the path the design note suspected does not move the hash.
+TEST(DashCoinStateMaintainer, PayeeDesyncLeavesSmlCurrencyHashIntact) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+
+    // SML current at a real block; payee queue armed and live at the tip.
+    m.on_mnlistdiff(diff_with_seed(uint256::ZERO, PREV_HASH, H - 1,
+                                   111'000'000LL, sml_entry(0x40)));
+    ASSERT_EQ(st.sml_current_hash(), PREV_HASH);
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)));
+    m.on_new_tip(H - 1, PREV_HASH, BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER,
+                 CURTIME, VERSION);
+
+    // Force a payee desync: the connected block's coinbase pays a script the
+    // projected MN does not.
+    BlockType blk;
+    blk.m_txs.push_back(make_spend(raw256(0x90), 0, 500000000, 1));
+    blk.m_txs[0].vout[0].scriptPubKey.m_data = p2pkh_script(0x77);  // NOT the MN
+    bind_block(blk);
+    auto r = m.on_block_connected(blk, H);
+
+    ASSERT_TRUE(r.payee_desync) << "precondition: the desync path must fire";
+    EXPECT_EQ(st.mnstates().size(), 0u) << "the PAYEE set is wiped...";
+    EXPECT_EQ(st.sml_current_hash(), PREV_HASH)
+        << "...but the SML currency hash is UNTOUCHED — a payee-axis wipe is "
+           "not an SML wipe. Zeroing it here would needlessly force a full "
+           "SML re-sync on every payee desync; leaving it stale-WRONG would "
+           "deadlock the conjunct. It must stay EXACTLY what the SML is at.";
+    EXPECT_TRUE(st.have_sml()) << "the SML list itself survives a payee wipe";
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// STEP 2 — THE FOURTH-AXIS CONJUNCT (SML currency) in maybe_promote_pending_tip.
+//
+// Publish-last: the body-first serve tip is promoted only once ALL FOUR
+// derived axes agree on the block — credit-pool, payee cursor, AND now the SML
+// currency hash. This makes node_coin_state.hpp clause 12 (dmn-stale)
+// structurally unsatisfiable in steady state WITHOUT relaxing the gate: the
+// serve tip m_prev_hash is never advanced to a block the SML is not at.
+//
+// Helper: arm credit-pool + payee current AT `tip`/`height` directly on the
+// NodeCoinState (each axis has its own public setter), leaving SML to the
+// individual test. Promotion reads these axes plus the maintainer's stashed
+// header tip; the require_* serve flags gate SERVING, not promotion.
+static void arm_cp_and_payee_at(NodeCoinState& st, const uint256& tip,
+                                uint32_t height) {
+    st.set_credit_pool(111'000'000LL, tip, static_cast<int32_t>(height));
+    MNState s;
+    s.isValid = true;
+    s.nRegisteredHeight = 2'300'000;
+    s.scriptPayout.m_data = p2pkh_script(0x30);
+    s.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+    st.mnstates().load(
+        std::vector<std::pair<uint256, MNState>>{{raw256(0x01), s}}, height);
+}
+
+// SML behind the tip (nonzero, mismatched) MUST block promotion — the tip
+// stays body-pending rather than advancing into a dmn-stale refusal.
+TEST(DashCoinStateMaintainer, FourthAxisSmlBehindTipBlocksPromotion) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    m.set_body_first_serve_tip(true);
+
+    arm_cp_and_payee_at(st, PREV_HASH, H - 1);
+    st.set_have_sml(true);
+    st.set_sml_current_hash(raw256(0xCD));   // SML at a DIFFERENT nonzero block
+
+    m.on_new_tip(H - 1, PREV_HASH, BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER,
+                 CURTIME, VERSION);
+
+    EXPECT_TRUE(m.tip_body_pending())
+        << "credit-pool and payee are current at the tip but the SML is not — "
+           "promoting here would advance the serve tip straight into a "
+           "dmn-stale refusal (clause 12). The fourth-axis conjunct must hold "
+           "the tip body-pending until the SML currency reaches it.";
+}
+
+// SML current at the tip (all four axes agree) MUST promote.
+TEST(DashCoinStateMaintainer, FourthAxisSmlCurrentAtTipPromotes) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    m.set_body_first_serve_tip(true);
+
+    arm_cp_and_payee_at(st, PREV_HASH, H - 1);
+    st.set_have_sml(true);
+    st.set_sml_current_hash(PREV_HASH);      // SML current AT the tip
+
+    m.on_new_tip(H - 1, PREV_HASH, BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER,
+                 CURTIME, VERSION);
+
+    // tip_body_pending() flipping to false IS the promotion (the conjunct
+    // released). m.live()/populated() additionally needs the MN-readiness
+    // snapshot plumbing, which this unit does not arm — the promotion axis is
+    // exactly tip_body_pending here.
+    EXPECT_FALSE(m.tip_body_pending())
+        << "all four axes current at the tip — promotion must proceed";
+}
+
+// THE CARVE-OUT (coordinator-mandated, test-visible so a future reader cannot
+// "tighten" it into a cold-start deadlock). A ZERO SML currency hash is
+// cold-start OR post-reorg-wipe (step-1 audit: both land the identical ZERO
+// sentinel). It must NOT block promotion — serving is still gated by the
+// require_sml half of populated(), which surfaces as clause 10 (no-dmn-set),
+// evaluated before clause 12. If the ZERO case blocked promotion, a cold node
+// would deadlock: the currency hash can only reach the tip once a full
+// snapshot lands, and nothing drives that if the whole arm waited on it first.
+TEST(DashCoinStateMaintainer, FourthAxisColdSmlDoesNotBlockPromotion) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    m.set_body_first_serve_tip(true);
+
+    arm_cp_and_payee_at(st, PREV_HASH, H - 1);
+    st.set_sml_current_hash(uint256::ZERO);  // cold / post-wipe sentinel
+
+    m.on_new_tip(H - 1, PREV_HASH, BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER,
+                 CURTIME, VERSION);
+
+    EXPECT_FALSE(m.tip_body_pending())
+        << "a ZERO (cold/wiped) SML currency must NOT hold promotion back — "
+           "that is the carve-out; blocking here would deadlock cold start. "
+           "Serving is still gated by require_sml/no-dmn-set downstream.";
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// STEP 3 — the LOAD-BEARING companion: the diff-phase sub-threshold re-request.
+// Without it the conjunct turns a dropped/lost getmnlistd into up to 30 s of
+// silent H-1 serving (which orphans past propagation). check_tip_body_overdue,
+// driven opportunistically (on_mempool_tx is the clock), fires ONE bounded
+// getmnlistd(base=sml, target=hdr-tip) after ~min_quiet, capped, before the
+// unchanged 30 s hard demote.
+// ════════════════════════════════════════════════════════════════════════
+TEST(DashCoinStateMaintainer, DiffPhaseReRequestFiresBoundedThenDefersToDemote) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    m.set_body_first_serve_tip(true);
+    m.set_tip_body_overdue_secs(30);
+
+    int64_t now = 1000;
+    m.set_now_fn([&now]() { return now; });
+
+    std::vector<std::pair<uint256, uint256>> reqs;
+    m.set_on_sml_rerequest(
+        [&reqs](const uint256& base, const uint256& target) {
+            reqs.emplace_back(base, target);
+        });
+
+    // Tip body-pending with the SML stuck one behind the tip.
+    arm_cp_and_payee_at(st, PREV_HASH, H - 1);
+    st.set_have_sml(true);
+    st.set_sml_current_hash(raw256(0xCD));
+    m.on_new_tip(H - 1, PREV_HASH, BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER,
+                 CURTIME, VERSION);
+    ASSERT_TRUE(m.tip_body_pending()) << "conjunct holds it pending";
+
+    auto tick = [&](int64_t at) {
+        now = at;
+        m.on_mempool_tx(make_spend(raw256(0x90), 0, 90'000, /*salt=*/int(at)));
+    };
+
+    // First sighting of the stuck (tip, sml) pair starts the quiet clock and
+    // NEVER retries — this is what keeps the ordinary sub-second per-tip window
+    // (104 of 109 measured episodes) from ever generating traffic.
+    tick(1001);
+    EXPECT_TRUE(reqs.empty()) << "first sighting must not re-request";
+
+    // Still inside the quiet period (2 s < 4 s).
+    tick(1003);
+    EXPECT_TRUE(reqs.empty()) << "must not re-request inside the quiet period";
+
+    // Past min_quiet (5 s ≥ 4 s): exactly ONE re-request, byte-identical to the
+    // tip-change getmnlistd (base = where the SML is, target = the header tip).
+    tick(1006);
+    ASSERT_EQ(reqs.size(), 1u) << "one bounded re-request after ~min_quiet";
+    EXPECT_EQ(reqs[0].first,  raw256(0xCD)) << "base = where the SML is";
+    EXPECT_EQ(reqs[0].second, PREV_HASH)    << "target = the header tip";
+
+    // Geometric backoff + hard cap at 3: keep ticking well past any wait; the
+    // count must stop at 3, never grow unbounded (never hammer a struggling peer).
+    for (int64_t t = 1010; t <= 1200; t += 5) tick(t);
+    EXPECT_EQ(reqs.size(), 3u)
+        << "re-request must cap at max_attempts (3), then go quiet and let the "
+           "unchanged 30 s hard demote take over exactly as today";
+
+    // Throughout, the SML never reached the tip, so the conjunct kept the tip
+    // body-pending the entire time — it never promoted into a dmn-stale serve.
+    EXPECT_TRUE(m.tip_body_pending());
+}
+
 // H-7 base-continuity: once the SML is current at block A, an INCREMENTAL diff
 // whose base is NOT A is rejected — the SML and its current-at marker are left
 // untouched (no ghost-MN corruption from applying a diff off the wrong base).
@@ -633,23 +920,6 @@ TEST(DashCoinStateMaintainer, MalformedQuorumTailHealsViaFullResyncNotIncrementa
 }
 
 // Build a diff carrying a type-5 cbTx seed (creditPool @ cb_height).
-static CSimplifiedMNListDiff diff_with_seed(const uint256& base, const uint256& block,
-                                            int32_t cb_height, int64_t credit_pool,
-                                            CSimplifiedMNListEntry mn) {
-    CSimplifiedMNListDiff d;
-    d.baseBlockHash = base;
-    d.blockHash     = block;
-    d.mnList = {mn};
-    dash::coin::vendor::CCbTx cb;
-    cb.nVersion = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
-    cb.nHeight  = cb_height;
-    cb.creditPoolBalance = credit_pool;
-    d.cbTx.version = 3;
-    d.cbTx.type    = 5;
-    d.cbTx.extra_payload = dash::coin::encode_cbtx(cb);
-    return d;
-}
-
 // SOAK FIX v3 — POST-RESTART: after a cold snapshot the credit-pool seed MUST
 // advance off the snapshot on the first incremental (the re-soak #2 defect was
 // it staying put). And a non-advancing seed (a diff whose cbTx does not carry a
