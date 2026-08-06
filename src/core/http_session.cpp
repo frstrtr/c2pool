@@ -750,22 +750,80 @@ void HttpSession::process_request()
                     // backend can answer from its own validated state (DASH's
                     // header chain), its answer — including a refusal that
                     // names the blocking condition — is served verbatim.
-                    if ((ep == "getblockchaininfo" || ep == "getbestblockhash" || ep == "getblockhash")
-                        && mining_interface_->has_coin_chain_query_fn()) {
+                    //
+                    // Methods a coin backend may answer from its own validated
+                    // state. getblock/getblockheader/getrawtransaction joined the
+                    // list when the daemonless block-data policy landed: the
+                    // header chain answers getblockheader in full and getblock
+                    // partially, and REFUSES the body-backed shapes with a named
+                    // reason rather than letting the request fall through to a
+                    // branch that would answer {} (#99).
+                    const bool coin_owned_query =
+                        (ep == "getblockchaininfo" || ep == "getbestblockhash"
+                         || ep == "getblockhash"   || ep == "getblockheader"
+                         || ep == "getblock"       || ep == "getrawtransaction");
+                    if (coin_owned_query && mining_interface_->has_coin_chain_query_fn()) {
                         rest_result = [&]() -> nlohmann::json {
                             nlohmann::json qp = nlohmann::json::array();
-                            if (ep == "getblockhash") {
+                            if (ep == "getblockheader" || ep == "getblock") {
+                                // hash, or height resolved through the same hook.
+                                std::string hash = getQueryParam("hash");
+                                if (hash.empty()) {
+                                    std::string h_str = getQueryParam("height");
+                                    if (!h_str.empty()) {
+                                        nlohmann::json hp = nlohmann::json::array();
+                                        try { hp.push_back(static_cast<uint32_t>(std::stoul(h_str))); }
+                                        catch (...) {
+                                            return nlohmann::json{
+                                                {"error", ep + " withheld: height parameter '"
+                                                          + h_str + "' is not a number "
+                                                          "(threshold: decimal height)"},
+                                                {"code", "BAD_PARAMS"},
+                                                {"method", ep}};
+                                        }
+                                        auto hj = mining_interface_->call_coin_chain_query(
+                                            "getblockhash", hp, chain);
+                                        if (hj.is_string()) hash = hj.get<std::string>();
+                                        else return hj;   // propagate the refusal verbatim
+                                    }
+                                }
+                                if (hash.empty())
+                                    return nlohmann::json{
+                                        {"error", ep + " withheld: neither ?hash= nor ?height= "
+                                                  "was supplied (threshold: one of them)"},
+                                        {"code", "BAD_PARAMS"},
+                                        {"method", ep}};
+                                qp.push_back(hash);
+                                if (ep == "getblock") {
+                                    auto vs = getQueryParam("verbosity");
+                                    if (vs.empty()) vs = getQueryParam("verbose");
+                                    if (!vs.empty()) {
+                                        if (vs == "true")       qp.push_back(1);
+                                        else if (vs == "false") qp.push_back(0);
+                                        else { try { qp.push_back(std::stoi(vs)); } catch (...) {} }
+                                    }
+                                } else {
+                                    auto vs = getQueryParam("verbose");
+                                    if (vs == "false") qp.push_back(false);
+                                }
+                            } else if (ep == "getrawtransaction") {
+                                qp.push_back(getQueryParam("txid"));
+                            } else if (ep == "getblockhash") {
                                 std::string height_str = getQueryParam("height");
                                 if (height_str.empty())
                                     return nlohmann::json{
                                         {"error", "getblockhash withheld: missing height "
-                                                  "parameter (threshold: ?height=<n> required)"}};
+                                                  "parameter (threshold: ?height=<n> required)"},
+                                        {"code", "BAD_PARAMS"},
+                                        {"method", ep}};
                                 try { qp.push_back(static_cast<uint32_t>(std::stoul(height_str))); }
                                 catch (...) {
                                     return nlohmann::json{
                                         {"error", "getblockhash withheld: height parameter '"
                                                   + height_str + "' is not a number "
-                                                  "(threshold: decimal height)"}};
+                                                  "(threshold: decimal height)"},
+                                        {"code", "BAD_PARAMS"},
+                                        {"method", ep}};
                                 }
                             }
                             return mining_interface_->call_coin_chain_query(ep, qp, chain);
@@ -917,8 +975,27 @@ void HttpSession::process_request()
                 }  // end static file serving else
             }  // end explorer/static dispatch
 
-            if (!rest_result.is_null())
+            if (!rest_result.is_null()) {
+                // ── CAPABILITY REFUSALS DO NOT SHIP AS 200 ────────────────────
+                // A refusal from a coin backend carries a stable `code` (see
+                // dash/coin/chain_rpc.hpp). Serving it as 200 would put it in
+                // the same status class as a real answer, which is precisely
+                // how an empty stub passed for data on this lane for months.
+                // 501 Not Implemented is a statement about THIS NODE ("we do
+                // not implement that"), as distinct from 404 ("that block does
+                // not exist"), which is a statement about the CHAIN. Callers
+                // act on those differently, so they must not share a status.
+                //
+                // The status is carried in the payload by the producer, so the
+                // transport can never disagree with the contract; a payload
+                // that omits it defaults to 501 whenever `code` is present.
+                if (rest_result.is_object() && rest_result.contains("code")) {
+                    int st = rest_result.value("http_status", 501);
+                    if (st < 400 || st > 599) st = 501;
+                    response.result(static_cast<http::status>(st));
+                }
                 response_body = rest_result.dump();
+            }
         }
         else if (request_.method() == http::verb::post) {
             // Handle JSON-RPC POST request.

@@ -54,6 +54,7 @@
 #include <ctime>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace dash {
 namespace coin {
@@ -166,6 +167,102 @@ struct Answer {
 /// The daemonless answer source, echoed on every response so a consumer can
 /// never confuse it with a real dashd reply.
 inline constexpr const char* SOURCE_TAG = "c2pool-embedded-header-chain";
+
+/// ── THE REFUSAL CONTRACT ────────────────────────────────────────────────────
+///
+/// An unwired seam in this tree used to answer with a well-formed EMPTY
+/// document under HTTP 200 (core's fallback stubs: web_server.cpp:2907 window,
+/// :3313 delta). That is why the DASH dashboard drew blank panels for months
+/// with no error in the UI, no line in the log and nothing red in CI. The
+/// lesson generalises:
+///
+///     ABSENCE OF DATA AND ABSENCE OF CAPABILITY ARE DIFFERENT ANSWERS
+///     AND MUST NEVER SHARE A REPRESENTATION.
+///
+/// "This block has no transactions we can show you" (empty) and "this node
+/// cannot show transactions at all" (incapable) look identical if both are
+/// `{"tx":[]}` with status 200. So a refusal here is built to be impossible to
+/// mistake for emptiness, by a machine AND by a human:
+///
+///   machine — HTTP 501 Not Implemented, plus a `code` field naming the
+///             missing capability as a stable enum. No successful answer in
+///             this file ever carries `code`, and no empty collection can
+///             synthesise one. A caller's whole check is:
+///                 if (status === 501 || body.code) -> capability refusal
+///             501 is chosen deliberately over 404: 404 means "that block does
+///             not exist", which is a statement about the CHAIN. 501 means
+///             "this node does not implement that", which is a statement about
+///             THIS NODE. Those are different facts and callers act on them
+///             differently.
+///
+///   human   — `error` is a sentence naming the blocking condition, what we DO
+///             retain, and the two concrete remedies. Never a bare "failed".
+///
+/// A partially-answerable query (getblock verbosity 1: we own every header
+/// field but not the transaction list) is NOT a refusal. It answers 200 with
+/// `partial: true` and lists each withheld field under `unavailable` with its
+/// reason — the same shape getblockchaininfo has always used. Critically the
+/// withheld fields are ABSENT, never emitted as `[]` or `0`: a consumer that
+/// blindly reads `result.tx.length` must throw, not silently render an empty
+/// transaction table. Emitting `tx: []` there would recreate the exact bug
+/// this contract exists to prevent.
+
+/// Stable machine-readable refusal codes. Additive only — callers match on
+/// these strings.
+inline constexpr const char* CODE_REQUIRES_BLOCK_BODIES = "REQUIRES_BLOCK_BODIES";
+inline constexpr const char* CODE_REQUIRES_TX_INDEX     = "REQUIRES_TX_INDEX";
+inline constexpr const char* CODE_UNKNOWN_METHOD        = "UNKNOWN_METHOD";
+inline constexpr const char* CODE_BAD_PARAMS            = "BAD_PARAMS";
+inline constexpr const char* CODE_CHAIN_STATE           = "CHAIN_STATE";
+
+/// What this node retains today. Emitted on every refusal so the answer is
+/// self-describing without the caller consulting docs.
+inline constexpr const char* RETAINED_HEADERS_ONLY = "headers-only";
+
+/// HTTP status a refusal must be served with. Kept here, next to the codes, so
+/// the transport cannot drift from the contract.
+inline constexpr int REFUSAL_HTTP_STATUS = 501;
+
+/// Build the refusal envelope. `remedies` names what would make the query
+/// answerable — the operator's product choice is explicit in the payload
+/// itself, not buried in documentation.
+inline nlohmann::json refusal(const std::string& method,
+                              const char*        code,
+                              const std::string& reason,
+                              std::vector<std::string> remedies = {})
+{
+    nlohmann::json r;
+    r["error"]              = reason;
+    // Retained for the callers of the original three queries, which already
+    // read this key.
+    r["unavailable_reason"] = reason;
+    r["code"]               = code;
+    r["method"]             = method;
+    r["source"]             = SOURCE_TAG;
+    r["retained"]           = RETAINED_HEADERS_ONLY;
+    r["http_status"]        = REFUSAL_HTTP_STATUS;
+    if (!remedies.empty()) r["requires"] = remedies;
+    return r;
+}
+
+/// The two ways an operator can make body-backed queries work. Symmetric by
+/// design: one costs an external process, the other costs disk.
+inline std::vector<std::string> body_remedies()
+{
+    return {"external-daemon-rpc", "archive-mode"};
+}
+
+/// Reason text shared by every body-requiring query, so the wording cannot
+/// drift between endpoints.
+inline std::string body_reason(const std::string& what)
+{
+    return what + " requires transaction bodies; this node retains block "
+                  "HEADERS ONLY (X11+DGW validated, genesis..tip). Replay "
+                  "streams every block body through the fold and prunes it "
+                  "immediately, so no body store exists. Remedies: connect an "
+                  "external daemon RPC, or enable archive mode to retain "
+                  "bodies (materially larger disk footprint).";
+}
 
 /// getbestblockhash. Answerable only while the chain is synced: the tip of a
 /// chain we know is behind is not the network best block, and returning it
@@ -325,6 +422,187 @@ inline nlohmann::json getblockchaininfo(const HeaderChain& hc,
     return r;
 }
 
+/// Header-level fields for one indexed entry, in dashd's getblockheader shape.
+/// Every field here is owned: it comes out of the stored IndexEntry, which was
+/// X11-PoW and DGW-validated before it was indexed.
+inline nlohmann::json header_fields(const HeaderChain& hc, const IndexEntry& e,
+                                    const SyncStatus& s)
+{
+    const auto& p = hc.params();
+    nlohmann::json r;
+    r["hash"]              = e.hash.GetHex();
+    r["height"]            = e.height;
+    r["version"]           = e.header.m_version;
+    r["versionHex"]        = hex8(static_cast<uint32_t>(e.header.m_version));
+    r["merkleroot"]        = e.header.m_merkle_root.GetHex();
+    r["time"]              = e.header.m_timestamp;
+    r["bits"]              = hex8(e.header.m_bits);
+    r["nonce"]             = e.header.m_nonce;
+    r["source"]            = SOURCE_TAG;
+    // confirmations counts against OUR tip, which is only the network tip when
+    // synced. Under a stale tip the number would overstate finality, so it is
+    // withheld rather than quietly computed from a tip we know is behind.
+    if (s.synced)
+        r["confirmations"] = static_cast<int64_t>(s.tip_height) - static_cast<int64_t>(e.height) + 1;
+
+    // Genesis has no predecessor; every other entry carries one.
+    if (!e.prev_hash.IsNull())
+        r["previousblockhash"] = e.prev_hash.GetHex();
+
+    // nextblockhash exists only if we hold the successor on the active branch.
+    if (auto nxt = hc.get_header_by_height(e.height + 1))
+        r["nextblockhash"] = nxt->hash.GetHex();
+
+    uint256 target = target_from_bits(e.header.m_bits);
+    if (!target.IsNull())
+        r["difficulty"] = p.pow_limit.getdouble() / target.getdouble();
+
+    return r;
+}
+
+/// Locate an entry by hash, with a refusal that distinguishes "we do not hold
+/// that height" from "no such block". Returns nullopt on failure and fills
+/// `out_refusal`.
+inline std::optional<IndexEntry> lookup_by_hash(const HeaderChain& hc,
+                                                const std::string& method,
+                                                const std::string& hash_hex,
+                                                nlohmann::json&    out_refusal)
+{
+    uint256 h;
+    if (hash_hex.size() != 64) {
+        out_refusal = refusal(method, CODE_BAD_PARAMS,
+                              method + " withheld: block hash '" + hash_hex
+                              + "' is not 64 hex characters (threshold: a "
+                                "64-char block hash)");
+        return std::nullopt;
+    }
+    h.SetHex(hash_hex);
+    auto e = hc.get_header(h);
+    if (e) return e;
+
+    // Not indexed. Say WHICH of the two reasons applies — an operator asking
+    // for a pre-anchor block needs a different action than one asking for a
+    // hash that is not on our chain at all.
+    auto anchor = first_indexed_height(hc);
+    out_refusal = refusal(
+        method, CODE_CHAIN_STATE,
+        method + " withheld: block " + hash_hex + " is not in our header index. "
+        "We index the active branch from height "
+        + (anchor ? std::to_string(*anchor) : std::string("n/a"))
+        + " to the tip; the hash is either below that anchor, on a branch we "
+          "did not follow, or not a Dash block.");
+    return std::nullopt;
+}
+
+/// getblockheader <hash>. FULLY answerable — a header chain is exactly the
+/// state this query names. verbose=false returns the serialised header hex.
+inline nlohmann::json getblockheader(const HeaderChain& hc,
+                                     const std::string& hash_hex,
+                                     bool verbose = true,
+                                     uint32_t now = now_unix())
+{
+    nlohmann::json ref;
+    auto e = lookup_by_hash(hc, "getblockheader", hash_hex, ref);
+    if (!e) return ref;
+
+    if (is_synthetic_anchor(*e))
+        return refusal("getblockheader", CODE_CHAIN_STATE,
+                       "getblockheader withheld: height " + std::to_string(e->height)
+                       + " is the synthetic anchor entry (bits=0, timestamp=0; no "
+                         "real header was ever connected there), so every field "
+                         "would be a fabricated zero (threshold: a real header)");
+
+    auto s = sync_status(hc, now);
+    if (!verbose) {
+        auto packed = pack(e->header);
+        auto span   = packed.get_span();   // std::span<const std::byte>
+        std::string out;
+        out.reserve(span.size() * 2);
+        static const char* HEX = "0123456789abcdef";
+        for (auto sb : span) {
+            const auto b = static_cast<unsigned char>(sb);
+            out += HEX[b >> 4];
+            out += HEX[b & 0x0f];
+        }
+        return nlohmann::json(out);
+    }
+    return header_fields(hc, *e, s);
+}
+
+/// getblock <hash> [verbosity].
+///
+///   verbosity 0 — the raw serialised BLOCK. Needs the body. REFUSED.
+///   verbosity 1 — header fields + the txid list. We own every header field
+///                 and none of the txid list, so this answers PARTIAL: owned
+///                 fields present, `tx`/`nTx`/`size`/`strippedsize` ABSENT and
+///                 named under `unavailable`. Never `tx: []`.
+///   verbosity 2 — header + fully decoded transactions. Needs bodies. REFUSED.
+///
+/// The merkle root commits to the transaction set but does not reveal it: no
+/// amount of header data can reconstruct a txid list, which is why verbosity 1
+/// cannot be completed rather than merely being unimplemented.
+inline nlohmann::json getblock(const HeaderChain& hc,
+                               const std::string& hash_hex,
+                               int verbosity = 1,
+                               uint32_t now = now_unix())
+{
+    if (verbosity <= 0)
+        return refusal("getblock", CODE_REQUIRES_BLOCK_BODIES,
+                       body_reason("getblock verbosity 0 (raw serialised block)"),
+                       body_remedies());
+    if (verbosity >= 2)
+        return refusal("getblock", CODE_REQUIRES_BLOCK_BODIES,
+                       body_reason("getblock verbosity 2 (decoded transactions)"),
+                       body_remedies());
+
+    nlohmann::json ref;
+    auto e = lookup_by_hash(hc, "getblock", hash_hex, ref);
+    if (!e) return ref;
+
+    if (is_synthetic_anchor(*e))
+        return refusal("getblock", CODE_CHAIN_STATE,
+                       "getblock withheld: height " + std::to_string(e->height)
+                       + " is the synthetic anchor entry (bits=0, timestamp=0); "
+                         "every header field would be a fabricated zero "
+                         "(threshold: a real header)");
+
+    auto s = sync_status(hc, now);
+    nlohmann::json r = header_fields(hc, *e, s);
+
+    // The honest half. These are ABSENT above, not zeroed, and each says why.
+    const std::string why = body_reason("the transaction list");
+    nlohmann::json unavailable = nlohmann::json::object();
+    for (const char* f : {"tx", "nTx", "size", "strippedsize", "weight"})
+        unavailable[f] = why;
+    r["unavailable"] = unavailable;
+    // The one flag a consumer must branch on before treating this like a
+    // daemon's getblock. Present ONLY when fields were withheld.
+    r["partial"] = true;
+    r["requires"] = body_remedies();
+    if (!s.synced) r["sync_blocked_by"] = s.blocked_by;
+    return r;
+}
+
+/// getrawtransaction <txid>. Doubly unanswerable: it needs the block body the
+/// transaction lives in AND a txid->block index to find which body that is.
+/// Both are named, because archive mode alone does not fix this one.
+inline nlohmann::json getrawtransaction(const std::string& txid)
+{
+    auto r = refusal(
+        "getrawtransaction", CODE_REQUIRES_BLOCK_BODIES,
+        "getrawtransaction withheld for txid '" + txid + "': this node retains "
+        "block HEADERS ONLY. Serving a transaction needs (1) the block body it "
+        "is in, which replay prunes immediately after folding, and (2) a "
+        "txid->block index, which is not built even in archive mode unless "
+        "transaction indexing is also enabled. Remedies: connect an external "
+        "daemon RPC, or enable archive mode WITH transaction indexing.",
+        {"external-daemon-rpc", "archive-mode+txindex"});
+    // Second code so a caller can tell this apart from a plain body refusal:
+    // enabling archive mode alone will NOT make this succeed.
+    r["also_requires"] = CODE_REQUIRES_TX_INDEX;
+    return r;
+}
+
 /// Single dispatch entry point for the three queries, shaped for the web
 /// server's coin-chain-query hook. Returns the bare dashd-compatible result on
 /// success; on refusal an object carrying the named blocking condition.
@@ -362,12 +640,42 @@ inline nlohmann::json chain_query(const HeaderChain& hc,
         return a.available ? a.value : refuse(a);
     }
 
-    return nlohmann::json{
-        {"error", std::string("method '") + method +
-                  "' is not answerable from the header chain (owned: "
-                  "getbestblockhash, getblockhash, getblockchaininfo)"},
-        {"method", method},
-        {"source", SOURCE_TAG}};
+    if (method == "getblockheader") {
+        if (!params.is_array() || params.empty() || !params[0].is_string())
+            return refusal(method, CODE_BAD_PARAMS,
+                           "getblockheader withheld: missing or non-string block "
+                           "hash (threshold: params[0] must be a 64-char hash)");
+        bool verbose = true;
+        if (params.size() > 1 && params[1].is_boolean()) verbose = params[1].get<bool>();
+        return getblockheader(hc, params[0].get<std::string>(), verbose, now);
+    }
+
+    if (method == "getblock") {
+        if (!params.is_array() || params.empty() || !params[0].is_string())
+            return refusal(method, CODE_BAD_PARAMS,
+                           "getblock withheld: missing or non-string block hash "
+                           "(threshold: params[0] must be a 64-char hash)");
+        int verbosity = 1;
+        if (params.size() > 1) {
+            if (params[1].is_number())       verbosity = params[1].get<int>();
+            else if (params[1].is_boolean()) verbosity = params[1].get<bool>() ? 1 : 0;
+        }
+        return getblock(hc, params[0].get<std::string>(), verbosity, now);
+    }
+
+    if (method == "getrawtransaction") {
+        std::string txid;
+        if (params.is_array() && !params.empty() && params[0].is_string())
+            txid = params[0].get<std::string>();
+        return getrawtransaction(txid);
+    }
+
+    return refusal(method, CODE_UNKNOWN_METHOD,
+                   std::string("method '") + method +
+                   "' is not answerable from the header chain (owned: "
+                   "getbestblockhash, getblockhash, getblockchaininfo, "
+                   "getblockheader, getblock[verbosity=1, partial]; refused with "
+                   "a named reason: getblock[verbosity 0|2], getrawtransaction)");
 }
 
 } // namespace chain_rpc
