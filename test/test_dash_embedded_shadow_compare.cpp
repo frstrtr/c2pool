@@ -352,3 +352,112 @@ TEST(DashShadowCompare, MatchingRootsWithDifferentTxSetsIsStillMatch) {
     EXPECT_EQ(o.kind, ShadowOutcome::Kind::Match);
     EXPECT_FALSE(o.served_mismatch);
 }
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE-1 MEMPOOL INGEST — the coverage measurement
+//
+// While dashd is present its template's tx set is a free, per-block answer key
+// for our own mempool. This is the gate for ever enabling
+// --embedded-serve-mempool-txs: a wrong tx set costs a whole block, a shadow
+// run costs nothing. The two directions are not symmetric — dashd-only is
+// revenue we are forfeiting, ours-only is a block we might lose.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace {
+// Attach a tx set to a WorkData the way the builder does: m_txs and
+// m_tx_hashes are PARALLEL, and shadow_tx_set_diff refuses to measure when
+// they are not (see the KAT below).
+void with_txs(DashWorkData& w, const std::vector<uint8_t>& seeds) {
+    w.m_txs.clear();
+    w.m_tx_hashes.clear();
+    for (uint8_t sd : seeds) {
+        MutableTransaction t;
+        t.version = 2;
+        w.m_txs.emplace_back(t);
+        w.m_tx_hashes.push_back(hashn(sd));
+    }
+}
+} // namespace
+
+TEST(DashShadowCompare, TxSetCoverageIsMeasuredAgainstDashd) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    // dashd has five; we ingested three of them.
+    with_txs(emb,  {1, 2, 3});
+    with_txs(dref, {1, 2, 3, 4, 5});
+
+    const auto d = shadow_tx_set_diff(emb, dref);
+    EXPECT_EQ(d.ours, 3u);
+    EXPECT_EQ(d.theirs, 5u);
+    EXPECT_EQ(d.both, 3u);
+    EXPECT_EQ(d.dashd_only, 2u);      // the fees we are still forfeiting
+    EXPECT_EQ(d.ours_only, 0u);       // the safe direction
+    EXPECT_TRUE(d.coverage_defined());
+    EXPECT_NEAR(d.coverage_pct(), 60.0, 1e-9);
+
+    const auto o = shadow_evaluate(WorkSource::Embedded, emb,
+                                   std::optional<DashWorkData>(dref));
+    EXPECT_TRUE(has_line_with(o.log_lines, "[SHADOW-TXSET]"));
+    EXPECT_TRUE(has_line_with(o.log_lines, "coverage=60%"));
+    EXPECT_TRUE(has_line_with(o.log_lines, "dashd_only=2"));
+    // The measurement is a DIAGNOSTIC: a coverage shortfall is not a mismatch.
+    EXPECT_FALSE(o.served_mismatch);
+}
+
+// The dangerous direction is called out in the line itself, because the
+// operator reads the line, not the struct.
+TEST(DashShadowCompare, TxWeHaveThatDashdDoesNotIsFlaggedLoudly) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    with_txs(emb,  {1, 2, 9});        // 9 is ours alone
+    with_txs(dref, {1, 2, 3});
+
+    const auto d = shadow_tx_set_diff(emb, dref);
+    EXPECT_EQ(d.ours_only, 1u);
+    EXPECT_EQ(d.dashd_only, 1u);
+
+    const auto o = shadow_evaluate(WorkSource::Embedded, emb,
+                                   std::optional<DashWorkData>(dref));
+    EXPECT_TRUE(has_line_with(o.log_lines, "ours_only=1"));
+    EXPECT_TRUE(has_line_with(o.log_lines, "OURS-ONLY"));
+    EXPECT_TRUE(has_line_with(o.log_lines,
+                              "do NOT enable --embedded-serve-mempool-txs"));
+}
+
+// A coinbase-only dashd template means there was no fee to capture at this
+// height. Reporting that as 0% coverage would slander a working ingest lane,
+// so coverage is UNDEFINED, and the line says so.
+TEST(DashShadowCompare, CoverageIsUndefinedWhenDashdHadNoTxsEither) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+
+    const auto d = shadow_tx_set_diff(emb, dref);
+    EXPECT_EQ(d.theirs, 0u);
+    EXPECT_FALSE(d.coverage_defined());
+    EXPECT_EQ(d.dashd_only, 0u);
+
+    const auto o = shadow_evaluate(WorkSource::Embedded, emb,
+                                   std::optional<DashWorkData>(dref));
+    EXPECT_TRUE(has_line_with(o.log_lines, "coverage=n/a"));
+}
+
+// An unaligned WorkData must produce NO measurement rather than a fabricated
+// one. A wrong number here would be read as evidence and acted on.
+TEST(DashShadowCompare, UnalignedTxHashesMeasureNothingRatherThanGuess) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    with_txs(dref, {1, 2, 3});
+    with_txs(emb,  {1, 2, 3});
+    emb.m_tx_hashes.pop_back();       // parallel vectors no longer aligned
+
+    const auto d = shadow_tx_set_diff(emb, dref);
+    EXPECT_EQ(d.ours, 0u) << "an unaligned tx set must not be measured";
+    EXPECT_EQ(d.ours_only, 0u)
+        << "and must never manufacture the dangerous direction";
+    EXPECT_EQ(d.theirs, 3u);
+    EXPECT_EQ(d.dashd_only, 3u);
+}

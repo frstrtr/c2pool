@@ -110,6 +110,66 @@ struct ShadowFieldDiff {
     bool        commitment{false};
     bool        modulo_mempool_protx{false};
 };
+/// ── THE MEMPOOL COVERAGE MEASUREMENT (phase-1 mempool ingest) ────────────
+///
+/// While dashd is still present, its template's tx set is a free, per-block
+/// answer key for our own mempool. This is the cheapest possible proof that
+/// our ingest is working and, more importantly, the gate for ever turning
+/// --embedded-serve-mempool-txs on: a wrong tx set costs a whole block, and a
+/// shadow run costs nothing.
+///
+/// The two directions are NOT symmetric:
+///   * dashd-only  — transactions dashd had and we did not. Pure REVENUE loss;
+///     the coverage number the whole mempool project is trying to move.
+///   * ours-only   — transactions WE selected and dashd did not. The dangerous
+///     direction: it means we would have built a block on something dashd's
+///     mempool rejected, did not know about, or had already seen conflict. Any
+///     sustained non-zero here BLOCKS enabling the serve flag.
+/// Diagnostic only — nothing in the served decision reads this.
+struct ShadowTxSetDiff
+{
+    size_t ours{0};
+    size_t theirs{0};
+    size_t both{0};
+    size_t dashd_only{0};   // revenue we are leaving on the table
+    size_t ours_only{0};    // the dangerous direction
+    /// theirs == 0 means dashd's own template was coinbase-only: there was no
+    /// fee to capture at this height, so the coverage ratio is undefined
+    /// rather than 0% (counting it as a miss would slander the ingest lane).
+    bool coverage_defined() const { return theirs != 0; }
+    double coverage_pct() const
+    {
+        return coverage_defined() ? (100.0 * static_cast<double>(both)
+                                     / static_cast<double>(theirs)) : 0.0;
+    }
+};
+
+inline ShadowTxSetDiff shadow_tx_set_diff(const DashWorkData& embedded,
+                                          const DashWorkData& dashd)
+{
+    auto ids = [](const DashWorkData& w) {
+        std::set<std::string> out;
+        // Identify by txid when the parallel hash vector is aligned. When it is
+        // not, report EMPTY rather than guessing: an unaligned WorkData would
+        // otherwise manufacture a coverage number out of nothing, and a
+        // fabricated measurement is worse than a missing one.
+        if (w.m_tx_hashes.size() != w.m_txs.size()) return out;
+        for (const auto& h : w.m_tx_hashes) out.insert(h.GetHex());
+        return out;
+    };
+    const auto e = ids(embedded);
+    const auto d = ids(dashd);
+    ShadowTxSetDiff r;
+    r.ours = e.size();
+    r.theirs = d.size();
+    for (const auto& t : e) {
+        if (d.count(t)) ++r.both; else ++r.ours_only;
+    }
+    r.dashd_only = r.theirs - r.both;
+    return r;
+}
+
+
 
 /// The verdict for one served height. MatchModuloMempoolProTx is the benign
 /// verdict for "every divergence is the tx-set-dependent merkleRootMNList case"
@@ -124,6 +184,9 @@ struct ShadowOutcome {
     std::string                 no_oracle_reason;
     std::vector<ShadowFieldDiff> diffs;          // diverging fields only
     bool                        served_mismatch{false}; // served && a commitment field diverged
+    /// Mempool coverage vs dashd for this height (phase-1 ingest measurement).
+    /// Zeroed on the no-oracle paths, where there is nothing to compare.
+    ShadowTxSetDiff             tx_set;
     std::vector<std::string>    log_lines;        // the [SHADOW] lines, ready to emit
 };
 
@@ -233,6 +296,27 @@ inline ShadowOutcome shadow_evaluate(WorkSource source,
         o.log_lines.push_back("[SHADOW] h=" + std::to_string(o.height)
                               + " no-oracle reason=" + o.no_oracle_reason);
         return o;
+    }
+
+    // ── MEMPOOL COVERAGE, measured against dashd's own set ───────────────
+    // Emitted for every compared height, whether or not anything diverges:
+    // the number only means something as a series.
+    o.tx_set = shadow_tx_set_diff(embedded, dashd);
+    {
+        std::string l = "[SHADOW-TXSET] h=" + std::to_string(o.height)
+                      + " ours=" + std::to_string(o.tx_set.ours)
+                      + " dashd=" + std::to_string(o.tx_set.theirs)
+                      + " both=" + std::to_string(o.tx_set.both)
+                      + " dashd_only=" + std::to_string(o.tx_set.dashd_only)
+                      + " ours_only=" + std::to_string(o.tx_set.ours_only);
+        l += o.tx_set.coverage_defined()
+                 ? " coverage=" + std::to_string(
+                       static_cast<int>(o.tx_set.coverage_pct() + 0.5)) + "%"
+                 : " coverage=n/a(dashd-template-was-coinbase-only)";
+        if (o.tx_set.ours_only)
+            l += " ⚠ OURS-ONLY txs present — do NOT enable"
+                 " --embedded-serve-mempool-txs until this is zero";
+        o.log_lines.push_back(std::move(l));
     }
 
     auto add = [&](const char* field, bool commitment,

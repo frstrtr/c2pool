@@ -630,6 +630,48 @@ private:
     // Collapses the N-peer inv fan-in to one getdata. Bounded + expiring.
     InvDedup m_inv_dedup;
 
+    /// Reclaim tx-pull slots whose getdata was never answered. Without this a
+    /// peer that goes quiet after announcing permanently consumes the budget.
+    void expire_tx_pulls(int64_t now)
+    {
+        for (auto it = m_tx_pull_inflight.begin(); it != m_tx_pull_inflight.end(); ) {
+            if (now - it->second > TX_PULL_TIMEOUT_SEC) {
+                it = m_tx_pull_inflight.erase(it);
+                ++m_tx_pull_expired;
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // ── MEMPOOL INGEST (phase 1): the MSG_TX pull ────────────────────────
+    // The whole reason every embedded template is EMPTY. inv_type_is_pulled()
+    // admits quorum_final_commitment and clsig only, so a peer's inv(MSG_TX)
+    // was dropped without a getdata, the `tx` handler below never fired, and
+    // Mempool::add_tx was unreachable FROM THE NETWORK. Everything downstream
+    // of that handler already exists (#1110).
+    //
+    // Not simply added to inv_type_is_pulled: tx invs arrive orders of
+    // magnitude more often than blocks or clsigs, so an unbudgeted pull lets
+    // a peer make us getdata-flood ourselves. This lane is therefore:
+    //   * OPT-IN                (m_tx_pull_enabled, --embedded-mempool-ingest)
+    //   * BUDGETED              (m_tx_pull_inflight_cap outstanding at once)
+    //   * STRICTLY LOWER PRIORITY than the tip body — no tx getdata is issued
+    //     while a tracked block body is outstanding, the same invariant the
+    //     bulk-fetch lane observes.
+    // In-flight slots expire on their own (TX_PULL_TIMEOUT_SEC) so a peer that
+    // answers a getdata with silence cannot wedge the budget.
+    static constexpr int64_t TX_PULL_TIMEOUT_SEC = 60;
+    bool     m_tx_pull_enabled{false};
+    size_t   m_tx_pull_inflight_cap{64};
+    std::map<uint256, int64_t> m_tx_pull_inflight;   // txid -> requested-at
+    uint64_t m_tx_inv_seen{0};       // inv(MSG_TX) admitted by the dedup
+    uint64_t m_tx_pull_sent{0};      // getdata(MSG_TX) issued
+    uint64_t m_tx_pull_skipped_budget{0};
+    uint64_t m_tx_pull_skipped_busy{0};
+    uint64_t m_tx_received{0};       // tx bodies that arrived
+    uint64_t m_tx_pull_expired{0};   // getdata that never got an answer
+
     // ── SPORK listener (state + telemetry ONLY — nothing gates on it) ────
     // Seeded with the assume-active mainnet defaults (7/7 active, matching
     // dashd's hardened mainnet spork values), refined by VERIFIED spork
@@ -1279,6 +1321,36 @@ public:
         auto msg = message_mempool::make_raw();
         m_primary->write(msg);
     }
+
+    /// Arm the MSG_TX pull (phase-1 mempool ingest). OFF by default: turning it
+    /// on changes what this node asks its peers for, so it is an explicit
+    /// operator decision (--embedded-mempool-ingest), not a side effect of
+    /// running a newer build. `cap` bounds outstanding tx getdata.
+    void set_tx_pull(bool on, size_t cap = 64)
+    {
+        m_tx_pull_enabled      = on;
+        m_tx_pull_inflight_cap = cap ? cap : 1;
+        if (!on) m_tx_pull_inflight.clear();
+    }
+    bool tx_pull_enabled() const { return m_tx_pull_enabled; }
+
+    /// One greppable line: what the ingest lane asked for and what it got.
+    /// received < pull_sent is normal (notfound, races, peers that drop);
+    /// received == 0 with pull_sent > 0 for a sustained period is the
+    /// signature of a peer set that will not serve us transactions.
+    std::string tx_ingest_status() const
+    {
+        return "[MEMPOOL-INGEST] tx_inv=" + std::to_string(m_tx_inv_seen)
+             + " getdata=" + std::to_string(m_tx_pull_sent)
+             + " received=" + std::to_string(m_tx_received)
+             + " inflight=" + std::to_string(m_tx_pull_inflight.size())
+             + "/" + std::to_string(m_tx_pull_inflight_cap)
+             + " skipped(budget)=" + std::to_string(m_tx_pull_skipped_budget)
+             + " skipped(tip-body-busy)=" + std::to_string(m_tx_pull_skipped_busy)
+             + " expired=" + std::to_string(m_tx_pull_expired);
+    }
+    uint64_t tx_received_count() const { return m_tx_received; }
+    size_t   tx_pull_inflight()  const { return m_tx_pull_inflight.size(); }
 
     /// Request a full block via plain MSG_BLOCK getdata (E2 pull seam).
     /// Routed to the peer that ANNOUNCED this block (block_source), which holds
@@ -2164,7 +2236,9 @@ private:
         {
             const bool pulled = inv_type_is_pulled(inv.m_type);
             const bool is_block = (inv.base_type() == inventory_type::block);
-            if (!pulled && !is_block)
+            const bool is_tx = (inv.base_type() == inventory_type::tx)
+                            && m_tx_pull_enabled;
+            if (!pulled && !is_block && !is_tx)
                 continue;   // not actionable — do not spend a dedup slot on it
             if (!m_inv_dedup.admit(static_cast<uint32_t>(inv.m_type), inv.m_hash, now))
             {
@@ -2201,6 +2275,29 @@ private:
                 p->write(getdata_msg);
                 continue;
             }
+            if (is_tx)
+            {
+                ++m_tx_inv_seen;
+                expire_tx_pulls(now);
+                // STRICT PRIORITY: the tip body always wins. A transaction is
+                // worth a fraction of a block's fees; a late tip body is a
+                // stale template on every attached rig.
+                if (!m_pending_bodies.empty()) {
+                    ++m_tx_pull_skipped_busy;
+                    continue;
+                }
+                if (m_tx_pull_inflight.size() >= m_tx_pull_inflight_cap) {
+                    ++m_tx_pull_skipped_budget;
+                    continue;
+                }
+                if (m_tx_pull_inflight.count(inv.m_hash)) continue;
+                m_tx_pull_inflight.emplace(inv.m_hash, now);
+                ++m_tx_pull_sent;
+                auto getdata_msg = message_getdata::make_raw(
+                    {inventory_type(inventory_type::tx, inv.m_hash)});
+                p->write(getdata_msg);
+                continue;
+            }
             LOG_INFO << "[" << m_chain_label << "] block inv "
                      << inv.m_hash.GetHex().substr(0, 16) << "... from " << p->key;
             // Remember WHO announced it: the body/headers pull the new_block
@@ -2213,6 +2310,22 @@ private:
 
     ADD_P2P_HANDLER(tx)
     {
+        ++m_tx_received;
+        // Release the budget slot. The txid is the SHA256d of the serialized
+        // body; computing it here (rather than trusting the announcement we
+        // asked for) means an unsolicited or substituted body cannot free a
+        // slot it never occupied.
+        {
+            ::PackStream ps;
+            ps << msg->m_tx;
+            auto sp = ps.get_span();
+            uint256 txid;
+            CHash256()
+                .Write(std::span<const unsigned char>(
+                    reinterpret_cast<const unsigned char*>(sp.data()), sp.size()))
+                .Finalize(std::span<unsigned char>(txid.data(), 32));
+            m_tx_pull_inflight.erase(txid);
+        }
         m_coin->new_tx.happened(Transaction(msg->m_tx));
     }
 
