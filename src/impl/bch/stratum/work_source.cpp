@@ -367,6 +367,12 @@ void BCHWorkSource::set_donation_script(std::vector<unsigned char> script)
     donation_script_ = std::move(script);
 }
 
+void BCHWorkSource::set_on_found_block_fn(OnFoundBlockFn fn)
+{
+    std::lock_guard<std::mutex> lk(callback_mutex_);
+    on_found_block_fn_ = std::move(fn);
+}
+
 // -- slice-d: share-WRITE / validation hot path (SHA256d, non-SegWit) ---------
 
 core::stratum::CoinbaseResult BCHWorkSource::build_connection_coinbase(
@@ -775,6 +781,23 @@ nlohmann::json BCHWorkSource::mining_submit(
         } else {
             LOG_ERROR << "[BCH-STRATUM-BLOCK] no submit_block_fn wired -- WON BLOCK height="
                       << height << " not broadcast -- lost subsidy!";
+        }
+
+        // Found-block telemetry sink (#995 BCH arm): record the won block to the
+        // operator dashboard + arm the confirm/orphan poller. STRICTLY DOWNSTREAM
+        // of the submit above -- a throw here can never affect the broadcast, and
+        // it is skipped entirely when no sink is wired. pow_hash == SHA256d(header)
+        // == the BCH block id.
+        {
+            OnFoundBlockFn found_sink;
+            { std::lock_guard<std::mutex> lk(callback_mutex_); found_sink = on_found_block_fn_; }
+            if (found_sink) {
+                try { found_sink(height, pow_hash, username, reached_network); }
+                catch (const std::exception& e) {
+                    LOG_WARNING << "[BCH-STRATUM-BLOCK] on_found_block sink threw: "
+                                << e.what() << " (telemetry only; block already dispatched)";
+                }
+            }
         }
 
         // #887: the won block is a SHARE too. The dispatch above has already

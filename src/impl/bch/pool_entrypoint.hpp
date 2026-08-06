@@ -58,6 +58,7 @@
 #include "share_check.hpp"      // bch::create_local_share (transitive via node.hpp)
 #include "share_types.hpp"      // bch::StaleInfo
 #include "coin/block.hpp"       // bch::coin::SmallBlockHeaderType
+#include "coin/block_confirm.hpp" // #995 BCH arm: found-block confirm/orphan resolver
 
 #include <core/pack_types.hpp>    // BaseScript
 
@@ -66,6 +67,9 @@
 #include <core/web_server.hpp>       // H-STATS.944: operator dashboard + graph_db persist
 #include <core/filesystem.hpp>      // config_path() for the graph_db location
 #include <functional>
+#include <ctime>       // std::time (found-block record timestamp)
+#include <limits>       // std::numeric_limits (RPC-fallback sentinel)
+#include <optional>     // std::optional (winner_at oracle)
 
 #include <btclibs/util/strencodings.h>   // HexStr
 
@@ -692,6 +696,87 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
                 {"pool_hashrate", s.pool_hashrate},
             };
         });
+
+        // ââ Found-block verifier: confirm/orphan a won block vs the chain ââ
+        // #995 BCH arm. Before this a BCH won block was recorded "pending"
+        // forever and an orphan (the class that lost DASH block 2508008) surfaced
+        // only to humans. Two halves, BOTH TELEMETRY-ONLY and strictly downstream
+        // of the block submit -- neither gates broadcast, mint, target or payout:
+        //   (a) record + arm: when BCHWorkSource dispatches a won block, record it
+        //       to /recent_blocks and arm the confirm/orphan poller.
+        //   (b) verdict fn: resolve confirm/orphan daemonless-first off the
+        //       embedded HeaderChain (authoritative best branch), with the
+        //       always-retained BCHN-RPC getblockheader confirmations as fallback.
+        work_source->set_on_found_block_fn(
+            [mi](uint32_t height, const uint256& block_hash,
+                 const std::string& miner, bool reached_network) {
+                const double pool_hr = mi->get_local_hashrate();
+                uint64_t     subsidy = 0;
+                auto tmpl = mi->get_current_work_template();
+                if (!tmpl.is_null() && tmpl.contains("coinbasevalue"))
+                    subsidy = tmpl["coinbasevalue"].get<uint64_t>();
+                const std::string hash_hex = block_hash.GetHex();
+                mi->record_found_block(
+                    height, block_hash,
+                    static_cast<uint64_t>(std::time(nullptr)),
+                    "BCH", miner, hash_hex,
+                    mi->get_network_difficulty(),
+                    /*share_difficulty=*/0.0, pool_hr, subsidy);
+                mi->schedule_block_verification(hash_hex);
+                if (!reached_network)
+                    LOG_WARNING << "[BCH-POOL] recorded found block height=" << height
+                                << " that reached NO network sink";
+            });
+
+        mi->set_block_verify_fn(
+            [mi, &daemon](const std::string& hash_hex) -> int {
+                uint256 h; h.SetHex(hash_hex);
+                auto& hc = daemon.chain();
+
+                // found_height: authoritative from our own found-block record
+                // (survives an orphan whose header peers never relayed to us);
+                // else recovered from the embedded header chain.
+                uint32_t found_height = 0;
+                bool     have_height  = false;
+                for (const auto& b : mi->get_found_blocks()) {
+                    if (b.hash == hash_hex) {
+                        found_height = static_cast<uint32_t>(b.height);
+                        have_height  = true;
+                        break;
+                    }
+                }
+                if (!have_height) {
+                    if (auto e = hc.get_header(h)) {
+                        found_height = e->height;
+                        have_height  = true;
+                    }
+                }
+
+                if (have_height) {
+                    auto winner_at = [&hc](uint32_t hh) -> std::optional<uint256> {
+                        if (auto e = hc.get_header_by_height(hh)) return e->block_hash;
+                        return std::nullopt;
+                    };
+                    int v = coin::block_confirm::resolve_status(
+                        winner_at, hc.height(), h, found_height);
+                    // Daemonless-first: trust a definite confirmed/orphaned verdict.
+                    // A 0 (pending) with the header chain ALREADY past found_height
+                    // is a genuine shallow-pending; only fall through to RPC when
+                    // the header chain has not yet reached the height.
+                    if (v != 0) return v;
+                    if (hc.height() >= found_height) return 0;
+                }
+
+                // Fallback arm (header chain absent or behind): external BCHN-RPC
+                // getblockheader confirmations. c < 0 => off the best chain.
+                int c = daemon.rpc_block_confirmations(h);
+                if (c != std::numeric_limits<int>::min()) {
+                    if (c < 0) return -1;
+                    if (c >= static_cast<int>(coin::block_confirm::kDefaultConfirmDepth))
+                        return c;
+                }
+                return 0; // still pending
+            });
 
         // graph_db stats persistence -- survives restarts (LTC-parity site 2/3;
         // mirrors main_ltc.cpp:1967-1973). BCH-namespaced sub-dir keeps the
