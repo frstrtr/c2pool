@@ -12,15 +12,25 @@
 // exact predicate + call; the "unwired" pass omits it (the perturbation the
 // integrator asked for) and is asserted to grow past the cap. Green = bounded;
 // the unwired control proves the assertion can actually fail.
-#include <gtest/gtest.h>
+//
+// Harness posture matches the sibling bch ABLA-seam tests: plain main() +
+// CHECK() over <core/*> headers, NO GTest (the bch test tree has no GTest
+// harness -- CMakeLists BCH_ABLA_TESTS builds bare add_executable targets).
+// p2pool-merged-v36 surface: NONE (local tx-forward cache hygiene).
 
+#include <cstdint>
 #include <deque>
+#include <iostream>
 #include <map>
 
 #include <core/known_txs_eviction.hpp>
 #include <core/uint256.hpp>
 
 namespace {
+
+int failures = 0;
+#define CHECK(cond) do { if (!(cond)) { \
+    std::cerr << "FAIL: " #cond " @ line " << __LINE__ << "\n"; ++failures; } } while (0)
 
 uint256 H(uint64_t i) { return uint256(i); }
 
@@ -41,11 +51,9 @@ void clean_pass_wired(std::map<uint256, int>& m, std::deque<uint256>& order,
 // i.e. the pre-fix behaviour where the only caller was dead code.
 void clean_pass_unwired(std::map<uint256, int>&, std::deque<uint256>&, size_t) {}
 
-} // namespace
-
 // Green: sustained over-cap learning + periodic clean passes keeps the cache
 // bounded at the cap, and the survivors are the most-recently-learned txs.
-TEST(BchKnownTxsEvictWiring, LivePassKeepsCacheBounded) {
+void live_pass_keeps_cache_bounded() {
     std::map<uint256, int> m;
     std::deque<uint256> order;
     constexpr size_t cap = 16;
@@ -54,19 +62,19 @@ TEST(BchKnownTxsEvictWiring, LivePassKeepsCacheBounded) {
     for (int round = 0; round < 50; ++round) {
         for (int k = 0; k < 100; ++k) learn(m, order, next++);  // 100 new txs
         clean_pass_wired(m, order, cap);                        // periodic clean
-        ASSERT_LE(m.size(), cap) << "cap breached after round " << round;
-        ASSERT_EQ(order.size(), m.size()) << "recency sidecar desynced";
+        CHECK(m.size() <= cap);          // cap breached this round
+        CHECK(order.size() == m.size()); // recency sidecar desynced
     }
     // Bounded exactly at the cap, holding the most-recent `cap` learns.
-    EXPECT_EQ(m.size(), cap);
+    CHECK(m.size() == cap);
     for (uint64_t i = next - cap; i < next; ++i)
-        EXPECT_TRUE(m.contains(H(i))) << "recent tx " << i << " should survive";
-    EXPECT_FALSE(m.contains(H(next - cap - 1))) << "stale tx must be evicted";
+        CHECK(m.contains(H(i)));         // recent tx should survive
+    CHECK(!m.contains(H(next - cap - 1))); // stale tx must be evicted
 }
 
 // Red control: perturb the wiring out and the cache grows without bound past
-// the cap — proving the LivePassKeepsCacheBounded assertion has real teeth.
-TEST(BchKnownTxsEvictWiring, UnwiredPassGrowsPastCap) {
+// the cap -- proving the live_pass_keeps_cache_bounded assertion has real teeth.
+void unwired_pass_grows_past_cap() {
     std::map<uint256, int> m;
     std::deque<uint256> order;
     constexpr size_t cap = 16;
@@ -76,6 +84,20 @@ TEST(BchKnownTxsEvictWiring, UnwiredPassGrowsPastCap) {
         for (int k = 0; k < 100; ++k) learn(m, order, next++);
         clean_pass_unwired(m, order, cap);
     }
-    EXPECT_GT(m.size(), cap) << "unwired pass must leak past the cap";
-    EXPECT_EQ(m.size(), 5000u);
+    CHECK(m.size() > cap);        // unwired pass must leak past the cap
+    CHECK(m.size() == 5000u);
+}
+
+} // namespace
+
+int main() {
+    live_pass_keeps_cache_bounded();
+    unwired_pass_grows_past_cap();
+
+    if (failures == 0) {
+        std::cout << "known_txs_evict_wiring_test: ALL PASS\n";
+        return 0;
+    }
+    std::cerr << "known_txs_evict_wiring_test: " << failures << " FAILURE(S)\n";
+    return 1;
 }
