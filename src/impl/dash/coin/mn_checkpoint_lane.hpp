@@ -1717,6 +1717,35 @@ public:
         m_snapshot_hash    = *hash;
         m_snapshot_height  = height;
         m_snapshot_waits   = 0;
+        // ── EVERY pause drops its in-flight bodies, so EVERY resume must
+        // re-request from the cursor (task #103; found measuring #1151's
+        // baseline). on_block_connected() returns early while
+        // m_snapshot_pending is set, so whatever getdata was outstanding when
+        // this fold paused is answered into the void. The resume paths call
+        // request_window(), but with this flag clear that computes
+        // from = m_requested_through + 1 — PAST the end of the already-
+        // requested window — and issues ZERO getdata. The bridge then sits
+        // idle until the next tip change (~2.5 min mainnet), once per fold:
+        // measured 4m16s, 5m34s, then 16m25s of dead gap on a cold bridge —
+        // 26 of its first 28 minutes doing nothing, against a fetch lane that
+        // moves at ~190 blk/s.
+        //
+        // The BAN-STATE PROBE path already sets this flag for itself, with a
+        // comment naming this exact failure ("the bridge would sit on the
+        // stall probe until the next tip change"); it was the ONE pause path
+        // that did, because it uniquely re-consumes a block it already folded.
+        // But the dropped-getdata half applies to ALL pauses, so the flag
+        // belongs to the pause itself, not to one caller. One flag set per
+        // pause, consumed once by the next request_window() (which resets it),
+        // and re-requesting a body we already hold is harmless — apply_block
+        // skips heights != m_next. No storm: a pause re-arms exactly once.
+        //
+        // SET BEFORE m_request_snapshot below, for the same reason the probe
+        // sets its latch first: the request may be answered INLINE (ordered
+        // stream / same-thread demux), in which case on_historical_snapshot()
+        // resumes and calls request_window() before begin_fold() returns —
+        // and that resume must already see the flag.
+        m_rerequest_from_cursor = true;
         LOG_INFO << "[MN-CKPT] "
                  << (!why.empty()
                          ? why

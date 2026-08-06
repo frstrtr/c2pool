@@ -3364,6 +3364,108 @@ struct DirtyBridge {
 
 } // namespace
 
+// ═══════════════════════════════════════════════════════════════════════════
+// TASK #103 — EVERY pause must re-arm the request window, not just the probe
+//
+// MEASURED (cold MN-CKPT bridge, found while baselining #1151): the bulk
+// fetch runs at ~190 blk/s, but the bridge's wall clock was dead gaps AFTER
+// FOLDS — 4m16s, 5m34s, then 16m25s; 26 of the first 28 minutes doing
+// nothing. Mechanism: a fold pauses the replay, on_block_connected drops
+// every in-flight body while paused, and the resume's request_window()
+// computes from = m_requested_through + 1 — PAST end — so it issues ZERO
+// getdata and the bridge waits for the next tip change (~2.5 min), once per
+// fold. The BAN-STATE PROBE path already set m_rerequest_from_cursor for
+// itself, with a comment naming this exact failure; begin_fold() and
+// begin_ondemand_fold() did not, and they are the pauses a cold bridge
+// actually takes.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashMnCheckpointPoseFold, ResumeAfterAFoldReRequestsTheDroppedWindow)
+{
+    constexpr uint32_t kAnchorH = 2513000;
+    constexpr uint32_t kTip     = 2513010;
+    const uint256 anchor_hash = uint256S(kAnchorHash);
+    const auto cp = synthetic_anchor(64, kAnchorH, anchor_hash);
+
+    // Nobody banned: this test is about scheduling, not adjudication.
+    std::vector<std::pair<uint256, bool>> attest;
+    for (const auto& e : cp.entries) attest.emplace_back(e.first, true);
+
+    SnapshotRig rig;
+    rig.attest = attest;
+    rig.install(kAnchorH, kTip, anchor_hash);
+    rig.by_height[kAnchorH] = make_snapshot(anchor_hash, kAnchorH, attest);
+    // The queue runs rank 0, 1, 2, ... — each block pays the next head.
+    for (uint32_t bh = kAnchorH + 1; bh <= kTip; ++bh)
+        rig.h.blocks[bh] = block_paying(
+            cp.entries[bh - (kAnchorH + 1)].second.scriptPayout.m_data);
+
+    // PRODUCTION SHAPE: bodies are requested but arrive ASYNCHRONOUSLY.
+    // auto_deliver=false records the getdata without answering, which is
+    // exactly the state a paused fold drops on the floor. Snapshot replies
+    // stay inline (rig.answer=true) — the ordered-stream case the flag's
+    // set-before-request ordering exists for.
+    rig.h.auto_deliver = false;
+    rig.h.lane.set_fold_interval(4);      // fold point at cursor 2513004
+
+    rig.h.lane.arm(cp);
+    rig.h.lane.pump();
+    ASSERT_EQ(rig.h.lane.state(), MnCheckpointLane::State::Bridging)
+        << rig.h.lane.status();
+    // The window was requested up front: anchor+1 .. tip (tip < kWindow away).
+    ASSERT_FALSE(rig.h.requested.empty());
+    ASSERT_EQ(rig.h.lane.requested_through(), kTip);
+
+    // Deliver bodies up to the fold point. At 2513004 the lane pauses,
+    // requests the list AS OF 2513004, is answered inline, folds, and
+    // RESUMES. The bodies for 2513005..kTip were requested before the pause
+    // and (auto_deliver=false) never arrived — in production they were
+    // dropped by the paused on_block_connected.
+    rig.h.requested.clear();
+    for (uint32_t bh = kAnchorH + 1; bh <= kAnchorH + 4; ++bh)
+        rig.h.lane.on_block_connected(rig.h.blocks[bh], bh);
+    ASSERT_FALSE(rig.h.lane.snapshot_pending())
+        << "the inline snapshot answer must have resolved the fold";
+    ASSERT_EQ(rig.h.lane.folds_applied(), 2u)   // anchor fold + h=2513004
+        << rig.h.lane.status();
+    ASSERT_EQ(rig.h.lane.cursor_height(), kAnchorH + 4)
+        << "cursor_height() is the LAST FOLDED height; the next block the"
+           " bridge needs is +5";
+
+    // ── THE DEFECT. On master the resume issues ZERO getdata (from =
+    // requested_through + 1 = kTip + 1 > end) and the bridge sits until the
+    // next tip change — ~2.5 minutes per fold, 26 of a cold bridge's first
+    // 28 minutes. Fixed, the resume re-requests from the cursor.
+    std::vector<uint32_t> rerequested = rig.h.requested;
+    ASSERT_FALSE(rerequested.empty())
+        << "resume after a fold issued no getdata: the in-flight bodies were"
+           " dropped by the pause and nothing will ever re-request them —"
+           " the bridge is dead until the next tip change";
+    EXPECT_EQ(rerequested.front(), kAnchorH + 5)
+        << "the re-request must start at the cursor, where the dropped"
+           " window began";
+    EXPECT_EQ(rerequested.back(), kTip);
+
+    // ── NO STORM. The flag is consumed by the ONE re-request pass of the
+    // resume. The next request_window on the ordinary post-apply path (the
+    // end of on_block_connected) must issue NOTHING new: from returns to
+    // requested_through+1, past end. (pump()'s stall detector re-arms per
+    // STALL at tip-change cadence — that is its pre-existing job and is not
+    // exercised here; this asserts the pause's own flag does not linger.)
+    rig.h.requested.clear();
+    rig.h.lane.on_block_connected(rig.h.blocks[kAnchorH + 5], kAnchorH + 5);
+    EXPECT_TRUE(rig.h.requested.empty())
+        << "the resume's re-arm must be one-shot: an ordinary block apply"
+           " after it must not re-request the window again";
+
+    // The bridge still completes: deliver the rest of the tail and publish.
+    for (uint32_t bh = kAnchorH + 6; bh <= kTip; ++bh)
+        rig.h.lane.on_block_connected(rig.h.blocks[bh], bh);
+    EXPECT_TRUE(rig.h.published)
+        << rig.h.lane.status();
+    EXPECT_EQ(rig.h.published_as_of, kTip);
+}
+
+
 TEST(DashMnCheckpointReseed, ReArmResetsEveryFieldArmSets)
 {
     DirtyBridge d;
