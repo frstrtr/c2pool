@@ -51,6 +51,8 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <iterator>
+#include <map>
 #include <optional>
 #include <string>
 
@@ -62,10 +64,24 @@ namespace replay {
 struct FoldConsumerStats
 {
     uint64_t blocks_folded{0};      // folds that completed without error
-    uint64_t roots_matched{0};      // THE proof counter
+    uint64_t roots_matched{0};      // THE proof counter — the SML axis
+    // The SECOND proof counter — the PAYEE axis. Blocks whose projected payee
+    // was found in that block's own coinbase. Separate from roots_matched on
+    // purpose: merkleRootMNList does not commit nLastPaidHeight, so a run of
+    // byte-exact roots proves NOTHING about payment-queue order. Two counters,
+    // two proofs, and the difference between them is legible.
+    uint64_t payees_verified{0};
     uint64_t blocks_skipped{0};     // below the anchor, already folded
     uint32_t first_height{0};       // first height actually folded
     uint32_t last_height{0};        // highest height folded
+
+    // The merkleRootMNList of the LAST block whose self-check passed — the
+    // root the folded list hashed to at `last_height`, as committed by that
+    // block's own cbTx. Retained so a downstream consumer of the folded list
+    // can RE-DERIVE the root from the state it is about to use and compare it
+    // against the chain's answer key, rather than trusting the counters above.
+    // Null until the first match.
+    uint256 last_matched_root;
 
     // Aggregated transition counters (diagnostics, not consensus).
     uint64_t registered{0};
@@ -199,7 +215,11 @@ public:
         if (m_stats.blocks_folded == 0) m_stats.first_height = height;
         ++m_stats.blocks_folded;
         ++m_stats.roots_matched;
-        m_stats.last_height = height;
+        m_stats.last_height       = height;
+        if (r.payee_paid_verified) ++m_stats.payees_verified;
+        // Recorded from the OBSERVED equality above, so it is the block's own
+        // committed root and our own computed root at once.
+        m_stats.last_matched_root = r.committed_root;
         m_stats.registered       += r.registered;
         m_stats.updated          += r.updated;
         m_stats.revoked          += r.revoked;
@@ -221,6 +241,7 @@ public:
             const auto secs = elapsed_seconds();
             LOG_INFO << "[REPLAY-FOLD] h=" << height
                      << " roots-matched=" << m_stats.roots_matched
+                     << " payees-verified=" << m_stats.payees_verified
                      << " mns=" << m_engine.size()
                      << " reg=" << m_stats.registered
                      << " ban=" << m_stats.banned
@@ -252,6 +273,7 @@ public:
         std::string s =
             "[REPLAY-FOLD SUMMARY] folded=" + std::to_string(m_stats.blocks_folded)
             + " roots_matched=" + std::to_string(m_stats.roots_matched)
+            + " payees_verified=" + std::to_string(m_stats.payees_verified)
             + " range=" + std::to_string(m_stats.first_height) + ".."
             + std::to_string(m_stats.last_height)
             + " mns=" + std::to_string(m_engine.size())
@@ -285,6 +307,131 @@ private:
     uint32_t          m_progress_every;
     FoldConsumerStats m_stats;
     std::chrono::steady_clock::time_point m_started;
+};
+
+/// ── THE LAST MILE: live tip blocks finish what the bulk lane started ──────
+///
+/// FOUND BY THE FIRST LIVE SEAM RUN. The W2 bulk lane fetches the heights its
+/// peers announced when it planned, delivers them, and goes idle:
+///
+///     [BULK] delivered=2516911/2516911 rate=0blk/s inflight=0 hdr=joined
+///
+/// while our own PoW-validated header chain had moved on to h=2516923. The
+/// fold therefore parked 12 blocks short of the tip — permanently — and any
+/// consumer with a currency requirement could never be satisfied.
+///
+/// The node already HAS those blocks: the tip lane connects each one and fires
+/// block_connected. The only thing missing was contiguity in time — a live
+/// block for h=2516915 arrives while the fold is still down at h=2515000, and
+/// the forward-contiguous fold cannot take it *yet*. So hold it, and drain the
+/// moment the fold catches up.
+///
+/// Deliberately NOT a fetcher: it never asks the network for anything, it only
+/// keeps what the node was already handed. A block it does not receive is a
+/// gap it reports rather than papers over — the fold stays behind, and
+/// whatever guards currency keeps refusing.
+class FoldLiveTail
+{
+public:
+    /// `cap` bounds the hold. Overflow drops the HIGHEST buffered height, not
+    /// the lowest: the lowest is the one the fold needs next, and dropping it
+    /// would break the contiguity that makes the drain safe. A fold far enough
+    /// behind to overflow is a fold that must keep failing its currency check
+    /// anyway — that is the honest outcome, not a reason to skip blocks.
+    /// `bulk_floor` is an EXCLUSIVE floor: the highest height the bulk lane
+    /// still owns (its delivered high-water and its fetch ceiling, whichever
+    /// is greater). The tail touches NOTHING at or below it.
+    ///
+    /// That floor is not politeness, it is correctness. The first attempt had
+    /// no floor and folded whatever arrived on block_connected — which also
+    /// carries the checkpoint bridge's own historical replay. The fold then
+    /// advanced through heights the bulk lane had not delivered, the W4 quorum
+    /// lane lost the cycles it derives from the bulk ordering, and the run
+    /// died at h=2512821 with "quorum-member resolver has no member set".
+    /// The tail exists to close the gap the bulk lane LEAVES, never to race it.
+    using HeightFn = std::function<uint32_t()>;
+
+    FoldLiveTail(FoldReplayConsumer& consumer, const DmlFoldEngine& engine,
+                 HeightFn bulk_floor, size_t cap = 512)
+        : m_consumer(consumer)
+        , m_engine(engine)
+        , m_bulk_floor(std::move(bulk_floor))
+        , m_cap(cap ? cap : 512)
+    {}
+
+    /// Offer a connected block. Heights at or below the fold cursor are a
+    /// no-op (the bulk lane already folded them); higher ones are held and the
+    /// buffer is drained contiguously.
+    void offer(uint32_t height, const BlockType& block)
+    {
+        if (height <= m_engine.height()) return;
+        if (height <= floor()) return;      // the bulk lane still owns it
+        ++m_offered;
+        auto [it, inserted] = m_held.emplace(height, block);
+        if (!inserted) return;                       // already holding it
+        if (m_held.size() > m_cap) {
+            m_held.erase(std::prev(m_held.end()));   // drop the HIGHEST
+            ++m_dropped;
+        }
+        drain();
+    }
+
+    /// Fold every held block the engine can take, in order. Also called after
+    /// the bulk lane advances the cursor, so a hold that became contiguous
+    /// without a new arrival still lands.
+    void drain()
+    {
+        for (;;) {
+            // Discard anything the bulk lane folded while we held it.
+            while (!m_held.empty() && m_held.begin()->first <= m_engine.height())
+                m_held.erase(m_held.begin());
+            if (m_held.empty()) return;
+            const uint32_t want = m_engine.height() + 1;
+            // Never fold a height the bulk lane is still going to deliver:
+            // its ordering is what the W4 quorum lane derives membership from.
+            if (want <= floor()) return;
+            auto it = m_held.find(want);
+            if (it == m_held.end()) return;          // still a gap; wait
+            // The REAL block hash, not a placeholder: the quorum lane keys
+            // derived member cycles by it.
+            const bool ok = m_consumer.on_replay_block(
+                want, DmlFoldEngine::block_header_hash(it->second), it->second);
+            m_held.erase(it);
+            ++m_folded_live;
+            if (!ok) {
+                // A live block that fails the fold is exactly as fatal as a
+                // replayed one — the consumer has already recorded the
+                // divergence and the engine is poisoned. Stop; do not try the
+                // next height on top of a poisoned state.
+                LOG_ERROR << "[REPLAY-TAIL] live block h=" << want
+                          << " FAILED the fold — the fold is now poisoned and"
+                             " no further block will be folded from either lane";
+                return;
+            }
+        }
+    }
+
+    uint32_t bulk_floor()  const { return floor(); }
+    size_t   held()        const { return m_held.size(); }
+    uint64_t folded_live() const { return m_folded_live; }
+    uint64_t offered()     const { return m_offered; }
+    uint64_t dropped()     const { return m_dropped; }
+    uint32_t lowest_held() const
+    {
+        return m_held.empty() ? 0u : m_held.begin()->first;
+    }
+
+private:
+    uint32_t floor() const { return m_bulk_floor ? m_bulk_floor() : 0u; }
+
+    FoldReplayConsumer&               m_consumer;
+    const DmlFoldEngine&              m_engine;
+    HeightFn                          m_bulk_floor;
+    size_t                            m_cap;
+    std::map<uint32_t, BlockType>     m_held;
+    uint64_t m_folded_live{0};
+    uint64_t m_offered{0};
+    uint64_t m_dropped{0};
 };
 
 } // namespace replay

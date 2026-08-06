@@ -1829,3 +1829,89 @@ TEST(DashCoinStateMaintainer, UnlockBlockContiguousAdvanceNoAccrualDrift) {
            "missing from the credit-pool delta";
     EXPECT_EQ(st.credit_pool(), 1'365'481'498'408LL);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// THE STALE-SML SEED RECONCILE (contabo, 2026-08-05, h=2516956)
+//
+// on_mn_list_update reconciles a freshly seeded payee queue against whatever
+// SML is already held, so a live-advanced SML's bans land immediately. That is
+// right when the SML is CURRENT. It is destructive when the SML is older than
+// the snapshot: the snapshot already reflects every ban and revive up to its
+// own height, so an older attestation can only undo them.
+//
+// MEASURED. A replay-fold snapshot as-of h=2516955 — byte-exact with dashd's
+// list at that height — was reconciled 13 ms after publication against an SML
+// dated h=2478000:
+//     [SML->PAYEE] seed reconcile: -6 banned +21 revived @ h=2478000
+//     [MNS-SM] PAYEE DESYNC h=2516956: coinbase does not pay projected MN
+//              8ef71d8296c6e516
+// Twenty-one masternodes the chain had banned were revived in the queue.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashCoinStateMaintainer, StaleSmlMustNotReviveBansInAFreshSnapshot) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+
+    // An OLD SML that still believes this masternode is valid.
+    CSimplifiedMNListEntry e = sml_entry(0x40);
+    e.isValid = true;
+    m.on_mnlistdiff(diff_with_seed(uint256::ZERO, raw256(0xA0),
+                                   /*cb_height=*/2478000, 0, e));
+    ASSERT_TRUE(st.have_sml());
+    ASSERT_EQ(m.sml_current_height(), 2478000u);
+    ASSERT_TRUE(m.sml_height_paired());
+
+    // A snapshot ~39k blocks NEWER in which the chain has banned it.
+    std::vector<std::pair<uint256, MNState>> snap;
+    {
+        MNState mn;
+        mn.scriptPayout.m_data = p2pkh_script(0x30);
+        mn.nRegisteredHeight   = 2400000;
+        mn.nLastPaidHeight     = 2516000;
+        mn.nPoSeBanHeight      = 2485482;   // banned on-chain
+        mn.isValid             = false;
+        mn.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+        snap.emplace_back(raw256(0x40), mn);
+    }
+    m.on_mn_list_update(snap, 2516955, "replay-fold");
+
+    const auto& held = st.mnstates().entries();
+    auto it = held.find(raw256(0x40));
+    ASSERT_NE(it, held.end());
+    EXPECT_FALSE(it->second.isValid)
+        << "a 39k-block-stale SML must not revive a masternode the snapshot "
+           "says the chain banned";
+    EXPECT_EQ(it->second.nPoSeBanHeight, 2485482u)
+        << "the snapshot's own ban height must survive the reconcile";
+}
+
+// The mirror: an SML at or AHEAD of the snapshot is real evidence and the
+// reconcile still runs, so the behaviour this guard protects is not lost.
+TEST(DashCoinStateMaintainer, CurrentSmlStillReconcilesAFreshSnapshot) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+
+    CSimplifiedMNListEntry e = sml_entry(0x40);
+    e.isValid = false;                       // the SML says: banned
+    m.on_mnlistdiff(diff_with_seed(uint256::ZERO, raw256(0xA0),
+                                   /*cb_height=*/2516955, 0, e));
+    ASSERT_EQ(m.sml_current_height(), 2516955u);
+
+    std::vector<std::pair<uint256, MNState>> snap;
+    {
+        MNState mn;
+        mn.scriptPayout.m_data = p2pkh_script(0x30);
+        mn.nRegisteredHeight   = 2400000;
+        mn.nLastPaidHeight     = 2516000;
+        mn.isValid             = true;       // the snapshot says: fine
+        mn.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+        snap.emplace_back(raw256(0x40), mn);
+    }
+    m.on_mn_list_update(snap, 2516955, "replay-fold");
+
+    const auto& held = st.mnstates().entries();
+    auto it = held.find(raw256(0x40));
+    ASSERT_NE(it, held.end());
+    EXPECT_FALSE(it->second.isValid)
+        << "an SML current AT the snapshot height is authoritative and its "
+           "ban must land";
+}

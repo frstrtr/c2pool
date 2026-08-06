@@ -401,6 +401,12 @@ struct FoldResult
     // non-empty) and whether it was still present to be marked paid.
     std::optional<uint256> payee;
     bool        payee_marked{false};
+    // THE SECOND self-check (pass 0b): the pre-block scriptPayout of the
+    // projected payee was found among this block's own coinbase outputs.
+    // False ONLY when the pre-block list was empty (nothing to project) —
+    // a projection that is NOT paid fails the fold closed, it never leaves
+    // this flag quietly clear.
+    bool        payee_paid_verified{false};
 };
 
 class DmlFoldEngine
@@ -459,6 +465,22 @@ public:
 
     using Entries = std::map<uint256, ReplayMNState>;
     const Entries& entries() const { return m_entries; }
+
+    /// Dash block identity = X11(80-byte header) — same as header_chain.hpp.
+    /// PUBLIC because a feeder that hands blocks to fold_block must be able to
+    /// name them the SAME way: the quorum lane keys derived member cycles by
+    /// block hash, and a caller that passed a null placeholder there made W4
+    /// lose the cycle and the fold fail closed at the next punishing
+    /// commitment (live-observed, h=2512821 llmqType=2).
+    static uint256 block_header_hash(const dash::coin::BlockType& block)
+    {
+        const bitcoin_family::coin::BlockHeaderType& hdr = block;
+        ::PackStream s;
+        s << hdr;
+        auto sp = s.get_span();
+        return dash::crypto::hash_x11(
+            reinterpret_cast<const unsigned char*>(sp.data()), sp.size());
+    }
 
     const ReplayMNState* find(const uint256& proTxHash) const
     {
@@ -599,6 +621,29 @@ public:
         // ── Pass 0: payee, from the PRE-block list ──────────────────────
         r.payee = project_payee(H);
 
+        // ── Pass 0b: capture the payee's PRE-BLOCK payout script ────────
+        // dashd built this block's coinbase from the list at H-1, which is
+        // exactly the list being held right now. A ProUpRegTx later in this
+        // same block may rewrite scriptPayout, and a collateral spend may
+        // remove the masternode outright, so the script is captured HERE and
+        // adjudicated in pass 6 — after the special-tx folds, so that a block
+        // with a genuinely broken payload still reports ITS OWN blocking
+        // condition rather than this one.
+        std::vector<unsigned char> payee_script_pre;
+        if (r.payee) {
+            const ReplayMNState* pst = find(*r.payee);
+            if (pst == nullptr) {
+                r.error = "fold refused at h=" + std::to_string(height)
+                        + ": projected payee " + r.payee->GetHex()
+                        + " is not in the pre-block list (internal invariant "
+                          "violated) — HARD STOP, engine poisoned";
+                poison(r.error);
+                LOG_ERROR << "[DML-FOLD] " << r.error;
+                return r;
+            }
+            payee_script_pre = pst->scriptPayout.m_data;
+        }
+
         // ── Pass 1: confirmedHash (specialtxman.cpp:205-218) ────────────
         // Walks every MN, BANNED INCLUDED. Confirmation compares against
         // H−1 (the prev block's height), and the recorded hash is hash(H−1)
@@ -708,6 +753,63 @@ public:
             poison(r.error);
             LOG_ERROR << "[DML-FOLD] " << r.error;
             return r;
+        }
+
+        // ── THE SECOND SELF-CHECK: the payee axis ───────────────────────
+        //
+        // The root check above proves the masternode SET. It cannot prove the
+        // payment ORDER, because merkleRootMNList commits the DIP-4 SML entry
+        // — proRegTxHash, confirmedHash, netInfo, pubKeyOperator, keyIDVoting,
+        // isValid, nType, platform ports — and NOT nLastPaidHeight, which is
+        // the field GetMNPayee orders by. Pass 5 just wrote nLastPaidHeight=H
+        // onto the masternode THIS ENGINE projected; if that projection was
+        // wrong, two entries are now mis-dated, the error is carried forward
+        // by every later block, and a run of N byte-exact roots says nothing
+        // about it. "4753/4753 byte-exact, DIVERGED=none" has been quoted as
+        // if it proved both axes. It proves one.
+        //
+        // Every block carries the answer key for the other axis too: its own
+        // coinbase, which dashd built from the list at H-1. So check it, and
+        // fail closed on exactly the same footing as a root mismatch.
+        //
+        // MEASURED (contabo, 2026-08-05): a fold reporting 4755/4755 roots and
+        // DIVERGED=none published its list, and the next block answered
+        //     [MNS-SM] PAYEE DESYNC h=2516956: coinbase does not pay
+        //              projected MN 8ef71d8296c6e516
+        //
+        // HONEST LIMIT, stated where the check lives: this proves the payee's
+        // SCRIPT is paid, not that this exact proTxHash was the one dashd
+        // picked. Payout scripts are shared — at h=2516955 FORTY masternodes
+        // share the script block 2516956 pays. So it falsifies a projection
+        // that drifts ACROSS payout groups (which is the observed failure,
+        // and the one that mints a rejected coinbase) and cannot separate
+        // members WITHIN a group. A within-group swap is invisible to the
+        // coinbase and therefore invisible to any consumer of it, including
+        // dashd's own validation of our block.
+        if (r.payee && !payee_script_pre.empty()) {
+            bool paid = false;
+            if (!block.m_txs.empty()) {
+                for (const auto& out : block.m_txs[0].vout) {
+                    if (out.scriptPubKey.m_data == payee_script_pre) {
+                        paid = true;
+                        break;
+                    }
+                }
+            }
+            if (!paid) {
+                r.error = "DML FOLD PAYEE MISMATCH at h=" + std::to_string(height)
+                        + ": this block's coinbase does not pay the projected "
+                          "masternode " + r.payee->GetHex()
+                        + " — the merkleRootMNList self-check PASSED at this "
+                          "height, which is exactly why this check exists: "
+                          "nLastPaidHeight is not committed by any block, so "
+                          "a wrong payment order folds to the right root — "
+                          "HARD STOP, engine poisoned, re-seed required";
+                poison(r.error);
+                LOG_ERROR << "[DML-FOLD] " << r.error;
+                return r;
+            }
+            r.payee_paid_verified = true;
         }
 
         // Fold accepted — advance the cursor.
@@ -922,17 +1024,6 @@ private:
                 reinterpret_cast<const unsigned char*>(sp.data()), sp.size()))
             .Finalize(std::span<unsigned char>(h.data(), 32));
         return h;
-    }
-
-    // Dash block identity = X11(80-byte header) — same as header_chain.hpp.
-    static uint256 block_header_hash(const dash::coin::BlockType& block)
-    {
-        const bitcoin_family::coin::BlockHeaderType& hdr = block;
-        ::PackStream s;
-        s << hdr;
-        auto sp = s.get_span();
-        return dash::crypto::hash_x11(
-            reinterpret_cast<const unsigned char*>(sp.data()), sp.size());
     }
 
     // ── Special-tx folds. Return "" on success, an error sentence on the ─

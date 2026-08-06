@@ -617,9 +617,32 @@ static MutableTransaction make_special_tx(uint16_t type, const Payload& p,
     return tx;
 }
 
+/// The scriptPayout of the masternode `eng` will project for block H — i.e.
+/// the script a REAL block at that height would have to pay. Empty when the
+/// pre-block list is empty.
+static std::vector<unsigned char> projected_payout_script(
+    const DmlFoldEngine& eng, int32_t H)
+{
+    auto p = eng.project_payee(H);
+    if (!p) return {};
+    const ReplayMNState* st = eng.find(*p);
+    return st ? st->scriptPayout.m_data : std::vector<unsigned char>{};
+}
+
+/// `pay_from`: build the coinbase so it PAYS the masternode the engine
+/// projects for this height, the way every real DIP3 block does.
+///
+/// The fold now adjudicates that (replay_fold_engine.hpp, "THE SECOND
+/// SELF-CHECK"): merkleRootMNList does not commit nLastPaidHeight, so a wrong
+/// payment order folds to the right root, and the block's own coinbase is the
+/// only answer key for that axis. A synthetic block that pays nobody is not a
+/// block dashd could have produced, so these fixtures now model the one
+/// property the engine checks. Pass nullptr only where a payee mismatch is
+/// the thing under test.
 static BlockType make_block(uint32_t height, const uint256& prev_hash,
                             const uint256& committed_root,
-                            std::vector<MutableTransaction> special_txs = {})
+                            std::vector<MutableTransaction> special_txs = {},
+                            const DmlFoldEngine* pay_from = nullptr)
 {
     BlockType b;
     b.m_version        = 536870912;
@@ -627,7 +650,18 @@ static BlockType make_block(uint32_t height, const uint256& prev_hash,
     b.m_timestamp      = 1700000000 + height;
     b.m_bits           = 0x1e0fffff;
     b.m_nonce          = height;
-    b.m_txs.push_back(make_coinbase(height, committed_root));
+    auto cb = make_coinbase(height, committed_root);
+    if (pay_from) {
+        auto script = projected_payout_script(*pay_from,
+                                              static_cast<int32_t>(height));
+        if (!script.empty()) {
+            TxOut out;
+            out.value = 1;
+            out.scriptPubKey.m_data = std::move(script);
+            cb.vout.push_back(std::move(out));
+        }
+    }
+    b.m_txs.push_back(std::move(cb));
     for (auto& tx : special_txs) b.m_txs.push_back(std::move(tx));
     return b;
 }
@@ -853,7 +887,7 @@ TEST(DashReplayFoldSynthetic, OperatorKeyChangeResetsAndBans)
     auto tx = make_special_tx(1, p, 1);
     const uint256 mn = tx_hash_of(tx);
     ASSERT_TRUE(eng.fold_block(
-        make_block(101, raw256(9), root_of({expected_entry_of(p, mn)}), {tx}),
+        make_block(101, raw256(9), root_of({expected_entry_of(p, mn)}), {tx}, &eng),
         101).ok);
 
     // Set an operator payout script first (so the reset is observable).
@@ -866,7 +900,7 @@ TEST(DashReplayFoldSynthetic, OperatorKeyChangeResetsAndBans)
         auto uptx = make_special_tx(2, up, 2);
         auto r = eng.fold_block(
             make_block(102, raw256(10), root_of({expected_entry_of(p, mn)}),
-                       {uptx}), 102);
+                       {uptx}, &eng), 102);
         ASSERT_TRUE(r.ok) << r.error;
         EXPECT_FALSE(eng.find(mn)->scriptOperatorPayout.m_data.empty());
     }
@@ -891,7 +925,7 @@ TEST(DashReplayFoldSynthetic, OperatorKeyChangeResetsAndBans)
     e.keyIDVoting    = upr.keyIDVoting;
     e.isValid        = false; // banned until a ProUpServTx revives
     e.nType          = MnType::REGULAR;
-    auto r = eng.fold_block(make_block(103, raw256(11), root_of({e}), {uprtx}),
+    auto r = eng.fold_block(make_block(103, raw256(11), root_of({e}), {uprtx}, &eng),
                             103);
     ASSERT_TRUE(r.ok) << r.error;
     EXPECT_EQ(r.banned, 1u);
@@ -917,7 +951,7 @@ TEST(DashReplayFoldSynthetic, ProUpRevRevokesAndRecordsReason)
     auto tx = make_special_tx(1, p, 1);
     const uint256 mn = tx_hash_of(tx);
     ASSERT_TRUE(eng.fold_block(
-        make_block(101, raw256(9), root_of({expected_entry_of(p, mn)}), {tx}),
+        make_block(101, raw256(9), root_of({expected_entry_of(p, mn)}), {tx}, &eng),
         101).ok);
 
     CProUpRevTx rev;
@@ -931,7 +965,7 @@ TEST(DashReplayFoldSynthetic, ProUpRevRevokesAndRecordsReason)
     e.proRegTxHash = mn;
     e.keyIDVoting  = p.keyIDVoting;
     e.isValid      = false;
-    auto r = eng.fold_block(make_block(102, raw256(10), root_of({e}), {revtx}),
+    auto r = eng.fold_block(make_block(102, raw256(10), root_of({e}), {revtx}, &eng),
                             102);
     ASSERT_TRUE(r.ok) << r.error;
     EXPECT_EQ(r.revoked, 1u);
@@ -951,7 +985,7 @@ TEST(DashReplayFoldSynthetic, CollateralReplacementRemovesOldMN)
     const uint256 mn1 = tx_hash_of(tx1);
     ASSERT_TRUE(eng.fold_block(
         make_block(101, raw256(9), root_of({expected_entry_of(p1, mn1)}),
-                   {tx1}), 101).ok);
+                   {tx1}, &eng), 101).ok);
 
     // A second ProRegTx re-registering the SAME external collateral:
     // dashd removes the old MN and adds the new one fresh
@@ -962,7 +996,7 @@ TEST(DashReplayFoldSynthetic, CollateralReplacementRemovesOldMN)
     const uint256 mn2 = tx_hash_of(tx2);
     auto r = eng.fold_block(
         make_block(102, raw256(10), root_of({expected_entry_of(p2, mn2)}),
-                   {tx2}), 102);
+                   {tx2}, &eng), 102);
     ASSERT_TRUE(r.ok) << r.error;
     EXPECT_EQ(r.collateral_replaced, 1u);
     EXPECT_EQ(eng.find(mn1), nullptr);
@@ -1014,7 +1048,7 @@ TEST(DashReplayFoldSynthetic, PunishDecayBanReviveLifecycle)
     auto ea = expected_entry_of(pa, a), eb = expected_entry_of(pb, b),
          ec = expected_entry_of(pc, c);
     ASSERT_TRUE(eng.fold_block(
-        make_block(101, raw256(9), root_of({ea, eb, ec}), {txa, txb, txc}),
+        make_block(101, raw256(9), root_of({ea, eb, ec}), {txa, txb, txc}, &eng),
         101).ok);
     EXPECT_EQ(eng.calc_max_pose_penalty(), 100);
     EXPECT_EQ(eng.calc_penalty(66), 66);
@@ -1044,7 +1078,7 @@ TEST(DashReplayFoldSynthetic, PunishDecayBanReviveLifecycle)
 
     // Block 102: punish #1 → penalty 66, no ban (66 < 100), root unchanged.
     auto r = eng.fold_block(
-        make_block(102, raw256(10), root_of({ea, eb, ec}), {make_qc(4)}), 102);
+        make_block(102, raw256(10), root_of({ea, eb, ec}), {make_qc(4)}, &eng), 102);
     ASSERT_TRUE(r.ok) << r.error;
     EXPECT_EQ(r.punished, 1u);
     EXPECT_EQ(r.banned, 0u);
@@ -1058,7 +1092,7 @@ TEST(DashReplayFoldSynthetic, PunishDecayBanReviveLifecycle)
     ea_banned.isValid = false;
     r = eng.fold_block(
         make_block(103, raw256(11), root_of({ea_banned, eb, ec}),
-                   {make_qc(5)}), 103);
+                   {make_qc(5)}, &eng), 103);
     ASSERT_TRUE(r.ok) << r.error;
     EXPECT_EQ(r.decayed, 1u);
     EXPECT_EQ(r.punished, 1u);
@@ -1078,7 +1112,7 @@ TEST(DashReplayFoldSynthetic, PunishDecayBanReviveLifecycle)
     null_qc.commitment.validMembers = {false, false, false};
     r = eng.fold_block(
         make_block(104, raw256(12), root_of({ea_banned, eb, ec}),
-                   {make_special_tx(6, null_qc, 6)}), 104);
+                   {make_special_tx(6, null_qc, 6)}, &eng), 104);
     ASSERT_TRUE(r.ok) << r.error;
     EXPECT_EQ(r.punished, 0u);
     EXPECT_EQ(r.decayed, 0u);
@@ -1091,7 +1125,7 @@ TEST(DashReplayFoldSynthetic, PunishDecayBanReviveLifecycle)
     up.netInfo   = pa.netInfo;
     r = eng.fold_block(
         make_block(105, raw256(13), root_of({ea, eb, ec}),
-                   {make_special_tx(2, up, 7)}), 105);
+                   {make_special_tx(2, up, 7)}, &eng), 105);
     ASSERT_TRUE(r.ok) << r.error;
     EXPECT_EQ(r.revived, 1u);
     EXPECT_EQ(eng.find(a)->nPoSePenalty, 0);
@@ -1109,14 +1143,14 @@ TEST(DashReplayFoldSynthetic, ConfirmedHashSetAtMinimumConfirmations)
     const uint256 mn = tx_hash_of(tx);
     auto e = expected_entry_of(p, mn);
     ASSERT_TRUE(eng.fold_block(
-        make_block(101, raw256(9), root_of({e}), {tx}), 101).ok);
+        make_block(101, raw256(9), root_of({e}), {tx}, &eng), 101).ok);
 
     // Registered at 101. Confirmation at fold height H needs
     // (H−1) − 101 ≥ 15, i.e. FIRST at H = 117, with
     // confirmedHash = hash(116) = that block's own hashPrevBlock.
     for (uint32_t h = 102; h <= 116; ++h) {
         auto r = eng.fold_block(
-            make_block(h, raw256(static_cast<uint8_t>(h)), root_of({e})), h);
+            make_block(h, raw256(static_cast<uint8_t>(h)), root_of({e}), {}, &eng), h);
         ASSERT_TRUE(r.ok) << "h=" << h << ": " << r.error;
         EXPECT_EQ(r.confirmed, 0u) << "h=" << h;
         EXPECT_TRUE(eng.find(mn)->confirmedHash.IsNull()) << "h=" << h;
@@ -1124,7 +1158,7 @@ TEST(DashReplayFoldSynthetic, ConfirmedHashSetAtMinimumConfirmations)
     const uint256 hash116 = raw256(117); // prev-hash we hand block 117
     auto e_conf = e;
     e_conf.confirmedHash = hash116;
-    auto r = eng.fold_block(make_block(117, hash116, root_of({e_conf})), 117);
+    auto r = eng.fold_block(make_block(117, hash116, root_of({e_conf}), {}, &eng), 117);
     ASSERT_TRUE(r.ok) << r.error;
     EXPECT_EQ(r.confirmed, 1u);
     EXPECT_EQ(eng.find(mn)->confirmedHash, hash116);
@@ -1189,7 +1223,7 @@ TEST(DashReplayFoldSynthetic, ExtAddrPayloadFailsClosed)
     up.nType     = MnType::REGULAR;
     up.proTxHash = mn;
     auto r = eng.fold_block(
-        make_block(101, raw256(9), uint256{}, {make_special_tx(2, up, 1)}),
+        make_block(101, raw256(9), uint256{}, {make_special_tx(2, up, 1)}, &eng),
         101);
     ASSERT_FALSE(r.ok);
     EXPECT_NE(r.error.find("ExtAddr"), std::string::npos);

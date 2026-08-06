@@ -320,8 +320,22 @@ public:
     /// payoutAddress (live-observed: E2b's 288-block UTXO bootstrap replay
     /// scrambled the seeded queue and the embedded template projected the
     /// wrong payee).
+    ///
+    /// `source` NAMES the lane that produced this snapshot — "dashd-seed"
+    /// (E2c protx-list RPC), "mn-ckpt" (E2d compiled-in anchor replayed
+    /// forward) or "replay-fold" (the root-checked full-history DML fold).
+    /// Logged verbatim, because the three are NOT interchangeable and a bare
+    /// "populated" cannot tell an RPC-seeded payee queue from a daemonlessly
+    /// derived one — the ambiguity that let a LAN run be read as proof of a
+    /// daemonless serve when its payee half had come from dashd.
     void on_mn_list_update(std::vector<std::pair<uint256, MNState>> mnstates,
-                           uint32_t as_of_height = 0) {
+                           uint32_t as_of_height = 0,
+                           const std::string& source = std::string()) {
+        m_mn_source = source.empty() ? std::string("unnamed") : source;
+        LOG_INFO << "[PAYEE-QUEUE] snapshot source=" << m_mn_source
+                 << " as_of_h=" << as_of_height
+                 << " mns=" << mnstates.size()
+                 << (mnstates.empty() ? " (EMPTY -> set-gap, demoting)" : "");
         // With the anti-mint latch on, a snapshot with NO height cannot arm
         // MN-readiness either: an unheighted set leaves the apply cursor at 0,
         // which disables apply_block's contiguity guard — the exact condition
@@ -354,12 +368,59 @@ public:
         if (m_have_mn && m_have_mn_sml) {
             const uint32_t vh = m_sml_current_height ? m_sml_current_height
                                                      : as_of_height;
-            const auto vr = m_state.mnstates().sync_validity_from_sml(
-                m_state.sml(), vh);
-            if (vr.flipped_to_invalid || vr.flipped_to_valid)
-                LOG_INFO << "[SML->PAYEE] seed reconcile: -"
-                         << vr.flipped_to_invalid << " banned +"
-                         << vr.flipped_to_valid << " revived @ h=" << vh;
+            // ── FRESHNESS GATE (contabo, 2026-08-05, h=2516956) ───────────
+            // An SML OLDER than the snapshot cannot speak to the snapshot's
+            // height. The snapshot already reflects every ban and revive up
+            // to as_of_height; an older attestation can only undo them.
+            //
+            // MEASURED. A replay-fold snapshot as-of h=2516955 — byte-exact
+            // with dashd's list at that height, independently re-derived —
+            // was reconciled 13 ms after publication against an SML dated
+            // h=2478000, ~39,000 blocks stale:
+            //     [SML->PAYEE] seed reconcile: -6 banned +21 revived @ h=2478000
+            // Twenty-one masternodes the chain had banned were revived in the
+            // payee queue, one of them went to the front, and the very next
+            // block disagreed:
+            //     [MNS-SM] PAYEE DESYNC h=2516956: coinbase does not pay
+            //              projected MN 8ef71d8296c6e516
+            // (dashd's own list at 2516955 carries that masternode with
+            // PoSeBanHeight=2485482 — banned. So did ours. The reconcile
+            // un-banned it.)
+            //
+            // This was always wrong; it only became REACHABLE when a lane
+            // started publishing snapshots newer than the SML sync had got
+            // to. Fail closed and say so: the queue keeps the snapshot's own
+            // authoritative isValid, and the next mnlistdiff reconciles it
+            // for real once the SML has caught up.
+            // Two ways an SML fails to speak to this snapshot: it is DATED
+            // and older, or it cannot be dated at all. sml_height_paired() is
+            // false after a warm restart and whenever a diff advanced the list
+            // without a parseable cbTx — and the maintainer's own rule for
+            // that case is already written down: a height of 0 means "the SML
+            // covers NOTHING", not "covers everything". An undatable
+            // attestation cannot adjudicate a dated authoritative list either.
+            const bool sml_undatable = !m_sml_height_paired;
+            if (as_of_height != 0 && (sml_undatable || vh < as_of_height)) {
+                LOG_WARNING
+                    << "[SML->PAYEE] seed reconcile REFUSED: "
+                    << (sml_undatable
+                            ? std::string("the SML cannot be dated"
+                                          " (sml_height_paired=false)")
+                            : "the SML is at h=" + std::to_string(vh) + " ("
+                              + std::to_string(as_of_height - vh)
+                              + " blocks STALE)")
+                    << " but the snapshot is as-of h=" << as_of_height
+                    << " — an attestation that cannot speak to that height is"
+                       " not evidence; the snapshot's own isValid stands until"
+                       " the SML catches up";
+            } else {
+                const auto vr = m_state.mnstates().sync_validity_from_sml(
+                    m_state.sml(), vh);
+                if (vr.flipped_to_invalid || vr.flipped_to_valid)
+                    LOG_INFO << "[SML->PAYEE] seed reconcile: -"
+                             << vr.flipped_to_invalid << " banned +"
+                             << vr.flipped_to_valid << " revived @ h=" << vh;
+            }
         }
         // BODY-FIRST: an authoritative snapshot loaded as-of the pending tip
         // completes the payee axis — the last promotion precondition when the
@@ -1275,6 +1336,11 @@ public:
     /// being adjudicated. See MnCheckpointLane::maybe_fold_sml().
     uint32_t sml_current_height() const { return m_sml_current_height; }
 
+    /// The lane that last populated the payee queue — "dashd-seed",
+    /// "mn-ckpt", "replay-fold", "unnamed", or empty when nothing has ever
+    /// populated it. Diagnostic; the serve gate does not branch on it.
+    const std::string& mn_source() const { return m_mn_source; }
+
     /// Whether m_sml_current_height actually describes the SML currently held.
     /// FALSE after a diff advanced the list without a parseable type-5 cbTx to
     /// advance the height with it (F2). A consumer that pairs the two — the
@@ -1750,6 +1816,11 @@ private:
     bool m_have_mn{false};
     bool m_have_tip{false};
     bool m_have_mn_sml{false};   // a non-empty SML has been applied (CCbTx source)
+    // Which lane last populated the payee queue ("dashd-seed" / "mn-ckpt" /
+    // "replay-fold" / "unnamed"). Diagnostic only — nothing branches on it —
+    // but it is the difference between "this node serves" and "this node
+    // serves WITHOUT a daemon", which no other field records.
+    std::string m_mn_source;
     // E2d anti-mint latch — see set_require_seeded_mn_set(). Default FALSE so
     // every existing construction site (the KATs, the dashd-RPC posture) keeps
     // byte-identical behaviour; main_dash opts the embedded arm in.

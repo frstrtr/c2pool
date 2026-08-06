@@ -78,6 +78,17 @@ struct MnListUpdate
     // on testnet where dozens of MNs share one payoutAddress) and projects
     // the WRONG payee. 0 preserves the pre-E2c behavior (no skip).
     uint32_t as_of_height{0};
+
+    // WHICH LANE produced this snapshot, carried verbatim into the
+    // maintainer's populate log line. Three exist and they are NOT
+    // interchangeable: "dashd-seed" is an RPC call to a daemon (a run that
+    // used it has NOT proven a daemonless serve), "mn-ckpt" is the
+    // compiled-in trust anchor replayed forward, "replay-fold" is the
+    // root-checked full-history DML fold. A refusal, a stale queue or a wrong
+    // payee is diagnosed completely differently depending on which is in
+    // force, and a bare "populated" cannot tell them apart. Empty = an
+    // un-named caller (pre-existing behaviour, logged as "unnamed").
+    std::string source;
 };
 
 struct Node

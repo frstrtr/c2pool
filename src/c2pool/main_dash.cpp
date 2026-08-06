@@ -95,6 +95,7 @@
 #include <impl/dash/coin/replay_prestate.hpp>    // W5: anchor prestate loader (--replay-fold-prestate)
 #include <impl/dash/coin/replay_fold_consumer.hpp> // W5: bulk lane -> W1 DML fold + per-block root check
 #include <impl/dash/coin/replay_quorum_bridge.hpp> // SEAM: W4 quorum lane <-> W1 MembersFn
+#include <impl/dash/coin/replay_payee_publish.hpp> // SEAM: W1 fold -> the PAYEE queue that gates serving
 #include <impl/dash/node.hpp>          // dash::Node — sharechain pool-node (NodeBridge<NodeImpl,Legacy,Actual>)
 #include <impl/dash/config.hpp>        // dash::Config (PoolConfig/CoinConfig)
 #include <impl/dash/config_pool.hpp>   // dash::SharechainConfig — P2P_PORT / PREFIX / min-proto SSOT
@@ -255,6 +256,13 @@ std::string g_replay_fold_prestate;           // --replay-fold-prestate FILE
 bool        g_replay_fold_quorums = false;    // --replay-fold-quorums
 std::string g_replay_fold_qsnapshot;          // --replay-fold-qsnapshot FILE
 std::string g_replay_fold_worklists;          // --replay-fold-worklists FILE
+// --embedded-no-dashd-mn-seed: cut the PAYEE axis off from dashd while KEEPING
+// the dashd RPC for the OBSERVE-only shadow-compare. The E2c `protx list` seed
+// and the E2d checkpoint bridge are both skipped, so the root-checked replay
+// fold is the only thing that can populate the payee queue. Exists to make a
+// parity run measurable: a run that was dashd-seeded proves the fold and the
+// serve are both fine WITHOUT proving the serve is daemonless.
+bool        g_no_dashd_mn_seed = false;       // --embedded-no-dashd-mn-seed
 
 // Report the requested sharechain peering topology at run-loop bring-up. Honest
 // about the deferred live bind: a won/seen share does NOT yet cross the wire
@@ -303,6 +311,7 @@ void print_banner(const char* argv0)
         << "           [--replay-bulk] [--replay-bulk-capture DIR] [--replay-bulk-start H]\n"
         << "           [--replay-fold-prestate FILE] [--replay-fold-quorums]\n"
         << "           [--replay-fold-qsnapshot FILE] [--replay-fold-worklists FILE]\n"
+        << "           [--embedded-no-dashd-mn-seed]\n"
         << "           [--oracle-graduation-blocks N] [--oracle-class-coverage K]\n"
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
         << "           [--redistribute pplns|fee|boost|donate]\n"
@@ -417,7 +426,19 @@ void print_banner(const char* argv0)
         << "        without any anchor-supplied member set;\n"
         << "        --replay-fold-qsnapshot FILE seeds ONLY the pre-anchor\n"
         << "        rotated-cycle snapshots a Phase-1 run cannot have produced.\n"
-        << "        None of this changes serving.\n"
+        << "        THE SERVE SEAM: once the fold is PROVEN CURRENT (not\n"
+        << "        poisoned, DIVERGED=none, roots_matched == folded, the list\n"
+        << "        re-hashes to the root its last block committed, cursor AT\n"
+        << "        the header tip) it publishes that list into the PAYEE queue\n"
+        << "        as source=replay-fold, which is what flips the serve gate's\n"
+        << "        have_mn on a node with no dashd. Anything short of the full\n"
+        << "        guard WITHHOLDS and names the blocking condition; the dashd\n"
+        << "        seed and the checkpoint bridge are unchanged.\n"
+        << "        --embedded-no-dashd-mn-seed cuts the PAYEE axis off from a\n"
+        << "        configured dashd (no `protx list` seed, no checkpoint\n"
+        << "        bridge) while KEEPING the RPC for --embedded-shadow-compare:\n"
+        << "        the posture in which a serve-vs-dashd parity run actually\n"
+        << "        measures a DAEMONLESS serve instead of a dashd-seeded one.\n"
         << "        PRUNED (bodies never persisted). Strictly lower priority than\n"
         << "        the tip lane; resumable (high-water cursor); [BULK] telemetry.\n"
         << "        OBSERVE-only in W2 (counting consumer stands in for the W1 fold);\n"
@@ -2752,6 +2773,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // THE SEAM: W4's quorum lane and the bridge that closes the loop.
     std::unique_ptr<dash::coin::replay::QuorumReplayEngine>    replay_quorum_engine;
     std::unique_ptr<dash::coin::replay::ReplayQuorumBridge>    replay_quorum_bridge;
+    // THE SERVE SEAM: the fold's proven-current list -> the payee queue that
+    // gates serving, plus the live-tip tail that lets the fold actually REACH
+    // the tip (the bulk lane idles at the height its peers announced).
+    // Constructed only alongside the fold engine.
+    std::unique_ptr<dash::coin::replay::FoldLiveTail>          replay_live_tail;
+    std::unique_ptr<dash::coin::replay::ReplayPayeePublisher>  replay_payee_pub;
     if (coin_p2p) {
         const auto dash_params = testnet
             ? dash::coin::make_dash_chain_params_testnet()
@@ -4338,6 +4365,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                           : "")
                   << "\n";
 
+        // The payee-desync re-seed answer this posture installs, kept in a
+        // named variable so the replay serve seam (below, behind the replay
+        // flags) can chain IN FRONT of it without replacing it: the replay
+        // fold answers the ask when it is still proven current, otherwise the
+        // node falls through to exactly the lane it had before.
+        std::function<void()> mn_reseed_fallback;
+
         // ── E2c (#738): RPC MN-set SEED — flip the DMN half of populated() ──
         // E2a proved the TIP half populates live, but populated() ALSO needs a
         // payout-bearing DMN set, and no live leg can cold-start one: the P2P
@@ -4353,7 +4387,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // bad-cb-payee class #746 fixed). Synchronous-before-ioc.run() is safe:
         // NodeRPC::Send self-connects via the blocking sync_reconnect fallback
         // (the same property --submit-block relies on).
-        if (rpc) {
+        if (rpc && !g_no_dashd_mn_seed) {
             // Reusable authoritative seed fetch: invoked once at startup AND
             // re-invoked by the maintainer's payee-desync fail-closed path
             // (set_on_mn_reseed below) after it wiped a desynced payee queue.
@@ -4388,6 +4422,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     dash::interfaces::MnListUpdate up;
                     up.mnstates     = std::move(seed);
                     up.as_of_height = as_of;
+                    // NAME the lane: this snapshot came FROM DASHD. A run
+                    // seeded here has not proven a daemonless serve, however
+                    // daemonless the rest of it is.
+                    up.source       = dash::coin::replay::kPayeeSourceDashdSeed;
                     coin_state.mn_list_update.happened(up);
                     std::cout << "[run] E2c MN-set seed LOADED (" << tag
                               << "): "
@@ -4448,9 +4486,41 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // dashd fallback, re-arm the embedded payee half from the
             // authoritative protx list. Until the re-seed lands, get_work
             // keeps serving the reward-safe fallback.
-            maintainer->set_on_mn_reseed([seed_mn_set_from_rpc]() {
+            mn_reseed_fallback = [seed_mn_set_from_rpc]() {
                 seed_mn_set_from_rpc("payee-desync re-seed");
-            });
+            };
+            maintainer->set_on_mn_reseed(mn_reseed_fallback);
+        } else if (rpc) {
+            // ── --embedded-no-dashd-mn-seed: THE PROOF POSTURE ─────────────
+            // A dashd RPC IS configured, but the payee axis is deliberately
+            // cut off from it. Nothing else changes: the shadow-compare
+            // diagnostic keeps asking dashd for its template so the two can
+            // be diffed — which is the entire point. Without this switch a
+            // parity run cannot separate "the replay serves correctly" from
+            // "dashd seeded the queue and the replay watched": the LAN run on
+            // .211 served in 7 minutes off
+            //   [run] E2c MN-set seed LOADED (startup): 2971/2971 registered
+            //         MNs as-of h=2516893 FROM DASHD `protx list registered
+            //         true`
+            // and that is NOT a daemonless serve, however daemonless the fold
+            // beside it was.
+            //
+            // The E2d checkpoint bridge is skipped too: this posture exists to
+            // leave the ROOT-CHECKED REPLAY FOLD as the only thing that can
+            // populate the payee queue. If the fold does not get there, the
+            // node does not serve — which is the honest outcome to measure.
+            std::cout << "[run] --embedded-no-dashd-mn-seed: the E2c dashd"
+                         " `protx list` MN-set seed is DISABLED and the E2d"
+                         " checkpoint bridge is NOT armed.\n"
+                         "      The PAYEE queue can now be populated by ONE"
+                         " thing only: the root-checked replay fold"
+                         " (source=replay-fold).\n"
+                         "      The dashd RPC stays available to the"
+                         " OBSERVE-only shadow-compare, which is what makes"
+                         " this a parity measurement rather than a\n"
+                         "      daemon-assisted serve. Until the fold"
+                         " publishes, the embedded arm will not serve and no"
+                         " masternode payee will be guessed.\n";
         } else {
             // ── E2d (#738): PURE DAEMONLESS MN-SET SEED ────────────────────
             // No dashd RPC, so no `protx list`. The set comes from a
@@ -4656,6 +4726,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     dash::interfaces::MnListUpdate up;
                     up.mnstates     = std::move(set);
                     up.as_of_height = as_of;
+                    // NAME the lane: compiled-in trust anchor replayed
+                    // forward — daemonless, but anchored on this build's
+                    // assertion rather than on a per-block consensus check.
+                    up.source       = dash::coin::replay::kPayeeSourceMnCkpt;
                     coin_state.mn_list_update.happened(up);
                     std::cout << "[run] E2d MN-set BRIDGE COMPLETE: "
                               << up.mnstates.size() << " masternodes as-of h="
@@ -4715,7 +4789,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // Same io thread, no lock held (the lane takes none). The anchor is
             // captured BY VALUE rather than re-parsed per ask: parsing is not
             // free and a deferred ask must stay cheap.
-            maintainer->set_on_mn_reseed(
+            mn_reseed_fallback =
                 [mnl = mn_ckpt_lane.get(), anchor = ckpt]() {
                     using Lane    = dash::coin::MnCheckpointLane;
                     const auto out = mnl->rearm(
@@ -4739,7 +4813,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     // past the anchor, so the replay starts on this call rather
                     // than waiting for the next tip change.
                     mnl->pump();
-                });
+                };
+            maintainer->set_on_mn_reseed(mn_reseed_fallback);
 
             // Kick the lane once now in case the header chain is already past
             // the anchor from a previous run's persisted header DB.
@@ -4902,6 +4977,138 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                  " commitment that marks a member invalid"
                                  " will fail closed (by design).\n";
                 }
+
+                // ── THE SERVE SEAM: the fold FEEDS the payee queue ────────
+                // Everything above proves a masternode list. Nothing above
+                // ever handed it to the thing that gates serving.
+                //
+                // MEASURED on contabo (pure daemonless, no dashd, cold
+                // start): the fold reconstructed the DML to tip in 264 s,
+                // 4690/4690 byte-exact roots, DIVERGED=none — while the
+                // serve gate sat on
+                //   [EMBED-GATE] DECLINED cause=not-populated
+                //                value=have_tip=1,have_mn=0
+                // waiting for the MN-CKPT bridge's SECOND, independent
+                // reconstruction to crawl the same range at ~0.8-1 blk/s
+                // (40-60 min), because the payee axis had no third source.
+                // With no dashd creds the fallback arm is unarmed, so the
+                // node pushed ZERO mining.notify for that whole window.
+                //
+                // This publisher is that third source. It goes through the
+                // EXACT leg-4 event the dashd seed and the checkpoint bridge
+                // use, so the maintainer takes it as an ordinary
+                // authoritative resync — snapshot fence at the folded height,
+                // apply cursor armed for the next live block. Neither
+                // existing lane is removed or bypassed; whichever is ready
+                // first populates the queue, and the log NAMES it.
+                //
+                // FAIL-CLOSED: ReplayPayeePublisher::evaluate() must pass all
+                // of G1..G8 — not poisoned, DIVERGED=none, roots_matched ==
+                // folded, engine cursor == last root-checked height, the list
+                // RE-HASHES right now to the merkleRootMNList that block
+                // committed, the cursor is AT the header tip, and every entry
+                // carries a payout script. A fold that diverged, is poisoned,
+                // or is behind the tip can never become the authoritative
+                // snapshot, and the refusal names which condition blocked.
+                if (replay_fold_consumer) {
+                    replay_payee_pub =
+                        std::make_unique<rp::ReplayPayeePublisher>(
+                            *replay_fold_engine, *replay_fold_consumer,
+                            [hc = header_chain.get()]() -> uint32_t {
+                                // OUR OWN PoW-validated header chain is the
+                                // currency reference — not a peer's claim.
+                                return hc ? hc->height() : 0u;
+                            },
+                            [&coin_state](
+                                std::vector<std::pair<uint256,
+                                                      dash::coin::MNState>> set,
+                                uint32_t as_of, const char* source) {
+                                dash::interfaces::MnListUpdate up;
+                                up.mnstates     = std::move(set);
+                                up.as_of_height = as_of;
+                                up.source       = source;
+                                coin_state.mn_list_update.happened(up);
+                            });
+                    // ── THE LAST MILE (found by the first live seam run) ──
+                    // The W2 bulk lane fetches what its peers ANNOUNCED and
+                    // then goes idle: on .211 it parked at
+                    //   [BULK] delivered=2516911/2516911 inflight=0 hdr=joined
+                    // while our own header chain had already advanced to
+                    // h=2516923. The fold therefore sat 12 blocks short of the
+                    // tip, permanently, and the currency guard (G7) could never
+                    // flip — correctly refusing, and never publishing.
+                    //
+                    // The node is ALREADY receiving those blocks: the tip lane
+                    // connects them and fires block_connected. Hand them to the
+                    // fold. The consumer no-ops any height at or below the
+                    // engine's cursor, so a body the bulk lane also delivers is
+                    // counted once; both feeds run on the same io thread, so
+                    // there is no interleaving to guard. And because the fold
+                    // keeps root-checking live blocks after the handover, the
+                    // proof does not stop at the tip — it continues.
+                    //
+                    // A live block that FAILS the fold behaves exactly as a
+                    // replayed one: W1 poisons, the consumer records the
+                    // divergence, and the guard's G1/G2 stop the seam from ever
+                    // publishing again. It cannot un-publish an earlier
+                    // snapshot — but it cannot mint a new one either.
+                    replay_live_tail =
+                        std::make_unique<rp::FoldLiveTail>(
+                            *replay_fold_consumer, *replay_fold_engine,
+                            // EXCLUSIVE floor: the bulk lane's DELIVERED
+                            // high-water, and nothing more aspirational than
+                            // that. The first attempt used
+                            // max(delivered, target_end) and orphaned every
+                            // height in between: the lane raises its ceiling
+                            // as headers arrive, so live blocks 2516933..42
+                            // were refused as "the lane's" and then never
+                            // fetched, leaving the fold 12 short again with
+                            //   [REPLAY-TAIL] held=2 lowest_held=2516943
+                            //                 bulk_floor=2516932
+                            // A ceiling is an intention; only `delivered` is a
+                            // fact. Above it the tail may hold, and it still
+                            // only ever folds engine.height()+1 — the exact
+                            // height and order the lane itself would have
+                            // delivered, with the same block hash — so the W4
+                            // quorum lane sees no difference. Before the lane
+                            // exists the floor is "everything".
+                            [&replay_lane]() -> uint32_t {
+                                if (!replay_lane) return UINT32_MAX;
+                                return replay_lane->delivered();
+                            });
+                    coin_feed_subs.push_back(
+                        coin_state.block_connected.subscribe(
+                            [lt = replay_live_tail.get()]
+                            (const dash::interfaces::BlockConnected& bc) {
+                                lt->offer(bc.height, bc.block);
+                            }));
+
+                    std::cout << "[run] REPLAY SERVE SEAM ARMED: the fold's"
+                                 " root-checked masternode list will populate"
+                                 " the PAYEE queue (source=replay-fold) the"
+                                 " moment it is proven current — G1..G8"
+                                 " fail-closed guard; the dashd-seed and"
+                                 " mn-ckpt lanes are UNCHANGED and keep"
+                                 " whichever job they get to first\n";
+
+                    // CHAIN, do not replace. The maintainer's payee-desync
+                    // re-seed ask fired THREE times in one contabo daemonless
+                    // run (h=2513168, 2513261, 2515266) — the last one on a
+                    // LIVE tip advance, i.e. independently of any bridge
+                    // replay. Answer it from the fold when the fold is still
+                    // proven current (the queue was just wiped, so
+                    // republishing the same height is precisely the repair);
+                    // otherwise fall through to the EXACT handler this
+                    // posture had installed a moment ago.
+                    if (maintainer) {
+                        maintainer->set_on_mn_reseed(
+                            [pp = replay_payee_pub.get(),
+                             fb = mn_reseed_fallback]() {
+                                if (pp && pp->republish_for_reseed()) return;
+                                if (fb) fb();
+                            });
+                    }
+                }
             }
 
             if (!g_replay_bulk_capture_dir.empty()) {
@@ -4994,6 +5201,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 : (g_replay_bulk_start != 0
                        ? g_replay_bulk_start
                        : (testnet ? 1 : rp::MAINNET_DIP3_HEIGHT));
+            // ── THE EXCLUSION BAND (found by the third live seam run) ──────
+            // The lane's default fetch ceiling is tip − 12: the live edge
+            // "belongs to the tip lane" (priority invariant 3). For an
+            // OBSERVE-only throughput lane that is exactly right. For a fold
+            // whose whole purpose is to BE current it is a permanent
+            // 12-block deficit — and nobody else fetches that band, because
+            // the tip lane only pulls the tip's own body. Three runs in a row
+            // parked on it, to the block:
+            //   [REPLAY-PAYEE] WITHHELD: G7 fold is BEHIND the tip:
+            //                  fold h=2516939, tip h=2516951 (12 blocks to go)
+            //
+            // With the fold armed the band is closed. The priority invariant
+            // that actually matters is preserved: the lane still issues no
+            // request while a tracked tip body is outstanding (the tip_busy
+            // guard in BulkFetchLane::tick), so the tip lane keeps winning
+            // every race — it simply no longer wins a band it never enters.
+            // Unarmed (--replay-bulk alone) the default 12 is untouched.
+            if (replay_fold_consumer) rcfg.tip_exclusion = 0;
             replay_lane = std::make_unique<rp::BulkFetchLane>(
                 std::move(seams), rcfg, replay_backfill.get(),
                 replay_consumer, replay_cursor.get());
@@ -5017,10 +5242,22 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             replay_timer->start(1, [ln = replay_lane.get(),
                                     fc = replay_fold_consumer.get(),
                                     br = replay_quorum_bridge.get(),
+                                    pp = replay_payee_pub.get(),
+                                    lt = replay_live_tail.get(),
                                     tick = std::make_shared<uint64_t>(0)] {
                 ln->tick(std::chrono::duration_cast<std::chrono::seconds>(
                     std::chrono::steady_clock::now().time_since_epoch())
                         .count());
+                // Drain any live tip block the fold could not take when it
+                // arrived: the bulk lane advances the cursor on its own
+                // schedule, so contiguity can become satisfiable with no new
+                // arrival to trigger it.
+                if (lt) lt->drain();
+                // THE SERVE SEAM, evaluated once a second: the instant the
+                // fold is proven current the payee queue is populated from it
+                // and the gate's have_mn flips. One-shot; the guard is pure
+                // and cheap, and it says out loud what is still blocking.
+                if (pp) pp->maybe_publish();
                 // The run's deliverable is a COUNT of byte-exact root checks;
                 // print it on a cadence so a run that is killed, wedged or
                 // watched from another terminal still reports what it proved.
@@ -5040,6 +5277,33 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                  << (bs.last_skip_reason.empty()
                                         ? std::string()
                                         : " last_skip=\"" + bs.last_skip_reason + "\"");
+                    }
+                    if (lt && (lt->held() || lt->folded_live())) {
+                        LOG_INFO << "[REPLAY-TAIL] live tip blocks folded="
+                                 << lt->folded_live()
+                                 << " held=" << lt->held()
+                                 << (lt->held()
+                                        ? " lowest_held=" + std::to_string(lt->lowest_held())
+                                          + " (waiting for the bulk lane to close h="
+                                          + std::to_string(lt->lowest_held() - 1) + ")"
+                                        : std::string())
+                                 << " offered=" << lt->offered()
+                                 << " dropped=" << lt->dropped()
+                                 << " bulk_floor=" << lt->bulk_floor();
+                    }
+                    if (pp) {
+                        // The serve seam says its own state: either it has
+                        // populated the payee queue and at what height, or it
+                        // names the ONE guard condition still refusing.
+                        LOG_INFO << "[REPLAY-PAYEE] serve seam: "
+                                 << (pp->has_published()
+                                        ? "PUBLISHED source=replay-fold as_of_h="
+                                          + std::to_string(pp->published_height())
+                                          + " publishes="
+                                          + std::to_string(pp->publishes())
+                                          + " reseeds="
+                                          + std::to_string(pp->reseeds())
+                                        : "WITHHELD — " + pp->last_blocker());
                     }
                 }
             });
@@ -5908,6 +6172,10 @@ int main(int argc, char** argv)
             g_replay_fold_qsnapshot = argv[++i];
         else if (std::strcmp(argv[i], "--replay-fold-worklists") == 0 && i + 1 < argc)
             g_replay_fold_worklists = argv[++i];
+        // THE PROOF POSTURE: keep the dashd RPC (shadow-compare) but cut the
+        // PAYEE axis off from it — see g_no_dashd_mn_seed.
+        else if (std::strcmp(argv[i], "--embedded-no-dashd-mn-seed") == 0)
+            g_no_dashd_mn_seed = true;
         else if (std::strcmp(argv[i], "--oracle-graduation-blocks") == 0 && i + 1 < argc)
             oracle_grad_blocks = std::strtoull(argv[++i], nullptr, 10);
         else if (std::strcmp(argv[i], "--oracle-class-coverage") == 0 && i + 1 < argc)
