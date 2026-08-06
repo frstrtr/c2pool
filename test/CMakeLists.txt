@@ -299,7 +299,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # weight ring buffer (compute_v36_weights), decay table, donation split,
     # window slides. PoW-independent consensus core; socket-free, chain-free.
     # Mirrors the test_dash_conformance link set.
-    add_executable(test_dash_share_tracker test_dash_share_tracker.cpp)
+    add_executable(test_dash_share_tracker test_dash_share_tracker.cpp test_dash_share_remove_owns_data.cpp)
     target_link_libraries(test_dash_share_tracker PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -307,6 +307,8 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_share_tracker PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
+    target_compile_definitions(test_dash_share_tracker PRIVATE  # #1131 source-structural KAT: borrow, don't own, on verified.remove(bad)
+        DASH_SHARE_TRACKER_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/impl/dash/share_tracker.hpp")
     gtest_add_tests(test_dash_share_tracker "" AUTO)
 
     # DASH S8 pool-node leaf 5 (FINAL) slice A — node.hpp skeleton KAT: NodeImpl
