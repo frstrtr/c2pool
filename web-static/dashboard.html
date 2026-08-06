@@ -6480,6 +6480,11 @@
         var _cachedPPLNSPayouts = null;
         function renderMainPPLNS(payouts) {
                 if (!payouts || typeof payouts !== 'object') return;
+                // Coin label from currency_info (per-node truthful). This
+                // treemap hardcoded 'LTC', so on a DASH node every cell and
+                // tooltip read "% LTC".
+                var _pplnsSym = ((typeof currency_info !== 'undefined'
+                                  && currency_info.symbol) || 'COIN').toUpperCase();
                 var pl = document.getElementById('pplns-loading');
                 if (pl) pl.style.display = 'none';
                 var grid = document.getElementById('pplns-main-grid');
@@ -6574,7 +6579,7 @@
                         var el = document.createElement('div');
                         el.className = 'pm-pct';
                         el.style.fontSize = fitPct + 'px';
-                        el.textContent = (r.pct * 100).toFixed(1) + (r.w > 60 ? '% LTC' : '%');
+                        el.textContent = (r.pct * 100).toFixed(1) + (r.w > 60 ? '% ' + _pplnsSym : '%');
                         cell.appendChild(el);
                     }
                     // DOGE %
@@ -6686,7 +6691,7 @@
                             if (mHr > 0) hrLine = '<div style="color:var(--text-secondary)">' + format_hashrate(mHr) + '</div>';
                             tooltip.innerHTML =
                                 '<div style="color:var(--primary);font-weight:700;margin-bottom:4px">' + r.addr + '</div>' +
-                                '<div style="font-weight:600">' + (r.pct*100).toFixed(2) + '% \u2014 ' + r.amt.toFixed(8) + ' LTC</div>' +
+                                '<div style="font-weight:600">' + (r.pct*100).toFixed(2) + '% \u2014 ' + r.amt.toFixed(8) + ' ' + _pplnsSym + '</div>' +
                                 dogeLine + hrLine + verLine +
                                 '<div style="color:var(--text-muted);font-size:0.75em;margin-top:4px">Click to view on Blockchair</div>';
                             tooltip.style.display = 'block';

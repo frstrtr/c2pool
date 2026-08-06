@@ -699,7 +699,15 @@
                 // Use per-share PPLNS from server cache (exact for this share's position)
                 var shortHash = share_hash.substr(0, 16);
                 var sharePplns = null;
-                if (winData.pplns && winData.pplns[shortHash]) {
+                // Preferred source: the PPLNS breakdown carried BY this share's
+                // own document (/web/share/<hash>.pplns), computed on demand
+                // from the share's own window position, subsidy and payment set.
+                // It is exact and needs no server-side per-share precompute
+                // cache — which is what a coin whose work pipeline does not run
+                // core's refresh_work() (i.e. DASH) can never populate.
+                if (share && share.pplns && Object.keys(share.pplns).length > 0) {
+                    sharePplns = share.pplns;
+                } else if (winData.pplns && winData.pplns[shortHash]) {
                     sharePplns = winData.pplns[shortHash];
                 } else if (winData.pplns_current) {
                     sharePplns = winData.pplns_current;
@@ -798,7 +806,11 @@
                             var pctEl = document.createElement('div');
                             pctEl.className = 'pplns-pct';
                             pctEl.style.fontSize = fitPct + 'px';
-                            pctEl.textContent = (r.pct * 100).toFixed(1) + (r.w > 60 ? '% LTC' : '%');
+                            // Coin label from currency_info (per-node truthful),
+                            // never the hardcoded 'LTC' this treemap shipped
+                            // with — on a DASH node it read "% LTC".
+                            pctEl.textContent = (r.pct * 100).toFixed(1)
+                                + (r.w > 60 ? '% ' + symbol.toUpperCase() : '%');
                             cell.appendChild(pctEl);
                         }
 
