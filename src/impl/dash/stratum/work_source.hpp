@@ -38,7 +38,15 @@
 //   - `workers_` is guarded by `workers_mutex_`
 //   - `best_share_hash_fn_` / `mint_share_fn_` guarded by their own mutexes
 //   - the template cache (stage 4c) is guarded by `template_mutex_`
-//   - `coin_state_` has its own internal locking; `dashd_fallback_` is const
+//   - `dashd_fallback_` is const
+//   - `coin_state_` has NO internal locking (#1134 — the line here used to
+//     claim it did, and that claim is what made the background re-source look
+//     safe). `coin::NodeCoinState` contains ZERO mutexes and hands RAW POINTERS
+//     into its live containers out of select_work(), so it may be read ONLY
+//     from the thread that mutates it. In this class that is: cached_work(),
+//     resolve_coin_state_arm() and get_work() — all reached from the single
+//     ioc.run() thread. Everything that runs elsewhere (the refresh_executor_
+//     job) takes a by-value CoinStateArm instead.
 //
 // What's deliberately MVP-incomplete in this 4a skeleton (mirrors
 // dgb::stratum::DGBWorkSource's own 4a landing): every work-generation /
@@ -416,11 +424,86 @@ private:
     /// template source armed / empty template) -- never a fabricated one.
     /// Bumps work_generation_ when a refresh observes a moved coin tip so
     /// stratum sessions re-push work on their next heartbeat.
+    ///
+    /// COIN-STATE-OWNING THREAD ONLY (#1134). This reads NodeCoinState directly
+    /// (the serve-time embedded re-check) and calls resolve_coin_state_arm();
+    /// NodeCoinState carries ZERO mutexes, so it may only be read from the
+    /// thread that mutates it. Every production caller reaches this through
+    /// core::StratumServer, which is constructed over main_dash's `ioc` and
+    /// creates no thread, strand or pool of its own -- so "the caller" is the
+    /// single ioc.run() thread by construction, not by configuration.
     std::shared_ptr<const coin::DashWorkData> cached_work() const;
-    // io-thread-decouple: the blocking select_work()/dashd-GBT re-source, factored
-    // out so it runs either inline (legacy blocking path, no executor wired) OR
-    // on the background rpc_pool thread (via refresh_executor_). Updates the
-    // template cache under template_mutex_.
+
+    /// Everything the template re-source needs to know from NodeCoinState,
+    /// RESOLVED BY VALUE. It deliberately carries no pointer, reference or
+    /// handle into the coin state -- see resolve_coin_state_arm().
+    ///
+    /// This is the DASHWorkSource sibling of EmbeddedOracleShadow::TipJob
+    /// (PR #1135) and of the queue element EmbeddedShadowCompare::on_serve
+    /// already used correctly: the owning thread resolves, the value crosses
+    /// the thread boundary, the reader owns every byte it reads.
+    struct CoinStateArm {
+        /// work_generation_ observed BEFORE any sourcing began (including the
+        /// resolution itself). The negative cache and the stored cache
+        /// generation key off this, so it must be sampled at the FIRST step of
+        /// the re-source, never after it -- see resource_template_now().
+        uint64_t            gen_at_source{0};
+        /// coin_state_.populated() AND the mainnet gate: the embedded arm was
+        /// actually consulted. false => a pure dashd-fallback re-source.
+        bool                try_embedded{false};
+        /// The embedded arm won AND passed the pre-emit hard gate. When false
+        /// the sourcing thread takes the dashd-RPC arm.
+        bool                is_embedded{false};
+        /// The embedded template, DEEP-COPIED out of the selector on the owning
+        /// thread. Meaningful only when is_embedded. DashWorkData is
+        /// all-by-value (coin/rpc_data.hpp) -- owning it is what makes the
+        /// off-thread read safe.
+        coin::DashWorkData  work;
+        /// WHY the fallback arm will be taken, carried out of the SAME branch
+        /// that chose it (never recomputed on the sourcing thread). viable{}
+        /// when is_embedded.
+        coin::DeclineReport decline;
+        /// Height the embedded arm was refusing AT, when the pre-emit gate
+        /// rejected its template. 0 otherwise. Used only to keep an UNARMED
+        /// fallback's h=0 from erasing the one number the operator needs.
+        uint32_t            declined_height{0};
+        /// The resolution itself threw. The sourcing thread reproduces the
+        /// pre-#1134 "template sourcing threw" log + empty-template outcome
+        /// rather than swallowing it.
+        bool                resolve_threw{false};
+        std::string         resolve_error;
+    };
+
+    /// COIN-STATE-OWNING THREAD ONLY (#1134). Reads NodeCoinState -- populated(),
+    /// select_work(), describe_decline(), embedded_template_emit_ok() -- and
+    /// returns a self-contained VALUE. NodeCoinState has ZERO mutexes and
+    /// select_work() hands RAW POINTERS into its live containers
+    /// (node_coin_state.hpp `&m_mnstates` / `&m_sml`) which the template
+    /// assembly then dereferences, so reading it from the rpc_pool thread while
+    /// the coin-P2P maintainer mutates it on the io thread is the 2026-08-05
+    /// hotel heap-corruption shape -- on the SERVE path this time. Everything
+    /// downstream of this call runs off a copy.
+    ///
+    /// The select_work() fallback arm is bound to a NO-OP here on purpose: the
+    /// real fallback is a dashd getblocktemplate behind NodeRPC::m_rpc_mutex
+    /// (12 s socket deadline) and this may run on the io thread. The dashd RPC
+    /// is taken by resource_template_now() instead -- same call, same count, on
+    /// whichever thread the re-source itself runs.
+    CoinStateArm resolve_coin_state_arm() const;
+
+    // io-thread-decouple: the blocking dashd-GBT re-source + cache update,
+    // factored out so it runs either inline (legacy blocking path, no executor
+    // wired) OR on the background rpc_pool thread (via refresh_executor_).
+    // Updates the template cache under template_mutex_.
+    //
+    // ANY THREAD (#1134). This overload must NEVER name coin_state_: everything
+    // it knows about the embedded arm arrives in `arm`, already resolved and
+    // copied by resolve_coin_state_arm() on the owning thread. The structural
+    // guard in test/test_dash_work_source_ownership.cpp pins that.
+    void resource_template_now(CoinStateArm arm) const;
+
+    // Convenience for the inline (no-executor) path: resolve on THIS thread and
+    // source immediately. Identical to the pre-#1134 single-function form.
     void resource_template_now() const;
 
 public:

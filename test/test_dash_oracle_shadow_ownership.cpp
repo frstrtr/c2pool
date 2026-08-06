@@ -43,6 +43,11 @@
 #ifndef DASH_MAIN_SRC
 #error "DASH_MAIN_SRC must be defined by CMake to the path of src/c2pool/main_dash.cpp"
 #endif
+// #1134: the superseded arm-guard tripwire below now asserts the ownership split
+// in the work source itself, so it needs that source too.
+#ifndef DASH_WORK_SOURCE_SRC
+#error "DASH_WORK_SOURCE_SRC must be defined by CMake to the path of src/impl/dash/stratum/work_source.cpp"
+#endif
 
 namespace {
 
@@ -241,43 +246,62 @@ TEST(DashOracleShadowOwnership, PendingSlotHoldsTheJobByValue)
 }
 
 // ── The SIBLING exposure: DASHWorkSource::resource_template_now() ───────────
-// work_source.cpp:335/:346/:353/:371/:383 read NodeCoinState (populated(),
-// select_work(), describe_decline(), embedded_template_emit_ok()) and can run
-// on the rpc_pool worker (main_dash.cpp:5056) when refresh_executor_ is wired.
-// That is the SAME unguarded-read shape as the oracle-shadow bug — and today
-// the ONLY thing that makes it safe is ARM EXCLUSIVITY: the executor is
-// installed under `!coin_p2p`, while every NodeCoinState MUTATOR lives inside
-// the `if (coin_p2p)` block, so on the arm that has the worker the coin state
-// is write-quiescent. That is an accident of configuration, not an invariant,
-// and main_dash.cpp:4197-4204 explicitly anticipates extending io-decouple to
-// the coin_p2p arm. This test makes that day RED instead of silent.
+// SUPERSEDED BY #1134. This test was `RefreshExecutorStaysOffTheCoinP2PArm`.
 //
-// It deliberately does NOT change the serve path — the fix belongs in its own
-// PR (see the tracking issue referenced in the PR body).
-TEST(DashOracleShadowOwnership, RefreshExecutorStaysOffTheCoinP2PArm)
+// When #1135 landed, DASHWorkSource::resource_template_now() read NodeCoinState
+// (populated(), select_work(), describe_decline(), embedded_template_emit_ok())
+// and ran on the rpc_pool worker whenever refresh_executor_ was wired — the same
+// unguarded-read shape as the oracle-shadow bug, on the SERVE path. The ONLY
+// thing that made it safe was ARM EXCLUSIVITY: the executor was installed under
+// `!coin_p2p` while every NodeCoinState MUTATOR lived inside `if (coin_p2p)`, so
+// on the arm that had the worker the coin state happened to be write-quiescent.
+// This test asserted that configuration coincidence, because a tripwire was all
+// #1135 could offer without touching the serve path.
+//
+// #1134 replaced the coincidence with OWNERSHIP: resolve_coin_state_arm() makes
+// every NodeCoinState read on the owning thread and hands the background job a
+// by-value CoinStateArm. The `!coin_p2p` condition is therefore no longer
+// load-bearing for this shape, and continuing to assert it would pin the exact
+// configuration detail the dashd cut is going to relax.
+//
+// What this test pins INSTEAD: the executor may be installed on either arm,
+// PROVIDED the function that executor runs owns everything it reads. Revert the
+// split -> RED, with the arm-guard warning restated. The full serve-path guard
+// (every reader enumerated by name, the by-value handoff, the no-op fallback)
+// lives in test/test_dash_work_source_ownership.cpp.
+TEST(DashOracleShadowOwnership, RefreshExecutorArmGuardSupersededByCoinStateOwnership)
 {
     const std::string src = strip_comments(read_main_dash());
     ASSERT_EQ(count_of(src, "set_refresh_executor("), 1u)
         << "expected exactly one set_refresh_executor() install site in main_dash.cpp";
-    const size_t at = src.find("set_refresh_executor(");
-    ASSERT_NE(at, std::string::npos);
 
-    // Nearest enclosing top-level (4-space indent) `if (` before the install.
-    const std::string head = src.substr(0, at);
-    const size_t if_at = head.rfind("\n    if (");
-    ASSERT_NE(if_at, std::string::npos)
-        << "set_refresh_executor() is no longer inside a top-level if — the arm "
-           "guard cannot be verified.";
-    const size_t eol = src.find('\n', if_at + 1);
-    const std::string cond = src.substr(if_at + 1, eol - if_at - 1);
+    const std::string ws = strip_comments(read_text(DASH_WORK_SOURCE_SRC));
 
-    EXPECT_NE(cond.find("!coin_p2p"), std::string::npos)
-        << "The rpc_pool refresh executor is being installed WITHOUT the "
-           "!coin_p2p guard. DASHWorkSource::resource_template_now() then reads "
-           "NodeCoinState (select_work -> raw pointers into m_mnstates/m_sml) on "
-           "a worker thread while the coin-P2P maintainer mutates it on the io "
-           "thread — the 2026-08-05 heap-corruption shape, on the SERVE path "
-           "this time. Resolve on the io thread and hand the worker a value "
-           "(the on_new_tip pattern) before relaxing this. Condition was: "
-        << cond;
+    // (1) The ownership handoff exists: the executor-run overload takes the
+    //     already-resolved arm BY VALUE.
+    const size_t sig =
+        ws.find("void DASHWorkSource::resource_template_now(CoinStateArm arm)");
+    ASSERT_NE(sig, std::string::npos)
+        << "resource_template_now(CoinStateArm) is gone — the #1134 ownership "
+           "split has been reverted, so the rpc_pool job resolves the arm itself "
+           "again and the only thing between this node and the 2026-08-05 heap "
+           "corruption is the !coin_p2p install guard in main_dash.cpp. Restore "
+           "the split before relaxing that guard.";
+
+    // (2) The function the executor runs never names the coin state.
+    const size_t close = ws.find("\n}\n", sig);
+    ASSERT_NE(close, std::string::npos)
+        << "resource_template_now(CoinStateArm) has no terminator";
+    const std::string body = ws.substr(sig, close - sig);
+    EXPECT_EQ(body.find("coin_state_"), std::string::npos)
+        << "resource_template_now() reads NodeCoinState again. It runs on the "
+           "rpc_pool worker whenever refresh_executor_ is wired; NodeCoinState "
+           "has ZERO mutexes and select_work() hands raw pointers into "
+           "m_mnstates/m_sml. Resolve on the owning thread "
+           "(resolve_coin_state_arm) and pass a value.";
+
+    // (3) And the owning-thread resolver is where those reads went.
+    EXPECT_NE(ws.find("DASHWorkSource::resolve_coin_state_arm()"), std::string::npos)
+        << "resolve_coin_state_arm() is missing — there is no owning-thread "
+           "resolver for the background job to take its value from.";
 }

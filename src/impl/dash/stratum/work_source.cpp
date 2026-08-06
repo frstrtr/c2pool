@@ -315,20 +315,52 @@ int64_t DASHWorkSource::peek_template_age_sec() const
 // IWorkSource: work generation -- Stage 4c (the template trio).
 // ─────────────────────────────────────────────────────────────────────────────
 
-void DASHWorkSource::resource_template_now() const
-{
-    // The blocking select_work()/dashd-GBT re-source + cache update. Runs either
-    // inline on the caller (legacy blocking path) OR on the background rpc_pool
-    // thread (io-thread-decouple, via refresh_executor_). select_work() is done
-    // OUTSIDE the lock (the fallback arm is a blocking dashd RPC); the cache is
-    // then updated under template_mutex_.
+// ─────────────────────────────────────────────────────────────────────────────
+// #1134 — OWNERSHIP SPLIT ON THE SERVE PATH.
+//
+// resource_template_now() used to read NodeCoinState itself, and it runs on the
+// background rpc_pool thread whenever refresh_executor_ is wired. NodeCoinState
+// has ZERO mutexes and select_work() hands RAW POINTERS into its live containers
+// (`&m_mnstates`, `&m_sml`) which build_embedded_workdata() then dereferences
+// for the WHOLE template assembly — the identical shape that took the hotel
+// primary down with glibc heap corruption on 2026-08-05 (PR #1135), except this
+// one is on the path that serves miners.
+//
+// It did not fire only because of ARM EXCLUSIVITY: the executor is installed
+// under `!coin_p2p` while every NodeCoinState mutator lives inside
+// `if (coin_p2p)`, so on the arm that has the worker the coin state happened to
+// be write-quiescent. Nothing in the code enforced that, and removing --coin-rpc
+// steers the process straight into the combination it depends on being
+// impossible.
+//
+// The split below is a LIFETIME/OWNERSHIP change only:
+//
+//   resolve_coin_state_arm()      OWNING THREAD. Every NodeCoinState read.
+//                                 Returns a self-contained value.
+//   resource_template_now(arm)    ANY THREAD. Every dashd RPC, the arm log,
+//                                 the journal, the cache update. Names no
+//                                 coin state at all.
+//
+// Same shape as EmbeddedOracleShadow::on_new_tip/process_tip (#1135) and
+// EmbeddedShadowCompare::on_serve. NOT a mutex on NodeCoinState — see the PR
+// body: this is the hot serve path (26 sessions per work-generation bump), a
+// lock across select_work() is a lock across a 12 s dashd RPC deadline, the
+// class exposes many reference-returning accessors so a partial lock only LOOKS
+// safe, and WorkSelection is already all-by-value so the copy is not new work.
+// ─────────────────────────────────────────────────────────────────────────────
 
-    // Captured BEFORE sourcing: a failed attempt negative-caches against THIS
-    // generation, so an event (work-generation bump) that lands while the
-    // blocking source runs still breaks through the retry throttle (soak0804e
-    // resume-quantization fix — see cached_work()).
-    const uint64_t gen_at_source =
-        work_generation_.load(std::memory_order_relaxed);
+DASHWorkSource::CoinStateArm DASHWorkSource::resolve_coin_state_arm() const
+{
+    CoinStateArm arm;
+
+    // Captured BEFORE sourcing — and the resolution IS the first step of
+    // sourcing. A failed attempt negative-caches against THIS generation, so an
+    // event (work-generation bump) that lands while the blocking source runs
+    // still breaks through the retry throttle (soak0804e resume-quantization
+    // fix — see cached_work()). Sampling it here rather than on the rpc_pool
+    // thread additionally covers the queueing delay, which can only ever make
+    // the cache MORE willing to re-source, never less.
+    arm.gen_at_source = work_generation_.load(std::memory_order_relaxed);
 
     // ── Mainnet embedded gate (v0.2.4 trigger) ──────────────────────────────
     // The SML/QuorumManager wiring emits a real DIP-0004 type-5 CCbTx, and its
@@ -341,65 +373,137 @@ void DASHWorkSource::resource_template_now() const
     // (SML+quorum fresh at the tip, non-superblock, credit-pool seed height at
     // tip, bestCL fresh) fails safe to the fallback, so no invalid template mines.
     const bool embedded_arm_enabled = is_testnet_ || embedded_mainnet_;
-    if (!embedded_arm_enabled && coin_state_.populated()) {
-        static std::once_flag mainnet_gate_logged;
-        std::call_once(mainnet_gate_logged, [] {
-            LOG_WARNING << "[DASH-STRATUM-GBT] embedded template arm disabled on "
-                           "mainnet (byte-parity proven; enable with --embedded-mainnet) "
-                           "— using dashd-RPC fallback";
-        });
+    try {
+        const bool populated = coin_state_.populated();
+        if (!embedded_arm_enabled && populated) {
+            static std::once_flag mainnet_gate_logged;
+            std::call_once(mainnet_gate_logged, [] {
+                LOG_WARNING << "[DASH-STRATUM-GBT] embedded template arm disabled on "
+                               "mainnet (byte-parity proven; enable with --embedded-mainnet) "
+                               "— using dashd-RPC fallback";
+            });
+        }
+        arm.try_embedded = embedded_arm_enabled && populated;
+
+        // Nothing to source at all (no embedded arm AND no dashd arm): leave the
+        // arm empty and do NOT consult the clause list. Byte-identical to the
+        // pre-split `if (try_embedded || dashd_fallback_)` guard.
+        if (!arm.try_embedded && !dashd_fallback_) return arm;
+
+        if (!arm.try_embedded) {
+            // The mainnet gate refused BEFORE viability was ever consulted;
+            // name that, or the operator reads "dashd-fallback" and starts
+            // hunting a coin-state fault that does not exist.
+            if (!embedded_arm_enabled) {
+                // The mainnet opt-in is off, so viability was never even
+                // consulted. Name the GATE, not the coin state -- an
+                // operator here must flip a flag, not chase a sync fault.
+                arm.decline.viable    = false;
+                arm.decline.cause     = "mainnet-gate-off";
+                arm.decline.value     = "embedded_mainnet=false";
+                arm.decline.threshold = "--embedded-mainnet";
+            } else {
+                // Armed but unpopulated. Ask THE clause list rather than
+                // restating a poorer version of it here; that duplication
+                // is precisely the drift this design exists to prevent.
+                arm.decline = coin_state_.describe_decline();
+            }
+            return arm;
+        }
+
+        // THE embedded-arm resolution. The fallback closure is a NO-OP: this may
+        // run on the io thread and the real fallback is a dashd getblocktemplate
+        // RPC. select_dash_work() only invokes the fallback on the non-viable
+        // branch, so binding it to an empty template here changes nothing except
+        // WHICH THREAD makes the RPC — resource_template_now() makes exactly the
+        // same one, exactly once, below.
+        coin::WorkSelection sel =
+            coin_state_.select_work([]() { return coin::DashWorkData{}; });
+        if (sel.source != coin::WorkSource::Embedded) {
+            arm.decline = std::move(sel.decline);
+            return arm;
+        }
+
+        // BLOCKER-3 pre-emit HARD GATE (PR #780): re-validate an EMBEDDED
+        // template's CbTx against consensus invariants (both roots recomputed,
+        // DKG/superblock/bestCL/credit-pool-height guards) before it can be
+        // served; on any failure DISCARD it for the reward-safe dashd arm.
+        // Evaluated HERE, beside the selection it judges, because it reads the
+        // same unguarded containers.
+        coin::DeclineReport emit_why;
+        if (!coin_state_.embedded_template_emit_ok(sel.work, &emit_why)) {
+            // Keep the height the embedded arm was refusing AT: on a daemonless
+            // node the fallback arm is UNARMED and returns an empty template
+            // (m_height == 0), and "h=0" told the operator nothing — it is the
+            // single most misleading field in the measured 08-03 fallback lines.
+            arm.declined_height = sel.work.m_height;
+            arm.decline         = std::move(emit_why);
+            return arm;
+        }
+
+        arm.is_embedded = true;
+        arm.work        = std::move(sel.work);   // DEEP COPY, owned by the value
+        arm.decline     = std::move(sel.decline);
+    } catch (const std::exception& e) {
+        // Reproduced verbatim by resource_template_now() so the log line and the
+        // empty-template outcome are byte-identical to the pre-split form.
+        arm.resolve_threw = true;
+        arm.resolve_error = e.what();
+    } catch (...) {
+        // NOTHING here throws a non-std exception today, but this resolution now
+        // runs on the io thread BETWEEN template_refresh_inflight_ being claimed
+        // and the job being posted. An escape there would strand the
+        // single-flight flag set forever and wedge every future re-source, so it
+        // fails closed into the same empty-template path instead.
+        arm.resolve_threw = true;
+        arm.resolve_error = "unknown exception";
     }
+    return arm;
+}
+
+void DASHWorkSource::resource_template_now() const
+{
+    // Inline (no-executor) path: resolve and source on this thread, exactly as
+    // the single pre-#1134 function did.
+    resource_template_now(resolve_coin_state_arm());
+}
+
+void DASHWorkSource::resource_template_now(CoinStateArm arm) const
+{
+    // The blocking dashd-GBT re-source + cache update. Runs either inline on the
+    // caller (legacy blocking path) OR on the background rpc_pool thread
+    // (io-thread-decouple, via refresh_executor_). The RPC is done OUTSIDE the
+    // lock; the cache is then updated under template_mutex_.
+    //
+    // THREAD CONTRACT (#1134): this function must NEVER name coin_state_.
+    // Everything it knows about the embedded arm arrived in `arm`, already
+    // resolved and deep-copied on the owning thread.
+    const uint64_t gen_at_source = arm.gen_at_source;
 
     coin::DashWorkData work;
     bool work_is_embedded = false;   // tracks the FINAL sourced arm for the cache tag
-    const bool try_embedded = embedded_arm_enabled && coin_state_.populated();
-    if (try_embedded || dashd_fallback_) {
+    if (arm.resolve_threw) {
+        LOG_WARNING << "[DASH-STRATUM] template sourcing threw: " << arm.resolve_error;
+        work = coin::DashWorkData{};
+    } else if (arm.try_embedded || dashd_fallback_) {
         try {
-            // Mainnet-gated: bypass select_work and source the reward-safe dashd
-            // fallback directly; testnet/regtest picks embedded-when-viable.
             coin::WorkSelection sel;
-            if (try_embedded) {
-                sel = coin_state_.select_work(dashd_fallback_);
+            if (arm.is_embedded) {
+                sel = coin::WorkSelection{ std::move(arm.work),
+                                           coin::WorkSource::Embedded,
+                                           arm.decline };
             } else {
-                // The mainnet gate refused BEFORE viability was ever consulted;
-                // name that, or the operator reads "dashd-fallback" and starts
-                // hunting a coin-state fault that does not exist.
-                coin::DeclineReport gated;
-                if (!embedded_arm_enabled) {
-                    // The mainnet opt-in is off, so viability was never even
-                    // consulted. Name the GATE, not the coin state -- an
-                    // operator here must flip a flag, not chase a sync fault.
-                    gated.viable    = false;
-                    gated.cause     = "mainnet-gate-off";
-                    gated.value     = "embedded_mainnet=false";
-                    gated.threshold = "--embedded-mainnet";
-                } else {
-                    // Armed but unpopulated. Ask THE clause list rather than
-                    // restating a poorer version of it here; that duplication
-                    // is precisely the drift this design exists to prevent.
-                    gated = coin_state_.describe_decline();
-                }
-                sel = coin::WorkSelection{
-                    dashd_fallback_ ? dashd_fallback_() : coin::DashWorkData{},
-                    coin::WorkSource::DashdFallback, std::move(gated) };
-            }
-            // BLOCKER-3 pre-emit HARD GATE (PR #780): re-validate an EMBEDDED
-            // template's CbTx against consensus invariants (both roots recomputed,
-            // DKG/superblock/bestCL/credit-pool-height guards) before it can be
-            // served; on any failure DISCARD it for the reward-safe dashd arm.
-            coin::DeclineReport emit_why;
-            if (sel.source == coin::WorkSource::Embedded
-                && !coin_state_.embedded_template_emit_ok(sel.work, &emit_why)) {
-                const uint32_t declined_h = sel.work.m_height;
-                sel = coin::WorkSelection{
-                    dashd_fallback_ ? dashd_fallback_() : coin::DashWorkData{},
-                    coin::WorkSource::DashdFallback, emit_why };
-                // On a daemonless node the fallback arm is UNARMED and returns
-                // an empty template (m_height == 0). Keep the height the
-                // embedded arm was refusing AT -- "h=0" told the operator
-                // nothing, and it is the single most misleading field in the
-                // measured 08-03 fallback lines.
-                if (sel.work.m_height == 0) sel.work.m_height = declined_h;
+                // The fallback arm: the blocking dashd getblocktemplate. This is
+                // the ONLY reason the io-decouple exists, and it stays here — on
+                // whichever thread the re-source runs — rather than moving onto
+                // the io thread with the coin-state resolution.
+                coin::DashWorkData fb =
+                    dashd_fallback_ ? dashd_fallback_() : coin::DashWorkData{};
+                if (fb.m_height == 0 && arm.declined_height != 0)
+                    fb.m_height = arm.declined_height;
+                sel = coin::WorkSelection{ std::move(fb),
+                                           coin::WorkSource::DashdFallback,
+                                           arm.decline };
             }
             // GBT-xcheck reward-safety BACKSTOP (soak): when enabled and a dashd
             // is reachable, cross-check the embedded CbTx creditPoolBalance
@@ -611,8 +715,18 @@ nlohmann::json DASHWorkSource::embedded_arm_status_json() const
 
 std::shared_ptr<const coin::DashWorkData> DASHWorkSource::cached_work() const
 {
+    // COIN-STATE-OWNING THREAD ONLY (#1134) — see the declaration. This body
+    // reads NodeCoinState (the serve-time embedded re-check below) and resolves
+    // the arm for the background job; NodeCoinState has no lock. Production
+    // reaches here only through core::StratumServer, which shares main_dash's
+    // single-threaded `ioc` and creates no thread, strand or pool of its own.
     const uint64_t gen = work_generation_.load(std::memory_order_relaxed);
     const auto now = std::chrono::steady_clock::now();
+    // Deferred to AFTER template_mutex_ is released: resolving the arm can build
+    // a full embedded template, and holding the template lock across that would
+    // stall peek_template() on the dashboard thread for no reason.
+    bool post_refresh = false;
+    std::shared_ptr<const coin::DashWorkData> executor_serve;
     {
         std::lock_guard<std::mutex> lk(template_mutex_);
         // FRESH cache (same generation, inside the TTL) -> serve it. The
@@ -640,9 +754,9 @@ std::shared_ptr<const coin::DashWorkData> DASHWorkSource::cached_work() const
 
         if (refresh_executor_) {
             // NON-BLOCKING scale path (the fix for 60+ sessions freezing on each
-            // re-source): the io thread NEVER runs the blocking select_work()/
-            // dashd-GBT. Hand it to the background rpc_pool as a SINGLE-FLIGHT
-            // job and serve the CURRENT cache (possibly stale, or null on a
+            // re-source): the io thread NEVER runs the blocking dashd-GBT. Hand
+            // it to the background rpc_pool as a SINGLE-FLIGHT job and serve the
+            // CURRENT cache (possibly stale, or null on a
             // set-gap) immediately. A minted share bumps the generation ~every
             // 15-30 s; before, that blocked the io thread on a full GBT -- now it
             // costs one background fetch, coalesced. A stale serve is bounded by
@@ -661,24 +775,48 @@ std::shared_ptr<const coin::DashWorkData> DASHWorkSource::cached_work() const
                 && template_last_fail_at_.time_since_epoch().count() != 0
                 && now - template_last_fail_at_ < kRetryAfter
                 && template_last_fail_gen_ == gen;
-            if (!recently_failed && !template_refresh_inflight_.exchange(true)) {
-                refresh_executor_([this]() {
-                    resource_template_now();
-                    template_refresh_inflight_.store(false);
-                });
-            }
-            return template_cache_;   // stale-or-null; null == honest set-gap
+            if (!recently_failed && !template_refresh_inflight_.exchange(true))
+                post_refresh = true;
+            // Snapshot the cache UNDER the lock, exactly as the pre-#1134 form
+            // returned it under the lock: the background job cannot have run
+            // yet (it is posted below and must take template_mutex_ to store),
+            // so this is the same stale-or-null value.
+            executor_serve = template_cache_;   // null == honest set-gap
+        } else {
+            // Legacy inline-blocking path (executor not wired: embedded/tests) --
+            // BYTE-IDENTICAL to the pre-decouple behaviour. Negative cache: a recent
+            // failed sourcing attempt -> don't re-poll yet — UNLESS the generation
+            // moved since the failure (an event changed the answer; same
+            // soak0804e break-through as the executor path above).
+            if (!template_cache_ && template_last_fail_at_.time_since_epoch().count() != 0
+                && now - template_last_fail_at_ < kRetryAfter
+                && template_last_fail_gen_ == gen)
+                return nullptr;
         }
+    }
 
-        // Legacy inline-blocking path (executor not wired: embedded/tests) --
-        // BYTE-IDENTICAL to the pre-decouple behaviour. Negative cache: a recent
-        // failed sourcing attempt -> don't re-poll yet — UNLESS the generation
-        // moved since the failure (an event changed the answer; same
-        // soak0804e break-through as the executor path above).
-        if (!template_cache_ && template_last_fail_at_.time_since_epoch().count() != 0
-            && now - template_last_fail_at_ < kRetryAfter
-            && template_last_fail_gen_ == gen)
-            return nullptr;
+    if (refresh_executor_) {
+        if (post_refresh) {
+            // ── #1134: THE OWNERSHIP HANDOFF ────────────────────────────────
+            // Resolve every NodeCoinState-dependent input HERE, on the thread
+            // that owns the coin state, and hand the background pool a
+            // self-contained VALUE. Before this, the posted job called
+            // resource_template_now() which read populated() / select_work() /
+            // describe_decline() / embedded_template_emit_ok() on the rpc_pool
+            // thread — select_work() hands raw pointers into m_mnstates/m_sml
+            // and the template assembly dereferences them for its whole
+            // duration, so a concurrent maintainer write was the 2026-08-05
+            // heap-corruption shape, on the serve path.
+            //
+            // The dashd getblocktemplate RPC — the ONLY reason the decouple
+            // exists — still runs inside the posted job, off this thread.
+            CoinStateArm arm = resolve_coin_state_arm();
+            refresh_executor_([this, arm = std::move(arm)]() mutable {
+                resource_template_now(std::move(arm));
+                template_refresh_inflight_.store(false);
+            });
+        }
+        return executor_serve;   // stale-or-null; null == honest set-gap
     }
 
     // Legacy path only: re-source inline (blocks the caller) then serve.
