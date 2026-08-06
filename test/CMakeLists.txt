@@ -918,9 +918,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     # source-structural guard over embedded_oracle_shadow.hpp + main_dash.cpp,
     # so it needs no link deps of its own; the compile definitions hand it the
     # paths to the SHIPPED sources.
+    # D-DASH.WORKSOURCE-OWNERSHIP (#1134) is its SERVE-path sibling and rides the
+    # same target for the same reason — it guards stratum/work_source.{cpp,hpp}
+    # by source text, so it adds no link deps either.
     add_executable(test_dash_node_coin_state
         test_dash_node_coin_state.cpp
-        test_dash_oracle_shadow_ownership.cpp)
+        test_dash_oracle_shadow_ownership.cpp
+        test_dash_work_source_ownership.cpp)
     target_link_libraries(test_dash_node_coin_state PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -930,7 +934,9 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_node_coin_state PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     target_compile_definitions(test_dash_node_coin_state PRIVATE
         DASH_ORACLE_SHADOW_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/impl/dash/coin/embedded_oracle_shadow.hpp"
-        DASH_MAIN_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/c2pool/main_dash.cpp")
+        DASH_MAIN_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/c2pool/main_dash.cpp"
+        DASH_WORK_SOURCE_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/impl/dash/stratum/work_source.cpp"
+        DASH_WORK_SOURCE_HDR="${CMAKE_CURRENT_SOURCE_DIR}/../src/impl/dash/stratum/work_source.hpp")
     gtest_add_tests(test_dash_node_coin_state "" AUTO)
 
     # bestCL template gate: dashcore's CheckCbTxBestChainlock rule (consensus-
