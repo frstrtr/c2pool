@@ -2018,7 +2018,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                      [](unsigned char c) { return std::isspace(c); }),
                       pin_hex.end());
         bool pin_ok = !pin_hex.empty() && pin_hex.size() % 2 == 0;
-        MutableTransaction pin_tx;
+        dash::coin::MutableTransaction pin_tx;
         if (pin_ok) {
             try {
                 auto raw = ParseHex(pin_hex);
