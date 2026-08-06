@@ -4325,6 +4325,18 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 if (cp) cp->send_getmnlistd(uint256::ZERO, tip);
             });
 
+        // Fourth-axis conjunct companion (#1153 policy wired to the ordering
+        // fix): when the serve-tip promotion is held because the SML currency
+        // is stuck behind the header tip, re-drive the INCREMENTAL getmnlistd
+        // the tip-change path already sends (base = where the SML is, target =
+        // the header tip). This is what keeps the conjunct from turning a
+        // dropped/lost diff into a silent doomed-tip window. Bounded inside the
+        // maintainer's SmlResyncWatchdog; this closure only forwards.
+        maintainer->set_on_sml_rerequest(
+            [cp = coin_p2p.get()](const uint256& base, const uint256& target) {
+                if (cp) cp->send_getmnlistd(base, target);
+            });
+
         // ChainLock verifier: BLS-verify a relayed clsig against the quorum
         // dashcore's SelectQuorumForSigning says must have signed it, before
         // the maintainer may adopt its height as the CCbTx bestCL*. Candidate
