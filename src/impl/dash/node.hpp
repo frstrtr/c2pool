@@ -377,6 +377,10 @@ protected:
     // on any recent job stays fully backable; a tx leaves m_known_txs only once it
     // has fallen out of EVERY retained set (peer-remembered txs are separate).
     static constexpr size_t RETAINED_TEMPLATE_TX_SETS = 8;
+    // #950: canonical p2pool's max_remembered_txs_size (p2p.py:30). A peer
+    // disconnects if an inbound remember_tx pushes its remembered_txs_size
+    // over this (p2p.py:488), so the standing-remember seed stays under it.
+    static constexpr std::size_t MAX_REMEMBERED_TXS_SIZE = 2500000;
     std::deque<std::set<uint256>> m_recent_template_tx_sets;
     // Fired on the IO thread when run_think() elects a new best share
     // (p2pool: new_work_event) — main_dash binds the stratum work refresh.
@@ -812,6 +816,18 @@ public:
         // landing on top of it. See core/tx_advertiser.hpp.
         advertise_known_txs(peer);
 
+        // #950: seed this freshly-connected peer's STANDING remembered set
+        // (canonical p2p.py:269). A peer's "txpool" for us (web.py:673
+        // remembered_txs_size) is fed ONLY by remember_tx bodies; c2pool
+        // emitted none outside the transient sendShares bracket, so every
+        // peer showed txpool == 0 (#950). Post-#863 the socket write queue
+        // drains composed writes in strict submission order
+        // (core/socket.cpp:110-145), so this no longer risks the mid-message
+        // interleave the comment above warns of — it is safely queued after
+        // the have_tx advert. Bounded by MAX_REMEMBERED_TXS_SIZE so a
+        // canonical peer never disconnects us on overflow (p2p.py:488).
+        send_standing_remember(peer);
+
         // #754 join trigger (oracle p2p.py handle_version → node.py
         // handle_share_hashes): a peer advertising a best share we don't have
         // is THE download entry point for an empty node joining an
@@ -1126,6 +1142,14 @@ public:
         for (auto& entry : m_peers)
             advertise_one(entry.second);
     }
+
+    /// #950: seed a freshly-connected peer's STANDING remembered set with the
+    /// txs we already hold, bounded by MAX_REMEMBERED_TXS_SIZE (canonical
+    /// p2p.py:269, :30/:488). IO-THREAD ONLY (handle_version handler): reads
+    /// IO-confined m_known_txs, same discipline as advertise_known_txs.
+    /// Defined in node.cpp because it serializes tx bytes (pack /
+    /// TX_WITH_WITNESS) to size the per-peer cap.
+    void send_standing_remember(const peer_ptr& peer);
 
     /// Broadcast a new best-block notification to every connected pool peer.
     /// Straight port of the LTC reference (src/impl/ltc/node.hpp:316-320; same
