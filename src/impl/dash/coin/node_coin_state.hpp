@@ -93,6 +93,37 @@ enum class BestClPolicy { Off, Freshness, ConsensusExact };
 ///                      nothing can be overstated.
 enum class UtxoImmaturePolicy { ServeEmptyTxSet, Refuse };
 
+/// The DISCRIMINATING tail of a block-hash display hex, for log/diagnostic use.
+///
+/// WHY THIS EXISTS (measured, hotel node 109.161.52.148, 2026-08-06). Every
+/// `dmn-stale` refusal in a 5h33m window printed
+///
+///     cause=dmn-stale value=000000000000 threshold=000000000000
+///
+/// — 114 of 114 identical, and the two sides equal, on a refusal whose ENTIRE
+/// meaning is that the two sides DIFFER. The fields were not unpopulated: they
+/// were `uint256::GetHex().substr(0, 12)`, i.e. the twelve MOST-significant
+/// nibbles of a PROOF-OF-WORK hash, which are zero by construction. The live
+/// tip hashes in the same log confirm it directly: `000000000000000e`,
+/// `000000000000001c`, `0000000000000018` — at mainnet difficulty the first
+/// ~14 nibbles are the difficulty padding and carry no information at all.
+///
+/// So the operator contract established by #1039 ("every decline names cause,
+/// value and threshold") was honoured in SHAPE and empty in SUBSTANCE, and no
+/// one could tell a genuinely stale DML from a broken predicate. Taking the
+/// TAIL instead of the head is the whole fix: the low-order nibbles are the
+/// hash's entropy.
+///
+/// Deliberately NOT applied to ProTx / transaction hashes elsewhere in this
+/// file (`mn-confirm-rollover-pending`, `mn-payout-split-unprovable`): those
+/// are ordinary double-SHA256 tx ids with no difficulty padding, so their
+/// leading nibbles ARE discriminating and their existing rendering is correct.
+inline std::string discriminating_hash_tail(const uint256& h, size_t n = 12)
+{
+    const std::string hex = h.GetHex();
+    return hex.size() <= n ? hex : hex.substr(hex.size() - n);
+}
+
 /// In-process coin-state the running node maintains for LOCAL template
 /// assembly. Non-copyable: it owns a Mempool (itself non-copyable) and is
 /// node-owned, never duplicated. The maintainer mutates mnstates()/mempool()
@@ -141,6 +172,23 @@ public:
     /// dashd fallback until the SML catches up to the new tip).
     void set_sml_current_hash(const uint256& h) { m_sml_current_hash = h; }
     const uint256& sml_current_hash() const { return m_sml_current_hash; }
+
+    /// The HEIGHT that same applied SML is current at, authoritative off the
+    /// accepted diff's own cbTx.nHeight (CoinStateMaintainer::m_sml_current_height).
+    /// -1 = never reported.
+    ///
+    /// DIAGNOSTIC-ONLY — nothing in the viability decision reads it. It exists
+    /// because the `dmn-stale` refusal below compares two BLOCK HASHES, and a
+    /// hash can only ever say "different", never "how far behind". Every long
+    /// dmn-stale episode measured on the hotel node (2026-08-06: 5 episodes,
+    /// 586 s of the 592 s total) was closed by the NEXT BLOCK arriving rather
+    /// than by the SML catching up at the same tip — a distinction the hash
+    /// alone cannot express, and the height makes obvious at a glance.
+    ///
+    /// Published from the SAME statement that publishes the hash, so the pair
+    /// can never disagree about which block it describes.
+    void set_sml_current_height(int64_t h) { m_sml_current_height = h; }
+    int64_t sml_current_height_dbg() const { return m_sml_current_height; }
 
     /// Seed the version-appropriate CCbTx fields the SML/quorum roots do not
     /// carry: the best-ChainLock height+signature and the DIP-0027 credit-pool
@@ -1241,11 +1289,25 @@ private:
             d = refuse("quorum-unhealthy", "quorum-tail-parse-failed", "parsed-ok");
         else if (m_require_sml && m_sml_current_hash != m_prev_hash)
             // A ZERO sml hash is "cold / wiped by reorg", not a block hash.
+            //
+            // Report the HEIGHT first and the discriminating hash TAIL second.
+            // Both halves are load-bearing:
+            //   * the height answers the only question an operator can act on —
+            //     HOW FAR behind is the DML? one block (the ordinary tip-change
+            //     round trip, ~54 ms measured) or many (a lost diff that will
+            //     not self-heal until the next block)?
+            //   * the hash tail still distinguishes a same-height fork from a
+            //     lag, which the height alone cannot.
+            // Before this, both fields rendered as twelve zeros — see
+            // discriminating_hash_tail() for the measurement.
             d = refuse("dmn-stale",
                        m_sml_current_hash.IsNull()
-                           ? std::string("n/a")
-                           : m_sml_current_hash.GetHex().substr(0, 12),
-                       m_prev_hash.GetHex().substr(0, 12));
+                           ? std::string("cold/wiped")
+                           : "h=" + (m_sml_current_height >= 0
+                                         ? std::to_string(m_sml_current_height)
+                                         : std::string("n/a"))
+                                 + ",..." + discriminating_hash_tail(m_sml_current_hash),
+                       "h=" + tip + ",..." + discriminating_hash_tail(m_prev_hash));
         else if (m_require_sml && find_unprojectable_confirmation(m_sml, m_mnstates))
             // FINDING-1 fail-closed fallback: an SML entry awaits its
             // height-driven confirmedHash rollover (specialtxman.cpp:206-215)
@@ -1432,6 +1494,7 @@ private:
     int64_t  m_credit_pool{0};                // DIP-0027 credit-pool balance (seeded from cbTx)
     bool     m_have_sml{false};               // a non-empty SML has been applied
     uint256  m_sml_current_hash;              // block hash the SML is current at (ZERO = cold/reorg)
+    int64_t  m_sml_current_height{-1};        // DIAGNOSTIC ONLY, -1 = never reported; see set_sml_current_height
     bool     m_require_sml{false};            // gate viability on have_sml (embedded arm)
     std::function<bool()> m_utxo_ready_fn;   // optional UTXO maturity gate (E2b)
     // Default REFUSES the immature window (p2pool semantics: an unsynced node

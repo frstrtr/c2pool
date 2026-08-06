@@ -669,11 +669,21 @@ void DASHWorkSource::note_arm_decision(bool served_embedded,
     }
     if (!d.emit()) return;
 
+    // The COST of the episode, in seconds off the embedded arm. This is the
+    // metric that RANKS the causes; the decline COUNT does not (measured
+    // 2026-08-06: 109 dmn-stale episodes vs 3 qc-plan-underivable, but 5.6 s vs
+    // 351 s of actual fallback serving). Emitting it here means nobody has to
+    // reconstruct it by hand-pairing DECLINED/RESUMED lines again.
+    const std::string dur =
+        d.episode_sec >= 0 ? " dur=" + std::to_string(d.episode_sec) + "s"
+                           : std::string();
+
     if (d.trigger == coin::ServeGateJournal::Trigger::Resumed) {
         LOG_WARNING << "[EMBED-GATE] h=" << height
                     << " arm=EMBEDDED RESUMED (was declining: "
                     << (d.previous_cause.empty() ? "unknown" : d.previous_cause)
-                    << "; " << d.suppressed << " decline(s) suppressed)";
+                    << ";" << dur
+                    << " " << d.suppressed << " decline(s) suppressed)";
         return;
     }
     // ONE named cause with its measured value and threshold -- never a list of
@@ -681,6 +691,7 @@ void DASHWorkSource::note_arm_decision(bool served_embedded,
     LOG_WARNING << "[EMBED-GATE] h=" << height
                 << " arm=dashd-fallback DECLINED " << why.one_line()
                 << " trigger=" << coin::ServeGateJournal::trigger_name(d.trigger)
+                << dur
                 << " suppressed=" << d.suppressed;
 }
 
