@@ -7069,7 +7069,18 @@
                 tryRender();
             });
             
-            d3.json('../network_difficulty?period=' + currentGraphPeriod, function(data) {
+            // Net Diff follows the period selector through the same binned
+            // graph_data source as every other series. The old
+            // /network_difficulty?period= ring was sparse (#1140) AND the
+            // series was mis-scaled onto the hashrate axis; both are fixed here.
+            var netDiffEndpoints = {
+                'hour': '../web/graph_data/network_difficulty/last_hour',
+                'day': '../web/graph_data/network_difficulty/last_day',
+                'week': '../web/graph_data/network_difficulty/last_week',
+                'month': '../web/graph_data/network_difficulty/last_month',
+                'year': '../web/graph_data/network_difficulty/last_year'
+            };
+            d3.json(netDiffEndpoints[currentGraphPeriod], function(data) {
                 networkDiffData = data || [];
                 tryRender();
             });
@@ -7298,17 +7309,19 @@
             var luckTrendData = [];
             var validLucks = [];
             
-            // Process network difficulty samples - convert to hashrate equivalent
+            // graph_data 4-tuple: [ts_seconds, difficulty, bin_width, default].
+            // Plot the RAW network difficulty on its own axis (yAxis 3). The
+            // leading bins on last_day/last_week are 0.0 (netdiff-at-find was
+            // recorded as 0 before #1127); a 0 here is UNMEASURED, so it is
+            // emitted as null and the spline breaks across it rather than
+            // diving to the floor.
             var netDiffData = [];
-            networkDiffSamples = networkDiffSamples || [];
-            console.log('Compact - Processing network difficulty:', networkDiffSamples.length, 'samples');
-            networkDiffSamples.forEach(function(sample) {
-                var sampleTime = sample.ts * 1000;
-                // Don't filter - backend already provides correctly bounded data with gap filling
-                var netHashrate = sample.network_diff * Math.pow(2, 32) / 150; // 150s avg block time for Dash
-                netDiffData.push([sampleTime, netHashrate]);
+            (networkDiffSamples || []).forEach(function(sample) {
+                if (!Array.isArray(sample)) return;
+                var sampleTime = sample[0] * 1000;
+                var diff = sample[1];
+                netDiffData.push([sampleTime, (diff && diff > 0) ? diff : null]);
             });
-            console.log('Net Diff data points:', netDiffData.length);
             
             // Sort blocks by timestamp
             var sortedBlocks = blocks.slice().sort(function(a, b) { return a.ts - b.ts; });
@@ -7631,6 +7644,21 @@
                     },
                     gridLineWidth: 0,
                     opposite: true
+                }, {
+                    // Fourth Y-axis for network difficulty. Difficulty is ~1e8,
+                    // ~500,000x off the hashrate axis (~5e13), so sharing yAxis 0
+                    // collapsed Net Diff onto a flat line. Its own right axis, in
+                    // millions, matches p2pool-dash's reference dashboard.
+                    title: { text: null },
+                    min: 0,
+                    lineColor: '#8b5cf6',
+                    tickColor: '#8b5cf6',
+                    labels: {
+                        style: { color: '#8b5cf6', fontSize: '10px' },
+                        formatter: function() { return (this.value / 1000000).toFixed(1) + 'M'; }
+                    },
+                    gridLineWidth: 0,
+                    opposite: true
                 }],
                 tooltip: {
                     shared: true,
@@ -7698,6 +7726,9 @@
                             } else if (point.series.name === 'Workers' || point.series.name === 'Miners' || point.series.name === 'Connected') {
                                 s += '<br/><span style="color:' + point.color + '">●</span> ' + 
                                      point.series.name + ': <b>' + Math.round(point.y) + '</b>';
+                            } else if (point.series.name === 'Net Diff') {
+                                s += '<br/><span style="color:' + point.color + '">●</span> ' + 
+                                     point.series.name + ': <b>' + format_difficulty(point.y) + '</b>';
                             } else {
                                 s += '<br/><span style="color:' + point.color + '">●</span> ' + 
                                      point.series.name + ': <b>' + format_hashrate(point.y) + '</b>';
@@ -7866,14 +7897,10 @@
                     data: netDiffData,
                     color: '#8b5cf6',
                     lineWidth: 2,
-                    marker: {
-                        enabled: true,
-                        radius: 3,
-                        fillColor: '#8b5cf6',
-                        symbol: 'circle'
-                    },
+                    marker: { enabled: false },
+                    connectNulls: false,
                     visible: seriesVisibility.netdiff,
-                    yAxis: 0
+                    yAxis: 3
                 }, {
                     type: 'spline',
                     name: 'Local',
@@ -7996,14 +8023,14 @@
             var luckTrendData = [];
             var validLucks = [];
             
-            // Process network difficulty samples - convert to hashrate equivalent
+            // graph_data 4-tuple [ts_seconds, difficulty, bin_width, default];
+            // raw difficulty on yAxis 3, leading 0.0 bins nulled (see compact).
             var netDiffData = [];
-            networkDiffSamples = networkDiffSamples || [];
-            networkDiffSamples.forEach(function(sample) {
-                var sampleTime = sample.ts * 1000;
-                // Don't filter - backend already provides correctly bounded data with gap filling
-                var netHashrate = sample.network_diff * Math.pow(2, 32) / 150; // 150s avg block time for Dash
-                netDiffData.push([sampleTime, netHashrate]);
+            (networkDiffSamples || []).forEach(function(sample) {
+                if (!Array.isArray(sample)) return;
+                var sampleTime = sample[0] * 1000;
+                var diff = sample[1];
+                netDiffData.push([sampleTime, (diff && diff > 0) ? diff : null]);
             });
             
             // Sort blocks by timestamp
@@ -8281,6 +8308,21 @@
                     },
                     gridLineWidth: 0,
                     opposite: true
+                }, {
+                    // Fourth Y-axis for network difficulty. Difficulty is ~1e8,
+                    // ~500,000x off the hashrate axis (~5e13), so sharing yAxis 0
+                    // collapsed Net Diff onto a flat line. Its own right axis, in
+                    // millions, matches p2pool-dash's reference dashboard.
+                    title: { text: null },
+                    min: 0,
+                    lineColor: '#8b5cf6',
+                    tickColor: '#8b5cf6',
+                    labels: {
+                        style: { color: '#8b5cf6', fontSize: '11px' },
+                        formatter: function() { return (this.value / 1000000).toFixed(1) + 'M'; }
+                    },
+                    gridLineWidth: 0,
+                    opposite: true
                 }],
                 tooltip: {
                     shared: true,
@@ -8349,6 +8391,9 @@
                             } else if (point.series.name === 'Workers' || point.series.name === 'Miners' || point.series.name === 'Connected') {
                                 s += '<br/><span style="color:' + point.color + '">●</span> ' + 
                                      point.series.name + ': <b>' + Math.round(point.y) + '</b>';
+                            } else if (point.series.name === 'Net Diff') {
+                                s += '<br/><span style="color:' + point.color + '">●</span> ' + 
+                                     point.series.name + ': <b>' + format_difficulty(point.y) + '</b>';
                             } else {
                                 s += '<br/><span style="color:' + point.color + '">●</span> ' + 
                                      point.series.name + ': <b>' + format_hashrate(point.y) + '</b>';
@@ -8529,14 +8574,10 @@
                     data: netDiffData,
                     color: '#8b5cf6',
                     lineWidth: 2,
-                    marker: {
-                        enabled: true,
-                        radius: 3,
-                        fillColor: '#8b5cf6',
-                        symbol: 'circle'
-                    },
+                    marker: { enabled: false },
+                    connectNulls: false,
                     visible: seriesVisibility.netdiff,
-                    yAxis: 0
+                    yAxis: 3
                 }, {
                     type: 'spline',
                     name: 'Local',
