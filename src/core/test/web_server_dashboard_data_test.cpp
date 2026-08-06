@@ -391,3 +391,153 @@ TEST(DashboardData, PersistedBestShareNeverLowersALiveRecord)
     std::remove(log_path.c_str());
     std::remove((log_path + ".best.json").c_str());
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 7. The node-fee amount is readable WITHOUT knowing which coin this is
+// ═══════════════════════════════════════════════════════════════════════════
+
+// THE INCIDENT (live, 2026-08-06, DASH node 109.161.52.148:8081): the Node Fee
+// card showed "- DASH" — no amount. /local_stats on that node carried
+//     node_fee_dash = 0.004240003478694174
+//     node_fee_ltc  = ABSENT
+// and dashboard.html:3228 read `local_stats.node_fee_ltc` unconditionally.
+// d3.format('.4f')(undefined) renders nothing, so the card sat at "-" on a node
+// that had computed the number correctly.
+//
+// There is exactly ONE shared web-static/dashboard.html for every coin, so the
+// key it reads cannot be per-coin. This pins the coin-neutral `node_fee` on
+// EVERY blockchain — a fix that only added `node_fee_bch`, say, would leave the
+// next coin broken the same way.
+//
+// The coin-suffixed keys are pinned as UNCHANGED in the same test: they are the
+// p2pool-compat surface, and the dashboard falls back to them so a newer page
+// dropped on an older binary still renders.
+namespace {
+
+// Fee amount = miner_subsidy x fee% x (local hashrate / pool hashrate).
+// 4.0 coins of miner subsidy (no protocol-payment lane), 1% fee, and
+// 1000/4000 = a quarter of the pool -> 4.0 x 0.01 x 0.25 = 0.01 exactly, so
+// the number is checkable by eye rather than merely "greater than zero".
+constexpr double kExpectedNodeFee = 0.01;
+
+void wire_fee_node(MiningInterface& mi)
+{
+    mi.set_coin_work_fn([]() {
+        MiningInterface::CoinWorkInfo cw;
+        cw.valid              = true;
+        cw.coinbase_value_sat = 400000000;   // 4.0
+        cw.height             = 1000000;
+        return cw;
+    });
+    mi.set_pool_fee_percent(1.0);
+    mi.set_stratum_hashrate_fn([]() { return 1000.0; });
+    mi.set_pool_hashrate_fn([]()    { return 4000.0; });
+}
+
+} // namespace
+
+TEST(DashboardData, NodeFeeAmountIsExposedUnderACoinNeutralKey)
+{
+    struct Case { c2pool::address::Blockchain chain; const char* legacy; };
+    const Case cases[] = {
+        {c2pool::address::Blockchain::DASH,     "node_fee_dash"},
+        {c2pool::address::Blockchain::LITECOIN, "node_fee_ltc"},
+        {c2pool::address::Blockchain::DOGECOIN, "node_fee_doge"},
+        {c2pool::address::Blockchain::BITCOIN,  "node_fee_ltc"},
+        {c2pool::address::Blockchain::DIGIBYTE, "node_fee_ltc"},
+    };
+
+    for (const auto& c : cases) {
+        MiningInterface mi(/*testnet=*/false, /*node=*/nullptr, c.chain);
+        wire_fee_node(mi);
+        auto stats = mi.rest_local_stats();
+
+        // THE FIX: present on every coin, so the shared page needs no per-coin
+        // knowledge to render the card.
+        ASSERT_TRUE(stats.contains("node_fee"))
+            << "no coin-neutral node_fee — the shared dashboard cannot read"
+               " this coin's amount";
+        EXPECT_DOUBLE_EQ(stats["node_fee"].get<double>(), kExpectedNodeFee);
+
+        // The legacy key still carries the identical value (compat surface).
+        ASSERT_TRUE(stats.contains(c.legacy));
+        EXPECT_DOUBLE_EQ(stats[c.legacy].get<double>(),
+                         stats["node_fee"].get<double>());
+    }
+}
+
+// THE NEGATIVE CONTROL: this reproduces the shipped defect exactly. On DASH the
+// key the dashboard actually read is absent, and reading it yields the
+// undefined that formatted to nothing.
+TEST(DashboardData, TheKeyTheDashboardUsedToReadIsAbsentOnDash)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    wire_fee_node(mi);
+    auto stats = mi.rest_local_stats();
+
+    EXPECT_FALSE(stats.contains("node_fee_ltc"))
+        << "if DASH ever emits node_fee_ltc this test is stale — but the "
+           "dashboard must still not depend on it";
+    EXPECT_TRUE(stats.contains("node_fee_dash"));
+    EXPECT_TRUE(stats.contains("node_fee"));
+
+    // The dashboard's resolution order (node_fee -> node_fee_<symbol> ->
+    // node_fee_ltc) transcribed: step 1 alone already answers.
+    EXPECT_DOUBLE_EQ(stats["node_fee"].get<double>(),
+                     stats["node_fee_dash"].get<double>());
+}
+
+// A node with no local miners owes no fee — and must say 0, not omit the key,
+// so the card renders "0.0000" rather than falling back through the chain to
+// some other coin's number.
+TEST(DashboardData, NodeFeeIsZeroNotAbsentWhenNothingIsMiningLocally)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    mi.set_pool_fee_percent(1.0);
+    mi.set_stratum_hashrate_fn([]() { return 0.0; });
+    mi.set_pool_hashrate_fn([]()    { return 4000.0; });
+    auto stats = mi.rest_local_stats();
+    ASSERT_TRUE(stats.contains("node_fee"));
+    EXPECT_DOUBLE_EQ(stats["node_fee"].get<double>(), 0.0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 8. block_value_payments only means "protocol outputs" where such a lane exists
+// ═══════════════════════════════════════════════════════════════════════════
+
+// The API sets block_value_payments == block_value on every non-DASH coin
+// (there is no masternode/superblock lane to deduct), so the dashboard must
+// gate the "− protocol" line on payments < block_value. Pinning the shape here
+// keeps that front-end gate honest: if a coin ever starts reporting a real
+// payments lane, the line appears on its own.
+TEST(DashboardData, PaymentsEqualBlockValueWhereThereIsNoProtocolLane)
+{
+    {
+        MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                           c2pool::address::Blockchain::DASH);
+        wire_dash_template(mi);
+        auto stats = mi.rest_local_stats();
+        // A genuine deduction: 1.77109977 total, 1.32832482 protocol outputs.
+        EXPECT_LT(stats["block_value_payments"].get<double>(),
+                  stats["block_value"].get<double>());
+        EXPECT_GT(stats["block_value_burn"].get<double>(), 0.0);
+    }
+    {
+        MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                           c2pool::address::Blockchain::LITECOIN);
+        mi.set_coin_work_fn([]() {
+            MiningInterface::CoinWorkInfo cw;
+            cw.valid              = true;
+            cw.coinbase_value_sat = 671473381;
+            cw.height             = 3000000;
+            return cw;
+        });
+        auto stats = mi.rest_local_stats();
+        EXPECT_DOUBLE_EQ(stats["block_value_payments"].get<double>(),
+                         stats["block_value"].get<double>())
+            << "the dashboard's protocol-lane gate keys on this equality";
+        EXPECT_FALSE(stats.contains("block_value_burn"));
+    }
+}
