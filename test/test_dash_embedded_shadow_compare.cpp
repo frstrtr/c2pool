@@ -564,3 +564,40 @@ TEST(DashShadowCompare, MissingFeeIsUnknownNotZero) {
     EXPECT_EQ(d.fee_overstated, 0u)
         << "an absent fee must not be scored as agreement OR as overstatement";
 }
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// THE SELF-CONFIRMING MEASUREMENT — caught on the first live soak
+//
+// shadow_evaluate's `embedded` argument is the SERVED template. When the gate
+// declines and the node serves the dashd-fallback arm, that argument IS
+// dashd's template, and diffing it against a fresh dashd template compares
+// dashd with itself. Live at h=2517157 (gate cause=utxo-immature) it reported
+//     ours=11 dashd=11 both=11 coverage=100% fee_agree=11
+// while our own mempool held ONE transaction. A number like that gets quoted.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashShadowCompare, NoCoverageMeasurementWhenServedByTheFallbackArm) {
+    auto cb = make_cbtx(2500000, 11, 22);
+    auto served = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref   = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    // The fallback case: the served template IS dashd's, so both sides match
+    // perfectly — which is precisely why it must not be reported as coverage.
+    with_txs(served, {1, 2, 3, 4, 5});
+    with_txs(dref,   {1, 2, 3, 4, 5});
+
+    const auto o = shadow_evaluate(WorkSource::DashdFallback, served,
+                                   std::optional<DashWorkData>(dref));
+    EXPECT_TRUE(has_line_with(o.log_lines, "no-measurement"));
+    EXPECT_TRUE(has_line_with(o.log_lines, "served-by-dashd-fallback"));
+    EXPECT_FALSE(has_line_with(o.log_lines, "coverage=100%"))
+        << "dashd compared with itself must never be reported as coverage";
+    EXPECT_EQ(o.tx_set.both, 0u)   << "counters must stay zero, not flattering";
+    EXPECT_EQ(o.tx_set.fee_agree, 0u);
+
+    // ... and the SAME inputs, when the embedded arm really did build it, ARE
+    // measured. The guard keys on provenance, not on the numbers.
+    const auto o2 = shadow_evaluate(WorkSource::Embedded, served,
+                                    std::optional<DashWorkData>(dref));
+    EXPECT_TRUE(has_line_with(o2.log_lines, "coverage=100%"));
+    EXPECT_EQ(o2.tx_set.fee_agree, 5u);
+}

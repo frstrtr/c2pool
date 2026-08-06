@@ -340,6 +340,25 @@ inline ShadowOutcome shadow_evaluate(WorkSource source,
     // ── MEMPOOL COVERAGE, measured against dashd's own set ───────────────
     // Emitted for every compared height, whether or not anything diverges:
     // the number only means something as a series.
+    //
+    // ⚠ THE "ours" SIDE IS ONLY OURS WHEN THE EMBEDDED ARM PRODUCED IT.
+    // `embedded` here is the SERVED template. When the gate declined and the
+    // node served the dashd-fallback arm, that argument IS dashd's template,
+    // and diffing it against a fresh dashd template compares dashd with
+    // itself — which reports a flawless ours=11 dashd=11 coverage=100%
+    // fee_agree=11 while our own mempool holds one transaction. Live-observed
+    // on the first soak run (h=2517157, gate cause=utxo-immature), and it is
+    // exactly the kind of self-confirming number that gets quoted as evidence.
+    // Membership and fee agreement are therefore measured ONLY when the
+    // embedded arm actually built the thing being measured; otherwise the line
+    // says why there is no measurement, and the counters stay zero.
+    if (!o.served) {
+        o.log_lines.push_back(
+            "[SHADOW-TXSET] h=" + std::to_string(o.height)
+            + " no-measurement reason=served-by-dashd-fallback"
+              " (the 'ours' side would be dashd's own template — comparing it"
+              " with dashd would report a fabricated 100%)");
+    } else {
     o.tx_set = shadow_tx_set_diff(embedded, dashd);
     {
         std::string l = "[SHADOW-TXSET] h=" + std::to_string(o.height)
@@ -370,6 +389,7 @@ inline ShadowOutcome shadow_evaluate(WorkSource source,
                  " bad-cb-amount and the block is REJECTED; do NOT enable"
                  " --embedded-serve-mempool-txs";
         o.log_lines.push_back(std::move(l));
+    }
     }
 
     auto add = [&](const char* field, bool commitment,
