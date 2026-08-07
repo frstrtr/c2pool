@@ -45,6 +45,16 @@ if(BUILD_TESTING)
         add_test(NAME bch_${t} COMMAND bch_${t})
     endforeach()
 
+    # #1131 source-structural KAT (BCH-lane mirror of dash/btc/ltc): the think-P1
+    # bad-share removal must borrow from `verified` (owns_data=false) so only the
+    # owning `chain` destroys the share. Its own executable (BCH tree is plain
+    # main()+CHECK, no GTest to fold into); needs the share_tracker.hpp path.
+    add_executable(bch_share_remove_owns_data_test share_remove_owns_data_test.cpp)
+    target_include_directories(bch_share_remove_owns_data_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_definitions(bch_share_remove_owns_data_test PRIVATE
+        BCH_SHARE_TRACKER_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../share_tracker.hpp")
+    add_test(NAME bch_share_remove_owns_data_test COMMAND bch_share_remove_owns_data_test)
+
     # block_connector_test exercises the full-block -> mempool reconciliation
     # path, so it constructs MutableTransaction objects whose ctors are out-of-line
     # in coin/transaction.cpp. Add that single TU to this test only; the link set
