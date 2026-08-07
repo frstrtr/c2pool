@@ -2054,9 +2054,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     [rpc_raw](const ::core::coin::Outpoint& op,
                               ::core::coin::Coin& out) -> bool {
                         try {
-                            auto j = rpc_raw->CallAPIMethod(
-                                "gettxout",
-                                {op.hash.GetHex(), static_cast<int>(op.n)});
+                            jsonrpccxx::positional_parameter params{
+                                nlohmann::json(op.txid.GetHex()),
+                                nlohmann::json(static_cast<int>(op.index))};
+                            auto j = rpc_raw->CallAPIMethod("gettxout", params);
                             if (j.is_null() || !j.contains("value")) return false;
                             const double v = j.value("value", 0.0);
                             out.value = static_cast<int64_t>(v * 1e8 + 0.5);
