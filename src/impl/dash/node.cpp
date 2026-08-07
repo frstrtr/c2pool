@@ -3,6 +3,7 @@
 #include "share.hpp"
 #include "mint_runloop.hpp"   // dash::mint::elect_best_share (election policy SSOT)
 #include "known_txs_retention.hpp"  // dash::retain_template_txs / all_txs_backable (F1/F3)
+#include "coin/transaction.hpp"  // coin::TX_WITH_WITNESS (remembered_tx_size, #950)
 #include "think_gate.hpp"     // dash::think:: think-slot protocol + clean-cycle tip decision (#854)
 
 #include <cassert>
@@ -1502,6 +1503,40 @@ uint256 NodeImpl::add_local_share(ShareType share, bool block_winning)
     broadcast_share(hash);
     run_think();
     return hash;
+}
+
+// #950: standing remembered-set seed (canonical p2p.py:269). Declared in
+// node.hpp. IO-thread only. Sizes each tx with canonical's 100 + packed_size
+// accounting (p2p.py:379) so the seed never overshoots the peer's cap (p2p.py:488).
+static std::size_t remembered_tx_size(const coin::Transaction& tx)
+{
+    coin::MutableTransaction mtx(tx);
+    return 100 + pack(coin::TX_WITH_WITNESS(mtx)).get_span().size();
+}
+
+void NodeImpl::send_standing_remember(const peer_ptr& peer)
+{
+    if (!peer)
+        return;
+    std::vector<coin::MutableTransaction> full_txs;
+    {
+        // try_to_lock, never block: mirrors advertise_known_txs — if the compute
+        // thread is mid-cycle we skip; the next inbound handshake reseeds.
+        std::shared_lock<std::shared_mutex> lk(m_tracker_mutex, std::try_to_lock);
+        if (!lk.owns_lock())
+            return;
+        auto chosen = dash::select_standing_remember(
+            m_known_txs, MAX_REMEMBERED_TXS_SIZE, &remembered_tx_size);
+        full_txs.reserve(chosen.size());
+        for (const auto& h : chosen)
+            if (auto it = m_known_txs.find(h); it != m_known_txs.end())
+                full_txs.emplace_back(it->second);
+    }
+    if (full_txs.empty())
+        return;
+    // Canonical p2p.py:269 sends tx_hashes=[] (all as bodies): at handshake we do
+    // not yet know the peer's remote_tx_hashes.
+    peer->write(dash::message_remember_tx::make_raw({}, full_txs));
 }
 
 void NodeImpl::register_template_txs(const std::vector<coin::Transaction>& txs,
