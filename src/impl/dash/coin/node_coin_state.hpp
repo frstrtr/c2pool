@@ -490,6 +490,16 @@ public:
         m_have_pinned_local_tx = true;
     }
 
+    /// Second source for the PIN GATE's coin lookups (money-path). Forwarded
+    /// to the mempool, which consults it only for inputs its own UTXO view
+    /// cannot resolve — see Mempool::set_external_coin_lookup for why that is
+    /// not a relaxation. Wired once at startup, before any template build.
+    void set_pin_external_coin_lookup(
+        std::function<bool(const ::core::coin::Outpoint&, ::core::coin::Coin&)> fn)
+    {
+        m_mempool.set_external_coin_lookup(std::move(fn));
+    }
+
     /// Superblock-height guard. On a Dash superblock height the coinbase MUST
     /// pay the governance/treasury (superblock) outputs; the embedded template
     /// does not compute those, so emitting a normal coinbase there is a
