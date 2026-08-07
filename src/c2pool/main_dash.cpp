@@ -2036,6 +2036,44 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             }
         }
         if (pin_ok) {
+            // SECOND SOURCE for the pin's inputs (money-path, 2026-08-07).
+            // The embedded UTXO view is built FORWARD from the height this node
+            // started at, so coins older than that are simply ABSENT from it —
+            // the gate then reports input-missing-or-spent for inputs that are
+            // in fact unspent. Measured on the production primary, which
+            // refused a pin whose 1032 inputs the local daemon confirmed
+            // unspent to the duff.
+            //
+            // This does NOT relax the gate. Value and spentness still come from
+            // an authoritative source, so fee==0 stays COMPUTED rather than
+            // assumed, and an input neither source can resolve is still
+            // refused. An unreachable daemon returns false — never a guess.
+            if (rpc) {
+                dash::coin::NodeRPC* rpc_raw = rpc.get();
+                node_coin_state.set_pin_external_coin_lookup(
+                    [rpc_raw](const ::core::coin::Outpoint& op,
+                              ::core::coin::Coin& out) -> bool {
+                        try {
+                            auto j = rpc_raw->gettxout(op.txid, op.index);
+                            if (j.is_null() || !j.contains("value")) return false;
+                            const double v = j.value("value", 0.0);
+                            out.value = static_cast<int64_t>(v * 1e8 + 0.5);
+                            // gettxout reports confirmations, not the height the
+                            // coin was created at. A confirmed non-coinbase coin
+                            // needs no maturity window; a coinbase one does, so
+                            // mark it height 0 and let the maturity arm refuse
+                            // unless the caller knows better. Conservative by
+                            // construction.
+                            out.coinbase = j.value("coinbase", false);
+                            out.height   = 0;
+                            return j.value("confirmations", 0) > 0;
+                        } catch (const std::exception&) {
+                            return false;
+                        }
+                    });
+                std::cout << "[run] pin input lookup: embedded UTXO view + "
+                             "coin-RPC second source (gettxout) ARMED\n";
+            }
             node_coin_state.set_pinned_local_tx(pin_tx);
             std::cout << "[run] pinned local tx ARMED: "
                       << dash::coin::dash_txid(pin_tx).GetHex()

@@ -594,6 +594,12 @@ nlohmann::json NodeRPC::getblockheader(uint256 header, bool verbose)
     return CallAPIMethod("getblockheader", {header, verbose});
 }
 
+nlohmann::json NodeRPC::gettxout(const uint256& txid, uint32_t n)
+{
+    return CallAPIMethod("gettxout",
+                         {txid.GetHex(), static_cast<int>(n)});
+}
+
 // verbosity: 0 for hex-encoded data, 1 for a json object, and 2 for json object with transaction data
 nlohmann::json NodeRPC::getblock(uint256 blockhash, int verbosity)
 {

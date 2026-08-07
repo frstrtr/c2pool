@@ -65,6 +65,7 @@
 #include <core/coin/utxo_view_cache.hpp>
 
 #include <atomic>
+#include <functional>
 #include <cstdint>
 #include <ctime>
 #include <deque>
@@ -170,16 +171,40 @@ public:
         }
         return "ok";
     }
+    /// SECOND SOURCE for coin lookup (money-path, added 2026-08-07 after the
+    /// production primary refused a valid pin). The embedded UTXO view is
+    /// built forward from the height the node was started at, so coins older
+    /// than that are simply ABSENT from it — the gate then reports
+    /// input-missing-or-spent for inputs that are, in fact, perfectly unspent.
+    ///
+    /// This is NOT a relaxation. The gate still demands the same three facts —
+    /// the coin exists, it is unspent, and its value is known so fee==0 can be
+    /// COMPUTED rather than assumed — it just accepts a second authoritative
+    /// place to learn them (the coin daemon's own UTXO set, when an RPC arm is
+    /// wired). A pin whose inputs neither source can resolve is still refused.
+    void set_external_coin_lookup(
+        std::function<bool(const ::core::coin::Outpoint&, ::core::coin::Coin&)> fn)
+    {
+        m_external_coin_lookup = std::move(fn);
+    }
+    bool has_external_coin_lookup() const { return static_cast<bool>(m_external_coin_lookup); }
+
     PinnedTxGate pinned_tx_admissible(const MutableTransaction& tx,
                                       uint32_t next_height) const {
         auto* utxo = m_utxo.load();
-        if (utxo == nullptr) return PinnedTxGate::UtxoViewUnset;
+        if (utxo == nullptr && !m_external_coin_lookup)
+            return PinnedTxGate::UtxoViewUnset;
         constexpr uint32_t kCoinbaseMaturity = 100;
         int64_t in_value = 0;
         for (const auto& vin : tx.vin) {
             ::core::coin::Coin coin;
             ::core::coin::Outpoint op{vin.prevout.hash, vin.prevout.index};
-            if (!utxo->get_coin(op, coin) || coin.is_spent())
+            bool found = utxo != nullptr && utxo->get_coin(op, coin) && !coin.is_spent();
+            if (!found && m_external_coin_lookup) {
+                coin = ::core::coin::Coin{};
+                found = m_external_coin_lookup(op, coin) && !coin.is_spent();
+            }
+            if (!found)
                 return PinnedTxGate::InputMissingOrSpent;
             if (coin.coinbase && next_height < coin.height + kCoinbaseMaturity)
                 return PinnedTxGate::ImmatureCoinbaseInput;
@@ -717,6 +742,12 @@ private:
     size_t                                             m_max_bytes;
     time_t                                             m_expiry_sec;
     std::atomic<::core::coin::UTXOViewCache*>          m_utxo{nullptr};
+    // Second-source coin lookup for the PINNED-TX gate only (see
+    // set_external_coin_lookup). Set once at wiring time, before any template
+    // build, and never mutated afterwards — the gate reads it on the template
+    // path where m_utxo is already read lock-free.
+    std::function<bool(const ::core::coin::Outpoint&, ::core::coin::Coin&)>
+                                                      m_external_coin_lookup;
 
     /// G1: gather `txid` plus every UNSELECTED in-mempool ancestor into
     /// `out`, parents strictly before children (post-order DFS). `seen`
