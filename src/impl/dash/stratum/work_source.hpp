@@ -539,6 +539,45 @@ public:
     /// first template has been sourced -- never a fabricated "ok".
     nlohmann::json embedded_arm_status_json() const;
 
+    // ── SERVE-STALENESS SENTINEL (2026-08-07 dead-height incident) ──────────
+    //
+    // For one hour this node handed h=2518006 to 26 rigs while the chain was at
+    // h=2518028, and nothing said so. The reason no existing signal could fire
+    // is that every one of them compares the node against ITSELF — see the
+    // catalogue in coin/serve_staleness.hpp. The missing datum is exactly this
+    // pair: the height we ACTUALLY handed out, and an INDEPENDENTLY observed
+    // height to compare it against.
+    //
+    // Both halves are plain relaxed atomics on purpose. The reader is an
+    // off-`ioc` sentinel thread and the HTTP status surface, and during the
+    // incident the io thread held template_mutex_ across the ~733 ms pre-emit
+    // gate — so a status path that takes ANY lock the serve path holds is dark
+    // at precisely the moment it is needed. Relaxed is sufficient: these feed a
+    // >=120 s sustain window, not a decision, and a torn read would at worst
+    // delay one poll.
+    //
+    // REPORT-ONLY. Nothing reads these back into a serve decision, an arm
+    // choice, or a template byte; the stores are pure observation.
+
+    /// Height of the last template actually handed to a miner (0 = none yet).
+    uint32_t last_served_height() const
+    { return last_served_height_.load(std::memory_order_relaxed); }
+
+    /// Steady-clock ms at which that happened (0 = none yet).
+    int64_t last_served_at_ms() const
+    { return last_served_at_ms_.load(std::memory_order_relaxed); }
+
+    /// Sentinel -> status surface. Publishes what an INDEPENDENT source said
+    /// the chain height was, when it said it, which source answered, and the
+    /// sentinel's own verdict. Called only from the sentinel thread; takes no
+    /// lock. `observed_height == 0` means "no source answered", which is NOT
+    /// the same claim as "we are current" and must never be rendered as one.
+    void note_serve_observation(uint32_t observed_height,
+                                int64_t observed_at_ms,
+                                const std::string& source,
+                                bool stale,
+                                int64_t stale_age_ms) const;
+
 private:
     /// Record ONE arm-selection outcome and, if the rate policy says so, emit
     /// the single named line. `why` MUST be the report the selecting branch
@@ -546,6 +585,16 @@ private:
     void note_arm_decision(bool served_embedded,
                            const coin::DeclineReport& why,
                            uint32_t height) const;
+
+    /// Record that height `h` was just handed to a miner. Two relaxed stores;
+    /// no allocation, no lock, no branch on coin state. This is the ONLY
+    /// addition to the serve path and it strictly adds observation — it cannot
+    /// change which template is chosen or a single byte of it.
+    void note_served_height(uint32_t h) const;
+
+    /// The lock-free half of the operator surface, composed before
+    /// embedded_arm_status_json takes serve_gate_mutex_.
+    nlohmann::json serve_staleness_json() const;
 
     // External dependencies (non-owning references) -- see Lifetime note.
     const coin::NodeCoinState&  coin_state_;    ///< embedded work arm (populated -> Embedded)
@@ -586,6 +635,20 @@ private:
     mutable coin::DeclineReport     last_decline_;
     mutable bool                    last_arm_embedded_{false};
     mutable bool                    arm_ever_observed_{false};
+
+    // ── Serve-staleness observation (lock-free by requirement) ─────────────
+    // Written on the serve path (get_current_work_template /
+    // build_connection_coinbase) and by the sentinel thread; read by the
+    // sentinel and by embedded_arm_status_json BEFORE it takes any lock.
+    // `observed_src_` is an index rather than a string precisely so the whole
+    // block stays atomic: 0=none 1=rpc 2=peer 3=hdr 4=other (serve_src_name).
+    mutable std::atomic<uint32_t> last_served_height_{0};
+    mutable std::atomic<int64_t>  last_served_at_ms_{0};
+    mutable std::atomic<uint32_t> observed_height_{0};
+    mutable std::atomic<int64_t>  observed_at_ms_{0};
+    mutable std::atomic<int>      observed_src_{0};
+    mutable std::atomic<bool>     serve_stale_{false};
+    mutable std::atomic<int64_t>  serve_stale_age_ms_{0};
 
     // Atomic state. work_generation_ is mutable: the const template-cache
     // resolve (cached_work) bumps it when a refresh observes a moved tip.
