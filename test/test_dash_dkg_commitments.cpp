@@ -36,6 +36,7 @@
 #include <core/uint256.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <fstream>
@@ -44,6 +45,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace dash::coin;
@@ -1771,4 +1773,321 @@ TEST(DashQcPoseNoopPredicate, UnprovableMemberCountsFailClosed)
     const auto c = real_commitment(kLlmq50_60, h256(0x35), 0, 0x04);
     EXPECT_FALSE(qc_pose_pass_provably_noop(c, 0));
     EXPECT_FALSE(qc_pose_pass_provably_noop(c, 51));
+}
+
+// ── The BLS aggregate verify is paid ONCE per commitment, not per read ─────
+//
+// THE INCIDENT (2026-08-07, DASH mainnet): the node served a DEAD height to 26
+// rigs for an hour with the main thread pegged at 99.9% in USERSPACE. Every
+// read of the cached template on the EMBEDDED arm re-runs the full pre-emit
+// consensus gate INLINE on the io thread — work_source.cpp:852-853
+//   `if (!template_cache_is_embedded_
+//        || coin_state_.embedded_template_emit_ok(*template_cache_))`
+// — and the dashd-fallback arm short-circuits it, which is why only the
+// embedded arm saturated. That gate re-derives the mandatory qc plan on every
+// call (node_coin_state.hpp:889-893 m_qc_plan_fn), which walks
+// daemonless_qc_commitments (dkg_commitments.hpp:741) into
+// MineableCommitmentCache::verified_for (dkg_commitments.hpp:676), and
+// verified_for invoked the installed BLS verifier UNCONDITIONALLY on every
+// hit, caching nothing. On mainnet that is a 391-signer LLMQ_400_60 aggregate
+// verification re-proved from scratch per call; StratumServer::notify_all
+// fans send_notify_work out SERIALLY per session (stratum_server.cpp:379-384),
+// so one share arrival cost N x that. One send_notify_work was measured going
+// 0.3 ms -> 733 ms at the arm flip.
+//
+// THE MEMO IS POSITIVE-ONLY AND LATCHED ON THE CACHE ENTRY ITSELF, which is
+// what makes its staleness argument by-construction rather than by-discipline:
+//   * the verifier's inputs are the commitment bytes and the member set for
+//     (llmqType, quorumHash); the bytes cannot change under a live latch,
+//     because entry replacement is the ONLY mutation (keep-best,
+//     dkg_commitments.hpp:659-665) and it constructs a FRESH entry;
+//   * quorumHash IS the quorum base block hash (dkg_commitments.hpp:421-426),
+//     so a reorg yields a different key, never a same-key different member
+//     set;
+//   * FALSE is never latched, so every recovery path (member set arrives, a
+//     better commitment lands, a verifier is installed) behaves as before;
+//   * set_bls_verify_fn clears every latch, so a verdict proven under one
+//     verifier is never served under another.
+// Nothing the gate CHECKS is checked less often — only the pairing math
+// inside one leaf predicate is reused.
+//
+// RED ON MASTER: the invocation counters below grow linearly with the number
+// of reads (100 and 50 x slots respectively) instead of standing at 1 / one
+// per commitment.
+
+namespace {
+
+// A structurally admissible real commitment with a chosen signer count, so a
+// strictly BETTER commitment for the same slot can be ingested (keep-best is
+// by CountSigners, dkg_commitments.hpp:661-663).
+CFinalCommitment real_commitment_signers(const LlmqParamsView& p,
+                                         const uint256& qh, int16_t qi,
+                                         uint8_t seed, size_t n_signers)
+{
+    auto c = real_commitment(p, qh, qi, seed);
+    c.signers.assign(p.size, false);
+    for (size_t i = 0; i < n_signers && i < p.size; ++i) c.signers[i] = true;
+    return c;
+}
+
+} // namespace
+
+TEST(DashQcVerifyMemo, AggregateVerifyIsPaidOnceAcrossManyServeReads)
+{
+    // Testnet: LLMQ_50_60 (type 1) is enabled there forever, so the 50/40/30
+    // shape is real (same reason as MineableCacheStructuralAdmissionAndBlsGate).
+    int calls = 0;
+    MineableCommitmentCache cache;
+    const uint256 qh = h256(0x71);
+    ASSERT_TRUE(cache.ingest(LlmqNetwork::Testnet,
+                             real_commitment(kLlmq50_60, qh, 0, 0x11)));
+    cache.set_bls_verify_fn([&calls](const CFinalCommitment&) {
+        ++calls;
+        return true;
+    });
+
+    // THE SERVE LOOP, abstracted: N reads, inputs unchanged.
+    constexpr int kReads = 100;
+    for (int i = 0; i < kReads; ++i) {
+        auto served = cache.verified_for(1, qh);
+        ASSERT_TRUE(served.has_value()) << "read " << i << " withheld a verified commitment";
+        EXPECT_EQ(served->quorumHash, qh);
+    }
+    EXPECT_EQ(calls, 1)
+        << "the BLS aggregate verify was re-run on the io thread " << calls
+        << " times for " << kReads << " reads of an UNCHANGED commitment "
+           "(dkg_commitments.hpp:676) — this is the tip-freeze hot loop";
+}
+
+TEST(DashQcVerifyMemo, BetterCommitmentForTheSameSlotReprovesFromScratch)
+{
+    // The guard against OVER-caching: the latch must die with the entry it was
+    // proven for. ingest_ex replaces the entry on keep-best
+    // (dkg_commitments.hpp:664), so the replacement is unlatched by
+    // construction and the next read must pay a fresh verify — for the NEW
+    // bytes.
+    int calls = 0;
+    MineableCommitmentCache cache;
+    const uint256 qh = h256(0x72);
+    ASSERT_TRUE(cache.ingest(
+        LlmqNetwork::Testnet,
+        real_commitment_signers(kLlmq50_60, qh, 0, 0x11, /*n_signers=*/45)));
+    cache.set_bls_verify_fn([&calls](const CFinalCommitment&) {
+        ++calls;
+        return true;
+    });
+
+    for (int i = 0; i < 10; ++i) ASSERT_TRUE(cache.verified_for(1, qh).has_value());
+    ASSERT_EQ(calls, 1) << "verify not memoised (see the once-across-N case)";
+    EXPECT_EQ(cache.cached_signers(1, qh), 45);
+
+    // A strictly better commitment for the SAME slot key.
+    ASSERT_TRUE(cache.ingest(
+        LlmqNetwork::Testnet,
+        real_commitment_signers(kLlmq50_60, qh, 0, 0x11, /*n_signers=*/50)));
+    EXPECT_EQ(cache.cached_signers(1, qh), 50);
+
+    auto after = cache.verified_for(1, qh);
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(after->CountSigners(), 50)
+        << "served the SUPERSEDED commitment — the memo returned stale bytes";
+    EXPECT_EQ(calls, 2)
+        << "the replacement commitment was served on a verdict proven for the "
+           "PREVIOUS bytes";
+    // ...and the new verdict latches in turn.
+    for (int i = 0; i < 10; ++i) ASSERT_TRUE(cache.verified_for(1, qh).has_value());
+    EXPECT_EQ(calls, 2);
+}
+
+TEST(DashQcVerifyMemo, FailedVerdictIsNeverLatched)
+{
+    // The opposite failure mode of memoising: latching FALSE would make a
+    // transient member-set gap permanent. A refusal must stay re-evaluated on
+    // every read, exactly as today (dkg_commitments.hpp:673-677 nullopt
+    // semantics), so the recovery paths keep working.
+    int calls = 0;
+    MineableCommitmentCache cache;
+    const uint256 qh = h256(0x73);
+    ASSERT_TRUE(cache.ingest(LlmqNetwork::Testnet,
+                             real_commitment(kLlmq50_60, qh, 0, 0x11)));
+    cache.set_bls_verify_fn([&calls](const CFinalCommitment&) {
+        ++calls;
+        return false;
+    });
+
+    constexpr int kReads = 20;
+    for (int i = 0; i < kReads; ++i)
+        EXPECT_FALSE(cache.verified_for(1, qh).has_value()) << "read " << i;
+    EXPECT_EQ(calls, kReads)
+        << "a FAILED verdict was latched — a transient refusal would become "
+           "permanent";
+    EXPECT_EQ(cache.diagnose(1, qh), QcSlotGap::BlsVerifyFailed);
+
+    // Recovery: the same commitment verifies once the verifier says so, and
+    // only THEN does the positive verdict latch.
+    int good_calls = 0;
+    cache.set_bls_verify_fn([&good_calls](const CFinalCommitment&) {
+        ++good_calls;
+        return true;
+    });
+    ASSERT_TRUE(cache.verified_for(1, qh).has_value());
+    EXPECT_EQ(good_calls, 1);
+    for (int i = 0; i < 10; ++i) ASSERT_TRUE(cache.verified_for(1, qh).has_value());
+    EXPECT_EQ(good_calls, 1) << "positive verdict not latched after recovery";
+    EXPECT_EQ(calls, kReads) << "the RETIRED verifier was called again";
+}
+
+TEST(DashQcVerifyMemo, InstallingAVerifierClearsEveryLatch)
+{
+    // A verdict is only ever a proof UNDER THE VERIFIER THAT PRODUCED IT.
+    // Swapping the verifier (set_bls_verify_fn, dkg_commitments.hpp:544 — the
+    // Phase-L seam main_dash.cpp:4124 installs the real BLS12-381 one through)
+    // must invalidate every latch, or a stub's verdict could outlive it.
+    int first_calls = 0, second_calls = 0;
+    MineableCommitmentCache cache;
+    const uint256 qh_a = h256(0x74);
+    const uint256 qh_b = h256(0x75);
+    ASSERT_TRUE(cache.ingest(LlmqNetwork::Testnet,
+                             real_commitment(kLlmq50_60, qh_a, 0, 0x11)));
+    ASSERT_TRUE(cache.ingest(LlmqNetwork::Testnet,
+                             real_commitment(kLlmq50_60, qh_b, 0, 0x12)));
+    cache.set_bls_verify_fn([&first_calls](const CFinalCommitment&) {
+        ++first_calls;
+        return true;
+    });
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_TRUE(cache.verified_for(1, qh_a).has_value());
+        ASSERT_TRUE(cache.verified_for(1, qh_b).has_value());
+    }
+    ASSERT_EQ(first_calls, 2) << "verify not memoised (see the once-across-N case)";
+
+    cache.set_bls_verify_fn([&second_calls](const CFinalCommitment&) {
+        ++second_calls;
+        return true;
+    });
+    ASSERT_TRUE(cache.verified_for(1, qh_a).has_value());
+    ASSERT_TRUE(cache.verified_for(1, qh_b).has_value());
+    EXPECT_EQ(second_calls, 2)
+        << "a latch survived a verifier swap — a verdict proven under the OLD "
+           "verifier was served under the new one";
+    EXPECT_EQ(first_calls, 2) << "the RETIRED verifier was called again";
+}
+
+TEST(DashQcVerifyMemo, ServePathPlanDerivationPaysTheVerifyOncePerCommitment)
+{
+    // THE SERVE PATH ITSELF, one level up: daemonless_qc_commitments is what
+    // the pre-emit gate's m_qc_plan_fn walks on EVERY cached-template read
+    // (node_coin_state.hpp:889-893 <- work_source.cpp:852-853). Re-deriving
+    // the plan N times must cost ONE verify per distinct commitment, not N.
+    constexpr uint32_t kH = 1'900'812u;   // testnet, inside a mining window
+    auto slots = compute_required_qc_slots(LlmqNetwork::Testnet, kH,
+                                           fake_hash_at, never_mined);
+    ASSERT_TRUE(slots.has_value());
+    ASSERT_FALSE(slots->empty());
+
+    int calls = 0;
+    MineableCommitmentCache cache;
+    for (const auto& s : *slots)
+        ASSERT_TRUE(cache.ingest(
+            LlmqNetwork::Testnet,
+            real_commitment(s.params, s.quorum_hash, s.quorum_index, 0x11)))
+            << "fixture commitment not admissible for type "
+            << static_cast<int>(s.params.type);
+    cache.set_bls_verify_fn([&calls](const CFinalCommitment&) {
+        ++calls;
+        return true;
+    });
+
+    const size_t n_slots = slots->size();
+    constexpr int kReads = 50;
+    for (int i = 0; i < kReads; ++i) {
+        auto plan = daemonless_qc_commitments(LlmqNetwork::Testnet, kH,
+                                              fake_hash_at, never_mined, &cache);
+        ASSERT_TRUE(plan.has_value()) << "read " << i << " failed the height closed";
+        ASSERT_EQ(plan->size(), n_slots);
+    }
+    EXPECT_EQ(static_cast<size_t>(calls), n_slots)
+        << "plan re-derivation re-proved the aggregate signatures: " << calls
+        << " verifies for " << kReads << " reads of " << n_slots
+        << " unchanged commitments — the io-thread cost the incident measured";
+}
+
+// ── C1: the latch is std::atomic<bool>, not a plain bool ───────────────────
+//
+// The memo's thread-safety was, as first written, an argument you had to READ
+// THE CODE to believe: `mutable bool`, no lock, justified by "the only
+// production caller is the single coin-state-owning thread"
+// (work_source.cpp:823-827). That is the same shape of assumption that
+// produced the 2026-08-05 heap corruption on this same money path (the
+// oracle-shadow worker racing lockless coin state), so the latch is now a
+// relaxed std::atomic<bool> (dkg_commitments.hpp:800). Relaxed is the right
+// order and the whole safety argument fits in one line: the latch publishes
+// NO data — the commitment bytes it guards are immutable for the entry's
+// lifetime, since replacement builds a fresh entry — so there is nothing for
+// an acquire/release pair to order, and the worst a concurrent reader can
+// suffer is a REDUNDANT re-verify of the same bytes to the same verdict.
+//
+// HOW THIS TEST IS DEMONSTRATED RED (it is a race-detector test, so it is
+// honest to say so: in an ordinary build it passes with a plain bool too —
+// a benign-in-practice race is still UB, and the tool that sees UB is TSan):
+//
+//   g++ -std=c++20 -O1 -g -fsanitize=thread \
+//       -I<repo>/include -I<repo>/src ... test/tools/tsan_qc_verify_latch.cpp \
+//       -o /tmp/tsan_latch
+//   setarch $(uname -m) -R /tmp/tsan_latch
+//
+//   with `mutable std::atomic<bool> verified` : served=16000/16000
+//                                               verifies=4, NO TSan report
+//   with `mutable bool verified`              : WARNING: ThreadSanitizer:
+//                                               data race — "Write of size 1"
+//                                               in verified_for at
+//                                               dkg_commitments.hpp:760, two
+//                                               reader threads
+//
+// test/tools/tsan_qc_verify_latch.cpp is that harness, committed alongside so
+// the demonstration is reproducible rather than reported. What the gtest below
+// pins WITHOUT a sanitizer is the behavioural contract the atomic must keep:
+// concurrency must never cost a reader its commitment, and the latch must
+// still converge (verifies bounded by the reader count, not by the read
+// count).
+
+TEST(DashQcVerifyMemo, ConcurrentServeReadsAlwaysGetTheirCommitmentAndConverge)
+{
+    MineableCommitmentCache cache;
+    const uint256 qh = h256(0x76);
+    ASSERT_TRUE(cache.ingest(LlmqNetwork::Testnet,
+                             real_commitment(kLlmq50_60, qh, 0, 0x11)));
+    std::atomic<int> calls{0};
+    cache.set_bls_verify_fn([&calls](const CFinalCommitment&) {
+        calls.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    });
+
+    constexpr int kThreads = 8;
+    constexpr int kReads   = 2000;
+    std::atomic<bool> go{false};
+    std::atomic<int> served{0};
+    std::vector<std::thread> readers;
+    readers.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        readers.emplace_back([&] {
+            while (!go.load(std::memory_order_acquire)) { }
+            for (int i = 0; i < kReads; ++i)
+                if (cache.verified_for(1, qh).has_value())
+                    served.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+    go.store(true, std::memory_order_release);
+    for (auto& t : readers) t.join();
+
+    EXPECT_EQ(served.load(), kThreads * kReads)
+        << "a concurrent read WITHHELD a verified commitment — the latch is "
+           "positive-only, so no interleaving may ever turn a verified slot "
+           "into a refusal";
+    EXPECT_GE(calls.load(), 1);
+    EXPECT_LE(calls.load(), kThreads)
+        << "the verify ran " << calls.load() << " times for "
+        << (kThreads * kReads)
+        << " reads: the only tolerable duplication is one racing re-verify "
+           "per reader thread at the moment of latching, never per read";
 }
