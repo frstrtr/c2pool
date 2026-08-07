@@ -221,6 +221,16 @@ inline WorkSelection select_dash_work(
                      << (emb.mnstates ? "mnstates=ok" : "mnstates=null")
                      << ") — enable --embedded-utxo to verify the pin";
         } else {
+            // HEIGHT (measured on the primary 2026-08-07): dashd's GBT reply
+            // does not always carry m_height by the time we splice — the live
+            // node logged `pinned tx EXCLUDED h=0`. A zero height makes the
+            // coinbase-maturity arm of the gate nonsense (next_height 0 marks
+            // every coinbase input immature), so take the bundle's own tip
+            // when dashd's copy is unset. emb.prev_height is the header tip we
+            // just evaluated the arm against, so prev_height + 1 is the height
+            // this template builds.
+            if (out.work.m_height == 0 && emb.prev_height != 0)
+                out.work.m_height = emb.prev_height + 1;
             splice_pinned_tx(out.work, *emb.pinned_local_tx,
                              *emb.mempool, *emb.mnstates, "dashd-splice");
         }

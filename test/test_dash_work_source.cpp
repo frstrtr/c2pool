@@ -447,6 +447,53 @@ TEST(HashrateVardiffHysteresis, LowerMarginHeldButDecisiveDropStepsDown)
 }
 
 
+// HEIGHT WIRING (live defect 2026-08-07): the primary logged
+// `pinned tx EXCLUDED h=0` because dashd's template copy carried no height at
+// the splice point. Zero is not a harmless label — the gate's coinbase
+// maturity arm reads it as next_height, which would mark every coinbase input
+// immature. When dashd's copy is unset the bundle's own tip must fill it in.
+TEST(DashWorkSource, PinnedSpliceFillsHeightFromBundleTipWhenDashdCopyIsUnset)
+{
+    using ::core::coin::UTXOViewCache;
+    using ::core::coin::Outpoint;
+    using ::core::coin::Coin;
+
+    uint256 prev;
+    prev.begin()[0] = 0x77;
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(9'000, {}, /*height=*/1, /*cb=*/false));
+
+    dash::coin::Mempool mp;
+    mp.set_utxo(&utxo);
+    MnStateMachine mn;
+
+    dash::coin::MutableTransaction pin;
+    pin.vin.resize(1);
+    pin.vin[0].prevout.hash  = prev;
+    pin.vin[0].prevout.index = 0;
+    pin.vout.resize(1);
+    pin.vout[0].value = 9'000;
+
+    EmbeddedWorkInputs emb;          // has_state=false -> fallback arm
+    emb.mnstates        = &mn;
+    emb.mempool         = &mp;
+    emb.pinned_local_tx = &pin;
+    emb.prev_height     = 2'517'800; // the header tip the arm was evaluated on
+
+    bool emb_ran = false, fb_ran = false;
+    WorkSelection sel = select_dash_work(
+        emb,
+        [&] { return embedded_stub(emb_ran); },
+        // dashd copy WITHOUT a height — the shape the primary produced.
+        [&] { fb_ran = true; DashWorkData w; w.m_height = 0; return w; });
+
+    EXPECT_EQ(sel.source, WorkSource::DashdFallback);
+    EXPECT_TRUE(fb_ran);
+    EXPECT_EQ(sel.work.m_height, 2'517'801u) << "height must come from the bundle tip + 1";
+    ASSERT_EQ(sel.work.m_txs.size(), 1u) << "the pin must still be spliced";
+    EXPECT_EQ(sel.work.m_tx_fees[0], 0u);
+}
+
 // ─── #107: creditPool divergence — explained vs unexplained ─────────────────
 // KAT for special_tx_pool_delta, the arithmetic that decides whether a GBT
 // creditPool divergence is ACCOUNTED FOR by pending DIP-0027 asset movement
