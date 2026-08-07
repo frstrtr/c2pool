@@ -221,8 +221,14 @@ inline WorkSelection select_dash_work(
     // path now gates beside the coin state and appends at the real template
     // (DASHWorkSource::resolve_coin_state_arm + the re-source site); callers
     // that pass a genuine fallback still splice here.
+    // The test is deliberately narrow: ONLY a value indistinguishable from a
+    // default-constructed DashWorkData counts as a placeholder. Anything
+    // carrying a height, a previous block, or transactions is a template that
+    // told us something, and we splice into it. Refusing on any single missing
+    // field would silently drop the pin from real templates.
     const bool fallback_is_placeholder =
-        out.work.m_previous_block.IsNull() && out.work.m_txs.empty();
+        out.work.m_height == 0 && out.work.m_previous_block.IsNull()
+        && out.work.m_txs.empty();
     if (emb.pinned_local_tx != nullptr && !fallback_is_placeholder) {
         if (emb.mempool == nullptr || emb.mnstates == nullptr) {
             LOG_INFO << "[dashd-splice] pinned tx EXCLUDED h="
