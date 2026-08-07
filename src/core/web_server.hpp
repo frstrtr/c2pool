@@ -280,7 +280,12 @@ public:
                             double network_difficulty = 0,
                             double share_difficulty = 0,
                             double pool_hashrate = 0,
-                            uint64_t subsidy = 0);
+                            uint64_t subsidy = 0,
+                            // TRUE only from the local won-block dispatch. The
+                            // sharechain-peer path passes false: that block was
+                            // built by ANOTHER node's template, so nothing this
+                            // node pins or serves is in it.
+                            bool found_locally = false);
     
     // Boundary types hoisted to core::stratum (see core/stratum_types.hpp).
     // Aliases kept here so existing references like `MiningInterface::JobSnapshot`
@@ -755,6 +760,13 @@ public:
         double      expected_time{0};      // expected seconds to find at current rate
         double      time_to_find{0};       // actual seconds since previous block
         double      luck{0};              // expected_time / time_to_find * 100
+        // WHO FOUND IT. On a p2pool sharechain the coinbase pays EVERY
+        // participant proportionally, so our payout address appearing in a
+        // block's coinbase means we earned a SHARE of it — never that we found
+        // it. Reading the coinbase for authorship is the mistake this field
+        // exists to make impossible: it is set at the call site that knows,
+        // and the log states it in words.
+        bool        found_locally{false};
     };
 
     // Block acceptance verification: schedule async checks at +10s, +30s, +120s.

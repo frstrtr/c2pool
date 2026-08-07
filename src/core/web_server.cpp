@@ -3421,7 +3421,8 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
                                           double network_difficulty,
                                           double share_difficulty,
                                           double pool_hashrate,
-                                          uint64_t subsidy)
+                                          uint64_t subsidy,
+                                          bool found_locally)
 {
     if (ts == 0) ts = static_cast<uint64_t>(std::time(nullptr));
     std::string hash_hex = hash.GetHex();
@@ -3477,6 +3478,12 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
                 if (existing.pool_hashrate <= 0.0)
                     existing.pool_hashrate = pool_hashrate;
                 if (existing.subsidy == 0) existing.subsidy = subsidy;
+                // Authorship only ever turns ON. The peer path records first
+                // (we see the block on the sharechain), and our own dispatch
+                // may enrich the same row afterwards — that second call is the
+                // one that knows we built it. The reverse never happens, so an
+                // OR is correct and an assignment would be a downgrade.
+                existing.found_locally = existing.found_locally || found_locally;
                 LOG_INFO << "[Pool] found-block row ENRICHED (was recorded"
                             " unattributed): h=" << existing.height
                          << " hash=" << hash_hex.substr(0, 16)
@@ -3495,7 +3502,7 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
 
     FoundBlock blk{height, hash_hex, ts, BlockStatus::pending, 0, chain, 0,
                    miner, share_hash, network_difficulty, share_difficulty,
-                   pool_hashrate, subsidy, 0, 0, 0};
+                   pool_hashrate, subsidy, 0, 0, 0, found_locally};
 
     // Compute time_to_find from previous block, then derive expected_time and luck
     {
@@ -3672,14 +3679,45 @@ void MiningInterface::verify_found_block(size_t index)
         if (blk.status == BlockStatus::pending) {
             blk.status = BlockStatus::confirmed;
             auto age_sec = static_cast<uint64_t>(std::time(nullptr)) - blk.ts;
+            // WHO FOUND IT, in words. On a p2pool sharechain the coinbase
+            // pays every participant proportionally, so our payout address in
+            // a block's coinbase means we earned a SHARE — never that we found
+            // it. That ambiguity cost real debugging time on 2026-08-07, when
+            // block 2517979 read as "ours" by its coinbase and was in fact
+            // found by another sharechain node, which is also why none of this
+            // node's pinned transactions were in it.
             LOG_INFO << "\n"
-                     << "  +++  BLOCK CONFIRMED — " << cn << " height " << blk.height << "  +++\n"
+                     << (blk.found_locally
+                            ? "  +++  BLOCK CONFIRMED — FOUND BY THIS NODE  +++\n"
+                            : "  +++  POOL BLOCK CONFIRMED — found by ANOTHER "
+                              "sharechain node  +++\n")
                      << "  Chain:      " << cn << "\n"
                      << "  Height:     " << blk.height << "\n"
                      << "  Block hash: " << blk.hash << "\n"
+                     << "  Found by:   "
+                     << (blk.found_locally ? "THIS NODE (we built the template"
+                                             " and dispatched it)"
+                                           : "ANOTHER NODE on the sharechain"
+                                             " — its template, not ours")
+                     << "\n"
+                     << "  Payout to:  " << (blk.miner.empty() ? "(unattributed)"
+                                                               : blk.miner)
+                     << (blk.found_locally ? ""
+                                           : "   [our address may still appear"
+                                             " in the coinbase as our SHARE of"
+                                             " the pool payout]")
+                     << "\n"
+                     << "  Share hash: " << (blk.share_hash.empty()
+                                                 ? "(none)" : blk.share_hash)
+                     << "\n"
                      << "  Verified:   check #" << (int)blk.check_count
                      << " (" << age_sec << "s after submission)"
-                     << " confirmations=" << blk.confirmations;
+                     << " confirmations=" << blk.confirmations
+                     << (blk.found_locally
+                            ? ""
+                            : "\n  Note:       transactions this node pins or"
+                              " serves are NOT in this block — the finder built"
+                              " its own template.");
         }
         // Already confirmed — just update confirmation count silently
     } else if (result < 0) {
