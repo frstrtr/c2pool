@@ -405,6 +405,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-utxo-immature-serve-empty] [--embedded-serve-mempool-txs]\n"
         << "           [--pin-local-tx-hex FILE]  (zero-fee self-mined tx, e.g. donation consolidation)\n"
         << "           [--pin-splice-xcheck-arm]  (let pins ride an xcheck-SWAPPED dashd template; default OFF)\n"
+        << "           [--pin-splice-block-budget] (EXCLUDE a pin that pushes the template past the block size cap; default OFF)\n"
         << "           [--bestcl-policy freshness|consensus-exact]\n"
         << "           [--embedded-oracle-shadow]\n"
         << "           [--embedded-shadow-compare]\n"
@@ -829,7 +830,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // unchanged; ON, the pins ride it too, through the same unchanged
              // admission gate plus a height check and a block-size budget that
              // can only EXCLUDE.
-             bool pin_splice_xcheck_arm = false)
+             bool pin_splice_xcheck_arm = false,
+             // --pin-splice-block-budget: ENFORCE the block-level size budget
+             // in the pin splice. DEFAULT OFF -- money path.
+             //
+             // The budget caps a pin against what the template already holds
+             // (2 MB minus a named reserve). Enforcing it turns an inclusion
+             // into an exclusion on the declined-embedded arm, which has been
+             // splicing pins onto served templates in production since before
+             // this flag existed -- so it CHANGES SERVED BYTES and may not
+             // default on. OFF, the overflow is a WARNING and a recorded flag
+             // on the template; ON, the pin is excluded with cause=block-budget
+             // (block 2517855 was lost to bad-txns-oversize).
+             bool pin_splice_block_budget = false)
 {
     namespace io = boost::asio;
 
@@ -2553,6 +2566,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
               << (pin_splice_xcheck_arm ? "ON (--pin-splice-xcheck-arm)"
                                         : "OFF (default; misses are named, "
                                           "not spliced)")
+              << "\n";
+    // Block-size budget for the pin splice (default OFF). It is a flag because
+    // ENFORCING it removes a pin from a template the declined-embedded arm is
+    // already serving -- that changes served bytes, which is exactly what a
+    // money-path change may not do unannounced. OFF it still SAYS the budget
+    // was blown; it just does not act.
+    work_source->set_pin_splice_block_budget(pin_splice_block_budget);
+    std::cout << "[DASH-STRATUM-GBT] pin splice block-size budget: "
+              << (pin_splice_block_budget
+                      ? "ENFORCED (--pin-splice-block-budget; an over-budget "
+                        "pin is EXCLUDED)"
+                      : "OFF (default; an over-budget pin still rides and the "
+                        "overflow is logged BLOCK-BUDGET EXCEEDED, NOT "
+                        "ENFORCED)")
               << "\n";
     if (xcheck_wanted && !rpc) {
         std::cout << "[DASH-STRATUM-GBT] GBT cross-check DISABLED: dashd RPC "
@@ -7261,6 +7288,7 @@ int main(int argc, char** argv)
     bool embedded_creditpool_publish_at_serve_tip = false;
     std::string pin_local_tx_hex_path;
     bool pin_splice_xcheck_arm = false;
+    bool pin_splice_block_budget = false;
     // --embedded-mempool-ingest: arm the coin-P2P MSG_TX pull (phase 1).
     // SEPARATE from --embedded-serve-mempool-txs on purpose: this only makes
     // the mempool FILL. Whether its contents ever reach a served template is
@@ -7371,6 +7399,8 @@ int main(int argc, char** argv)
             pin_local_tx_hex_path = argv[++i];
         else if (std::strcmp(argv[i], "--pin-splice-xcheck-arm") == 0)
             pin_splice_xcheck_arm = true;
+        else if (std::strcmp(argv[i], "--pin-splice-block-budget") == 0)
+            pin_splice_block_budget = true;
         else if (std::strcmp(argv[i], "--replay-utxo-db") == 0 && i + 1 < argc)
             replay_utxo_db = argv[++i];
         else if (std::strcmp(argv[i], "--replay-utxo-hash") == 0)
@@ -7654,7 +7684,8 @@ int main(int argc, char** argv)
                         pin_local_tx_hex_path,
                         serve_staleness_sentinel,
                         embedded_creditpool_publish_at_serve_tip,
-                        pin_splice_xcheck_arm);
+                        pin_splice_xcheck_arm,
+                        pin_splice_block_budget);
     }
     return run_selftest();
 }

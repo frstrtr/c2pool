@@ -349,7 +349,7 @@ int64_t DASHWorkSource::peek_template_age_sec() const
 // IWorkSource: work generation -- Stage 4c (the template trio).
 // ─────────────────────────────────────────────────────────────────────────────
 
-namespace {
+namespace detail {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // THE ONE PLACE a pinned donation tx meets a SERVED dashd-fallback template.
@@ -379,12 +379,20 @@ void splice_pins_onto_served_fallback(
     const std::vector<coin::MutableTransaction>* pins,
     const std::vector<coin::PinVerdict>& verdicts,
     bool from_xcheck_swap,
-    bool xcheck_arm_enabled)
+    bool xcheck_arm_enabled,
+    bool block_budget_enabled)
 {
     if (pins == nullptr || pins->empty()) return;   // nothing configured
 
     const char* const kArm = "dashd-splice";
-    const std::string site = from_xcheck_swap ? " site=xcheck-swap" : "";
+    const std::string site = from_xcheck_swap ? " site=xcheck-swap"
+                                              : " site=declined-embedded";
+
+    auto pin_value = [](const coin::MutableTransaction& pin) {
+        int64_t v = 0;
+        for (const auto& o : pin.vout) v += o.value;
+        return v;
+    };
 
     auto record = [&](const coin::MutableTransaction& pin, bool included,
                       const char* cause, uint32_t gate_h) {
@@ -394,7 +402,48 @@ void splice_pins_onto_served_fallback(
         o.cause           = included ? std::string() : std::string(cause);
         o.gate_height     = gate_h;
         o.template_height = w.m_height;
+        o.value           = pin_value(pin);
         w.m_pin_outcomes.push_back(std::move(o));
+    };
+
+    // ── THE DROP ALARM ────────────────────────────────────────────────────
+    // Emitted once per SERVED template that is missing at least one pin, at
+    // WARNING, naming the count, the height, the satoshi value at stake and
+    // every distinct cause. Runs on every exit path below (including the
+    // count-mismatch early return), which is why it is a named lambda and not
+    // a tail block.
+    //
+    // It exists because C1 of the review verdict is correct: with
+    // --pin-splice-xcheck-arm at its default OFF the h=2518044 loss shape is
+    // unchanged in BYTES -- the four pins are still absent from every swapped
+    // template. What changes is that the loss is now stated, per template,
+    // with the cause named and the money counted. An operator reading
+    // "pins=0/4" learns nothing; an operator reading
+    // "DONATION-DROPPED 4/4 pins h=2518044 value=... cause=xcheck-swap-pin-gate-off"
+    // knows exactly what is being given up and which flag buys it back.
+    auto raise_drop_alarm = [&]() {
+        size_t      dropped = 0;
+        int64_t     lost    = 0;
+        std::string causes;
+        for (const auto& o : w.m_pin_outcomes) {
+            if (o.included) continue;
+            ++dropped;
+            lost += o.value;
+            if (causes.find(o.cause) == std::string::npos)
+                causes += (causes.empty() ? "" : ",") + o.cause;
+        }
+        if (dropped == 0) return;
+        w.m_pin_drop_alarm =
+            "DONATION-DROPPED " + std::to_string(dropped) + "/"
+            + std::to_string(pins->size()) + " pins h="
+            + std::to_string(w.m_height) + " value=" + std::to_string(lost)
+            + "sat cause=" + causes + site;
+        LOG_WARNING << "[" << kArm << "] " << w.m_pin_drop_alarm
+                    << " -- this template IS SERVED to miners without the "
+                       "donation; if it wins, that value does not land"
+                    << (from_xcheck_swap && !xcheck_arm_enabled
+                            ? " (carry it with --pin-splice-xcheck-arm)"
+                            : "");
     };
 
     // The verdict vector is produced one-per-pin beside the coin state. A
@@ -409,6 +458,7 @@ void splice_pins_onto_served_fallback(
                         << pins->size() << " pins)" << site;
             record(pin, false, "pin-verdict-count-mismatch", 0);
         }
+        raise_drop_alarm();
         return;
     }
 
@@ -447,9 +497,11 @@ void splice_pins_onto_served_fallback(
         // With the flag off this arm behaves exactly as before -- except that
         // the miss is now NAMED instead of silent.
         if (from_xcheck_swap && !xcheck_arm_enabled) {
-            LOG_INFO << "[" << kArm << "] pinned tx EXCLUDED h=" << v.at_height
+            LOG_WARNING << "[" << kArm << "] pinned tx EXCLUDED h=" << v.at_height
                      << " cause=xcheck-swap-pin-gate-off txid=" << txid
-                     << " (enable with --pin-splice-xcheck-arm)" << site;
+                     << " value=" << pin_value(pin) << "sat"
+                     << " (admissible; DROPPED BY POLICY -- enable with"
+                        " --pin-splice-xcheck-arm)" << site;
             record(pin, false, "xcheck-swap-pin-gate-off", v.at_height);
             continue;
         }
@@ -483,18 +535,99 @@ void splice_pins_onto_served_fallback(
             continue;
         }
 
-        // (e) Pins vs THE BLOCK. Strictly work-removing: it can only ever turn
-        // an inclusion into an exclusion, and an unmineable block is worth
-        // less than a missed donation.
+        // (e) Pins vs THE BLOCK. FLAG-GATED (--pin-splice-block-budget),
+        // DEFAULT OFF, because it is NOT byte-neutral: on the declined-embedded
+        // arm -- which has spliced pins in production since before this branch
+        // -- turning an inclusion into an exclusion changes the transaction set
+        // of a template that is already being served. "Only ever removes work"
+        // is not the exemption; the exemption is "does not change served
+        // template bytes", and this changes them. The reviewer was right to
+        // call it a rule breach, so it ships off.
+        //
+        // Removing it is not an option either: the cap exists because block
+        // 2517855 was lost to bad-txns-oversize. So with the flag OFF the
+        // overflow is not silently ignored -- it is a WARNING plus a recorded
+        // flag on the template, and the operator can turn the exclusion on.
         if (existing_bytes + spliced_bytes + sz
             > coin::Mempool::kMaxPinnedBlockBytes) {
-            LOG_WARNING << "[" << kArm << "] pinned tx EXCLUDED h=" << v.at_height
-                        << " cause=block-budget txid=" << txid
+            if (block_budget_enabled) {
+                LOG_WARNING << "[" << kArm << "] pinned tx EXCLUDED h=" << v.at_height
+                            << " cause=block-budget txid=" << txid
+                            << " (" << existing_bytes << "+" << spliced_bytes << "+"
+                            << sz << " > " << coin::Mempool::kMaxPinnedBlockBytes
+                            << ")" << site;
+                record(pin, false, "block-budget", v.at_height);
+                continue;
+            }
+            w.m_pin_block_budget_unenforced = true;
+            LOG_WARNING << "[" << kArm << "] BLOCK-BUDGET EXCEEDED, NOT ENFORCED"
+                        << " h=" << v.at_height << " txid=" << txid
                         << " (" << existing_bytes << "+" << spliced_bytes << "+"
                         << sz << " > " << coin::Mempool::kMaxPinnedBlockBytes
-                        << ")" << site;
-            record(pin, false, "block-budget", v.at_height);
-            continue;
+                        << ") -- serving this template ANYWAY because"
+                           " --pin-splice-block-budget is off; if it wins the"
+                           " block may be rejected bad-blk-length, the loss"
+                           " that cost block 2517855" << site;
+        }
+
+        // (f) DUPLICATE / CONFLICT vs THE HOST TEMPLATE. The splice appends
+        // blind: it never asked whether the template it is appending to already
+        // carries this transaction, or already spends one of its inputs. Either
+        // one produces a block that CANNOT be mined -- bad-txns-duplicate /
+        // bad-txns-inputs-missingorspent -- so it costs the whole block, not
+        // just the donation. The presence scan four functions down
+        // (served_pins_field) already walks m_tx_hashes for exactly this txid;
+        // it just ran AFTER the append, where it could only report.
+        //
+        // The scan also covers pins spliced EARLIER in this same loop, because
+        // pin_append writes into the very containers it reads.
+        //
+        // WHY THIS ONE IS NOT FLAG-GATED AND (e) IS. Both remove a pin from a
+        // template the declined-embedded arm already serves, so both change
+        // served bytes -- but only one of them can change a template that was
+        // MINEABLE. (e)'s threshold is a HEURISTIC with a 100 KB reserve: a
+        // 1.95 MB template plus an 85-byte pin trips it while being 49915 bytes
+        // inside the real 2 MB consensus limit, so enforcing it would drop the
+        // donation from blocks that would have been accepted. This one is
+        // CONSENSUS-EXACT: a block containing the same txid twice, or two
+        // inputs spending one outpoint, is invalid unconditionally, at every
+        // size, on every node. The only templates it changes are templates that
+        // could never have produced a block. That is the exemption -- it does
+        // not change what we can serve, only what we can never mine.
+        {
+            const auto id = coin::dash_txid(pin);
+            if (std::find(w.m_tx_hashes.begin(), w.m_tx_hashes.end(), id)
+                != w.m_tx_hashes.end()) {
+                LOG_WARNING << "[" << kArm << "] pinned tx EXCLUDED h=" << v.at_height
+                            << " cause=already-in-template txid=" << txid
+                            << " (the served template already carries this txid;"
+                               " appending it again is bad-txns-duplicate)" << site;
+                record(pin, false, "already-in-template", v.at_height);
+                continue;
+            }
+            const char* conflict = nullptr;
+            for (const auto& pin_in : pin.vin) {
+                for (const auto& host : w.m_txs) {
+                    for (const auto& host_in : host.vin) {
+                        if (host_in.prevout.index == pin_in.prevout.index
+                            && host_in.prevout.hash == pin_in.prevout.hash) {
+                            conflict = "input-spent-by-template";
+                            break;
+                        }
+                    }
+                    if (conflict) break;
+                }
+                if (conflict) break;
+            }
+            if (conflict) {
+                LOG_WARNING << "[" << kArm << "] pinned tx EXCLUDED h=" << v.at_height
+                            << " cause=" << conflict << " txid=" << txid
+                            << " (an input of this pin is already spent by the"
+                               " served template; the block would be rejected"
+                               " bad-txns-inputs-missingorspent)" << site;
+                record(pin, false, conflict, v.at_height);
+                continue;
+            }
         }
 
         coin::pin_append(w, pin);
@@ -504,6 +637,8 @@ void splice_pins_onto_served_fallback(
                  << " txid=" << txid << " vin=" << pin.vin.size()
                  << " fee=0 (rides this template)" << site;
     }
+
+    raise_drop_alarm();
 }
 
 // The NEGATIVE SPACE on the arm line. Counted by txid PRESENCE in the served
@@ -528,10 +663,16 @@ std::string served_pins_field(const coin::DashWorkData& w,
             out += " pin_cause=" + o.cause;
             break;
         }
+    // The alarm rides the arm line too, so the ONE line an operator greps for
+    // template provenance also carries "money went missing here, this much,
+    // for this reason" instead of a bare ratio.
+    if (!w.m_pin_drop_alarm.empty()) out += " " + w.m_pin_drop_alarm;
+    if (w.m_pin_block_budget_unenforced)
+        out += " BLOCK-BUDGET-UNENFORCED";
     return out;
 }
 
-}  // namespace
+}  // namespace detail
 
 // ─────────────────────────────────────────────────────────────────────────────
 // #1134 — OWNERSHIP SPLIT ON THE SERVE PATH.
@@ -835,10 +976,10 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
             // path nobody remembered to wire. The embedded arm is untouched
             // (it splices in its own builder, embedded_gbt.hpp).
             if (sel.source == coin::WorkSource::DashdFallback)
-                splice_pins_onto_served_fallback(sel.work, arm.pin_txs,
-                                                 arm.pin_verdicts,
-                                                 served_via_xcheck_swap,
-                                                 pin_splice_xcheck_arm_);
+                detail::splice_pins_onto_served_fallback(
+                    sel.work, arm.pin_txs, arm.pin_verdicts,
+                    served_via_xcheck_swap, pin_splice_xcheck_arm_,
+                    pin_splice_block_budget_);
             // E2c observability: WHICH arm served this template + the MN payee
             // it carries (the payee-correctness axis of the embedded arm). One
             // line per re-source (cache-TTL cadence), INFO -- the field-
@@ -866,7 +1007,7 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                      // that quietly dropped every pin read exactly like one
                      // that carried them all. Counted by txid presence in what
                      // is ACTUALLY served, on BOTH arms.
-                     << served_pins_field(sel.work, arm.pin_txs);
+                     << detail::served_pins_field(sel.work, arm.pin_txs);
             work_is_embedded = (sel.source == coin::WorkSource::Embedded);
             // ── DEFECT-3: the gate must SAY WHY it refused ──────────────────
             // sel.decline came out of the branch that chose the arm (dashd's

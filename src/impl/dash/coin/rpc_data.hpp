@@ -97,6 +97,11 @@ struct PinOutcome {
     /// gate runs beside the coin state and the template may come from dashd.
     uint32_t    gate_height{0};
     uint32_t    template_height{0};
+    /// Sum of the pin's outputs, in satoshi. This is WHAT IS LOST when the pin
+    /// does not ride a template that then wins: the donation is a zero-fee
+    /// self-spend, so its output total is the whole amount at stake. Recorded
+    /// so the drop alarm can name a number instead of a count.
+    int64_t     value{0};
 };
 
 struct DashWorkData {
@@ -174,6 +179,26 @@ struct DashWorkData {
     // SERVED dashd-fallback arm. Empty on the embedded arm (which splices in
     // its own builder and logs there) and empty when no pin is configured.
     std::vector<PinOutcome> m_pin_outcomes;
+
+    // ── THE DROP ALARM (non-consensus) ────────────────────────────────────
+    // Non-empty when this SERVED template is missing at least one configured
+    // pin. It names the count, the height, the satoshi value at stake and the
+    // cause(s), because "pins=0/4" on its own does not tell an operator that
+    // money is going missing or why.
+    //
+    // The flag-off xcheck-swap arm is the case this exists for: with
+    // --pin-splice-xcheck-arm at its default the donation is DELIBERATELY not
+    // spliced, and a deliberate loss that is only visible as an INFO line is
+    // operationally identical to the silent loss that cost h=2518044.
+    std::string m_pin_drop_alarm;
+
+    // ── BLOCK-BUDGET NOT ENFORCED (non-consensus) ─────────────────────────
+    // True when a pin was appended even though it pushed the template past
+    // kMaxPinnedBlockBytes, because --pin-splice-block-budget is OFF (the
+    // default: enforcing it CHANGES SERVED BYTES on the already-live
+    // declined-embedded arm, so it may not be on by default). The block may be
+    // rejected as bad-blk-length if it wins. Always accompanied by a WARNING.
+    bool m_pin_block_budget_unenforced{false};
 };
 
 } // namespace coin
