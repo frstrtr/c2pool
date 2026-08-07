@@ -41,6 +41,7 @@
 #include <impl/dash/crypto/hash_x11.hpp>      // dash::crypto::hash_x11 (X11 PoW SSOT)
 #include <impl/dash/params.hpp>               // dash::make_coin_params
 #include <impl/dash/coin/vendor/cbtx.hpp>     // vendor::parse_cbtx (GBT-xcheck creditPool)
+#include <impl/dash/coin/special_tx_pool_delta.hpp> // #107: explain the pool delta
 
 #include <core/address_utils.hpp>             // core::address_to_script (mint payout from username)
 #include <core/log.hpp>
@@ -532,11 +533,51 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                 if (emb_ok && dref_ok
                     && dref.m_height == sel.work.m_height
                     && emb_cb.creditPoolBalance != dref_cb.creditPoolBalance) {
+                    // #107 phase 1 — EXPLAIN the delta before alarming on it.
+                    // Our builder excludes every special tx BY DESIGN (C-3,
+                    // mempool.hpp), so when dashd's template carries pending
+                    // asset locks/unlocks its CbTx pool differs by EXACTLY
+                    // their summed effect (DIP-0027: lock +sum(creditOutputs);
+                    // unlock −(payload.fee + Σvout)). dashd's template hands us
+                    // the exact tx list, so this is an equation, not a guess.
+                    // Serving behaviour is UNCHANGED either way (dashd wins);
+                    // only the classification differs, so the graduation-gate
+                    // statistics stop counting a by-design exclusion as drift.
+                    const coin::SpecialPoolDelta sp =
+                        coin::special_tx_pool_delta(dref.m_txs);
+                    const int64_t special_delta = sp.delta;
+                    const unsigned special_n = sp.count;
+                    const bool explained = sp.explains(emb_cb.creditPoolBalance,
+                                                      dref_cb.creditPoolBalance);
+                    if (explained) {
+                        LOG_INFO << "[DASH-STRATUM-GBT] GBT-xcheck MATCH-MODULO-SPECIAL at h="
+                                 << sel.work.m_height << " embedded creditPool="
+                                 << emb_cb.creditPoolBalance << " dashd="
+                                 << dref_cb.creditPoolBalance << " — delta "
+                                 << special_delta << " fully explained by "
+                                 << special_n << " pending asset lock/unlock tx(s)"
+                                 << " dashd includes and we exclude by design"
+                                 << " (serving dashd template; classification only)";
+                        coin::DeclineReport xok;
+                        xok.viable    = false;
+                        xok.cause     = "gbt-xcheck-modulo-special-explained";
+                        xok.value     = std::to_string(special_delta);
+                        xok.threshold = std::to_string(special_n) + "-special-txs";
+                        sel = coin::WorkSelection{ std::move(dref),
+                                                   coin::WorkSource::DashdFallback,
+                                                   std::move(xok) };
+                    } else {
                     LOG_WARNING << "[DASH-STRATUM-GBT] GBT-xcheck MISMATCH at h="
                                 << sel.work.m_height << " embedded creditPool="
                                 << emb_cb.creditPoolBalance << " dashd="
                                 << dref_cb.creditPoolBalance
-                                << " — serving dashd template (reward-safety backstop)";
+                                << " — serving dashd template (reward-safety backstop)"
+                                << (special_n
+                                        ? " [" + std::to_string(special_n)
+                                              + " special txs seen but they do NOT"
+                                                " explain the delta ("
+                                              + std::to_string(special_delta) + ")]"
+                                        : "");
                     coin::DeclineReport xcheck;
                     xcheck.viable    = false;
                     xcheck.cause     = "gbt-xcheck-creditpool-mismatch";
@@ -545,6 +586,7 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                     sel = coin::WorkSelection{ std::move(dref),
                                                coin::WorkSource::DashdFallback,
                                                std::move(xcheck) };
+                    }
                 }
             }
             // E2c observability: WHICH arm served this template + the MN payee
