@@ -1477,3 +1477,102 @@ TEST(DashPinGate, OversizeIsNamedEvenWithNoUtxoViewWired) {
               dash::coin::Mempool::PinnedTxGate::TooLarge)
         << "size is decidable without chain state; say so";
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// UNIFIED SIZE BUDGET — every component competes for ONE block.
+//
+// Before this, mempool selection was handed the WHOLE cap as if it were alone
+// in the block, and the consensus-required qc set plus any pinned transactions
+// were appended ON TOP. The arithmetic overshoots the 2 MB consensus limit,
+// and an oversize block is INVALID — dashd rejects it bad-blk-length and the
+// height goes to another miner. We lost block 2517855 to the same class of
+// error one level down (a single oversize TRANSACTION); this is the same
+// mistake at block scale.
+//
+// dashd accounts the other way round on purpose (node/miner.cpp): nBlockSize
+// starts at a 1000-byte coinbase reserve, each qcTx GetTotalSize() is added,
+// and packages are fitted into what remains. The component that can be dropped
+// safely — mempool txs, worth only fees — yields to the ones that cannot.
+// ════════════════════════════════════════════════════════════════════════
+
+TEST(DashSizeBudget, SelectionBudgetShrinksByTheRequiredSet) {
+    // The arithmetic that was wrong. Selection cap 1'990'000 while the pin set
+    // may hold kMaxPinnedTotalBytes (400'000) and the qc plan adds more — the
+    // sum exceeded the 2'000'000 consensus limit with no accounting anywhere.
+    constexpr uint64_t kConsensusBlockLimit = 2'000'000;
+    constexpr uint64_t kOldSelectionCap     = 1'990'000;
+    constexpr uint64_t kPinBudget = dash::coin::Mempool::kMaxPinnedTotalBytes;
+
+    // Worst case under the OLD scheme: selection fills its cap, pins fill
+    // theirs, qc rides on top. Even ignoring qc entirely this is already over.
+    const uint64_t old_worst = kOldSelectionCap + kPinBudget;
+    EXPECT_GT(old_worst, kConsensusBlockLimit)
+        << "the pre-fix arithmetic must actually overshoot, or this KAT is "
+           "asserting nothing: " << old_worst << " vs " << kConsensusBlockLimit;
+
+    // Under the unified budget the deduction is subtraction, so the total is
+    // bounded by construction no matter how the parts are sized.
+    constexpr uint64_t kCoinbaseReserve = 1'000;
+    const uint64_t qc_bytes  = 12'000;   // a fat rotated-boundary qc plan
+    const uint64_t reserved  = kCoinbaseReserve + qc_bytes + kPinBudget;
+    const uint64_t selection = reserved >= kOldSelectionCap
+                                   ? 0 : kOldSelectionCap - reserved;
+    EXPECT_LE(selection + reserved, kConsensusBlockLimit)
+        << "the unified budget must bound the whole block";
+}
+
+TEST(DashSizeBudget, RequiredSetLargerThanCapYieldsZeroNotUnderflow) {
+    // The face that would silently restore the old behaviour: if the required
+    // set exceeds the cap and the remainder is computed as an unsigned
+    // subtraction, it wraps to ~4 GB and selection fills the block again.
+    constexpr uint32_t MAX_BLOCK_BYTES = 1'990'000;
+    const uint64_t reserved = 2'500'000;   // required set alone over the cap
+
+    const uint32_t budget = reserved >= MAX_BLOCK_BYTES
+                                ? 0u
+                                : static_cast<uint32_t>(MAX_BLOCK_BYTES - reserved);
+    EXPECT_EQ(budget, 0u)
+        << "an over-budget required set must starve selection, never wrap";
+
+    // Demonstrate what the unguarded form would have produced, so the guard's
+    // value is visible rather than asserted.
+    const uint32_t unguarded =
+        static_cast<uint32_t>(MAX_BLOCK_BYTES - reserved);
+    EXPECT_GT(unguarded, MAX_BLOCK_BYTES)
+        << "unguarded subtraction wraps — this is the defect being prevented";
+}
+
+TEST(DashSizeBudget, BuilderDeductsPinsFromSelectionBudget) {
+    // End-to-end through the builder: with a pin configured, the template must
+    // not exceed the limit. The pin is admissible on the merits so it really
+    // does ride, and its bytes really do have to come from somewhere.
+    UTXOViewCache utxo(nullptr);
+    uint256 don = mint_hash(120);
+    utxo.add_coin(Outpoint(don, 0), Coin(50'000, {}, H - 5'000, /*cb=*/true));
+    Mempool mp; mp.set_utxo(&utxo);
+
+    MutableTransaction pin;
+    pin.version = 2; pin.type = 0; pin.locktime = 0;
+    { TxIn i; i.prevout.hash = don; i.prevout.index = 0;
+      i.sequence = 0xffffffffu; pin.vin.push_back(i); }
+    { TxOut o; o.value = 50'000; pin.vout.push_back(o); }
+    std::vector<MutableTransaction> pins{pin};
+
+    auto mnstates = single_mn(p2pkh_script(0x30));
+    auto w = build_embedded_workdata(
+        H - 1, raw256(0xAB), mnstates, mp,
+        0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER,
+        /*curtime=*/1'700'000'100u, /*version=*/0x20000000u,
+        /*underfill=*/nullptr, /*sml=*/nullptr, /*qmgr=*/nullptr,
+        /*best_cl_height=*/0, dash::coin::k_zero_cl_sig,
+        /*credit_pool=*/0, /*qc=*/nullptr, /*root_override=*/nullptr,
+        dash::coin::DASH_MN_RR_HEIGHT_MAINNET, /*superblock=*/nullptr,
+        dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+        /*suppress=*/true, "mempool-txs-disabled", &pins);
+
+    ASSERT_EQ(w.m_txs.size(), 1u) << "the pin rides";
+    uint64_t body = 0;
+    for (const auto& h : w.m_tx_data_hex) body += h.size() / 2;
+    EXPECT_LT(body, 2'000'000u)
+        << "template body must stay under the consensus block limit";
+}

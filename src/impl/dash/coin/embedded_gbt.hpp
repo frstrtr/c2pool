@@ -333,7 +333,47 @@ inline DashWorkData build_embedded_workdata(
 
     // Subsidy + tx selection.
     int64_t reward = compute_dash_block_reward_post_v20(w.m_height);
-    constexpr uint32_t MAX_BLOCK_BYTES = 1'990'000;  // leave headroom for cb
+
+    // ── UNIFIED SIZE BUDGET (block 2517855) ────────────────────────────────
+    // Every component of the block competes for ONE budget. Before this, the
+    // mempool selection was handed the WHOLE cap as if it were alone, and the
+    // consensus-required qc set plus any pinned transactions were appended on
+    // top of it. Worst case that overshoots the 2 MB block limit outright, and
+    // an oversize block is INVALID, not merely large — dashd rejects it with
+    // bad-blk-length and the height goes to another miner.
+    //
+    // dashd does the same accounting in the other direction: node/miner.cpp
+    // starts nBlockSize at a 1000-byte coinbase reserve, adds each qcTx's
+    // GetTotalSize(), and packages the rest against nBlockMaxSize minus that
+    // reserve. We mirror the ORDER — reserve, then consensus-required qc, then
+    // pins, then selection gets the remainder — so the component that can be
+    // dropped safely (mempool txs, worth fees) yields to the ones that cannot
+    // (coinbase and qc, required for validity).
+    //
+    // We size qc and pins BEFORE selection rather than after, because a budget
+    // discovered after the fact is not a budget. The pin figure here is an
+    // UPPER BOUND (every configured pin, before the admission gate runs); the
+    // gate can only shrink it, so deducting the bound is conservative and can
+    // never let the block exceed the cap.
+    constexpr uint32_t MAX_BLOCK_BYTES   = 1'990'000;  // leave headroom for cb
+    constexpr uint32_t kCoinbaseReserve  = 1'000;      // dashd node/miner.cpp:115
+    uint64_t reserved_bytes = kCoinbaseReserve;
+    if (qc_commitments != nullptr) {
+        for (const auto& c : *qc_commitments)
+            reserved_bytes += ::pack(build_qc_tx(w.m_height, c)).get_span().size();
+    }
+    if (pinned_local_txs != nullptr) {
+        for (const auto& t : *pinned_local_txs)
+            reserved_bytes += ::pack(t).get_span().size();
+    }
+    // Selection gets what is left. If the required set alone has eaten the
+    // budget, selection gets ZERO rather than a negative number wrapping to a
+    // huge unsigned cap — the underflow face is the one that would silently
+    // restore the old behaviour.
+    const uint32_t selection_budget =
+        reserved_bytes >= MAX_BLOCK_BYTES
+            ? 0u
+            : static_cast<uint32_t>(MAX_BLOCK_BYTES - reserved_bytes);
     // C-3: exclude Dash special txs (tx.type != 0) from the embedded template.
     // dashd recomputes the CbTx roots + creditPool by applying the block's own
     // special txs; including one without accounting for it yields bad-cbtx. The
@@ -350,7 +390,7 @@ inline DashWorkData build_embedded_workdata(
     auto [selected, total_fees] =
         suppress_mempool_txs
             ? std::pair<std::vector<Mempool::SelectedTx>, uint64_t>{{}, 0ull}
-            : mempool.get_sorted_txs_with_fees(MAX_BLOCK_BYTES,
+            : mempool.get_sorted_txs_with_fees(selection_budget,
                                                /*exclude_special=*/true,
                                                /*next_height=*/w.m_height);
     // MN-collateral spend filter (sml_projection.hpp, FINDING-2). The C-3
@@ -397,7 +437,10 @@ inline DashWorkData build_embedded_workdata(
     // which no consensus path reads.
     if (suppress_mempool_txs) {
         auto [cand, cand_fees] =
-            mempool.get_sorted_txs_with_fees(MAX_BLOCK_BYTES,
+            // Same budget as the served path. Reporting the forgone set
+            // against the FULL cap would overstate it — we could not have
+            // served more than selection_budget even with serving enabled.
+            mempool.get_sorted_txs_with_fees(selection_budget,
                                              /*exclude_special=*/true,
                                              /*next_height=*/w.m_height);
         (void)cand_fees;
