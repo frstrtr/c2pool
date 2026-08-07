@@ -74,6 +74,31 @@ inline bool submitblock_result_accepted(const nlohmann::json& result)
     return already_have && code.find("invalid") == std::string::npos;
 }
 
+// ── NON-CONSENSUS: what happened to each configured pinned local tx on THIS
+// template. One entry per configured pin, in file order, written by the splice
+// that judges it.
+//
+// It exists because a pin that is simply ABSENT is indistinguishable from a pin
+// that was never considered, and that ambiguity cost the donation on block
+// 2518044 (2026-08-07): the embedded builder logged four `pinned tx INCLUDED`
+// lines, the GBT-xcheck backstop swapped in dashd's template 57 ms later, and
+// the served template carried neither the pins nor one word about them.
+//
+// Never serialized, never hashed, never read by any consensus path -- the block
+// assembler reads m_txs / m_tx_data_hex only. It is the ANSWER a test can assert
+// on without scraping a log line.
+struct PinOutcome {
+    uint256     txid;
+    bool        included{false};
+    /// Named refusal reason when !included; empty when included.
+    std::string cause;
+    /// The height the pin GATE judged at (our tip + 1), and the height of the
+    /// template the pin was offered to. They are separate numbers because the
+    /// gate runs beside the coin state and the template may come from dashd.
+    uint32_t    gate_height{0};
+    uint32_t    template_height{0};
+};
+
 struct DashWorkData {
     // Raw getblocktemplate JSON response (kept for fallback access to fields
     // we haven't promoted to members yet).
@@ -143,6 +168,12 @@ struct DashWorkData {
     // what makes the fee lane completable at all.
     std::vector<uint256>  m_txset_candidates;
     std::vector<uint64_t> m_txset_candidate_fees;
+
+    // ── PIN OUTCOMES (see PinOutcome above) ───────────────────────────────
+    // One entry per configured pinned local tx, written by the splice on the
+    // SERVED dashd-fallback arm. Empty on the embedded arm (which splices in
+    // its own builder and logs there) and empty when no pin is configured.
+    std::vector<PinOutcome> m_pin_outcomes;
 };
 
 } // namespace coin

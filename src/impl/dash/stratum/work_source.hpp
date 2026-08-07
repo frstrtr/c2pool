@@ -327,31 +327,23 @@ public:
     /// independent seed-height + pre-emit gates.
     void set_gbt_xcheck(bool v) { gbt_xcheck_ = v; }
 
-    /// BLOCK-LEVEL PIN BUDGET on the served-dashd arm
-    /// (--dash-pin-block-budget). MONEY PATH, DEFAULT OFF.
+    /// PIN SPLICE ON THE XCHECK-SWAPPED ARM (--pin-splice-xcheck-arm).
+    /// DEFAULT OFF -- this is the money path.
     ///
-    /// #1177 unified the size budget on the EMBEDDED arm. The fallback arm
-    /// never got it: it splices up to kMaxPinnedTotalBytes (400000) onto
-    /// dashd's OWN template with no block-level accounting, and dashd fills
-    /// that template to its own blockmaxsize (node/miner.cpp:212 clamps to
-    /// MaxBlockSize()-1000; DEFAULT_BLOCK_MAX_SIZE is 2000000). Near the cap,
-    /// +400 KB is the bad-blk-length overshoot that cost block 2517855 — on
-    /// the arm we call the always-reachable safety path. Block 2518186 was
-    /// won on this arm carrying 154 KB of pinned donation, so the shape is
-    /// live, not hypothetical.
+    /// When set_gbt_xcheck's backstop swaps the served arm it throws away an
+    /// EMBEDDED template that already carries the pinned donation transactions
+    /// and serves a fresh dashd one instead. Until 2026-08-07 that replacement
+    /// never met the pin splice and never said so: 66 of 197 served fallback
+    /// templates in one measured hour carried no pin and no reason, and one of
+    /// them won block h=2518044 without the donation.
     ///
-    /// ON, the splice measures what dashd's template already occupies and
-    /// refuses the pin that would not fit, with the NAMED cause
-    /// pin-over-block-headroom. OFF, the arithmetic is byte-for-byte what
-    /// shipped: headroom collapses to the pin cap and the block-headroom arm
-    /// of the check is unreachable.
-    ///
-    /// It is OFF by default because it CHANGES SERVED BYTES in exactly the
-    /// case it fires — refusing a pin that today would ride. That is the
-    /// money-path rule, not a judgement that OFF is the better posture: a
-    /// refused pin costs one template's donation, an oversize block costs the
-    /// whole height.
-    void set_pin_block_budget(bool v) { pin_block_budget_ = v; }
+    /// OFF (default): the miss is NAMED -- each pin gets an outcome with
+    /// cause=xcheck-swap-pin-gate-off and the arm line reports pins=0/N. Served
+    /// bytes are IDENTICAL to before.
+    /// ON: the pins ride that arm too, through the same unchanged admission
+    /// gate (verdicts resolved beside the coin state), plus a height-agreement
+    /// check and the block-size budget -- both of which can only EXCLUDE.
+    void set_pin_splice_xcheck_arm(bool v) { pin_splice_xcheck_arm_ = v; }
 
     /// Embedded-vs-dashd SHADOW-COMPARE DIAGNOSTIC (--embedded-shadow-compare).
     /// OBSERVE-ONLY: on every template re-source the just-resolved template is
@@ -675,7 +667,7 @@ private:
     bool is_testnet_{false};
     bool embedded_mainnet_{false};   // gate-lift opt-in: daemonless embedded arm on mainnet
     bool gbt_xcheck_{false};         // reward-safety backstop: cross-check embedded creditPool vs dashd
-    bool pin_block_budget_{false};   // --dash-pin-block-budget: block-level pin budget on the served-dashd arm
+    bool pin_splice_xcheck_arm_{false};  // money path: splice pins onto an xcheck-SWAPPED template (default OFF)
 
     // OBSERVE-only serve-vs-dashd shadow-compare (--embedded-shadow-compare).
     // Unset (default / pure-daemonless) => strict no-op. Never on the hot path:
