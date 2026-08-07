@@ -464,7 +464,11 @@ TEST(DashQcPrefetch, RotatedCycleIsNotAskedBeforeItsSlotHeadersExist)
 {
     PrefetchHarness h;
     // LLMQ_60_75 on mainnet: dkg_interval 288, 32 signing-active slots.
-    const uint32_t cycle_base = 2517504;      // 2517504 % 288 == 0
+    // 2517408 = 288 * 8741, so it IS a cycle base. (An unaligned height would
+    // make prefetch_cycle derive a DIFFERENT base whose header we never added,
+    // and the test would pass for the wrong reason — it did, once.)
+    const uint32_t cycle_base = 2517408;
+    static_assert(2517408u % 288u == 0u, "cycle_base must be dkgInterval-aligned");
     h.add_range(cycle_base - 8, cycle_base);  // ONLY the base exists
 
     h.src->prefetch_cycle(cycle_base);
