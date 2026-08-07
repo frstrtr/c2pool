@@ -152,3 +152,238 @@ TEST(DashServeStalenessSeam, StalenessBlockIsBuiltBeforeAnyLockIsTaken)
            "the io thread is wedged inside the serve gate";
 #endif
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// C2 — THE PER-CONNECTION COINBASE PATH IS THE OTHER WAY A HEIGHT ESCAPES
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// A reviewer DELETED note_served_height(wd->m_height) from
+// build_connection_coinbase (work_source.cpp:1108) and the whole target stayed
+// 86/86 green — while the comment at that very site called it load-bearing.
+// A guard nothing can fail is not a guard.
+//
+// This test touches ONLY that path: it never calls get_current_work_template,
+// so the recorded served height can have come from nowhere else. Delete the
+// call and this reds.
+TEST(DashServeStalenessSeam, PerConnectionCoinbasePathRecordsTheServedHeight)
+{
+    dash::coin::NodeCoinState cs;
+    auto fallback = []() -> dash::coin::DashWorkData {
+        return seam_work(2518006u);
+    };
+    auto submit = [](const std::vector<unsigned char>&, uint32_t, bool) {
+        return true;
+    };
+
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/false);
+
+    // Nothing has been handed out yet.
+    ASSERT_EQ(ws.last_served_height(), 0u)
+        << "a fresh work source claimed to have already served a height";
+
+    // The per-connection path, and ONLY it. This is what StratumSession calls
+    // when a miner subscribes; on a node whose notify loop happens to be quiet
+    // it is the only way a height reaches a rig.
+    const uint256 prev_share = uint256::ZERO;
+    const std::vector<unsigned char> payout_script = {
+        0x76, 0xa9, 0x14,
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+        0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14,
+        0x88, 0xac};
+    const auto cb = ws.build_connection_coinbase(prev_share, "00000000",
+                                                 payout_script, {});
+    ASSERT_TRUE(cb.snapshot.has_header)
+        << "the per-connection coinbase path did not produce a job at all, so "
+           "this test cannot say anything about what it recorded";
+    ASSERT_EQ(cb.snapshot.height, 2518006u);
+
+    EXPECT_EQ(ws.last_served_height(), 2518006u)
+        << "build_connection_coinbase handed h=2518006 to a miner and left NO "
+           "record of it — exactly the blindness that let 26 rigs sit on a dead "
+           "height for an hour";
+    EXPECT_GT(ws.last_served_at_ms(), 0);
+
+    // And it must reach the operator surface, not just the accessor.
+    const nlohmann::json ss = ws.serve_staleness_json();
+    EXPECT_EQ(ss.value("served_height", 0u), 2518006u) << ss.dump();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// C4 — THE STALENESS BLOCK IS REACHABLE WITHOUT THE SERVE-GATE LOCK
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The first cut COMPOSED the block before the lock and then blocked
+// unconditionally on serve_gate_mutex_ one line later, so during the exact
+// saturation this detects the status endpoint hung with it. Composing early is
+// worthless if the only way to reach the result is through the lock.
+TEST(DashServeStalenessSeam, StalenessBlockHasItsOwnLockFreeAccessor)
+{
+    dash::coin::NodeCoinState cs;
+    auto fallback = []() -> dash::coin::DashWorkData {
+        return seam_work(2518006u);
+    };
+    auto submit = [](const std::vector<unsigned char>&, uint32_t, bool) {
+        return true;
+    };
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/false);
+    ws.get_current_work_template();
+
+    // Reached WITHOUT going through embedded_arm_status_json at all.
+    const nlohmann::json ss = ws.serve_staleness_json();
+    ASSERT_TRUE(ss.is_object()) << ss.dump();
+    EXPECT_EQ(ss.value("served_height", 0u), 2518006u) << ss.dump();
+    EXPECT_TRUE(ss.contains("stale"))       << ss.dump();
+    EXPECT_TRUE(ss.contains("stale_check")) << ss.dump();
+    EXPECT_TRUE(ss.contains("d2"))          << ss.dump();
+}
+
+// The lock-free property itself, pinned by source text — a lock ORDER cannot be
+// observed from outside the class, so it is read off the body that has it.
+TEST(DashServeStalenessSeam, StalenessJsonBodyTakesNoLockAtAll)
+{
+#ifndef DASH_WORK_SOURCE_SRC
+    GTEST_SKIP() << "DASH_WORK_SOURCE_SRC not defined";
+#else
+    FILE* f = std::fopen(DASH_WORK_SOURCE_SRC, "rb");
+    ASSERT_NE(f, nullptr) << DASH_WORK_SOURCE_SRC;
+    std::string src;
+    char buf[65536];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) src.append(buf, n);
+    std::fclose(f);
+
+    const size_t body = src.find("DASHWorkSource::serve_staleness_json");
+    ASSERT_NE(body, std::string::npos);
+    const size_t end = src.find("\n}", body);
+    ASSERT_NE(end, std::string::npos);
+    const std::string fn = src.substr(body, end - body);
+    EXPECT_EQ(fn.find("lock_guard"),        std::string::npos) << fn;
+    EXPECT_EQ(fn.find("unique_lock"),       std::string::npos) << fn;
+    EXPECT_EQ(fn.find("serve_gate_mutex_"), std::string::npos) << fn;
+    EXPECT_EQ(fn.find("template_mutex_"),   std::string::npos) << fn;
+
+    // And embedded_arm_status_json must not BLOCK on the serve gate either: it
+    // degrades with a named reason instead of hanging the whole response.
+    const size_t arm = src.find("DASHWorkSource::embedded_arm_status_json");
+    ASSERT_NE(arm, std::string::npos);
+    const size_t arm_end = src.find("\n}", arm);
+    ASSERT_NE(arm_end, std::string::npos);
+    const std::string armfn = src.substr(arm, arm_end - arm);
+    EXPECT_NE(armfn.find("try_to_lock"), std::string::npos)
+        << "embedded_arm_status_json blocks unconditionally on a lock the SERVE "
+           "PATH holds, so the status surface goes dark during exactly the "
+           "saturation the sentinel exists to report: " << armfn;
+    EXPECT_EQ(armfn.find("std::lock_guard<std::mutex> lk(serve_gate_mutex_)"),
+              std::string::npos)
+        << armfn;
+#endif
+}
+
+// The topology surface must read the staleness block from the LOCK-FREE
+// accessor, not dig it out of embedded_arm_status_json's result — otherwise the
+// one surface that reports serve-path saturation depends on the serve path.
+TEST(DashServeStalenessSeam, NodeTopologyReadsTheLockFreeAccessorDirectly)
+{
+#ifndef DASH_MAIN_SRC
+    GTEST_SKIP() << "DASH_MAIN_SRC not defined";
+#else
+    FILE* f = std::fopen(DASH_MAIN_SRC, "rb");
+    ASSERT_NE(f, nullptr) << DASH_MAIN_SRC;
+    std::string src;
+    char buf[65536];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) src.append(buf, n);
+    std::fclose(f);
+
+    EXPECT_NE(src.find("c[\"serve_staleness\"] = ws->serve_staleness_json();"),
+              std::string::npos)
+        << "/api/node_topology does not call the lock-free accessor";
+    EXPECT_EQ(src.find("if (arm.contains(\"serve_staleness\"))"),
+              std::string::npos)
+        << "the topology surface still sources the staleness block from the "
+           "arm status, which is gated behind serve_gate_mutex_";
+#endif
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// C1 / C3 / C6 ON THE SURFACE — the sentinel's standing verdict, as published
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The detector-side proof lives in test_dash_serve_staleness_unit.cpp. This is
+// the other half: what the sentinel concluded has to survive the trip to JSON
+// with its per-check ages intact and D2's refusal stated rather than implied.
+TEST(DashServeStalenessSeam, PublishedBlockNamesTheCheckAndKeepsAgesApart)
+{
+    dash::coin::NodeCoinState cs;
+    auto fallback = []() -> dash::coin::DashWorkData {
+        return seam_work(2518006u);
+    };
+    auto submit = [](const std::vector<unsigned char>&, uint32_t, bool) {
+        return true;
+    };
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/false);
+    ws.get_current_work_template();
+
+    // Before any sentinel poll: no verdict, and D2 explicitly unavailable
+    // rather than silently "not stale".
+    {
+        const nlohmann::json ss = ws.serve_staleness_json();
+        EXPECT_EQ(ss.value("stale", true), false)         << ss.dump();
+        EXPECT_EQ(ss.value("stale_check", std::string()), "none") << ss.dump();
+        EXPECT_EQ(ss.value("d2", std::string()),
+                  "unavailable-no-independent-reference") << ss.dump();
+        EXPECT_FALSE(ss.contains("behind")) << ss.dump();
+    }
+
+    // The incident as it presented: D1 standing for an hour, D2 blind because
+    // its mirror froze with the io thread, D3 quiet because templates were
+    // still going out.
+    dash::stratum::DASHWorkSource::ServeStalenessReport r;
+    r.observed_height = 2518006u;      // frozen mirror == the dead height
+    r.observed_at_ms  = 1000;
+    r.observed_src    = "peer";
+    r.d2_armed        = false;         // no independent reference this poll
+    r.stale           = true;
+    r.stale_check     = "io-silence";
+    r.stale_age_ms    = 3600000;
+    r.io_silent_ms    = 3600000;
+    r.skew_age_ms     = 0;
+    r.serve_quiet_ms  = 900;
+    ws.note_serve_observation(r);
+
+    const nlohmann::json ss = ws.serve_staleness_json();
+    EXPECT_EQ(ss.value("stale", false), true)
+        << "the surface reported health while the log alarmed: " << ss.dump();
+    EXPECT_EQ(ss.value("stale_check", std::string()), "io-silence") << ss.dump();
+    EXPECT_EQ(ss.value("stale_age_s", 0), 3600)      << ss.dump();
+    EXPECT_EQ(ss.value("io_silent_s", 0), 3600)      << ss.dump();
+    EXPECT_EQ(ss.value("skew_age_s", -1), 0)         << ss.dump();
+    EXPECT_EQ(ss.value("serve_quiet_s", -1), 0)      << ss.dump();
+    EXPECT_EQ(ss.value("d2", std::string()),
+              "unavailable-no-independent-reference")
+        << "D2 was blind and the surface must SAY so; rendering it as 'no skew' "
+           "is the node vouching for itself: " << ss.dump();
+
+    // A later poll with a real outside reference flips D2 to armed, and the two
+    // ages stay separate.
+    r.d2_armed        = true;
+    r.observed_height = 2518028u;
+    r.stale_check     = "height-skew";
+    r.stale_age_ms    = 480000;
+    r.skew_age_ms     = 480000;
+    r.io_silent_ms    = 1000;
+    ws.note_serve_observation(r);
+
+    const nlohmann::json ss2 = ws.serve_staleness_json();
+    EXPECT_EQ(ss2.value("d2", std::string()), "armed")        << ss2.dump();
+    EXPECT_EQ(ss2.value("stale_check", std::string()), "height-skew") << ss2.dump();
+    EXPECT_EQ(ss2.value("stale_age_s", 0), 480)               << ss2.dump();
+    EXPECT_EQ(ss2.value("io_silent_s", -1), 1)                << ss2.dump();
+    EXPECT_EQ(ss2.value("behind", 0u), 22u)                   << ss2.dump();
+}

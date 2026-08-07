@@ -57,6 +57,8 @@ ServeStalenessSample healthy(const FakeClock& c, uint32_t h)
     s.served_at_ms    = c.now();
     s.observed_height = h;
     s.observed_src    = "rpc";
+    s.observed_independent = true;
+    s.observed_independent = true;   // a real outside source answered
     s.sessions        = 26;
     return s;
 }
@@ -140,6 +142,7 @@ TEST(DashServeStaleness, InducedSkewAlarms)
         s.served_at_ms    = c.now();   // still SERVING -- just a dead height
         s.observed_height = obs;
         s.observed_src    = "rpc";
+        s.observed_independent = true;
         s.sessions        = 26;
 
         const auto v = sen.poll(s);
@@ -195,6 +198,7 @@ TEST(DashServeStaleness, InducedSkewIsSilentWhenTheGuardIsNeutered)
         s.served_at_ms    = c.now();   // still SERVING -- just a dead height
         s.observed_height = obs;
         s.observed_src    = "rpc";
+        s.observed_independent = true;
         s.sessions        = 26;
 
         const auto v = sen.poll(s);
@@ -237,6 +241,7 @@ TEST(DashServeStaleness, IoHeartbeatSilenceAlarms)
         s.served_at_ms    = frozen_beat;
         s.observed_height = kNetwork;
         s.observed_src    = "peer";
+        s.observed_independent = true;
         s.sessions        = 26;
         const auto v = sen.poll(s);
         if (v.fired) {
@@ -273,6 +278,7 @@ TEST(DashServeStaleness, IoHeartbeatSilenceIsSilentWhenTheGuardIsNeutered)
         s.served_at_ms    = frozen_beat;
         s.observed_height = kNetwork;
         s.observed_src    = "peer";
+        s.observed_independent = true;
         s.sessions        = 26;
         ASSERT_FALSE(sen.poll(s).fired);
     }
@@ -303,6 +309,7 @@ TEST(DashServeStaleness, ServeSilenceAlarmsOnlyWhileSessionsAreAttached)
         s.served_at_ms    = frozen_serve;
         s.observed_height = kNetwork;
         s.observed_src    = "rpc";
+        s.observed_independent = true;
         s.sessions        = 0;
         ASSERT_FALSE(sen.poll(s).fired) << "alarmed on an idle pool";
     }
@@ -320,6 +327,7 @@ TEST(DashServeStaleness, ServeSilenceAlarmsOnlyWhileSessionsAreAttached)
         s.served_at_ms    = frozen_serve;
         s.observed_height = kNetwork;
         s.observed_src    = "rpc";
+        s.observed_independent = true;
         s.sessions        = 26;
         const auto v = sen.poll(s);
         if (v.fired) {
@@ -357,6 +365,7 @@ TEST(DashServeStaleness, SustainedSkewIsRateLimitedNotFlooded)
         s.served_at_ms    = c.now();   // still SERVING -- just a dead height
         s.observed_height = kNetwork;
         s.observed_src    = "rpc";
+        s.observed_independent = true;
         s.sessions        = 26;
         if (sen.poll(s).fired) ++fires;
     }
@@ -387,6 +396,7 @@ TEST(DashServeStaleness, AlarmClearsWhenTheServedHeightCatchesUp)
         s.served_at_ms    = c.now();   // still SERVING -- just a dead height
         s.observed_height = kNetwork;
         s.observed_src    = "rpc";
+        s.observed_independent = true;
         s.sessions        = 26;
         if (sen.poll(s).fired) ever_fired = true;
     }
@@ -424,4 +434,338 @@ TEST(DashServeStaleness, UnknownObservedHeightDoesNotAlarmAndDoesNotClaimHealth)
         EXPECT_FALSE(v.stale) << "claimed a skew verdict with no observation";
     }
     EXPECT_EQ(sen.skew_alarms(), 0u);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// C1 — THE INCIDENT AS IT TRULY PRESENTED, AND WHAT THE SURFACE SAID
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The first cut of this detector reproduced the incident with the SERVED height
+// frozen and an INDEPENDENTLY MOVING observed height (InducedSkewAlarms above).
+// That is not what happened. What happened is:
+//
+//   * the io thread pegged at 99.9% userspace, so EVERY value mirrored by an
+//     `ioc` timer froze — including the observed-height mirror the sentinel
+//     reads. observed_height therefore stayed EQUAL to the dead served height
+//     for the whole hour and D2 could not see anything;
+//   * the serve path still trickled h=2518006 out to 26 rigs, so served_at_ms
+//     kept advancing and D3 could not see anything either;
+//   * only D1 — "the io thread has stopped being able to write a number" —
+//     could see it, and it did: 60 correct [STALE-SERVE] check=io-silence lines
+//     across the hour.
+//
+// And the operator surface said `stale: false` for all sixty of them, because
+// `stale` carried D2 alone. An operator refreshing /api/node_topology during the
+// real event saw nothing wrong. The log and the surface must not be able to
+// disagree; this test is that claim.
+TEST(DashServeStaleness, IncidentAsItPresentedIsVisibleOnTheStatusSurface)
+{
+    FakeClock c;
+    ServeStalenessSentinel sen{ServeStalenessConfig{}};
+
+    for (int i = 0; i < 4; ++i) {
+        c.advance(15000);
+        ASSERT_FALSE(sen.poll(healthy(c, kServedDead)).fired);
+    }
+
+    // The peg. Both ioc-written mirrors freeze together — that is not two
+    // faults, it is one fault seen twice.
+    const int64_t frozen_beat = c.now();
+    int  lines = 0, stale_polls = 0;
+    dash::coin::ServeStalenessVerdict last{};
+    for (int i = 0; i < 240; ++i) {          // one hour at a 15 s poll
+        c.advance(15000);
+        ServeStalenessSample s;
+        s.now_ms          = c.now();
+        s.io_heartbeat_ms = frozen_beat;     // io thread cannot write a number
+        s.served_height   = kServedDead;     // dead height, still going out
+        s.served_at_ms    = c.now();         // 26 rigs are still being served
+        s.observed_height = kServedDead;     // mirror froze WITH the io thread
+        s.observed_src    = "peer";
+        s.observed_independent = true;       // the source is real, just stale
+        s.sessions        = 26;
+
+        last = sen.poll(s);
+        if (last.fired) {
+            ++lines;
+            EXPECT_EQ(last.check, StaleServeCheck::IoSilence) << last.line;
+        }
+        if (last.stale) ++stale_polls;
+    }
+
+    // The log half — this already worked, and is asserted so the test fails
+    // loudly if the fix breaks it.
+    EXPECT_GT(lines, 30) << "the log went quiet on the incident it exists for";
+
+    // THE SURFACE HALF — this is the C1 fix. Without it stale_polls is 0.
+    // 237 of 240: the first three polls are inside the 60 s D1 threshold.
+    EXPECT_GE(stale_polls, 236)
+        << "the status surface reported HEALTH while the log printed " << lines
+        << " [STALE-SERVE] lines about the same hour";
+    EXPECT_TRUE(last.stale);
+    EXPECT_EQ(last.stale_check, StaleServeCheck::IoSilence);
+    EXPECT_GE(last.stale_age_ms, 3600000)
+        << "the surface must carry HOW LONG, not just that something is wrong";
+
+    // And D2 must say it was blind rather than say nothing was wrong: the
+    // observed height equalled the served height only because the mirror died.
+    EXPECT_EQ(last.skew_age_ms, 0);
+}
+
+// C1, mutation: if `stale` were still D2-only, the surface would stay silent for
+// the whole hour. Driving the same incident with the height comparison as the
+// ONLY thing that could set `stale` — by handing D2 nothing to work with —
+// leaves stale false, which is precisely the state the fix removed.
+TEST(DashServeStaleness, IncidentSurfaceClaimDependsOnDOneNotOnTheSkew)
+{
+    FakeClock c;
+    ServeStalenessConfig cfg;
+    cfg.io_silence_ms = std::numeric_limits<int32_t>::max();  // D1 neutered
+    ServeStalenessSentinel sen{cfg};
+
+    for (int i = 0; i < 4; ++i) {
+        c.advance(15000);
+        ASSERT_FALSE(sen.poll(healthy(c, kServedDead)).fired);
+    }
+    const int64_t frozen_beat = c.now();
+    for (int i = 0; i < 240; ++i) {
+        c.advance(15000);
+        ServeStalenessSample s;
+        s.now_ms          = c.now();
+        s.io_heartbeat_ms = frozen_beat;
+        s.served_height   = kServedDead;
+        s.served_at_ms    = c.now();
+        s.observed_height = kServedDead;
+        s.observed_src    = "peer";
+        s.observed_independent = true;
+        s.sessions        = 26;
+        const auto v = sen.poll(s);
+        ASSERT_FALSE(v.stale)
+            << "with D1 neutered nothing in this drive can see the fault — if "
+               "the surface still claims staleness, the C1 assertion above is "
+               "not testing D1: " << v.line;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// C5 — A HEALTHY BUSY NODE MUST NOT TRIP D1
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// notify_all() walks the session snapshot SERIALLY on the io thread
+// (core/stratum_server.cpp:379-385) and one send_notify_work measured ~733 ms.
+// 26 rigs is 19.06 s in a single round with the heartbeat timer unable to run,
+// and a tip change landing mid-round makes that two rounds: 38.1 s. The
+// original 10 s default sat BELOW one round, so it would have paged on a
+// perfectly healthy pool of 14+ rigs.
+TEST(DashServeStaleness, BusyHealthyNodeSerialNotifyRoundDoesNotTripIoSilence)
+{
+    constexpr int64_t kPerNotifyMs = 733;
+    constexpr int64_t kSessions    = 26;
+    constexpr int64_t kRoundMs     = kPerNotifyMs * kSessions;   // 19058
+    static_assert(kRoundMs == 19058, "the measured round is 26 x 733 ms");
+
+    FakeClock c;
+    ServeStalenessConfig cfg;   // the shipped default
+    ASSERT_GE(cfg.io_silence_ms, 2 * kRoundMs)
+        << "io_silence_ms must clear TWO serial notify rounds (" << (2 * kRoundMs)
+        << " ms); at " << cfg.io_silence_ms << " ms it fires on a healthy node";
+    ServeStalenessSentinel sen{cfg};
+
+    for (int i = 0; i < 4; ++i) {
+        c.advance(15000);
+        ASSERT_FALSE(sen.poll(healthy(c, kNetwork)).fired);
+    }
+
+    // An hour of a busy-but-healthy node: back-to-back double rounds (a tip
+    // change landing inside a round), the heartbeat catching up between them.
+    int64_t beat = c.now();
+    for (int round = 0; round < 90; ++round) {
+        c.advance(2 * kRoundMs);        // io thread is inside notify_all
+        {
+            ServeStalenessSample s = healthy(c, kNetwork);
+            s.io_heartbeat_ms = beat;   // still the pre-round beat
+            const auto v = sen.poll(s);
+            ASSERT_FALSE(v.fired)
+                << "round " << round << ": a healthy 26-rig notify round paged: "
+                << v.line;
+            ASSERT_FALSE(v.stale) << "round " << round;
+        }
+        beat = c.now();                 // round done, the 1 s timer runs again
+        c.advance(1000);
+        ASSERT_FALSE(sen.poll(healthy(c, kNetwork)).fired);
+    }
+    EXPECT_EQ(sen.io_alarms(), 0u)
+        << "D1 cried wolf on a healthy node; an ignored detector is worth less "
+           "than no detector";
+}
+
+// C5, mutation: the SAME healthy drive against the retired 10 s default must
+// alarm. If it did not, the test above would be passing for a reason that has
+// nothing to do with the threshold.
+TEST(DashServeStaleness, BusyHealthyNodeWouldHaveTrippedTheOldTenSecondDefault)
+{
+    FakeClock c;
+    ServeStalenessConfig cfg;
+    cfg.io_silence_ms = 10000;          // the value this condition retired
+    ServeStalenessSentinel sen{cfg};
+
+    for (int i = 0; i < 4; ++i) {
+        c.advance(15000);
+        ASSERT_FALSE(sen.poll(healthy(c, kNetwork)).fired);
+    }
+    int64_t beat = c.now();
+    bool fired = false;
+    for (int round = 0; round < 90 && !fired; ++round) {
+        c.advance(2 * 733 * 26);
+        ServeStalenessSample s = healthy(c, kNetwork);
+        s.io_heartbeat_ms = beat;
+        if (sen.poll(s).fired) fired = true;
+        beat = c.now();
+        c.advance(1000);
+        if (sen.poll(healthy(c, kNetwork)).fired) fired = true;
+    }
+    ASSERT_TRUE(fired)
+        << "the 10 s default did NOT false-positive on the busy-node drive, so "
+           "the raised default is unjustified by this test";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// C6 — D2 REFUSES TO COMPARE THE NODE AGAINST ITSELF
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// peer_tip_height() is fed only from the coin-p2p peer-height callback, and
+// header_chain exists only when coin_p2p does. Without coin-p2p there is no
+// outside height, and the only number to hand is our own tip. Comparing the
+// served height against our own tip is the node vouching for itself — the exact
+// property that made every pre-existing signal blind. D2 must decline.
+TEST(DashServeStaleness, DTwoRefusesToRunWithoutAnIndependentReference)
+{
+    FakeClock c;
+    ServeStalenessSentinel sen{ServeStalenessConfig{}};
+
+    // Drive a skew that is UNMISTAKABLE — 22 blocks, the incident's own gap,
+    // sustained far past the window. The only thing wrong with it is that the
+    // observed height did not come from outside this process.
+    for (int i = 0; i < 240; ++i) {
+        c.advance(15000);
+        ServeStalenessSample s;
+        s.now_ms          = c.now();
+        s.io_heartbeat_ms = c.now();
+        s.served_height   = kServedDead;
+        s.served_at_ms    = c.now();
+        s.observed_height = kNetwork;       // 22 ahead
+        s.observed_src    = "hdr";          // OUR OWN header tip
+        s.observed_independent = false;     // ...so it proves nothing
+        s.sessions        = 26;
+
+        const auto v = sen.poll(s);
+        ASSERT_FALSE(v.d2_armed)
+            << "D2 claimed to be armed on a self-sourced height";
+        ASSERT_FALSE(v.stale)
+            << "D2 compared the node against ITSELF and called the result a "
+               "verdict: " << v.line;
+        ASSERT_EQ(v.skew_age_ms, 0);
+    }
+    EXPECT_EQ(sen.skew_alarms(), 0u);
+}
+
+// C6, mutation: the SAME drive with the reference marked independent MUST
+// alarm. Without this the refusal test would pass on a detector whose skew
+// comparison was simply dead.
+TEST(DashServeStaleness, DTwoRunsAndAlarmsOnceTheReferenceIsIndependent)
+{
+    FakeClock c;
+    ServeStalenessSentinel sen{ServeStalenessConfig{}};
+
+    bool fired = false;
+    bool armed_seen = false;
+    for (int i = 0; i < 240 && !fired; ++i) {
+        c.advance(15000);
+        ServeStalenessSample s;
+        s.now_ms          = c.now();
+        s.io_heartbeat_ms = c.now();
+        s.served_height   = kServedDead;
+        s.served_at_ms    = c.now();
+        s.observed_height = kNetwork;
+        s.observed_src    = "peer";         // from OUTSIDE this process
+        s.observed_independent = true;
+        s.sessions        = 26;
+        const auto v = sen.poll(s);
+        if (v.d2_armed) armed_seen = true;
+        if (v.fired) {
+            fired = true;
+            EXPECT_EQ(v.check, StaleServeCheck::HeightSkew) << v.line;
+        }
+    }
+    EXPECT_TRUE(armed_seen);
+    ASSERT_TRUE(fired)
+        << "with a genuinely independent reference the 22-block skew raised "
+           "nothing — the refusal test proves only that dead code is dead";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// C3 — EVERY AGE IS ITS OWN FIELD
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The first cut set v.age_ms to the skew age and then OVERWROTE it with
+// whichever check fired, and main_dash passed that same number on as the
+// operator-visible stale_age. One field that means io-silence on one poll and
+// height-skew on the next is how a true number produces a false conclusion.
+// Drive a state where D1 and D2 are BOTH standing and their ages DIFFER, and
+// require the surface to keep them apart.
+TEST(DashServeStaleness, EachCheckCarriesItsOwnAgeAndTheVerdictNamesWhichOne)
+{
+    FakeClock c;
+    ServeStalenessSentinel sen{ServeStalenessConfig{}};
+
+    for (int i = 0; i < 4; ++i) {
+        c.advance(15000);
+        ASSERT_FALSE(sen.poll(healthy(c, kServedDead)).fired);
+    }
+
+    // Phase 1: skew ONLY. io keeps ticking, so the skew age runs ahead alone.
+    for (int i = 0; i < 40; ++i) {
+        c.advance(15000);
+        ServeStalenessSample s;
+        s.now_ms          = c.now();
+        s.io_heartbeat_ms = c.now();
+        s.served_height   = kServedDead;
+        s.served_at_ms    = c.now();
+        s.observed_height = kNetwork;
+        s.observed_src    = "peer";
+        s.observed_independent = true;
+        s.sessions        = 26;
+        sen.poll(s);
+    }
+
+    // Phase 2: the io thread now pegs too. Skew is ~600 s old; io-silence is
+    // seconds old. A single shared field cannot express both.
+    const int64_t frozen_beat = c.now();
+    dash::coin::ServeStalenessVerdict v{};
+    for (int i = 0; i < 8; ++i) {
+        c.advance(15000);
+        ServeStalenessSample s;
+        s.now_ms          = c.now();
+        s.io_heartbeat_ms = frozen_beat;
+        s.served_height   = kServedDead;
+        s.served_at_ms    = c.now();
+        s.observed_height = kNetwork;
+        s.observed_src    = "peer";
+        s.observed_independent = true;
+        s.sessions        = 26;
+        v = sen.poll(s);
+    }
+
+    ASSERT_TRUE(v.stale);
+    EXPECT_EQ(v.stale_check, StaleServeCheck::IoSilence)
+        << "a dead io thread outranks the skew it causes";
+    EXPECT_EQ(v.stale_age_ms, v.io_silent_ms)
+        << "stale_age_ms must be the age of the check stale_check NAMES";
+    EXPECT_GT(v.skew_age_ms, v.io_silent_ms)
+        << "the two ages are genuinely different here (" << v.skew_age_ms
+        << " vs " << v.io_silent_ms << "), which is the whole point";
+    EXPECT_GE(v.skew_age_ms, 600000);
+    EXPECT_LE(v.io_silent_ms, 130000);
+    // D3 never raised: templates kept going out the whole time.
+    EXPECT_LT(v.serve_quiet_ms, 20000);
 }

@@ -3326,8 +3326,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     // the SERVE path and carries the sentinel's standing
                     // verdict, so the page can state a fault instead of leaving
                     // it to a human to notice two numbers disagree.
-                    if (arm.contains("serve_staleness"))
-                        c["serve_staleness"] = arm["serve_staleness"];
+                    //
+                    // Read from serve_staleness_json() DIRECTLY, not out of
+                    // `arm`. embedded_arm_status_json also touches
+                    // serve_gate_mutex_ -- a lock the SERVE PATH holds -- so
+                    // sourcing the staleness block from its result would make
+                    // the one surface that reports serve-path saturation depend
+                    // on the serve path. This call takes no lock at all.
+                    c["serve_staleness"] = ws->serve_staleness_json();
                     return nlohmann::json{
                         {"node_symbol", "DASH"},
                         {"auto_detected", false},
@@ -6601,12 +6607,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // So the independent reference is the PEER-ADVERTISED height —
     // HeaderChain::peer_tip_height(), a relaxed atomic that already existed and
     // is already fed from the coin-p2p peer-height callback. It is genuinely
-    // from outside this process, which is the property that matters. Our own
-    // header tip is the documented second choice and is labelled `hdr` so a
-    // reader can tell the two apart. The honest consequence, recorded rather
-    // than hidden: BOTH mirrors are written on `ioc`, so in a full io freeze
-    // they stop advancing and D2 goes blind — D1 is the sub-check that would
-    // have fired in THIS incident, and D2 is the generalisation.
+    // from outside this process, which is the property that matters.
+    //
+    // AND IT IS THE ONLY ELIGIBLE SOURCE. There is deliberately NO fallback to
+    // our own header tip. set_peer_tip_height is wired only inside the coin_p2p
+    // block below, and header_chain is only constructed when coin_p2p exists —
+    // so on a node without coin-p2p there is no outside height at all, and an
+    // `hdr` fallback would have quietly turned D2 into the node comparing
+    // itself against itself. That is the exact class of check this lane's
+    // catalogue condemns in (b), (c) and (d): it would have read "served ==
+    // observed, healthy" for every minute of the incident. D2 REFUSES to run
+    // instead, and /api/node_topology publishes
+    // serve_staleness.d2 = "unavailable-no-independent-reference" so the refusal
+    // is visible rather than indistinguishable from a clean bill of health.
+    //
+    // The honest consequence, recorded rather than hidden: BOTH mirrors are
+    // written on `ioc`, so in a full io freeze they stop advancing and D2 goes
+    // blind — D1 is the sub-check that fires in THIS incident, D2 is the
+    // generalisation, and the status surface names which one raised.
     std::shared_ptr<std::atomic<int64_t>>  ss_beat;
     std::shared_ptr<std::atomic<uint32_t>> ss_obs_h;
     std::shared_ptr<std::atomic<int>>      ss_obs_src;
@@ -6634,18 +6652,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             ss_beat->store(ddiag::steady_now_ms(), std::memory_order_relaxed);
 
             // Mirrors, taken here because THIS is the thread on which reading
-            // them is safe. peer_tip_height() is preferred over our own tip
-            // precisely because it is the one height that did not come from
-            // inside this process.
+            // them is safe.
+            //
+            // THE ONLY ELIGIBLE SOURCE IS peer_tip_height() — a height that
+            // came from OUTSIDE this process. Our own header tip is NOT a
+            // fallback and must never be one: hc->peer_tip_height() is fed only
+            // from the coin-p2p peer-height callback (set_peer_tip_height,
+            // below in the coin_p2p block) and header_chain itself is only
+            // constructed when coin_p2p exists, so on a node without coin-p2p
+            // there is no outside height at all. Falling back to hc->height()
+            // there would have made D2 compare the node against ITSELF — the
+            // exact defect this lane's own header condemns, and it would have
+            // reported "served == observed, healthy" for the whole incident
+            // hour. 0/none means D2 does not run, and the surface says so.
             uint32_t obs = 0;
             int      src = 0;
             if (hc) {
                 const uint32_t peer = hc->peer_tip_height();
                 if (peer > 0) { obs = peer; src = 2; }          // "peer"
-                else {
-                    const uint32_t own = hc->height();
-                    if (own > 0) { obs = own; src = 3; }        // "hdr"
-                }
             }
             ss_obs_h->store(obs, std::memory_order_relaxed);
             ss_obs_src->store(src, std::memory_order_relaxed);
@@ -6673,6 +6697,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         default: return "none";
                     }
                 };
+                // INDEPENDENT means "not from inside this process". Only the
+                // peer-advertised height qualifies today; "hdr" is our own tip
+                // and is listed here solely so that if a future source is
+                // wired it has to declare which side of this line it is on.
+                const auto src_independent = [](int i) {
+                    return i == 1 || i == 2;   // rpc (separate daemon) | peer
+                };
                 while (!ss_stop->load(std::memory_order_relaxed)) {
                     // ~15 s poll, slept in 100 ms slices so shutdown is prompt
                     // rather than up to a poll-period late.
@@ -6687,9 +6718,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     s.io_heartbeat_ms = ss_beat->load(std::memory_order_relaxed);
                     s.served_height   = ws->last_served_height();
                     s.served_at_ms    = ws->last_served_at_ms();
+                    const int obs_src_i =
+                        ss_obs_src->load(std::memory_order_relaxed);
                     s.observed_height = ss_obs_h->load(std::memory_order_relaxed);
-                    s.observed_src    =
-                        src_name(ss_obs_src->load(std::memory_order_relaxed));
+                    s.observed_src    = src_name(obs_src_i);
+                    s.observed_independent = src_independent(obs_src_i);
                     s.sessions        = ss_sessions->load(std::memory_order_relaxed);
 
                     const auto v = sen.poll(s);
@@ -6698,11 +6731,26 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     // status surface must be able to say "checked N seconds
                     // ago and it was fine", because "quiet" and "dead" looking
                     // identical is the defect this whole lane exists to close.
-                    ws->note_serve_observation(s.observed_height,
-                                               s.io_heartbeat_ms,
-                                               s.observed_src,
-                                               v.stale,
-                                               v.age_ms);
+                    //
+                    // And publish the STANDING verdict, not just D2's. In the
+                    // incident as it truly presented, the io thread was pegged,
+                    // so BOTH ioc-written mirrors froze and D2 went blind while
+                    // D1 raised correctly every minute. A surface carrying D2
+                    // alone reported `stale: false` for the entire hour that the
+                    // log was printing [STALE-SERVE] check=io-silence.
+                    dash::stratum::DASHWorkSource::ServeStalenessReport rep;
+                    rep.observed_height = s.observed_height;
+                    rep.observed_at_ms  = s.io_heartbeat_ms;
+                    rep.observed_src    = s.observed_src;
+                    rep.d2_armed        = v.d2_armed;
+                    rep.stale           = v.stale;
+                    rep.stale_check =
+                        dash::coin::stale_serve_check_name(v.stale_check);
+                    rep.stale_age_ms    = v.stale_age_ms;
+                    rep.io_silent_ms    = v.io_silent_ms;
+                    rep.skew_age_ms     = v.skew_age_ms;
+                    rep.serve_quiet_ms  = v.serve_quiet_ms;
+                    ws->note_serve_observation(rep);
                     if (v.fired) LOG_ERROR << v.line;
                 }
             });

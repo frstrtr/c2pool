@@ -126,10 +126,39 @@ inline const char* stale_serve_check_name(StaleServeCheck c)
 /// does NOT fire. A guard that cannot be shown to matter has not been tested.
 struct ServeStalenessConfig {
     /// D1: silence of the io-thread heartbeat that counts as "the io thread is
-    /// gone". The incident measured 13.145 s of io handler-queue latency
-    /// against 0.1 ms before it, so 10 s separates the two by two orders of
-    /// magnitude and still fires inside the first minute.
-    int64_t io_silence_ms{10000};
+    /// gone".
+    ///
+    /// THIS DEFAULT WAS 10 s AND WOULD HAVE CRIED WOLF ON A HEALTHY NODE. The
+    /// arithmetic that retired it, with every input measured rather than
+    /// assumed:
+    ///
+    ///   * one send_notify_work costs ~733 ms on the hotel node — the pre-emit
+    ///     gate held across it (stratum/work_source.cpp:853 records the same
+    ///     733 ms figure from the incident capture);
+    ///   * notify_all runs those SERIALLY over the session snapshot, on the io
+    ///     thread, with no yield between them (core/stratum_server.cpp:379-385);
+    ///   * 26 attached rigs is therefore 26 x 733 ms = 19.06 s in ONE notify
+    ///     round, during which the 1 s heartbeat timer CANNOT run — on a node
+    ///     that is perfectly healthy and simply busy;
+    ///   * a tip change landing inside a round makes two rounds back to back:
+    ///     38.1 s.
+    ///
+    /// 10 s sat BELOW one round. It would have fired on every tip change with
+    /// 14+ rigs attached, and a detector that fires on a healthy node is worth
+    /// less than nothing: it trains the operator to skip the tag, which is how
+    /// [EMBED-STATUS] became unreadable.
+    ///
+    /// 60 s sits above two full rounds and far below the fault. The incident's
+    /// io handler-queue latency was 13.145 s SUSTAINED for 3600 s — a peg does
+    /// not recover, so a 60 s threshold still raises 60 s in and once per
+    /// repeat_ms thereafter, i.e. ~59 lines inside the hour that produced zero.
+    ///
+    /// THE CEILING, STATED SO IT IS FALSIFIABLE: this holds while
+    ///     io_silence_ms >= 2 * sessions * 733 ms,
+    /// i.e. up to 40 attached sessions at 60 s. A pool above ~40 rigs MUST
+    /// raise this or D1 will false-positive on it. The value is a config field
+    /// for exactly that reason.
+    int64_t io_silence_ms{60000};
 
     /// D2: how many blocks behind an independently observed height the SERVED
     /// height must be. 1 is the ordinary propagation race (we are mid-block, a
@@ -158,16 +187,57 @@ struct ServeStalenessSample {
     int64_t  served_at_ms{0};       ///< when that happened (steady).
     uint32_t observed_height{0};    ///< independently observed chain height; 0 = unknown.
     std::string observed_src{"none"};  ///< "rpc" | "peer" | "hdr" — which source won.
+    /// TRUE only when `observed_height` came from OUTSIDE this process.
+    ///
+    /// D2 REFUSES TO RUN WHEN THIS IS FALSE, and that refusal is the whole
+    /// point of the sub-check. Our own header tip is not an independent
+    /// reference: comparing served-height against it is the node measuring
+    /// itself, which is precisely the failure mode this file's catalogue
+    /// condemns in (b), (c) and (d) above. A D2 that silently degrades to
+    /// self-comparison is not a weaker detector, it is a FALSE ONE — it would
+    /// have reported "served == observed, all good" for the whole incident
+    /// hour. Unknown must render as unknown.
+    bool     observed_independent{false};
     uint32_t sessions{0};           ///< attached stratum sessions.
 };
 
-/// What a poll concluded. `fired` is true only on the polls that owe a line.
+/// What a poll concluded.
+///
+/// `fired` is true only on the polls that OWE A LINE (rate policy). The
+/// standing-condition fields below are true whenever the condition holds,
+/// whether or not a line was owed — that split exists because the surface and
+/// the log must not be able to disagree: during the incident the log knew and
+/// the JSON did not.
+///
+/// EVERY AGE IS ITS OWN FIELD. A single `age_ms` that meant io-silence on one
+/// poll and skew-age on the next is how an operator reads a number that is
+/// true and concludes something false; the 2026-08-07 confusion started
+/// exactly there. `stale_age_ms` is the age of the condition named by
+/// `stale_check` AND NOTHING ELSE.
 struct ServeStalenessVerdict {
     bool            fired{false};
-    StaleServeCheck check{StaleServeCheck::None};
+    StaleServeCheck check{StaleServeCheck::None};  ///< which check emitted `line`.
     std::string     line;        ///< the full "[STALE-SERVE] ..." payload.
-    bool            stale{false};///< D2 condition currently true (independent of rate policy).
-    int64_t         age_ms{0};   ///< how long the raised condition has been true.
+
+    /// ANY sub-check condition currently true — D1, D2 or D3. Not D2 alone:
+    /// in the incident as it truly presented, D1 was the only one that could
+    /// see anything, and a `stale` that ignored it left the status surface
+    /// reporting health for an hour while the log printed 60 alarms.
+    bool            stale{false};
+    /// Which condition `stale` refers to, most-severe first (D1 > D2 > D3).
+    StaleServeCheck stale_check{StaleServeCheck::None};
+    /// Age of the condition named by `stale_check`. 0 when none is raised.
+    int64_t         stale_age_ms{0};
+
+    /// Per-check ages, always populated, never overwritten by each other.
+    int64_t         io_silent_ms{0};    ///< D1: since the io heartbeat last moved.
+    int64_t         skew_age_ms{0};     ///< D2: since served fell behind observed.
+    int64_t         serve_quiet_ms{0};  ///< D3: since a template was last handed out.
+
+    /// D2 had an INDEPENDENT reference this poll and therefore actually ran.
+    /// False means D2 said nothing — which is not the same claim as "no skew"
+    /// and must never be rendered as one.
+    bool            d2_armed{false};
 };
 
 class ServeStalenessSentinel
@@ -205,8 +275,16 @@ public:
 
         // ── D2: served-vs-observed skew (state kept regardless of who wins) ──
         // Sustain window, so a single-block propagation race cannot raise it.
+        //
+        // REFUSE-TO-SELF-COMPARE. `observed_independent` is a hard precondition,
+        // not a hint. Without an outside height the honest answer is "D2 did not
+        // run"; comparing against our own header tip would make the detector
+        // agree with the freeze, which is the exact defect this file exists to
+        // close. m_skew_since is cleared on refusal so a later real observation
+        // starts a fresh sustain window rather than inheriting a stale one.
+        v.d2_armed = s.observed_independent && s.observed_height > 0;
         const bool skew_now =
-            s.observed_height > 0 && s.served_height > 0 &&
+            v.d2_armed && s.served_height > 0 &&
             (static_cast<uint64_t>(s.served_height) + m_cfg.height_skew_blocks
                  <= static_cast<uint64_t>(s.observed_height));
         if (skew_now) {
@@ -218,8 +296,6 @@ public:
             m_skew_since == 0 ? 0 : (s.now_ms - m_skew_since);
         const bool skew_sustained =
             skew_now && skew_age >= m_cfg.height_skew_sustain_ms;
-        v.stale  = skew_sustained;
-        v.age_ms = skew_age;
 
         // ── D3: serve silence, only while miners are actually attached ──────
         if (s.served_height > m_last_served_height ||
@@ -238,12 +314,50 @@ public:
             m_serve_wd.disarm();
         }
 
+        // ── STANDING CONDITIONS — computed BEFORE the rate policy ───────────
+        //
+        // This block is the C1 fix. Previously `stale` carried D2 only, so the
+        // incident as it TRULY presented — io thread pegged, therefore BOTH
+        // ioc-written mirrors frozen, therefore observed == served and D2 blind,
+        // while the serve path still trickled the dead height to 26 rigs —
+        // produced 60 correct [STALE-SERVE] check=io-silence LOG lines and a
+        // status surface that said `stale: false` for the whole hour. An
+        // operator reading /api/node_topology during the real event saw nothing
+        // wrong. The log and the surface must not be able to disagree.
+        //
+        // `due()` mutates (it is the rate policy), so the standing state is read
+        // with the non-mutating elapsed_ms() and is independent of whether a
+        // line is owed this poll.
+        v.io_silent_ms   = m_io_wd.elapsed_ms(s.now_ms);
+        v.skew_age_ms    = skew_age;
+        v.serve_quiet_ms = m_serve_wd.elapsed_ms(s.now_ms);
+
+        const bool io_cond =
+            m_io_wd.armed() && v.io_silent_ms >= m_cfg.io_silence_ms;
+        const bool serve_cond =
+            m_serve_wd.armed() && v.serve_quiet_ms >= m_cfg.serve_silence_ms;
+
+        // Same severity order as the lines: a dead io thread explains the other
+        // two, so it is what the surface names.
+        if (io_cond) {
+            v.stale        = true;
+            v.stale_check  = StaleServeCheck::IoSilence;
+            v.stale_age_ms = v.io_silent_ms;
+        } else if (skew_sustained) {
+            v.stale        = true;
+            v.stale_check  = StaleServeCheck::HeightSkew;
+            v.stale_age_ms = v.skew_age_ms;
+        } else if (serve_cond) {
+            v.stale        = true;
+            v.stale_check  = StaleServeCheck::ServeSilence;
+            v.stale_age_ms = v.serve_quiet_ms;
+        }
+
         // ── Rate policy + severity order ────────────────────────────────────
         if (auto d = m_io_wd.due(s.now_ms)) {
-            v.fired  = true;
-            v.check  = StaleServeCheck::IoSilence;
-            v.age_ms = *d;
-            v.line   = format_io(s, *d);
+            v.fired = true;
+            v.check = StaleServeCheck::IoSilence;
+            v.line  = format_io(s, *d);
             return v;
         }
         if (skew_sustained && owes_skew_line(s.now_ms)) {
@@ -253,10 +367,9 @@ public:
             return v;
         }
         if (auto d = m_serve_wd.due(s.now_ms)) {
-            v.fired  = true;
-            v.check  = StaleServeCheck::ServeSilence;
-            v.age_ms = *d;
-            v.line   = format_serve_silence(s, *d);
+            v.fired = true;
+            v.check = StaleServeCheck::ServeSilence;
+            v.line  = format_serve_silence(s, *d);
             return v;
         }
         return v;

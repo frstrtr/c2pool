@@ -567,16 +567,51 @@ public:
     int64_t last_served_at_ms() const
     { return last_served_at_ms_.load(std::memory_order_relaxed); }
 
+    /// One sentinel poll, as published to the operator surface.
+    ///
+    /// EVERY AGE IS ITS OWN FIELD. The previous shape carried a single
+    /// `stale_age_ms` that the sentinel overwrote with whichever sub-check had
+    /// fired, so the same operator field meant io-silence on one poll and
+    /// height-skew on the next. An operator field whose meaning depends on
+    /// which branch fired is how the 2026-08-07 confusion started.
+    /// `stale_age_ms` here is the age of the condition named by `stale_check`,
+    /// and nothing else.
+    struct ServeStalenessReport {
+        uint32_t    observed_height{0};
+        int64_t     observed_at_ms{0};
+        std::string observed_src{"none"};
+        /// D2 had an INDEPENDENT height this poll and therefore ran at all.
+        /// False is published as an explicit "unavailable" on the surface —
+        /// never as "no skew", which would be the node vouching for itself.
+        bool        d2_armed{false};
+        bool        stale{false};
+        std::string stale_check{"none"};   ///< names which condition `stale` is.
+        int64_t     stale_age_ms{0};       ///< age of THAT condition only.
+        int64_t     io_silent_ms{0};       ///< D1, always populated.
+        int64_t     skew_age_ms{0};        ///< D2, always populated.
+        int64_t     serve_quiet_ms{0};     ///< D3, always populated.
+    };
+
     /// Sentinel -> status surface. Publishes what an INDEPENDENT source said
     /// the chain height was, when it said it, which source answered, and the
-    /// sentinel's own verdict. Called only from the sentinel thread; takes no
-    /// lock. `observed_height == 0` means "no source answered", which is NOT
-    /// the same claim as "we are current" and must never be rendered as one.
-    void note_serve_observation(uint32_t observed_height,
-                                int64_t observed_at_ms,
-                                const std::string& source,
-                                bool stale,
-                                int64_t stale_age_ms) const;
+    /// sentinel's own standing verdict. Called only from the sentinel thread;
+    /// takes no lock. `observed_height == 0` means "no source answered", which
+    /// is NOT the same claim as "we are current" and must never be rendered as
+    /// one.
+    void note_serve_observation(const ServeStalenessReport& r) const;
+
+    /// The served-vs-observed staleness block, composed from RELAXED ATOMICS
+    /// ONLY — no mutex is taken anywhere on this path.
+    ///
+    /// PUBLIC on purpose. embedded_arm_status_json() also embeds it, but that
+    /// function additionally reads the arm bits behind serve_gate_mutex_, a
+    /// lock the SERVE PATH holds (note_arm_decision, work_source.cpp:759). A
+    /// status surface reachable only through a lock the failing path holds goes
+    /// dark exactly when it is needed, which is the failure this whole lane is
+    /// about. /api/node_topology calls THIS directly (main_dash.cpp), so the
+    /// staleness block is reachable with zero locks even if the arm block is
+    /// contended.
+    nlohmann::json serve_staleness_json() const;
 
 private:
     /// Record ONE arm-selection outcome and, if the rate policy says so, emit
@@ -591,10 +626,6 @@ private:
     /// addition to the serve path and it strictly adds observation — it cannot
     /// change which template is chosen or a single byte of it.
     void note_served_height(uint32_t h) const;
-
-    /// The lock-free half of the operator surface, composed before
-    /// embedded_arm_status_json takes serve_gate_mutex_.
-    nlohmann::json serve_staleness_json() const;
 
     // External dependencies (non-owning references) -- see Lifetime note.
     const coin::NodeCoinState&  coin_state_;    ///< embedded work arm (populated -> Embedded)
@@ -647,8 +678,16 @@ private:
     mutable std::atomic<uint32_t> observed_height_{0};
     mutable std::atomic<int64_t>  observed_at_ms_{0};
     mutable std::atomic<int>      observed_src_{0};
+    mutable std::atomic<bool>     serve_d2_armed_{false};
     mutable std::atomic<bool>     serve_stale_{false};
+    // Index of the check `serve_stale_` refers to (StaleServeCheck ordering:
+    // 0=none 1=io-silence 2=height-skew 3=serve-silence). A NAMED check plus a
+    // per-check age, rather than one age field that silently changed meaning.
+    mutable std::atomic<int>      serve_stale_check_{0};
     mutable std::atomic<int64_t>  serve_stale_age_ms_{0};
+    mutable std::atomic<int64_t>  serve_io_silent_ms_{0};
+    mutable std::atomic<int64_t>  serve_skew_age_ms_{0};
+    mutable std::atomic<int64_t>  serve_quiet_ms_{0};
 
     // Atomic state. work_generation_ is mutable: the const template-cache
     // resolve (cached_work) bumps it when a refresh observes a moved tip.

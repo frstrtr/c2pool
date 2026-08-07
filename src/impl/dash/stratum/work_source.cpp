@@ -834,27 +834,62 @@ int serve_src_index(const std::string& s)
     if (s == "none" || s.empty()) return 0;
     return 4;
 }
+
+// Which sub-check the standing `stale` verdict refers to. Same ordering as
+// coin::StaleServeCheck; kept as an index for the same reason as the source --
+// a std::string cannot be an atomic and this block must stay lock-free.
+const char* serve_check_name(int i)
+{
+    switch (i) {
+        case 1:  return "io-silence";
+        case 2:  return "height-skew";
+        case 3:  return "serve-silence";
+        default: return "none";
+    }
+}
+int serve_check_index(const std::string& s)
+{
+    if (s == "io-silence")    return 1;
+    if (s == "height-skew")   return 2;
+    if (s == "serve-silence") return 3;
+    return 0;
+}
 }  // namespace
 
-void DASHWorkSource::note_serve_observation(uint32_t observed_height,
-                                            int64_t observed_at_ms,
-                                            const std::string& source,
-                                            bool stale,
-                                            int64_t stale_age_ms) const
+void DASHWorkSource::note_serve_observation(
+    const DASHWorkSource::ServeStalenessReport& r) const
 {
-    observed_height_.store(observed_height, std::memory_order_relaxed);
-    observed_at_ms_.store(observed_at_ms, std::memory_order_relaxed);
-    observed_src_.store(serve_src_index(source), std::memory_order_relaxed);
-    serve_stale_.store(stale, std::memory_order_relaxed);
-    serve_stale_age_ms_.store(stale_age_ms, std::memory_order_relaxed);
+    observed_height_.store(r.observed_height, std::memory_order_relaxed);
+    observed_at_ms_.store(r.observed_at_ms, std::memory_order_relaxed);
+    observed_src_.store(serve_src_index(r.observed_src),
+                        std::memory_order_relaxed);
+    serve_d2_armed_.store(r.d2_armed, std::memory_order_relaxed);
+    serve_stale_.store(r.stale, std::memory_order_relaxed);
+    serve_stale_check_.store(serve_check_index(r.stale_check),
+                             std::memory_order_relaxed);
+    serve_stale_age_ms_.store(r.stale_age_ms, std::memory_order_relaxed);
+    serve_io_silent_ms_.store(r.io_silent_ms, std::memory_order_relaxed);
+    serve_skew_age_ms_.store(r.skew_age_ms, std::memory_order_relaxed);
+    serve_quiet_ms_.store(r.serve_quiet_ms, std::memory_order_relaxed);
 }
 
-// Composed from atomics ONLY. During the incident the io thread held
-// template_mutex_ across the ~733 ms pre-emit gate (see the serve-time re-check
-// below, and the gate call it wraps), so a status surface that waits on any
-// lock the serve path holds goes dark exactly when an operator needs it. This
-// function therefore runs BEFORE embedded_arm_status_json takes
-// serve_gate_mutex_, and takes nothing itself.
+// Composed from RELAXED ATOMICS ONLY -- this function takes no mutex of any
+// kind, and /api/node_topology calls it DIRECTLY rather than digging it out of
+// embedded_arm_status_json's result (main_dash.cpp).
+//
+// That directness is the point. embedded_arm_status_json additionally reads the
+// arm bits behind serve_gate_mutex_, and serve_gate_mutex_ is held by the SERVE
+// PATH (note_arm_decision, :759 above). During the incident the io thread held
+// template_mutex_ across the ~733 ms pre-emit gate; a status block reachable
+// only THROUGH a lock the failing path holds is dark exactly when an operator
+// needs it. Composing this block before that lock is not enough on its own --
+// the caller still blocked on the lock a line later -- so the block is public
+// and the topology surface reads it on its own.
+//
+// EVERY AGE IS ITS OWN FIELD, and `stale_check` names which condition
+// `stale`/`stale_age_s` are about. The previous shape reused one age field for
+// whichever sub-check happened to fire, so the same operator number meant
+// io-silence on one poll and height-skew on the next.
 nlohmann::json DASHWorkSource::serve_staleness_json() const
 {
     const int64_t  now      = coin::diag::steady_now_ms();
@@ -863,14 +898,27 @@ nlohmann::json DASHWorkSource::serve_staleness_json() const
     const uint32_t observed = observed_height_.load(std::memory_order_relaxed);
     const int64_t  obs_at   = observed_at_ms_.load(std::memory_order_relaxed);
     const int      src      = observed_src_.load(std::memory_order_relaxed);
+    const bool     d2_armed = serve_d2_armed_.load(std::memory_order_relaxed);
 
     nlohmann::json s;
     s["served_height"]   = served;
     s["observed_height"] = observed;
     s["observed_src"]    = serve_src_name(src);
     s["stale"]           = serve_stale_.load(std::memory_order_relaxed);
+    s["stale_check"]     =
+        serve_check_name(serve_stale_check_.load(std::memory_order_relaxed));
     s["stale_age_s"]     =
         serve_stale_age_ms_.load(std::memory_order_relaxed) / 1000;
+    // Per-check ages, always present, never standing in for one another.
+    s["io_silent_s"]     =
+        serve_io_silent_ms_.load(std::memory_order_relaxed) / 1000;
+    s["skew_age_s"]      =
+        serve_skew_age_ms_.load(std::memory_order_relaxed) / 1000;
+    s["serve_quiet_s"]   = serve_quiet_ms_.load(std::memory_order_relaxed) / 1000;
+    // D2 needs a height from OUTSIDE this process. Without one it does not run,
+    // and the surface says so instead of publishing a silent self-comparison --
+    // a node vouching for its own tip is exactly what stayed quiet for an hour.
+    s["d2"] = d2_armed ? "armed" : "unavailable-no-independent-reference";
     // Ages, not timestamps: "served 3 s ago" survives a log paste, an absolute
     // steady-clock reading does not.
     s["served_age_s"]    = served_at > 0 ? (now - served_at) / 1000 : -1;
@@ -889,7 +937,21 @@ nlohmann::json DASHWorkSource::embedded_arm_status_json() const
     // BEFORE the lock, deliberately -- see serve_staleness_json().
     j["serve_staleness"] = serve_staleness_json();
 
-    std::lock_guard<std::mutex> lk(serve_gate_mutex_);
+    // TRY_LOCK, not lock_guard. serve_gate_mutex_ is taken by the SERVE PATH
+    // (note_arm_decision, :759; the found-block ledger, :1478). Blocking here
+    // meant the whole status response waited on the very path this lane exists
+    // to report on -- during the exact saturation the sentinel detects, the
+    // endpoint hung with it. A status surface must degrade with a NAMED reason,
+    // never hang: the staleness block above is already composed and is returned
+    // regardless, and the arm block says which condition denied it.
+    std::unique_lock<std::mutex> lk(serve_gate_mutex_, std::try_to_lock);
+    if (!lk.owns_lock()) {
+        j["arm"]               = "unknown";
+        j["no_work_reason"]    = "status-serve-gate-busy";
+        j["no_work_value"]     = "n/a";
+        j["no_work_threshold"] = "n/a";
+        return j;
+    }
     if (!arm_ever_observed_) {
         j["arm"]               = "unknown";
         j["no_work_reason"]    = "no-template-sourced-yet";
