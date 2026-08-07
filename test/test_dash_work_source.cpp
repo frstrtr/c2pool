@@ -16,6 +16,8 @@
 #include <impl/dash/coin/work_source.hpp>
 #include <impl/dash/coin/special_tx_pool_delta.hpp>
 #include <impl/dash/coin/rpc_data.hpp>
+#include <impl/dash/coin/utxo_adapter.hpp>
+#include <core/coin/utxo_view_cache.hpp>
 #include <core/pack.hpp>
 #include <c2pool/hashrate/tracker.hpp>
 
@@ -188,6 +190,57 @@ TEST(DashWorkSource, PinnedTxOnFallbackFailsClosedWithoutUtxoView)
     EXPECT_TRUE(sel.work.m_txs.empty());
     EXPECT_TRUE(sel.work.m_tx_data_hex.empty());
 }
+
+// POSITIVE PATH: verify view wired (mempool + UTXO + mnstates), pin admissible
+// (mature input, fee exactly 0) -> appended to ALL FOUR tx vectors on the
+// SERVED dashd template, fee recorded as 0, coinbase value untouched. This is
+// the donation-consolidation contract: >100KB standardness never applies here.
+TEST(DashWorkSource, PinnedTxSplicedOnFallbackWithVerifyView)
+{
+    using ::core::coin::UTXOViewCache;
+    using ::core::coin::Outpoint;
+    using ::core::coin::Coin;
+
+    uint256 prev;
+    prev.begin()[0] = 0x42;
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(50'000, {}, /*height=*/1, /*cb=*/false));
+
+    dash::coin::Mempool mp;
+    mp.set_utxo(&utxo);
+    MnStateMachine mn;
+
+    dash::coin::MutableTransaction pin;
+    pin.vin.resize(1);
+    pin.vin[0].prevout.hash  = prev;
+    pin.vin[0].prevout.index = 0;
+    pin.vout.resize(1);
+    pin.vout[0].value = 50'000;   // sum(in) == sum(out): fee exactly zero
+
+    EmbeddedWorkInputs emb;       // has_state=false -> fallback arm
+    emb.mnstates        = &mn;
+    emb.mempool         = &mp;
+    emb.pinned_local_tx = &pin;
+
+    bool emb_ran = false, fb_ran = false;
+    WorkSelection sel = select_dash_work(
+        emb,
+        [&] { return embedded_stub(emb_ran); },
+        [&] { return dashd_stub(fb_ran); });
+
+    EXPECT_EQ(sel.source, WorkSource::DashdFallback);
+    EXPECT_TRUE(fb_ran);
+    ASSERT_EQ(sel.work.m_txs.size(), 1u);
+    ASSERT_EQ(sel.work.m_tx_hashes.size(), 1u);
+    ASSERT_EQ(sel.work.m_tx_fees.size(), 1u);
+    ASSERT_EQ(sel.work.m_tx_data_hex.size(), 1u);
+    EXPECT_EQ(sel.work.m_tx_fees[0], 0u);
+    EXPECT_EQ(sel.work.m_tx_hashes[0], dash::coin::dash_txid(pin));
+    EXPECT_FALSE(sel.work.m_tx_data_hex[0].empty());
+    // Coinbase value untouched by the splice (fee 0 adds nothing to claim).
+    EXPECT_EQ(sel.work.m_coinbase_value, 0u);
+}
+
 
 // ─── Firmware-grid vardiff quantization KAT (retention fix) ──────────────────
 // HashrateTracker::set_difficulty_from_hashrate must advertise ONLY power-of-two
