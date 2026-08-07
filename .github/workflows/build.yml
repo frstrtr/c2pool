@@ -185,10 +185,13 @@ jobs:
           ctest --test-dir build_ci -R '^boost_sentinel$' --output-on-failure
 
       - name: Build
-        run: cmake --build build_ci --target c2pool -j8
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/ci-logs"
+          cmake --build build_ci --target c2pool -j8 2>&1 | tee "${GITHUB_WORKSPACE}/ci-logs/build.log"
 
       - name: Build tests
         run: |
+          mkdir -p "${GITHUB_WORKSPACE}/ci-logs"
           cmake --build build_ci \
             --target coin_peer_rearm_kat test_hardening test_share_messages test_coin_broadcaster \
                     test_redistribute_address test_redistribute test_auto_ratchet \
@@ -209,11 +212,13 @@ jobs:
                     dgb_other_tx_assembler_test dgb_reconstruct_won_block_test dgb_reconstruct_closure_test dgb_gentx_unpack_test dgb_work_source_test dgb_template_builder_test dgb_embedded_coin_node_test dgb_live_node_status_test dgb_embedded_tx_select_test dgb_template_other_txs_test dgb_coinbase_value_parity_test dgb_submit_classify_test dgb_aux_parent_coinbase_parity_test dgb_template_capture_test dgb_aux_doge_db_commitment_bind_test dgb_aux_doge_mm_commitment_test dgb_aux_doge_dc_proof_test dgb_aux_doge_bind_parsers_test dgb_compact_blocks_bip152_parity_test dgb_aux_dual_target_select_test dgb_aux_broadcast_path_election_test dgb_aux_doge_submit_test dgb_aux_doge_embed_livewire_test dgb_aux_doge_dc_layout_verifier_test \
                     rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test header_chain_test \
                     dgb_coin_node_seam_test dgb_block_broadcast_test dgb_won_block_dispatch_test dgb_forced_won_share_dualpath_test dgb_scrypt_pow_test dgb_nonce_grinder_test dgb_regrind_block_test dgb_won_block_finalize_test dgb_share_target_genesis_test dgb_share_target_retarget_test dgb_share_bits_oracle_pin_test dgb_pool_msg_wire_test dgb_get_shares_walk_test dgb_download_stops_test dgb_think_p1_walk_bounds_test dgb_think_p1_desired_emit_test dgb_think_p6_desired_cutoff_test dgb_think_p4_head_keys_test dgb_think_p3_best_head_test dgb_g1_oracle_byte_parity_test dgb_think_p2_walk_bounds_test dgb_expected_time_to_block_test dgb_tail_score_endpoints_test dgb_pool_attempts_per_second_test dgb_pool_efficiency_test dgb_think_p5_best_share_punish_test dgb_auto_ratchet_tail_guard_test dgb_auto_ratchet_sim_test dgb_binomial_conf_interval_test dgb_desired_version_tally_test dgb_min_protocol_ratchet_test dgb_get_height_and_last_endpoints_test dgb_chain_walk_window_test dgb_redistribute_delegate_ghal_test dgb_share_weight_decay_test dgb_naughty_propagation_test dgb_hash_format_parity_test dgb_emergency_decay_saturation_test dgb_arith256_muldiv_kat_test dgb_share_tx_relay_refs_test dgb_coin_peer_rearm_test v37_test \
-            -j8
+            -j8 2>&1 | tee "${GITHUB_WORKSPACE}/ci-logs/build-tests.log"
 
       - name: Run tests
         working-directory: build_ci
-        run: ctest --output-on-failure -j8 --exclude-regex "LiveTest\."
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/ci-logs"
+          ctest --output-on-failure -j8 --exclude-regex "LiveTest\." 2>&1 | tee "${GITHUB_WORKSPACE}/ci-logs/run-tests.log"
 
       - name: Package release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -241,6 +246,13 @@ jobs:
         with:
           name: linux-x86_64
           path: c2pool-*-linux-x86_64.tar.gz*
+
+      # tee-captured build/test stdout — survives the case where GitHubs own
+      # per-job log capture returns 0 bytes (905-7 job 92744044447, Build tests).
+      - name: Upload build/test logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with: { name: ci-logs-linux, path: ci-logs/, retention-days: 7, if-no-files-found: ignore }
 
       - name: Upload test results on failure
         if: failure()
