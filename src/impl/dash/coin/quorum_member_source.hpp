@@ -276,6 +276,34 @@ public:
             // recent boundary at or below the tip.
             const uint32_t cycle_base = tip_height - (tip_height % p.dkg_interval);
             if (cycle_base == 0) continue;
+            // ROTATED TYPES (DIP-24): DO NOT ask at the cycle boundary.
+            //
+            // A rotated reply publishes one member set per slot, keyed by the
+            // header at cycleBase + quorumIndex (finalize_rotated). At the tip
+            // that CROSSES the boundary only cycleBase itself exists, so 31 of
+            // 32 slots are skipped for want of a header — and the one slot that
+            // does publish is index 0, whose key IS the cycle key. From then on
+            // request_rotated short-circuits on "cycle already ready" and the
+            // qfcommit kick can never re-ask: the cycle is permanently stuck at
+            // 1/32 sourced. That would REGRESS the rotated lane proven live by
+            // #1077, which works precisely because the qfcommit kick fires
+            // inside the mining window, when every slot header exists.
+            //
+            // So wait until the last slot's base header is in the chain. With
+            // signing_active_quorum_count=32 and mining_window_start=42 the
+            // prefetch still lands ~10 blocks (~25 min) before the window
+            // opens, which is the entire point of this change.
+            //
+            // The memo is inserted AFTER this check on purpose: memoising a
+            // cycle we deliberately skipped would burn the only chance to
+            // prefetch it at all.
+            if (p.use_rotation) {
+                const uint32_t last_slot_h =
+                    cycle_base + (p.signing_active_quorum_count > 0
+                                      ? p.signing_active_quorum_count - 1
+                                      : 0);
+                if (tip_height < last_slot_h) continue;   // retry on a later tip
+            }
             // Only act once per (type, cycle) — repeated tips inside the same
             // cycle must not re-walk the request path.
             const uint64_t seen_key =
