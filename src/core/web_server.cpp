@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "web_server.hpp"
 #include "stratum_server.hpp"
+#include <algorithm>   // std::max — authorship only ever climbs, never downgrades
 #include <memory>
 #include "address_utils.hpp"
 #include "socket.hpp"
@@ -2532,11 +2533,18 @@ nlohmann::json MiningInterface::rest_recent_blocks()
         // it, so luck_method must not fabricate a computed-luck label
         // ("first_block" wrongly implied a luck computation was attempted), and
         // the timing-derived fields are honest-absent (null) rather than a
-        // real-looking 0. found_locally is the explicit node-role signal the
-        // dashboard reads to render relay-learned blocks as such.
-        const bool found_locally = !(b.share_hash.empty() && b.miner.empty());
+        // real-looking 0.
+        //
+        // NAMING (2026-08-07): this predicate asks "do we hold a local record
+        // of the block", NOT "did we find it" — a sharechain peer's block
+        // satisfies it, because the gossiped share carries both fields. The
+        // two questions were conflated under one name; authorship now has its
+        // own field (b.authorship, emitted as found_by) set at the call site
+        // that knows. The wire key `found_locally` keeps its existing meaning
+        // and its existing consumers; read `found_by` for authorship.
+        const bool have_local_record = !(b.share_hash.empty() && b.miner.empty());
         std::string method;
-        if (!found_locally)                        method = "relayed";
+        if (!have_local_record)                    method = "relayed";
         else if (b.time_to_find > 0 && b.luck > 0) method = "simple_avg";
         else                                       method = "first_block";
         // #942 second slice, extended to EVERY unmeasured field (hotel,
@@ -2562,16 +2570,24 @@ nlohmann::json MiningInterface::rest_recent_blocks()
             {"confirmations", b.confirmations},
             {"miner", b.miner},
             {"share", b.share_hash},
-            {"found_locally", found_locally},
+            {"found_locally", have_local_record},
+            // Authorship, set at the call site that knows. "unknown" is a real
+            // answer -- a coin lane that has not labelled its sites -- and the
+            // UI must render it as unknown rather than folding it into either
+            // claim.
+            {"found_by", b.authorship == BlockAuthorship::this_node
+                             ? "this_node"
+                             : b.authorship == BlockAuthorship::sharechain_peer
+                                   ? "sharechain_peer" : "unknown"},
             {"network_difficulty", num_or_null(b.network_difficulty)},
             {"actual_hash_difficulty", actual_hash_difficulty(b.hash)},
             {"share_difficulty", num_or_null(b.share_difficulty)},
             {"pool_hashrate_at_find", num_or_null(b.pool_hashrate)},
             {"subsidy", b.subsidy != 0 ? nlohmann::json(b.subsidy)
                                        : nlohmann::json(nullptr)},
-            {"expected_time", found_locally ? num_or_null(b.expected_time) : nlohmann::json(nullptr)},
-            {"time_to_find", found_locally ? num_or_null(b.time_to_find) : nlohmann::json(nullptr)},
-            {"luck", found_locally ? num_or_null(b.luck) : nlohmann::json(nullptr)},
+            {"expected_time", have_local_record ? num_or_null(b.expected_time) : nlohmann::json(nullptr)},
+            {"time_to_find", have_local_record ? num_or_null(b.time_to_find) : nlohmann::json(nullptr)},
+            {"luck", have_local_record ? num_or_null(b.luck) : nlohmann::json(nullptr)},
             {"luck_method", method}
         });
     }
@@ -3421,7 +3437,8 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
                                           double network_difficulty,
                                           double share_difficulty,
                                           double pool_hashrate,
-                                          uint64_t subsidy)
+                                          uint64_t subsidy,
+                                          BlockAuthorship authorship)
 {
     if (ts == 0) ts = static_cast<uint64_t>(std::time(nullptr));
     std::string hash_hex = hash.GetHex();
@@ -3463,6 +3480,27 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
         for (auto& existing : m_found_blocks) {
             if (existing.hash != hash_hex || existing.chain != chain)
                 continue;
+            // AUTHORSHIP CLIMBS FIRST, and OUTSIDE the enrichment branch.
+            // It was inside it, gated on the existing row being unattributed
+            // -- which made the raise unreachable on the path it exists for.
+            // Both DASH sites record miner+share_hash, so the second call for
+            // a block always meets an ALREADY-ATTRIBUTED row, hit the plain
+            // early return, and left authorship at whatever the first caller
+            // happened to know. Attribution and authorship are independent
+            // facts: a fully attributed row can still be wrong about WHO
+            // found the block, and that is exactly the row this field exists
+            // to correct. EnrichmentRaisesAuthorshipAndNeverLowersIt proved
+            // this red before the fix.
+            const bool authorship_raised = authorship > existing.authorship;
+            if (authorship_raised) {
+                existing.authorship = authorship;
+                LOG_INFO << "[Pool] found-block AUTHORSHIP raised: h="
+                         << existing.height << " hash="
+                         << hash_hex.substr(0, 16) << " -> "
+                         << (authorship == BlockAuthorship::this_node
+                                 ? "THIS NODE" : "sharechain peer");
+            }
+
             const bool existing_unattributed =
                 existing.share_hash.empty() && existing.miner.empty();
             const bool incoming_attributed =
@@ -3488,6 +3526,15 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
                                        " found block: " << e.what();
                     }
                 }
+            } else if (authorship_raised && m_persist_block_fn) {
+                // Authorship changed on a row that needed no other enrichment.
+                // Without this the raise lives only in memory and the restored
+                // row reasserts the wrong finder after every restart.
+                try { m_persist_block_fn(existing); }
+                catch (const std::exception& e) {
+                    LOG_WARNING << "[Pool] Failed to persist raised"
+                                   " authorship: " << e.what();
+                }
             }
             return;  // already recorded (possibly just enriched)
         }
@@ -3495,7 +3542,7 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
 
     FoundBlock blk{height, hash_hex, ts, BlockStatus::pending, 0, chain, 0,
                    miner, share_hash, network_difficulty, share_difficulty,
-                   pool_hashrate, subsidy, 0, 0, 0};
+                   pool_hashrate, subsidy, 0, 0, 0, authorship};
 
     // Compute time_to_find from previous block, then derive expected_time and luck
     {
@@ -3672,14 +3719,53 @@ void MiningInterface::verify_found_block(size_t index)
         if (blk.status == BlockStatus::pending) {
             blk.status = BlockStatus::confirmed;
             auto age_sec = static_cast<uint64_t>(std::time(nullptr)) - blk.ts;
+            // WHO FOUND IT, in words. On a p2pool sharechain the coinbase
+            // pays every participant proportionally, so our payout address in
+            // a block's coinbase means we earned a SHARE — never that we found
+            // it. That ambiguity cost real debugging time on 2026-08-07, when
+            // block 2517979 read as "ours" by its coinbase and was in fact
+            // found by another sharechain node, which is also why none of this
+            // node's pinned transactions were in it.
+            const bool ours  = blk.authorship == BlockAuthorship::this_node;
+            const bool peers = blk.authorship == BlockAuthorship::sharechain_peer;
             LOG_INFO << "\n"
-                     << "  +++  BLOCK CONFIRMED — " << cn << " height " << blk.height << "  +++\n"
+                     << (ours  ? "  +++  BLOCK CONFIRMED — FOUND BY THIS NODE  +++\n"
+                       : peers ? "  +++  POOL BLOCK CONFIRMED — found by ANOTHER "
+                                 "sharechain node  +++\n"
+                               : "  +++  POOL BLOCK CONFIRMED  +++\n")
                      << "  Chain:      " << cn << "\n"
                      << "  Height:     " << blk.height << "\n"
                      << "  Block hash: " << blk.hash << "\n"
+                     << "  Found by:   "
+                     << (ours  ? "THIS NODE (we built the template and"
+                                 " dispatched it)"
+                       : peers ? "ANOTHER NODE on the sharechain — its"
+                                 " template, not ours"
+                               : "UNKNOWN — this coin lane does not record"
+                                 " which node found the block")
+                     << "\n"
+                     // The miner address is the payout of the WINNING SHARE,
+                     // i.e. the finder's own address, not the pool's and not
+                     // ours. It is meaningful on all three branches: on a
+                     // peer-found block it names the peer who found it.
+                     << "  Payout to:  " << (blk.miner.empty() ? "(unattributed)"
+                                                               : blk.miner)
+                     << (ours ? ""
+                              : "   [payout of the winning share — the finder."
+                                " Our address may ALSO appear in the coinbase"
+                                " as our SHARE of the pool payout]")
+                     << "\n"
+                     << "  Share hash: " << (blk.share_hash.empty()
+                                                 ? "(none)" : blk.share_hash)
+                     << "\n"
                      << "  Verified:   check #" << (int)blk.check_count
                      << " (" << age_sec << "s after submission)"
-                     << " confirmations=" << blk.confirmations;
+                     << " confirmations=" << blk.confirmations
+                     << (peers
+                            ? "\n  Note:       transactions this node pins or"
+                              " serves are NOT in this block — the finder built"
+                              " its own template."
+                            : "");
         }
         // Already confirmed — just update confirmation count silently
     } else if (result < 0) {
