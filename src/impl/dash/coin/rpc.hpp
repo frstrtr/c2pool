@@ -170,6 +170,13 @@ public:
     // template refresh without waiting on the 30 s staleness TTL. Empty string
     // on a null/absent result.
     std::string getbestblockhash();
+    // gettxout <txid> <n>: the daemon's own UTXO-set answer for one outpoint.
+    // SECOND SOURCE for the pinned-tx admission gate (money-path): our embedded
+    // UTXO view is built forward from the node's start height, so coins older
+    // than that are absent from it and the gate cannot tell "spent" from
+    // "never seen". Returns a null json when the coin is unspendable/absent —
+    // the caller must treat that as REFUSE, never as a guess.
+    nlohmann::json gettxout(const uint256& txid, uint32_t n);
     // getpeerinfo -> the dashd's OWN connected-peer addresses (the "addr" field
     // of each entry), parsed to NetService. Feeds the embedded
     // DashCoinPeerManager's daemon-peer overlap filter + coind-source -20 score
