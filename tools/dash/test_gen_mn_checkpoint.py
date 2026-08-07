@@ -29,6 +29,7 @@ import json
 import os
 import sys
 import tempfile
+from pathlib import Path
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
@@ -104,7 +105,7 @@ def refused(payload_text, network="testnet"):
 
 
 def main():
-    fixture_text = open(FIXTURE).read()
+    fixture_text = Path(FIXTURE).read_text()
 
     print("[1] verify: committed fixture re-derives its own digest")
     cp = g.parse_checkpoint(g.unwrap_inc(fixture_text), expected_network="testnet")
@@ -120,7 +121,7 @@ def main():
     g.main(["pin", "--network", "testnet", "--protx-json", jsrc,
             "--height", str(FIXTURE_HEIGHT), "--blockhash", FIXTURE_BLOCKHASH,
             "--generated", "2026-07-26T13:23:51Z", "--source", "kat", "--output", out, "--quiet"])
-    R, G = mn_map(g.unwrap_inc(fixture_text)), mn_map(g.unwrap_inc(open(out).read()))
+    R, G = mn_map(g.unwrap_inc(fixture_text)), mn_map(g.unwrap_inc(Path(out).read_text()))
     ok = R.keys() == G.keys()
     for h in R:
         for c in CRIT:
@@ -153,7 +154,7 @@ def main():
         so = tf.name
     g.main(["pin", "--network", "testnet", "--protx-json", sj, "--height", "12345",
             "--blockhash", "ab" * 32, "--generated", "2026-01-01T00:00:00Z", "--output", so, "--quiet"])
-    st = open(so).read()
+    st = Path(so).read_text()
     check("synthetic pin verifies", not refused(st))
     check("flip one payload byte -> refused", refused(st.replace("height 12345", "height 12346")))
 
@@ -204,7 +205,7 @@ def main():
     check("pin asks dashd for `protx list registered true <h>`",
           protx_calls == [("protx", ["list", "registered", True, 12345])])
 
-    pinned = g.parse_checkpoint(g.unwrap_inc(open(ro).read()),
+    pinned = g.parse_checkpoint(g.unwrap_inc(Path(ro).read_text()),
                                 expected_network="testnet")
     rows = pinned["_entries"]
     banned_rows = [f for f in rows if f[8] != "0"]
