@@ -41,7 +41,7 @@
 #include <impl/dash/crypto/hash_x11.hpp>      // dash::crypto::hash_x11 (X11 PoW SSOT)
 #include <impl/dash/params.hpp>               // dash::make_coin_params
 #include <impl/dash/coin/vendor/cbtx.hpp>     // vendor::parse_cbtx (GBT-xcheck creditPool)
-#include <impl/dash/coin/vendor/assetlock.hpp> // #107: explain pool delta via type-8/9 payloads
+#include <impl/dash/coin/special_tx_pool_delta.hpp> // #107: explain the pool delta
 
 #include <core/address_utils.hpp>             // core::address_to_script (mint payout from username)
 #include <core/log.hpp>
@@ -543,32 +543,12 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                     // Serving behaviour is UNCHANGED either way (dashd wins);
                     // only the classification differs, so the graduation-gate
                     // statistics stop counting a by-design exclusion as drift.
-                    int64_t special_delta = 0;
-                    unsigned special_n = 0;
-                    bool payload_unparsable = false;
-                    for (const auto& t : dref.m_txs) {
-                        if (t.type == coin::vendor::CAssetLockPayload::SPECIALTX_TYPE) {
-                            coin::vendor::CAssetLockPayload pl;
-                            if (!coin::vendor::parse_assetlock_payload(t.extra_payload, pl)) {
-                                payload_unparsable = true; break;
-                            }
-                            int64_t sum = 0;
-                            for (const auto& o : pl.creditOutputs) sum += o.value;
-                            special_delta += sum; ++special_n;
-                        } else if (t.type == coin::vendor::CAssetUnlockPayload::SPECIALTX_TYPE) {
-                            coin::vendor::CAssetUnlockPayload pl;
-                            if (!coin::vendor::parse_assetunlock_payload(t.extra_payload, pl)) {
-                                payload_unparsable = true; break;
-                            }
-                            int64_t vout_sum = 0;
-                            for (const auto& o : t.vout) vout_sum += o.value;
-                            special_delta -= (static_cast<int64_t>(pl.fee) + vout_sum);
-                            ++special_n;
-                        }
-                    }
-                    const bool explained = !payload_unparsable && special_n > 0
-                        && emb_cb.creditPoolBalance + special_delta
-                               == dref_cb.creditPoolBalance;
+                    const coin::SpecialPoolDelta sp =
+                        coin::special_tx_pool_delta(dref.m_txs);
+                    const int64_t special_delta = sp.delta;
+                    const unsigned special_n = sp.count;
+                    const bool explained = sp.explains(emb_cb.creditPoolBalance,
+                                                      dref_cb.creditPoolBalance);
                     if (explained) {
                         LOG_INFO << "[DASH-STRATUM-GBT] GBT-xcheck MATCH-MODULO-SPECIAL at h="
                                  << sel.work.m_height << " embedded creditPool="

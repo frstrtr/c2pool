@@ -14,6 +14,7 @@
 ///   4. viable but null mempool  -> fallback (defensive null-guard).
 
 #include <impl/dash/coin/work_source.hpp>
+#include <impl/dash/coin/special_tx_pool_delta.hpp>
 #include <c2pool/hashrate/tracker.hpp>
 
 #include <cmath>
@@ -335,4 +336,160 @@ TEST(HashrateVardiffHysteresis, LowerMarginHeldButDecisiveDropStepsDown)
             << "decisive drop did not step the advertised bucket (D4=" << D4 << ")";
         EXPECT_LE(t.get_current_difficulty(), D4);   // never advertise above ideal D
     }
+}
+
+
+// ─── #107: creditPool divergence — explained vs unexplained ─────────────────
+// KAT for special_tx_pool_delta, the arithmetic that decides whether a GBT
+// creditPool divergence is ACCOUNTED FOR by pending DIP-0027 asset movement
+// (dashd includes those txs, we exclude them by design, C-3) or is genuine
+// drift the reward-safety backstop must keep shouting about. Numbers are the
+// ones measured live on mainnet the night of 2026-08-06/07, so a regression
+// here is a regression against reality:
+//   h=2517494 lock   +0.02689906 DASH ; h=2517504 unlock -72.0000019 with a
+//   190-duff payload fee tail.
+// Folded into this EXISTING allowlisted target on purpose: a fresh
+// add_executable absent from the build.yml --target allowlist would be a
+// silently-passing NOT_BUILT sentinel (#143).
+namespace {
+
+template <typename Payload>
+std::vector<unsigned char> pack_payload(const Payload& pl) {
+    auto ps = ::pack(pl);
+    auto span = ps.get_span();
+    return std::vector<unsigned char>(
+        reinterpret_cast<const unsigned char*>(span.data()),
+        reinterpret_cast<const unsigned char*>(span.data()) + span.size());
+}
+
+TxOut out_of(int64_t v) { TxOut o; o.value = v; return o; }
+
+/// Type-8: pool GAINS sum(payload.creditOutputs).
+MutableTransaction make_lock(int64_t credit_value) {
+    CAssetLockPayload pl;
+    pl.creditOutputs.push_back(out_of(credit_value));
+    MutableTransaction tx;
+    tx.version = 3;
+    tx.type    = CAssetLockPayload::SPECIALTX_TYPE;   // 8
+    tx.extra_payload = pack_payload(pl);
+    return tx;
+}
+
+/// Type-9: pool LOSES (payload.fee + sum(vout)); no inputs, outputs are minted.
+MutableTransaction make_unlock(int64_t out_value, uint32_t fee) {
+    CAssetUnlockPayload pl;
+    pl.index           = 1;
+    pl.fee             = fee;
+    pl.requestedHeight = 1000;
+    MutableTransaction tx;
+    tx.version = 3;
+    tx.type    = CAssetUnlockPayload::SPECIALTX_TYPE; // 9
+    tx.vout.push_back(out_of(out_value));
+    tx.extra_payload = pack_payload(pl);
+    return tx;
+}
+
+MutableTransaction make_plain() {
+    MutableTransaction tx;
+    tx.version = 2;
+    tx.type    = 0;
+    tx.vout.push_back(out_of(50'000));
+    return tx;
+}
+
+} // namespace
+
+// 1) The mainnet h=2517494 shape: one pending lock of 0.02689906 DASH.
+TEST(DashSpecialPoolDelta, PendingLockExplainsThePositiveDivergence)
+{
+    const int64_t kLock = 2'689'906;                 // measured on mainnet
+    const int64_t ours  = 3'028'884'293'639;         // our CbTx creditPool
+    const int64_t dashd = ours + kLock;              // dashd's, with the lock
+
+    std::vector<MutableTransaction> txs{ make_plain(), make_lock(kLock) };
+    const auto sp = special_tx_pool_delta(txs);
+
+    EXPECT_EQ(sp.count, 1u);
+    EXPECT_FALSE(sp.unparsable);
+    EXPECT_EQ(sp.delta, kLock);
+    EXPECT_TRUE(sp.explains(ours, dashd));
+}
+
+// 2) The h=2517504 shape: an unlock, whose miner fee lives in the payload.
+TEST(DashSpecialPoolDelta, PendingUnlockSubtractsOutputsPlusPayloadFee)
+{
+    const int64_t kOut = 7'200'000'000;              // 72 DASH
+    const uint32_t kFee = 190;                       // the measured fee tail
+    const int64_t ours  = 3'029'419'859'335;
+    const int64_t dashd = ours - (kOut + kFee);
+
+    std::vector<MutableTransaction> txs{ make_unlock(kOut, kFee) };
+    const auto sp = special_tx_pool_delta(txs);
+
+    EXPECT_EQ(sp.count, 1u);
+    EXPECT_EQ(sp.delta, -(kOut + static_cast<int64_t>(kFee)));
+    EXPECT_TRUE(sp.explains(ours, dashd));
+}
+
+// 3) Both directions in one template — the signs must not cancel by accident.
+TEST(DashSpecialPoolDelta, MixedLockAndUnlockSumSigned)
+{
+    const int64_t kLock = 35'000'000;
+    const int64_t kOut  = 2'108'300'000;
+    const uint32_t kFee = 190;
+    const int64_t expected = kLock - (kOut + static_cast<int64_t>(kFee));
+    const int64_t ours  = 3'023'215'610'725;
+    const int64_t dashd = ours + expected;
+
+    std::vector<MutableTransaction> txs{
+        make_lock(kLock), make_plain(), make_unlock(kOut, kFee) };
+    const auto sp = special_tx_pool_delta(txs);
+
+    EXPECT_EQ(sp.count, 2u);
+    EXPECT_EQ(sp.delta, expected);
+    EXPECT_TRUE(sp.explains(ours, dashd));
+}
+
+// 4) A divergence the pending special txs do NOT account for stays a mismatch.
+//    This is the whole reason the check is an equation and not a heuristic.
+TEST(DashSpecialPoolDelta, UnrelatedDivergenceIsNotExplained)
+{
+    const int64_t kLock = 2'689'906;
+    const int64_t ours  = 3'028'884'293'639;
+    const int64_t dashd = ours + kLock + 1;          // one duff off
+
+    std::vector<MutableTransaction> txs{ make_lock(kLock) };
+    const auto sp = special_tx_pool_delta(txs);
+
+    EXPECT_EQ(sp.delta, kLock);
+    EXPECT_FALSE(sp.explains(ours, dashd));
+}
+
+// 5) No special txs: even an exactly-equal pool must not be reported as
+//    "explained by special movement" — there was nothing to explain it with.
+TEST(DashSpecialPoolDelta, NoSpecialTxsNeverExplains)
+{
+    std::vector<MutableTransaction> txs{ make_plain(), make_plain() };
+    const auto sp = special_tx_pool_delta(txs);
+
+    EXPECT_EQ(sp.count, 0u);
+    EXPECT_EQ(sp.delta, 0);
+    EXPECT_FALSE(sp.explains(1'000, 1'000));
+}
+
+// 6) Fail-closed: a special tx whose payload does not parse leaves us knowing
+//    NOTHING about the true movement, so nothing may be explained by it.
+TEST(DashSpecialPoolDelta, UnparsablePayloadExplainsNothing)
+{
+    MutableTransaction broken;
+    broken.version = 3;
+    broken.type    = CAssetLockPayload::SPECIALTX_TYPE;
+    broken.extra_payload = { 0xff, 0xff, 0xff };     // not a valid payload
+
+    std::vector<MutableTransaction> txs{ make_lock(1'000), broken };
+    const auto sp = special_tx_pool_delta(txs);
+
+    EXPECT_TRUE(sp.unparsable);
+    EXPECT_FALSE(sp.explains(0, 0));
+    EXPECT_FALSE(sp.explains(0, 1'000));
 }
