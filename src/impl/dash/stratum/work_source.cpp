@@ -363,6 +363,12 @@ DASHWorkSource::CoinStateArm DASHWorkSource::resolve_coin_state_arm() const
     // the cache MORE willing to re-source, never less.
     arm.gen_at_source = work_generation_.load(std::memory_order_relaxed);
 
+    // PIN GATE (donation lane) — evaluated HERE, beside the coin state, for the
+    // served-dashd arm to append later. Unconditional because the verdict does
+    // not depend on which arm wins: the embedded builder gates the pin itself,
+    // and this copy is simply unused when it does.
+    arm.pin_verdict = coin_state_.evaluate_pinned_tx(&arm.pin_tx);
+
     // ── Mainnet embedded gate (v0.2.4 trigger) ──────────────────────────────
     // The SML/QuorumManager wiring emits a real DIP-0004 type-5 CCbTx, and its
     // byte-parity against a real dashd getblocktemplate is PROVEN (from the raw
@@ -502,6 +508,31 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                     dashd_fallback_ ? dashd_fallback_() : coin::DashWorkData{};
                 if (fb.m_height == 0 && arm.declined_height != 0)
                     fb.m_height = arm.declined_height;
+                // PINNED LOCAL TX on the REAL served template. The gate already
+                // ran beside the coin state (resolve_coin_state_arm); all that
+                // happens here is the append, so this touches no coin-state
+                // container. The height in the log is the one the gate JUDGED
+                // at, not fb.m_height, so the line can never claim a check it
+                // did not make.
+                if (arm.pin_tx != nullptr) {
+                    const auto txid = coin::dash_txid(*arm.pin_tx)
+                                          .GetHex().substr(0, 16);
+                    if (arm.pin_verdict.ok) {
+                        coin::pin_append(fb, *arm.pin_tx);
+                        LOG_INFO << "[dashd-splice] pinned tx INCLUDED h="
+                                 << arm.pin_verdict.at_height
+                                 << " txid=" << txid
+                                 << " vin=" << arm.pin_tx->vin.size()
+                                 << " fee=0 (rides this template)";
+                    } else {
+                        LOG_INFO << "[dashd-splice] pinned tx EXCLUDED h="
+                                 << arm.pin_verdict.at_height
+                                 << " cause=" << arm.pin_verdict.cause
+                                 << " txid=" << txid
+                                 << " (template built without it; re-checked "
+                                    "next build)";
+                    }
+                }
                 sel = coin::WorkSelection{ std::move(fb),
                                            coin::WorkSource::DashdFallback,
                                            arm.decline };

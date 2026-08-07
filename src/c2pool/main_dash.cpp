@@ -2065,8 +2065,29 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             // unless the caller knows better. Conservative by
                             // construction.
                             out.coinbase = j.value("coinbase", false);
-                            out.height   = 0;
-                            return j.value("confirmations", 0) > 0;
+                            const int confs = j.value("confirmations", 0);
+                            if (confs <= 0) return false;   // unconfirmed => refuse
+                            // HEIGHT, not a placeholder. Measured on the
+                            // production primary: an earlier version set
+                            // height 0 "conservatively", which made the
+                            // maturity arm read every coinbase-sourced coin as
+                            // immature and refuse it forever — and the donation
+                            // inputs ARE coinbase outputs (they are mining
+                            // payouts), so that conservatism refused exactly
+                            // the transaction it was meant to protect:
+                            //   pinned tx EXCLUDED cause=immature-coinbase-input
+                            // gettxout reports confirmations, and the coin's
+                            // height is the chain tip minus (confirmations-1).
+                            // We take the tip from the daemon's own answer
+                            // rather than a local view, so the number and the
+                            // coin come from the same source.
+                            const int tip = rpc_raw->blockcount_cached();
+                            if (tip <= 0) return false;     // no tip => refuse
+                            const long h = static_cast<long>(tip)
+                                         - static_cast<long>(confs) + 1;
+                            if (h < 0) return false;
+                            out.height = static_cast<uint32_t>(h);
+                            return true;
                         } catch (const std::exception&) {
                             return false;
                         }

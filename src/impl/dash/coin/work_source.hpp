@@ -213,7 +213,17 @@ inline WorkSelection select_dash_work(
     // submitblock body both derive from the appended tx vectors. Fail-closed:
     // without the verify view (mempool+mnstates, i.e. --embedded-utxo) the
     // pin is EXCLUDED with a named cause, never included unverified.
-    if (emb.pinned_local_tx != nullptr) {
+    // A PLACEHOLDER fallback is not a template. The serve path binds this arm
+    // to a no-op closure returning DashWorkData{} (#1134: the real dashd RPC
+    // must not run on the io thread), so splicing here judged a throwaway —
+    // that is what produced `pinned tx EXCLUDED h=0` on the production primary
+    // on 2026-08-07 while the REAL served template went unspliced. The serve
+    // path now gates beside the coin state and appends at the real template
+    // (DASHWorkSource::resolve_coin_state_arm + the re-source site); callers
+    // that pass a genuine fallback still splice here.
+    const bool fallback_is_placeholder =
+        out.work.m_previous_block.IsNull() && out.work.m_txs.empty();
+    if (emb.pinned_local_tx != nullptr && !fallback_is_placeholder) {
         if (emb.mempool == nullptr || emb.mnstates == nullptr) {
             LOG_INFO << "[dashd-splice] pinned tx EXCLUDED h="
                      << out.work.m_height << " cause=no-verify-view ("
