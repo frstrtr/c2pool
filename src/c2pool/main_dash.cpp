@@ -123,6 +123,7 @@
 #include <impl/dash/enhanced_node.hpp>         // dash::EnhancedDashNode — core::IMiningNode the WebServer ctor takes
 #include <impl/dash/share_messages.hpp>        // dash::unpack_share_messages — signed transitional-blob DISPLAY+VERIFY feed
 #include <core/log.hpp>
+#include <impl/dash/coin/serve_staleness.hpp>  // REPORT-ONLY serve-staleness sentinel (2026-08-07 dead-height incident)
 
 #include <algorithm>    // std::copy (pool-share-cap pubkey_hash extract)
 #include <array>        // std::array<uint8_t,20> — AddrRateMap key
@@ -144,6 +145,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>       // the serve-staleness sentinel's DEDICATED poller
 #include <vector>
 
 #ifndef C2POOL_VERSION
@@ -388,6 +390,7 @@ void print_banner(const char* argv0)
         << "           [--bestcl-policy freshness|consensus-exact]\n"
         << "           [--embedded-oracle-shadow]\n"
         << "           [--embedded-shadow-compare]\n"
+        << "           [--serve-staleness-sentinel=off]\n"
         << "           [--replay-bulk] [--replay-bulk-capture DIR] [--replay-bulk-start H]\n"
         << "           [--replay-fold-prestate FILE] [--replay-fold-quorums]\n"
         << "           [--replay-fold-qsnapshot FILE] [--replay-fold-worklists FILE]\n"
@@ -479,6 +482,14 @@ void print_banner(const char* argv0)
         << "        ledger + /embedded_oracle verdict signal when the embedded arm is\n"
         << "        proven equivalent (safe to disable dashd, served domain). Needs the\n"
         << "        dashd RPC arm; never changes serving. N/K tune the graduation gate.\n"
+        << "        --serve-staleness-sentinel=off DISABLES the report-only\n"
+        << "        serve-staleness detector, which is ON by default. It compares\n"
+        << "        the height actually handed to miners against an independently\n"
+        << "        observed one, from a DEDICATED thread (never the io loop), and\n"
+        << "        alarms with [STALE-SERVE]. It is report-only: a log line and a\n"
+        << "        node_topology field, never a serve decision. Turn it off only\n"
+        << "        if it is noisy -- with it off, a dead height served to miners\n"
+        << "        raises NOTHING, which is the 2026-08-07 failure it exists for.\n"
         << "        --embedded-shadow-compare is a SEPARATE, simpler OBSERVE-only\n"
         << "        diagnostic (NOT a serve gate, no graduation state): on every\n"
         << "        template SERVE it best-effort field-compares the served template\n"
@@ -766,7 +777,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // in the builder against the live UTXO view — a bad or already-
              // mined pin is EXCLUDED, never a refused template, never a lost
              // block. Empty (default) = no pin, byte-unchanged.
-             const std::string& pin_local_tx_hex_path = std::string())
+             const std::string& pin_local_tx_hex_path = std::string(),
+             // --serve-staleness-sentinel=off: KILL SWITCH for the report-only
+             // serve-staleness sentinel (2026-08-07 dead-height incident). It
+             // is DEFAULT ON, which the money-path flag rule permits because it
+             // changes NOTHING about what is served: its only outputs are a log
+             // line and a JSON field. The flag exists for ops hygiene (a noisy
+             // detector must be silenceable without a redeploy), not for
+             // safety — there is no code path from an alarm to a serve
+             // decision. See coin/serve_staleness.hpp for why report-only was
+             // chosen over a detector that can stop serving.
+             bool serve_staleness_sentinel = true)
 {
     namespace io = boost::asio;
 
@@ -3298,6 +3319,21 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         ? std::string()
                         : cause + " (value=" + c["no_work_value"].get<std::string>()
                                 + " threshold=" + c["no_work_threshold"].get<std::string>() + ")";
+                    // SERVE-STALENESS: the height we actually handed to a miner
+                    // versus an independently observed one. header_height and
+                    // target_height above are about the HEADER chain and are
+                    // recomputed only when a browser asks; this block is about
+                    // the SERVE path and carries the sentinel's standing
+                    // verdict, so the page can state a fault instead of leaving
+                    // it to a human to notice two numbers disagree.
+                    //
+                    // Read from serve_staleness_json() DIRECTLY, not out of
+                    // `arm`. embedded_arm_status_json also touches
+                    // serve_gate_mutex_ -- a lock the SERVE PATH holds -- so
+                    // sourcing the staleness block from its result would make
+                    // the one surface that reports serve-path saturation depend
+                    // on the serve path. This call takes no lock at all.
+                    c["serve_staleness"] = ws->serve_staleness_json();
                     return nlohmann::json{
                         {"node_symbol", "DASH"},
                         {"auto_detected", false},
@@ -6525,6 +6561,207 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         diag_timer->async_wait(*diag_tick);
     }
 
+    // ═════════════════════════════════════════════════════════════════════
+    // SERVE-STALENESS SENTINEL — REPORT-ONLY (2026-08-07 dead-height incident)
+    // ═════════════════════════════════════════════════════════════════════
+    //
+    // On 2026-08-07 this node handed h=2518006 to 26 rigs for ONE HOUR while
+    // dashd advanced to h=2518028, and nothing said so. The catalogue of why
+    // every existing signal was structurally unable to fire lives at the top of
+    // impl/dash/coin/serve_staleness.hpp; the short version is that all of them
+    // compare the node against ITSELF, and the [EMBED-STATUS] line that would
+    // have carried the news is a steady_timer on `ioc` — the very thread that
+    // pegged, so it stopped printing.
+    //
+    // Two pieces stand up here:
+    //
+    //   1. A 1 s heartbeat timer ON `ioc`. Its only job is to prove the io
+    //      thread can still write a number. It ALSO mirrors, from the io thread
+    //      where those reads are safe, the two values the sentinel would
+    //      otherwise have to race for: an independently observed height and the
+    //      attached-session count. The sentinel then dereferences NOTHING but
+    //      atomics.
+    //
+    //   2. A DEDICATED sentinel thread. Not an ioc timer, and this is the whole
+    //      point — diag::StallWatchdog's own contract (coin/lane_diag.hpp:
+    //      209-219) says a stall detector must not live on the path it watches,
+    //      and half of what this detects is that path dying.
+    //
+    // REPORT-ONLY: the outputs are a LOG_ERROR line and a JSON field on the
+    // existing /api/node_topology surface. There is no code path from an alarm
+    // to a serve decision, an arm flip, or a template byte. A false positive
+    // costs a page; a blocking detector's false positive would cost 26 rigs an
+    // outage, which is strictly worse than the failure it guards.
+    //
+    // HEIGHT SOURCE — a deliberate deviation from the approved plan, stated
+    // plainly. The plan called for `dashd getblockcount` on the sentinel's own
+    // dedicated NodeRPC connection. That is NOT wired here, because:
+    //   * reusing the SHARED NodeRPC is a data race, not merely contention:
+    //     NodeRPC::CallAPIMethod takes no lock at all, and blockcount_cached()
+    //     mutates the plain non-atomic members m_blockcount_cache /
+    //     m_blockcount_cache_at (impl/dash/coin/rpc.hpp:110-111). Adding a race
+    //     on the money path in order to detect a freeze is the wrong trade.
+    //   * a SECOND dashd connection was already an open question in the plan
+    //     (hotel auth / connection limits) and is not something to answer by
+    //     assumption on a production node.
+    // So the independent reference is the PEER-ADVERTISED height —
+    // HeaderChain::peer_tip_height(), a relaxed atomic that already existed and
+    // is already fed from the coin-p2p peer-height callback. It is genuinely
+    // from outside this process, which is the property that matters.
+    //
+    // AND IT IS THE ONLY ELIGIBLE SOURCE. There is deliberately NO fallback to
+    // our own header tip. set_peer_tip_height is wired only inside the coin_p2p
+    // block below, and header_chain is only constructed when coin_p2p exists —
+    // so on a node without coin-p2p there is no outside height at all, and an
+    // `hdr` fallback would have quietly turned D2 into the node comparing
+    // itself against itself. That is the exact class of check this lane's
+    // catalogue condemns in (b), (c) and (d): it would have read "served ==
+    // observed, healthy" for every minute of the incident. D2 REFUSES to run
+    // instead, and /api/node_topology publishes
+    // serve_staleness.d2 = "unavailable-no-independent-reference" so the refusal
+    // is visible rather than indistinguishable from a clean bill of health.
+    //
+    // The honest consequence, recorded rather than hidden: BOTH mirrors are
+    // written on `ioc`, so in a full io freeze they stop advancing and D2 goes
+    // blind — D1 is the sub-check that fires in THIS incident, D2 is the
+    // generalisation, and the status surface names which one raised.
+    std::shared_ptr<std::atomic<int64_t>>  ss_beat;
+    std::shared_ptr<std::atomic<uint32_t>> ss_obs_h;
+    std::shared_ptr<std::atomic<int>>      ss_obs_src;
+    std::shared_ptr<std::atomic<uint32_t>> ss_sessions;
+    std::shared_ptr<std::atomic<bool>>     ss_stop;
+    std::thread                            ss_thread;
+    if (serve_staleness_sentinel && work_source) {
+        namespace ddiag = dash::coin::diag;
+        ss_beat     = std::make_shared<std::atomic<int64_t>>(ddiag::steady_now_ms());
+        ss_obs_h    = std::make_shared<std::atomic<uint32_t>>(0);
+        ss_obs_src  = std::make_shared<std::atomic<int>>(0);
+        ss_sessions = std::make_shared<std::atomic<uint32_t>>(0);
+        ss_stop     = std::make_shared<std::atomic<bool>>(false);
+
+        auto hb_timer = std::make_shared<io::steady_timer>(ioc);
+        auto hb_tick  =
+            std::make_shared<std::function<void(const boost::system::error_code&)>>();
+        *hb_tick = [hb_timer, hb_tick, ss_beat, ss_obs_h, ss_obs_src, ss_sessions,
+                    hc = header_chain.get(), ssrv = stratum_server.get()](
+                       const boost::system::error_code& ec) {
+            if (ec) return;   // cancelled at shutdown
+            // The liveness proof itself. Deliberately the FIRST thing the
+            // handler does: if the queue is drained late, the beat is late, and
+            // that lateness is exactly the measurement.
+            ss_beat->store(ddiag::steady_now_ms(), std::memory_order_relaxed);
+
+            // Mirrors, taken here because THIS is the thread on which reading
+            // them is safe.
+            //
+            // THE ONLY ELIGIBLE SOURCE IS peer_tip_height() — a height that
+            // came from OUTSIDE this process. Our own header tip is NOT a
+            // fallback and must never be one: hc->peer_tip_height() is fed only
+            // from the coin-p2p peer-height callback (set_peer_tip_height,
+            // below in the coin_p2p block) and header_chain itself is only
+            // constructed when coin_p2p exists, so on a node without coin-p2p
+            // there is no outside height at all. Falling back to hc->height()
+            // there would have made D2 compare the node against ITSELF — the
+            // exact defect this lane's own header condemns, and it would have
+            // reported "served == observed, healthy" for the whole incident
+            // hour. 0/none means D2 does not run, and the surface says so.
+            uint32_t obs = 0;
+            int      src = 0;
+            if (hc) {
+                const uint32_t peer = hc->peer_tip_height();
+                if (peer > 0) { obs = peer; src = 2; }          // "peer"
+            }
+            ss_obs_h->store(obs, std::memory_order_relaxed);
+            ss_obs_src->store(src, std::memory_order_relaxed);
+            if (ssrv)
+                ss_sessions->store(
+                    static_cast<uint32_t>(ssrv->get_session_count()),
+                    std::memory_order_relaxed);
+
+            hb_timer->expires_after(std::chrono::seconds(1));
+            hb_timer->async_wait(*hb_tick);
+        };
+        hb_timer->expires_after(std::chrono::seconds(1));
+        hb_timer->async_wait(*hb_tick);
+
+        ss_thread = std::thread(
+            [ss_beat, ss_obs_h, ss_obs_src, ss_sessions, ss_stop,
+             ws = work_source]() {
+                dash::coin::ServeStalenessSentinel sen{
+                    dash::coin::ServeStalenessConfig{}};
+                const auto src_name = [](int i) {
+                    switch (i) {
+                        case 1:  return "rpc";
+                        case 2:  return "peer";
+                        case 3:  return "hdr";
+                        default: return "none";
+                    }
+                };
+                // INDEPENDENT means "not from inside this process". Only the
+                // peer-advertised height qualifies today; "hdr" is our own tip
+                // and is listed here solely so that if a future source is
+                // wired it has to declare which side of this line it is on.
+                const auto src_independent = [](int i) {
+                    return i == 1 || i == 2;   // rpc (separate daemon) | peer
+                };
+                while (!ss_stop->load(std::memory_order_relaxed)) {
+                    // ~15 s poll, slept in 100 ms slices so shutdown is prompt
+                    // rather than up to a poll-period late.
+                    for (int i = 0;
+                         i < 150 && !ss_stop->load(std::memory_order_relaxed);
+                         ++i)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    if (ss_stop->load(std::memory_order_relaxed)) break;
+
+                    dash::coin::ServeStalenessSample s;
+                    s.now_ms          = dash::coin::diag::steady_now_ms();
+                    s.io_heartbeat_ms = ss_beat->load(std::memory_order_relaxed);
+                    s.served_height   = ws->last_served_height();
+                    s.served_at_ms    = ws->last_served_at_ms();
+                    const int obs_src_i =
+                        ss_obs_src->load(std::memory_order_relaxed);
+                    s.observed_height = ss_obs_h->load(std::memory_order_relaxed);
+                    s.observed_src    = src_name(obs_src_i);
+                    s.observed_independent = src_independent(obs_src_i);
+                    s.sessions        = ss_sessions->load(std::memory_order_relaxed);
+
+                    const auto v = sen.poll(s);
+
+                    // Publish EVERY poll, not only the alarming ones: the
+                    // status surface must be able to say "checked N seconds
+                    // ago and it was fine", because "quiet" and "dead" looking
+                    // identical is the defect this whole lane exists to close.
+                    //
+                    // And publish the STANDING verdict, not just D2's. In the
+                    // incident as it truly presented, the io thread was pegged,
+                    // so BOTH ioc-written mirrors froze and D2 went blind while
+                    // D1 raised correctly every minute. A surface carrying D2
+                    // alone reported `stale: false` for the entire hour that the
+                    // log was printing [STALE-SERVE] check=io-silence.
+                    dash::stratum::DASHWorkSource::ServeStalenessReport rep;
+                    rep.observed_height = s.observed_height;
+                    rep.observed_at_ms  = s.io_heartbeat_ms;
+                    rep.observed_src    = s.observed_src;
+                    rep.d2_armed        = v.d2_armed;
+                    rep.stale           = v.stale;
+                    rep.stale_check =
+                        dash::coin::stale_serve_check_name(v.stale_check);
+                    rep.stale_age_ms    = v.stale_age_ms;
+                    rep.io_silent_ms    = v.io_silent_ms;
+                    rep.skew_age_ms     = v.skew_age_ms;
+                    rep.serve_quiet_ms  = v.serve_quiet_ms;
+                    ws->note_serve_observation(rep);
+                    if (v.fired) LOG_ERROR << v.line;
+                }
+            });
+        std::cout << "[run] serve-staleness sentinel ARMED (report-only, "
+                     "dedicated poller, --serve-staleness-sentinel=off to "
+                     "disable)\n";
+    } else if (!serve_staleness_sentinel) {
+        std::cout << "[run] serve-staleness sentinel DISABLED by flag — a dead "
+                     "height served to miners will NOT be alarmed\n";
+    }
+
     std::cout << "[run] run-loop up (Ctrl-C to stop); won blocks relay DUAL-PATH:\n"
                  "[run]   ARM A embedded coin-P2P relay (primary, daemonless) = "
               << (p2p_relay ? "ARMED" : (no_p2p_relay ? "SUPPRESSED (--no-p2p-relay)"
@@ -6556,6 +6793,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // clean shutdown resumes exactly where it stopped (a crash costs at most
     // cursor_persist_every blocks of re-fetch). Timer callbacks no longer
     // fire — ioc.run() has returned.
+    // Serve-staleness sentinel: stop and JOIN its thread FIRST, before anything
+    // it can touch unwinds. It holds a shared_ptr to work_source (so the
+    // pointer cannot dangle) and otherwise reads only shared_ptr'd atomics, but
+    // joining here also guarantees no [STALE-SERVE] line is emitted after the
+    // log surface starts tearing down. The 100 ms sleep slices bound this wait
+    // at ~100 ms, not at a full 15 s poll period. Its ioc heartbeat timer is
+    // already dead: ioc.run() has returned.
+    if (ss_stop) ss_stop->store(true, std::memory_order_relaxed);
+    if (ss_thread.joinable()) ss_thread.join();
+
     if (replay_timer) replay_timer->stop();
     if (replay_lane) replay_lane->flush();
 
@@ -6820,6 +7067,10 @@ int main(int argc, char** argv)
     std::string bestcl_policy = "freshness";   // --bestcl-policy: freshness (default, conservative proxy) | consensus-exact (dashcore's actual CheckCbTxBestChainlock rule)
     bool embedded_oracle_shadow = false;       // --embedded-oracle-shadow: per-block dashd cross-check (OBSERVE-only)
     bool embedded_shadow_compare = false;      // --embedded-shadow-compare: serve-vs-dashd template diff (OBSERVE-only, NOT a gate)
+    // Serve-staleness sentinel (2026-08-07 dead-height incident): DEFAULT ON.
+    // Report-only -- log line + JSON field, no serve effect -- so the kill flag
+    // is ops hygiene, not a safety gate.
+    bool serve_staleness_sentinel = true;
     uint64_t oracle_grad_blocks = 5000;        // --oracle-graduation-blocks N (consecutive clean)
     uint64_t oracle_class_coverage = 20;       // --oracle-class-coverage K (per height class)
     double dev_donation = 0.1;                 // --give-author (donation_percentage; README default 0.1%)
@@ -6926,6 +7177,17 @@ int main(int argc, char** argv)
             embedded_oracle_shadow = true;
         else if (std::strcmp(argv[i], "--embedded-shadow-compare") == 0)
             embedded_shadow_compare = true;
+        // Serve-staleness sentinel kill switch. Accepts the bare flag (= on,
+        // already the default) and an explicit `=off` / `=on`, because an ops
+        // kill switch that needs the operator to remember which polarity the
+        // bare flag means is a kill switch that gets typed wrong at 04:00.
+        else if (std::strncmp(argv[i], "--serve-staleness-sentinel", 26) == 0) {
+            const char* eq = std::strchr(argv[i], '=');
+            serve_staleness_sentinel =
+                !(eq && (std::strcmp(eq + 1, "off") == 0 ||
+                         std::strcmp(eq + 1, "0")   == 0 ||
+                         std::strcmp(eq + 1, "false") == 0));
+        }
         // W2 full-history replay bulk-fetch lane (replay_bulk_fetch.hpp).
         else if (std::strcmp(argv[i], "--replay-bulk") == 0)
             g_replay_bulk = true;
@@ -7178,7 +7440,8 @@ int main(int argc, char** argv)
                         embedded_serve_mempool_txs,
                         embedded_shadow_compare,
                         embedded_mempool_ingest,
-                        pin_local_tx_hex_path);
+                        pin_local_tx_hex_path,
+                        serve_staleness_sentinel);
     }
     return run_selftest();
 }

@@ -493,6 +493,18 @@ public:
 
     void set_peer_tip_height(uint32_t height) { m_peer_tip_height.store(height); }
 
+    /// The PEER-ADVERTISED best height, lock-free. Distinct from height(),
+    /// which is OUR OWN tip behind m_mutex: this is the only height in the
+    /// class that comes from outside this process, which is what makes it
+    /// usable as an independent reference by the serve-staleness sentinel
+    /// (coin/serve_staleness.hpp). Read-only accessor over an atomic that
+    /// already existed and is already written on the io thread
+    /// (main_dash.cpp: the coin-p2p peer-height callback) — it adds no new
+    /// synchronisation and takes no lock the serve path holds. 0 = never
+    /// advertised, which is "unknown", NOT "we are current".
+    uint32_t peer_tip_height() const
+    { return m_peer_tip_height.load(std::memory_order_relaxed); }
+
     /// Backfill progress line throttle: at most one line per `headers` of
     /// forward progress OR per `ms` of wall clock, whichever comes first.
     /// Telemetry only; exposed so a KAT can prove the line fires without

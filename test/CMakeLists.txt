@@ -973,8 +973,19 @@ if (BUILD_TESTING AND GTest_FOUND)
     # Includes coin/zmq_tip_notify.cpp directly (NOT the C2POOL_ZMQ-guarded
     # subscriber — only the pure TipHashDedup / frame-decode helpers) so the
     # ZMQ hashblock instant-tip-notify KAT links without libzmq.
+    # SERVE-STALENESS SENTINEL rides this EXISTING allowlisted target rather
+    # than adding two of its own: a fresh add_executable absent from the
+    # build.yml --target allowlist is the #143 NOT_BUILT sentinel that "passes"
+    # by never being built (same reasoning as test_dash_node_coin_state above).
+    #   * ..._seam.cpp   -- the RED witness: compiles on master, fails there,
+    #                       because nothing publishes a serve_staleness block.
+    #   * ..._unit.cpp   -- the detector itself, driven off injected clock and
+    #                       height providers, including the deleted-guard
+    #                       mutation case.
     add_executable(test_dash_stratum_work_source
         test_dash_stratum_work_source.cpp
+        test_dash_serve_staleness_seam.cpp
+        test_dash_serve_staleness_unit.cpp
         ${CMAKE_SOURCE_DIR}/src/impl/dash/coin/zmq_tip_notify.cpp)
     target_link_libraries(test_dash_stratum_work_source PRIVATE
         GTest::gtest_main GTest::gtest
@@ -983,6 +994,9 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_stratum_work_source PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    target_compile_definitions(test_dash_stratum_work_source PRIVATE
+        DASH_WORK_SOURCE_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/impl/dash/stratum/work_source.cpp"
+        DASH_MAIN_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/c2pool/main_dash.cpp")
     gtest_add_tests(test_dash_stratum_work_source "" AUTO)
 
     # CoinStateMaintainer: drives NodeCoinState off async tip/MN/mempool update
