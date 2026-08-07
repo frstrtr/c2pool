@@ -541,7 +541,14 @@ public:
     /// the distinction is UNEVALUATED and prints n/a — it is never guessed.
     using MembersReadyFn = std::function<bool(uint8_t, const uint256&)>;
 
-    void set_bls_verify_fn(BlsVerifyFn fn) { m_bls_verify = std::move(fn); }
+    /// Installing (or swapping) the verifier RETIRES every memoised verdict:
+    /// a "verified" latch is only ever a proof UNDER THE VERIFIER THAT
+    /// PRODUCED IT, so a verdict must never outlive its prover.
+    void set_bls_verify_fn(BlsVerifyFn fn)
+    {
+        m_bls_verify = std::move(fn);
+        for (auto& e : m_cache) e.second.verified = false;
+    }
     bool has_bls_verifier() const { return static_cast<bool>(m_bls_verify); }
     void set_members_ready_fn(MembersReadyFn fn) { m_members_ready = std::move(fn); }
     bool has_members_ready_fn() const { return static_cast<bool>(m_members_ready); }
@@ -567,7 +574,7 @@ public:
     {
         auto it = m_cache.find(Key{llmq_type, quorum_hash});
         if (it == m_cache.end()) return -1;
-        return static_cast<int32_t>(it->second.CountSigners());
+        return static_cast<int32_t>(it->second.c.CountSigners());
     }
 
     /// Classify why `verified_for` withheld this slot. Callers MUST have just
@@ -659,22 +666,68 @@ public:
         const Key k{c.llmqType, c.quorumHash};
         auto it = m_cache.find(k);
         if (it != m_cache.end()
-            && it->second.CountSigners() >= c.CountSigners())
+            && it->second.c.CountSigners() >= c.CountSigners())
             return Admission::NotBetterThanCached;   // hold an equal-or-better one
-        m_cache[k] = c;
+        // Replacement builds a FRESH entry, so the incoming commitment is
+        // UNLATCHED by construction — a verdict proven for the superseded
+        // bytes can never be served for these ones.
+        Entry fresh;
+        fresh.c = c;
+        fresh.verified = false;
+        m_cache[k] = std::move(fresh);
         return Admission::Accepted;
     }
 
     /// The mineable commitment for a slot — ONLY once BLS-verified. The
     /// Phase-L blocker line: without a verifier this is always nullopt.
+    ///
+    /// THE AGGREGATE VERIFY IS PAID ONCE PER COMMITMENT, NOT ONCE PER READ.
+    /// This is a SERVE-PATH hot function: the pre-emit consensus gate re-runs
+    /// INLINE on the io thread for every read of a cached EMBEDDED template
+    /// (work_source.cpp:852-853), the gate re-derives the mandatory qc plan on
+    /// every call (node_coin_state.hpp:889-893), the plan walks
+    /// daemonless_qc_commitments (:741 below) into here, and notify_all fans
+    /// send_notify_work out SERIALLY per session (stratum_server.cpp:379-384).
+    /// Re-proving a 391-signer LLMQ_400_60 aggregate signature on each of
+    /// those was the 2026-08-07 tip freeze: one send_notify_work measured
+    /// 0.3 ms -> 733 ms, the io thread saturated in userspace, and the tip
+    /// stopped advancing — which is self-sustaining, because the expensive
+    /// slot only retires when the tip advances (:415/:425 below).
+    ///
+    /// The memo is a POSITIVE-ONLY latch carried ON the cache entry, so its
+    /// staleness argument is by construction, not by discipline:
+    ///   * the verifier's inputs are the commitment BYTES and the member set
+    ///     for (llmqType, quorumHash) (bls_verify.hpp);
+    ///   * the bytes cannot change under a live latch: entry replacement is
+    ///     the ONLY mutation (keep-best, ingest_ex above) and it builds a
+    ///     FRESH, unlatched entry;
+    ///   * quorumHash IS the quorum base block hash (:421-426 below), so a
+    ///     reorg gives a DIFFERENT key — never a same-key different member
+    ///     set;
+    ///   * FALSE is never latched, so every recovery path (member set
+    ///     arrives, better commitment lands, verifier installed) is unchanged,
+    ///     as is diagnose()'s classification;
+    ///   * set_bls_verify_fn retires every latch, so a verdict is never served
+    ///     under a verifier that did not produce it.
+    /// A latched TRUE is therefore a retained mathematical proof about
+    /// immutable bytes against a chain-determined member set: it cannot become
+    /// false, and nothing the pre-emit gate CHECKS is checked less often —
+    /// only this leaf predicate's pairing math is reused.
+    ///
+    /// THREADING: the latch is `mutable` under the cache's existing no-lock
+    /// discipline because the only production caller is the single
+    /// coin-state-owning thread (work_source.cpp:823-827).
     std::optional<vendor::CFinalCommitment>
     verified_for(uint8_t llmq_type, const uint256& quorum_hash) const
     {
         if (!m_bls_verify) return std::nullopt;
         auto it = m_cache.find(Key{llmq_type, quorum_hash});
         if (it == m_cache.end()) return std::nullopt;
-        if (!m_bls_verify(it->second)) return std::nullopt;
-        return it->second;
+        if (!it->second.verified) {
+            if (!m_bls_verify(it->second.c)) return std::nullopt;
+            it->second.verified = true;   // latched ONLY on success
+        }
+        return it->second.c;
     }
 
     size_t size() const { return m_cache.size(); }
@@ -690,7 +743,16 @@ private:
             return std::memcmp(quorumHash.data(), r.quorumHash.data(), 32) < 0;
         }
     };
-    std::map<Key, vendor::CFinalCommitment> m_cache;
+    /// The admitted commitment plus its memoised BLS verdict. `verified` is
+    /// the POSITIVE-ONLY latch verified_for() sets (see there for why it can
+    /// never go stale); it is `mutable` so the const serve-path read can
+    /// record the proof it just paid for, and it dies with the entry — a
+    /// replacement commitment is unlatched by construction.
+    struct Entry {
+        vendor::CFinalCommitment c;
+        mutable bool verified{false};
+    };
+    std::map<Key, Entry> m_cache;
     BlsVerifyFn m_bls_verify;   // unset until Phase L lands a BLS12-381 lib
     MembersReadyFn m_members_ready;   // observability only; unset => n/a
 };
