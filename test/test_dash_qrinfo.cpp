@@ -362,6 +362,178 @@ struct Harness {
 
 } // namespace
 
+// ── #108 QC-PREFETCH: ask early, but never before the slot headers exist ────
+//
+// The prefetch asks for a DKG cycle's member sets at the cycle boundary rather
+// than at the first qfcommit that needs them — 48 qc-plan-underivable declines
+// on the daemonless soak were exactly that round trip, paid late.
+//
+// The ROTATED lane must NOT be asked at the boundary. A rotated reply keys one
+// member set per slot on the header at cycleBase + quorumIndex; at the boundary
+// only cycleBase exists, so 31 of 32 slots would be skipped for want of a
+// header — and the one slot that publishes is index 0, whose key IS the cycle
+// key, after which request_rotated short-circuits "already ready" forever.
+// These KATs pin BOTH halves of that contract.
+namespace {
+
+struct PrefetchHarness {
+    std::map<uint32_t, uint256> by_height;
+    std::map<uint256, uint32_t> by_hash;
+    std::vector<std::pair<uint256, uint256>> sends;      // non-rotated getmnlistd
+    int qrinfo_sends{0};                                  // rotated getqrinfo
+
+    std::unique_ptr<QuorumMemberSource> src;
+
+    explicit PrefetchHarness(LlmqNetwork net = LlmqNetwork::Mainnet)
+    {
+        src = std::make_unique<QuorumMemberSource>(
+            net,
+            [this](uint32_t h) -> std::optional<uint256> {
+                auto it = by_height.find(h);
+                if (it == by_height.end()) return std::nullopt;
+                return it->second;
+            },
+            [this](const uint256& bh) -> std::optional<uint32_t> {
+                auto it = by_hash.find(bh);
+                if (it == by_hash.end()) return std::nullopt;
+                return it->second;
+            },
+            [](const uint256&) -> std::optional<uint256> { return std::nullopt; },
+            [this](const uint256& base, const uint256& tgt) {
+                sends.emplace_back(base, tgt);
+            });
+        src->set_send_getqrinfo(
+            [this](const std::vector<uint256>&, const uint256&, bool) {
+                ++qrinfo_sends;
+            });
+    }
+
+    void add(uint32_t h)
+    {
+        uint256 hash;
+        hash.begin()[0] = static_cast<unsigned char>(h & 0xff);
+        hash.begin()[1] = static_cast<unsigned char>((h >> 8) & 0xff);
+        hash.begin()[2] = static_cast<unsigned char>((h >> 16) & 0xff);
+        by_height[h] = hash;
+        by_hash[hash] = h;
+    }
+    void add_range(uint32_t from, uint32_t to) { for (uint32_t h = from; h <= to; ++h) add(h); }
+};
+
+} // namespace
+
+// A tip that CROSSES a cycle boundary asks for the non-rotated cycle
+// immediately — before any qfcommit for that cycle can have arrived.
+TEST(DashQcPrefetch, BoundaryTipAsksForTheNonRotatedCycle)
+{
+    PrefetchHarness h;
+    // LLMQ_100_67 on mainnet: dkg_interval 24. Give the chain the cycle base
+    // and its work block (base - 8).
+    const uint32_t cycle_base = 2517600;      // 2517600 % 24 == 0
+    h.add_range(cycle_base - 8, cycle_base);
+
+    EXPECT_TRUE(h.sends.empty()) << "nothing asked before the tip advances";
+    h.src->prefetch_cycle(cycle_base);
+    EXPECT_FALSE(h.sends.empty())
+        << "the boundary tip must have asked for at least one non-rotated cycle";
+}
+
+// The SAME cycle asked twice must not draw a second request — the memo and the
+// pending/ready dedupe both have to hold.
+TEST(DashQcPrefetch, RepeatedTipsInsideOneCycleDoNotReAsk)
+{
+    PrefetchHarness h;
+    const uint32_t cycle_base = 2517600;
+    h.add_range(cycle_base - 8, cycle_base + 5);
+
+    h.src->prefetch_cycle(cycle_base);
+    const size_t after_first = h.sends.size();
+    ASSERT_GT(after_first, 0u);
+
+    h.src->prefetch_cycle(cycle_base + 1);
+    h.src->prefetch_cycle(cycle_base + 2);
+    EXPECT_EQ(h.sends.size(), after_first)
+        << "tips inside the same cycle must not re-walk the request path";
+}
+
+// THE REGRESSION GUARD. At the cycle boundary the rotated slot headers
+// (cycleBase+1 .. cycleBase+31) do not exist yet. Asking then would publish
+// 1/32 slots and latch the cycle ready forever, so the prefetch must stay
+// silent on the rotated lane until the last slot header is in the chain.
+TEST(DashQcPrefetch, RotatedCycleIsNotAskedBeforeItsSlotHeadersExist)
+{
+    PrefetchHarness h;
+    // LLMQ_60_75 on mainnet: dkg_interval 288, 32 signing-active slots.
+    // 2517408 = 288 * 8741, so it IS a cycle base. (An unaligned height would
+    // make prefetch_cycle derive a DIFFERENT base whose header we never added,
+    // and the test would pass for the wrong reason — it did, once.)
+    const uint32_t cycle_base = 2517408;
+    static_assert(2517408u % 288u == 0u, "cycle_base must be dkgInterval-aligned");
+    h.add_range(cycle_base - 8, cycle_base);  // ONLY the base exists
+
+    h.src->prefetch_cycle(cycle_base);
+    EXPECT_EQ(h.qrinfo_sends, 0)
+        << "a rotated cycle must not be requested while 31 of its 32 slot "
+           "headers are missing — that publishes 1/32 and latches the cycle";
+
+    // Once the whole slot range is in the chain the same cycle IS asked: the
+    // skip must be a deferral, not a permanent memo burn.
+    h.add_range(cycle_base + 1, cycle_base + 31);
+    h.src->prefetch_cycle(cycle_base + 31);
+    EXPECT_GT(h.qrinfo_sends, 0)
+        << "after the slot headers arrive the rotated cycle must be prefetched";
+}
+
+
+// CATCH-UP GATE (Fable review, 2026-08-07): the tip callback fires once per
+// headers MESSAGE and add_headers coalesces up to 2000 headers, so a cold
+// start delivers tips ~2000 apart. Every such call would be a memo miss for
+// every type and would ask for cycles whose mining windows are long past —
+// measured shape ~215 requests / ~100 MB of full MN snapshots down the single
+// ordered stream the cold-start path depends on. Prefetch is for the LIVE tip.
+TEST(DashQcPrefetch, CatchUpTipJumpsAskNothing)
+{
+    PrefetchHarness h;
+    const uint32_t base = 2517600;                 // 2517600 % 24 == 0
+    h.add_range(base - 8, base + 4100);            // headers present either way
+
+    h.src->prefetch_cycle(base);                   // first call primes the tip
+    const size_t after_first = h.sends.size();
+    ASSERT_GT(after_first, 0u) << "a live tip must still prefetch";
+
+    // Two coalesced headers batches: +2000 each. Both must be refused.
+    h.src->prefetch_cycle(base + 2000);
+    h.src->prefetch_cycle(base + 4000);
+    EXPECT_EQ(h.sends.size(), after_first)
+        << "a tip jump larger than the biggest dkgInterval means we are still "
+           "catching up — prefetch must stay silent";
+
+    // Back to live cadence (+1): asking resumes.
+    h.src->prefetch_cycle(base + 4001);
+    EXPECT_GT(h.sends.size(), after_first)
+        << "the gate must be a deferral for catch-up, not a permanent stop";
+}
+
+// A header gap must NOT burn the cycle's single prefetch: the lookup happens
+// BEFORE the memo insert, so the next tip retries.
+TEST(DashQcPrefetch, HeaderGapDoesNotBurnTheMemo)
+{
+    PrefetchHarness h;
+    const uint32_t base = 2517600;
+    // Deliberately withhold the cycle base header; give only the work block.
+    h.add_range(base - 8, base - 1);
+
+    h.src->prefetch_cycle(base);
+    EXPECT_TRUE(h.sends.empty()) << "no header, nothing to ask with";
+
+    // Header arrives; the SAME cycle must now be asked for.
+    h.add(base);
+    h.src->prefetch_cycle(base);
+    EXPECT_FALSE(h.sends.empty())
+        << "a header gap is a 'not yet', not a spent prefetch";
+}
+
+
 TEST(DashQrInfo, RequestRotatedEmitsAnEmptyBaseFullSnapshotRequest)
 {
     Harness h;

@@ -3823,6 +3823,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // which also covers --regtest chains riding the testnet flag), exactly
         // the old refusal. The emit gate re-derives this same plan and
         // hard-rejects any template whose type-6 set drifts from it.
+        // #108: the member source is created inside the embedded-arm block
+        // below, but the tip-advance callback that must PREFETCH from it is
+        // installed further down at outer scope. Hold a handle out here so the
+        // callback can reach it; stays null when the embedded arm is off, and
+        // the callback checks.
+        std::shared_ptr<dash::coin::QuorumMemberSource> qc_ms_prefetch_handle;
         if (run_arm.embedded_arm_enabled) {
             const auto qc_net = testnet ? dash::coin::LlmqNetwork::Testnet
                                         : dash::coin::LlmqNetwork::Mainnet;
@@ -4020,6 +4026,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // closed to the dashd fallback (NOT null-served — dkg_commitments.hpp
             // HEIGHT COMPLETENESS). That is the pre-item-4 posture.
             if (coin_p2p) {
+                // #108: publish the handle for the tip-advance prefetch.
+                qc_ms_prefetch_handle = qc_member_source;
                 qc_member_source->set_send_getqrinfo(
                     [cp = coin_p2p.get()](const std::vector<uint256>& bases,
                                           const uint256& req, bool extra) {
@@ -4620,7 +4628,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             [&coin_state, &stratum_server, hc = header_chain.get(),
              addr_ver, p2sh_ver, ws = work_source.get(),
              cp = coin_p2p.get(), sml_base, m = maintainer.get(),
-             mnl = mn_ckpt_lane.get()]
+             mnl = mn_ckpt_lane.get(), qcms = qc_ms_prefetch_handle]
             (const uint256&, uint32_t, const uint256& new_tip, uint32_t new_height,
              bool was_reorg) {
                 // E2d bridge driver. Safe + REACHABLE here: HeaderChain fires
@@ -4632,6 +4640,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // relies on exactly that property and is proven live.
                 // No-op unless the lane was armed on the daemonless path.
                 if (mnl) mnl->pump();
+                // #108 QC-PREFETCH: ask for the member sets this DKG cycle
+                // will need while the tip is still ~10 blocks short of the
+                // mining window, instead of at the first qfcommit that needs
+                // them. Same request paths, same authentication, same dedupe —
+                // only the timing changes. Measured cost of asking late: 48
+                // qc-plan-underivable declines on the daemonless soak.
+                if (qcms) qcms->prefetch_cycle(new_height);
                 auto ta = dash::coin::tip_advance_from_chain(
                     *hc, addr_ver, p2sh_ver);
                 if (ta) {

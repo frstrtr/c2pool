@@ -128,6 +128,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <set>
 #include <optional>
 #include <string>
 #include <vector>
@@ -239,6 +240,119 @@ public:
 
     /// Kick sourcing for a quorum (idempotent). Called when a qfcommit for the
     /// quorum is admitted, so the member set is ready by the DKG-window height.
+    /// #108 — PREFETCH the member sets a DKG cycle will need, BEFORE the
+    /// commitments that need them arrive.
+    ///
+    /// MEASURED (fully-daemonless soak, 2026-08-06/07): 48 of the embedded
+    /// arm's decline events were cause=qc-plan-underivable, and they are not
+    /// scattered — every one sits at a height h where (h % dkgInterval) equals
+    /// the type's mining_window_start, and each clears in 1-7 minutes. That is
+    /// one getmnlistd/getqrinfo round trip, paid at the exact moment the plan
+    /// first needs the answer.
+    ///
+    /// The inputs, however, are available much earlier: a non-rotated quorum's
+    /// member set derives from the WORK block (quorumBase - 8), and the cycle
+    /// base is known the moment the tip crosses it — typically ten blocks and
+    /// ~25 minutes before the mining window opens. So the round trip is not
+    /// unavoidable latency; it is latency we chose by asking late.
+    ///
+    /// This asks early. It calls the SAME request paths with the SAME key, so
+    /// every invariant they carry is untouched: DIP-4 authentication of the
+    /// snapshot, dedupe-by-block-hash, one outstanding request per base, FIFO
+    /// reaping, and the demux that keeps historical replies away from the tip
+    /// SML. The qfcommit kick stays exactly as it was — this only changes WHEN
+    /// the first attempt happens, never whether the answer is trusted.
+    ///
+    /// Silent no-ops are deliberate: a header we do not hold yet, a pre-V20
+    /// height, a type whose params we do not know. Prefetch is an optimisation
+    /// and must never fail a template; the qfcommit kick remains the fallback
+    /// for every case this skips.
+    void prefetch_cycle(uint32_t tip_height)
+    {
+        if (tip_height == 0) return;
+        // CATCH-UP GATE. The tip callback fires once per headers MESSAGE, and
+        // add_headers coalesces up to 2000 headers into one — so during a cold
+        // start or a long resync each call arrives ~2000 blocks above the last.
+        // Every such call is a memo miss for every type (2000 > any mainnet
+        // dkgInterval), and each miss asks for a cycle whose mining window is
+        // long past: measured shape is ~215 requests / ~100 MB of full MN
+        // snapshots from a checkpointed cold start, all of it riding the ONE
+        // ordered stream to the primary coin-P2P peer that the cold-start path
+        // (#1162/#1151) just spent effort making fast. Prefetch is an
+        // optimisation for the LIVE tip; while we are catching up the qfcommit
+        // kick remains the correct and sufficient mechanism.
+        const uint32_t prev = m_last_prefetch_tip;
+        m_last_prefetch_tip = tip_height;
+        if (prev != 0 && tip_height > prev + kMaxDkgInterval)
+            return;   // jumped a whole cycle or more => still catching up
+        for (const auto& p : enabled_llmqs(m_net)) {
+            if (p.dkg_interval == 0) continue;
+            // The cycle whose mining window this tip is approaching: the most
+            // recent boundary at or below the tip.
+            const uint32_t cycle_base = tip_height - (tip_height % p.dkg_interval);
+            if (cycle_base == 0) continue;
+            // ROTATED TYPES (DIP-24): DO NOT ask at the cycle boundary.
+            //
+            // A rotated reply publishes one member set per slot, keyed by the
+            // header at cycleBase + quorumIndex (finalize_rotated). At the tip
+            // that CROSSES the boundary only cycleBase itself exists, so 31 of
+            // 32 slots are skipped for want of a header — and the one slot that
+            // does publish is index 0, whose key IS the cycle key. From then on
+            // request_rotated short-circuits on "cycle already ready" and the
+            // qfcommit kick can never re-ask: the cycle is permanently stuck at
+            // 1/32 sourced. That would REGRESS the rotated lane proven live by
+            // #1077, which works precisely because the qfcommit kick fires
+            // inside the mining window, when every slot header exists.
+            //
+            // So wait until the last slot's base header is in the chain. With
+            // signing_active_quorum_count=32 and mining_window_start=42 the
+            // prefetch still lands ~10 blocks (~25 min) before the window
+            // opens, which is the entire point of this change.
+            //
+            // The memo is inserted AFTER this check on purpose: memoising a
+            // cycle we deliberately skipped would burn the only chance to
+            // prefetch it at all.
+            if (p.use_rotation) {
+                const uint32_t last_slot_h =
+                    cycle_base + (p.signing_active_quorum_count > 0
+                                      ? p.signing_active_quorum_count - 1
+                                      : 0);
+                if (tip_height < last_slot_h) continue;   // retry on a later tip
+            }
+            // Only act once per (type, cycle) — repeated tips inside the same
+            // cycle must not re-walk the request path.
+            // Resolve the header BEFORE memoising. A header gap is a
+            // "not yet", not a "done": memoising it would spend the cycle's
+            // only prefetch on a lookup that failed.
+            auto base_hash = m_hash_at_height(cycle_base);
+            if (!base_hash || base_hash->IsNull()) continue;  // retry next tip
+            const uint64_t seen_key =
+                (static_cast<uint64_t>(p.type) << 32) | cycle_base;
+            if (!m_prefetched_cycles.insert(seen_key).second) continue;
+            // Lead time is measured from the tip we are ON, not from the
+            // window offset: a rotated type waits for its slot headers, so it
+            // asks LATER than a non-rotated one and the honest number is the
+            // difference. (An earlier version printed mining_window_start,
+            // which overstated the rotated lane by 4x.)
+            const uint32_t window_open_h = cycle_base + p.mining_window_start;
+            const long lead = static_cast<long>(window_open_h)
+                            - static_cast<long>(tip_height);
+            LOG_INFO << "[QC-PREFETCH] cycle_base=" << cycle_base
+                     << " type=" << static_cast<int>(p.type)
+                     << " hash=" << base_hash->GetHex().substr(0, 8)
+                     << " tip=" << tip_height
+                     << " rotated=" << (p.use_rotation ? 1 : 0)
+                     << " lead=" << lead
+                     << " blocks before the mining window opens at h="
+                     << window_open_h;
+            request(p.type, *base_hash);
+        }
+        // Bound the memo: a cycle far behind the tip can never be asked for
+        // again, and an unbounded set would grow for the life of the node.
+        if (m_prefetched_cycles.size() > kPrefetchMemoMax)
+            m_prefetched_cycles.clear();
+    }
+
     void request(uint8_t llmq_type, const uint256& quorum_hash)
     {
         // request() is kicked on every admitted qfcommit, which makes it the
@@ -793,6 +907,16 @@ private:
         uint32_t cycle_base_height{0};
         int64_t  sent_at{0};
     };
+
+    // #108 prefetch memo: (type<<32 | cycle_base) already walked. Cleared
+    // wholesale when it grows past the bound — re-walking a live cycle costs
+    // one deduped request(), which the pending/ready maps then absorb.
+    static constexpr size_t kPrefetchMemoMax = 4096;
+    // Largest mainnet dkgInterval (LLMQ_400_85 = 576). A tip advance larger
+    // than this cannot be live-chain progress; it is a headers batch.
+    static constexpr uint32_t kMaxDkgInterval = 576;
+    std::set<uint64_t> m_prefetched_cycles;
+    uint32_t           m_last_prefetch_tip{0};
 
     const LlmqParamsView* params_for(uint8_t type) const
     {
