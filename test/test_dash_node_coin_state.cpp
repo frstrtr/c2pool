@@ -1724,3 +1724,145 @@ TEST(DashQcPoseGate, NullCommitmentPlanIsExemptWithoutCapability) {
     EXPECT_TRUE(st.embedded_template_emit_ok(sel.work, &why))
         << "cause=" << why.cause << " value=" << why.value;
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// C2 — THE ONE REAL BEHAVIOUR CHANGE OF THE verified_for MEMO, PINNED.
+//
+// MineableCommitmentCache::verified_for now memoises its BLS verdict on the
+// cache entry (dkg_commitments.hpp:750-761). Once a slot is latched it no
+// longer calls the BLS verifier — and the verifier is what SOURCES THE MEMBER
+// KEY SET (bls_verify.hpp make_commitment_bls_verifier: provider nullopt =>
+// fail closed). Production feeds that same member source to the PoSe-noop
+// prover as well (main_dash.cpp:4160-4169
+// qc_member_source->lookup(...) -> nullopt => cannot prove).
+//
+// So if the member set is EVICTED after a successful verify, the refusal MOVES
+// DOWNSTREAM by one gate:
+//
+//   before: verified_for -> nullopt -> the whole height is underivable
+//           (dkg_commitments.hpp:869-878) -> cause=emit-qc-plan-underivable
+//           (node_coin_state.hpp:892)
+//   after:  verified_for -> LATCHED commitment -> plan derives -> the PoSe
+//           gate cannot source the member set -> pose_noop=n/a
+//           -> cause=emit-qc-real-pose-unfolded (node_coin_state.hpp:930)
+//
+// SAME OUTCOME — fail closed, nothing served, template bytes unchanged. But a
+// DIFFERENT DECLINE CAUSE STRING, and this project ranks serve-gate episodes
+// by exactly that string (ServeGateJournal, work_source.cpp:749-789), so the
+// change would otherwise show up as an unexplained shift in a soak histogram.
+// These two tests make it a decision on record.
+//
+// RED WITHOUT THE MEMO: revert verified_for to re-verify unconditionally (or
+// mutate the latch read to `if (true)`) and the first test fails at
+// EXPECT_EQ(cause, "emit-qc-real-pose-unfolded") — it gets
+// "emit-qc-plan-underivable", which is precisely the control case below.
+// ════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// A cache-backed plan fn with the shape daemonless_qc_commitments has for a
+// single mandatory slot (dkg_commitments.hpp:849-878): no BLS-verified
+// commitment for a mandatory slot => the WHOLE height is underivable.
+std::function<std::optional<dash::coin::QcBlockPlan>(uint32_t)>
+cache_backed_qc_plan_fn(const dash::coin::MineableCommitmentCache& cache,
+                        uint8_t llmq_type, const uint256& quorum_hash)
+{
+    return [&cache, llmq_type, quorum_hash](uint32_t)
+               -> std::optional<dash::coin::QcBlockPlan> {
+        auto real = cache.verified_for(llmq_type, quorum_hash);
+        if (!real) return std::nullopt;   // fail closed for the whole height
+        dash::coin::QcBlockPlan plan;
+        plan.commitments = {*real};
+        plan.merkle_root_quorums = raw256(0x77);
+        return plan;
+    };
+}
+
+}  // namespace
+
+TEST(DashQcVerifyMemoDeclineCause, EvictedMemberSetDeclinesAsPoseUnfolded) {
+    // ONE flag stands for the member source, exactly as production wires it:
+    // the SAME lookup backs the BLS verifier and the PoSe-noop prover.
+    bool member_set_cached = true;
+
+    const auto qc = make_real_qc(/*punish_listed_member=*/false);
+    dash::coin::MineableCommitmentCache cache;
+    ASSERT_TRUE(cache.ingest(dash::coin::LlmqNetwork::Testnet, qc));
+    cache.set_bls_verify_fn(
+        [&member_set_cached](const dash::coin::vendor::CFinalCommitment&) {
+            return member_set_cached;   // no member keys => fail closed
+        });
+
+    NodeCoinState st;
+    seed_real_qc_serving(st, qc);        // healthy DKG-window serving posture
+    st.set_qc_plan_fn(cache_backed_qc_plan_fn(cache, qc.llmqType, qc.quorumHash));
+    st.set_qc_pose_noop_fn(
+        [&member_set_cached](const dash::coin::vendor::CFinalCommitment& c)
+            -> std::optional<bool> {
+            if (!member_set_cached) return std::nullopt;   // cannot prove
+            return dash::coin::qc_pose_pass_provably_noop(c, 50);
+        });
+
+    // 1) Member set present: the slot verifies (and LATCHES), and the height
+    //    serves exactly as before the memo.
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded);
+    ASSERT_EQ(sel.work.m_txs.size(), 1u);
+    ASSERT_EQ(sel.work.m_txs[0].type, 6);
+    DeclineReport ok_why;
+    ASSERT_TRUE(st.embedded_template_emit_ok(sel.work, &ok_why))
+        << "cause=" << ok_why.cause << " value=" << ok_why.value;
+
+    // 2) The member set is EVICTED. Both the verifier and the PoSe prover go
+    //    blind — but the latch survives, so the plan still derives and the
+    //    refusal lands one gate downstream.
+    member_set_cached = false;
+
+    DeclineReport why;
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why))
+        << "an unprovable PoSe pass was SERVED";
+    EXPECT_EQ(why.cause, "emit-qc-real-pose-unfolded")
+        << "THE behaviour change this test exists for: with the verdict "
+           "latched, the member-set eviction is no longer caught at "
+           "verified_for (cause=emit-qc-plan-underivable) but at the PoSe "
+           "gate. Got cause=" << why.cause << " value=" << why.value;
+    EXPECT_NE(why.value.find("pose_noop=n/a"), std::string::npos)
+        << "the refusal must say the capability could not answer, not "
+           "fabricate a verdict: " << why.value;
+    EXPECT_EQ(why.threshold, "pose-pass-provably-noop(all-listed-members-valid)");
+}
+
+// The CONTROL, and the reason the test above is a change and not a bug: with
+// NO latch in play (a cache never read while the member set was present) the
+// old cause is still exactly what it was. The two tests together say the
+// cause string moved, and moved only for latched slots.
+TEST(DashQcVerifyMemoDeclineCause, UnlatchedSlotStillDeclinesAsPlanUnderivable) {
+    const auto qc = make_real_qc(/*punish_listed_member=*/false);
+
+    NodeCoinState st;
+    seed_real_qc_serving(st, qc);   // fixed plan fn => builds the template
+    st.set_qc_pose_noop_fn(
+        [](const dash::coin::vendor::CFinalCommitment& c)
+            -> std::optional<bool> {
+            return dash::coin::qc_pose_pass_provably_noop(c, 50);
+        });
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded);
+    ASSERT_EQ(sel.work.m_txs.size(), 1u);
+
+    // Now swap in a cache-backed plan whose commitment was NEVER verified
+    // while the member set existed — nothing is latched, so verified_for pays
+    // (and fails) the verify, and the whole height is underivable.
+    dash::coin::MineableCommitmentCache cold;
+    ASSERT_TRUE(cold.ingest(dash::coin::LlmqNetwork::Testnet, qc));
+    cold.set_bls_verify_fn(
+        [](const dash::coin::vendor::CFinalCommitment&) { return false; });
+    st.set_qc_plan_fn(cache_backed_qc_plan_fn(cold, qc.llmqType, qc.quorumHash));
+
+    DeclineReport why;
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why));
+    EXPECT_EQ(why.cause, "emit-qc-plan-underivable")
+        << "the PRE-memo cause must remain reachable for an unlatched slot: "
+        << "cause=" << why.cause << " value=" << why.value;
+    EXPECT_EQ(why.value, "nullopt");
+}

@@ -36,6 +36,7 @@
 #include <core/uint256.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <fstream>
@@ -44,6 +45,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace dash::coin;
@@ -2008,4 +2010,84 @@ TEST(DashQcVerifyMemo, ServePathPlanDerivationPaysTheVerifyOncePerCommitment)
         << "plan re-derivation re-proved the aggregate signatures: " << calls
         << " verifies for " << kReads << " reads of " << n_slots
         << " unchanged commitments — the io-thread cost the incident measured";
+}
+
+// ── C1: the latch is std::atomic<bool>, not a plain bool ───────────────────
+//
+// The memo's thread-safety was, as first written, an argument you had to READ
+// THE CODE to believe: `mutable bool`, no lock, justified by "the only
+// production caller is the single coin-state-owning thread"
+// (work_source.cpp:823-827). That is the same shape of assumption that
+// produced the 2026-08-05 heap corruption on this same money path (the
+// oracle-shadow worker racing lockless coin state), so the latch is now a
+// relaxed std::atomic<bool> (dkg_commitments.hpp:800). Relaxed is the right
+// order and the whole safety argument fits in one line: the latch publishes
+// NO data — the commitment bytes it guards are immutable for the entry's
+// lifetime, since replacement builds a fresh entry — so there is nothing for
+// an acquire/release pair to order, and the worst a concurrent reader can
+// suffer is a REDUNDANT re-verify of the same bytes to the same verdict.
+//
+// HOW THIS TEST IS DEMONSTRATED RED (it is a race-detector test, so it is
+// honest to say so: in an ordinary build it passes with a plain bool too —
+// a benign-in-practice race is still UB, and the tool that sees UB is TSan):
+//
+//   g++ -std=c++20 -O1 -g -fsanitize=thread \
+//       -I<repo>/include -I<repo>/src ... test/tools/tsan_qc_verify_latch.cpp \
+//       -o /tmp/tsan_latch
+//   setarch $(uname -m) -R /tmp/tsan_latch
+//
+//   with `mutable std::atomic<bool> verified` : served=16000/16000
+//                                               verifies=4, NO TSan report
+//   with `mutable bool verified`              : WARNING: ThreadSanitizer:
+//                                               data race — "Write of size 1"
+//                                               in verified_for at
+//                                               dkg_commitments.hpp:760, two
+//                                               reader threads
+//
+// test/tools/tsan_qc_verify_latch.cpp is that harness, committed alongside so
+// the demonstration is reproducible rather than reported. What the gtest below
+// pins WITHOUT a sanitizer is the behavioural contract the atomic must keep:
+// concurrency must never cost a reader its commitment, and the latch must
+// still converge (verifies bounded by the reader count, not by the read
+// count).
+
+TEST(DashQcVerifyMemo, ConcurrentServeReadsAlwaysGetTheirCommitmentAndConverge)
+{
+    MineableCommitmentCache cache;
+    const uint256 qh = h256(0x76);
+    ASSERT_TRUE(cache.ingest(LlmqNetwork::Testnet,
+                             real_commitment(kLlmq50_60, qh, 0, 0x11)));
+    std::atomic<int> calls{0};
+    cache.set_bls_verify_fn([&calls](const CFinalCommitment&) {
+        calls.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    });
+
+    constexpr int kThreads = 8;
+    constexpr int kReads   = 2000;
+    std::atomic<bool> go{false};
+    std::atomic<int> served{0};
+    std::vector<std::thread> readers;
+    readers.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        readers.emplace_back([&] {
+            while (!go.load(std::memory_order_acquire)) { }
+            for (int i = 0; i < kReads; ++i)
+                if (cache.verified_for(1, qh).has_value())
+                    served.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+    go.store(true, std::memory_order_release);
+    for (auto& t : readers) t.join();
+
+    EXPECT_EQ(served.load(), kThreads * kReads)
+        << "a concurrent read WITHHELD a verified commitment — the latch is "
+           "positive-only, so no interleaving may ever turn a verified slot "
+           "into a refusal";
+    EXPECT_GE(calls.load(), 1);
+    EXPECT_LE(calls.load(), kThreads)
+        << "the verify ran " << calls.load() << " times for "
+        << (kThreads * kReads)
+        << " reads: the only tolerable duplication is one racing re-verify "
+           "per reader thread at the moment of latching, never per read";
 }
