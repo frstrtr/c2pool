@@ -485,6 +485,55 @@ TEST(DashQcPrefetch, RotatedCycleIsNotAskedBeforeItsSlotHeadersExist)
 }
 
 
+// CATCH-UP GATE (Fable review, 2026-08-07): the tip callback fires once per
+// headers MESSAGE and add_headers coalesces up to 2000 headers, so a cold
+// start delivers tips ~2000 apart. Every such call would be a memo miss for
+// every type and would ask for cycles whose mining windows are long past —
+// measured shape ~215 requests / ~100 MB of full MN snapshots down the single
+// ordered stream the cold-start path depends on. Prefetch is for the LIVE tip.
+TEST(DashQcPrefetch, CatchUpTipJumpsAskNothing)
+{
+    PrefetchHarness h;
+    const uint32_t base = 2517600;                 // 2517600 % 24 == 0
+    h.add_range(base - 8, base + 4100);            // headers present either way
+
+    h.src->prefetch_cycle(base);                   // first call primes the tip
+    const size_t after_first = h.sends.size();
+    ASSERT_GT(after_first, 0u) << "a live tip must still prefetch";
+
+    // Two coalesced headers batches: +2000 each. Both must be refused.
+    h.src->prefetch_cycle(base + 2000);
+    h.src->prefetch_cycle(base + 4000);
+    EXPECT_EQ(h.sends.size(), after_first)
+        << "a tip jump larger than the biggest dkgInterval means we are still "
+           "catching up — prefetch must stay silent";
+
+    // Back to live cadence (+1): asking resumes.
+    h.src->prefetch_cycle(base + 4001);
+    EXPECT_GT(h.sends.size(), after_first)
+        << "the gate must be a deferral for catch-up, not a permanent stop";
+}
+
+// A header gap must NOT burn the cycle's single prefetch: the lookup happens
+// BEFORE the memo insert, so the next tip retries.
+TEST(DashQcPrefetch, HeaderGapDoesNotBurnTheMemo)
+{
+    PrefetchHarness h;
+    const uint32_t base = 2517600;
+    // Deliberately withhold the cycle base header; give only the work block.
+    h.add_range(base - 8, base - 1);
+
+    h.src->prefetch_cycle(base);
+    EXPECT_TRUE(h.sends.empty()) << "no header, nothing to ask with";
+
+    // Header arrives; the SAME cycle must now be asked for.
+    h.add(base);
+    h.src->prefetch_cycle(base);
+    EXPECT_FALSE(h.sends.empty())
+        << "a header gap is a 'not yet', not a spent prefetch";
+}
+
+
 TEST(DashQrInfo, RequestRotatedEmitsAnEmptyBaseFullSnapshotRequest)
 {
     Harness h;

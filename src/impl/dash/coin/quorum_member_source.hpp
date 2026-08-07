@@ -270,6 +270,21 @@ public:
     void prefetch_cycle(uint32_t tip_height)
     {
         if (tip_height == 0) return;
+        // CATCH-UP GATE. The tip callback fires once per headers MESSAGE, and
+        // add_headers coalesces up to 2000 headers into one — so during a cold
+        // start or a long resync each call arrives ~2000 blocks above the last.
+        // Every such call is a memo miss for every type (2000 > any mainnet
+        // dkgInterval), and each miss asks for a cycle whose mining window is
+        // long past: measured shape is ~215 requests / ~100 MB of full MN
+        // snapshots from a checkpointed cold start, all of it riding the ONE
+        // ordered stream to the primary coin-P2P peer that the cold-start path
+        // (#1162/#1151) just spent effort making fast. Prefetch is an
+        // optimisation for the LIVE tip; while we are catching up the qfcommit
+        // kick remains the correct and sufficient mechanism.
+        const uint32_t prev = m_last_prefetch_tip;
+        m_last_prefetch_tip = tip_height;
+        if (prev != 0 && tip_height > prev + kMaxDkgInterval)
+            return;   // jumped a whole cycle or more => still catching up
         for (const auto& p : enabled_llmqs(m_net)) {
             if (p.dkg_interval == 0) continue;
             // The cycle whose mining window this tip is approaching: the most
@@ -306,17 +321,30 @@ public:
             }
             // Only act once per (type, cycle) — repeated tips inside the same
             // cycle must not re-walk the request path.
+            // Resolve the header BEFORE memoising. A header gap is a
+            // "not yet", not a "done": memoising it would spend the cycle's
+            // only prefetch on a lookup that failed.
+            auto base_hash = m_hash_at_height(cycle_base);
+            if (!base_hash || base_hash->IsNull()) continue;  // retry next tip
             const uint64_t seen_key =
                 (static_cast<uint64_t>(p.type) << 32) | cycle_base;
             if (!m_prefetched_cycles.insert(seen_key).second) continue;
-            auto base_hash = m_hash_at_height(cycle_base);
-            if (!base_hash || base_hash->IsNull()) continue;  // header gap: skip
+            // Lead time is measured from the tip we are ON, not from the
+            // window offset: a rotated type waits for its slot headers, so it
+            // asks LATER than a non-rotated one and the honest number is the
+            // difference. (An earlier version printed mining_window_start,
+            // which overstated the rotated lane by 4x.)
+            const uint32_t window_open_h = cycle_base + p.mining_window_start;
+            const long lead = static_cast<long>(window_open_h)
+                            - static_cast<long>(tip_height);
             LOG_INFO << "[QC-PREFETCH] cycle_base=" << cycle_base
                      << " type=" << static_cast<int>(p.type)
                      << " hash=" << base_hash->GetHex().substr(0, 8)
                      << " tip=" << tip_height
-                     << " (asking " << (p.mining_window_start)
-                     << " blocks before the mining window opens)";
+                     << " rotated=" << (p.use_rotation ? 1 : 0)
+                     << " lead=" << lead
+                     << " blocks before the mining window opens at h="
+                     << window_open_h;
             request(p.type, *base_hash);
         }
         // Bound the memo: a cycle far behind the tip can never be asked for
@@ -884,7 +912,11 @@ private:
     // wholesale when it grows past the bound — re-walking a live cycle costs
     // one deduped request(), which the pending/ready maps then absorb.
     static constexpr size_t kPrefetchMemoMax = 4096;
+    // Largest mainnet dkgInterval (LLMQ_400_85 = 576). A tip advance larger
+    // than this cannot be live-chain progress; it is a headers batch.
+    static constexpr uint32_t kMaxDkgInterval = 576;
     std::set<uint64_t> m_prefetched_cycles;
+    uint32_t           m_last_prefetch_tip{0};
 
     const LlmqParamsView* params_for(uint8_t type) const
     {
