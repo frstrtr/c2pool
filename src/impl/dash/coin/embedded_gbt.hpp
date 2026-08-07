@@ -108,27 +108,45 @@ inline const std::array<uint8_t, 96> k_zero_cl_sig{};
 /// unspent against OUR UTXO view, coinbase-mature at this height, fee exactly
 /// zero, no MN-collateral spend). A bad pin must never cost a block, and an
 /// unverifiable one (utxo-view-unset) must never be included.
-inline void splice_pinned_tx(DashWorkData& w,
-                             const MutableTransaction& pin,
-                             const Mempool& mempool,
-                             const MnStateMachine& mnstates,
-                             const char* arm)
+/// The pin gate's ANSWER as a self-contained VALUE.
+///
+/// The served-dashd arm cannot run the gate where it appends. The gate reads
+/// the mempool UTXO view and the MN state machine, which the coin-P2P
+/// maintainer mutates on the io thread — reading them from the re-source
+/// thread is the #1134 heap-corruption shape on the serve path. So the gate
+/// runs beside the coin state and only this value crosses.
+struct PinVerdict {
+    bool        ok{false};
+    const char* cause{""};     ///< named refusal reason when !ok
+    uint32_t    at_height{0};  ///< the height the gate judged AT
+};
+
+/// Gate only — no template touched. Same checks, same order, same names as the
+/// splice below, because it IS the splice's gate.
+inline PinVerdict pin_gate_verdict(const MutableTransaction& pin,
+                                   const Mempool& mempool,
+                                   const MnStateMachine& mnstates,
+                                   uint32_t next_height)
 {
-    const auto gate = mempool.pinned_tx_admissible(pin, w.m_height);
-    uint256 protx;
+    PinVerdict v;
+    v.at_height = next_height;
+    const auto gate = mempool.pinned_tx_admissible(pin, next_height);
     if (gate != Mempool::PinnedTxGate::Ok) {
-        LOG_INFO << "[" << arm << "] pinned tx EXCLUDED h=" << w.m_height
-                 << " cause=" << Mempool::pinned_gate_name(gate)
-                 << " txid=" << dash::coin::dash_txid(pin).GetHex().substr(0, 16)
-                 << " (template built without it; re-checked next build)";
-        return;
+        v.cause = Mempool::pinned_gate_name(gate);
+        return v;
     }
+    uint256 protx;
     if (tx_spends_mn_collateral(mnstates, pin, &protx)) {
-        LOG_WARNING << "[" << arm << "] pinned tx EXCLUDED h=" << w.m_height
-                    << " cause=spends-mn-collateral MN "
-                    << protx.GetHex().substr(0, 16);
-        return;
+        v.cause = "spends-mn-collateral";
+        return v;
     }
+    v.ok = true;
+    return v;
+}
+
+/// Append only — the caller must already hold an ok PinVerdict for THIS height.
+inline void pin_append(DashWorkData& w, const MutableTransaction& pin)
+{
     auto stream = ::pack(pin);
     auto sp = stream.get_span();
     w.m_txs.emplace_back(pin);
@@ -136,6 +154,23 @@ inline void splice_pinned_tx(DashWorkData& w,
     w.m_tx_fees.push_back(0);
     w.m_tx_data_hex.push_back(HexStr(std::span<const unsigned char>(
         reinterpret_cast<const unsigned char*>(sp.data()), sp.size())));
+}
+
+inline void splice_pinned_tx(DashWorkData& w,
+                             const MutableTransaction& pin,
+                             const Mempool& mempool,
+                             const MnStateMachine& mnstates,
+                             const char* arm)
+{
+    const auto v = pin_gate_verdict(pin, mempool, mnstates, w.m_height);
+    if (!v.ok) {
+        LOG_INFO << "[" << arm << "] pinned tx EXCLUDED h=" << w.m_height
+                 << " cause=" << v.cause
+                 << " txid=" << dash::coin::dash_txid(pin).GetHex().substr(0, 16)
+                 << " (template built without it; re-checked next build)";
+        return;
+    }
+    pin_append(w, pin);
     LOG_INFO << "[" << arm << "] pinned tx INCLUDED h=" << w.m_height
              << " txid=" << dash::coin::dash_txid(pin).GetHex().substr(0, 16)
              << " vin=" << pin.vin.size() << " fee=0 (rides this template)";

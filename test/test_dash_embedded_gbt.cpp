@@ -1289,3 +1289,91 @@ TEST(DashEmbeddedGbt, PinnedLocalTxExcludedFacesLeaveTemplateUntouched) {
         EXPECT_EQ(w2.m_tx_fees[0], 0u);
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// PIN GATE vs the SERVED-DASHD arm. Both KATs below are red on the code that
+// ran on the production primary on 2026-08-07, which logged
+//     [dashd-splice] pinned tx EXCLUDED h=0 cause=immature-coinbase-input
+// and told the operator nothing true: the height was not the template's, and
+// the template was not the one being served.
+// ════════════════════════════════════════════════════════════════════════
+
+// DEFECT 1 — a zero height marks a MATURE coinbase input immature. The gate is
+// correct; feeding it a height nobody established is what is wrong, so the
+// serve path must judge at a height it OWNS (coin-state tip + 1) and refuse by
+// name when it has none.
+TEST(DashPinGate, ZeroHeightWouldRefuseAMatureCoinbaseInput) {
+    UTXOViewCache utxo(nullptr);
+    uint256 don = mint_hash(90);
+    // Mined 5000 blocks ago: mature by any reading, 50x the 100-block rule.
+    utxo.add_coin(Outpoint(don, 0), Coin(100'000, {}, H - 5'000, /*cb=*/true));
+    Mempool mp; mp.set_utxo(&utxo);
+
+    MutableTransaction pin;
+    pin.version = 2; pin.type = 0; pin.locktime = 0;
+    { TxIn i; i.prevout.hash = don; i.prevout.index = 0;
+      i.sequence = 0xffffffffu; pin.vin.push_back(i); }
+    { TxOut o; o.value = 100'000; pin.vout.push_back(o); }
+
+    auto mnstates = single_mn(p2pkh_script(0x30));
+
+    const auto at_tip = dash::coin::pin_gate_verdict(pin, mp, mnstates, H);
+    EXPECT_TRUE(at_tip.ok) << "mature at the real height, cause=" << at_tip.cause;
+    EXPECT_EQ(at_tip.at_height, H) << "the verdict must carry the height it judged at";
+
+    const auto at_zero = dash::coin::pin_gate_verdict(pin, mp, mnstates, 0);
+    EXPECT_FALSE(at_zero.ok)
+        << "height 0 must not silently admit — it cannot evaluate maturity";
+    EXPECT_STREQ(at_zero.cause, "immature-coinbase-input")
+        << "and this is exactly the production line: the SAME coin, refused "
+           "only because the height was never established";
+}
+
+// DEFECT 2 — the serve path binds the fallback arm to a no-op returning an
+// EMPTY template (#1134). Splicing into that judged a throwaway while the real
+// served template went unspliced, so the pin could never ride a block no matter
+// what the log said. A placeholder must be left alone.
+TEST(DashPinGate, PlaceholderFallbackIsNeverSpliced) {
+    UTXOViewCache utxo(nullptr);
+    uint256 don = mint_hash(91);
+    utxo.add_coin(Outpoint(don, 0), Coin(100'000, {}, H - 5'000, /*cb=*/true));
+    Mempool mp; mp.set_utxo(&utxo);
+
+    MutableTransaction pin;
+    pin.version = 2; pin.type = 0; pin.locktime = 0;
+    { TxIn i; i.prevout.hash = don; i.prevout.index = 0;
+      i.sequence = 0xffffffffu; pin.vin.push_back(i); }
+    { TxOut o; o.value = 100'000; pin.vout.push_back(o); }
+
+    auto mnstates = single_mn(p2pkh_script(0x30));
+
+    // NON-VIABLE bundle => the selector takes the fallback arm. The pin is
+    // admissible on the merits, so anything appended here is appended to the
+    // placeholder.
+    dash::coin::EmbeddedWorkInputs e;
+    e.has_state        = false;        // forces the fallback arm
+    e.prev_height      = 0;            // exactly the production shape
+    e.mnstates         = &mnstates;
+    e.mempool          = &mp;
+    e.pinned_local_tx  = &pin;
+
+    auto placeholder = []() -> dash::coin::DashWorkData { return {}; };
+    auto sel = dash::coin::select_dash_work(e, placeholder);
+    ASSERT_EQ(sel.source, dash::coin::WorkSource::DashdFallback);
+    EXPECT_TRUE(sel.work.m_txs.empty())
+        << "a placeholder is not a template — the pin must not be spliced into it";
+    EXPECT_TRUE(sel.work.m_tx_data_hex.empty());
+
+    // A REAL fallback (it has a previous block) still splices here, so the
+    // guard discriminates on placeholder-ness, not on the arm.
+    auto real_fb = []() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_previous_block = raw256(0xAB);
+        w.m_height         = H;
+        return w;
+    };
+    auto sel_real = dash::coin::select_dash_work(e, real_fb);
+    ASSERT_EQ(sel_real.source, dash::coin::WorkSource::DashdFallback);
+    EXPECT_EQ(sel_real.work.m_txs.size(), 1u)
+        << "a genuine fallback template still carries the pin";
+}

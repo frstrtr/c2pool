@@ -40,6 +40,7 @@
 #include "rpc_data.hpp"
 #include "node_interface.hpp"
 
+#include <ctime>
 #include <functional>
 #include <iostream>
 #include <mutex>
@@ -104,6 +105,10 @@ private:
     // payee cached from BEFORE the churn window. Assigned once at startup,
     // before the io loop runs.
     std::function<void()> m_on_reconnect;
+
+    // blockcount_cached() memo — see its declaration below.
+    int          m_blockcount_cache{0};
+    std::time_t  m_blockcount_cache_at{0};
 
     std::string Send(const std::string &request) override;
     nlohmann::json CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params = {});
@@ -177,6 +182,13 @@ public:
     // "never seen". Returns a null json when the coin is unspendable/absent —
     // the caller must treat that as REFUSE, never as a guess.
     nlohmann::json gettxout(const uint256& txid, uint32_t n);
+    // Chain height with a short cache. The pin gate calls gettxout once per
+    // input (1032 for the donation consolidation) and each answer needs the
+    // tip to turn `confirmations` into a coin height; asking the daemon 1032
+    // times for a number that changes every ~2.6 minutes would be waste. The
+    // cache is refreshed at most once every kBlockCountCacheSecs. Returns 0
+    // when the daemon cannot be reached, which callers must treat as REFUSE.
+    int blockcount_cached();
     // getpeerinfo -> the dashd's OWN connected-peer addresses (the "addr" field
     // of each entry), parsed to NetService. Feeds the embedded
     // DashCoinPeerManager's daemon-peer overlap filter + coind-source -20 score

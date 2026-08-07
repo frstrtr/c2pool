@@ -452,7 +452,26 @@ TEST(HashrateVardiffHysteresis, LowerMarginHeldButDecisiveDropStepsDown)
 // the splice point. Zero is not a harmless label — the gate's coinbase
 // maturity arm reads it as next_height, which would mark every coinbase input
 // immature. When dashd's copy is unset the bundle's own tip must fill it in.
-TEST(DashWorkSource, PinnedSpliceFillsHeightFromBundleTipWhenDashdCopyIsUnset)
+// ─── The PLACEHOLDER fallback (corrected 2026-08-07) ───────────────────────
+//
+// This test previously asserted the OPPOSITE: that a fallback arriving with no
+// height still gets the pin spliced, with the height filled from the bundle
+// tip. It was written from the production log line
+//
+//     [dashd-splice] pinned tx EXCLUDED h=0 cause=input-missing-or-spent
+//
+// on the belief that "the shape the primary produced" was a real dashd
+// template missing its height. It was not. The serve path binds this arm to a
+// NO-OP closure returning DashWorkData{} (#1134 — the real dashd
+// getblocktemplate must not run on the io thread), so that h=0 was a
+// PLACEHOLDER, and every splice into it landed on a value nobody serves while
+// the real template went unspliced.
+//
+// The corrected contract: a value indistinguishable from a default-constructed
+// DashWorkData is not a template and is left alone. The serve path gates
+// beside the coin state and appends at the real template instead
+// (DASHWorkSource::resolve_coin_state_arm).
+TEST(DashWorkSource, PlaceholderFallbackLeavesThePinAlone)
 {
     using ::core::coin::UTXOViewCache;
     using ::core::coin::Outpoint;
@@ -467,6 +486,8 @@ TEST(DashWorkSource, PinnedSpliceFillsHeightFromBundleTipWhenDashdCopyIsUnset)
     mp.set_utxo(&utxo);
     MnStateMachine mn;
 
+    // Admissible on the merits: input unspent, fee exactly zero. So anything
+    // that DOES get spliced here is spliced into the placeholder.
     dash::coin::MutableTransaction pin;
     pin.vin.resize(1);
     pin.vin[0].prevout.hash  = prev;
@@ -478,20 +499,65 @@ TEST(DashWorkSource, PinnedSpliceFillsHeightFromBundleTipWhenDashdCopyIsUnset)
     emb.mnstates        = &mn;
     emb.mempool         = &mp;
     emb.pinned_local_tx = &pin;
-    emb.prev_height     = 2'517'800; // the header tip the arm was evaluated on
+    emb.prev_height     = 2'517'800; // a tip IS known — still not a template
 
     bool emb_ran = false, fb_ran = false;
     WorkSelection sel = select_dash_work(
         emb,
         [&] { return embedded_stub(emb_ran); },
-        // dashd copy WITHOUT a height — the shape the primary produced.
-        [&] { fb_ran = true; DashWorkData w; w.m_height = 0; return w; });
+        // EXACTLY what the serve path's no-op closure returns.
+        [&] { fb_ran = true; return DashWorkData{}; });
 
     EXPECT_EQ(sel.source, WorkSource::DashdFallback);
     EXPECT_TRUE(fb_ran);
-    EXPECT_EQ(sel.work.m_height, 2'517'801u) << "height must come from the bundle tip + 1";
-    ASSERT_EQ(sel.work.m_txs.size(), 1u) << "the pin must still be spliced";
+    EXPECT_TRUE(sel.work.m_txs.empty())
+        << "a placeholder is not a template — splicing it is a no-op that "
+           "reads as success in the log";
+    EXPECT_TRUE(sel.work.m_tx_data_hex.empty());
+}
+
+// A fallback that carries ANY information is a real template, and the pin
+// still rides it here. This is the discriminator the guard turns on, so it is
+// asserted rather than assumed.
+TEST(DashWorkSource, FallbackCarryingAHeightIsATemplateAndTakesThePin)
+{
+    using ::core::coin::UTXOViewCache;
+    using ::core::coin::Outpoint;
+    using ::core::coin::Coin;
+
+    uint256 prev;
+    prev.begin()[0] = 0x78;
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(9'000, {}, /*height=*/1, /*cb=*/false));
+
+    dash::coin::Mempool mp;
+    mp.set_utxo(&utxo);
+    MnStateMachine mn;
+
+    dash::coin::MutableTransaction pin;
+    pin.vin.resize(1);
+    pin.vin[0].prevout.hash  = prev;
+    pin.vin[0].prevout.index = 0;
+    pin.vout.resize(1);
+    pin.vout[0].value = 9'000;
+
+    EmbeddedWorkInputs emb;
+    emb.mnstates        = &mn;
+    emb.mempool         = &mp;
+    emb.pinned_local_tx = &pin;
+    emb.prev_height     = 2'517'800;
+
+    bool emb_ran = false, fb_ran = false;
+    WorkSelection sel = select_dash_work(
+        emb,
+        [&] { return embedded_stub(emb_ran); },
+        [&] { fb_ran = true; DashWorkData w; w.m_height = 2'517'801; return w; });
+
+    EXPECT_EQ(sel.source, WorkSource::DashdFallback);
+    EXPECT_TRUE(fb_ran);
+    ASSERT_EQ(sel.work.m_txs.size(), 1u) << "a real template still carries the pin";
     EXPECT_EQ(sel.work.m_tx_fees[0], 0u);
+    EXPECT_EQ(sel.work.m_height, 2'517'801u);
 }
 
 // ─── #107: creditPool divergence — explained vs unexplained ─────────────────

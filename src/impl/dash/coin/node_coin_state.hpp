@@ -485,6 +485,31 @@ public:
     /// against the live UTXO view on every template
     /// (Mempool::pinned_tx_admissible) — exclusion-only failure, never a
     /// template refusal. Call on the io thread before serving starts.
+    /// PIN GATE for the SERVED-DASHD arm, as a VALUE (#1134).
+    ///
+    /// The embedded builder gates and appends in one place because both happen
+    /// beside the coin state. The served-dashd arm cannot: it appends on the
+    /// re-source thread, where touching m_mempool/m_mnstates is the serve-path
+    /// heap-corruption shape. So the gate runs HERE and only the verdict
+    /// crosses. `out_tx` receives a pointer to the pin, which is safe to hand
+    /// out because it is written once before serving and never mutated.
+    ///
+    /// The height is OURS (m_prev_height + 1), not the template's: a served
+    /// dashd template can reach the splice with height 0, and a zero height
+    /// makes the coinbase-maturity arm read every coinbase-sourced input as
+    /// immature. An unknown tip is REFUSED by name rather than guessed at.
+    PinVerdict evaluate_pinned_tx(const MutableTransaction** out_tx) const {
+        if (!m_have_pinned_local_tx) return PinVerdict{};
+        if (out_tx) *out_tx = &m_pinned_local_tx;
+        if (m_prev_height == 0) {
+            PinVerdict v;
+            v.cause = "tip-unknown";
+            return v;
+        }
+        return pin_gate_verdict(m_pinned_local_tx, m_mempool, m_mnstates,
+                                m_prev_height + 1);
+    }
+
     void set_pinned_local_tx(MutableTransaction tx) {
         m_pinned_local_tx = std::move(tx);
         m_have_pinned_local_tx = true;

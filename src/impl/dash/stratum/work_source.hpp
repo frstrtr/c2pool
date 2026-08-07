@@ -472,6 +472,21 @@ private:
         /// rather than swallowing it.
         bool                resolve_threw{false};
         std::string         resolve_error;
+        /// PINNED LOCAL TX, served-dashd arm (donation lane). The gate runs
+        /// beside the coin state -- it reads the UTXO view and the MN state
+        /// machine, which the io thread mutates -- and only this VALUE crosses
+        /// to the sourcing thread, which appends. Before this, the splice ran
+        /// inside select_work()'s fallback arm, and on the serve path that arm
+        /// is bound to a NO-OP empty template: the gate judged a throwaway at
+        /// h=0 and the real dashd template was never spliced at all. That is
+        /// what the production primary logged on 2026-08-07
+        /// (`pinned tx EXCLUDED h=0`) -- an honest report about the wrong
+        /// object.
+        coin::PinVerdict            pin_verdict;
+        /// Points at load-time-immutable storage (set once before serving,
+        /// never mutated), which is why a pointer may cross where a container
+        /// reference may not. nullptr when no pin is configured.
+        const coin::MutableTransaction* pin_tx{nullptr};
     };
 
     /// COIN-STATE-OWNING THREAD ONLY (#1134). Reads NodeCoinState -- populated(),
