@@ -100,6 +100,47 @@ inline std::vector<unsigned char> encode_cbtx(const vendor::CCbTx&);
 // Zero CLSIG default for the E2d best_cl_sig seam (no temporary-bound ref).
 inline const std::array<uint8_t, 96> k_zero_cl_sig{};
 
+/// PINNED LOCAL TX splice — the ONE admission-and-append used by BOTH serving
+/// arms (embedded builder and the served-dashd-template arm), so the gate can
+/// never drift between them. `arm` names the caller in the log lines
+/// ("GBT-EMB" / "dashd-splice") so soaks can tell which arm carried the pin.
+/// Exclusion is the only failure mode: gate re-checked on EVERY build (inputs
+/// unspent against OUR UTXO view, coinbase-mature at this height, fee exactly
+/// zero, no MN-collateral spend). A bad pin must never cost a block, and an
+/// unverifiable one (utxo-view-unset) must never be included.
+inline void splice_pinned_tx(DashWorkData& w,
+                             const MutableTransaction& pin,
+                             const Mempool& mempool,
+                             const MnStateMachine& mnstates,
+                             const char* arm)
+{
+    const auto gate = mempool.pinned_tx_admissible(pin, w.m_height);
+    uint256 protx;
+    if (gate != Mempool::PinnedTxGate::Ok) {
+        LOG_INFO << "[" << arm << "] pinned tx EXCLUDED h=" << w.m_height
+                 << " cause=" << Mempool::pinned_gate_name(gate)
+                 << " txid=" << dash::coin::dash_txid(pin).GetHex().substr(0, 16)
+                 << " (template built without it; re-checked next build)";
+        return;
+    }
+    if (tx_spends_mn_collateral(mnstates, pin, &protx)) {
+        LOG_WARNING << "[" << arm << "] pinned tx EXCLUDED h=" << w.m_height
+                    << " cause=spends-mn-collateral MN "
+                    << protx.GetHex().substr(0, 16);
+        return;
+    }
+    auto stream = ::pack(pin);
+    auto sp = stream.get_span();
+    w.m_txs.emplace_back(pin);
+    w.m_tx_hashes.push_back(dash::coin::dash_txid(pin));
+    w.m_tx_fees.push_back(0);
+    w.m_tx_data_hex.push_back(HexStr(std::span<const unsigned char>(
+        reinterpret_cast<const unsigned char*>(sp.data()), sp.size())));
+    LOG_INFO << "[" << arm << "] pinned tx INCLUDED h=" << w.m_height
+             << " txid=" << dash::coin::dash_txid(pin).GetHex().substr(0, 16)
+             << " vin=" << pin.vin.size() << " fee=0 (rides this template)";
+}
+
 inline DashWorkData build_embedded_workdata(
     uint32_t prev_height,
     const uint256& prev_hash,
@@ -363,33 +404,8 @@ inline DashWorkData build_embedded_workdata(
     // only failure mode (see the parameter note); the MN-collateral filter
     // applies here too — a pinned tx spending a collateral would poison the
     // committed merkleRootMNList exactly like a selected one.
-    if (pinned_local_tx != nullptr) {
-        const auto gate = mempool.pinned_tx_admissible(*pinned_local_tx,
-                                                       w.m_height);
-        uint256 protx;
-        if (gate != Mempool::PinnedTxGate::Ok) {
-            LOG_INFO << "[GBT-EMB] pinned tx EXCLUDED h=" << w.m_height
-                     << " cause=" << Mempool::pinned_gate_name(gate)
-                     << " txid=" << dash::coin::dash_txid(*pinned_local_tx)
-                            .GetHex().substr(0, 16)
-                     << " (template built without it; re-checked next build)";
-        } else if (tx_spends_mn_collateral(mnstates, *pinned_local_tx,
-                                           &protx)) {
-            LOG_WARNING << "[GBT-EMB] pinned tx EXCLUDED h=" << w.m_height
-                        << " cause=spends-mn-collateral MN "
-                        << protx.GetHex().substr(0, 16);
-        } else {
-            w.m_txs.emplace_back(*pinned_local_tx);
-            w.m_tx_hashes.push_back(dash::coin::dash_txid(*pinned_local_tx));
-            w.m_tx_fees.push_back(0);
-            w.m_tx_data_hex.push_back(tx_hex(*pinned_local_tx));
-            LOG_INFO << "[GBT-EMB] pinned tx INCLUDED h=" << w.m_height
-                     << " txid=" << dash::coin::dash_txid(*pinned_local_tx)
-                            .GetHex().substr(0, 16)
-                     << " vin=" << pinned_local_tx->vin.size()
-                     << " fee=0 (rides this template)";
-        }
-    }
+    if (pinned_local_tx != nullptr)
+        splice_pinned_tx(w, *pinned_local_tx, mempool, mnstates, "GBT-EMB");
     uint64_t selected_bytes = 0;  // wire bytes packed into this template (underfill guard)
     for (auto& s : selected) {
         selected_bytes += s.base_size;
