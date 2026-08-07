@@ -87,3 +87,24 @@ export function formatHashrate(hps: number): string {
   const digits = v >= 100 ? 0 : v >= 10 ? 1 : 2;
   return `${v.toFixed(digits)} ${units[idx]}`;
 }
+
+// -- Coin registry (task #111 coin-agnostic) -------------------------
+// Maps a coin symbol to its PPLNS descriptor so a view renders the node's
+// actual coin instead of a compile-time LTC hardcode. Match is
+// case-insensitive; an unknown or absent coin falls back to the LTC
+// descriptor (the historical default) so a mis-config degrades to prior
+// behaviour rather than a blank view.
+export const COIN_PPLNS_DESCRIPTORS: Readonly<Record<string, CoinPplnsDescriptor>> =
+  Object.freeze({
+    LTC:  LTC_COIN_PPLNS_DESCRIPTOR,
+    DASH: DASH_COIN_PPLNS_DESCRIPTOR,
+  });
+
+export function descriptorForCoin(
+  coin: string | null | undefined,
+): CoinPplnsDescriptor {
+  if (typeof coin !== "string" || coin.length === 0) {
+    return LTC_COIN_PPLNS_DESCRIPTOR;
+  }
+  return COIN_PPLNS_DESCRIPTORS[coin.toUpperCase()] ?? LTC_COIN_PPLNS_DESCRIPTOR;
+}
