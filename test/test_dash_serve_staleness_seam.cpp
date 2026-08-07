@@ -54,6 +54,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -310,6 +311,75 @@ TEST(DashServeStalenessSeam, NodeTopologyReadsTheLockFreeAccessorDirectly)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// A HEIGHT OF ZERO IS NOT A SERVE — note_served_height's do-not-fabricate rule
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// work_source.cpp:807 refuses to record h == 0. Round-2 mutation: deleting that
+// line left the whole suite green, even though the comment beside it calls it
+// load-bearing. It is the SAME do-not-fabricate rule this branch enforces for
+// `behind` (absent, never 0, when either side is unknown) and for D2 (declines
+// rather than self-comparing): a number nobody actually observed must not be
+// published as if it had been.
+//
+// Zero is reachable. DashWorkData default-constructs m_height to 0, and both
+// serve paths hand cached_work()'s snapshot straight to note_served_height —
+// so a degenerate or not-yet-filled template walks into it. If it were
+// recorded, the detector this whole lane exists for would be fed a fabricated
+// pair: served_height=0 with a served_at of NOW. That is worse than no data,
+// because served_age_s would read "we served a template a moment ago" about a
+// node that served nothing, and it would OVERWRITE the record of the last real
+// height — the one number the 2026-08-07 incident proved nothing else has.
+TEST(DashServeStalenessSeam, ZeroHeightIsNeitherFabricatedNorAllowedToClobber)
+{
+    dash::coin::NodeCoinState cs;
+    auto height = std::make_shared<uint32_t>(0u);
+    auto fallback = [height]() -> dash::coin::DashWorkData {
+        return seam_work(*height);
+    };
+    auto submit = [](const std::vector<unsigned char>&, uint32_t, bool) {
+        return true;
+    };
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/false);
+
+    // ── (a) NOT FABRICATED. A zero-height template goes out; nothing about it
+    // may be recorded as a serve. served_age_s is the falsifiable half: with
+    // the guard the record is untouched and the age renders -1 ("never"); with
+    // the guard deleted, last_served_at_ms_ is stamped with now and the surface
+    // claims a serve that did not happen.
+    ws.get_current_work_template();
+    ws.build_connection_coinbase(uint256::ZERO, "", {}, {});
+    {
+        const nlohmann::json ss = ws.serve_staleness_json();
+        EXPECT_EQ(ss.value("served_height", 99u), 0u)   << ss.dump();
+        EXPECT_EQ(ss.value("served_age_s", 0), -1)
+            << "a template with no height was recorded as a serve, so the "
+               "surface says we handed work out moments ago when we handed out "
+               "nothing: " << ss.dump();
+    }
+
+    // ── (b) NOT ALLOWED TO CLOBBER. A real height is served, and then the
+    // template degenerates back to zero. The record of the last height that
+    // ACTUALLY reached a miner must survive — it is the only such record in the
+    // process, which is the entire premise of this lane.
+    *height = 2518006u;
+    ws.invalidate_template_cache("test");
+    ASSERT_EQ(ws.get_current_work_template().value("height", 0u), 2518006u);
+    ASSERT_EQ(ws.serve_staleness_json().value("served_height", 0u), 2518006u);
+
+    *height = 0u;
+    ws.invalidate_template_cache("test");
+    ws.get_current_work_template();
+    ws.build_connection_coinbase(uint256::ZERO, "", {}, {});
+
+    const nlohmann::json ss = ws.serve_staleness_json();
+    EXPECT_EQ(ss.value("served_height", 0u), 2518006u)
+        << "a zero-height template ERASED the record of the last height a miner "
+           "actually got: " << ss.dump();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // C1 / C3 / C6 ON THE SURFACE — the sentinel's standing verdict, as published
 // ═══════════════════════════════════════════════════════════════════════════
 //
@@ -354,7 +424,12 @@ TEST(DashServeStalenessSeam, PublishedBlockNamesTheCheckAndKeepsAgesApart)
     r.stale_age_ms    = 3600000;
     r.io_silent_ms    = 3600000;
     r.skew_age_ms     = 0;
-    r.serve_quiet_ms  = 900;
+    // 7 s, NOT the 900 ms this test used to carry. 900 integer-divides to a
+    // published 0, which is indistinguishable from note_serve_observation
+    // never storing the field at all -- and the round-2 mutation
+    // (serve_quiet_ms_.store(0)) proved it: the suite stayed green. Every
+    // published age needs a value whose plumbing can be seen end to end.
+    r.serve_quiet_ms  = 7000;
     ws.note_serve_observation(r);
 
     const nlohmann::json ss = ws.serve_staleness_json();
@@ -364,7 +439,7 @@ TEST(DashServeStalenessSeam, PublishedBlockNamesTheCheckAndKeepsAgesApart)
     EXPECT_EQ(ss.value("stale_age_s", 0), 3600)      << ss.dump();
     EXPECT_EQ(ss.value("io_silent_s", 0), 3600)      << ss.dump();
     EXPECT_EQ(ss.value("skew_age_s", -1), 0)         << ss.dump();
-    EXPECT_EQ(ss.value("serve_quiet_s", -1), 0)      << ss.dump();
+    EXPECT_EQ(ss.value("serve_quiet_s", -1), 7)      << ss.dump();
     EXPECT_EQ(ss.value("d2", std::string()),
               "unavailable-no-independent-reference")
         << "D2 was blind and the surface must SAY so; rendering it as 'no skew' "
@@ -385,5 +460,15 @@ TEST(DashServeStalenessSeam, PublishedBlockNamesTheCheckAndKeepsAgesApart)
     EXPECT_EQ(ss2.value("stale_check", std::string()), "height-skew") << ss2.dump();
     EXPECT_EQ(ss2.value("stale_age_s", 0), 480)               << ss2.dump();
     EXPECT_EQ(ss2.value("io_silent_s", -1), 1)                << ss2.dump();
+    // ALL FOUR ages are asserted on a report where all four DIFFER. The round-2
+    // mutation hardwired serve_skew_age_ms_.store(0) and skew_age_s was still
+    // green, because the only assertion on it was against a report whose skew
+    // age was genuinely 0 -- an assertion that cannot disagree with the code it
+    // checks. This block sets skew_age_ms=480000 and serve_quiet_ms=7000 and
+    // now says so.
+    EXPECT_EQ(ss2.value("skew_age_s", -1), 480)               << ss2.dump();
+    EXPECT_EQ(ss2.value("serve_quiet_s", -1), 7)
+        << "a field not set by THIS report was not carried forward from the "
+           "last one -- the publisher is dropping it: " << ss2.dump();
     EXPECT_EQ(ss2.value("behind", 0u), 22u)                   << ss2.dump();
 }

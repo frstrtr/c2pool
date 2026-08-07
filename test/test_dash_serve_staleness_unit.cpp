@@ -291,7 +291,8 @@ TEST(DashServeStaleness, IoHeartbeatSilenceIsSilentWhenTheGuardIsNeutered)
 TEST(DashServeStaleness, ServeSilenceAlarmsOnlyWhileSessionsAreAttached)
 {
     FakeClock c;
-    ServeStalenessSentinel sen{ServeStalenessConfig{}};
+    const ServeStalenessConfig cfg{};          // serve_silence_ms = 300 s
+    ServeStalenessSentinel sen{cfg};
 
     for (int i = 0; i < 4; ++i) {
         c.advance(15000);
@@ -311,15 +312,24 @@ TEST(DashServeStaleness, ServeSilenceAlarmsOnlyWhileSessionsAreAttached)
         s.observed_src    = "rpc";
         s.observed_independent = true;
         s.sessions        = 0;
-        ASSERT_FALSE(sen.poll(s).fired) << "alarmed on an idle pool";
+        const auto v = sen.poll(s);
+        ASSERT_FALSE(v.fired)  << "alarmed on an idle pool";
+        // The SURFACE must agree with the log here too: an idle pool is not a
+        // stale one, and the D3 watchdog is disarmed so its age is not running.
+        ASSERT_FALSE(v.stale)  << "an idle pool was published as stale";
+        ASSERT_EQ(v.serve_quiet_ms, 0)
+            << "the D3 age ran while the check was disarmed";
     }
     EXPECT_EQ(sen.serve_alarms(), 0u);
 
     // Miners attach and STILL nothing is served -> that is a fault.
     bool fired = false;
     std::string line;
+    dash::coin::ServeStalenessVerdict at_fire{};
+    int polls_after_attach = 0;
     for (int i = 0; i < 60 && !fired; ++i) {
         c.advance(15000);
+        ++polls_after_attach;
         ServeStalenessSample s;
         s.now_ms          = c.now();
         s.io_heartbeat_ms = c.now();
@@ -330,14 +340,44 @@ TEST(DashServeStaleness, ServeSilenceAlarmsOnlyWhileSessionsAreAttached)
         s.observed_independent = true;
         s.sessions        = 26;
         const auto v = sen.poll(s);
+        // ── D3 CARRIES A REAL AGE, POLL BY POLL ─────────────────────────────
+        // Round-2 mutation: hardwiring `v.serve_quiet_ms = 0`
+        // (serve_staleness.hpp:333) left the suite green, because the only
+        // assertion on this field anywhere was EXPECT_LT(..., 20000) — which 0
+        // satisfies. One of the three "every check gets its own field" fields
+        // was never shown to carry a value at all. It is the watchdog's own
+        // elapsed clock, so it must equal the time since attach exactly.
+        EXPECT_EQ(v.serve_quiet_ms,
+                  static_cast<int64_t>(polls_after_attach - 1) * 15000)
+            << "D3 age at poll " << polls_after_attach;
         if (v.fired) {
-            fired = true;
-            line  = v.line;
+            fired   = true;
+            line    = v.line;
+            at_fire = v;
             EXPECT_EQ(v.check, StaleServeCheck::ServeSilence) << v.line;
         }
     }
     ASSERT_TRUE(fired) << "26 rigs attached, no template for 15 minutes, silence";
     EXPECT_NE(line.find("check=serve-silence"), std::string::npos) << line;
+
+    // ── THE SURFACE, NOT ONLY THE LOG ───────────────────────────────────────
+    // Round-2 mutation: `} else if (serve_cond) {` -> `} else if (false) {`
+    // (serve_staleness.hpp:350) left the suite green. This test asserted only
+    // v.fired — the LOG — so the D3 arm of the operator-visible verdict was
+    // entirely uncovered and could be deleted silently. Exactly the C1 defect
+    // (log knows, surface says healthy) reintroduced one sub-check at a time.
+    EXPECT_TRUE(at_fire.stale)
+        << "26 rigs attached, nothing served for 5 minutes, and the status "
+           "surface still reported health";
+    EXPECT_EQ(at_fire.stale_check, StaleServeCheck::ServeSilence);
+    EXPECT_EQ(at_fire.stale_age_ms, at_fire.serve_quiet_ms)
+        << "stale_age_ms must be the age of the check stale_check NAMES";
+    EXPECT_GE(at_fire.serve_quiet_ms, cfg.serve_silence_ms)
+        << "D3 raised before its own threshold";
+    // D1 and D2 stayed quiet the whole time, so their ages must NOT have been
+    // borrowed to satisfy the above.
+    EXPECT_EQ(at_fire.io_silent_ms, 0) << "io heartbeat was ticking every poll";
+    EXPECT_EQ(at_fire.skew_age_ms, 0)  << "served == observed the whole time";
 }
 
 // ── The detector must not go permanently loud once raised. A condition that
@@ -679,6 +719,7 @@ TEST(DashServeStaleness, DTwoRunsAndAlarmsOnceTheReferenceIsIndependent)
 
     bool fired = false;
     bool armed_seen = false;
+    dash::coin::ServeStalenessVerdict at_fire{};
     for (int i = 0; i < 240 && !fired; ++i) {
         c.advance(15000);
         ServeStalenessSample s;
@@ -693,7 +734,8 @@ TEST(DashServeStaleness, DTwoRunsAndAlarmsOnceTheReferenceIsIndependent)
         const auto v = sen.poll(s);
         if (v.d2_armed) armed_seen = true;
         if (v.fired) {
-            fired = true;
+            fired   = true;
+            at_fire = v;
             EXPECT_EQ(v.check, StaleServeCheck::HeightSkew) << v.line;
         }
     }
@@ -701,6 +743,31 @@ TEST(DashServeStaleness, DTwoRunsAndAlarmsOnceTheReferenceIsIndependent)
     ASSERT_TRUE(fired)
         << "with a genuinely independent reference the 22-block skew raised "
            "nothing — the refusal test proves only that dead code is dead";
+
+    // ── THE SURFACE, NOT ONLY THE LOG ───────────────────────────────────────
+    // Round-2 mutation: `} else if (skew_sustained) {` -> `} else if (false) {`
+    // in the standing-conditions block (serve_staleness.hpp:346) left the whole
+    // suite green, because every D2 test asserted `fired` (the LOG) and the one
+    // test that touched `stale` asserted it FALSE — which a hardwired-false arm
+    // satisfies vacuously. D2 is the sub-check for this lane's entire reason to
+    // exist: a dead height being served while the io thread is alive and
+    // answering. Its contribution to the operator-visible verdict must be
+    // asserted POSITIVELY, or it can be deleted and nothing notices.
+    //
+    // The refusal test (DTwoRefusesToRunWithoutAnIndependentReference) asserts
+    // ASSERT_FALSE(v.stale) on the same drive with observed_independent=false.
+    // These two together are the pair: same 22-block skew, opposite verdict,
+    // and the ONLY difference is where the reference came from.
+    EXPECT_TRUE(at_fire.stale)
+        << "the log alarmed on a 22-block sustained skew and the STATUS SURFACE "
+           "still said healthy — that exact disagreement is what left "
+           "/api/node_topology clean for the whole incident hour";
+    EXPECT_EQ(at_fire.stale_check, StaleServeCheck::HeightSkew)
+        << "stale is standing but names the wrong check";
+    EXPECT_EQ(at_fire.stale_age_ms, at_fire.skew_age_ms)
+        << "stale_age_ms must be the age of the check stale_check NAMES";
+    EXPECT_GE(at_fire.skew_age_ms, 120000)
+        << "the sustain window is 120 s; a shorter age means D2 raised early";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -766,6 +833,44 @@ TEST(DashServeStaleness, EachCheckCarriesItsOwnAgeAndTheVerdictNamesWhichOne)
         << " vs " << v.io_silent_ms << "), which is the whole point";
     EXPECT_GE(v.skew_age_ms, 600000);
     EXPECT_LE(v.io_silent_ms, 130000);
-    // D3 never raised: templates kept going out the whole time.
-    EXPECT_LT(v.serve_quiet_ms, 20000);
+    // D3 never raised: templates kept going out the whole time, so its age is
+    // EXACTLY zero rather than merely small.
+    EXPECT_EQ(v.serve_quiet_ms, 0);
+
+    // ── PHASE 3: ALL THREE AGES RUNNING AT ONCE, AND ALL THREE DIFFERENT ────
+    // The two phases above leave serve_quiet_ms pinned at 0, which is why the
+    // round-2 mutation `v.serve_quiet_ms = 0` (serve_staleness.hpp:333) went
+    // unnoticed: a field that is only ever asserted to be small is not
+    // demonstrated to carry anything. Templates now stop going out as well —
+    // 90 s of it, deliberately BELOW D3's 300 s threshold, so D3 does not fire
+    // and the only thing under test is whether its age is real and its own.
+    const int64_t frozen_serve = c.now();
+    for (int i = 0; i < 6; ++i) {
+        c.advance(15000);
+        ServeStalenessSample s;
+        s.now_ms          = c.now();
+        s.io_heartbeat_ms = frozen_beat;    // io still pegged
+        s.served_height   = kServedDead;
+        s.served_at_ms    = frozen_serve;   // and now nothing is served either
+        s.observed_height = kNetwork;
+        s.observed_src    = "peer";
+        s.observed_independent = true;
+        s.sessions        = 26;
+        v = sen.poll(s);
+    }
+
+    // Three conditions, three ages, three DIFFERENT numbers, from one poll.
+    EXPECT_EQ(v.serve_quiet_ms, 90000)  << "D3 age is not the time since the "
+                                           "last template left";
+    EXPECT_EQ(v.io_silent_ms,  210000)  << "D1 age is not the time since the "
+                                           "heartbeat froze";
+    EXPECT_GE(v.skew_age_ms,   690000);
+    EXPECT_NE(v.serve_quiet_ms, v.io_silent_ms);
+    EXPECT_NE(v.serve_quiet_ms, v.skew_age_ms);
+    EXPECT_NE(v.io_silent_ms,   v.skew_age_ms);
+    // D1 still outranks, and stale_age_ms still tracks the check it names --
+    // NOT the largest age, and not the one that happens to be newest.
+    ASSERT_TRUE(v.stale);
+    EXPECT_EQ(v.stale_check, StaleServeCheck::IoSilence);
+    EXPECT_EQ(v.stale_age_ms, v.io_silent_ms);
 }
