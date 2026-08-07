@@ -149,7 +149,8 @@ TEST(DashWorkSource, PinnedTxExcludedOnFallbackWithoutVerifyView)
     EmbeddedWorkInputs emb;            // has_state=false → fallback arm
     dash::coin::MutableTransaction pin;
     pin.vin.resize(1);
-    emb.pinned_local_tx = &pin;        // pin present, but no mempool/mnstates
+    std::vector<dash::coin::MutableTransaction> pins{pin};
+    emb.pinned_local_txs = &pins;        // pin present, but no mempool/mnstates
 
     bool emb_ran = false, fb_ran = false;
     WorkSelection sel = select_dash_work(
@@ -178,7 +179,8 @@ TEST(DashWorkSource, PinnedTxOnFallbackFailsClosedWithoutUtxoView)
     emb.mempool  = &mp;
     dash::coin::MutableTransaction pin;
     pin.vin.resize(1);
-    emb.pinned_local_tx = &pin;
+    std::vector<dash::coin::MutableTransaction> pins{pin};
+    emb.pinned_local_txs = &pins;
 
     bool emb_ran = false, fb_ran = false;
     WorkSelection sel = select_dash_work(
@@ -220,7 +222,8 @@ TEST(DashWorkSource, PinnedTxSplicedOnFallbackWithVerifyView)
     EmbeddedWorkInputs emb;       // has_state=false -> fallback arm
     emb.mnstates        = &mn;
     emb.mempool         = &mp;
-    emb.pinned_local_tx = &pin;
+    std::vector<dash::coin::MutableTransaction> pins{pin};
+    emb.pinned_local_txs = &pins;
 
     bool emb_ran = false, fb_ran = false;
     WorkSelection sel = select_dash_work(
@@ -498,7 +501,8 @@ TEST(DashWorkSource, PlaceholderFallbackLeavesThePinAlone)
     EmbeddedWorkInputs emb;          // has_state=false -> fallback arm
     emb.mnstates        = &mn;
     emb.mempool         = &mp;
-    emb.pinned_local_tx = &pin;
+    std::vector<dash::coin::MutableTransaction> pins{pin};
+    emb.pinned_local_txs = &pins;
     emb.prev_height     = 2'517'800; // a tip IS known — still not a template
 
     bool emb_ran = false, fb_ran = false;
@@ -544,7 +548,8 @@ TEST(DashWorkSource, FallbackCarryingAHeightIsATemplateAndTakesThePin)
     EmbeddedWorkInputs emb;
     emb.mnstates        = &mn;
     emb.mempool         = &mp;
-    emb.pinned_local_tx = &pin;
+    std::vector<dash::coin::MutableTransaction> pins{pin};
+    emb.pinned_local_txs = &pins;
     emb.prev_height     = 2'517'800;
 
     bool emb_ran = false, fb_ran = false;

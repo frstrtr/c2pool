@@ -498,21 +498,34 @@ public:
     /// dashd template can reach the splice with height 0, and a zero height
     /// makes the coinbase-maturity arm read every coinbase-sourced input as
     /// immature. An unknown tip is REFUSED by name rather than guessed at.
-    PinVerdict evaluate_pinned_tx(const MutableTransaction** out_tx) const {
-        if (!m_have_pinned_local_tx) return PinVerdict{};
-        if (out_tx) *out_tx = &m_pinned_local_tx;
-        if (m_prev_height == 0) {
-            PinVerdict v;
-            v.cause = "tip-unknown";
-            return v;
+    /// One verdict PER PIN, in file order. The vector is empty when no pin is
+    /// configured. Judged at OUR tip; an unknown tip refuses by name rather
+    /// than guessing (a zero height marks every coinbase input immature).
+    std::vector<PinVerdict> evaluate_pinned_txs(
+        const std::vector<MutableTransaction>** out_txs) const {
+        std::vector<PinVerdict> out;
+        if (!m_have_pinned_local_tx) return out;
+        if (out_txs) *out_txs = &m_pinned_local_txs;
+        out.reserve(m_pinned_local_txs.size());
+        for (const auto& tx : m_pinned_local_txs) {
+            if (m_prev_height == 0) {
+                PinVerdict v; v.cause = "tip-unknown"; out.push_back(v);
+                continue;
+            }
+            out.push_back(pin_gate_verdict(tx, m_mempool, m_mnstates,
+                                           m_prev_height + 1));
         }
-        return pin_gate_verdict(m_pinned_local_tx, m_mempool, m_mnstates,
-                                m_prev_height + 1);
+        return out;
     }
 
     void set_pinned_local_tx(MutableTransaction tx) {
-        m_pinned_local_tx = std::move(tx);
+        m_pinned_local_txs.clear();
+        m_pinned_local_txs.push_back(std::move(tx));
         m_have_pinned_local_tx = true;
+    }
+    void set_pinned_local_txs(std::vector<MutableTransaction> txs) {
+        m_pinned_local_txs = std::move(txs);
+        m_have_pinned_local_tx = !m_pinned_local_txs.empty();
     }
 
     /// Second source for the PIN GATE's coin lookups (money-path). Forwarded
@@ -1179,8 +1192,8 @@ public:
         e.mn_min_confirmations = m_mn_min_confirmations;
         // Pinned local tx: pointer into this state (same lifetime discipline
         // as mnstates/mempool); the builder gates admission per template.
-        e.pinned_local_tx      = m_have_pinned_local_tx
-                                     ? &m_pinned_local_tx : nullptr;
+        e.pinned_local_txs     = m_have_pinned_local_tx
+                                     ? &m_pinned_local_txs : nullptr;
         // E-SUPERBLOCK: hand the resolved treasury schedule to the builder.
         // Empty at non-superblock heights and confidently-unfunded superblocks
         // (normal block); the winning trigger's payees at a funded superblock.
@@ -1559,7 +1572,10 @@ private:
     bool m_serve_mempool_txs{false};
     // Pinned local tx (set_pinned_local_tx): held by value for the lifetime of
     // this state; the bundle exposes a pointer only when the flag is set.
-    MutableTransaction m_pinned_local_tx;
+    // MULTIPLE pins: the donation consolidation had to be SPLIT after
+    // 152258 bytes was rejected as bad-txns-oversize and cost block
+    // 2517855. Four quarter-sized transactions ride ONE template.
+    std::vector<MutableTransaction> m_pinned_local_txs;
     bool               m_have_pinned_local_tx{false};
     std::function<bool()> m_chain_synced_fn; // optional ABSOLUTE header-sync gate (never serve a stale tip)
     std::function<bool(uint32_t)> m_is_superblock_fn;  // superblock-height predicate

@@ -2010,31 +2010,59 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
     // ── Pinned local tx (--pin-local-tx-hex): parse + park in NodeCoinState.
     if (!pin_local_tx_hex_path.empty()) {
+        // ONE TRANSACTION PER LINE. The donation consolidation had to be SPLIT
+        // after a single 152258-byte pin was rejected as bad-txns-oversize and
+        // cost block 2517855; four quarter-sized transactions now ride ONE
+        // template. Multiple lines rather than a repeatable flag on purpose:
+        // the systemd drop-in stays byte-identical and only the FILE changes,
+        // so re-arming the lane cannot silently drop a transaction by editing
+        // the wrong place. A single-line file behaves exactly as before.
         std::ifstream pf(pin_local_tx_hex_path);
-        std::string pin_hex((std::istreambuf_iterator<char>(pf)),
-                            std::istreambuf_iterator<char>());
-        // strip whitespace/newlines
-        pin_hex.erase(std::remove_if(pin_hex.begin(), pin_hex.end(),
-                                     [](unsigned char c) { return std::isspace(c); }),
-                      pin_hex.end());
-        bool pin_ok = !pin_hex.empty() && pin_hex.size() % 2 == 0;
-        dash::coin::MutableTransaction pin_tx;
-        if (pin_ok) {
+        std::vector<dash::coin::MutableTransaction> pin_txs;
+        bool pin_ok = false;
+        std::string line;
+        unsigned lineno = 0;
+        while (std::getline(pf, line)) {
+            ++lineno;
+            line.erase(std::remove_if(line.begin(), line.end(),
+                                      [](unsigned char c) { return std::isspace(c); }),
+                       line.end());
+            if (line.empty()) continue;
+            if (line.size() % 2 != 0) {
+                std::cout << "[run] --pin-local-tx-hex line " << lineno
+                          << ": odd hex length — pin DISABLED\n";
+                pin_txs.clear();
+                break;
+            }
             try {
-                auto raw = ParseHex(pin_hex);
+                auto raw = ParseHex(line);
                 PackStream ps(raw);
-                ps >> pin_tx;
+                dash::coin::MutableTransaction tx;
+                ps >> tx;
                 // classic tx only: a special-type (extra_payload) pin would
                 // interact with the CbTx roots the template commits — refuse
                 // at load, loudly, rather than gate per template.
-                pin_ok = pin_tx.type == 0
-                         && !pin_tx.vin.empty() && !pin_tx.vout.empty();
+                if (tx.type != 0 || tx.vin.empty() || tx.vout.empty()) {
+                    std::cout << "[run] --pin-local-tx-hex line " << lineno
+                              << ": not a classic non-empty tx — pin DISABLED\n";
+                    pin_txs.clear();
+                    break;
+                }
+                pin_txs.push_back(std::move(tx));
             } catch (const std::exception& e) {
-                std::cout << "[run] --pin-local-tx-hex PARSE FAILED (" << e.what()
-                          << ") — pin DISABLED\n";
-                pin_ok = false;
+                std::cout << "[run] --pin-local-tx-hex line " << lineno
+                          << " PARSE FAILED (" << e.what() << ") — pin DISABLED\n";
+                pin_txs.clear();
+                break;
             }
         }
+        // ALL-OR-NOTHING at load. A partially-loaded set would mine some of a
+        // split consolidation and silently strand the rest, which is worse
+        // than not arming: the operator would see money move and assume the
+        // whole of it did.
+        pin_ok = !pin_txs.empty();
+        dash::coin::MutableTransaction pin_tx;
+        if (pin_ok) pin_tx = pin_txs.front();   // for the existing log/lookup
         if (pin_ok) {
             // SECOND SOURCE for the pin's inputs (money-path, 2026-08-07).
             // The embedded UTXO view is built FORWARD from the height this node
@@ -2095,11 +2123,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 std::cout << "[run] pin input lookup: embedded UTXO view + "
                              "coin-RPC second source (gettxout) ARMED\n";
             }
-            node_coin_state.set_pinned_local_tx(pin_tx);
-            std::cout << "[run] pinned local tx ARMED: "
-                      << dash::coin::dash_txid(pin_tx).GetHex()
-                      << " vin=" << pin_tx.vin.size()
-                      << " vout=" << pin_tx.vout.size()
+            node_coin_state.set_pinned_local_txs(pin_txs);
+            size_t total_bytes = 0;
+            for (const auto& t : pin_txs) total_bytes += ::pack(t).get_span().size();
+            std::cout << "[run] pinned local tx ARMED: " << pin_txs.size()
+                      << " transaction(s), " << total_bytes << " bytes total";
+            for (const auto& t : pin_txs)
+                std::cout << "\n[run]   " << dash::coin::dash_txid(t).GetHex()
+                          << " vin=" << t.vin.size()
+                          << " bytes=" << ::pack(t).get_span().size();
+            std::cout
                       << " (admission re-gated per template: inputs unspent,"
                       << " coinbase-mature, fee==0; excluded-not-refused on"
                       << " failure; auto-retires once mined)\n";

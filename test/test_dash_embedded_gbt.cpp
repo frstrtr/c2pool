@@ -1177,6 +1177,12 @@ static dash::coin::DashWorkData build_with_pin(
     const MnStateMachine& mnstates, const Mempool& mp,
     const uint256& prev_hash, const MutableTransaction* pin,
     bool suppress = false) {
+    // The builder now takes a VECTOR of pins (the consolidation had to be
+    // split); these KATs each exercise one, so wrap it.
+    static thread_local std::vector<MutableTransaction> pins;
+    pins.clear();
+    if (pin != nullptr) pins.push_back(*pin);
+    const std::vector<MutableTransaction>* pins_arg = pin ? &pins : nullptr;
     return build_embedded_workdata(
         H - 1, prev_hash, mnstates, mp,
         0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER,
@@ -1186,7 +1192,7 @@ static dash::coin::DashWorkData build_with_pin(
         /*credit_pool=*/0, /*qc=*/nullptr, /*root_override=*/nullptr,
         dash::coin::DASH_MN_RR_HEIGHT_MAINNET, /*superblock=*/nullptr,
         dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
-        suppress, "mempool-txs-disabled", pin);
+        suppress, "mempool-txs-disabled", pins_arg);
 }
 
 TEST(DashEmbeddedGbt, PinnedLocalTxRidesWithZeroFeeAndExactCoinbase) {
@@ -1355,7 +1361,8 @@ TEST(DashPinGate, PlaceholderFallbackIsNeverSpliced) {
     e.prev_height      = 0;            // exactly the production shape
     e.mnstates         = &mnstates;
     e.mempool          = &mp;
-    e.pinned_local_tx  = &pin;
+    std::vector<dash::coin::MutableTransaction> pins{pin};
+    e.pinned_local_txs = &pins;
 
     auto placeholder = []() -> dash::coin::DashWorkData { return {}; };
     auto sel = dash::coin::select_dash_work(e, placeholder);

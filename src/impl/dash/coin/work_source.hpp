@@ -164,7 +164,7 @@ struct EmbeddedWorkInputs {
     // tx. The builder gates admission per template; a null pointer is the
     // byte-unchanged legacy shape. Points into NodeCoinState (same lifetime
     // discipline as mnstates/mempool).
-    const MutableTransaction*        pinned_local_tx{nullptr};
+    const std::vector<MutableTransaction>* pinned_local_txs{nullptr};
 
     bool viable() const {
         return has_state && mnstates != nullptr && mempool != nullptr;
@@ -229,7 +229,8 @@ inline WorkSelection select_dash_work(
     const bool fallback_is_placeholder =
         out.work.m_height == 0 && out.work.m_previous_block.IsNull()
         && out.work.m_txs.empty();
-    if (emb.pinned_local_tx != nullptr && !fallback_is_placeholder) {
+    if (emb.pinned_local_txs != nullptr && !emb.pinned_local_txs->empty()
+        && !fallback_is_placeholder) {
         if (emb.mempool == nullptr || emb.mnstates == nullptr) {
             LOG_INFO << "[dashd-splice] pinned tx EXCLUDED h="
                      << out.work.m_height << " cause=no-verify-view ("
@@ -247,8 +248,8 @@ inline WorkSelection select_dash_work(
             // this template builds.
             if (out.work.m_height == 0 && emb.prev_height != 0)
                 out.work.m_height = emb.prev_height + 1;
-            splice_pinned_tx(out.work, *emb.pinned_local_tx,
-                             *emb.mempool, *emb.mnstates, "dashd-splice");
+            splice_pinned_txs(out.work, *emb.pinned_local_txs,
+                              *emb.mempool, *emb.mnstates, "dashd-splice");
         }
     }
     return out;
@@ -295,7 +296,7 @@ inline WorkSelection select_dash_work(
                 emb.suppress_cause,
                 // Pinned local tx (donation consolidation): admission gated
                 // inside the builder per template; null => byte-unchanged.
-                emb.pinned_local_tx);
+                emb.pinned_local_txs);
         },
         dashd_fallback);
 }
