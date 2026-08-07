@@ -15,6 +15,8 @@
 
 #include <impl/dash/coin/work_source.hpp>
 #include <impl/dash/coin/special_tx_pool_delta.hpp>
+#include <impl/dash/coin/rpc_data.hpp>
+#include <core/pack.hpp>
 #include <c2pool/hashrate/tracker.hpp>
 
 #include <cmath>
@@ -362,35 +364,35 @@ std::vector<unsigned char> pack_payload(const Payload& pl) {
         reinterpret_cast<const unsigned char*>(span.data()) + span.size());
 }
 
-TxOut out_of(int64_t v) { TxOut o; o.value = v; return o; }
+::bitcoin_family::coin::TxOut out_of(int64_t v) { ::bitcoin_family::coin::TxOut o; o.value = v; return o; }
 
 /// Type-8: pool GAINS sum(payload.creditOutputs).
-MutableTransaction make_lock(int64_t credit_value) {
-    CAssetLockPayload pl;
+dash::coin::MutableTransaction make_lock(int64_t credit_value) {
+    dash::coin::vendor::CAssetLockPayload pl;
     pl.creditOutputs.push_back(out_of(credit_value));
-    MutableTransaction tx;
+    dash::coin::MutableTransaction tx;
     tx.version = 3;
-    tx.type    = CAssetLockPayload::SPECIALTX_TYPE;   // 8
+    tx.type    = dash::coin::vendor::CAssetLockPayload::SPECIALTX_TYPE;   // 8
     tx.extra_payload = pack_payload(pl);
     return tx;
 }
 
 /// Type-9: pool LOSES (payload.fee + sum(vout)); no inputs, outputs are minted.
-MutableTransaction make_unlock(int64_t out_value, uint32_t fee) {
-    CAssetUnlockPayload pl;
+dash::coin::MutableTransaction make_unlock(int64_t out_value, uint32_t fee) {
+    dash::coin::vendor::CAssetUnlockPayload pl;
     pl.index           = 1;
     pl.fee             = fee;
     pl.requestedHeight = 1000;
-    MutableTransaction tx;
+    dash::coin::MutableTransaction tx;
     tx.version = 3;
-    tx.type    = CAssetUnlockPayload::SPECIALTX_TYPE; // 9
+    tx.type    = dash::coin::vendor::CAssetUnlockPayload::SPECIALTX_TYPE; // 9
     tx.vout.push_back(out_of(out_value));
     tx.extra_payload = pack_payload(pl);
     return tx;
 }
 
-MutableTransaction make_plain() {
-    MutableTransaction tx;
+dash::coin::MutableTransaction make_plain() {
+    dash::coin::MutableTransaction tx;
     tx.version = 2;
     tx.type    = 0;
     tx.vout.push_back(out_of(50'000));
@@ -406,8 +408,8 @@ TEST(DashSpecialPoolDelta, PendingLockExplainsThePositiveDivergence)
     const int64_t ours  = 3'028'884'293'639;         // our CbTx creditPool
     const int64_t dashd = ours + kLock;              // dashd's, with the lock
 
-    std::vector<MutableTransaction> txs{ make_plain(), make_lock(kLock) };
-    const auto sp = special_tx_pool_delta(txs);
+    std::vector<dash::coin::MutableTransaction> txs{ make_plain(), make_lock(kLock) };
+    const auto sp = dash::coin::special_tx_pool_delta(txs);
 
     EXPECT_EQ(sp.count, 1u);
     EXPECT_FALSE(sp.unparsable);
@@ -423,8 +425,8 @@ TEST(DashSpecialPoolDelta, PendingUnlockSubtractsOutputsPlusPayloadFee)
     const int64_t ours  = 3'029'419'859'335;
     const int64_t dashd = ours - (kOut + kFee);
 
-    std::vector<MutableTransaction> txs{ make_unlock(kOut, kFee) };
-    const auto sp = special_tx_pool_delta(txs);
+    std::vector<dash::coin::MutableTransaction> txs{ make_unlock(kOut, kFee) };
+    const auto sp = dash::coin::special_tx_pool_delta(txs);
 
     EXPECT_EQ(sp.count, 1u);
     EXPECT_EQ(sp.delta, -(kOut + static_cast<int64_t>(kFee)));
@@ -441,9 +443,9 @@ TEST(DashSpecialPoolDelta, MixedLockAndUnlockSumSigned)
     const int64_t ours  = 3'023'215'610'725;
     const int64_t dashd = ours + expected;
 
-    std::vector<MutableTransaction> txs{
+    std::vector<dash::coin::MutableTransaction> txs{
         make_lock(kLock), make_plain(), make_unlock(kOut, kFee) };
-    const auto sp = special_tx_pool_delta(txs);
+    const auto sp = dash::coin::special_tx_pool_delta(txs);
 
     EXPECT_EQ(sp.count, 2u);
     EXPECT_EQ(sp.delta, expected);
@@ -458,8 +460,8 @@ TEST(DashSpecialPoolDelta, UnrelatedDivergenceIsNotExplained)
     const int64_t ours  = 3'028'884'293'639;
     const int64_t dashd = ours + kLock + 1;          // one duff off
 
-    std::vector<MutableTransaction> txs{ make_lock(kLock) };
-    const auto sp = special_tx_pool_delta(txs);
+    std::vector<dash::coin::MutableTransaction> txs{ make_lock(kLock) };
+    const auto sp = dash::coin::special_tx_pool_delta(txs);
 
     EXPECT_EQ(sp.delta, kLock);
     EXPECT_FALSE(sp.explains(ours, dashd));
@@ -469,8 +471,8 @@ TEST(DashSpecialPoolDelta, UnrelatedDivergenceIsNotExplained)
 //    "explained by special movement" — there was nothing to explain it with.
 TEST(DashSpecialPoolDelta, NoSpecialTxsNeverExplains)
 {
-    std::vector<MutableTransaction> txs{ make_plain(), make_plain() };
-    const auto sp = special_tx_pool_delta(txs);
+    std::vector<dash::coin::MutableTransaction> txs{ make_plain(), make_plain() };
+    const auto sp = dash::coin::special_tx_pool_delta(txs);
 
     EXPECT_EQ(sp.count, 0u);
     EXPECT_EQ(sp.delta, 0);
@@ -481,13 +483,13 @@ TEST(DashSpecialPoolDelta, NoSpecialTxsNeverExplains)
 //    NOTHING about the true movement, so nothing may be explained by it.
 TEST(DashSpecialPoolDelta, UnparsablePayloadExplainsNothing)
 {
-    MutableTransaction broken;
+    dash::coin::MutableTransaction broken;
     broken.version = 3;
-    broken.type    = CAssetLockPayload::SPECIALTX_TYPE;
+    broken.type    = dash::coin::vendor::CAssetLockPayload::SPECIALTX_TYPE;
     broken.extra_payload = { 0xff, 0xff, 0xff };     // not a valid payload
 
-    std::vector<MutableTransaction> txs{ make_lock(1'000), broken };
-    const auto sp = special_tx_pool_delta(txs);
+    std::vector<dash::coin::MutableTransaction> txs{ make_lock(1'000), broken };
+    const auto sp = dash::coin::special_tx_pool_delta(txs);
 
     EXPECT_TRUE(sp.unparsable);
     EXPECT_FALSE(sp.explains(0, 0));
