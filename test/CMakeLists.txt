@@ -1027,6 +1027,11 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_get_work PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining c2pool_storage pool)  # OBJECT-lib SCC direct-naming (#22/#39)
+    # #950: every target that includes node.hpp and instantiates handle_version
+    # links NodeImpl::send_standing_remember, defined in node.cpp — see the
+    # test_dash_node_embedded_wire note above and the #889 precedent. Targets
+    # that only type-check against the header do not need this; these do.
+    target_link_libraries(test_dash_get_work PRIVATE dash sharechain)
     gtest_add_tests(test_dash_get_work "" AUTO)
 
     # Reception wire (legs 1-3): interfaces::Node reception Events ->
@@ -1213,7 +1218,12 @@ if (BUILD_TESTING AND GTest_FOUND)
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}
     )
-    target_link_libraries(test_dash_auto_ratchet PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    target_link_libraries(test_dash_auto_ratchet PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining c2pool_storage pool)  # OBJECT-lib SCC direct-naming (#22/#39)
+    # #950: every target that includes node.hpp and instantiates handle_version
+    # links NodeImpl::send_standing_remember, defined in node.cpp — see the
+    # test_dash_node_embedded_wire note above and the #889 precedent. Targets
+    # that only type-check against the header do not need this; these do.
+    target_link_libraries(test_dash_auto_ratchet PRIVATE dash sharechain)
     gtest_add_tests(test_dash_auto_ratchet "" AUTO)
 
     add_executable(test_dash_peer test_dash_peer.cpp)
