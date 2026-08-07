@@ -541,3 +541,90 @@ TEST(DashboardData, PaymentsEqualBlockValueWhereThereIsNoProtocolLane)
         EXPECT_FALSE(stats.contains("block_value_burn"));
     }
 }
+
+// ── AUTHORSHIP: three states, and "unknown" is one of them ───────────────
+//
+// Block 2517979 (2026-08-07) read as ours by every check the log offered --
+// our address in the coinbase, BLOCK CONFIRMED printed, confirmations=1 --
+// and was found by another node on the sharechain. The coinbase cannot
+// answer authorship on a p2pool sharechain: it pays every participant.
+//
+// The first cut of the fix used a bool defaulting to false. That is a
+// two-valued answer to a three-valued question, and its default reads as a
+// CLAIM -- every LTC/DGB/BTC/BCH block, whose call sites do not label, would
+// have announced a sharechain peer as its finder. These tests pin the third
+// state and the direction of the merge.
+TEST(FoundBlockAuthorship, UnlabelledCallSiteStaysUnknownAndClaimsNothing)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const std::string h =
+        "5555555555555555555555555555555555555555555555555555555555555555";
+    // The LTC/DGB/BTC/BCH call shape: no authorship argument at all.
+    mi.record_found_block(2500000, uint256S(h), /*ts=*/1785955172, "LTC",
+                          "LhY4example", h, 1000.0, 1.0, 0.0, 0);
+    auto blk = find_block(mi.rest_recent_blocks(), h);
+    ASSERT_TRUE(blk.is_object());
+    EXPECT_EQ(blk["found_by"].get<std::string>(), "unknown")
+        << "a lane that does not label must say unknown, never name a finder";
+}
+
+TEST(FoundBlockAuthorship, LabelledSitesReportTheFinderTheyKnow)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const std::string hp =
+        "6666666666666666666666666666666666666666666666666666666666666666";
+    const std::string hl =
+        "7777777777777777777777777777777777777777777777777777777777777777";
+    mi.record_found_block(2517979, uint256S(hp), 1785955172, "DASH",
+                          "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", hp,
+                          1000.0, 1.0, 0.0, 0,
+                          MiningInterface::BlockAuthorship::sharechain_peer);
+    mi.record_found_block(2517980, uint256S(hl), 1785955174, "DASH",
+                          "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", hl,
+                          1000.0, 1.0, 0.0, 0,
+                          MiningInterface::BlockAuthorship::this_node);
+    auto blocks = mi.rest_recent_blocks();
+    EXPECT_EQ(find_block(blocks, hp)["found_by"].get<std::string>(),
+              "sharechain_peer");
+    EXPECT_EQ(find_block(blocks, hl)["found_by"].get<std::string>(),
+              "this_node");
+}
+
+TEST(FoundBlockAuthorship, EnrichmentRaisesAuthorshipAndNeverLowersIt)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const std::string h =
+        "8888888888888888888888888888888888888888888888888888888888888888";
+    // The real ordering on DASH: the peer path sees the block on the
+    // sharechain first, and our own dispatch enriches the SAME row after.
+    // That second call is the one that knows we built it.
+    mi.record_found_block(2517981, uint256S(h), 1785955172, "DASH",
+                          "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", h,
+                          1000.0, 1.0, 0.0, 0,
+                          MiningInterface::BlockAuthorship::sharechain_peer);
+    mi.record_found_block(2517981, uint256S(h), 1785955172, "DASH",
+                          "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", h,
+                          1000.0, 1.0, 0.0, 0,
+                          MiningInterface::BlockAuthorship::this_node);
+    EXPECT_EQ(find_block(mi.rest_recent_blocks(), h)["found_by"].get<std::string>(),
+              "this_node");
+
+    // And the reverse order must NOT demote it. An assignment-style merge
+    // would; taking the max is why it cannot.
+    const std::string h2 =
+        "9999999999999999999999999999999999999999999999999999999999999999";
+    mi.record_found_block(2517982, uint256S(h2), 1785955174, "DASH",
+                          "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", h2,
+                          1000.0, 1.0, 0.0, 0,
+                          MiningInterface::BlockAuthorship::this_node);
+    mi.record_found_block(2517982, uint256S(h2), 1785955174, "DASH",
+                          "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", h2,
+                          1000.0, 1.0, 0.0, 0,
+                          MiningInterface::BlockAuthorship::sharechain_peer);
+    EXPECT_EQ(find_block(mi.rest_recent_blocks(), h2)["found_by"].get<std::string>(),
+              "this_node")
+        << "a later, less informed call must not downgrade a known finder";
+}

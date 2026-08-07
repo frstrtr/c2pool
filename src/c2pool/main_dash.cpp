@@ -1672,7 +1672,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             // template that won. Our pins and our tx selection
                             // are not in it, and our address may still be in
                             // the coinbase as our share of the pool payout.
-                            /*found_locally=*/false);
+                            // row.miner is that peer's own payout address,
+                            // derived from the winning share's pubkey hash.
+                            core::MiningInterface::BlockAuthorship
+                                ::sharechain_peer);
                         // Arm the post-broadcast confirm/orphan poller so this
                         // peer-found block flips off "pending" (main_ltc.cpp:6315
                         // parity). Telemetry only; never gates a broadcast.
@@ -2617,7 +2620,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         subsidy,
                         // Local dispatch: THIS node built the template and
                         // sent the block. Whatever we pinned rode it.
-                        /*found_locally=*/true);
+                        core::MiningInterface::BlockAuthorship::this_node);
                     // Arm the post-broadcast confirm/orphan poller so this local
                     // win flips off "pending" (main_ltc.cpp:4258 parity).
                     // Telemetry only; runs after dispatch, never gates it.
