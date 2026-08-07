@@ -1164,3 +1164,128 @@ TEST(DashUtxoImmatureServing, SelectorThreadsSuppressionIntoTheBuilder) {
     EXPECT_EQ(sel_empty.work.m_coinbase_value,
               static_cast<uint64_t>(compute_dash_block_reward_post_v20(H)));
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// PINNED LOCAL TX (donation-dust consolidation lane). The four gate faces:
+// admissible rides with fee 0 and exact coinbase; a missing/spent input, an
+// immature coinbase input, and a nonzero fee are each EXCLUDED — template
+// byte-identical to a build with no pin at all, never a refused template.
+// ════════════════════════════════════════════════════════════════════════
+
+// Convenience: full positional call up to the trailing pinned seam.
+static dash::coin::DashWorkData build_with_pin(
+    const MnStateMachine& mnstates, const Mempool& mp,
+    const uint256& prev_hash, const MutableTransaction* pin,
+    bool suppress = false) {
+    return build_embedded_workdata(
+        H - 1, prev_hash, mnstates, mp,
+        0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER,
+        /*curtime=*/1'700'000'100u, /*version=*/0x20000000u,
+        /*underfill=*/nullptr, /*sml=*/nullptr, /*qmgr=*/nullptr,
+        /*best_cl_height=*/0, dash::coin::k_zero_cl_sig,
+        /*credit_pool=*/0, /*qc=*/nullptr, /*root_override=*/nullptr,
+        dash::coin::DASH_MN_RR_HEIGHT_MAINNET, /*superblock=*/nullptr,
+        dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+        suppress, "mempool-txs-disabled", pin);
+}
+
+TEST(DashEmbeddedGbt, PinnedLocalTxRidesWithZeroFeeAndExactCoinbase) {
+    UTXOViewCache utxo(nullptr);
+    // Two MATURE coinbase outputs (donation dust shape): height far below
+    // H - 100, spendable at H.
+    uint256 don1 = mint_hash(70), don2 = mint_hash(71);
+    utxo.add_coin(Outpoint(don1, 0), Coin(60'000, {}, H - 5'000, /*cb=*/true));
+    utxo.add_coin(Outpoint(don2, 0), Coin(40'000, {}, H - 4'000, /*cb=*/true));
+    Mempool mp; mp.set_utxo(&utxo);
+
+    // The consolidation: 2 inputs -> 1 output of the EXACT sum (fee 0).
+    MutableTransaction pin;
+    pin.version = 2; pin.type = 0; pin.locktime = 0;
+    { TxIn i; i.prevout.hash = don1; i.prevout.index = 0; i.sequence = 0xffffffffu; pin.vin.push_back(i); }
+    { TxIn i; i.prevout.hash = don2; i.prevout.index = 0; i.sequence = 0xffffffffu; pin.vin.push_back(i); }
+    { TxOut o; o.value = 100'000; pin.vout.push_back(o); }
+
+    auto mnstates = single_mn(p2pkh_script(0x30));
+    // suppress_mempool_txs=true — the production hotel posture; the pin must
+    // ride the coinbase-only body regardless.
+    auto w = build_with_pin(mnstates, mp, raw256(0xAB), &pin, /*suppress=*/true);
+
+    ASSERT_EQ(w.m_txs.size(), 1u) << "the pinned tx and nothing else";
+    EXPECT_EQ(w.m_tx_hashes[0], dash::coin::dash_txid(pin));
+    EXPECT_EQ(w.m_tx_fees[0], 0u);
+    // Zero fee => coinbase value is the pure subsidy, bit-exact.
+    EXPECT_EQ(w.m_coinbase_value,
+              static_cast<uint64_t>(compute_dash_block_reward_post_v20(H)));
+    // The wire body carries the pin (submit-time source).
+    ASSERT_EQ(w.m_tx_data_hex.size(), 1u);
+    EXPECT_FALSE(w.m_tx_data_hex[0].empty());
+}
+
+TEST(DashEmbeddedGbt, PinnedLocalTxExcludedFacesLeaveTemplateUntouched) {
+    auto mnstates = single_mn(p2pkh_script(0x30));
+    uint256 prev_hash = raw256(0xAB);
+
+    // Baseline: no pin at all, coinbase-only.
+    UTXOViewCache utxo0(nullptr);
+    Mempool mp0; mp0.set_utxo(&utxo0);
+    auto base = build_with_pin(mnstates, mp0, prev_hash, nullptr, true);
+    ASSERT_EQ(base.m_txs.size(), 0u);
+
+    // Face 1 — input missing entirely (already mined / never existed).
+    {
+        UTXOViewCache utxo(nullptr);
+        Mempool mp; mp.set_utxo(&utxo);
+        MutableTransaction pin;
+        pin.version = 2; pin.type = 0;
+        TxIn i; i.prevout.hash = mint_hash(80); i.prevout.index = 0; pin.vin.push_back(i);
+        TxOut o; o.value = 1'000; pin.vout.push_back(o);
+        auto w = build_with_pin(mnstates, mp, prev_hash, &pin, true);
+        EXPECT_EQ(w.m_txs.size(), 0u) << "missing input must EXCLUDE the pin";
+        EXPECT_EQ(w.m_coinbase_value, base.m_coinbase_value);
+    }
+    // Face 2 — immature coinbase input (donation output younger than 100).
+    {
+        UTXOViewCache utxo(nullptr);
+        uint256 fresh = mint_hash(81);
+        utxo.add_coin(Outpoint(fresh, 0), Coin(5'000, {}, H - 10, /*cb=*/true));
+        Mempool mp; mp.set_utxo(&utxo);
+        MutableTransaction pin;
+        pin.version = 2; pin.type = 0;
+        TxIn i; i.prevout.hash = fresh; i.prevout.index = 0; pin.vin.push_back(i);
+        TxOut o; o.value = 5'000; pin.vout.push_back(o);
+        auto w = build_with_pin(mnstates, mp, prev_hash, &pin, true);
+        EXPECT_EQ(w.m_txs.size(), 0u)
+            << "coinbase input at H-10 is immature at H — must EXCLUDE";
+    }
+    // Face 3 — fee not exactly zero (snapshot drift: output != input sum).
+    {
+        UTXOViewCache utxo(nullptr);
+        uint256 old1 = mint_hash(82);
+        utxo.add_coin(Outpoint(old1, 0), Coin(9'000, {}, H - 5'000, /*cb=*/true));
+        Mempool mp; mp.set_utxo(&utxo);
+        MutableTransaction pin;
+        pin.version = 2; pin.type = 0;
+        TxIn i; i.prevout.hash = old1; i.prevout.index = 0; pin.vin.push_back(i);
+        TxOut o; o.value = 8'000; pin.vout.push_back(o);   // 1000 duffs "fee"
+        auto w = build_with_pin(mnstates, mp, prev_hash, &pin, true);
+        EXPECT_EQ(w.m_txs.size(), 0u)
+            << "nonzero fee breaks this lane's contract — must EXCLUDE";
+    }
+    // Face 4 — the gate self-heals: same pin becomes admissible when its
+    // input appears mature, WITHOUT any state reset between builds.
+    {
+        UTXOViewCache utxo(nullptr);
+        Mempool mp; mp.set_utxo(&utxo);
+        uint256 don = mint_hash(83);
+        MutableTransaction pin;
+        pin.version = 2; pin.type = 0;
+        TxIn i; i.prevout.hash = don; i.prevout.index = 0; pin.vin.push_back(i);
+        TxOut o; o.value = 7'000; pin.vout.push_back(o);
+        auto w1 = build_with_pin(mnstates, mp, prev_hash, &pin, true);
+        EXPECT_EQ(w1.m_txs.size(), 0u);
+        utxo.add_coin(Outpoint(don, 0), Coin(7'000, {}, H - 5'000, /*cb=*/true));
+        auto w2 = build_with_pin(mnstates, mp, prev_hash, &pin, true);
+        ASSERT_EQ(w2.m_txs.size(), 1u) << "pin must self-heal into the template";
+        EXPECT_EQ(w2.m_tx_fees[0], 0u);
+    }
+}

@@ -193,7 +193,20 @@ inline DashWorkData build_embedded_workdata(
     // default-OFF posture ("mempool-txs-disabled", node_coin_state.hpp). The
     // cause rides the template (m_txset_empty_cause) + the log line, so soaks
     // can tell the two coinbase-only modes apart.
-    const char* txset_empty_cause = "utxo-immature-serving")
+    const char* txset_empty_cause = "utxo-immature-serving",
+    // ── PINNED LOCAL TX seam (donation-dust consolidation lane) ──────────
+    // An operator-supplied, externally-signed, ZERO-fee tx that can only
+    // reach the chain through OUR OWN block (relay rejects 0-fee). Included
+    // right after the mandatory type-6 commitments when — and only when —
+    // Mempool::pinned_tx_admissible() passes against the live UTXO view; on
+    // ANY failure the tx is EXCLUDED and the template is built exactly as if
+    // no pin existed (a bad pinned tx must never cost a block, and must
+    // never refuse a template). Fee is 0 by the gate's contract, so
+    // total_fees / block_value / mn_payment stay exact untouched. Rides
+    // regardless of suppress_mempool_txs — the coinbase-only posture is
+    // about MEMPOOL selection; the pin is not a mempool tx.
+    // Default nullptr => every existing positional caller byte-unchanged.
+    const MutableTransaction* pinned_local_tx = nullptr)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
@@ -342,6 +355,39 @@ inline DashWorkData build_embedded_workdata(
             w.m_tx_hashes.push_back(dash::coin::dash_txid(qtx));
             w.m_tx_fees.push_back(0);
             w.m_tx_data_hex.push_back(tx_hex(qtx));
+        }
+    }
+    // ── PINNED LOCAL TX — after the consensus-required type-6 set, before
+    // mempool selection. Gate re-checked on EVERY build: inputs unspent,
+    // coinbase-mature at THIS height, fee exactly zero. Exclusion is the
+    // only failure mode (see the parameter note); the MN-collateral filter
+    // applies here too — a pinned tx spending a collateral would poison the
+    // committed merkleRootMNList exactly like a selected one.
+    if (pinned_local_tx != nullptr) {
+        const auto gate = mempool.pinned_tx_admissible(*pinned_local_tx,
+                                                       w.m_height);
+        uint256 protx;
+        if (gate != Mempool::PinnedTxGate::Ok) {
+            LOG_INFO << "[GBT-EMB] pinned tx EXCLUDED h=" << w.m_height
+                     << " cause=" << Mempool::pinned_gate_name(gate)
+                     << " txid=" << dash::coin::dash_txid(*pinned_local_tx)
+                            .GetHex().substr(0, 16)
+                     << " (template built without it; re-checked next build)";
+        } else if (tx_spends_mn_collateral(mnstates, *pinned_local_tx,
+                                           &protx)) {
+            LOG_WARNING << "[GBT-EMB] pinned tx EXCLUDED h=" << w.m_height
+                        << " cause=spends-mn-collateral MN "
+                        << protx.GetHex().substr(0, 16);
+        } else {
+            w.m_txs.emplace_back(*pinned_local_tx);
+            w.m_tx_hashes.push_back(dash::coin::dash_txid(*pinned_local_tx));
+            w.m_tx_fees.push_back(0);
+            w.m_tx_data_hex.push_back(tx_hex(*pinned_local_tx));
+            LOG_INFO << "[GBT-EMB] pinned tx INCLUDED h=" << w.m_height
+                     << " txid=" << dash::coin::dash_txid(*pinned_local_tx)
+                            .GetHex().substr(0, 16)
+                     << " vin=" << pinned_local_tx->vin.size()
+                     << " fee=0 (rides this template)";
         }
     }
     uint64_t selected_bytes = 0;  // wire bytes packed into this template (underfill guard)
