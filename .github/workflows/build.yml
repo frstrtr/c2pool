@@ -185,11 +185,17 @@ jobs:
           ctest --test-dir build_ci -R '^boost_sentinel$' --output-on-failure
 
       - name: Build
+        # shell: bash => bash -o pipefail. WITHOUT it the default shell is
+        # `bash -e {0}` (no pipefail), so `cmake ... | tee` would report TEE's
+        # exit status — a FAILING build would go green. Every teed step below
+        # needs this for the same reason.
+        shell: bash
         run: |
           mkdir -p "${GITHUB_WORKSPACE}/ci-logs"
           cmake --build build_ci --target c2pool -j8 2>&1 | tee "${GITHUB_WORKSPACE}/ci-logs/build.log"
 
       - name: Build tests
+        shell: bash          # pipefail: see the Build step note above
         run: |
           mkdir -p "${GITHUB_WORKSPACE}/ci-logs"
           cmake --build build_ci \
@@ -216,6 +222,7 @@ jobs:
 
       - name: Run tests
         working-directory: build_ci
+        shell: bash          # pipefail: a failing ctest must fail the step
         run: |
           mkdir -p "${GITHUB_WORKSPACE}/ci-logs"
           ctest --output-on-failure -j8 --exclude-regex "LiveTest\." 2>&1 | tee "${GITHUB_WORKSPACE}/ci-logs/run-tests.log"
