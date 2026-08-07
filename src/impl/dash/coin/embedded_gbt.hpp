@@ -176,6 +176,41 @@ inline void splice_pinned_tx(DashWorkData& w,
              << " vin=" << pin.vin.size() << " fee=0 (rides this template)";
 }
 
+/// Splice EVERY admissible pin, in file order, under a CUMULATIVE byte cap.
+///
+/// The donation consolidation had to be split into four transactions after a
+/// single 152258-byte pin was rejected as bad-txns-oversize and cost block
+/// 2517855. Four quarter-sized transactions ride ONE template, so the money
+/// lands in one block instead of four.
+///
+/// Each pin is gated INDEPENDENTLY: one bad pin excludes itself and the others
+/// still ride. The cumulative cap is checked against what has ALREADY been
+/// accepted, so the answer never depends on the order the caller happened to
+/// pass them in beyond file order itself.
+inline void splice_pinned_txs(DashWorkData& w,
+                              const std::vector<MutableTransaction>& pins,
+                              const Mempool& mempool,
+                              const MnStateMachine& mnstates,
+                              const char* arm)
+{
+    size_t spliced_bytes = 0;
+    for (const auto& pin : pins) {
+        const size_t sz = ::pack(pin).get_span().size();
+        if (spliced_bytes + sz > Mempool::kMaxPinnedTotalBytes) {
+            LOG_INFO << "[" << arm << "] pinned tx EXCLUDED h=" << w.m_height
+                     << " cause=pin-total-too-large txid="
+                     << dash::coin::dash_txid(pin).GetHex().substr(0, 16)
+                     << " (" << spliced_bytes << "+" << sz << " > "
+                     << Mempool::kMaxPinnedTotalBytes
+                     << "; earlier pins keep their places)";
+            continue;
+        }
+        const size_t before = w.m_txs.size();
+        splice_pinned_tx(w, pin, mempool, mnstates, arm);
+        if (w.m_txs.size() != before) spliced_bytes += sz;
+    }
+}
+
 inline DashWorkData build_embedded_workdata(
     uint32_t prev_height,
     const uint256& prev_hash,
@@ -282,7 +317,7 @@ inline DashWorkData build_embedded_workdata(
     // regardless of suppress_mempool_txs — the coinbase-only posture is
     // about MEMPOOL selection; the pin is not a mempool tx.
     // Default nullptr => every existing positional caller byte-unchanged.
-    const MutableTransaction* pinned_local_tx = nullptr)
+    const std::vector<MutableTransaction>* pinned_local_txs = nullptr)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
@@ -439,8 +474,8 @@ inline DashWorkData build_embedded_workdata(
     // only failure mode (see the parameter note); the MN-collateral filter
     // applies here too — a pinned tx spending a collateral would poison the
     // committed merkleRootMNList exactly like a selected one.
-    if (pinned_local_tx != nullptr)
-        splice_pinned_tx(w, *pinned_local_tx, mempool, mnstates, "GBT-EMB");
+    if (pinned_local_txs != nullptr && !pinned_local_txs->empty())
+        splice_pinned_txs(w, *pinned_local_txs, mempool, mnstates, "GBT-EMB");
     uint64_t selected_bytes = 0;  // wire bytes packed into this template (underfill guard)
     for (auto& s : selected) {
         selected_bytes += s.base_size;

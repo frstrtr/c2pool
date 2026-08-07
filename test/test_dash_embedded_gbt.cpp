@@ -1177,6 +1177,12 @@ static dash::coin::DashWorkData build_with_pin(
     const MnStateMachine& mnstates, const Mempool& mp,
     const uint256& prev_hash, const MutableTransaction* pin,
     bool suppress = false) {
+    // The builder now takes a VECTOR of pins (the consolidation had to be
+    // split); these KATs each exercise one, so wrap it.
+    static thread_local std::vector<MutableTransaction> pins;
+    pins.clear();
+    if (pin != nullptr) pins.push_back(*pin);
+    const std::vector<MutableTransaction>* pins_arg = pin ? &pins : nullptr;
     return build_embedded_workdata(
         H - 1, prev_hash, mnstates, mp,
         0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER,
@@ -1186,7 +1192,7 @@ static dash::coin::DashWorkData build_with_pin(
         /*credit_pool=*/0, /*qc=*/nullptr, /*root_override=*/nullptr,
         dash::coin::DASH_MN_RR_HEIGHT_MAINNET, /*superblock=*/nullptr,
         dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
-        suppress, "mempool-txs-disabled", pin);
+        suppress, "mempool-txs-disabled", pins_arg);
 }
 
 TEST(DashEmbeddedGbt, PinnedLocalTxRidesWithZeroFeeAndExactCoinbase) {
@@ -1355,7 +1361,8 @@ TEST(DashPinGate, PlaceholderFallbackIsNeverSpliced) {
     e.prev_height      = 0;            // exactly the production shape
     e.mnstates         = &mnstates;
     e.mempool          = &mp;
-    e.pinned_local_tx  = &pin;
+    std::vector<dash::coin::MutableTransaction> pins{pin};
+    e.pinned_local_txs = &pins;
 
     auto placeholder = []() -> dash::coin::DashWorkData { return {}; };
     auto sel = dash::coin::select_dash_work(e, placeholder);
@@ -1376,4 +1383,97 @@ TEST(DashPinGate, PlaceholderFallbackIsNeverSpliced) {
     ASSERT_EQ(sel_real.source, dash::coin::WorkSource::DashdFallback);
     EXPECT_EQ(sel_real.work.m_txs.size(), 1u)
         << "a genuine fallback template still carries the pin";
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// SIZE — the gate face that did not exist, and the block it cost.
+//
+//   2026-08-07 14:33:45  won block height=2517855 bytes=152889
+//   2026-08-07 14:33:45  submit_block_hex result: "bad-txns-oversize"
+//
+// Height 2517855 went to another miner. The pinned consolidation was 152258
+// bytes (1032 inputs) and EVERY face the gate had — inputs unspent, coinbase
+// maturity, fee exactly zero, no MN-collateral spend — passed it. The tx was
+// admissible by every rule anyone had thought to write, and unmineable by
+// consensus. dashd agreed independently:
+//   testmempoolaccept -> allowed=false reject-reason="bad-txns-oversize"
+//
+// A pin is not worth its own value when it is wrong. It is worth the block.
+// ════════════════════════════════════════════════════════════════════════
+
+// Build a pin with `n` inputs, all mature and unspent, fee exactly zero — so
+// the ONLY thing that can refuse it is size.
+static MutableTransaction make_admissible_pin(UTXOViewCache& utxo, unsigned n,
+                                              unsigned seed_base) {
+    MutableTransaction pin;
+    pin.version = 2; pin.type = 0; pin.locktime = 0;
+    int64_t total = 0;
+    for (unsigned i = 0; i < n; ++i) {
+        uint256 h = mint_hash(seed_base + i);
+        const int64_t v = 1'000 + i;
+        utxo.add_coin(Outpoint(h, 0), Coin(v, {}, H - 5'000, /*cb=*/true));
+        TxIn in; in.prevout.hash = h; in.prevout.index = 0;
+        // A real signed input carries a ~107-byte scriptSig (DER sig +
+        // compressed pubkey). Without it the KAT would measure a shape that
+        // never reaches a block, and the size face would be tested against
+        // fiction.
+        std::vector<unsigned char> sig(107, 0x51);
+        in.scriptSig = OPScript(sig.data(), sig.data() + sig.size());
+        in.sequence = 0xffffffffu;
+        pin.vin.push_back(in);
+        total += v;
+    }
+    TxOut o; o.value = total; pin.vout.push_back(o);   // fee exactly zero
+    return pin;
+}
+
+TEST(DashPinGate, OversizePinIsRefusedByNameNotDiscoveredAtSubmit) {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp; mp.set_utxo(&utxo);
+
+    // 1032 inputs — the production shape, byte-for-byte in spirit.
+    auto pin = make_admissible_pin(utxo, 1032, 5'000);
+    const size_t bytes = ::pack(pin).get_span().size();
+    EXPECT_GT(bytes, dash::coin::Mempool::kMaxPinnedTxBytes)
+        << "the KAT must reproduce an OVERSIZE tx or it proves nothing; got "
+        << bytes << " bytes";
+
+    EXPECT_EQ(mp.pinned_tx_admissible(pin, H),
+              dash::coin::Mempool::PinnedTxGate::TooLarge)
+        << "an oversize pin must be refused BY NAME at gate time — the "
+           "alternative is discovering it from dashd after the block is gone";
+    EXPECT_STREQ(dash::coin::Mempool::pinned_gate_name(
+                     dash::coin::Mempool::PinnedTxGate::TooLarge),
+                 "tx-too-large");
+}
+
+TEST(DashPinGate, SplitPinUnderTheCapIsAdmissible) {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp; mp.set_utxo(&utxo);
+
+    // 258 inputs = the 1032 consolidation split four ways. Same coins, same
+    // zero fee, same maturity — the ONLY change is size.
+    auto pin = make_admissible_pin(utxo, 258, 9'000);
+    const size_t bytes = ::pack(pin).get_span().size();
+    EXPECT_LT(bytes, dash::coin::Mempool::kMaxPinnedTxBytes)
+        << "a quarter-split must fit under the cap; got " << bytes;
+
+    EXPECT_EQ(mp.pinned_tx_admissible(pin, H),
+              dash::coin::Mempool::PinnedTxGate::Ok)
+        << "splitting is the fix, so the split must actually pass";
+}
+
+// The size face runs BEFORE the coin lookups. With no UTXO view wired at all,
+// an oversize tx must still be named TooLarge rather than utxo-view-unset:
+// the verdict is certain without consulting any chain state, and reporting the
+// weaker cause would send the operator hunting a view that is not the problem.
+TEST(DashPinGate, OversizeIsNamedEvenWithNoUtxoViewWired) {
+    UTXOViewCache utxo(nullptr);
+    Mempool sizing; sizing.set_utxo(&utxo);
+    auto pin = make_admissible_pin(utxo, 1032, 13'000);
+
+    Mempool bare;   // no view, no external lookup
+    EXPECT_EQ(bare.pinned_tx_admissible(pin, H),
+              dash::coin::Mempool::PinnedTxGate::TooLarge)
+        << "size is decidable without chain state; say so";
 }

@@ -160,13 +160,35 @@ public:
         InputMissingOrSpent,    // an input is not an unspent coin we know
         ImmatureCoinbaseInput,  // a coinbase-output input below 100 confs
         FeeNotZero,             // sum(in) - sum(out) != 0: snapshot drift
+        TooLarge,               // serialized size exceeds the consensus cap
     };
+    /// Dash rejects an oversize transaction at CONSENSUS, not merely policy —
+    /// CheckTransaction() returns "bad-txns-oversize", so a block carrying one
+    /// is INVALID, not just non-standard. That distinction cost a real block:
+    ///
+    ///   2026-08-07 14:33:45  won block height=2517855 bytes=152889
+    ///   2026-08-07 14:33:45  submit_block_hex result: "bad-txns-oversize"
+    ///
+    /// height 2517855 went to another miner. The pinned tx was 152258 bytes
+    /// (1032 inputs). Every gate face we had — inputs unspent, coinbase
+    /// maturity, fee exactly zero, no MN-collateral spend — PASSED. The tx was
+    /// admissible by every rule we had thought to write, and unmineable.
+    /// Confirmed independently against the daemon:
+    ///   testmempoolaccept -> allowed=false reject-reason="bad-txns-oversize"
+    ///
+    /// A pin costs the WHOLE BLOCK when it is wrong, not just its own value.
+    static constexpr size_t kMaxPinnedTxBytes = 100000;
+    /// Cumulative cap across ALL pins in one template. Well under Dash's
+    /// 2 MB block limit, because the pins are not the only thing in the block
+    /// and a template we cannot mine is worth nothing.
+    static constexpr size_t kMaxPinnedTotalBytes = 400000;
     static const char* pinned_gate_name(PinnedTxGate g) {
         switch (g) {
             case PinnedTxGate::Ok:                    return "ok";
             case PinnedTxGate::UtxoViewUnset:         return "utxo-view-unset";
             case PinnedTxGate::InputMissingOrSpent:   return "input-missing-or-spent";
             case PinnedTxGate::ImmatureCoinbaseInput: return "immature-coinbase-input";
+            case PinnedTxGate::TooLarge:              return "tx-too-large";
             case PinnedTxGate::FeeNotZero:            return "fee-not-zero";
         }
         return "ok";
@@ -191,6 +213,12 @@ public:
 
     PinnedTxGate pinned_tx_admissible(const MutableTransaction& tx,
                                       uint32_t next_height) const {
+        // SIZE FIRST. It is the cheapest check and the only one whose failure
+        // is certain regardless of chain state — an oversize tx is invalid at
+        // every height, against every UTXO view. Checking it before the 1032
+        // coin lookups also stops us paying for a verdict we already know.
+        if (::pack(tx).get_span().size() > kMaxPinnedTxBytes)
+            return PinnedTxGate::TooLarge;
         auto* utxo = m_utxo.load();
         if (utxo == nullptr && !m_external_coin_lookup)
             return PinnedTxGate::UtxoViewUnset;

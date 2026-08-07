@@ -367,7 +367,7 @@ DASHWorkSource::CoinStateArm DASHWorkSource::resolve_coin_state_arm() const
     // served-dashd arm to append later. Unconditional because the verdict does
     // not depend on which arm wins: the embedded builder gates the pin itself,
     // and this copy is simply unused when it does.
-    arm.pin_verdict = coin_state_.evaluate_pinned_tx(&arm.pin_tx);
+    arm.pin_verdicts = coin_state_.evaluate_pinned_txs(&arm.pin_txs);
 
     // ── Mainnet embedded gate (v0.2.4 trigger) ──────────────────────────────
     // The SML/QuorumManager wiring emits a real DIP-0004 type-5 CCbTx, and its
@@ -514,23 +514,44 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                 // container. The height in the log is the one the gate JUDGED
                 // at, not fb.m_height, so the line can never claim a check it
                 // did not make.
-                if (arm.pin_tx != nullptr) {
-                    const auto txid = coin::dash_txid(*arm.pin_tx)
-                                          .GetHex().substr(0, 16);
-                    if (arm.pin_verdict.ok) {
-                        coin::pin_append(fb, *arm.pin_tx);
+                if (arm.pin_txs != nullptr
+                    && arm.pin_verdicts.size() == arm.pin_txs->size()) {
+                    // Each pin is judged and reported INDEPENDENTLY: one bad
+                    // pin excludes itself and the rest still ride. The height
+                    // logged is the one the gate JUDGED at, never fb.m_height,
+                    // so a line can never claim a check it did not make.
+                    size_t spliced_bytes = 0;
+                    for (size_t i = 0; i < arm.pin_txs->size(); ++i) {
+                        const auto& pin = (*arm.pin_txs)[i];
+                        const auto& v   = arm.pin_verdicts[i];
+                        const auto txid = coin::dash_txid(pin)
+                                              .GetHex().substr(0, 16);
+                        if (!v.ok) {
+                            LOG_INFO << "[dashd-splice] pinned tx EXCLUDED h="
+                                     << v.at_height << " cause=" << v.cause
+                                     << " txid=" << txid
+                                     << " (template built without it; "
+                                        "re-checked next build)";
+                            continue;
+                        }
+                        const size_t sz = ::pack(pin).get_span().size();
+                        if (spliced_bytes + sz
+                            > coin::Mempool::kMaxPinnedTotalBytes) {
+                            LOG_INFO << "[dashd-splice] pinned tx EXCLUDED h="
+                                     << v.at_height
+                                     << " cause=pin-total-too-large txid="
+                                     << txid << " (" << spliced_bytes << "+"
+                                     << sz << " > "
+                                     << coin::Mempool::kMaxPinnedTotalBytes
+                                     << ")";
+                            continue;
+                        }
+                        coin::pin_append(fb, pin);
+                        spliced_bytes += sz;
                         LOG_INFO << "[dashd-splice] pinned tx INCLUDED h="
-                                 << arm.pin_verdict.at_height
-                                 << " txid=" << txid
-                                 << " vin=" << arm.pin_tx->vin.size()
+                                 << v.at_height << " txid=" << txid
+                                 << " vin=" << pin.vin.size()
                                  << " fee=0 (rides this template)";
-                    } else {
-                        LOG_INFO << "[dashd-splice] pinned tx EXCLUDED h="
-                                 << arm.pin_verdict.at_height
-                                 << " cause=" << arm.pin_verdict.cause
-                                 << " txid=" << txid
-                                 << " (template built without it; re-checked "
-                                    "next build)";
                     }
                 }
                 sel = coin::WorkSelection{ std::move(fb),

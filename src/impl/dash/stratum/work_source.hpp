@@ -482,11 +482,11 @@ private:
         /// what the production primary logged on 2026-08-07
         /// (`pinned tx EXCLUDED h=0`) -- an honest report about the wrong
         /// object.
-        coin::PinVerdict            pin_verdict;
+        std::vector<coin::PinVerdict> pin_verdicts;
         /// Points at load-time-immutable storage (set once before serving,
         /// never mutated), which is why a pointer may cross where a container
         /// reference may not. nullptr when no pin is configured.
-        const coin::MutableTransaction* pin_tx{nullptr};
+        const std::vector<coin::MutableTransaction>* pin_txs{nullptr};
     };
 
     /// COIN-STATE-OWNING THREAD ONLY (#1134). Reads NodeCoinState -- populated(),
