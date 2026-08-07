@@ -327,6 +327,24 @@ public:
     /// independent seed-height + pre-emit gates.
     void set_gbt_xcheck(bool v) { gbt_xcheck_ = v; }
 
+    /// PIN SPLICE ON THE XCHECK-SWAPPED ARM (--pin-splice-xcheck-arm).
+    /// DEFAULT OFF -- this is the money path.
+    ///
+    /// When set_gbt_xcheck's backstop swaps the served arm it throws away an
+    /// EMBEDDED template that already carries the pinned donation transactions
+    /// and serves a fresh dashd one instead. Until 2026-08-07 that replacement
+    /// never met the pin splice and never said so: 66 of 197 served fallback
+    /// templates in one measured hour carried no pin and no reason, and one of
+    /// them won block h=2518044 without the donation.
+    ///
+    /// OFF (default): the miss is NAMED -- each pin gets an outcome with
+    /// cause=xcheck-swap-pin-gate-off and the arm line reports pins=0/N. Served
+    /// bytes are IDENTICAL to before.
+    /// ON: the pins ride that arm too, through the same unchanged admission
+    /// gate (verdicts resolved beside the coin state), plus a height-agreement
+    /// check and the block-size budget -- both of which can only EXCLUDE.
+    void set_pin_splice_xcheck_arm(bool v) { pin_splice_xcheck_arm_ = v; }
+
     /// Embedded-vs-dashd SHADOW-COMPARE DIAGNOSTIC (--embedded-shadow-compare).
     /// OBSERVE-ONLY: on every template re-source the just-resolved template is
     /// handed (by copy) to this probe, which best-effort field-compares it against
@@ -561,6 +579,7 @@ private:
     bool is_testnet_{false};
     bool embedded_mainnet_{false};   // gate-lift opt-in: daemonless embedded arm on mainnet
     bool gbt_xcheck_{false};         // reward-safety backstop: cross-check embedded creditPool vs dashd
+    bool pin_splice_xcheck_arm_{false};  // money path: splice pins onto an xcheck-SWAPPED template (default OFF)
 
     // OBSERVE-only serve-vs-dashd shadow-compare (--embedded-shadow-compare).
     // Unset (default / pure-daemonless) => strict no-op. Never on the hot path:

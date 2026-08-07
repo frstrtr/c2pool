@@ -2499,3 +2499,359 @@ TEST(DashServeGateJournal, TwoTransitionsBothEmitEvenWithOneCause) {
         << "expected: first decline (transition), resume, second decline "
            "(transition) -- three edges, none swallowed by the same-cause rule";
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PINNED DONATION TX vs THE SERVED FALLBACK TEMPLATE
+//
+// Measured on the production primary, 2026-08-07 (log c2pool-dash-v024.log.1,
+// window 22:33:35 -> 23:32:45, 197 distinct served dashd-fallback templates):
+//
+//     131  produced by the DECLINED-EMBEDDED branch  -> the splice ran
+//                                                        (28 INCLUDED, 103
+//                                                         EXCLUDED cause=tip-unknown)
+//      66  produced by the GBT-XCHECK SWAP           -> the splice NEVER ran,
+//                                                        and NOTHING was logged
+//
+// The 66 are the defect. The swap replaces the embedded selection -- which
+// already carries the pins -- with a fresh dashd template that no pin splice
+// ever touches, so the donation silently falls off a third of everything we
+// serve. Block h=2518044 was won from one of them:
+//
+//     23:12:31.660-.711  [GBT-EMB] pinned tx INCLUDED x4  h=2518044
+//     23:12:31.768       GBT-xcheck MATCH-MODULO-SPECIAL  h=2518044
+//     23:12:31.768       template sourced: arm=dashd-fallback
+//     23:12:39           won block 2518044                (0 of 4 pins on chain)
+//
+// 57 ms between "the pins are on this template" and serving a different one.
+// ═════════════════════════════════════════════════════════════════════════════
+namespace {
+
+// A pinned tx that the gate ADMITS: one mature non-coinbase input, one output
+// of exactly the input value (fee == 0), well under kMaxPinnedTxBytes.
+dash::coin::MutableTransaction admissible_pin(const uint256& funding)
+{
+    dash::coin::MutableTransaction pin;
+    pin.vin.resize(1);
+    pin.vin[0].prevout.hash  = funding;
+    pin.vin[0].prevout.index = 0;
+    pin.vout.resize(1);
+    pin.vout[0].value  = 50'000;
+    pin.vout[0].scriptPubKey.m_data = fixture_miner_script();
+    return pin;
+}
+
+bool template_carries(const dash::coin::DashWorkData& w, const uint256& txid)
+{
+    return std::find(w.m_tx_hashes.begin(), w.m_tx_hashes.end(), txid)
+        != w.m_tx_hashes.end();
+}
+
+const dash::coin::PinOutcome* find_pin_outcome(const dash::coin::DashWorkData& w,
+                                               const uint256& txid)
+{
+    for (const auto& o : w.m_pin_outcomes)
+        if (o.txid == txid) return &o;
+    return nullptr;
+}
+
+// The xcheck fixture: populated + SML-fresh + credit-pool-fresh coin state whose
+// embedded template is viable, plus a dashd fallback that disagrees on
+// creditPool at the SAME height so the backstop swaps the served arm.
+void seed_xcheck_ready(dash::coin::NodeCoinState& cs, const uint256& emb_prev,
+                       int64_t seed)
+{
+    dash::coin::vendor::CSimplifiedMNListEntry e1;
+    e1.proRegTxHash.SetHex(std::string(64, '4'));
+    e1.confirmedHash.SetHex(std::string(64, '5'));
+    e1.isValid = true;
+    cs.sml().mnList = {e1};
+    cs.sml().sort();
+    cs.set_have_sml(true);
+    cs.set_sml_current_hash(emb_prev);
+    cs.set_require_sml(true);
+    cs.set_require_fresh_credit_pool(true);
+    cs.set_credit_pool(seed, emb_prev, static_cast<int32_t>(kEmbeddedPrevHeight));
+    cs.set_tip(kEmbeddedPrevHeight, emb_prev, 0x1e0ffff0u, 1'700'000'000u,
+               76, 16, kCurtime, static_cast<uint32_t>(kVersion));
+    seed_resolvable_mn(cs);
+}
+
+}  // namespace
+
+// THE DEFECT. An admissible pin rides the EMBEDDED template (proved first, so
+// this test cannot pass vacuously on an inadmissible pin), and then the
+// GBT-xcheck swap serves a dashd template that carries neither the pin nor any
+// record of why it is missing.
+TEST(DashStratumPinSplice, XcheckSwapDropsThePinnedDonationSilently)
+{
+    using ::core::coin::UTXOViewCache;
+    using ::core::coin::Outpoint;
+    using ::core::coin::Coin;
+
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    uint256 funding;  funding.begin()[0] = 0x42;
+    const int64_t seed = 500'000'000LL;
+
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(funding, 0), Coin(50'000, {}, /*height=*/1, /*cb=*/false));
+    const auto pin  = admissible_pin(funding);
+    const auto txid = dash::coin::dash_txid(pin);
+
+    auto submit = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+
+    // ── (a) NON-VACUITY: the same pin, the same gate, xcheck OFF -> the served
+    // EMBEDDED template carries it. If this fails the fixture is wrong, not the
+    // code under test.
+    {
+        dash::coin::NodeCoinState cs;
+        seed_xcheck_ready(cs, emb_prev, seed);
+        cs.mempool().set_utxo(&utxo);
+        cs.set_pinned_local_txs({pin});
+
+        auto fallback = []() -> dash::coin::DashWorkData { return dash::coin::DashWorkData{}; };
+        dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                         core::stratum::StratumConfig{},
+                                         /*is_testnet=*/true);
+        ASSERT_FALSE(ws.get_current_work_template().empty());
+        auto t = ws.peek_template();
+        ASSERT_TRUE(t);
+        ASSERT_TRUE(template_carries(*t, txid))
+            << "fixture broken: the pin is not admissible on the embedded arm, "
+               "so the xcheck assertion below would be vacuous";
+    }
+
+    // ── (b) THE DEFECT: same coin state, xcheck ARMED, dashd disagrees on
+    // creditPool at the same height -> the backstop serves dashd's template.
+    dash::coin::NodeCoinState cs;
+    seed_xcheck_ready(cs, emb_prev, seed);
+    cs.mempool().set_utxo(&utxo);
+    cs.set_pinned_local_txs({pin});
+
+    const int64_t dashd_credit = seed + 424242LL;
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height         = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits           = 0x1e0ffff0u;
+        w.m_version        = static_cast<uint32_t>(kVersion);
+        w.m_curtime        = kCurtime;
+        dash::coin::vendor::CCbTx cb;
+        cb.nVersion           = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+        cb.nHeight            = static_cast<int32_t>(kEmbeddedPrevHeight + 1);
+        cb.creditPoolBalance  = dashd_credit;
+        w.m_coinbase_payload  = dash::coin::encode_cbtx(cb);
+        return w;
+    };
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    ws.set_gbt_xcheck(true);
+
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+    dash::coin::vendor::CCbTx served;
+    ASSERT_TRUE(dash::coin::vendor::parse_cbtx(t->m_coinbase_payload, served));
+    ASSERT_EQ(served.creditPoolBalance, dashd_credit)
+        << "precondition: the xcheck backstop must have swapped in dashd's template";
+
+    // THE CONTRACT: ride, or say why. Never both absent.
+    const bool rides = template_carries(*t, txid);
+    const auto* outcome = find_pin_outcome(*t, dash::coin::dash_txid(pin));
+    EXPECT_TRUE(rides || (outcome != nullptr && !outcome->cause.empty()))
+        << "h=2518044 shape: the served dashd template dropped the pinned "
+           "donation and recorded no reason at all";
+
+    // With the arm flag at its DEFAULT (off) the served bytes are unchanged --
+    // so the resolution must be the NAMED cause, not an inclusion.
+    EXPECT_FALSE(rides)
+        << "--pin-splice-xcheck-arm defaults OFF: no new bytes may be served";
+    ASSERT_NE(outcome, nullptr);
+    EXPECT_EQ(outcome->cause, "xcheck-swap-pin-gate-off");
+    EXPECT_EQ(outcome->gate_height, kEmbeddedPrevHeight + 1);
+    EXPECT_EQ(outcome->template_height, kEmbeddedPrevHeight + 1);
+}
+
+// FLAG ON: the same swap, the same pin, and now it RIDES -- the served dashd
+// template carries the donation and the outcome says so. This is the arm the
+// operator turns on once the flag-off shape has been read in production.
+TEST(DashStratumPinSplice, XcheckSwapCarriesThePinWhenTheArmIsEnabled)
+{
+    using ::core::coin::UTXOViewCache;
+    using ::core::coin::Outpoint;
+    using ::core::coin::Coin;
+
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    uint256 funding;  funding.begin()[0] = 0x44;
+    const int64_t seed = 500'000'000LL;
+
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(funding, 0), Coin(50'000, {}, /*height=*/1, /*cb=*/false));
+    const auto pin  = admissible_pin(funding);
+    const auto txid = dash::coin::dash_txid(pin);
+
+    dash::coin::NodeCoinState cs;
+    seed_xcheck_ready(cs, emb_prev, seed);
+    cs.mempool().set_utxo(&utxo);
+    cs.set_pinned_local_txs({pin});
+
+    const int64_t dashd_credit = seed + 424242LL;
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height         = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits           = 0x1e0ffff0u;
+        w.m_version        = static_cast<uint32_t>(kVersion);
+        w.m_curtime        = kCurtime;
+        dash::coin::vendor::CCbTx cb;
+        cb.nVersion          = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+        cb.nHeight           = static_cast<int32_t>(kEmbeddedPrevHeight + 1);
+        cb.creditPoolBalance = dashd_credit;
+        w.m_coinbase_payload = dash::coin::encode_cbtx(cb);
+        return w;
+    };
+    auto submit = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    ws.set_gbt_xcheck(true);
+    ws.set_pin_splice_xcheck_arm(true);
+
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+    dash::coin::vendor::CCbTx served;
+    ASSERT_TRUE(dash::coin::vendor::parse_cbtx(t->m_coinbase_payload, served));
+    ASSERT_EQ(served.creditPoolBalance, dashd_credit)
+        << "precondition: the xcheck backstop must have swapped in dashd's template";
+
+    EXPECT_TRUE(template_carries(*t, txid))
+        << "--pin-splice-xcheck-arm is ON: the pin must ride the swapped template";
+    const auto* outcome = find_pin_outcome(*t, txid);
+    ASSERT_NE(outcome, nullptr);
+    EXPECT_TRUE(outcome->included);
+    EXPECT_TRUE(outcome->cause.empty());
+    // The append must be COMPLETE -- all four parallel vectors, fee recorded as
+    // zero, coinbase claim untouched. A half-spliced tx is an unmineable block.
+    ASSERT_EQ(t->m_txs.size(), t->m_tx_hashes.size());
+    ASSERT_EQ(t->m_txs.size(), t->m_tx_fees.size());
+    ASSERT_EQ(t->m_txs.size(), t->m_tx_data_hex.size());
+    EXPECT_EQ(t->m_tx_fees.back(), 0u);
+    EXPECT_FALSE(t->m_tx_data_hex.back().empty());
+}
+
+// THE BUDGET. The fallback splice caps pins against 400 KB of PINS and nothing
+// else -- never against what the template it is appending to already holds. A
+// dashd template that is already near the 2 MB block limit therefore accepts
+// the pin and produces a block that cannot be mined (bad-blk-length).
+TEST(DashStratumPinSplice, FallbackSpliceRespectsTheBlockSizeBudget)
+{
+    using ::core::coin::UTXOViewCache;
+    using ::core::coin::Outpoint;
+    using ::core::coin::Coin;
+
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    uint256 funding;  funding.begin()[0] = 0x43;
+
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(funding, 0), Coin(50'000, {}, /*height=*/1, /*cb=*/false));
+    const auto pin  = admissible_pin(funding);
+    const auto txid = dash::coin::dash_txid(pin);
+
+    // Mainnet with --embedded-mainnet OFF: the arm declines by the gate, the
+    // tip is still known (so the pin gate judges at a real height), and the
+    // served template is the dashd fallback that the splice runs on today.
+    dash::coin::NodeCoinState cs;
+    seed_populated(cs);
+    cs.mempool().set_utxo(&utxo);
+    cs.set_pinned_local_txs({pin});
+
+    // A dashd template already holding ~1.95 MB of transaction payload.
+    constexpr size_t kFatBytes = 1'950'000;
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height         = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits           = 0x1e0ffff0u;
+        w.m_version        = static_cast<uint32_t>(kVersion);
+        w.m_curtime        = kCurtime;
+        dash::coin::MutableTransaction fat;   // identity only; the BYTES are the hex
+        fat.vin.resize(1);
+        fat.vin[0].prevout.hash.begin()[0] = 0x77;
+        w.m_txs.emplace_back(fat);
+        w.m_tx_hashes.push_back(dash::coin::dash_txid(fat));
+        w.m_tx_fees.push_back(0);
+        w.m_tx_data_hex.push_back(std::string(kFatBytes * 2, 'a'));
+        return w;
+    };
+    auto submit = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/false);
+
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t);
+    ASSERT_EQ(t->m_height, kEmbeddedPrevHeight + 1)
+        << "precondition: the dashd fallback template is the one being served";
+
+    EXPECT_FALSE(template_carries(*t, txid))
+        << "the pin was appended to a template already at " << kFatBytes
+        << " bytes -- the only cap that ran was pins-vs-400KB";
+    const auto* outcome = find_pin_outcome(*t, txid);
+    ASSERT_NE(outcome, nullptr) << "an exclusion without a record is the defect";
+    EXPECT_EQ(outcome->cause, "block-budget");
+}
+
+// THE HOIST MUST NOT REGRESS THE PATH THAT ALREADY WORKED. Same declined-
+// embedded producer as the budget KAT above, but a normal-sized dashd template:
+// the pin still rides, still with fee 0, still recorded as INCLUDED. Moving the
+// splice from inside the fallback branch to the final selection is a pure move
+// only if this stays green.
+TEST(DashStratumPinSplice, DeclinedEmbeddedFallbackStillCarriesThePin)
+{
+    using ::core::coin::UTXOViewCache;
+    using ::core::coin::Outpoint;
+    using ::core::coin::Coin;
+
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    uint256 funding;  funding.begin()[0] = 0x45;
+
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(funding, 0), Coin(50'000, {}, /*height=*/1, /*cb=*/false));
+    const auto pin  = admissible_pin(funding);
+    const auto txid = dash::coin::dash_txid(pin);
+
+    dash::coin::NodeCoinState cs;
+    seed_populated(cs);
+    cs.mempool().set_utxo(&utxo);
+    cs.set_pinned_local_txs({pin});
+
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height         = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits           = 0x1e0ffff0u;
+        w.m_version        = static_cast<uint32_t>(kVersion);
+        w.m_curtime        = kCurtime;
+        return w;
+    };
+    auto submit = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+    // mainnet, --embedded-mainnet OFF => the arm declines by the gate and the
+    // dashd fallback is what gets served.
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/false);
+
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t);
+    EXPECT_TRUE(template_carries(*t, txid))
+        << "the declined-embedded fallback has spliced the pin since #1170; "
+           "the hoist must not have taken that away";
+    const auto* outcome = find_pin_outcome(*t, txid);
+    ASSERT_NE(outcome, nullptr);
+    EXPECT_TRUE(outcome->included);
+    ASSERT_FALSE(t->m_tx_fees.empty());
+    EXPECT_EQ(t->m_tx_fees.back(), 0u);
+}

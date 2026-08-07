@@ -518,6 +518,11 @@ public:
         return out;
     }
 
+    /// Is ANY pin configured? Read by the legacy get_work() adapter, which has
+    /// no splice, so it can NAME the omission instead of shipping a template
+    /// that silently lacks the donation.
+    bool has_pinned_local_txs() const { return m_have_pinned_local_tx; }
+
     void set_pinned_local_tx(MutableTransaction tx) {
         m_pinned_local_txs.clear();
         m_pinned_local_txs.push_back(std::move(tx));

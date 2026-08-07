@@ -385,6 +385,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-mn-bridge-no-cursor]\n"
         << "           [--embedded-utxo-immature-serve-empty] [--embedded-serve-mempool-txs]\n"
         << "           [--pin-local-tx-hex FILE]  (zero-fee self-mined tx, e.g. donation consolidation)\n"
+        << "           [--pin-splice-xcheck-arm]  (let pins ride an xcheck-SWAPPED dashd template; default OFF)\n"
         << "           [--bestcl-policy freshness|consensus-exact]\n"
         << "           [--embedded-oracle-shadow]\n"
         << "           [--embedded-shadow-compare]\n"
@@ -766,7 +767,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // in the builder against the live UTXO view — a bad or already-
              // mined pin is EXCLUDED, never a refused template, never a lost
              // block. Empty (default) = no pin, byte-unchanged.
-             const std::string& pin_local_tx_hex_path = std::string())
+             const std::string& pin_local_tx_hex_path = std::string(),
+             // --pin-splice-xcheck-arm: let the pinned txs ride a template the
+             // GBT cross-check SWAPPED IN. DEFAULT OFF -- money path.
+             //
+             // The cross-check discards an embedded template that already
+             // carries the pins and serves a fresh dashd one; that replacement
+             // has never run the splice. Measured on the primary 2026-08-07,
+             // 66 of 197 served fallback templates came from that swap and one
+             // of them won h=2518044 without the donation. OFF, the miss is now
+             // NAMED (cause=xcheck-swap-pin-gate-off) and served bytes are
+             // unchanged; ON, the pins ride it too, through the same unchanged
+             // admission gate plus a height check and a block-size budget that
+             // can only EXCLUDE.
+             bool pin_splice_xcheck_arm = false)
 {
     namespace io = boost::asio;
 
@@ -2482,6 +2496,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // consulted, i.e. during an actual embedded outage.
     const bool xcheck_wanted = (testnet || embedded_mainnet);
     work_source->set_gbt_xcheck(xcheck_wanted && static_cast<bool>(rpc));
+    // Pin splice on the xcheck-SWAPPED arm (default OFF). Announce the state
+    // either way: with it off the donation still misses every swapped
+    // template -- it just no longer does so silently.
+    work_source->set_pin_splice_xcheck_arm(pin_splice_xcheck_arm);
+    std::cout << "[DASH-STRATUM-GBT] pin splice on xcheck-swapped arm: "
+              << (pin_splice_xcheck_arm ? "ON (--pin-splice-xcheck-arm)"
+                                        : "OFF (default; misses are named, "
+                                          "not spliced)")
+              << "\n";
     if (xcheck_wanted && !rpc) {
         std::cout << "[DASH-STRATUM-GBT] GBT cross-check DISABLED: dashd RPC "
                      "arm UNARMED (pure-daemonless) -- the embedded arm relies "
@@ -6811,6 +6834,7 @@ int main(int argc, char** argv)
     // operator decision.
     bool embedded_serve_mempool_txs = false;
     std::string pin_local_tx_hex_path;
+    bool pin_splice_xcheck_arm = false;
     // --embedded-mempool-ingest: arm the coin-P2P MSG_TX pull (phase 1).
     // SEPARATE from --embedded-serve-mempool-txs on purpose: this only makes
     // the mempool FILL. Whether its contents ever reach a served template is
@@ -6912,6 +6936,8 @@ int main(int argc, char** argv)
             embedded_mempool_ingest = true;
         else if (std::strcmp(argv[i], "--pin-local-tx-hex") == 0 && i + 1 < argc)
             pin_local_tx_hex_path = argv[++i];
+        else if (std::strcmp(argv[i], "--pin-splice-xcheck-arm") == 0)
+            pin_splice_xcheck_arm = true;
         else if (std::strcmp(argv[i], "--replay-utxo-db") == 0 && i + 1 < argc)
             replay_utxo_db = argv[++i];
         else if (std::strcmp(argv[i], "--replay-utxo-hash") == 0)
@@ -7178,7 +7204,8 @@ int main(int argc, char** argv)
                         embedded_serve_mempool_txs,
                         embedded_shadow_compare,
                         embedded_mempool_ingest,
-                        pin_local_tx_hex_path);
+                        pin_local_tx_hex_path,
+                        pin_splice_xcheck_arm);
     }
     return run_selftest();
 }
