@@ -3279,10 +3279,16 @@ TEST(DashStratumSpliceGuards, DropAlarmNamesTheCountValueAndCause)
 // outcome. An alarm that fires where the money DID land is the alarm the next
 // operator learns to ignore, and then block 2518044 happens again unseen.
 //
-// RED WITHOUT THE FIX: delete `if (o.cause == "already-in-template") continue;`
-// from raise_drop_alarm (work_source.cpp) and arms (a), (b) and (c) all fail --
-// (a) and (b) on a non-empty m_pin_drop_alarm, (c) on the count/value/cause of
-// a real loss being inflated by a pin that is being served.
+// RED WITHOUT THE FIX: delete the presence test from raise_drop_alarm
+// (work_source.cpp -- the std::find over w.m_tx_hashes) and arms (a), (b) and
+// (c) all fail -- (a) and (b) on a non-empty m_pin_drop_alarm, (c) on the
+// count/value/cause of a real loss being inflated by a pin that is being served.
+//
+// This test originally rode a skip on the cause STRING. It does not any more:
+// the string skip was one refusal shape short (see
+// DropAlarmKeysOnPresenceNotOnTheCauseString below) and is gone, so this test
+// and that one now both hang on the same single statement, which is the point --
+// one mutation must be able to take them both down.
 TEST(DashStratumSpliceGuards, DropAlarmIsSilentWhenTheDuplicatePinIsActuallyServed)
 {
     uint256 funding; funding.begin()[0] = 0x68;
@@ -3373,6 +3379,170 @@ TEST(DashStratumSpliceGuards, DropAlarmIsSilentWhenTheDuplicatePinIsActuallyServ
         EXPECT_EQ(w.m_pin_drop_alarm.find("already-in-template"),
                   std::string::npos)
             << "a cause that describes a SERVED pin is in a loss report: "
+            << w.m_pin_drop_alarm;
+    }
+}
+
+// THE ALARM KEYS ON PRESENCE, NOT ON A CAUSE STRING.
+//
+// The first cut of this fix skipped outcomes whose cause == "already-in-template",
+// and that was one refusal shape short of the truth condition. `already-in-template`
+// is only ever REACHED by the duplicate scan (work_source.cpp guard (f)), and FIVE
+// guards run BEFORE it and `continue` with a different cause:
+//
+//   the verdict-count-mismatch early return  (cause=pin-verdict-count-mismatch)
+//   (a) the pin's own verdict !v.ok          (cause=<whatever the gate said>)
+//   (b) xcheck-swap-pin-gate-off
+//   (c) xcheck-swap-height-mismatch
+//   (d)/(e) pin-total-too-large / block-budget
+//
+// A pin that IS on the served template but trips any of those records that
+// cause instead, and the cause-string skip never sees it -- so the alarm still
+// says the donation was lost while the donation is sitting in the block.
+//
+// This is not hypothetical shape-hunting. (a) is the PRODUCTION shape: the
+// embedded UTXO view is built forward from the height we started at, so a coin
+// older than that reads back input-missing-or-spent (mempool.hpp:205, and the
+// SECOND SOURCE comment at :212 exists because the production primary refused a
+// perfectly valid pin exactly this way). The dashd fallback template we splice
+// onto was built from dashd's OWN mempool, which can already carry that same
+// donation. Our gate refuses; dashd already included it; the money lands; the
+// alarm shouts that it did not.
+//
+// The truth condition the WARNING asserts is "the txid is NOT in the served
+// template". So that is what the alarm must test. The cause string is a
+// description of a decision; presence is the fact.
+//
+// RED WITHOUT THE FIX: with the presence test removed from raise_drop_alarm
+// (work_source.cpp) -- or replaced by the old cause-string skip, which is what
+// shipped -- arms (a) through (d) all fail on a non-empty m_pin_drop_alarm, and
+// arm (f) fails on a real loss whose count/value is inflated by a served pin.
+TEST(DashStratumSpliceGuards, DropAlarmKeysOnPresenceNotOnTheCauseString)
+{
+    uint256 funding; funding.begin()[0] = 0x6a;
+    const auto pin  = admissible_pin(funding);          // 50'000 sat
+    const auto txid = dash::coin::dash_txid(pin);
+    const std::vector<dash::coin::MutableTransaction> pins{pin};
+
+    // A refusal from the pin's own gate, at the template's height, with a cause
+    // that is NOT "already-in-template" -- the reviewer's scratch KAT.
+    auto bad_verdict = [](const char* cause) {
+        dash::coin::PinVerdict v;
+        v.ok        = false;
+        v.cause     = cause;
+        v.at_height = kSpliceHeight;
+        return v;
+    };
+
+    // Every arm below serves a template that ALREADY CARRIES the pin. Whatever
+    // the splice decided, the donation is in the block. Nothing may claim a loss.
+    auto expect_no_alarm = [&](const dash::coin::DashWorkData& w,
+                               const char* which, const char* expected_cause) {
+        ASSERT_EQ(w.m_pin_outcomes.size(), 1u) << which;
+        ASSERT_FALSE(w.m_pin_outcomes[0].included) << which;
+        // If this ever reads already-in-template the arm has stopped testing
+        // what it was written to test and the cause-string skip covers it.
+        ASSERT_EQ(w.m_pin_outcomes[0].cause, expected_cause)
+            << which << ": fixture no longer reaches the guard it targets";
+        ASSERT_TRUE(template_carries(w, txid))
+            << which << ": fixture broken, the alarm would be telling the truth";
+        EXPECT_TRUE(w.m_pin_drop_alarm.empty())
+            << which << ": DONATION-DROPPED on a template that IS carrying the "
+                        "donation: " << w.m_pin_drop_alarm;
+        const auto field = dash::stratum::detail::served_pins_field(w, &pins);
+        EXPECT_EQ(field.find("DONATION-DROPPED"), std::string::npos)
+            << which << ": the arm line claims a loss and a full pin count at "
+                        "once: " << field;
+        EXPECT_NE(field.find("pins=1/1"), std::string::npos) << which << field;
+    };
+
+    // (a) THE REVIEWER'S KAT. Guard (a) fires on the pin's own verdict and
+    // `continue`s long before the duplicate scan can name it.
+    {
+        auto w = host_template({pin});
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, {bad_verdict("input-missing-or-spent")},
+            /*from_xcheck_swap=*/false, /*xcheck_arm_enabled=*/false,
+            /*block_budget_enabled=*/false);
+        expect_no_alarm(w, "(a) !v.ok", "input-missing-or-spent");
+    }
+
+    // (b) The xcheck-swap money-path flag, default OFF. The swapped template
+    // came from dashd and can already carry the donation.
+    {
+        auto w = host_template({pin});
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, {ok_verdict(kSpliceHeight)},
+            /*from_xcheck_swap=*/true, /*xcheck_arm_enabled=*/false, false);
+        expect_no_alarm(w, "(b) xcheck-swap-pin-gate-off",
+                        "xcheck-swap-pin-gate-off");
+    }
+
+    // (c) Height disagreement on the xcheck arm.
+    {
+        auto w = host_template({pin});
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, {ok_verdict(kSpliceHeight - 1)},
+            /*from_xcheck_swap=*/true, /*xcheck_arm_enabled=*/true, false);
+        expect_no_alarm(w, "(c) xcheck-swap-height-mismatch",
+                        "xcheck-swap-height-mismatch");
+    }
+
+    // (d) The count-mismatch EARLY RETURN, which raises the alarm from its own
+    // exit path. Refusing everything by name is right; calling it a loss is not.
+    {
+        auto w = host_template({pin});
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, /*verdicts=*/{}, false, false, false);
+        expect_no_alarm(w, "(d) pin-verdict-count-mismatch",
+                        "pin-verdict-count-mismatch");
+    }
+
+    // (e) THE CONTROL, and the reason this is not "silence the alarm": the SAME
+    // refusal cause on a pin that is genuinely ABSENT must still shout, with the
+    // money and the cause named.
+    {
+        auto w = host_template();                       // carries nothing
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, {bad_verdict("input-missing-or-spent")}, false, false,
+            false);
+        ASSERT_FALSE(template_carries(w, txid));
+        ASSERT_FALSE(w.m_pin_drop_alarm.empty())
+            << "a pin that is genuinely absent stopped raising the alarm";
+        EXPECT_NE(w.m_pin_drop_alarm.find("DONATION-DROPPED 1/1"),
+                  std::string::npos) << w.m_pin_drop_alarm;
+        EXPECT_NE(w.m_pin_drop_alarm.find("value=50000sat"), std::string::npos)
+            << w.m_pin_drop_alarm;
+        EXPECT_NE(w.m_pin_drop_alarm.find("cause=input-missing-or-spent"),
+                  std::string::npos) << w.m_pin_drop_alarm;
+    }
+
+    // (f) MIXED, the arm that stops presence-keying from swallowing a real loss:
+    // one pin served-but-refused beside one genuinely absent, same cause on
+    // both. The alarm must read 1/2 and 30000sat, not 2/2 and 80000sat.
+    {
+        uint256 other; other.begin()[0] = 0x6b;
+        auto lost_pin = admissible_pin(other);
+        lost_pin.vout[0].value = 30'000;
+        const auto lost_txid = dash::coin::dash_txid(lost_pin);
+
+        auto w = host_template({pin});                  // carries `pin` only
+        const std::vector<dash::coin::MutableTransaction> both{pin, lost_pin};
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &both,
+            {bad_verdict("input-missing-or-spent"),
+             bad_verdict("input-missing-or-spent")},
+            false, false, false);
+
+        ASSERT_TRUE(template_carries(w, txid));
+        ASSERT_FALSE(template_carries(w, lost_txid));
+        ASSERT_FALSE(w.m_pin_drop_alarm.empty())
+            << "the genuinely absent pin stopped raising the alarm";
+        EXPECT_NE(w.m_pin_drop_alarm.find("DONATION-DROPPED 1/2"),
+                  std::string::npos)
+            << "the served pin was counted as lost: " << w.m_pin_drop_alarm;
+        EXPECT_NE(w.m_pin_drop_alarm.find("value=30000sat"), std::string::npos)
+            << "the served pin's 50000 sat was added to the loss: "
             << w.m_pin_drop_alarm;
     }
 }

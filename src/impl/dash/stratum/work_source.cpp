@@ -424,19 +424,35 @@ void splice_pins_onto_served_fallback(
     //
     // WHAT THE ALARM ASSERTS, and therefore what it may NOT fire on. The WARNING
     // says "this template IS SERVED without the donation; if it wins, that value
-    // does not land". `included` is a fact about THE SPLICE (did this call
-    // append?), not about the SERVED TEMPLATE (is the txid in it?), and for one
-    // cause the two disagree: `already-in-template` refuses precisely BECAUSE
-    // w.m_tx_hashes already carries the pin's txid, so the money is on the
-    // template and does land. It produced lines that contradicted themselves
-    // inside one string --
-    //   pins=1/1 pin_cause=already-in-template DONATION-DROPPED 1/1 pins h=500001
+    // does not land". That sentence is a claim about ONE fact: is the txid in
+    // w.m_tx_hashes or not. `included` does not answer it -- `included` records
+    // what THE SPLICE did (did this call append?), and a pin can be refused by
+    // this function while sitting in the template anyway, because the template
+    // we splice ONTO is not ours. The dashd fallback arm serves a template dashd
+    // built from ITS mempool, which can already carry the donation.
+    //
+    // So the alarm keys on PRESENCE, not on the refusal cause. Keying on the
+    // cause string is what shipped first and it was one refusal shape short:
+    // `already-in-template` is only reached by guard (f) below, and FIVE guards
+    // run before it and `continue` with a different cause -- the verdict-count
+    // early return, (a) !v.ok, (b) xcheck-swap-pin-gate-off, (c) height
+    // mismatch, (d)/(e) the size caps. Any of those on a pin dashd already
+    // included reproduces the self-contradicting line this branch exists to
+    // kill --
+    //   pins=1/1 pin_cause=input-missing-or-spent DONATION-DROPPED 1/1 pins h=…
     // -- pins=1/1 counted by txid PRESENCE (served_pins_field, below) against a
-    // DONATION-DROPPED counted by splice outcome. It is the only one of the
-    // seven causes that can false-fire: every other one (pin-verdict-count-
-    // mismatch, xcheck-swap-pin-gate-off, xcheck-swap-height-mismatch,
-    // pin-total-too-large, block-budget, input-spent-by-template) leaves the
-    // txid absent from the served template, which is a real loss.
+    // DONATION-DROPPED counted by splice outcome, in one string.
+    //
+    // (a) is not a hypothetical: the embedded UTXO view is built forward from
+    // the height we started at, so a coin older than that reads back
+    // input-missing-or-spent (mempool.hpp:205 and the SECOND SOURCE note at
+    // :212, added after the production primary refused a valid pin exactly so).
+    //
+    // The presence test subsumes the cause-string skip, which is therefore GONE
+    // rather than kept beside it: two keys for one condition would leave this
+    // one un-mutable -- delete the presence test and the already-in-template
+    // shapes would still pass on the string, and a guard that cannot be made to
+    // fail is not a guard.
     //
     // An alarm that also fires where the money DID land is worth less than
     // nothing: block 2518044 dropped four pins and block 2518186 landed all
@@ -448,7 +464,10 @@ void splice_pins_onto_served_fallback(
         std::string causes;
         for (const auto& o : w.m_pin_outcomes) {
             if (o.included) continue;
-            if (o.cause == "already-in-template") continue;  // it IS served
+            // THE TRUTH CONDITION: is it in the template we are about to serve?
+            if (std::find(w.m_tx_hashes.begin(), w.m_tx_hashes.end(), o.txid)
+                != w.m_tx_hashes.end())
+                continue;  // refused by the splice, SERVED by the template
             ++dropped;
             lost += o.value;
             if (causes.find(o.cause) == std::string::npos)
