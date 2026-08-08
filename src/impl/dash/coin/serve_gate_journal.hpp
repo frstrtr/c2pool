@@ -81,6 +81,32 @@ public:
         /// A journal that emits only counts cannot express that, so the episode
         /// duration rides the line that closes the episode.
         int64_t episode_sec{-1};
+        /// Seconds the cause named on THIS line has been the first-unmet
+        /// condition, as of this decision. -1 when there is no active cause
+        /// (Resumed lines, or the arm was already serving).
+        ///
+        /// WHY THIS FIELD EXISTS — episode_sec is deliberately whole-episode
+        /// (measured from the FIRST decline, surviving cause changes, see
+        /// above), which means a cause-change line attributes the WHOLE
+        /// episode's duration to the cause it happens to name. Measured at
+        /// h=2518004 (hotel, 2026-08-07): a cause-change line naming
+        /// emit-bestcl-null-committed carried dur=512s, of which that cause
+        /// owned 0.89 s — the 512 s belonged to the PRECEDING
+        /// qc-plan-underivable segment. Every per-cause TIME histogram built
+        /// from episode_sec alone is therefore wrong; by count
+        /// emit-bestcl-null-committed read as 29% of the gap, by time it is
+        /// 0.065% of wall clock while qc-plan-underivable is 87% of decline
+        /// time. cause_sec restores the per-cause clock WITHOUT redefining
+        /// episode_sec: it is 0 on the line that starts a cause segment and
+        /// grows on heartbeats of the same cause.
+        int64_t cause_sec{-1};
+        /// Seconds the PREVIOUS cause (the `previous_cause` field) ran, on the
+        /// lines that CLOSE a cause segment: CauseChange (the old cause's
+        /// segment ends as the new one is named) and Resumed (the episode's
+        /// final segment ends). -1 on every other line. Summing this field by
+        /// `previous_cause` over a journal window yields the CORRECT per-cause
+        /// time histogram; episode_sec cannot, by design.
+        int64_t prev_cause_sec{-1};
 
         bool emit() const { return trigger != Trigger::None; }
     };
@@ -106,6 +132,11 @@ public:
                 // so a cause-change mid-episode cannot shorten the number.
                 d.episode_sec = (m_episode_start_sec >= 0)
                                     ? now_sec - m_episode_start_sec : -1;
+                // The episode's FINAL cause segment closes here; attribute its
+                // duration to the cause it names (d.previous_cause).
+                d.prev_cause_sec = (m_cause_start_sec >= 0)
+                                       ? now_sec - m_cause_start_sec : -1;
+                m_cause_start_sec   = -1;
                 m_episode_start_sec = -1;
                 m_suppressed = 0;
                 m_last_emit_sec = now_sec;
@@ -129,6 +160,18 @@ public:
         else if (!m_have_emitted || now_sec - m_last_emit_sec >= m_heartbeat_sec)
             d.trigger = Trigger::Heartbeat;
 
+        // Per-cause segment clock. Unlike the episode clock above, it does NOT
+        // survive cause changes: a change of the first-unmet condition closes
+        // the old cause's segment (attributed via prev_cause_sec — this line
+        // always emits, it is a CauseChange) and starts the new cause's clock
+        // at ZERO. This is what keeps a cause-change line from attributing the
+        // whole episode to the cause it names (the h=2518004 trap).
+        if (prev_arm == Arm::Declining && cause != m_last_cause &&
+            m_cause_start_sec >= 0)
+            d.prev_cause_sec = now_sec - m_cause_start_sec;
+        if (prev_arm != Arm::Declining || cause != m_last_cause)
+            m_cause_start_sec = now_sec;
+
         m_last_cause = cause;
 
         if (d.trigger == Trigger::None) {
@@ -142,6 +185,8 @@ public:
         // four minutes", which read identically before.
         d.episode_sec   = (m_episode_start_sec >= 0)
                               ? now_sec - m_episode_start_sec : -1;
+        d.cause_sec     = (m_cause_start_sec >= 0)
+                              ? now_sec - m_cause_start_sec : -1;
         m_suppressed    = 0;
         m_last_emit_sec = now_sec;
         m_have_emitted  = true;
@@ -178,6 +223,9 @@ private:
     int64_t     m_last_emit_sec{0};
     /// Start of the CURRENT continuous off-embedded episode; -1 = arm serving.
     int64_t     m_episode_start_sec{-1};
+    /// Start of the CURRENT cause segment WITHIN the episode; -1 = no active
+    /// cause. Resets on every cause change; m_episode_start_sec does not.
+    int64_t     m_cause_start_sec{-1};
     bool        m_have_emitted{false};
     uint64_t    m_suppressed{0};
 };
