@@ -1831,9 +1831,18 @@ private:
             m_cp_publish_at_serve_tip
             && m_body_first_serve_tip
             // No serve tip yet (cold start / post-demote): there is no tip for
-            // the pool to run ahead OF, and holding here would deadlock the
-            // arm -- promotion is what publishes, and nothing would ever
-            // promote. Publish, exactly as today.
+            // the pool to run ahead OF, so publish, exactly as today.
+            // NO DEADLOCK IS CLAIMED. An earlier revision of this comment said
+            // holding here "would deadlock the arm"; that was not demonstrable
+            // and is retracted -- every pending slot reachable from a cold
+            // start is drained by the very next promotion, which matches it
+            // via credit_pool_derived_at and publishes it in the same step.
+            // What the conjunct actually buys is the INTERMEDIATE state: with
+            // no serve tip the pool lands in the PUBLISHED slot rather than a
+            // slot only a promotion can drain, so a node whose promotion is
+            // held on another axis still has a published pool. That, and only
+            // that, is what ColdStartPublishesImmediatelyWithPublicationHeightOn
+            // asserts -- and it is red without this line.
             && m_have_tip
             && at_height > static_cast<int32_t>(m_prev_height);
         m_cp_pending_valid   = hold;
@@ -1854,6 +1863,17 @@ private:
 
     /// Drop anything held (rollback paths: the branch it was derived on is
     /// gone, or the seed is being invalidated outright).
+    ///
+    /// NOT inert bookkeeping — MONEY PATH. The pending slot answers
+    /// credit_pool_derived_at(), which IS the credit-pool promotion
+    /// precondition, so a slot that survives a rollback lets the next
+    /// promotion at that same hash/height publish the ORPHANED branch's
+    /// balance. On the cold-wipe path (:942) that silently undoes the
+    /// deliberate fail-closed write of (0, ZERO, -1) one line later.
+    /// Covered red-on-mutation by ColdWipeDiscardsHeldPoolSoTheOrphanCannot-
+    /// BeRepublished and ReorgUndoDiscardsHeldPoolDerivedAboveTheForkPoint —
+    /// emptying this body turns both red (orphan pool republished at H, serve
+    /// tip promoted onto it).
     void discard_held_credit_pool() { m_cp_pending_valid = false; }
 
     /// Is the credit pool DERIVED at exactly this block — published already,
