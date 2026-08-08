@@ -13,7 +13,12 @@ import { PendingTracker } from '../abort.js';
 import type { ExplorerError } from '../errors.js';
 import { parseSnapshot, parseMinerDetail } from './parse.js';
 import { render, resolveContainer } from './render.js';
-import { LTC_COIN_PPLNS_DESCRIPTOR } from './classify.js';
+import {
+  LTC_COIN_PPLNS_DESCRIPTOR,
+  DASH_COIN_PPLNS_DESCRIPTOR,
+  COIN_PPLNS_DESCRIPTORS,
+  descriptorForCoin,
+} from './classify.js';
 import { renderMinerDetail, type DetailPanelHandle } from './detail.js';
 import {
   renderToolbar,
@@ -40,7 +45,14 @@ export type {
   PplnsViewOptions,
   CoinPplnsDescriptor,
 };
-export { parseSnapshot, render, LTC_COIN_PPLNS_DESCRIPTOR };
+export {
+  parseSnapshot,
+  render,
+  LTC_COIN_PPLNS_DESCRIPTOR,
+  DASH_COIN_PPLNS_DESCRIPTOR,
+  COIN_PPLNS_DESCRIPTORS,
+  descriptorForCoin,
+};
 
 const DEFAULTS = {
   mode:              'full' as const,

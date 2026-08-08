@@ -60,8 +60,22 @@
   <script type="module">
     import {
       PplnsView,
-      LTC_COIN_PPLNS_DESCRIPTOR,
+      descriptorForCoin,
     } from './dist/pplns-view.js';
+
+    // Coin identity for this node's dashboard. The Qt host injects
+    // window.__C2POOL_COIN__ from the node's config; a ?coin= query param is
+    // a manual override; absent both we fall back to LTC (historical default).
+    function resolveCoin() {
+      if (typeof window.__C2POOL_COIN__ === 'string' && window.__C2POOL_COIN__) {
+        return window.__C2POOL_COIN__;
+      }
+      try {
+        const q = new URLSearchParams(window.location.search).get('coin');
+        if (q) return q;
+      } catch (e) { /* no location in some embed hosts */ }
+      return 'LTC';
+    }
 
     const statusEl = document.getElementById('status');
     const logEl    = document.getElementById('log');
@@ -161,7 +175,7 @@
         const ctrl = PplnsView.init({
           container: tree,
           transport,
-          coin: LTC_COIN_PPLNS_DESCRIPTOR,
+          coin: descriptorForCoin(resolveCoin()),
           showVersionBadge: true,
           showHashrate: true,
           showMerged: true,
