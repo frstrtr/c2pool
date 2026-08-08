@@ -72,6 +72,7 @@
 #include <cstring>
 #include <map>
 #include <optional>
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -175,6 +176,38 @@ BlockType parse_block(const char* hex_text)
     s >> b;
     EXPECT_TRUE(s.empty()) << "trailing bytes after block";
     return b;
+}
+
+/// Seed the mainnet anchor's FULL active set (h=2513685, 88 commitments —
+/// 24+32+4+4+24) into a quorum engine. Same fixture the W4 engine KAT uses;
+/// columns are `type qidx base_height quorumHash commitment_hex`. This is the
+/// state that makes active_sets_complete() true, i.e. the exact precondition
+/// the removed auto-arm keyed on.
+size_t seed_anchor_active_set(QuorumReplayEngine& eng)
+{
+    const std::string path = std::string(DASH_FIXTURE_DIR)
+                           + "/dash_mainnet_active_quorums_2513685.txt";
+    std::ifstream f(path);
+    EXPECT_TRUE(f.good()) << "cannot open fixture: " << path;
+    std::string line;
+    size_t n = 0;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        auto fl = split_ws(line);
+        EXPECT_EQ(fl.size(), 5u) << line.substr(0, 80);
+        if (fl.size() != 5) continue;
+        std::vector<uint8_t> bytes;
+        EXPECT_TRUE(hex_to_bytes(fl[4], bytes));
+        dash::coin::vendor::CFinalCommitment c;
+        ::PackStream s(bytes);
+        s >> c;
+        EXPECT_EQ(s.cursor_size(), 0u) << "commitment slice must parse exact";
+        std::string err;
+        EXPECT_TRUE(eng.seed_commitment(
+            static_cast<uint32_t>(std::stoul(fl[2])), c, err)) << err;
+        ++n;
+    }
+    return n;
 }
 
 /// dashd `quorum info` member order IS the DKG order the validMembers bitset
@@ -662,4 +695,84 @@ TEST(DashReplayQuorumSeam, BridgeInstallsTheResolverAndNamesAMiss)
     for (const auto& e : *list)
         if (!e.confirmedHash.IsNull()) { any_confirmed = true; break; }
     EXPECT_TRUE(any_confirmed);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KAT-7 — ISSUE #90: the bridge NEVER arms the root self-check by itself.
+//
+// One revision of replay_quorum_bridge.hpp armed QuorumReplayEngine's root
+// self-check from inside observe(), the moment active_sets_complete() went
+// true. That was the only change in PR-2 not behind
+// --replay-mined-commitment-index: it rides the PRE-EXISTING
+// --replay-fold-quorums. And arming is not a diagnostic — once armed, a
+// merkleRootQuorums differ POISONS the engine (observe_block's m_self_check
+// branch), a poisoned engine answers no member sets, the fold stops, the
+// replay payee publisher stops publishing and the node STOPS SERVING. It was
+// argued inert on mainnet because type 1 is short by 24 forever, which is a
+// fact about the chain, not about this code.
+//
+// So the arming half now belongs to #90's own PR, behind its own default-OFF
+// flag. THIS KAT holds the line: a COMPLETE active set — the trigger — must
+// not arm anything, and neither must an observation the engine refused (the
+// removed code sat BEFORE `if (!r.ok) return r.error;`, so it armed on a
+// refusal too).
+//
+// RED: put back
+//     if (!m_quorum.self_check_armed() && m_quorum.active_sets_complete())
+//         m_quorum.arm_self_check();
+// anywhere in ReplayQuorumBridge::observe.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashReplayQuorumSeam, BridgeNeverArmsTheRootSelfCheckByItself)
+{
+    FoldConfig fcfg; fcfg.enabled = true;
+    DmlFoldEngine dml(fcfg);
+    auto ps = parse_prestate_text(kDashReplayPrestate2513129);
+    ASSERT_TRUE(ps.ok) << ps.error;
+    ASSERT_TRUE(seed_engine_from_prestate(dml, ps).empty());
+
+    QuorumReplayConfig qcfg;
+    qcfg.enabled = true;
+    qcfg.network = LlmqNetwork::Mainnet;
+    QuorumReplayEngine quorum(qcfg);
+    QuorumBridgeConfig bcfg;
+    bcfg.network = LlmqNetwork::Mainnet;
+    ReplayQuorumBridge bridge(dml, quorum, bcfg);
+
+    // THE TRIGGER, present and true: every chainparams type at its full
+    // active quota. Nothing weaker than this ever armed the old code.
+    ASSERT_EQ(seed_anchor_active_set(quorum), 88u);
+    ASSERT_TRUE(quorum.active_sets_complete())
+        << "shortfall: " << quorum.active_set_shortfall_text();
+    EXPECT_EQ(bridge.active_set_shortfall_text(), "complete");
+    ASSERT_FALSE(bridge.self_check_armed());
+
+    const auto blk = parse_block(kDashReplayBlock2513130);
+    // Window key only; nothing under test reads it.
+    const uint256 observed_hash =
+        from_display("0000000000000000000000000000000000000000000000000000000000513130");
+
+    // ── Arm 1: an observation the ENGINE REFUSES (no seeded cursor). The
+    //    removed auto-arm ran before the !r.ok return, so this refused block
+    //    armed the consensus check anyway.
+    const std::string refused = bridge.observe(kSeamHeight, observed_hash, blk);
+    ASSERT_FALSE(refused.empty())
+        << "precondition: an unseeded engine must refuse this observation";
+    EXPECT_FALSE(bridge.self_check_armed())
+        << "a REFUSED observation must not arm the root self-check: " << refused;
+
+    // ── Arm 2: a real observation, cursor seeded, the fold actually runs.
+    quorum.seed_cursor(kAnchor, from_display(ps.blockhash_display.c_str()));
+    bridge.observe(kSeamHeight, observed_hash, blk);
+    EXPECT_FALSE(bridge.self_check_armed())
+        << "observing a block with a COMPLETE active set must not arm the "
+           "root self-check — arming can stop serving and belongs behind its "
+           "own flag (issue #90)";
+    EXPECT_FALSE(quorum.self_check_armed());
+
+    // ── Anti-vacuity: the flag IS reachable, and only an explicit caller
+    //    reaches it. Without this the EXPECT_FALSEs above could be measuring
+    //    an observable that is never true for unrelated reasons.
+    quorum.arm_self_check();
+    EXPECT_TRUE(bridge.self_check_armed())
+        << "arm_self_check() is the ONLY door, and it must still work";
 }

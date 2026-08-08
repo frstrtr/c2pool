@@ -65,6 +65,7 @@
 #include <impl/dash/coin/arm_resolution.hpp>   // dash::coin::resolve_embedded_arm (#738 arm decision, one place)
 #include <impl/dash/coin/dkg_window.hpp>       // dash::coin::is_dkg_commitment_window (BLOCKER-1 guard)
 #include <impl/dash/coin/dkg_commitments.hpp>  // E1: build_daemonless_qc_plan (serve DKG windows daemonlessly)
+#include <impl/dash/coin/mined_commitment_index.hpp>  // PR-2 FORWARD: dashd's mined-commitment store, from OUR replay
 #include <impl/dash/coin/qc_episode_classifier.hpp>  // [QC-EPISODE] terminal-event classifier (null-arm design §8)
 #include <impl/dash/coin/vendor/bls_verify.hpp>  // E1 Phase-L: make_commitment_bls_verifier (real qc verify seam)
 #include <impl/dash/coin/chainlock_verify.hpp>   // live-path ChainLock quorum selection + BLS verify gate
@@ -279,6 +280,22 @@ std::string g_replay_fold_worklists;          // --replay-fold-worklists FILE
 // serve are both fine WITHOUT proving the serve is daemonless.
 bool        g_no_dashd_mn_seed = false;       // --embedded-no-dashd-mn-seed
 
+// ── PR-2 FORWARD: --replay-mined-commitment-index ─────────────────────────
+// Arms the forward half of dashd's mined-commitment store
+// (mined_commitment_index.hpp, ported from v23.1.7 llmq/blockprocessor.cpp)
+// off the replay lane, and — ONLY once armed — offers it as a SECOND
+// "already mined" source to the daemonless qc plan, alongside the
+// mnlistdiff/qrinfo-fed QuorumManager.
+//
+// ⚠ MONEY PATH, default OFF. A slot that reads already-mined is a type-6 tx
+// the served template no longer carries, so this is byte-visible. The index
+// itself REFUSES TO ARM when the node's tip is live (dashd's UndoBlock half
+// is not ported; a reorg would leave a phantom mined record and the template
+// would be short one qfcommit => bad-qc-missing => lost block). The flag is
+// therefore two gates deep: the operator must ask for it AND the tip posture
+// must permit it.
+bool        g_mined_commitment_index = false; // --replay-mined-commitment-index
+
 // ───────────────────────────────────────────────────────────────────────────
 // [BLOCK-LEDGER] — our own block accounting, from PERSISTENT state
 // ───────────────────────────────────────────────────────────────────────────
@@ -395,6 +412,7 @@ void print_banner(const char* argv0)
         << "           [--replay-bulk] [--replay-bulk-capture DIR] [--replay-bulk-start H]\n"
         << "           [--replay-fold-prestate FILE] [--replay-fold-quorums]\n"
         << "           [--replay-fold-qsnapshot FILE] [--replay-fold-worklists FILE]\n"
+        << "           [--replay-mined-commitment-index]\n"
         << "           [--embedded-no-dashd-mn-seed]\n"
         << "           [--oracle-graduation-blocks N] [--oracle-class-coverage K]\n"
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
@@ -3248,6 +3266,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // Constructed only alongside the fold engine.
     std::unique_ptr<dash::coin::replay::FoldLiveTail>          replay_live_tail;
     std::unique_ptr<dash::coin::replay::ReplayPayeePublisher>  replay_payee_pub;
+    // PR-2 FORWARD: dashd's mined-commitment store, fed from the same replayed
+    // bodies. shared_ptr because the qc-plan lambda (installed far above, on
+    // the serve path) captures it by value and must see it appear later — it
+    // stays null, and the lambda's guard stays false, when the flag is off or
+    // the arm is refused.
+    std::shared_ptr<dash::coin::MinedCommitmentIndex>          mined_commitment_index;
     if (coin_p2p) {
         const auto dash_params = testnet
             ? dash::coin::make_dash_chain_params_testnet()
@@ -4339,7 +4363,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             node_coin_state.set_qc_plan_fn(
                 [&node_coin_state, hc = header_chain.get(), qc_net, qc_cache,
                  qc_gap_logged_h, qc_first_plan_h, qc_cold_note_done,
-                 qc_type_recon, qc_recon_said, qc_recon_log, qc_episode]
+                 qc_type_recon, qc_recon_said, qc_recon_log, qc_episode,
+                 // PR-2 FORWARD. By REFERENCE: the index is constructed later
+                 // in this same function (alongside the replay lane), so a
+                 // by-value capture would freeze the null it holds today.
+                 // Same lifetime class as &node_coin_state above.
+                 &mined_commitment_index]
                 (uint32_t next_h) -> std::optional<dash::coin::QcBlockPlan> {
                     if (*qc_first_plan_h == 0u) *qc_first_plan_h = next_h;
                     // Observe the MINED set at the tip we are building on.
@@ -4389,7 +4418,30 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         },
                         qc_cache.get(),
                         /*null_evidence=*/nullptr,
-                        &gap);
+                        &gap,
+                        // ── PR-2 FORWARD: the SECOND already-mined source ──
+                        // dashd answers HasMinedCommitment from the block it
+                        // connected (v23.1.7 llmq/blockprocessor.cpp:502 over
+                        // the DB_MINED_COMMITMENT record ProcessCommitment
+                        // wrote at :359). We answered it only from the
+                        // mnlistdiff/qrinfo-fed QuorumManager — a round trip
+                        // that lands AFTER the block did, which is what turned
+                        // "another miner already mined this slot" into
+                        // qc-plan-underivable episodes of 512/302/283/249 s.
+                        //
+                        // Two gates deep: null unless the operator passed
+                        // --replay-mined-commitment-index AND the index armed
+                        // (it REFUSES on a live tip — the undo half is not
+                        // ported). Both false => this is nullptr and the plan
+                        // is byte-identical to before.
+                        (mined_commitment_index
+                         && mined_commitment_index->armed())
+                            ? std::function<bool(uint8_t, const uint256&)>(
+                                  [mi = mined_commitment_index](
+                                      uint8_t t, const uint256& qh) {
+                                      return mi->has_mined_commitment(t, qh);
+                                  })
+                            : std::function<bool(uint8_t, const uint256&)>());
                     if (!plan && !gap.quorum_hash.IsNull()
                         && *qc_gap_logged_h != next_h) {
                         *qc_gap_logged_h = next_h;
@@ -5766,6 +5818,73 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 }
             }
 
+            // ── PR-2 FORWARD: the mined-commitment store ──────────────────
+            // Placed HERE, after replay_live_tail is (or is not) constructed,
+            // because that pointer is the STRUCTURAL answer to "is this
+            // node's tip live?". FoldLiveTail subscribes block_connected and
+            // hands LIVE TIP blocks to the same fold consumer this index
+            // rides — so its existence means a disconnect can reach us, and
+            // the missing UndoBlock half would matter. The posture is read
+            // off the wiring, never guessed from how old the tip looks.
+            if (g_mined_commitment_index && replay_fold_consumer
+                && replay_fold_engine) {
+                dash::coin::MinedCommitmentIndexConfig micfg;
+                micfg.enabled = true;   // the operator asked for it by name
+                micfg.network = testnet ? dash::coin::LlmqNetwork::Testnet
+                                        : dash::coin::LlmqNetwork::Mainnet;
+                auto mi = std::make_shared<dash::coin::MinedCommitmentIndex>(
+                    micfg);
+                mi->seed_cursor(replay_fold_engine->height());
+                dash::coin::TipPosture posture;
+                posture.live = (replay_live_tail != nullptr);
+                posture.declared_by =
+                    replay_live_tail
+                        ? "FoldLiveTail is wired (live tip blocks are folded "
+                          "into this same consumer)"
+                        : "no FoldLiveTail: this consumer sees only replayed "
+                          "historical bodies";
+                const auto verdict = mi->arm(posture);
+                std::cout << "[run] " << verdict.reason << "\n";
+                LOG_INFO << "[QC-MINED-INDEX] " << verdict.reason;
+                if (verdict.armed) {
+                    mined_commitment_index = mi;
+                    // Chain onto whatever pre_fold the quorum seam installed:
+                    // the index observes the block FIRST (it needs no folded
+                    // state), then the quorum lane, then the DML fold. A
+                    // refusal here is reported through the same channel the
+                    // quorum lane uses and never stops the fold.
+                    auto prev = replay_fold_consumer->take_pre_fold();
+                    replay_fold_consumer->set_pre_fold(
+                        [mi, prev, hc = header_chain.get()](
+                            uint32_t h, const uint256& bh,
+                            const dash::coin::BlockType& blk) -> std::string {
+                            std::string err;
+                            const auto r = mi->process_block(
+                                h, bh, blk,
+                                [hc](uint32_t q) -> std::optional<uint256> {
+                                    if (auto e = hc->get_header_by_height(q))
+                                        return e->hash;
+                                    return std::nullopt;
+                                },
+                                &err);
+                            std::string out;
+                            if (r != dash::coin::MinedIngestResult::Applied)
+                                out = "mined-commitment index refused: " + err;
+                            if (prev) {
+                                const std::string q = prev(h, bh, blk);
+                                if (!q.empty())
+                                    out = out.empty() ? q : (out + "; " + q);
+                            }
+                            return out;
+                        });
+                }
+            } else if (g_mined_commitment_index) {
+                std::cout << "[run] --replay-mined-commitment-index given but "
+                             "no replay fold consumer (needs "
+                             "--replay-fold-prestate) — mined-commitment "
+                             "index NOT armed\n";
+            }
+
             if (!g_replay_bulk_capture_dir.empty()) {
                 replay_capture = std::make_unique<rp::CaptureReplayConsumer>(
                     g_replay_bulk_capture_dir, replay_consumer);
@@ -5899,6 +6018,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                     br = replay_quorum_bridge.get(),
                                     pp = replay_payee_pub.get(),
                                     lt = replay_live_tail.get(),
+                                    mi = mined_commitment_index,
                                     tick = std::make_shared<uint64_t>(0)] {
                 ln->tick(std::chrono::duration_cast<std::chrono::seconds>(
                     std::chrono::steady_clock::now().time_since_epoch())
@@ -5918,6 +6038,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // watched from another terminal still reports what it proved.
                 if (fc && ++*tick % 30 == 0) {
                     LOG_INFO << fc->summary();
+                    // PR-2 FORWARD: the mined-commitment store's own line —
+                    // cursor, how many mined records it holds, and (issue #90)
+                    // which llmq type is still short of the full active quota.
+                    if (mi) LOG_INFO << mi->summary();
                     if (br) {
                         const auto& bs = br->stats();
                         LOG_INFO << "[REPLAY-SEAM] member_cycles_derived="
@@ -5945,17 +6069,42 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                  << bs.quorum_roots_matched << "/"
                                  << bs.quorum_roots_differed
                                  << " self_check="
-                                 << (br->self_check_armed() ? "armed"
-                                                            : "UNARMED")
+                                 << (br->self_check_armed()
+                                        ? std::string("armed")
+                                        : std::string("UNARMED"))
+                                 // ── ISSUE #90 ─────────────────────────
+                                 // The counter now NAMES ITS BLOCKING
+                                 // CONDITION — which llmq type is short and
+                                 // by how many — instead of reading `0/N`
+                                 // with nothing to say. NOTHING IN THIS
+                                 // BINARY ARMS THE SELF-CHECK: the arming
+                                 // half of #90 is deliberately not in this
+                                 // PR (see the ISSUE #90 note in
+                                 // ReplayQuorumBridge::observe — armed, a
+                                 // root differ is a hard stop that can stop
+                                 // SERVING, so it needs its own default-OFF
+                                 // flag and its own KAT). The armed branch
+                                 // below reads the real state rather than
+                                 // asserting a constant, so the line stays
+                                 // truthful when #90 lands.
                                  << (br->self_check_armed()
                                         ? std::string()
                                         : std::string(
-                                              " (unarmed: no quorum-set seed —"
-                                              " a differ here is warm-up, NOT"
-                                              " divergence; the SERVED root is"
-                                              " measured by the shadow"
-                                              " comparison, not by this"
-                                              " counter)"))
+                                              " (unarmed: active set "
+                                              "incomplete — ")
+                                              + br->active_set_shortfall_text()
+                                              + "; on mainnet type1"
+                                                " (LLMQ_50_60) is short"
+                                                " FOREVER: its last 24"
+                                                " commitments were mined"
+                                                " before DIP0024 (~h1738698)"
+                                                " and no forward replay from"
+                                                " a modern anchor can observe"
+                                                " them — they must be SEEDED"
+                                                " or reached by a genesis"
+                                                " replay. Until then a differ"
+                                                " here is warm-up, NOT"
+                                                " divergence)")
                                  << (bs.last_skip_reason.empty()
                                         ? std::string()
                                         : " last_skip=\"" + bs.last_skip_reason + "\"");
@@ -7274,6 +7423,9 @@ int main(int argc, char** argv)
             g_replay_fold_qsnapshot = argv[++i];
         else if (std::strcmp(argv[i], "--replay-fold-worklists") == 0 && i + 1 < argc)
             g_replay_fold_worklists = argv[++i];
+        // PR-2 FORWARD: the mined-commitment store, fed from our own replay.
+        else if (std::strcmp(argv[i], "--replay-mined-commitment-index") == 0)
+            g_mined_commitment_index = true;
         // THE PROOF POSTURE: keep the dashd RPC (shadow-compare) but cut the
         // PAYEE axis off from it — see g_no_dashd_mn_seed.
         else if (std::strcmp(argv[i], "--embedded-no-dashd-mn-seed") == 0)

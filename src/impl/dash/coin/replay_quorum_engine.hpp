@@ -841,6 +841,51 @@ public:
         return true;
     }
 
+    /// WHICH types are short, and by how many — issue #90's missing half.
+    ///
+    /// `active_sets_complete()` is a bare bool, so a run that never completes
+    /// cannot say WHY, and the fold_root_vs_committed counter it gates reads
+    /// `0/N` forever with no blocking condition named. It has a NAME:
+    ///
+    ///   * MAINNET, LLMQ_50_60 (type 1) short by 24, PERMANENTLY. The type
+    ///     stopped being MINED at DIP0024 (~h 1738698) but its last 24
+    ///     commitments stay in dashd's active set forever, because
+    ///     GetMinedAndActiveCommitmentsUntilBlock walks the CHAINPARAMS list
+    ///     (v23.1.7 llmq/blockprocessor.cpp:664), not the runtime-enabled one.
+    ///     A forward replay seeded at a modern anchor can NEVER observe them
+    ///     from blocks. They must be SEEDED (seed_commitment(), 24 records) or
+    ///     reached by a genesis replay (Phase 2).
+    ///   * Any other type short: warm-up. It closes on its own within
+    ///     signingActiveQuorumCount × dkgInterval blocks of the anchor —
+    ///     576 blocks for the rotated type-5 ring, 96 for type 2/3.
+    ///
+    /// Empty => complete => the reconstructed set IS dashd's set and the root
+    /// self-check may be armed.
+    std::vector<std::pair<uint8_t, size_t>> active_set_shortfall() const
+    {
+        std::vector<std::pair<uint8_t, size_t>> out;
+        for (const auto& p : replay_chainparams_llmqs(m_cfg.network)) {
+            const size_t have = active_count(p.type);
+            if (have < p.signing_active_quorum_count)
+                out.emplace_back(p.type, p.signing_active_quorum_count - have);
+        }
+        return out;
+    }
+
+    /// Human-readable form of the above; "complete" when nothing is short.
+    std::string active_set_shortfall_text() const
+    {
+        const auto miss = active_set_shortfall();
+        if (miss.empty()) return "complete";
+        std::string s;
+        for (size_t i = 0; i < miss.size(); ++i) {
+            if (i) s += ",";
+            s += "type" + std::to_string(int(miss[i].first)) + ":short"
+               + std::to_string(miss[i].second);
+        }
+        return s;
+    }
+
     /// The W1 DmlFoldEngine::MembersFn contract: ORDERED member proTxHashes
     /// of the quorum (llmqType, quorumHash), or nullopt (caller fails
     /// closed). Resolution: quorumHash → observed/seeded height → the
