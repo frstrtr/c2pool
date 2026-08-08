@@ -830,6 +830,12 @@ public:
     void set_mn_needs_reseed(bool v) { m_mn_needs_reseed = v; }
     bool mn_needs_reseed() const { return m_mn_needs_reseed; }
 
+    /// Number of times embedded_template_emit_ok() has been evaluated on this
+    /// state (counted at the top of the gate, before any early return). Test
+    /// seam: pins that submit-path tip reads never evaluate the serve gate
+    /// (the 2026-08-07/08 hotel freeze amplifier).
+    uint64_t emit_ok_call_count() const { return m_emit_ok_calls; }
+
     /// BLOCKER-3 pre-emit HARD GATE. Before the embedded arm's template is
     /// served/mined, re-validate the BUILT CbTx against consensus invariants;
     /// any failure => the caller must fall back to the reward-safe dashd path.
@@ -850,6 +856,12 @@ public:
     /// existing caller and KAT source-compatible.
     bool embedded_template_emit_ok(const DashWorkData& w,
                                    DeclineReport* why = nullptr) const {
+        // Call counter FIRST, before any early return: the regression gate in
+        // test_dash_submit_gate_scaling.cpp pins that a submit-path tip READ
+        // (get_current_gbt_prevhash) never evaluates this gate -- the
+        // 2026-08-07/08 hotel freeze was this method's SML CalcMerkleRoot
+        // running per share submit on the io thread.
+        ++m_emit_ok_calls;
         auto reject = [why](const char* c, std::string v, std::string t) -> bool {
             if (why) {
                 why->viable    = false;
@@ -1560,6 +1572,12 @@ private:
     uint256  m_sml_current_hash;              // block hash the SML is current at (ZERO = cold/reorg)
     int64_t  m_sml_current_height{-1};        // DIAGNOSTIC ONLY, -1 = never reported; see set_sml_current_height
     bool     m_require_sml{false};            // gate viability on have_sml (embedded arm)
+    // How many times embedded_template_emit_ok() was EVALUATED (incremented at
+    // its top, before any early return). Test seam for the 2026-08-07/08 hotel
+    // freeze regression gate: the serve gate re-derives the full SML merkle
+    // root, so the count of evaluations per submit-path tip read must be ZERO
+    // (test_dash_submit_gate_scaling.cpp). mutable because the gate is const.
+    mutable uint64_t m_emit_ok_calls{0};
     std::function<bool()> m_utxo_ready_fn;   // optional UTXO maturity gate (E2b)
     // Default REFUSES the immature window (p2pool semantics: an unsynced node
     // does not serve templates) -- byte-identical to the pre-policy behaviour.
