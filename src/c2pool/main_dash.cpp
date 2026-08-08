@@ -795,7 +795,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // occupies and refuse the pin that would push the assembled
              // block past the 2 MB consensus limit, with a NAMED cause.
              // OFF reproduces the shipped arithmetic byte-for-byte.
-             bool pin_block_budget = false)
+             bool pin_block_budget = false,
+             // --embedded-creditpool-publish-at-serve-tip: publish the derived
+             // DIP-0027 credit pool AT THE SERVE TIP instead of at the folded
+             // body height (dashd derives the pool for the block you ask
+             // about -- creditpool.cpp:224 GetCreditPool(block_index), read at
+             // pindexPrev by both the template and validation paths). Removes
+             // the `creditpool-stale value=threshold+1` window that opens when
+             // the fourth-axis conjunct holds promotion. MONEY PATH: it makes
+             // the arm SERVE where it previously refused, so default false.
+             // Only meaningful on the body-first (coin-P2P daemonless) arm.
+             bool embedded_creditpool_publish_at_serve_tip = false)
 {
     namespace io = boost::asio;
 
@@ -4740,6 +4750,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // advance. `creditpool-stale` then ceases to exist as a class in
         // normal operation; the ~1-2 s window is named `tip-body-pending`.
         maintainer->set_body_first_serve_tip(true);
+        // PR-5 publication height (default OFF; money path). With body-first
+        // on, the credit pool derived for a block ABOVE the serve tip is held
+        // and published atomically with the promotion that makes that block
+        // the serve tip -- so the pool the template is built from is the pool
+        // at the block it builds ON, which is what dashd does by construction
+        // (GetCreditPool(pindexPrev)).
+        maintainer->set_credit_pool_publish_at_serve_tip(
+            embedded_creditpool_publish_at_serve_tip);
+        std::cout << "[run] embedded credit-pool publication height: "
+                  << (embedded_creditpool_publish_at_serve_tip
+                          ? "SERVE TIP (--embedded-creditpool-publish-at-serve-tip)"
+                          : "body height (default; creditpool-stale windows "
+                            "possible while promotion is held)")
+                  << "\n";
         maintainer->set_full_block_buffer(true);
         maintainer->set_chain_hash_at_height_fn(
             [hc = header_chain.get()](uint32_t h) -> std::optional<uint256> {
@@ -7085,6 +7109,12 @@ int main(int argc, char** argv)
     // DASH_CONNECTBLOCK_REJECT_SURFACE_AUDIT.md) arms only on explicit
     // operator decision.
     bool embedded_serve_mempool_txs = false;
+    // --embedded-creditpool-publish-at-serve-tip: publish the derived credit
+    // pool AT THE SERVE TIP rather than at the folded body height (PR-5,
+    // dashd GetCreditPool(pindexPrev) parity). MONEY PATH -> default OFF: it
+    // makes the body-first arm SERVE serve-tip-based work in windows where it
+    // currently refuses with `creditpool-stale`.
+    bool embedded_creditpool_publish_at_serve_tip = false;
     std::string pin_local_tx_hex_path;
     // --embedded-mempool-ingest: arm the coin-P2P MSG_TX pull (phase 1).
     // SEPARATE from --embedded-serve-mempool-txs on purpose: this only makes
@@ -7192,6 +7222,9 @@ int main(int argc, char** argv)
             embedded_mempool_ingest = true;
         else if (std::strcmp(argv[i], "--dash-pin-block-budget") == 0)
             pin_block_budget = true;
+        else if (std::strcmp(argv[i],
+                             "--embedded-creditpool-publish-at-serve-tip") == 0)
+            embedded_creditpool_publish_at_serve_tip = true;
         else if (std::strcmp(argv[i], "--pin-local-tx-hex") == 0 && i + 1 < argc)
             pin_local_tx_hex_path = argv[++i];
         else if (std::strcmp(argv[i], "--replay-utxo-db") == 0 && i + 1 < argc)
@@ -7473,7 +7506,8 @@ int main(int argc, char** argv)
                         embedded_mempool_ingest,
                         pin_local_tx_hex_path,
                         serve_staleness_sentinel,
-                        pin_block_budget);
+                        pin_block_budget,
+                        embedded_creditpool_publish_at_serve_tip);
     }
     return run_selftest();
 }

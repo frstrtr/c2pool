@@ -663,8 +663,13 @@ public:
                     // the seed does not advance to the tip, the seed height stays
                     // behind m_prev_height and the freshness gate fails closed
                     // instead of committing a lagged creditPoolBalance (soak fix).
-                    m_state.set_credit_pool(observed.creditPoolBalance,
-                                            diff.blockHash, observed.nHeight);
+                    // PR-5: publication height. Same rule as the body fold —
+                    // a diff-derived pool ABOVE the serve tip is held for the
+                    // promotion below (maybe_promote_pending_tip) to publish.
+                    // Under the default-off flag this is m_state.set_credit_pool
+                    // verbatim.
+                    publish_credit_pool_at(observed.creditPoolBalance,
+                                           diff.blockHash, observed.nHeight);
                     // E2: re-anchor the independent running accrual to this
                     // authoritative snapshot value/height so the per-block advance
                     // (on_block_connected) continues contiguously from here, and
@@ -911,6 +916,10 @@ public:
                         && cb.nVersion >= vendor::CCbTx::VERSION_CLSIG_AND_BALANCE
                         && cb.nHeight == static_cast<int32_t>(*fork_h)) {
                         m_credit_pool_sm.seed(cb.creditPoolBalance, *fork_h);
+                        // Rollback: write straight through and drop anything
+                        // held — a held pool was derived on the branch that
+                        // just went away (PR-5).
+                        discard_held_credit_pool();
                         m_state.set_credit_pool(cb.creditPoolBalance, rb.hash,
                                                 static_cast<int32_t>(*fork_h));
                         cp_undone = true;
@@ -928,7 +937,9 @@ public:
         if (!cp_undone) {
             // Invalidate the credit-pool seed's freshness (height -1 != any
             // tip), so the arm fails closed on the credit-pool axis until a
-            // fresh re-seed.
+            // fresh re-seed. A HELD pool (PR-5) is dropped with it: it was
+            // derived on the orphaned branch and must never be published.
+            discard_held_credit_pool();
             m_state.set_credit_pool(0, uint256::ZERO, -1);
             // E2: wipe the independent running accrual as well — its balance
             // was built on the now-orphaned branch. It re-bootstraps from the
@@ -1351,6 +1362,32 @@ public:
     void set_body_first_serve_tip(bool on) { m_body_first_serve_tip = on; }
     bool body_first_serve_tip() const { return m_body_first_serve_tip; }
 
+    /// PUBLICATION HEIGHT (PR-5). When enabled (and body-first is on), the
+    /// derived credit pool is PUBLISHED at the SERVE tip instead of at the
+    /// body height: a pool derived for a block ABOVE the serve tip is held in
+    /// a pending slot and published atomically with the promotion that makes
+    /// that block the serve tip. See publish_credit_pool_at() for the dashd
+    /// mechanism this ports and why the current write is not merely
+    /// gate-tripping but reward-WRONG for the tip we are actually building on.
+    ///
+    /// MONEY PATH -> default OFF. Turning it on changes what the embedded arm
+    /// serves during a held window: it serves serve-tip-based work where it
+    /// previously refused with `creditpool-stale`. main_dash exposes it as
+    /// --embedded-creditpool-publish-at-serve-tip; nothing enables it
+    /// implicitly.
+    void set_credit_pool_publish_at_serve_tip(bool on) {
+        m_cp_publish_at_serve_tip = on;
+    }
+    bool credit_pool_publish_at_serve_tip() const {
+        return m_cp_publish_at_serve_tip;
+    }
+    /// Observability (STATE SAYS ITS OWN NAME): is a derived credit pool
+    /// currently HELD above the serve tip, awaiting promotion? -1 = nothing
+    /// held.
+    int32_t held_credit_pool_height() const {
+        return m_cp_pending_valid ? m_cp_pending_height : -1;
+    }
+
     /// Body-first observability (STATE SAYS ITS OWN NAME): is the maintainer
     /// currently holding the serve tip below a known header tip, awaiting the
     /// tip body? TRUE is the normal ~1-2 s propagation transient, never an
@@ -1656,11 +1693,18 @@ private:
             // referential — value AND height come straight off the wire.
             m_credit_pool_sm.seed(from_wire, height);
         }
-        // Advance the freshness seed to THIS block: height == the tip we build the
-        // next template on, so the credit-pool freshness gate passes at the right
-        // height without waiting for the next mnlistdiff.
-        m_state.set_credit_pool(from_wire, block_identity_hash(block),
-                                static_cast<int32_t>(height));
+        // Advance the freshness seed to THIS block. The comment that used to
+        // stand here asserted "height == the tip we build the next template
+        // on" — true in header-first mode, and true in body-first mode ONLY
+        // when this fold promotes the serve tip. When promotion is held (the
+        // fourth axis, maybe_promote_pending_tip:1820-1822), the serve tip
+        // stays at H-1 while this write moved the pool to H: the pool AHEAD of
+        // the tip, which is exactly the `creditpool-stale value=threshold+1`
+        // class. publish_credit_pool_at() makes the assertion true by
+        // construction under the flag — it publishes at the serve tip and
+        // holds anything above it for the promotion to publish.
+        publish_credit_pool_at(from_wire, block_identity_hash(block),
+                               static_cast<int32_t>(height));
     }
 
     // E-SUPERBLOCK (R4): derive the funding threshold from the CURRENT SML —
@@ -1742,6 +1786,125 @@ private:
 
     // ── BODY-FIRST serve-tip machinery ───────────────────────────────────
 
+    // ── PR-5: PUBLICATION HEIGHT of the credit pool ──────────────────────
+    //
+    // THE MECHANISM, from dashd v23.1.7. dashd has no single "current" credit
+    // pool at all. CCreditPoolManager::GetCreditPool(block_index)
+    // (src/evo/creditpool.cpp:224-239) DERIVES the pool FOR THE BLOCK YOU ASK
+    // ABOUT, walking back to the nearest cached ancestor, and caches the
+    // result keyed by that block's own hash+height
+    // (creditpool.cpp:218 AddToCache(block_index->GetBlockHash(),
+    // block_index->nHeight, pool), store at creditpool.h:115). Deriving the
+    // pool at H therefore leaves the pool at H-1 exactly as available as it
+    // was. Every consumer asks for the pool AT THE BLOCK IT IS BUILDING OR
+    // VALIDATING ON, never "the newest one":
+    //   * template  : CChainstateHelper::GetCreditPool passthrough
+    //                 (evo/chainhelper.cpp:48-51), called with pindexPrev;
+    //   * validation: GetCreditPoolDiffForBlock ->
+    //                 cpoolman.GetCreditPool(pindexPrev)
+    //                 (creditpool.cpp:325-333), and the connect-time path
+    //                 CSpecialTxProcessor (evo/specialtxman.cpp:565)
+    //                 GetCreditPool(pindex->pprev).
+    // The committed balance of a block at height X is the pool at X-1 plus
+    // that block's own deltas (specialtxman.cpp:745-755).
+    //
+    // WE have ONE published slot, and node_coin_state.hpp:1334-1340 measures
+    // its height against the SERVE tip while node_coin_state.hpp:1096-1103
+    // builds the next CbTx's creditPoolBalance from its VALUE. Writing that
+    // slot at the BODY height while the serve tip is still H-1 (promotion
+    // held on the fourth axis, :1820-1822) is therefore wrong twice over:
+    //   1. the freshness gate reports `creditpool-stale` with value =
+    //      threshold+1 -- the pool is AHEAD of the tip, never behind, which is
+    //      why every one of the 48 measured episodes carried exactly +1;
+    //   2. had the gate not refused, the template built on H-1 would have
+    //      committed the pool at H -- the wrong base, a bad-cbtx block.
+    // Publishing at the serve tip fixes both: the pool the arm serves from is
+    // the pool at the block it builds on, which is what dashd does by
+    // construction.
+    //
+    // Every credit-pool ADVANCE routes through here. The rollback paths
+    // (reorg undo / cold wipe) write m_state directly and clear the pending
+    // slot -- they move the seed to or below the tip, never above it.
+    void publish_credit_pool_at(int64_t balance, const uint256& at_hash,
+                                int32_t at_height) {
+        const bool hold =
+            m_cp_publish_at_serve_tip
+            && m_body_first_serve_tip
+            // No serve tip yet (cold start / post-demote): there is no tip for
+            // the pool to run ahead OF, so publish, exactly as today.
+            // NO DEADLOCK IS CLAIMED. An earlier revision of this comment said
+            // holding here "would deadlock the arm"; that was not demonstrable
+            // and is retracted -- every pending slot reachable from a cold
+            // start is drained by the very next promotion, which matches it
+            // via credit_pool_derived_at and publishes it in the same step.
+            // What the conjunct actually buys is the INTERMEDIATE state: with
+            // no serve tip the pool lands in the PUBLISHED slot rather than a
+            // slot only a promotion can drain, so a node whose promotion is
+            // held on another axis still has a published pool. That, and only
+            // that, is what ColdStartPublishesImmediatelyWithPublicationHeightOn
+            // asserts -- and it is red without this line.
+            && m_have_tip
+            && at_height > static_cast<int32_t>(m_prev_height);
+        m_cp_pending_valid   = hold;
+        m_cp_pending_balance = balance;
+        m_cp_pending_hash    = at_hash;
+        m_cp_pending_height  = at_height;
+        if (hold) {
+            LOG_INFO
+                << "[CREDITPOOL] derived h=" << at_height
+                << " HELD above the serve tip h=" << m_prev_height
+                << " — publishing at the serve tip (dashd derives the pool at"
+                   " pindexPrev; the template building on h=" << m_prev_height
+                << " must commit the pool at h=" << m_prev_height << ")";
+            return;
+        }
+        m_state.set_credit_pool(balance, at_hash, at_height);
+    }
+
+    /// Drop anything held (rollback paths: the branch it was derived on is
+    /// gone, or the seed is being invalidated outright).
+    ///
+    /// NOT inert bookkeeping — MONEY PATH. The pending slot answers
+    /// credit_pool_derived_at(), which IS the credit-pool promotion
+    /// precondition, so a slot that survives a rollback lets the next
+    /// promotion at that same hash/height publish the ORPHANED branch's
+    /// balance. On the cold-wipe path (:942) that silently undoes the
+    /// deliberate fail-closed write of (0, ZERO, -1) one line later.
+    /// Covered red-on-mutation by ColdWipeDiscardsHeldPoolSoTheOrphanCannot-
+    /// BeRepublished and ReorgUndoDiscardsHeldPoolDerivedAboveTheForkPoint —
+    /// emptying this body turns both red (orphan pool republished at H, serve
+    /// tip promoted onto it).
+    void discard_held_credit_pool() { m_cp_pending_valid = false; }
+
+    /// Is the credit pool DERIVED at exactly this block — published already,
+    /// or held pending publication? This is the promotion precondition: what
+    /// matters is that we HAVE the pool for that block, not which slot it is
+    /// sitting in.
+    bool credit_pool_derived_at(const uint256& at_hash, uint32_t at_height) const {
+        if (m_cp_pending_valid
+            && m_cp_pending_hash == at_hash
+            && m_cp_pending_height == static_cast<int32_t>(at_height))
+            return true;
+        return m_state.credit_pool_current_hash() == at_hash
+               && m_state.credit_pool_height() == static_cast<int32_t>(at_height);
+    }
+
+    /// Publish a HELD pool at the moment the serve tip becomes its block.
+    /// Called from maybe_promote_pending_tip immediately before
+    /// promote_serve_tip, so the publication and the serve-tip advance are one
+    /// indivisible step on the single io thread — the same atomicity the whole
+    /// body-first design rests on. A pending slot for a DIFFERENT block is
+    /// left alone (it is not this tip's pool).
+    void publish_held_credit_pool_at(const uint256& at_hash, uint32_t at_height) {
+        if (!m_cp_pending_valid) return;
+        if (m_cp_pending_hash != at_hash
+            || m_cp_pending_height != static_cast<int32_t>(at_height))
+            return;
+        m_state.set_credit_pool(m_cp_pending_balance, m_cp_pending_hash,
+                                m_cp_pending_height);
+        m_cp_pending_valid = false;
+    }
+
     /// Copy the stashed header-tip params into the SERVE slots. In
     /// header-first (legacy) mode this runs inside on_new_tip, byte-identical
     /// to the old direct assignment; in body-first mode it runs only from
@@ -1785,9 +1948,13 @@ private:
     bool maybe_promote_pending_tip() {
         if (!m_body_first_serve_tip || !m_tip_body_pending) return false;
         if (!m_have_hdr_tip) return false;
-        if (m_state.credit_pool_current_hash() != m_hdr_prev_hash) return false;
-        if (m_state.credit_pool_height()
-            != static_cast<int32_t>(m_hdr_prev_height)) return false;
+        // Credit-pool axis: the pool must be DERIVED at this exact block —
+        // published already (flag off / at-or-below the serve tip), or HELD
+        // pending publication (PR-5). Asking "do we have the pool for this
+        // block" rather than "is the published slot at this block" is what
+        // lets the publication ride the promotion instead of preceding it.
+        if (!credit_pool_derived_at(m_hdr_prev_hash, m_hdr_prev_height))
+            return false;
         // The PAYEE axis must be current at the tip too (its cursor advances
         // in the tip-body apply_block, or a snapshot loaded as-of the tip):
         // promoting off a tip-targeted mnlistdiff that outraced the body
@@ -1820,6 +1987,12 @@ private:
         if (!m_state.sml_current_hash().IsNull()
             && m_state.sml_current_hash() != m_hdr_prev_hash)
             return false;
+        // PUBLISH-WITH-PROMOTION (PR-5): the held pool for this exact block
+        // becomes the published pool in the same indivisible step that makes
+        // the block the serve tip. No observer can see the pool at H with the
+        // serve tip at H-1 — the creditpool-stale window is not shortened, it
+        // ceases to have a state to exist in.
+        publish_held_credit_pool_at(m_hdr_prev_hash, m_hdr_prev_height);
         promote_serve_tip();
         m_state.set_tip_body_pending_dbg(false);
         LOG_INFO << "[EMB-DASH] serve tip promoted h=" << m_prev_height << " "
@@ -2056,6 +2229,15 @@ private:
     // Body-first mode + pending-window state. Defaults keep every existing
     // construction site byte-identical (header-first).
     bool    m_body_first_serve_tip{false};
+    // PR-5 publication height. m_cp_pending_* holds a credit pool DERIVED for
+    // a block above the serve tip until promotion publishes it (see
+    // publish_credit_pool_at). Default OFF => the pending slot is never used
+    // and every write goes straight through, byte-identical to header-first.
+    bool    m_cp_publish_at_serve_tip{false};
+    bool    m_cp_pending_valid{false};
+    int64_t m_cp_pending_balance{0};
+    uint256 m_cp_pending_hash;
+    int32_t m_cp_pending_height{-1};
     bool    m_tip_body_pending{false};
     bool    m_tip_overdue_latched{false};
     int64_t m_tip_pending_since{0};
