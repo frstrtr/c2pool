@@ -58,6 +58,7 @@
 #include "share_check.hpp"      // bch::create_local_share (transitive via node.hpp)
 #include "share_types.hpp"      // bch::StaleInfo
 #include "coin/block.hpp"       // bch::coin::SmallBlockHeaderType
+#include "coin/block_confirm.hpp" // #995 BCH arm: found-block confirm/orphan resolver
 
 #include <core/pack_types.hpp>    // BaseScript
 
@@ -66,6 +67,9 @@
 #include <core/web_server.hpp>       // H-STATS.944: operator dashboard + graph_db persist
 #include <core/filesystem.hpp>      // config_path() for the graph_db location
 #include <functional>
+#include <ctime>       // std::time (found-block record timestamp)
+#include <limits>       // std::numeric_limits (RPC-fallback sentinel)
+#include <optional>     // std::optional (winner_at oracle)
 
 #include <btclibs/util/strencodings.h>   // HexStr
 
@@ -640,17 +644,139 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
     std::unique_ptr<core::WebServer> web_server;
     std::shared_ptr<boost::asio::steady_timer> stats_timer;
     if (http_port != 0) {
+        // No-silent-ctor bracket (integrator req #2, per-lane port of ltc #1041).
+        // core::WebServer's ctor already logs "core::WebServer constructed on ..."
+        // (shared, blockchain= numeric only); these two BCH-namespaced lines make
+        // the boot log self-identify THIS lane's dashboard standup on the way in
+        // and out, so a ctor that throws mid-standup shows as an unmatched
+        // "standing up" with no "constructed" follow-up. src/impl/bch only.
+        LOG_INFO << "[BCH-POOL] standing up core::WebServer + MiningInterface (http bind "
+                 << http_addr << ":" << http_port << ") ...";
         web_server = std::make_unique<core::WebServer>(
             ioc, http_addr, http_port, is_testnet,
             std::shared_ptr<core::IMiningNode>{},        // no IMiningNode adapter yet
             c2pool::address::Blockchain::BITCOIN);       // SHA256d graph_db pairing
         auto* mi = web_server->get_mining_interface();
+        if (mi == nullptr) {
+            LOG_ERROR << "[BCH-POOL] core::WebServer constructed but MiningInterface is"
+                      << " NULL -- dashboard disabled, run-loop continues.";
+            web_server.reset();
+        }
+        if (mi != nullptr) {
+        LOG_INFO << "[BCH-POOL] core::WebServer + MiningInterface constructed (coin=BCH, "
+                 << "http " << http_addr << ":" << http_port << "); MiningInterface alive.";
 #ifdef C2POOL_VERSION
         mi->set_coin_label("BCH");
         mi->set_pool_version("c2pool/" C2POOL_VERSION);
 #endif
         mi->set_io_context(&ioc);
         web_server->set_stratum_port(stratum_port);
+
+        // D-BCH dashboard feeds (integrator 2026-08-03): wire the live BCH
+        // data sources into the MiningInterface the H-STATS.944 seam already
+        // stood up (it was constructed with a NULL IMiningNode + zero feeds,
+        // so /api rendered empty). Reuses core/web_server.hpp generic feed
+        // setters (the same LTC-parity shape) -- ZERO src/core edit. The
+        // lambdas capture daemon/node by reference; both are declared at the
+        // top of standup_pool_run and outlive ioc.run(), so no dangle. All
+        // reads are display-only (lock-free snapshots / atomics).
+        //   /api/node_topology -- BCHN embedded daemon peers + synced height.
+        mi->set_node_topology_fn([&daemon]() { return daemon.dashboard_topology(); });
+        //   share-peers -- the pool node sharechain P2P peer snapshot.
+        mi->set_peer_info_fn([&node]() { return node.get_peer_info_json(); });
+        //   pool hashrate -- lock-free tracker snapshot published by think().
+        mi->set_pool_hashrate_fn([&node]() { return node.get_tracker_snapshot().pool_hashrate; });
+        //   sharechain stats -- chain/verified/head counts + hashrate.
+        mi->set_sharechain_stats_fn([&node]() {
+            auto s = node.get_tracker_snapshot();
+            return nlohmann::json{
+                {"chain_count", s.chain_count},
+                {"verified_count", s.verified_count},
+                {"head_count", s.head_count},
+                {"pool_hashrate", s.pool_hashrate},
+            };
+        });
+
+        // ââ Found-block verifier: confirm/orphan a won block vs the chain ââ
+        // #995 BCH arm. Before this a BCH won block was recorded "pending"
+        // forever and an orphan (the class that lost DASH block 2508008) surfaced
+        // only to humans. Two halves, BOTH TELEMETRY-ONLY and strictly downstream
+        // of the block submit -- neither gates broadcast, mint, target or payout:
+        //   (a) record + arm: when BCHWorkSource dispatches a won block, record it
+        //       to /recent_blocks and arm the confirm/orphan poller.
+        //   (b) verdict fn: resolve confirm/orphan daemonless-first off the
+        //       embedded HeaderChain (authoritative best branch), with the
+        //       always-retained BCHN-RPC getblockheader confirmations as fallback.
+        work_source->set_on_found_block_fn(
+            [mi](uint32_t height, const uint256& block_hash,
+                 const std::string& miner, bool reached_network) {
+                const double pool_hr = mi->get_local_hashrate();
+                uint64_t     subsidy = 0;
+                auto tmpl = mi->get_current_work_template();
+                if (!tmpl.is_null() && tmpl.contains("coinbasevalue"))
+                    subsidy = tmpl["coinbasevalue"].get<uint64_t>();
+                const std::string hash_hex = block_hash.GetHex();
+                mi->record_found_block(
+                    height, block_hash,
+                    static_cast<uint64_t>(std::time(nullptr)),
+                    "BCH", miner, hash_hex,
+                    mi->get_network_difficulty(),
+                    /*share_difficulty=*/0.0, pool_hr, subsidy);
+                mi->schedule_block_verification(hash_hex);
+                if (!reached_network)
+                    LOG_WARNING << "[BCH-POOL] recorded found block height=" << height
+                                << " that reached NO network sink";
+            });
+
+        mi->set_block_verify_fn(
+            [mi, &daemon](const std::string& hash_hex) -> int {
+                uint256 h; h.SetHex(hash_hex);
+                auto& hc = daemon.chain();
+
+                // found_height: authoritative from our own found-block record
+                // (survives an orphan whose header peers never relayed to us);
+                // else recovered from the embedded header chain.
+                uint32_t found_height = 0;
+                bool     have_height  = false;
+                for (const auto& b : mi->get_found_blocks()) {
+                    if (b.hash == hash_hex) {
+                        found_height = static_cast<uint32_t>(b.height);
+                        have_height  = true;
+                        break;
+                    }
+                }
+                if (!have_height) {
+                    if (auto e = hc.get_header(h)) {
+                        found_height = e->height;
+                        have_height  = true;
+                    }
+                }
+
+                if (have_height) {
+                    auto winner_at = [&hc](uint32_t hh) -> std::optional<uint256> {
+                        if (auto e = hc.get_header_by_height(hh)) return e->block_hash;
+                        return std::nullopt;
+                    };
+                    int v = coin::block_confirm::resolve_status(
+                        winner_at, hc.height(), h, found_height);
+                    // Daemonless-first: trust a definite confirmed/orphaned verdict.
+                    // A 0 (pending) with the header chain ALREADY past found_height
+                    // is a genuine shallow-pending; only fall through to RPC when
+                    // the header chain has not yet reached the height.
+                    if (v != 0) return v;
+                    if (hc.height() >= found_height) return 0;
+                }
+
+                // Fallback arm (header chain absent or behind): external BCHN-RPC
+                // getblockheader confirmations. c < 0 => off the best chain.
+                int c = daemon.rpc_block_confirmations(h);
+                if (c != std::numeric_limits<int>::min()) {
+                    if (c < 0) return -1;
+                    if (c >= static_cast<int>(coin::block_confirm::kDefaultConfirmDepth))
+                        return c;
+                }
+                return 0; // still pending
+            });
 
         // graph_db stats persistence -- survives restarts (LTC-parity site 2/3;
         // mirrors main_ltc.cpp:1967-1973). BCH-namespaced sub-dir keeps the
@@ -659,6 +785,14 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
             std::string net_label = is_testnet ? "testnet" : "mainnet";
             std::string graph_db_path = (core::filesystem::config_path()
                 / net_label / "bch" / "graph_db").string();
+            // #1040 gap (STATS.944 restart proof, 2026-08-03): the graph_db parent
+            // dir (config_path()/<net>/bch/) was never created, so save_stat_log's
+            // tmp-write + rename failed every 100s and NO stats survived restart.
+            // Mirror the main_btc.cpp:358 / main_dgb.cpp:196 create_directories(net_dir)
+            // best-effort pattern, targeting the actual stat-log parent.
+            std::error_code graph_db_mkdir_ec;
+            std::filesystem::create_directories(
+                std::filesystem::path(graph_db_path).parent_path(), graph_db_mkdir_ec);
             mi->set_stat_log_path(graph_db_path);
             mi->load_stat_log();
             LOG_INFO << "[BCH-POOL] graph_db stats persistence -> " << graph_db_path;
@@ -686,12 +820,29 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
                       << http_port << " -- dashboard disabled, run-loop continues.";
             web_server.reset();
         }
+        } // if (mi != nullptr)
     } else {
         LOG_INFO << "[BCH-POOL] dashboard disabled (no --http bind given).";
     }
 
     // Drive the shared io_context: pool node + embedded daemon + stratum run together.
     ioc.run();
+
+    // LTC-parity site 3/3 (the TRUE third, missing until now): save the stat log
+    // on clean shutdown. load-on-start (site 1) + periodic-100s (site 2) only
+    // persist at tick boundaries, so without this every clean restart drops
+    // whatever accumulated since the last 100s tick. Mirrors BTC #1100
+    // (main_btc.cpp) / main_ltc.cpp:7456-7457 (\"Save stats on shutdown\").
+    // web_server (declared above, outside the http_port block) is still alive
+    // here -- the reset()/teardown happens when this function returns, after this
+    // flush. mi is block-local to the standup block, so re-fetch it through the
+    // still-live web_server. Precondition: GRACEFUL stop (ioc.stop() from the
+    // signal handler unwinds ioc.run()); SIGKILL flushes neither lane. Display-
+    // only stat log; p2pool-merged-v36 surface: NONE.
+    if (web_server) {
+        if (auto* mi = web_server->get_mining_interface())
+            mi->save_stat_log();
+    }
 }
 
 } // namespace bch

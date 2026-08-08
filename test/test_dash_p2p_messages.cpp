@@ -227,3 +227,68 @@ TEST(DashP2PMessages, CommandStringsPinned) {
     CSimplifiedMNListDiff d;
     EXPECT_EQ(message_mnlistdiff::make_raw(d)->m_command, "mnlistdiff");
 }
+// ─── inv → getdata sourcing policy (the ChainLock acquisition leg) ──────────
+//
+// MSG_CLSIG was decodable and handled long before it was ever REQUESTED: the
+// inv handler only ever issued a getdata for type 21, so `clsig` never arrived
+// and on_new_chainlock never fired. These lock the pull policy the inv handler
+// actually consults (dash::coin::p2p::inv_type_is_pulled), so dropping the
+// ChainLock leg again goes red.
+
+TEST(DashP2PMessages, InvTypeNumbersMatchDashcoreProtocol) {
+    // dashcore src/protocol.h enum GetDataMsg
+    EXPECT_EQ(static_cast<uint32_t>(inventory_type::quorum_final_commitment), 21u);
+    EXPECT_EQ(static_cast<uint32_t>(inventory_type::clsig), 29u);   // protocol.h:522
+}
+
+TEST(DashP2PMessages, InvPullPolicyCoversChainLocksAndCommitments) {
+    EXPECT_TRUE(inv_type_is_pulled(inventory_type::clsig))
+        << "ChainLocks are inv-announced and served only on getdata; without "
+           "this the clsig handler can never fire";
+    EXPECT_TRUE(inv_type_is_pulled(inventory_type::quorum_final_commitment));
+
+    // Types we must NOT blind-getdata: blocks take the getheaders-first path,
+    // and we do not pull the tx mempool.
+    EXPECT_FALSE(inv_type_is_pulled(inventory_type::block));
+    EXPECT_FALSE(inv_type_is_pulled(inventory_type::tx));
+    EXPECT_FALSE(inv_type_is_pulled(inventory_type::filtered_block));
+}
+
+TEST(DashP2PMessages, GetdataForClsigInvRoundTripsOnTheWire) {
+    // What the inv handler builds for an announced ChainLock: a getdata
+    // echoing the announcement's type and hash (the hash is
+    // SerializeHash(clsig), which we cannot derive and must echo verbatim).
+    const uint256 inv_hash = raw256_seq(0xC1);
+    auto raw = message_getdata::make_raw(
+        {inventory_type(inventory_type::clsig, inv_hash)});
+    EXPECT_EQ(raw->m_command, "getdata");
+
+    auto parsed = message_getdata::make(raw->m_data);
+    ASSERT_EQ(parsed->m_requests.size(), 1u);
+    EXPECT_EQ(static_cast<uint32_t>(parsed->m_requests[0].m_type), 29u);
+    EXPECT_EQ(parsed->m_requests[0].m_hash, inv_hash);
+}
+
+TEST(DashP2PMessages, ClsigWireLayoutMatchesRealMainnetChainLock) {
+    // The real 132-byte clsig body from mainnet `getbestchainlock` at 2515965:
+    // int32LE height || blockHash(32 LE) || sig(96). Decoding it must recover
+    // exactly the height and block hash dashd reported.
+    const std::string hex =
+        "fd632600"
+        "8ba8205c0861bc9b6063b67aeff818075a148d1a989502250b00000000000000"
+        "b37fa65f662141fde71d5ead7f3548547aa08915274c188c47554e814770a381"
+        "6b0c772c10fdb6ca1cc8bf851bcb218301454d5aa6c2fd0d3d25162096f416b9"
+        "a629196307efe214b20380c2606c9191550cbefee9ad7e59c05d691929d4a7dd";
+    std::vector<std::byte> body;
+    for (size_t i = 0; i + 1 < hex.size(); i += 2)
+        body.push_back(static_cast<std::byte>(
+            std::stoul(hex.substr(i, 2), nullptr, 16)));
+    ASSERT_EQ(body.size(), 132u);
+
+    PackStream ps(body);
+    auto parsed = message_clsig::make(ps);
+    EXPECT_EQ(parsed->m_height, 2515965);
+    EXPECT_EQ(parsed->m_sig.size(), 96u);
+    EXPECT_EQ(parsed->m_block_hash.GetHex(),
+              "000000000000000b250295981a8d145a0718f8ef7ab663609bbc61085c20a88b");
+}

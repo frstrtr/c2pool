@@ -81,11 +81,12 @@ protected:
     // Protocol handlers look up tx hashes here when processing shares.
     std::map<uint256, coin::Transaction> m_known_txs;
     // Insertion-order recency sidecar for m_known_txs. Recorded at each NEW
-    // remember_tx insert; consumed by prune_shares to evict OLDEST-first down to
-    // m_max_known_txs instead of the old wholesale clear() (which dropped every
-    // forwardable tx byte at once -> canonical "referenced unknown transaction"
-    // disconnect). Tx-forwarding only; no consensus/mint state. See
-    // core::evict_known_txs_to_cap (core/known_txs_eviction.hpp).
+    // remember_tx insert. NOTE: its only consumer was the now-removed dead
+    // prune_shares() (via core::evict_known_txs_to_cap), so the m_known_txs cap
+    // is NOT currently enforced on BCH -- the sidecar accumulates write-only.
+    // Re-wiring eviction into the live clean_tracker() compute-thread path is a
+    // tracked follow-up (pre-existing: prune_shares was already unreachable).
+    // Tx-forwarding only; no consensus/mint state. See core/known_txs_eviction.hpp.
     std::deque<uint256> m_known_txs_order;
 
     // -- Won-block broadcaster sink (broadcaster-gate A+B in-operation fire) --
@@ -742,12 +743,6 @@ public:
     /// Expose tracker mutex for IO-thread callbacks that access the tracker.
     /// Callers MUST use shared_lock(try_to_lock) — NEVER blocking lock().
     std::shared_mutex& tracker_mutex() { return m_tracker_mutex; }
-
-    /// Unified share retention: single-pass prune of chain + verified + LevelDB.
-    /// Replaces multi-pass trim with work-based dead head detection and
-    /// deferred destruction for verified cascade safety.
-    /// Called from run_think() on the ioc thread.
-    void prune_shares(const uint256& best_share);
 
     /// Run the share tracker think() cycle: verifies chains, scores heads,
     /// identifies bad peers, and requests needed shares.

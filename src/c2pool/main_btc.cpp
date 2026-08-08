@@ -55,6 +55,7 @@
 #include <core/pack.hpp>
 #include <core/hash.hpp>
 #include <core/stratum_server.hpp>
+#include <core/web_server.hpp>          // H-STATS.944: operator dashboard + graph_db persist
 #include <btclibs/util/strencodings.h>
 
 #include <boost/asio.hpp>
@@ -152,6 +153,8 @@ int main(int argc, char* argv[])
     uint16_t    p2pool_port   = 0;
     std::string stratum_addr  = "0.0.0.0";  // listen all interfaces by default
     uint16_t    stratum_port  = 0;          // 0 disables stratum; --stratum sets it
+    std::string http_addr     = "0.0.0.0";  // dashboard bind; --http sets it (H-STATS.944)
+    uint16_t    http_port     = 0;          // 0 disables dashboard; --http sets it (H-STATS.944)
     uint16_t    sharechain_port = 0;        // 0 = default P2P_PORT (9333); --sharechain-port overrides (opt-in isolation)
     std::string network_id_hex;             // --network-id: c2pool IDENTIFIER override (empty = public net)
     std::string prefix_hex;                 // --prefix: c2pool PREFIX override (empty = compiled default)
@@ -230,6 +233,20 @@ int main(int argc, char* argv[])
             } else {
                 stratum_addr = ep.substr(0, colon);
                 stratum_port = static_cast<uint16_t>(std::stoi(ep.substr(colon + 1)));
+            }
+        }
+        else if (arg == "--http" && i + 1 < argc)
+        {
+            // --http [HOST:]PORT — bind the H-STATS.944 operator dashboard.
+            // HOST defaults to 0.0.0.0. When omitted entirely, the dashboard
+            // is disabled (mirrors --stratum).
+            std::string ep = argv[++i];
+            auto colon = ep.find(':');
+            if (colon == std::string::npos) {
+                http_port = static_cast<uint16_t>(std::stoi(ep));
+            } else {
+                http_addr = ep.substr(0, colon);
+                http_port = static_cast<uint16_t>(std::stoi(ep.substr(colon + 1)));
             }
         }
         else if (arg == "--sharechain-port" && i + 1 < argc)
@@ -1602,6 +1619,137 @@ int main(int argc, char* argv[])
     // the lambda handles it.
     stratum_server_for_shutdown = std::move(stratum_server);
 
+    // ââ Operator dashboard + graph_db stats persistence (H-STATS.944) ââ
+    // Mirror of bch standup_pool_run (PR #1040 "stand up core::WebServer + graph_db
+    // persist", commit 2b9fc26c; integrator 2026-08-03 "copy the shape"). main_btc
+    // has no factored standup_pool_run, so the SAME core::WebServer standup lives
+    // inline here, right after the stratum block, held at main scope so it and its
+    // stats timer outlive the run-loop. ISOLATION: constructs existing core classes
+    // only â ZERO src/core edits â so this stays OFF the four-coin smoke gate. node
+    // == nullptr: BTC coin_node does not implement core::IMiningNode; the dashboard +
+    // graph_db stat-log path does not require it (a live adapter is a follow-up
+    // slice). Blockchain::BITCOIN selects the SHA256d graph_db constant pairing.
+    std::unique_ptr<core::WebServer> web_server;
+    std::shared_ptr<boost::asio::steady_timer> stats_timer;
+    if (http_port != 0) {
+        const bool web_is_testnet = testnet || testnet4 || regtest;
+        // No-silent-ctor bracket (integrator req #2, per-lane port of bch #1050
+        // "name the WebServer standup per-lane" / ltc #1041): name THIS lane's
+        // dashboard standup on the way IN and OUT so a ctor that throws mid-standup
+        // shows as an unmatched "standing up" with no "constructed" follow-up, and
+        // guard a null MiningInterface before use. src/c2pool/main_btc.cpp only.
+        LOG_INFO << "[BTC-POOL] standing up core::WebServer + MiningInterface (http bind "
+                 << http_addr << ":" << http_port << ") ...";
+        web_server = std::make_unique<core::WebServer>(
+            ioc, http_addr, http_port, web_is_testnet,
+            std::shared_ptr<core::IMiningNode>{},          // no IMiningNode adapter yet
+            c2pool::address::Blockchain::BITCOIN);         // SHA256d graph_db pairing
+        auto* mi = web_server->get_mining_interface();
+        if (mi == nullptr) {
+            LOG_ERROR << "[BTC-POOL] core::WebServer constructed but MiningInterface is"
+                      << " NULL -- dashboard disabled, run-loop continues.";
+            web_server.reset();
+        }
+        if (mi != nullptr) {
+        LOG_INFO << "[BTC-POOL] core::WebServer + MiningInterface constructed (coin=BTC, "
+                 << "http " << http_addr << ":" << http_port << "); MiningInterface alive.";
+#ifdef C2POOL_VERSION
+        mi->set_coin_label("BTC");
+        mi->set_pool_version("c2pool/" C2POOL_VERSION);
+#endif
+        mi->set_io_context(&ioc);
+        web_server->set_stratum_port(stratum_port);
+
+        // D-BTC dashboard feeds (integrator 2026-08-03): mirror of D-BCH
+        // (PR #1055) into the live MiningInterface the H-STATS.944 seam already
+        // stood up with a NULL IMiningNode + zero feeds (so /api rendered empty).
+        // BTC has no coin/embedded_daemon.hpp dashboard_topology() -- its embedded
+        // transport is coin_node (BTC P2P) + an optional submitblock RPC fallback
+        // -- so node_topology is synthesized inline from header_chain + coin_node,
+        // and the sharechain feeds read the p2p_node NodeBridge accessors exactly
+        // like the proven LTC feeders (main_ltc.cpp:2861/3378). Reuses the generic
+        // core/web_server.hpp setters -- ZERO src/core edit. All captured objects
+        // are declared above at main scope and outlive ioc.run(); all reads are
+        // display-only (lock-free snapshots/atomics).
+        mi->set_peer_info_fn([p2p_node_raw]() -> nlohmann::json {
+            return p2p_node_raw->get_peer_info_json();
+        });
+        mi->set_pool_hashrate_fn([p2p_node_raw]() -> double {
+            return p2p_node_raw->get_tracker_snapshot().pool_hashrate;
+        });
+        mi->set_sharechain_stats_fn([p2p_node_raw]() {
+            auto s = p2p_node_raw->get_tracker_snapshot();
+            return nlohmann::json{
+                {"chain_count", s.chain_count},
+                {"verified_count", s.verified_count},
+                {"head_count", s.head_count},
+                {"pool_hashrate", s.pool_hashrate},
+            };
+        });
+        mi->set_node_topology_fn([&header_chain, &coin_node]() {
+            const uint32_t synced   = header_chain.height();
+            const uint32_t peer_tip = header_chain.peer_tip_height();
+            const bool     emb_p2p  = coin_node.has_p2p();
+            const bool     ext_rpc  = coin_node.has_rpc();
+            return nlohmann::json{
+                {"coin", "BTC"},
+                {"embedded", true},
+                {"has_rpc", ext_rpc},
+                {"synced_height", synced},
+                {"peer_tip_height", peer_tip},
+                {"sync_pct", (peer_tip > 0 ? 100.0 * synced / peer_tip : 0.0)},
+                {"embedded_peers", emb_p2p ? 1 : 0},
+                {"broadcast_route", emb_p2p ? "p2p" : (ext_rpc ? "rpc" : "none")},
+            };
+        });
+
+        // graph_db stats persistence â survives restarts (LTC-parity site 2/3,
+        // mirrors main_ltc.cpp:1967-1973). BTC-namespaced sub-dir keeps the per-coin
+        // stat log isolated under the shared config path.
+        {
+            std::string net_label = web_is_testnet ? "testnet" : "mainnet";
+            std::string graph_db_path = (core::filesystem::config_path()
+                / net_label / "btc" / "graph_db").string();
+            // #1040 gap (STATS.944 restart proof, 2026-08-03): the graph_db parent
+            // dir (config_path()/<net>/btc/) was never created, so save_stat_log's
+            // tmp-write + rename failed every 100s and NO stats survived restart.
+            // Mirror the main_btc.cpp:358 / main_dgb.cpp:196 create_directories(net_dir)
+            // best-effort pattern, targeting the actual stat-log parent.
+            std::error_code graph_db_mkdir_ec;
+            std::filesystem::create_directories(
+                std::filesystem::path(graph_db_path).parent_path(), graph_db_mkdir_ec);
+            mi->set_stat_log_path(graph_db_path);
+            mi->load_stat_log();
+            LOG_INFO << "[BTC-POOL] graph_db stats persistence -> " << graph_db_path;
+        }
+
+        if (web_server->start()) {
+            // LTC-parity site 3/3: periodic save_stat_log every 100s (matches p2pool
+            // graph_db + main_ltc.cpp:7429). Self-rescheduling steady_timer on the SAME
+            // ioc the run-loop drives; captured by shared_ptr so it outlives each
+            // async_wait continuation.
+            stats_timer = std::make_shared<boost::asio::steady_timer>(ioc);
+            auto save_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+            *save_fn = [stats_timer, save_fn, mi](boost::system::error_code ec) {
+                if (ec) return;
+                mi->save_stat_log();
+                stats_timer->expires_after(std::chrono::seconds(100));
+                stats_timer->async_wait(*save_fn);
+            };
+            stats_timer->expires_after(std::chrono::seconds(100));
+            stats_timer->async_wait(*save_fn);
+            LOG_INFO << "[BTC-POOL] dashboard live on http://" << http_addr << ":"
+                     << http_port << " (graph_db persist every 100s).";
+        } else {
+            LOG_ERROR << "[BTC-POOL] WebServer FAILED to bind " << http_addr << ":"
+                      << http_port << " â dashboard disabled, run-loop continues.";
+            web_server.reset();
+        }
+        } // if (mi != nullptr)
+    } else {
+        LOG_INFO << "[BTC-POOL] dashboard disabled (no --http bind given).";
+    }
+
     LOG_INFO << "[BTC] io_context running. Ctrl-C to stop.";
 
     // Diagnostic [IOC-LAT]: when a single run_for slice takes far longer
@@ -1627,6 +1775,18 @@ int main(int argc, char* argv[])
             LOG_WARNING << "[IOC-LAT] iteration took " << loop_ms
                         << "ms (target 100ms)";
         }
+    }
+
+    // LTC-parity site 3/3 (the TRUE third, missing until now): save the stat
+    // log on clean shutdown. load-on-start (:1722) + periodic-100s (:1735) only
+    // persist at tick boundaries, so without this every restart drops whatever
+    // accumulated since the last 100s tick. Mirrors main_ltc.cpp:7456-7457
+    // ("Save stats on shutdown"). web_server (and thus its MiningInterface) is
+    // still alive here — the reset()s below run after. Display-only stat log;
+    // p2pool-merged-v36 surface: NONE.
+    if (web_server) {
+        if (auto* mi = web_server->get_mining_interface())
+            mi->save_stat_log();
     }
 
     // ── Graceful shutdown — explicit teardown order ──────────────────────

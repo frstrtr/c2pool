@@ -299,7 +299,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # weight ring buffer (compute_v36_weights), decay table, donation split,
     # window slides. PoW-independent consensus core; socket-free, chain-free.
     # Mirrors the test_dash_conformance link set.
-    add_executable(test_dash_share_tracker test_dash_share_tracker.cpp)
+    add_executable(test_dash_share_tracker test_dash_share_tracker.cpp test_dash_share_remove_owns_data.cpp)
     target_link_libraries(test_dash_share_tracker PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -307,6 +307,8 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_share_tracker PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
+    target_compile_definitions(test_dash_share_tracker PRIVATE  # #1131 source-structural KAT: borrow, don't own, on verified.remove(bad)
+        DASH_SHARE_TRACKER_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/impl/dash/share_tracker.hpp")
     gtest_add_tests(test_dash_share_tracker "" AUTO)
 
     # DASH S8 pool-node leaf 5 (FINAL) slice A — node.hpp skeleton KAT: NodeImpl
@@ -327,7 +329,25 @@ if (BUILD_TESTING AND GTest_FOUND)
     # same reason as the second: a standalone target would need a build.yml
     # --target edit and would trip CI's NOT_BUILT sentinel until it had one
     # (#769/#883/#893).
-    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp)
+    # test_dash_block_confirm_lane.cpp: the post-broadcast found-block
+    # confirmation / orphan lane (daemonless resolve_status verdict + the
+    # MiningInterface pending→confirmed / pending→orphaned status flip). FOLDED
+    # in as another TU for the same reason as the found-block TU above — a
+    # standalone target would need a build.yml --target edit and trip CI's
+    # NOT_BUILT sentinel until it had one. Needs exactly this link set (core
+    # MiningInterface; the resolver is header-only).
+    # test_dash_dashboard_views.cpp: the sharechain WINDOW / DELTA / SHARE-DETAIL
+    # read-model KATs (dashboard_views.hpp). FOLDED in as another TU for the same
+    # reason as the TUs above — a standalone target would need a build.yml
+    # --target edit and would trip CI's NOT_BUILT sentinel until it had one
+    # (#143/#883/#893). Needs exactly this link set: a real dash::NodeImpl +
+    # ShareTracker, and core's address_utils for the DASH base58 rendering.
+    # test_dash_dashboard_pplns.cpp: the PPLNS payout read-model KATs
+    # (dashboard_pplns.hpp) — the pool-wide split behind /current_payouts and
+    # the per-share split on an individual share's page. FOLDED in for the same
+    # reason; needs the same link set plus the header-only mint/producer weight
+    # walk and coinbase allocator, both already reachable from `dash`.
+    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp)
     target_link_libraries(test_dash_node PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -516,7 +536,16 @@ if (BUILD_TESTING AND GTest_FOUND)
     # double-spend conflict removal + feerate-sorted selection. Header-only over
     # block/transaction/utxo_adapter + core/coin; no ltc/pool SCC dependency.
     # Direct prerequisite for the embedded_gbt template builder (S7 main).
-    add_executable(test_dash_mempool test_dash_mempool.cpp)
+    # Second TU: test_dash_replay_utxo_fold.cpp — the W3 FULL-HISTORY REPLAY
+    # standalone UTXO fold (coin/replay_utxo_fold.hpp): dashd WriteVarInt /
+    # CompactSize primitive KATs, the hash_serialized_2 stream vs an
+    # independently hand-assembled preimage (incl. the v23.1.x ApplyHash
+    # ternary quirk, pinned), strict fold rules (zero-value coins kept,
+    # OP_RETURN excluded, missing-input/gap/BIP30/cold-start fail-closed,
+    # genesis short-circuit), resumable cursor across reopen, versioned-format
+    # fail-loud, 100-block undo window retention, disconnect/reconnect set-
+    # hash identity. Same target, no new allowlist entry.
+    add_executable(test_dash_mempool test_dash_mempool.cpp test_dash_replay_utxo_fold.cpp)
     target_link_libraries(test_dash_mempool PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -565,6 +594,26 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_dash_quorum_root PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_quorum_root "" AUTO)
+
+    # Live-path ChainLock acquisition + verification KAT, against a REAL mainnet
+    # ChainLock (tip 2515965) and the real LLMQ_400_60 candidate set.
+    # DELIBERATELY *NOT* inside the C2POOL_DASH_BLS gate: the request-id, DKG-
+    # window scan-set and quorum-SELECTION halves need no BLS backend, and they
+    # are the pieces most likely to drift silently (in particular the memcmp-vs-
+    # bignum score-ordering trap, which selects a DIFFERENT quorum if broken).
+    # Those run in EVERY build; the BLS crypto KATs — including the tampered-
+    # signature negative — are #ifdef C2POOL_DASH_BLS-gated in the source and
+    # exercise only when the backend is linked. dash_bls_verify compiles
+    # unconditionally (fail-closed stub without the backend), so this always links.
+    add_executable(test_dash_chainlock_verify test_dash_chainlock_verify.cpp)
+    target_link_libraries(test_dash_chainlock_verify PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_bls_verify dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_chainlock_verify PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_chainlock_verify "" AUTO)
 
     # KNOWN COVERAGE GAP (surfaced by the top-level drift-guard, #883 follow-up):
     # the three targets below are gated behind C2POOL_DASH_BLS, but no workflow
@@ -662,7 +711,40 @@ if (BUILD_TESTING AND GTest_FOUND)
     # over the SimplifiedMNList leaf (#309). Last absent header before the
     # embedded_gbt capstone. Header-only over core/uint256 + core/pack +
     # core/hash; no ltc/pool SCC dependency.
-    add_executable(test_dash_mn_state test_dash_mn_state.cpp)
+    # Second TU (W1, dash/replay): test_dash_replay_fold.cpp — the DML fold
+    # engine (replay_fold_engine.hpp): dashd RebuildListFromBlock transcription
+    # KAT'd against REAL mainnet chain bytes (the h=2516756 PoSe REVIVE, the
+    # h=2516412 case-D punish/ban, 4-block quiet sequence), the per-block
+    # committed-cbTx-root self-check hard stop, and the versioned full-state
+    # snapshot v3 (save/load/resume/fail-loud). FOLDED into this EXISTING
+    # allowlisted target on purpose — a new add_executable would not be in the
+    # build.yml --target list and would silently report "Not Run" (#143
+    # NOT_BUILT trap). Needs dash_x11 for the block-identity hash — already in
+    # this target's link set.
+    # Third TU (W5, dash/replay): test_dash_replay_run.cpp — the Phase-1
+    # replay PROVING harness. Data-driven and SKIPPED unless
+    # C2POOL_REPLAY_PRESTATE + C2POOL_REPLAY_CORPUS are set, so it is inert in
+    # CI; pointed at an anchor prestate and a contiguous block corpus it folds
+    # the range and asserts the committed-cbTx-root equality at every block.
+    # Fourth TU (THE SEAM): test_dash_replay_quorum_seam.cpp — W4's derived
+    # quorum membership feeding W1's MembersFn (coin/replay_quorum_bridge.hpp):
+    # the pre-anchor seed guards, the DIP-0024 cycle-2513088 derivation matched
+    # against dashd's own `quorum info`, and h=2513130 (the height the first
+    # live daemonless replay stopped at) folding to its own committed root
+    # through the derived member sets.
+    # Both folded into this SAME allowlisted target for the #143 NOT_BUILT
+    # reason.
+    # Fifth TU (THE SERVE SEAM): test_dash_replay_payee_publish.cpp — the
+    # fold's root-checked masternode list feeding the PAYEE queue that gates
+    # serving (coin/replay_payee_publish.hpp): the proven-current publish, the
+    # ReplayMNState->MNState dialect change, and the fail-closed guard — a
+    # diverged, poisoned, unchecked or behind-the-tip fold must NOT publish.
+    # Same allowlisted target, same #143 NOT_BUILT reason.
+    add_executable(test_dash_mn_state test_dash_mn_state.cpp
+                   test_dash_replay_fold.cpp
+                   test_dash_replay_run.cpp
+                   test_dash_replay_quorum_seam.cpp
+                   test_dash_replay_payee_publish.cpp)
     target_link_libraries(test_dash_mn_state PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -670,6 +752,12 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_mn_state PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    # The seam TU's issue-#90 arming KAT seeds the mainnet anchor's full
+    # 88-commitment active set from dash_mainnet_active_quorums_2513685.txt —
+    # the same fixture the W4 engine suite uses. Test-only define; no source
+    # in this target reads it otherwise.
+    target_compile_definitions(test_dash_mn_state PRIVATE
+        DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     gtest_add_tests(test_dash_mn_state "" AUTO)
 
     # DASH embedded getblocktemplate bit-parity capstone (S7 main): fuses the
@@ -691,14 +779,57 @@ if (BUILD_TESTING AND GTest_FOUND)
     # -> a standalone target would be a NOT_BUILT sentinel). Do NOT re-add
     # standalone add_executable/gtest_add_tests for any of them — CTest would
     # register unbuilt executables (ctest "Not Run" exit 8, the Linux x86_64 red).
-    # DASH_FIXTURE_DIR is needed by the from-wire fixture loader (mnlistdiff).
+    # DASH_FIXTURE_DIR is needed by the from-wire fixture loader (mnlistdiff)
+    # and by the qrinfo / rotated-quorum suites, which read the real 602'189-byte
+    # testnet qrinfo capture. test_dash_rotated_quorum_members.cpp is folded here
+    # for the same reason as test_dash_qrinfo.cpp: this target IS in the build.yml
+    # "Build tests" --target allowlist, and a standalone target would be a
+    # NOT_BUILT sentinel (the push bot lacks `workflow` scope, #769).
+    # test_dash_mn_confirm_rollover.cpp / test_dash_collateral_spend_filter.cpp
+    # (sml_projection.hpp): the two silent block-loss defects of the committed
+    # merkleRootMNList — the height-driven confirmedHash rollover
+    # (specialtxman.cpp:206-215) and MN-collateral spends by normal type-0 txs
+    # (specialtxman.cpp:457-464). Folded here for the same reason as the other
+    # leaves above: this target IS in the build.yml "Build tests" --target
+    # allowlist, and a standalone target would be a NOT_BUILT sentinel (#769).
     add_executable(test_dash_embedded_gbt
         test_dash_embedded_gbt.cpp
         test_dash_embedded_cbtx_byte_parity.cpp
         test_dash_mnlistdiff_root_parity.cpp
+        test_dash_qrinfo.cpp
+        test_dash_rotated_quorum_members.cpp
         test_dash_dkg_commitments.cpp
+        test_dash_qc_episode_classifier.cpp
         test_dash_sml_quorum_db.cpp
-        test_dash_embedded_oracle_shadow.cpp)
+        test_dash_embedded_oracle_shadow.cpp
+        test_dash_embedded_shadow_compare.cpp
+        test_dash_mn_confirm_rollover.cpp
+        test_dash_collateral_spend_filter.cpp
+        # test_dash_operator_split.cpp: incident h=2516595 bad-cb-payee — the
+        # MN operator-reward split KATs (builder dual-output + serve-gate
+        # cause=mn-payout-split-unprovable + ResetOperatorFields mirror +
+        # pass-3 split observation). Folded here per the same #769 rule.
+        test_dash_operator_split.cpp
+        # test_dash_replay_quorum_engine.cpp: W4 of the FULL-HISTORY REPLAY
+        # mode (replay_quorum_engine.hpp) — quorum state from replayed mined
+        # qfcommits: 3101-block mainnet merkleRootQuorums byte-parity replay
+        # (dash_mainnet_quorum_scan_* + dash_mainnet_active_quorums_*),
+        # rotated-member + snapshot-PRODUCER KATs against a real mainnet
+        # qrinfo (dash_mainnet_qrinfo_2516785.bin) and dashd's own `quorum
+        # info` member lists. Folded here per the same #769 rule; reads
+        # DASH_FIXTURE_DIR.
+        test_dash_replay_quorum_engine.cpp
+        # test_dash_mined_commitment_index.cpp: PR-2 FORWARD
+        # (mined_commitment_index.hpp) — dashd's mined-commitment store
+        # (v23.1.7 llmq/blockprocessor.cpp ProcessBlock/ProcessCommitment/
+        # HasMinedCommitment/GetMinedCommitmentsUntilBlock) rebuilt from OUR
+        # OWN block replay: 3101-block mainnet merkleRootQuorums byte-parity
+        # over the DERIVED active set, plus the arm/contiguity/null-skip
+        # guards and the money-path has_mined seam. Reuses the same
+        # dash_mainnet_quorum_scan_* / _active_quorums_ fixtures as the W4
+        # suite above, and is folded into this target for the same #769
+        # reason (the push bot cannot add a build.yml --target).
+        test_dash_mined_commitment_index.cpp)
     target_compile_definitions(test_dash_embedded_gbt PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_embedded_gbt PRIVATE
@@ -805,7 +936,22 @@ if (BUILD_TESTING AND GTest_FOUND)
     # NodeCoinState: node-held embedded coin-state holder over the
     # work_source selector link set (mn_state_machine + mempool header-only);
     # no ltc/pool SCC dependency. Mirrors the test_dash_work_source link set.
-    add_executable(test_dash_node_coin_state test_dash_node_coin_state.cpp)
+    # D-DASH.ORACLE-OWNERSHIP rides this EXISTING allowlisted target rather than
+    # a new add_executable — a fresh target absent from the build.yml --target
+    # allowlist becomes the silently-passing NOT_BUILT sentinel (#143). It is a
+    # source-structural guard over embedded_oracle_shadow.hpp + main_dash.cpp,
+    # so it needs no link deps of its own; the compile definitions hand it the
+    # paths to the SHIPPED sources.
+    # D-DASH.WORKSOURCE-OWNERSHIP (#1134) is its SERVE-path sibling and rides the
+    # same target for the same reason — it guards stratum/work_source.{cpp,hpp}
+    # by source text, so it adds no link deps either.
+    # D-DASH.SML-RESYNC rides it too (#143): the watchdog is header-only over
+    # core/uint256.hpp, so it adds no link deps either.
+    add_executable(test_dash_node_coin_state
+        test_dash_node_coin_state.cpp
+        test_dash_oracle_shadow_ownership.cpp
+        test_dash_work_source_ownership.cpp
+        test_dash_sml_resync_watchdog.cpp)
     target_link_libraries(test_dash_node_coin_state PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -813,7 +959,30 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_node_coin_state PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    target_compile_definitions(test_dash_node_coin_state PRIVATE
+        DASH_ORACLE_SHADOW_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/impl/dash/coin/embedded_oracle_shadow.hpp"
+        DASH_MAIN_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/c2pool/main_dash.cpp"
+        DASH_WORK_SOURCE_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/impl/dash/stratum/work_source.cpp"
+        DASH_WORK_SOURCE_HDR="${CMAKE_CURRENT_SOURCE_DIR}/../src/impl/dash/stratum/work_source.hpp")
     gtest_add_tests(test_dash_node_coin_state "" AUTO)
+
+    # bestCL template gate: dashcore's CheckCbTxBestChainlock rule (consensus-
+    # exact) vs the original freshness proxy, plus the fail-closed fences
+    # (missing prev-block committed CL, unverified advance, unjustified
+    # provenance). DELIBERATELY NOT BLS-gated: the gate is a pure state
+    # decision over heights + provenance and must be exercised on EVERY build,
+    # including a BLS-dark one — proving the relaxation cannot degenerate into
+    # a no-op there is the whole point of two of its cases. Same header-only
+    # link set as test_dash_node_coin_state.
+    add_executable(test_dash_bestcl_gate test_dash_bestcl_gate.cpp)
+    target_link_libraries(test_dash_bestcl_gate PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_bestcl_gate PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_bestcl_gate "" AUTO)
 
     # DASHWorkSource (dash::stratum): concrete core::stratum::IWorkSource for
     # DASH X11 -- 4b construction + contract KAT. Links the dash_stratum OBJECT
@@ -821,8 +990,20 @@ if (BUILD_TESTING AND GTest_FOUND)
     # Includes coin/zmq_tip_notify.cpp directly (NOT the C2POOL_ZMQ-guarded
     # subscriber — only the pure TipHashDedup / frame-decode helpers) so the
     # ZMQ hashblock instant-tip-notify KAT links without libzmq.
+    # SERVE-STALENESS SENTINEL rides this EXISTING allowlisted target rather
+    # than adding two of its own: a fresh add_executable absent from the
+    # build.yml --target allowlist is the #143 NOT_BUILT sentinel that "passes"
+    # by never being built (same reasoning as test_dash_node_coin_state above).
+    #   * ..._seam.cpp   -- the RED witness: compiles on master, fails there,
+    #                       because nothing publishes a serve_staleness block.
+    #   * ..._unit.cpp   -- the detector itself, driven off injected clock and
+    #                       height providers, including the deleted-guard
+    #                       mutation case.
     add_executable(test_dash_stratum_work_source
         test_dash_stratum_work_source.cpp
+        test_dash_submit_gate_scaling.cpp
+        test_dash_serve_staleness_seam.cpp
+        test_dash_serve_staleness_unit.cpp
         ${CMAKE_SOURCE_DIR}/src/impl/dash/coin/zmq_tip_notify.cpp)
     target_link_libraries(test_dash_stratum_work_source PRIVATE
         GTest::gtest_main GTest::gtest
@@ -831,6 +1012,9 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_stratum_work_source PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    target_compile_definitions(test_dash_stratum_work_source PRIVATE
+        DASH_WORK_SOURCE_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/impl/dash/stratum/work_source.cpp"
+        DASH_MAIN_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/c2pool/main_dash.cpp")
     gtest_add_tests(test_dash_stratum_work_source "" AUTO)
 
     # CoinStateMaintainer: drives NodeCoinState off async tip/MN/mempool update
@@ -857,6 +1041,13 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_node_embedded_wire PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining c2pool_storage pool)  # OBJECT-lib SCC direct-naming (#22/#39)
+    # #950: handle_version() in node.hpp now calls NodeImpl::send_standing_remember,
+    # whose definition lives in node.cpp — the same shape as #889 on
+    # test_dash_node above. A target that includes node.hpp and instantiates the
+    # handler must link the `dash` OBJECT lib or the reference is undefined at
+    # link time. `dash`'s own deps are already on this line or arrive
+    # transitively; nothing outside src/impl/dash is added.
+    target_link_libraries(test_dash_node_embedded_wire PRIVATE dash sharechain)
     gtest_add_tests(test_dash_node_embedded_wire "" AUTO)
     # get_work() consumer capstone: fuses NodeCoinState::select_work() (embedded
     # template source) with assemble_work_job_targets(); same OBJECT-lib SCC.
@@ -868,6 +1059,11 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_get_work PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining c2pool_storage pool)  # OBJECT-lib SCC direct-naming (#22/#39)
+    # #950: every target that includes node.hpp and instantiates handle_version
+    # links NodeImpl::send_standing_remember, defined in node.cpp — see the
+    # test_dash_node_embedded_wire note above and the #889 precedent. Targets
+    # that only type-check against the header do not need this; these do.
+    target_link_libraries(test_dash_get_work PRIVATE dash sharechain)
     gtest_add_tests(test_dash_get_work "" AUTO)
 
     # Reception wire (legs 1-3): interfaces::Node reception Events ->
@@ -894,10 +1090,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     # add_executable would not be in the build.yml --target list and would
     # silently report "Not Run" (#143 NOT_BUILT trap). No #ifdef guards in that
     # TU either, so every registered case actually executes (#895).
+    # Fifth TU: test_dash_lane_diag.cpp — the embedded/replay DIAGNOSTIC
+    # primitives (coin/lane_diag.hpp) plus the two lane-level properties they
+    # exist for: the progress throttle never degenerates to a per-block flood,
+    # and the stall watchdog fires from a path pump() CANNOT skip (the
+    # 2026-08-04 11-12 minute silent freeze on .211 and contabo, where the
+    # probe sat below the early-return that the freeze itself produced). Also
+    # pins masternode-list SOURCE attribution end-to-end through the leg-4
+    # event. FOLDED into this EXISTING allowlisted target for the same reason
+    # the E2d TU was: a new add_executable would not be in the build.yml
+    # --target list and would silently report "Not Run" (#143 NOT_BUILT trap).
     add_executable(test_dash_node_reception_wire test_dash_node_reception_wire.cpp
                    test_dash_live_feed_bridge.cpp
                    test_dash_mn_seed.cpp
-                   test_dash_mn_checkpoint.cpp)
+                   test_dash_mn_checkpoint.cpp
+                   test_dash_lane_diag.cpp)
     target_link_libraries(test_dash_node_reception_wire PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -965,7 +1172,40 @@ if (BUILD_TESTING AND GTest_FOUND)
     # (coin/coin_peer_manager.hpp): source scoring (daemon penalty / addr-crawl
     # bonus), selection ordering, /16 Sybil group caps, anchor persistence, and
     # the pinned protected local node. Same target, no new allowlist entry.
-    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp)
+    # Fourth and fifth TUs on this target:
+    #  * test_dash_coin_p2p_pool.cpp — the MULTI-PEER POOL: concurrency, per-peer
+    #    state isolation (a pong from one peer must never close another's ping),
+    #    independent reaping, inv fan-in collapsing to ONE getdata, the BOUNDED
+    #    dedup set proven by eviction, refill after a loss, broadcast relay.
+    #  * test_dash_qrinfo_wire.cpp — the DIP-24 rotated lane driven from RAW WIRE
+    #    BYTES through p2p::Handler::parse() into QuorumMemberSource.
+    # THIS TARGET, not test_dash_embedded_gbt: the qrinfo gate is Handler REGISTRY
+    # membership, which needs the full p2p Handler instantiated, which ODR-uses
+    # CBlockHeaderAndShortTxIDs::FillShortTxIDSelector() out of dash_block_replay
+    # — only linked here. No new build.yml --target entry needed (test_dash_p2p_node
+    # is already allowlisted; the push bot lacks `workflow` scope, #769, so a
+    # standalone target would be a NOT_BUILT sentinel).
+    # Sixth TU: test_dash_coin_peer_rearm.cpp — the emergency seed RE-ARM
+    # (never-re-arm defect fix): saturating exponential backoff schedule/floor/
+    # overflow, the single-latch re-entry guard (N ticks -> one re-arm), and the
+    # recovery reset. Same target, no new allowlist entry.
+    # Seventh TU: test_dash_replay_bulk_fetch.cpp — the W2 FULL-HISTORY REPLAY
+    # bulk block-fetch lane (coin/replay_bulk_fetch.hpp): multi-peer range
+    # partitioning, timeout/notfound/peer-loss re-request, in-order
+    # deliver-then-PRUNE into the W1 consumer seam, merkle-bind rejection,
+    # tip-lane strict priority, resumable cursor (verified hash, fail-closed
+    # mismatch), genesis→anchor header-backfill join, capture segment cache.
+    # Same target, no new allowlist entry.
+    # DASH_FIXTURE_DIR: the wire suite replays the real 602'189-byte testnet capture.
+    # Eighth TU: test_dash_spork.cpp — the SPORK listener (registry-membership
+    # gate per the qrinfo #1077 rule + signature verification vs the
+    # chainparams spork key + assume-active SporkState). Folded here for the
+    # same #769 reason as every TU above: this target IS in the build.yml
+    # "Build tests" --target allowlist, and a standalone target would be a
+    # NOT_BUILT sentinel.
+    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp test_dash_coin_p2p_pool.cpp test_dash_qrinfo_wire.cpp test_dash_coin_peer_rearm.cpp test_dash_replay_bulk_fetch.cpp test_dash_spork.cpp)
+    target_compile_definitions(test_dash_p2p_node PRIVATE
+        DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_p2p_node PRIVATE
         GTest::gtest_main GTest::gtest
         dash_block_replay   # E1: coin/vendor/blockencodings.cpp — the full p2p Handler
@@ -1010,7 +1250,12 @@ if (BUILD_TESTING AND GTest_FOUND)
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}
     )
-    target_link_libraries(test_dash_auto_ratchet PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    target_link_libraries(test_dash_auto_ratchet PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining c2pool_storage pool)  # OBJECT-lib SCC direct-naming (#22/#39)
+    # #950: every target that includes node.hpp and instantiates handle_version
+    # links NodeImpl::send_standing_remember, defined in node.cpp — see the
+    # test_dash_node_embedded_wire note above and the #889 precedent. Targets
+    # that only type-check against the header do not need this; these do.
+    target_link_libraries(test_dash_auto_ratchet PRIVATE dash sharechain)
     gtest_add_tests(test_dash_auto_ratchet "" AUTO)
 
     add_executable(test_dash_peer test_dash_peer.cpp)
@@ -1394,7 +1639,23 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_web_honesty_regression PRIVATE c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage ltc_coin pool)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_web_honesty_regression "" AUTO)
     target_compile_definitions(test_web_honesty_regression PRIVATE  # folded #912 static-HTML KAT
-        DASHBOARD_HTML_PATH="${CMAKE_SOURCE_DIR}/web-static/dashboard.html")
+        DASHBOARD_HTML_PATH="${CMAKE_SOURCE_DIR}/web-static/dashboard.html"
+        # WebStaticMergedGating KATs read the sibling web-static pages
+        # (miners/miner/loading) for standalone-coin merged-UI gating.
+        WEB_STATIC_DIR="${CMAKE_SOURCE_DIR}/web-static")
 
+
+    # L-KR1Z1S drop_tails release-order race guard (self-contained ASan stand-in,
+    # #759 pattern). Compiles + runs its own harness in three modes under
+    # AddressSanitizer: green PASS (fixed discipline survives concurrent prune),
+    # deadcode RED (models the main_ltc.cpp:5011 caller-unlock revert), uaf RED
+    # (models the node.cpp:1038 under-lock-deref revert). It does NOT link
+    # NodeImpl/main_ltc. Script-based add_test => no build target, so it stays off
+    # the build.yml --target allowlist (#143) and needs no link into the suite.
+    add_test(NAME LtcKr1z1sDropTailGuard
+             COMMAND ${CMAKE_COMMAND} -E env CXX=${CMAKE_CXX_COMPILER}
+                     bash ${CMAKE_CURRENT_SOURCE_DIR}/kr1z1s/kr1z1s_droptail_guard.sh)
+    set_tests_properties(LtcKr1z1sDropTailGuard PROPERTIES
+        TIMEOUT 180 LABELS "ltc;threading;asan-stand-in")
 endif()
 

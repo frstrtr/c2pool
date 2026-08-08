@@ -1,0 +1,8 @@
+target_head    = 6ae3facd8 (ltc bootstrap-gate core_util boost include-dir)
+compiler       = g++ 13.3.0
+flags          = -std=c++17 -O1 -g -fsanitize=address -pthread
+asan_options   = abort_on_error=0:exitcode=1:detect_leaks=0
+shape          = CHAIN_SIZE=18300 ITERS=300
+source_sha256  = 15c969a98dd4944342543251513910c586811ac513963d8459175ec9a22c5028   (deterministic anchor)
+binary_sha256  = ddba050689982c45ef60c304c613698c1d856b63004bd34fdae7e7b89069a803
+supersedes     = daf8153505cb5a29... (A/B-prep binary; green-mode had shared_mutex writer starvation -> fixed here)

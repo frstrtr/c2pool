@@ -36,7 +36,12 @@
 ///       hashMerkleRoot (header already PoW-verified by the header chain) at
 ///       tx index 0 (the coinbase);
 ///   (c) the snapshot SML's computed merkle root == cbTx.merkleRootMNList.
-/// Any failure -> the pending quorums for that hash FAIL CLOSED (null-serve).
+/// Any failure -> the pending quorums for that hash FAIL CLOSED: their member
+/// set stays unsourced, so no commitment can be BLS-verified for those slots.
+/// That is a REFUSAL, not a null serve — the slot is unsatisfiable and the
+/// whole height falls back to dashd (cause=qc-plan-underivable). c2pool never
+/// mines a null commitment to fill the shortfall (dkg_commitments.hpp HEIGHT
+/// COMPLETENESS: doing so diverged merkleRootQuorums at block 1520106).
 ///
 /// MODIFIER (#814 review R5): the coinbase ChainLock input is the work block's
 /// OWN cbTx bestCLSignature — v23.1.7 GetNonNullCoinbaseChainlock does NOT
@@ -58,14 +63,48 @@
 /// replies here and skips the tip feed. Only STRICT matches consume: the diff
 /// must be a full snapshot (baseBlockHash null) at an awaited block hash.
 ///
-/// ROTATED (DIP-24): request() no-ops for a rotated type (compute is
-/// unsupported there); the verifier stays fail-closed. qrinfo-based rotated
-/// sourcing is the documented follow-up.
+/// ROTATED (DIP-24) — NOW SERVED, one qrinfo per CYCLE fills 32 slots:
+/// request() derives the cycle base from the quorum's own base height
+/// (quorumIndex = baseHeight % dkgInterval, cycleBase = baseHeight -
+/// quorumIndex — dashcore utils.cpp GetAllQuorumMembers), emits ONE getqrinfo
+/// for that cycle base, and on_qrinfo() DIP-4 authenticates all four cycle
+/// mnlistdiffs (each bound to the height the cycle geometry demands), runs
+/// vendor::compute_quorum_members_by_quarter_rotation, and inserts ALL 32
+/// resulting member sets into the SAME m_ready map the non-rotated path uses.
+///
+/// WHY (type, quorumHash) STAYS THE KEY: every one of the 32 rotated quorums
+/// in a cycle has its OWN quorumHash — the block at cycleBase + quorumIndex
+/// (DIP-0024; dashcore stores them as {cycleBaseHash, quorumIndex} internally
+/// but the COMMITMENT carries the per-index base block hash). So no key,
+/// provider signature or commitment-cache change was needed: one authenticated
+/// reply simply populates 32 distinct keys at once.
+///
+/// DELIBERATE REVERSAL (was: "issue no getqrinfo"): the previous slice left
+/// request() silent for rotated types on the reasoning that a live request
+/// whose reply could not yet produce a member set is traffic on a money path
+/// for no gain. Now that the reply DOES produce the member set, that reasoning
+/// inverts and the branch emits. The request is still bounded exactly like the
+/// non-rotated one (one outstanding per cycle base, deduped, FIFO-reaped) and
+/// is only made for a cycle whose geometry validates locally first.
+///
+/// OBSERVABILITY ON THE ROTATED LANE (the defect this discipline exists for):
+/// three live soaks cached 32 type-5 (LLMQ_60_75) qfcommits and produced ZERO
+/// "[QC-MEMBERS] READY type=5", and NOTHING in the logs could distinguish
+///   (a) the getqrinfo was never sent,
+///   (b) it was sent and no reply came,
+///   (c) a reply came and was dropped.
+/// It was (c): message_qrinfo was missing from the p2p::Handler type list, so
+/// every reply died in the "unhandled command" catch at DEBUG level and
+/// on_qrinfo() was never called. Both the registry gap and the silence are
+/// fixed. Every terminal state of this lane is now a RotatedOutcome that names
+/// itself in the log with the cause=/value=/threshold= discipline the serve
+/// gate uses, and an unanswered getqrinfo TIMES OUT by name — which also stops
+/// one lost reply from wedging its cycle forever behind the dedup branch.
 ///
 /// FAIL-CLOSED throughout: pre-V20 work block, base not dkgInterval-aligned,
-/// header gap, rotated type, snapshot authentication failure, member
-/// computation ambiguous -> the quorum simply never becomes ready and the
-/// verifier serves null.
+/// header gap, unknown type, snapshot authentication failure, member
+/// computation ambiguous (score tie / short quarter / zero operator key)
+/// -> the quorum simply never becomes ready and the verifier serves null.
 ///
 /// Threading: all entry points run on the single coin ioc thread (same
 /// assumption as QuorumManager) — no internal locking.
@@ -74,22 +113,96 @@
 #include <impl/dash/coin/dkg_commitments.hpp>          // LlmqNetwork, enabled_llmqs
 #include <impl/dash/coin/utxo_adapter.hpp>             // dash_txid
 #include <impl/dash/coin/vendor/quorum_members.hpp>    // compute_quorum_members
+#include <impl/dash/coin/vendor/quorum_members_rotated.hpp>  // DIP-24 quarter rotation
 #include <impl/dash/coin/vendor/smldiff.hpp>           // CSimplifiedMNListDiff, apply_diff, ExtractMatches
 #include <impl/dash/coin/vendor/cbtx.hpp>              // CCbTx, parse_cbtx
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>     // CSimplifiedMNList
+#include <impl/dash/coin/vendor/quorum_rotation_info.hpp>  // DIP-24 CQuorumRotationInfo / CQuorumSnapshot
 
 #include <core/uint256.hpp>
 #include <core/log.hpp>
 
+#include <array>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <map>
+#include <set>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace dash {
 namespace coin {
+
+/// Every terminal outcome of the DIP-24 ROTATED lane, so the lane can never
+/// again fail without saying which of them happened.
+///
+/// WHY THIS EXISTS: three live soaks cached 32 type-5 (LLMQ_60_75) qfcommits
+/// and produced zero READY, and the logs could not distinguish "the request
+/// was never sent" from "it was sent and no reply came" from "a reply came and
+/// was dropped". Each rotated exit below now names itself with the same
+/// cause=/value=/threshold= discipline the serve gate uses.
+enum class RotatedOutcome {
+    kNone = 0,
+    // request() / request_rotated() — the SEND side
+    kRequestSent,
+    kRequestDeduped,             // a getqrinfo for this cycle is already out
+    kRequestAlreadyReady,        // the cycle is served; no traffic needed
+    kRefusedUnknownType,
+    kRefusedNotRotated,
+    kRefusedNoSendSeam,          // set_send_getqrinfo() never called
+    kRefusedIntervalZero,
+    kRefusedBaseHeaderMissing,   // header chain does not hold the quorum base
+    kRefusedIndexOutOfRange,     // quorumIndex >= signingActiveQuorumCount
+    kRefusedCycleHeaderGap,      // cycle-base header not held
+    kRefusedBaseUnaligned,       // cycle base not on a dkgInterval boundary
+    kRefusedCycleSpanTooShallow, // chain shorter than base-8-3C
+    kRefusedPreV20,
+    // on_qrinfo() — the REPLY side
+    kReplyNoCbTx,
+    kReplyUnsolicited,           // matched no outstanding request
+    kReplyTypeVanished,
+    kReplyNotFullList,
+    kReplyAuthFailed,
+    // finalize_rotated() — the COMPUTE side
+    kComputeAmbiguous,
+    kNoSlotHeaders,
+    kReady,
+    // expire_rotated_requests()
+    kTimedOut,                   // getqrinfo sent, no reply inside the window
+};
+
+inline const char* rotated_outcome_name(RotatedOutcome o)
+{
+    switch (o) {
+    case RotatedOutcome::kNone:                     return "none";
+    case RotatedOutcome::kRequestSent:              return "request_sent";
+    case RotatedOutcome::kRequestDeduped:           return "request_deduped";
+    case RotatedOutcome::kRequestAlreadyReady:      return "already_ready";
+    case RotatedOutcome::kRefusedUnknownType:       return "unknown_llmq_type";
+    case RotatedOutcome::kRefusedNotRotated:        return "type_not_rotated";
+    case RotatedOutcome::kRefusedNoSendSeam:        return "no_send_seam";
+    case RotatedOutcome::kRefusedIntervalZero:      return "dkg_interval_zero";
+    case RotatedOutcome::kRefusedBaseHeaderMissing: return "base_header_not_held";
+    case RotatedOutcome::kRefusedIndexOutOfRange:   return "quorum_index_out_of_range";
+    case RotatedOutcome::kRefusedCycleHeaderGap:    return "cycle_base_header_not_held";
+    case RotatedOutcome::kRefusedBaseUnaligned:     return "cycle_base_unaligned";
+    case RotatedOutcome::kRefusedCycleSpanTooShallow: return "cycle_span_too_shallow";
+    case RotatedOutcome::kRefusedPreV20:            return "pre_v20_work_block";
+    case RotatedOutcome::kReplyNoCbTx:              return "reply_no_type5_cbtx";
+    case RotatedOutcome::kReplyUnsolicited:         return "reply_unsolicited";
+    case RotatedOutcome::kReplyTypeVanished:        return "reply_type_vanished";
+    case RotatedOutcome::kReplyNotFullList:         return "reply_not_full_list";
+    case RotatedOutcome::kReplyAuthFailed:          return "reply_dip4_auth_failed";
+    case RotatedOutcome::kComputeAmbiguous:         return "member_compute_ambiguous";
+    case RotatedOutcome::kNoSlotHeaders:            return "no_slot_base_headers";
+    case RotatedOutcome::kReady:                    return "ready";
+    case RotatedOutcome::kTimedOut:                 return "request_timed_out";
+    }
+    return "unnamed";   // unreachable; a new enumerator without a name is a bug
+}
 
 class QuorumMemberSource {
 public:
@@ -127,54 +240,178 @@ public:
 
     /// Kick sourcing for a quorum (idempotent). Called when a qfcommit for the
     /// quorum is admitted, so the member set is ready by the DKG-window height.
+    /// #108 — PREFETCH the member sets a DKG cycle will need, BEFORE the
+    /// commitments that need them arrive.
+    ///
+    /// MEASURED (fully-daemonless soak, 2026-08-06/07): 48 of the embedded
+    /// arm's decline events were cause=qc-plan-underivable, and they are not
+    /// scattered — every one sits at a height h where (h % dkgInterval) equals
+    /// the type's mining_window_start, and each clears in 1-7 minutes. That is
+    /// one getmnlistd/getqrinfo round trip, paid at the exact moment the plan
+    /// first needs the answer.
+    ///
+    /// The inputs, however, are available much earlier: a non-rotated quorum's
+    /// member set derives from the WORK block (quorumBase - 8), and the cycle
+    /// base is known the moment the tip crosses it — typically ten blocks and
+    /// ~25 minutes before the mining window opens. So the round trip is not
+    /// unavoidable latency; it is latency we chose by asking late.
+    ///
+    /// This asks early. It calls the SAME request paths with the SAME key, so
+    /// every invariant they carry is untouched: DIP-4 authentication of the
+    /// snapshot, dedupe-by-block-hash, one outstanding request per base, FIFO
+    /// reaping, and the demux that keeps historical replies away from the tip
+    /// SML. The qfcommit kick stays exactly as it was — this only changes WHEN
+    /// the first attempt happens, never whether the answer is trusted.
+    ///
+    /// Silent no-ops are deliberate: a header we do not hold yet, a pre-V20
+    /// height, a type whose params we do not know. Prefetch is an optimisation
+    /// and must never fail a template; the qfcommit kick remains the fallback
+    /// for every case this skips.
+    void prefetch_cycle(uint32_t tip_height)
+    {
+        if (tip_height == 0) return;
+        // CATCH-UP GATE. The tip callback fires once per headers MESSAGE, and
+        // add_headers coalesces up to 2000 headers into one — so during a cold
+        // start or a long resync each call arrives ~2000 blocks above the last.
+        // Every such call is a memo miss for every type (2000 > any mainnet
+        // dkgInterval), and each miss asks for a cycle whose mining window is
+        // long past: measured shape is ~215 requests / ~100 MB of full MN
+        // snapshots from a checkpointed cold start, all of it riding the ONE
+        // ordered stream to the primary coin-P2P peer that the cold-start path
+        // (#1162/#1151) just spent effort making fast. Prefetch is an
+        // optimisation for the LIVE tip; while we are catching up the qfcommit
+        // kick remains the correct and sufficient mechanism.
+        const uint32_t prev = m_last_prefetch_tip;
+        m_last_prefetch_tip = tip_height;
+        if (prev != 0 && tip_height > prev + kMaxDkgInterval)
+            return;   // jumped a whole cycle or more => still catching up
+        for (const auto& p : enabled_llmqs(m_net)) {
+            if (p.dkg_interval == 0) continue;
+            // The cycle whose mining window this tip is approaching: the most
+            // recent boundary at or below the tip.
+            const uint32_t cycle_base = tip_height - (tip_height % p.dkg_interval);
+            if (cycle_base == 0) continue;
+            // ROTATED TYPES (DIP-24): DO NOT ask at the cycle boundary.
+            //
+            // A rotated reply publishes one member set per slot, keyed by the
+            // header at cycleBase + quorumIndex (finalize_rotated). At the tip
+            // that CROSSES the boundary only cycleBase itself exists, so 31 of
+            // 32 slots are skipped for want of a header — and the one slot that
+            // does publish is index 0, whose key IS the cycle key. From then on
+            // request_rotated short-circuits on "cycle already ready" and the
+            // qfcommit kick can never re-ask: the cycle is permanently stuck at
+            // 1/32 sourced. That would REGRESS the rotated lane proven live by
+            // #1077, which works precisely because the qfcommit kick fires
+            // inside the mining window, when every slot header exists.
+            //
+            // So wait until the last slot's base header is in the chain. With
+            // signing_active_quorum_count=32 and mining_window_start=42 the
+            // prefetch still lands ~10 blocks (~25 min) before the window
+            // opens, which is the entire point of this change.
+            //
+            // The memo is inserted AFTER this check on purpose: memoising a
+            // cycle we deliberately skipped would burn the only chance to
+            // prefetch it at all.
+            if (p.use_rotation) {
+                const uint32_t last_slot_h =
+                    cycle_base + (p.signing_active_quorum_count > 0
+                                      ? p.signing_active_quorum_count - 1
+                                      : 0);
+                if (tip_height < last_slot_h) continue;   // retry on a later tip
+            }
+            // Only act once per (type, cycle) — repeated tips inside the same
+            // cycle must not re-walk the request path.
+            // Resolve the header BEFORE memoising. A header gap is a
+            // "not yet", not a "done": memoising it would spend the cycle's
+            // only prefetch on a lookup that failed.
+            auto base_hash = m_hash_at_height(cycle_base);
+            if (!base_hash || base_hash->IsNull()) continue;  // retry next tip
+            const uint64_t seen_key =
+                (static_cast<uint64_t>(p.type) << 32) | cycle_base;
+            if (!m_prefetched_cycles.insert(seen_key).second) continue;
+            // Lead time is measured from the tip we are ON, not from the
+            // window offset: a rotated type waits for its slot headers, so it
+            // asks LATER than a non-rotated one and the honest number is the
+            // difference. (An earlier version printed mining_window_start,
+            // which overstated the rotated lane by 4x.)
+            const uint32_t window_open_h = cycle_base + p.mining_window_start;
+            const long lead = static_cast<long>(window_open_h)
+                            - static_cast<long>(tip_height);
+            LOG_INFO << "[QC-PREFETCH] cycle_base=" << cycle_base
+                     << " type=" << static_cast<int>(p.type)
+                     << " hash=" << base_hash->GetHex().substr(0, 8)
+                     << " tip=" << tip_height
+                     << " rotated=" << (p.use_rotation ? 1 : 0)
+                     << " lead=" << lead
+                     << " blocks before the mining window opens at h="
+                     << window_open_h;
+            request(p.type, *base_hash);
+        }
+        // Bound the memo: a cycle far behind the tip can never be asked for
+        // again, and an unbounded set would grow for the life of the node.
+        if (m_prefetched_cycles.size() > kPrefetchMemoMax)
+            m_prefetched_cycles.clear();
+    }
+
     void request(uint8_t llmq_type, const uint256& quorum_hash)
     {
+        // request() is kicked on every admitted qfcommit, which makes it the
+        // one reliable heartbeat this class has. Use it to retire rotated
+        // requests that were sent and never answered — otherwise a single
+        // unanswered getqrinfo wedges its cycle FOREVER (every later slot of
+        // that cycle dedupes against the stuck pending and sends nothing).
+        // That is precisely what a dropped reply produced in the soaks.
+        expire_rotated_requests();
+
         const Key key{llmq_type, quorum_hash};
         if (m_ready.count(key) || m_pending.count(key)) return;
 
         const LlmqParamsView* p = params_for(llmq_type);
-        if (p == nullptr) return;                       // unknown type => fail closed
+        if (p == nullptr) {                             // unknown type => fail closed
+            note_rotated(RotatedOutcome::kRefusedUnknownType,
+                         "type=" + std::to_string(static_cast<int>(llmq_type)));
+            return;
+        }
         if (p->use_rotation) {
-            // ── ROTATED (DIP-24, e.g. llmq_60_75) SOURCING SEAM ─────────────
-            // The non-rotated path above sources ONE full snapshot at the work
-            // block (base-8) and runs ComputeQuorumMembers. A rotated quorum's
-            // member set is NOT derivable from a single snapshot: dashcore
-            // ComputeQuorumMembersByQuarterRotation (llmq/utils.cpp) assembles
-            // it from the QUARTER-ROTATION snapshots + cycle-base mnlistdiffs
-            // that only the qrinfo message carries. That wire + decode +
-            // quarter-rotation port is the ITEM 2 follow-up; UNTIL it lands the
-            // rotated path FAILS CLOSED here (no ready set is produced), so the
-            // #816 completeness gate leaves the mixed-quorum DKG window
-            // unserveable and get_work routes to the reward-safe dashd fallback.
+            // ── ROTATED (DIP-24, e.g. llmq_60_75) ───────────────────────────
+            // A rotated quorum's member set is NOT derivable from a single
+            // work-block snapshot: dashcore ComputeQuorumMembersByQuarterRotation
+            // (llmq/utils.cpp) assembles it from the three QUARTER-ROTATION
+            // snapshots plus the four cycle work-block lists, which only the
+            // qrinfo message carries. Sourcing is therefore per CYCLE, not per
+            // quorum — and ONE reply yields all signingActiveQuorumCount sets.
             //
-            // REMAINING WORK to make this SERVEABLE (each behind a real-vector
-            // KAT against test/data/dash_rotated_quorum_members_kat.hpp — the
-            // captured llmq_60_75 @1520064 ground truth: dashd's exact ordered
-            // 60-member set + operator keys):
-            //   1. getqrinfo P2P request: CGetQuorumRotationInfo
-            //      (baseBlockHashes + blockRequestHash=quorumHash,
-            //       extraShare=false) — a new p2p_messages type + a send seam
-            //      analogous to send_getmnlistd (send_getqrinfo).
-            //   2. CQuorumRotationInfo decode (llmq/snapshot.h /
-            //      quorum_rotation_info): the 3 CQuorumSnapshot skip-lists
-            //      (quorumSnapshotAtHMinusC/2C/3C) + the mnlistdiffs
-            //      (mnListDiffTip/AtH/AtHMinusC/2C/3C[/4C]) — decode + DIP-4
-            //      authenticate each mnlistdiff exactly like authenticate_snapshot.
-            //   3. vendor::compute_quorum_members_by_quarter_rotation port of
-            //      dashcore ComputeQuorumMembersByQuarterRotation +
-            //      BuildNewQuorumQuarterMembers + the snapshot skip-list decode
-            //      (GetQuorumQuarterMembersBySnapshot), producing the ordered
-            //      MemberOperatorKey vector — MUST reproduce the captured order.
-            //   4. feed that set to the SAME m_ready map so lookup() (and #812's
-            //      verify_final_commitment) serves rotated commitments real.
-            // Fail-closed if qrinfo can't be sourced or any snapshot mnlistdiff
-            // fails DIP-4 authentication (same discipline as the non-rotated
-            // authenticate_snapshot).
-            LOG_DEBUG_COIND << "[QC-MEMBERS] rotated type="
-                            << static_cast<int>(llmq_type) << " quorum="
-                            << quorum_hash.GetHex().substr(0, 16)
-                            << " => fail closed (qrinfo quarter-rotation sourcing "
-                               "not yet wired; reward-safe dashd fallback)";
+            // Derive the cycle base exactly as upstream GetAllQuorumMembers
+            // does: quorumIndex = baseHeight % dkgInterval, and the cycle base
+            // is baseHeight - quorumIndex. Upstream also REFUSES an index at or
+            // beyond signingActiveQuorumCount (`return {}`), so do we.
+            const std::string who =
+                "type=" + std::to_string(static_cast<int>(llmq_type))
+                + " quorum=" + quorum_hash.GetHex().substr(0, 16);
+            auto rot_base_h = m_height_of_hash(quorum_hash);
+            if (!rot_base_h) {                          // base header not held
+                note_rotated(RotatedOutcome::kRefusedBaseHeaderMissing, who);
+                return;
+            }
+            if (p->dkg_interval == 0) {
+                note_rotated(RotatedOutcome::kRefusedIntervalZero, who);
+                return;
+            }
+            const uint32_t quorum_index = *rot_base_h % p->dkg_interval;
+            if (quorum_index >= p->signing_active_quorum_count) {
+                note_rotated(RotatedOutcome::kRefusedIndexOutOfRange,
+                             who + " value=" + std::to_string(quorum_index)
+                             + " threshold=" + std::to_string(p->signing_active_quorum_count));
+                return;
+            }
+            const uint32_t cycle_h = *rot_base_h - quorum_index;
+            auto cycle_hash = m_hash_at_height(cycle_h);
+            if (!cycle_hash || cycle_hash->IsNull()) {   // header gap
+                note_rotated(RotatedOutcome::kRefusedCycleHeaderGap,
+                             who + " cycle_base_h=" + std::to_string(cycle_h));
+                return;
+            }
+            request_rotated(llmq_type, *cycle_hash);
             return;
         }
 
@@ -228,6 +465,361 @@ public:
         return m_await.count(block_hash) != 0;
     }
 
+    // ═══ DIP-24 ROTATED SOURCING + SERVING ═════════════════════════════════
+    // Wire + authenticated decode + the quarter-rotation member computation.
+    // on_qrinfo() ends by inserting all signingActiveQuorumCount member sets
+    // into m_ready, so lookup() serves rotated commitments for real.
+    // Everything below is exercised by the real-vector KAT.
+
+    using SendGetQrInfo = std::function<void(const std::vector<uint256>& bases,
+                                            const uint256& request_hash,
+                                            bool extra_share)>;
+
+    /// Optional (not a constructor arg, so no existing call site changes).
+    void set_send_getqrinfo(SendGetQrInfo f) { m_send_qrinfo = std::move(f); }
+
+    /// The four cycle SMLs a rotated member computation consumes, each already
+    /// DIP-4 authenticated and bound to its expected height.
+    struct RotatedInputs {
+        uint8_t  llmq_type{0};
+        uint256  quorum_hash;
+        uint32_t cycle_base_height{0};
+        // heights: H = base-8, then -C, -2C, -3C
+        std::array<uint32_t, 4>                      heights{};
+        std::array<vendor::CSimplifiedMNList, 4>     smls{};
+        // GetHashModifier for each of the four CYCLE BASES (not the work
+        // blocks): post-V20 that is SHA256d(type, workHeight, bestCLSignature)
+        // taken from each cycle work block's OWN cbTx, with the
+        // SHA256d(type, workBlockHash) fallback when that CL is null.
+        std::array<uint256, 4>                       modifiers{};
+        std::array<vendor::CQuorumSnapshot, 3>       snapshots{};  // H-C, H-2C, H-3C
+        std::vector<vendor::CFinalCommitment>        last_commitment_per_index;
+    };
+
+    /// Ask a peer for the rotation info backing `quorum_hash`. Returns false
+    /// (and sends nothing) when the request cannot be validated locally —
+    /// unknown/non-rotated type, unaligned base, missing header, pre-V20.
+    /// EMPTY baseBlockHashes on purpose: it makes the peer answer with FULL
+    /// (from-genesis) lists, and only a full list is self-authenticating
+    /// against its own cbTx.merkleRootMNList.
+    /// `quorum_hash` is the CYCLE BASE block hash (dkgInterval-aligned) — the
+    /// per-index entry point is request(), which derives it.
+    bool request_rotated(uint8_t llmq_type, const uint256& quorum_hash)
+    {
+        const std::string who =
+            "type=" + std::to_string(static_cast<int>(llmq_type))
+            + " cycle_base=" + quorum_hash.GetHex().substr(0, 16);
+
+        const LlmqParamsView* p = params_for(llmq_type);
+        if (p == nullptr)
+            return note_rotated_false(RotatedOutcome::kRefusedUnknownType, who);
+        if (!p->use_rotation)
+            return note_rotated_false(RotatedOutcome::kRefusedNotRotated, who);
+        // The one refusal that is a WIRING fault, not a data fault: with no
+        // send seam the lane emits nothing at all and every rotated quorum
+        // stays unsourced forever (its slots refuse; they are NOT null-served
+        // -- see the 1520106 incident). It must never be silent again.
+        if (!m_send_qrinfo)
+            return note_rotated_false(RotatedOutcome::kRefusedNoSendSeam, who);
+
+        auto base_h = m_height_of_hash(quorum_hash);
+        if (!base_h)
+            return note_rotated_false(RotatedOutcome::kRefusedBaseHeaderMissing, who);
+        if (p->dkg_interval == 0)
+            return note_rotated_false(RotatedOutcome::kRefusedIntervalZero, who);
+        if (*base_h % p->dkg_interval != 0)
+            return note_rotated_false(
+                RotatedOutcome::kRefusedBaseUnaligned,
+                who + " value=" + std::to_string(*base_h)
+                + " threshold=dkg_interval:" + std::to_string(p->dkg_interval));
+        // Need H-3C to exist: base - 8 - 3*C.
+        const uint64_t span = static_cast<uint64_t>(kWorkDiffDepth)
+                            + 3ull * p->dkg_interval;
+        if (*base_h < span)
+            return note_rotated_false(
+                RotatedOutcome::kRefusedCycleSpanTooShallow,
+                who + " value=" + std::to_string(*base_h)
+                + " threshold=" + std::to_string(span));
+        if (*base_h - kWorkDiffDepth < quorum_members_v20_floor())
+            return note_rotated_false(
+                RotatedOutcome::kRefusedPreV20,
+                who + " value=" + std::to_string(*base_h - kWorkDiffDepth)
+                + " threshold=" + std::to_string(quorum_members_v20_floor()));
+
+        const Key ckey{llmq_type, quorum_hash};
+        // ONE outstanding getqrinfo per cycle base: the 32 slots of a cycle all
+        // resolve to this same request, and a duplicate would draw a second
+        // 600 kB reply that no await matches (the R1 hazard, per-cycle form).
+        if (m_rotated_pending.count(ckey)) {
+            m_last_rotated = RotatedOutcome::kRequestDeduped;
+            return true;
+        }
+        // The cycle's index-0 quorum hash IS the cycle base hash, so a ready
+        // cycle needs no re-request.
+        if (m_ready.count(ckey)) {
+            m_last_rotated = RotatedOutcome::kRequestAlreadyReady;
+            return true;
+        }
+        reap_rotated_if_needed();
+
+        m_rotated_pending[ckey] = RotatedPending{*base_h, m_now()};
+        m_rotated_fifo.push_back(ckey);
+        m_send_qrinfo(std::vector<uint256>{}, quorum_hash, /*extra_share=*/false);
+        m_last_rotated = RotatedOutcome::kRequestSent;
+        LOG_INFO << "[QC-MEMBERS] rotated getqrinfo SENT outcome="
+                 << rotated_outcome_name(RotatedOutcome::kRequestSent)
+                 << " " << who << " cycle_base_h=" << *base_h
+                 << " timeout=" << kRotatedRequestTimeoutSec << "s"
+                 << " (awaiting a qrinfo RECEIVED line; if none appears a "
+                    "TIMED OUT line will)";
+        return true;
+    }
+
+    /// Consume a qrinfo reply. DIP-4 authenticates EVERY cycle mnlistdiff with
+    /// the same discipline as the non-rotated path, binding each to the height
+    /// the cycle geometry says it must be — a peer cannot answer with another
+    /// block's genuine snapshot. Returns the authenticated inputs, or nullopt
+    /// (fail closed) if anything does not check out.
+    std::optional<RotatedInputs>
+    on_qrinfo(const vendor::CQuorumRotationInfo& info)
+    {
+        // Which outstanding rotated request is this? Bind by the H diff's
+        // height: H must be (cycle_base - 8) for exactly one pending.
+        // Named ARRIVAL: this is the line whose absence made "no reply came"
+        // and "a reply came and was dropped" indistinguishable in the soaks.
+        LOG_INFO << "[QC-MEMBERS] qrinfo ARRIVED at member source: "
+                 << "lastCommitmentPerIndex=" << info.lastCommitmentPerIndex.size()
+                 << " outstanding=" << m_rotated_pending.size();
+
+        vendor::CCbTx probe_cbtx;
+        if (info.mnListDiffH.cbTx.type != 5
+            || !vendor::parse_cbtx(info.mnListDiffH.cbTx.extra_payload, probe_cbtx)
+            || probe_cbtx.nHeight < 0) {
+            note_rotated(RotatedOutcome::kReplyNoCbTx,
+                         "mnListDiffH carries no usable type-5 cbTx");
+            return std::nullopt;
+        }
+        const uint64_t h_height = static_cast<uint64_t>(probe_cbtx.nHeight);
+
+        const Key* match = nullptr;
+        uint32_t   base_h = 0;
+        for (const auto& [key, pend] : m_rotated_pending) {
+            if (static_cast<uint64_t>(pend.cycle_base_height)
+                == h_height + kWorkDiffDepth) {
+                match = &key;
+                base_h = pend.cycle_base_height;
+                break;
+            }
+        }
+        if (match == nullptr) {
+            note_rotated(RotatedOutcome::kReplyUnsolicited,
+                         "value=H:" + std::to_string(h_height)
+                         + " threshold=outstanding:"
+                         + std::to_string(m_rotated_pending.size()));
+            return std::nullopt;
+        }
+        const Key key = *match;
+
+        const LlmqParamsView* p = params_for(key.llmqType);
+        if (p == nullptr || !p->use_rotation || p->dkg_interval == 0) {
+            erase_rotated_pending(key);
+            note_rotated(RotatedOutcome::kReplyTypeVanished,
+                         "type=" + std::to_string(static_cast<int>(key.llmqType)));
+            return std::nullopt;
+        }
+        const uint32_t C = p->dkg_interval;
+
+        RotatedInputs out;
+        out.llmq_type        = key.llmqType;
+        out.quorum_hash      = key.quorumHash;
+        out.cycle_base_height = base_h;
+
+        const vendor::CSimplifiedMNListDiff* diffs[4] = {
+            &info.mnListDiffH,
+            &info.mnListDiffAtHMinusC,
+            &info.mnListDiffAtHMinus2C,
+            &info.mnListDiffAtHMinus3C,
+        };
+        for (size_t i = 0; i < 4; ++i) {
+            const uint32_t expect_h =
+                base_h - kWorkDiffDepth - static_cast<uint32_t>(i) * C;
+            out.heights[i] = expect_h;
+
+            // A qrinfo cycle diff MUST be a FULL list: authentication applies
+            // it onto an EMPTY list, so an incremental diff would authenticate
+            // a list that is not the one at that height.
+            //
+            // ⚠ NOT the same test as the getmnlistd path's baseBlockHash.IsNull().
+            // Observed from a real dashd: when the request carries an EMPTY
+            // baseBlockHashes, the qrinfo diffs come back with baseBlockHash =
+            // the GENESIS hash, not ZERO. So "full" is signalled here by having
+            // nothing to delete (from genesis there is nothing to delete), and
+            // the actual GUARANTEE is leg (c) of the authentication below: the
+            // applied-onto-empty SML root must equal cbTx.merkleRootMNList, which
+            // an incremental diff cannot satisfy.
+            if (!diffs[i]->deletedMNs.empty()) {
+                erase_rotated_pending(key);
+                note_rotated(RotatedOutcome::kReplyNotFullList,
+                             "cycle_diff=" + std::to_string(i)
+                             + " value=deletedMNs:"
+                             + std::to_string(diffs[i]->deletedMNs.size())
+                             + " threshold=0 — whole reply fails closed");
+                return std::nullopt;
+            }
+            vendor::CCbTx cbtx;
+            auto sml = authenticate_historical_snapshot(
+                *diffs[i], expect_h, m_merkle_root_of_hash, cbtx, "QC-MEMBERS");
+            if (!sml) {
+                erase_rotated_pending(key);
+                note_rotated(RotatedOutcome::kReplyAuthFailed,
+                             "cycle_diff=" + std::to_string(i)
+                             + " expected_h=" + std::to_string(expect_h)
+                             + " — whole reply fails closed");
+                return std::nullopt;
+            }
+            out.smls[i] = std::move(*sml);
+
+            // GetHashModifier for cycle base (base - i*C): post-V20 it hashes
+            // the WORK block's height + its OWN cbTx bestCLSignature (R5 — no
+            // walk-back), else falls back to (type, workBlockHash). The
+            // work-block hash is the diff's own blockHash, which leg (b) of the
+            // authentication above has just tied to a PoW-verified header.
+            std::optional<std::array<uint8_t, vendor::CFinalCommitment::BLS_SIG_SIZE>> clsig;
+            if (cbtx.nVersion >= vendor::CCbTx::VERSION_CLSIG_AND_BALANCE
+                && cbtx.has_best_cl_signature()) {
+                clsig = cbtx.bestCLSignature;
+            }
+            out.modifiers[i] = vendor::compute_quorum_modifier(
+                key.llmqType, expect_h, clsig, diffs[i]->blockHash);
+        }
+
+        out.snapshots[0] = info.quorumSnapshotAtHMinusC;
+        out.snapshots[1] = info.quorumSnapshotAtHMinus2C;
+        out.snapshots[2] = info.quorumSnapshotAtHMinus3C;
+        out.last_commitment_per_index = info.lastCommitmentPerIndex;
+
+        erase_rotated_pending(key);
+        LOG_INFO << "[QC-MEMBERS] qrinfo AUTHENTICATED for rotated type="
+                 << static_cast<int>(key.llmqType) << " cycle_base="
+                 << key.quorumHash.GetHex().substr(0, 16)
+                 << " cycle_base_h=" << base_h
+                 << " (H=" << out.heights[0] << ")";
+
+        // ITEM 4: the authenticated inputs go straight into the SAME m_ready
+        // map the non-rotated path fills, so lookup() serves these quorums.
+        finalize_rotated(out);
+        return out;
+    }
+
+    /// Run the quarter rotation over already-authenticated inputs and publish
+    /// every resulting member set. Separated from on_qrinfo() so the compute
+    /// can be gated in isolation. Returns the number of slots published.
+    size_t finalize_rotated(const RotatedInputs& in)
+    {
+        const LlmqParamsView* p = params_for(in.llmq_type);
+        if (p == nullptr || !p->use_rotation) return 0;
+
+        vendor::RotatedQuorumParams rp{p->type, p->size,
+                                       p->signing_active_quorum_count};
+        std::array<vendor::RotatedCycleInput, 4> cycles{};
+        for (size_t i = 0; i < 4; ++i) {
+            cycles[i].sml      = &in.smls[i];
+            cycles[i].modifier = in.modifiers[i];
+        }
+        const std::array<const vendor::CQuorumSnapshot*, 3> snaps{
+            &in.snapshots[0], &in.snapshots[1], &in.snapshots[2]};
+
+        auto sets = vendor::compute_quorum_members_by_quarter_rotation(
+            rp, cycles, snaps);
+        if (!sets) {
+            note_rotated(RotatedOutcome::kComputeAmbiguous,
+                         "type=" + std::to_string(static_cast<int>(in.llmq_type))
+                         + " cycle_base_h=" + std::to_string(in.cycle_base_height)
+                         + " -> fail closed (whole cycle stays unsourced; its "
+                           "slots refuse, they are NOT null-served)");
+            return 0;
+        }
+
+        // Each of the 32 quorums in the cycle carries its OWN quorumHash: the
+        // block at cycleBase + quorumIndex (DIP-0024). A slot whose header we
+        // do not hold yet is simply skipped — it will be re-requested and the
+        // ride-the-outstanding dedup will not fire once the cycle is ready,
+        // because index 0's key IS the cycle key.
+        size_t published = 0;
+        for (size_t qi = 0; qi < sets->size(); ++qi) {
+            auto qh = m_hash_at_height(in.cycle_base_height
+                                       + static_cast<uint32_t>(qi));
+            if (!qh || qh->IsNull()) continue;
+            insert_ready(Key{in.llmq_type, *qh}, std::move((*sets)[qi]));
+            ++published;
+        }
+        if (published == 0) {
+            note_rotated(RotatedOutcome::kNoSlotHeaders,
+                         "type=" + std::to_string(static_cast<int>(in.llmq_type))
+                         + " cycle_base_h=" + std::to_string(in.cycle_base_height)
+                         + " value=published:0 threshold=computed:"
+                         + std::to_string(sets->size())
+                         + " -- no slot base-block header held; nothing published, "
+                           "cycle stays unsourced (its slots refuse)");
+        } else {
+            m_last_rotated = RotatedOutcome::kReady;
+            // Mirrors the non-rotated "[QC-MEMBERS] READY type=" token so a
+            // single grep answers "did ANY type reach ready?" for both lanes.
+            LOG_INFO << "[QC-MEMBERS] READY type="
+                     << static_cast<int>(in.llmq_type)
+                     << " members=" << p->size
+                     << " outcome=" << rotated_outcome_name(RotatedOutcome::kReady)
+                     << " lane=ROTATED cycle_base_h=" << in.cycle_base_height
+                     << " slots=" << published << "/" << sets->size()
+                     << " (real-commitment serving ENABLED for this cycle)";
+        }
+        return published;
+    }
+
+    size_t rotated_pending_count() const { return m_rotated_pending.size(); }
+
+    /// The most recent named outcome of the rotated lane. Exists so a test can
+    /// assert that a failure NAMED ITSELF, not merely that it failed — the
+    /// property the soaks could not check.
+    RotatedOutcome last_rotated_outcome() const { return m_last_rotated; }
+
+    /// Monotonic clock seam (seconds). Defaults to steady_clock; tests inject.
+    using NowSeconds = std::function<int64_t()>;
+    void set_clock(NowSeconds f) { if (f) m_now = std::move(f); }
+
+    /// A getqrinfo the peer never answered must EXPIRE, for two reasons that
+    /// the soaks demonstrated together:
+    ///   (1) DIAGNOSTIC — "sent, never answered" is otherwise indistinguishable
+    ///       from "sent, answered, dropped"; only one of them is a peer problem;
+    ///   (2) LIVENESS — a stuck pending makes every later slot of that cycle
+    ///       take the dedup branch and send nothing, so ONE lost reply wedges
+    ///       the cycle permanently. Expiry re-opens it for the next qfcommit.
+    /// Returns the number expired. Driven off request() (the qfcommit kick).
+    size_t expire_rotated_requests()
+    {
+        const int64_t now = m_now();
+        std::vector<Key> dead;
+        for (const auto& [key, pend] : m_rotated_pending) {
+            if (now - pend.sent_at >= kRotatedRequestTimeoutSec)
+                dead.push_back(key);
+        }
+        for (const auto& key : dead) {
+            const auto it = m_rotated_pending.find(key);
+            const uint32_t base_h = it->second.cycle_base_height;
+            const int64_t  age    = now - it->second.sent_at;
+            erase_rotated_pending(key);
+            note_rotated(RotatedOutcome::kTimedOut,
+                         "type=" + std::to_string(static_cast<int>(key.llmqType))
+                         + " cycle_base=" + key.quorumHash.GetHex().substr(0, 16)
+                         + " cycle_base_h=" + std::to_string(base_h)
+                         + " value=age_s:" + std::to_string(age)
+                         + " threshold=" + std::to_string(kRotatedRequestTimeoutSec)
+                         + " — NO qrinfo reply reached the member source; cycle "
+                           "re-opened for re-request");
+        }
+        return dead.size();
+    }
+
     /// Consume a historical work-block snapshot. Returns TRUE iff the diff
     /// matched an outstanding await (so the caller must NOT also feed the
     /// tip-SML maintainer) — including when it then FAILS authentication (the
@@ -268,6 +860,28 @@ private:
     // llmq/snapshot.h @ v23.1.7: WORK_DIFF_DEPTH = 8.
     static constexpr uint32_t kWorkDiffDepth = 8;
 
+    /// How long a getqrinfo may stay outstanding before it is declared dead.
+    /// Sized well above a normal round trip for a ~600 kB reply while staying
+    /// far under DASH's 2.5-minute block time, so a wedged cycle re-opens
+    /// within the same block it was requested in.
+    static constexpr int64_t kRotatedRequestTimeoutSec = 120;
+
+    /// Record + LOG a named rotated outcome. EVERY exit of the rotated lane
+    /// goes through here (or sets m_last_rotated directly for the two
+    /// non-events, dedup and already-ready), so no rotated path can end
+    /// without saying which outcome it was.
+    void note_rotated(RotatedOutcome o, const std::string& detail)
+    {
+        m_last_rotated = o;
+        LOG_WARNING << "[QC-MEMBERS] rotated lane cause="
+                    << rotated_outcome_name(o) << " " << detail;
+    }
+    bool note_rotated_false(RotatedOutcome o, const std::string& detail)
+    {
+        note_rotated(o, detail);
+        return false;
+    }
+
     struct Key {
         uint8_t llmqType;
         uint256 quorumHash;
@@ -287,6 +901,22 @@ private:
         uint32_t work_height{0};
         uint256  work_hash;
     };
+    /// An outstanding getqrinfo. `sent_at` is what makes "no reply came" a
+    /// NAMED, TIMED outcome instead of an entry that sits there forever.
+    struct RotatedPending {
+        uint32_t cycle_base_height{0};
+        int64_t  sent_at{0};
+    };
+
+    // #108 prefetch memo: (type<<32 | cycle_base) already walked. Cleared
+    // wholesale when it grows past the bound — re-walking a live cycle costs
+    // one deduped request(), which the pending/ready maps then absorb.
+    static constexpr size_t kPrefetchMemoMax = 4096;
+    // Largest mainnet dkgInterval (LLMQ_400_85 = 576). A tip advance larger
+    // than this cannot be live-chain progress; it is a headers batch.
+    static constexpr uint32_t kMaxDkgInterval = 576;
+    std::set<uint64_t> m_prefetched_cycles;
+    uint32_t           m_last_prefetch_tip{0};
 
     const LlmqParamsView* params_for(uint8_t type) const
     {
@@ -328,7 +958,8 @@ private:
             diff, expect_h, m_merkle_root_of_hash, cbtx_out, "QC-MEMBERS");
         if (!sml) {
             LOG_WARNING << "[QC-MEMBERS] " << keys.size()
-                        << " quorum(s) fail closed (null-serve)";
+                        << " quorum(s) fail closed (member set unsourced -> "
+                           "those slots refuse, they are NOT null-served)";
         }
         return sml;
     }
@@ -368,7 +999,41 @@ private:
         } else {
             LOG_WARNING << "[QC-MEMBERS] member computation ambiguous for quorum "
                         << pend.quorum_hash.GetHex().substr(0, 16)
-                        << " -> fail closed (null-serve)";
+                        << " -> fail closed (member set unsourced -> this slot "
+                           "refuses, it is NOT null-served)";
+        }
+    }
+
+    void erase_rotated_pending(const Key& key)
+    {
+        m_rotated_pending.erase(key);
+        for (auto it = m_rotated_fifo.begin(); it != m_rotated_fifo.end(); ++it) {
+            if (*it == key) { m_rotated_fifo.erase(it); break; }
+        }
+    }
+
+    // Same bound + rationale as reap_if_needed(), for the qrinfo lane. A
+    // rotated cycle is 32 slots wide, so far fewer outstanding requests are
+    // ever legitimate; an evicted cycle simply stays unsourced, so its slots
+    // refuse (fail-safe) — they are never null-served.
+    static constexpr size_t kRotatedPendingCap = 8;
+    void reap_rotated_if_needed()
+    {
+        while (m_rotated_pending.size() >= kRotatedPendingCap
+               && !m_rotated_fifo.empty()) {
+            const Key victim = m_rotated_fifo.front();
+            auto it = m_rotated_pending.find(victim);
+            if (it != m_rotated_pending.end()) {
+                LOG_WARNING << "[QC-MEMBERS] rotated lane cause=pending_cap_evicted"
+                            << " type=" << static_cast<int>(victim.llmqType)
+                            << " cycle_base_h=" << it->second.cycle_base_height
+                            << " value=" << m_rotated_pending.size()
+                            << " threshold=" << kRotatedPendingCap
+                            << " — oldest outstanding getqrinfo dropped, that "
+                               "cycle stays null-serve until re-requested";
+                m_rotated_pending.erase(it);
+            }
+            m_rotated_fifo.pop_front();
         }
     }
 
@@ -382,7 +1047,8 @@ private:
 
     // Bound outstanding requests: evict the OLDEST pending (and its await
     // membership) once the cap is hit — a dead peer must not grow state
-    // forever, and an evicted quorum simply stays null-serve (fail-safe).
+    // forever, and an evicted quorum simply stays unsourced, so its slot
+    // refuses (fail-safe) — it is never null-served.
     void reap_if_needed()
     {
         while (m_pending.size() >= kPendingCap && !m_pending_fifo.empty()) {
@@ -426,6 +1092,15 @@ private:
     std::map<Key, Pending> m_pending;
     std::deque<Key> m_pending_fifo;
     std::map<uint256, std::vector<Key>> m_await;   // work-block hash -> waiters
+
+    SendGetQrInfo                  m_send_qrinfo;
+    std::map<Key, RotatedPending>  m_rotated_pending;  // cycle-base key -> when/where
+    std::deque<Key>                m_rotated_fifo;
+    RotatedOutcome                 m_last_rotated{RotatedOutcome::kNone};
+    NowSeconds                     m_now{[] {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::steady_clock::now().time_since_epoch()).count();
+    }};
 };
 
 } // namespace coin

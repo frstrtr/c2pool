@@ -172,6 +172,9 @@ static MnStateMachine single_mn(const std::vector<unsigned char>& payout) {
     s.nRegisteredHeight = 2'300'000;
     s.nLastPaidHeight = 0;
     s.scriptPayout.m_data = payout;
+    // Hand-seeded fixtures declare their (zero) operator split PROVEN, as
+    // every real ingest path does (h=2516595 serve gate).
+    s.payoutSplitProvenance = MNState::SPLIT_KNOWN;
     MnStateMachine m;
     m.load(std::vector<std::pair<uint256, MNState>>{{raw256(0x01), s}});
     return m;
@@ -713,6 +716,7 @@ e2_mn_pairs(const std::vector<unsigned char>& payout) {
     s.nRegisteredHeight = 2'300'000;
     s.nLastPaidHeight = 0;
     s.scriptPayout.m_data = payout;
+    s.payoutSplitProvenance = MNState::SPLIT_KNOWN;   // h=2516595 serve gate
     return std::vector<std::pair<uint256, MNState>>{{raw256(0x01), s}};
 }
 
@@ -919,4 +923,909 @@ TEST(DashEmbeddedGbt, E2ForgedBlockBodyRefusedDoesNotAdvanceSeed) {
     m.on_block_connected(good, H);
     EXPECT_EQ(st.credit_pool_height(), static_cast<int32_t>(H));
     EXPECT_EQ(st.credit_pool(), CP1_real);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// UTXO-IMMATURE SERVING — the coinbase-only template (pure-daemonless OPT-IN)
+//
+// The DEFAULT during the UTXO-immature window is to REFUSE (p2pool semantics:
+// an unsynced node does not serve templates — pinned in
+// test_dash_node_coin_state.cpp DefaultRefusesTheImmatureWindowExactlyAsBefore).
+// The suppress_mempool_txs seam exercised here is the explicit opt-in for
+// pure-daemonless nodes with no fallback: serve a coinbase-only template
+// rather than nothing for ~106 blocks (~4.4 h at ~150 s/block).
+//
+// Consensus never requires a mempool transaction in a block, so a
+// coinbase-only template is a fully valid block; and because this builder has
+// no TestBlockValidity equivalent, the decisive property is that with ZERO
+// selected txs the fee term is exactly 0 — there is no fee to overstate, so
+// bad-cb-amount is structurally impossible in this mode rather than merely
+// improbable.
+//
+// These pin exactly that: the suppressed template is byte-valid (subsidy exact,
+// CCbTx fields exact, fees exactly zero and never above the normal template),
+// and it SAYS it is running in that mode.
+// ════════════════════════════════════════════════════════════════════════════
+
+// Build one template from a mempool holding a fee-paying tx, with and without
+// suppression, from otherwise IDENTICAL state — so every difference asserted
+// below is attributable to the suppression flag alone.
+namespace {
+struct ImmatureFixture {
+    UTXOViewCache      utxo{nullptr};
+    Mempool            mp;
+    MnStateMachine     mnstates;
+    uint256            prev_hash{raw256(0xAB)};
+    MutableTransaction tx;
+    static constexpr int64_t  FEE  = 10'000;
+    static constexpr uint32_t BITS = 0x1b104be3u;
+    static constexpr uint32_t MTP  = 1'700'000'000u;
+
+    ImmatureFixture() : mnstates(single_mn(p2pkh_script(0x30))) {
+        uint256 prev = mint_hash(77);
+        utxo.add_coin(Outpoint(prev, 0),
+                      Coin(100'000, {}, /*height=*/1, /*cb=*/false));
+        mp.set_utxo(&utxo);
+        tx = make_spend(prev, 0, 100'000 - FEE, /*salt=*/7);
+        EXPECT_TRUE(mp.add_tx(tx));
+    }
+
+    dash::coin::DashWorkData build(bool suppress,
+                                   const CSimplifiedMNList* sml = nullptr,
+                                   const QuorumManager* qmgr = nullptr,
+                                   int64_t credit_pool = 0) const {
+        return build_embedded_workdata(
+            /*prev_height=*/H - 1, prev_hash, mnstates, mp,
+            BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER,
+            /*curtime=*/1'700'000'123u, /*version=*/0x20000000u,
+            /*underfill_tripped=*/nullptr,
+            sml, qmgr,
+            /*best_cl_height=*/0, dash::coin::k_zero_cl_sig, credit_pool,
+            /*qc_commitments=*/nullptr, /*quorum_root_override=*/nullptr,
+            dash::coin::DASH_MN_RR_HEIGHT_MAINNET,
+            /*superblock_payments=*/nullptr,
+            dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+            /*suppress_mempool_txs=*/suppress);
+    }
+};
+}  // namespace
+
+TEST(DashUtxoImmatureServing, SuppressedTemplateIsCoinbaseOnlyWithExactSubsidy) {
+    ImmatureFixture f;
+
+    // Control: without suppression the fee-paying tx IS selected, so the
+    // fixture genuinely has something to lose (a vacuous mempool would make
+    // every assertion below pass for the wrong reason).
+    auto normal = f.build(/*suppress=*/false);
+    ASSERT_EQ(normal.m_txs.size(), 1u);
+    ASSERT_EQ(normal.m_tx_fees[0], static_cast<uint64_t>(ImmatureFixture::FEE));
+
+    auto empty = f.build(/*suppress=*/true);
+
+    // (1) Coinbase-only body.
+    EXPECT_TRUE(empty.m_txs.empty());
+    EXPECT_TRUE(empty.m_tx_fees.empty());
+    EXPECT_TRUE(empty.m_tx_hashes.empty());
+    EXPECT_TRUE(empty.m_tx_data_hex.empty());
+
+    // (2) Value fields exact, recomputed independently from the same
+    //     closed-form formulas dashcore uses. total_fees is exactly 0.
+    const int64_t reward = compute_dash_block_reward_post_v20(H);
+    const int64_t platform_reward =
+        compute_dash_platform_reward_post_v20_mn_rr(H);
+    const int64_t mn_payment =
+        compute_dash_mn_payment_post_v20(reward) - platform_reward;
+    EXPECT_EQ(empty.m_coinbase_value, static_cast<uint64_t>(reward))
+        << "with zero txs the coinbase value must be the bare subsidy";
+    EXPECT_EQ(empty.m_payment_amount, static_cast<uint64_t>(mn_payment));
+
+    // (3) NO fee overstatement — the one failure mode that costs a block
+    //     (bad-cb-amount). The suppressed template must claim strictly LESS
+    //     than the fee-bearing one, never more.
+    EXPECT_LT(empty.m_coinbase_value, normal.m_coinbase_value);
+    EXPECT_EQ(normal.m_coinbase_value - empty.m_coinbase_value,
+              static_cast<uint64_t>(ImmatureFixture::FEE));
+
+    // (4) Payout structure is otherwise untouched: platform burn first, then
+    //     the base58 MN payee.
+    ASSERT_EQ(empty.m_packed_payments.size(), 2u);
+    EXPECT_EQ(empty.m_packed_payments[0].payee, "!6a");
+    EXPECT_EQ(empty.m_packed_payments[0].amount,
+              static_cast<uint64_t>(platform_reward));
+    EXPECT_EQ(empty.m_packed_payments[1].amount,
+              static_cast<uint64_t>(mn_payment));
+    EXPECT_NE(empty.m_packed_payments[1].payee.front(), '!');
+
+    // (5) Header fields unchanged by the mode.
+    EXPECT_EQ(empty.m_height, H);
+    EXPECT_EQ(empty.m_previous_block, f.prev_hash);
+    EXPECT_EQ(empty.m_bits, ImmatureFixture::BITS);
+    EXPECT_EQ(empty.m_mintime, ImmatureFixture::MTP + 1u);
+    EXPECT_EQ(empty.m_version, normal.m_version);
+}
+
+TEST(DashUtxoImmatureServing, SuppressedTemplateNamesItselfAndReportsThePrice) {
+    ImmatureFixture f;
+
+    auto normal = f.build(/*suppress=*/false);
+    EXPECT_TRUE(normal.m_txset_empty_cause.empty())
+        << "a normal template must NOT claim to be deliberately empty";
+    EXPECT_EQ(normal.m_txset_forgone_fees, 0u);
+
+    auto empty = f.build(/*suppress=*/true);
+    // Silence here would hide a real economic trade-off: a soak has to be able
+    // to measure how long the node ran coinbase-only and what it cost.
+    EXPECT_EQ(empty.m_txset_empty_cause, "utxo-immature-serving");
+    EXPECT_EQ(empty.m_txset_forgone_fees, f.mp.total_known_fees());
+    EXPECT_EQ(empty.m_txset_forgone_fees,
+              static_cast<uint64_t>(ImmatureFixture::FEE));
+}
+
+TEST(DashUtxoImmatureServing, SuppressedTemplateCbTxIsByteIdenticalToNormal) {
+    // The CCbTx commits merkleRootMNList / merkleRootQuorums / bestCL* /
+    // creditPoolBalance — NONE of which is a function of transaction fees
+    // (the credit-pool accrual is prev + platformReward, and platformReward is
+    // height-derived). So suppressing the tx set must not move a single CbTx
+    // byte. If a future edit ever couples fees into that payload, this goes red
+    // before it can cost a block.
+    CSimplifiedMNListEntry e1; e1.proRegTxHash = raw256(0x11); e1.isValid = true;
+    CSimplifiedMNListEntry e2; e2.proRegTxHash = raw256(0x22); e2.isValid = true;
+    CSimplifiedMNList sml(std::vector<CSimplifiedMNListEntry>{e1, e2});
+    QuorumManager qmgr;
+    const int64_t CP = 123'456'789LL;
+
+    ImmatureFixture f;
+    auto normal = f.build(/*suppress=*/false, &sml, &qmgr, CP);
+    auto empty  = f.build(/*suppress=*/true,  &sml, &qmgr, CP);
+
+    ASSERT_FALSE(empty.m_coinbase_payload.empty())
+        << "the suppressed template must still carry a REAL type-5 payload";
+    EXPECT_EQ(empty.m_coinbase_payload, normal.m_coinbase_payload)
+        << "fees do not enter the CCbTx; suppression must not move its bytes";
+
+    // …and it parses to the right height + an unchanged credit-pool accrual.
+    CCbTx got;
+    ASSERT_TRUE(parse_cbtx(empty.m_coinbase_payload, got));
+    EXPECT_EQ(got.nHeight, static_cast<int32_t>(H));
+    EXPECT_EQ(got.creditPoolBalance,
+              CP + compute_dash_platform_reward_post_v20_mn_rr(H));
+    CSimplifiedMNList sml_copy = sml;
+    EXPECT_EQ(got.merkleRootMNList, sml_copy.CalcMerkleRoot());
+    EXPECT_EQ(got.merkleRootQuorums, compute_merkle_root_quorums(qmgr));
+}
+
+TEST(DashUtxoImmatureServing, SuppressionDoesNotTripTheUnderfillGuard) {
+    // The underfill guard exists to flag an UNEXPLAINED near-empty template.
+    // This one is explained, and letting the guard fire here would train
+    // operators to ignore the line that is supposed to mean "template-fill
+    // regression".
+    ImmatureFixture f;
+    bool tripped_normal = false;
+    bool tripped_empty  = false;
+
+    build_embedded_workdata(
+        H - 1, f.prev_hash, f.mnstates, f.mp,
+        ImmatureFixture::BITS, ImmatureFixture::MTP,
+        DASH_PUBKEY_VER, DASH_P2SH_VER,
+        1'700'000'123u, 0x20000000u, &tripped_normal);
+
+    build_embedded_workdata(
+        H - 1, f.prev_hash, f.mnstates, f.mp,
+        ImmatureFixture::BITS, ImmatureFixture::MTP,
+        DASH_PUBKEY_VER, DASH_P2SH_VER,
+        1'700'000'123u, 0x20000000u, &tripped_empty,
+        nullptr, nullptr, 0, dash::coin::k_zero_cl_sig, 0,
+        nullptr, nullptr, dash::coin::DASH_MN_RR_HEIGHT_MAINNET,
+        nullptr, dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+        /*suppress_mempool_txs=*/true);
+
+    EXPECT_FALSE(tripped_empty)
+        << "a deliberately coinbase-only template is not an underfill defect";
+    EXPECT_FALSE(tripped_normal)
+        << "control: this fixture's mempool is too small to trip the guard "
+           "either way, so the assertion above is about the mode, not the size";
+}
+
+// End-to-end through the SELECTOR: NodeCoinState's suppression flag must reach
+// build_embedded_workdata. A flag that is set but never threaded would leave
+// the arm serving a normal template off an immature UTXO view — the one
+// dangerous variant.
+TEST(DashUtxoImmatureServing, SelectorThreadsSuppressionIntoTheBuilder) {
+    ImmatureFixture f;
+    dash::coin::EmbeddedWorkInputs e;
+    e.has_state           = true;
+    e.prev_height         = H - 1;
+    e.prev_hash           = f.prev_hash;
+    e.mnstates            = &f.mnstates;
+    e.mempool             = &f.mp;
+    e.bits_for_next       = ImmatureFixture::BITS;
+    e.mtp_at_tip          = ImmatureFixture::MTP;
+    e.address_version     = DASH_PUBKEY_VER;
+    e.address_p2sh_version = DASH_P2SH_VER;
+    e.curtime             = 1'700'000'123u;
+    e.version             = 0x20000000u;
+
+    auto never = []() -> dash::coin::DashWorkData {
+        ADD_FAILURE() << "viable bundle must not reach the dashd fallback";
+        return {};
+    };
+
+    e.suppress_mempool_txs = false;
+    auto sel_normal = dash::coin::select_dash_work(e, never);
+    ASSERT_EQ(sel_normal.source, dash::coin::WorkSource::Embedded);
+    EXPECT_EQ(sel_normal.work.m_txs.size(), 1u);
+
+    e.suppress_mempool_txs = true;
+    auto sel_empty = dash::coin::select_dash_work(e, never);
+    ASSERT_EQ(sel_empty.source, dash::coin::WorkSource::Embedded)
+        << "suppression changes WHAT is served, never WHETHER";
+    EXPECT_TRUE(sel_empty.work.m_txs.empty());
+    EXPECT_EQ(sel_empty.work.m_txset_empty_cause, "utxo-immature-serving");
+    EXPECT_EQ(sel_empty.work.m_coinbase_value,
+              static_cast<uint64_t>(compute_dash_block_reward_post_v20(H)));
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// PINNED LOCAL TX (donation-dust consolidation lane). The four gate faces:
+// admissible rides with fee 0 and exact coinbase; a missing/spent input, an
+// immature coinbase input, and a nonzero fee are each EXCLUDED — template
+// byte-identical to a build with no pin at all, never a refused template.
+// ════════════════════════════════════════════════════════════════════════
+
+// Convenience: full positional call up to the trailing pinned seam.
+static dash::coin::DashWorkData build_with_pin(
+    const MnStateMachine& mnstates, const Mempool& mp,
+    const uint256& prev_hash, const MutableTransaction* pin,
+    bool suppress = false) {
+    // The builder now takes a VECTOR of pins (the consolidation had to be
+    // split); these KATs each exercise one, so wrap it.
+    static thread_local std::vector<MutableTransaction> pins;
+    pins.clear();
+    if (pin != nullptr) pins.push_back(*pin);
+    const std::vector<MutableTransaction>* pins_arg = pin ? &pins : nullptr;
+    return build_embedded_workdata(
+        H - 1, prev_hash, mnstates, mp,
+        0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER,
+        /*curtime=*/1'700'000'100u, /*version=*/0x20000000u,
+        /*underfill=*/nullptr, /*sml=*/nullptr, /*qmgr=*/nullptr,
+        /*best_cl_height=*/0, dash::coin::k_zero_cl_sig,
+        /*credit_pool=*/0, /*qc=*/nullptr, /*root_override=*/nullptr,
+        dash::coin::DASH_MN_RR_HEIGHT_MAINNET, /*superblock=*/nullptr,
+        dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+        suppress, "mempool-txs-disabled", pins_arg);
+}
+
+TEST(DashEmbeddedGbt, PinnedLocalTxRidesWithZeroFeeAndExactCoinbase) {
+    UTXOViewCache utxo(nullptr);
+    // Two MATURE coinbase outputs (donation dust shape): height far below
+    // H - 100, spendable at H.
+    uint256 don1 = mint_hash(70), don2 = mint_hash(71);
+    utxo.add_coin(Outpoint(don1, 0), Coin(60'000, {}, H - 5'000, /*cb=*/true));
+    utxo.add_coin(Outpoint(don2, 0), Coin(40'000, {}, H - 4'000, /*cb=*/true));
+    Mempool mp; mp.set_utxo(&utxo);
+
+    // The consolidation: 2 inputs -> 1 output of the EXACT sum (fee 0).
+    MutableTransaction pin;
+    pin.version = 2; pin.type = 0; pin.locktime = 0;
+    { TxIn i; i.prevout.hash = don1; i.prevout.index = 0; i.sequence = 0xffffffffu; pin.vin.push_back(i); }
+    { TxIn i; i.prevout.hash = don2; i.prevout.index = 0; i.sequence = 0xffffffffu; pin.vin.push_back(i); }
+    { TxOut o; o.value = 100'000; pin.vout.push_back(o); }
+
+    auto mnstates = single_mn(p2pkh_script(0x30));
+    // suppress_mempool_txs=true — the production hotel posture; the pin must
+    // ride the coinbase-only body regardless.
+    auto w = build_with_pin(mnstates, mp, raw256(0xAB), &pin, /*suppress=*/true);
+
+    ASSERT_EQ(w.m_txs.size(), 1u) << "the pinned tx and nothing else";
+    EXPECT_EQ(w.m_tx_hashes[0], dash::coin::dash_txid(pin));
+    EXPECT_EQ(w.m_tx_fees[0], 0u);
+    // Zero fee => coinbase value is the pure subsidy, bit-exact.
+    EXPECT_EQ(w.m_coinbase_value,
+              static_cast<uint64_t>(compute_dash_block_reward_post_v20(H)));
+    // The wire body carries the pin (submit-time source).
+    ASSERT_EQ(w.m_tx_data_hex.size(), 1u);
+    EXPECT_FALSE(w.m_tx_data_hex[0].empty());
+}
+
+TEST(DashEmbeddedGbt, PinnedLocalTxExcludedFacesLeaveTemplateUntouched) {
+    auto mnstates = single_mn(p2pkh_script(0x30));
+    uint256 prev_hash = raw256(0xAB);
+
+    // Baseline: no pin at all, coinbase-only.
+    UTXOViewCache utxo0(nullptr);
+    Mempool mp0; mp0.set_utxo(&utxo0);
+    auto base = build_with_pin(mnstates, mp0, prev_hash, nullptr, true);
+    ASSERT_EQ(base.m_txs.size(), 0u);
+
+    // Face 1 — input missing entirely (already mined / never existed).
+    {
+        UTXOViewCache utxo(nullptr);
+        Mempool mp; mp.set_utxo(&utxo);
+        MutableTransaction pin;
+        pin.version = 2; pin.type = 0;
+        TxIn i; i.prevout.hash = mint_hash(80); i.prevout.index = 0; pin.vin.push_back(i);
+        TxOut o; o.value = 1'000; pin.vout.push_back(o);
+        auto w = build_with_pin(mnstates, mp, prev_hash, &pin, true);
+        EXPECT_EQ(w.m_txs.size(), 0u) << "missing input must EXCLUDE the pin";
+        EXPECT_EQ(w.m_coinbase_value, base.m_coinbase_value);
+    }
+    // Face 2 — immature coinbase input (donation output younger than 100).
+    {
+        UTXOViewCache utxo(nullptr);
+        uint256 fresh = mint_hash(81);
+        utxo.add_coin(Outpoint(fresh, 0), Coin(5'000, {}, H - 10, /*cb=*/true));
+        Mempool mp; mp.set_utxo(&utxo);
+        MutableTransaction pin;
+        pin.version = 2; pin.type = 0;
+        TxIn i; i.prevout.hash = fresh; i.prevout.index = 0; pin.vin.push_back(i);
+        TxOut o; o.value = 5'000; pin.vout.push_back(o);
+        auto w = build_with_pin(mnstates, mp, prev_hash, &pin, true);
+        EXPECT_EQ(w.m_txs.size(), 0u)
+            << "coinbase input at H-10 is immature at H — must EXCLUDE";
+    }
+    // Face 3 — fee not exactly zero (snapshot drift: output != input sum).
+    {
+        UTXOViewCache utxo(nullptr);
+        uint256 old1 = mint_hash(82);
+        utxo.add_coin(Outpoint(old1, 0), Coin(9'000, {}, H - 5'000, /*cb=*/true));
+        Mempool mp; mp.set_utxo(&utxo);
+        MutableTransaction pin;
+        pin.version = 2; pin.type = 0;
+        TxIn i; i.prevout.hash = old1; i.prevout.index = 0; pin.vin.push_back(i);
+        TxOut o; o.value = 8'000; pin.vout.push_back(o);   // 1000 duffs "fee"
+        auto w = build_with_pin(mnstates, mp, prev_hash, &pin, true);
+        EXPECT_EQ(w.m_txs.size(), 0u)
+            << "nonzero fee breaks this lane's contract — must EXCLUDE";
+    }
+    // Face 4 — the gate self-heals: same pin becomes admissible when its
+    // input appears mature, WITHOUT any state reset between builds.
+    {
+        UTXOViewCache utxo(nullptr);
+        Mempool mp; mp.set_utxo(&utxo);
+        uint256 don = mint_hash(83);
+        MutableTransaction pin;
+        pin.version = 2; pin.type = 0;
+        TxIn i; i.prevout.hash = don; i.prevout.index = 0; pin.vin.push_back(i);
+        TxOut o; o.value = 7'000; pin.vout.push_back(o);
+        auto w1 = build_with_pin(mnstates, mp, prev_hash, &pin, true);
+        EXPECT_EQ(w1.m_txs.size(), 0u);
+        utxo.add_coin(Outpoint(don, 0), Coin(7'000, {}, H - 5'000, /*cb=*/true));
+        auto w2 = build_with_pin(mnstates, mp, prev_hash, &pin, true);
+        ASSERT_EQ(w2.m_txs.size(), 1u) << "pin must self-heal into the template";
+        EXPECT_EQ(w2.m_tx_fees[0], 0u);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// PIN GATE vs the SERVED-DASHD arm. Both KATs below are red on the code that
+// ran on the production primary on 2026-08-07, which logged
+//     [dashd-splice] pinned tx EXCLUDED h=0 cause=immature-coinbase-input
+// and told the operator nothing true: the height was not the template's, and
+// the template was not the one being served.
+// ════════════════════════════════════════════════════════════════════════
+
+// DEFECT 1 — a zero height marks a MATURE coinbase input immature. The gate is
+// correct; feeding it a height nobody established is what is wrong, so the
+// serve path must judge at a height it OWNS (coin-state tip + 1) and refuse by
+// name when it has none.
+TEST(DashPinGate, ZeroHeightWouldRefuseAMatureCoinbaseInput) {
+    UTXOViewCache utxo(nullptr);
+    uint256 don = mint_hash(90);
+    // Mined 5000 blocks ago: mature by any reading, 50x the 100-block rule.
+    utxo.add_coin(Outpoint(don, 0), Coin(100'000, {}, H - 5'000, /*cb=*/true));
+    Mempool mp; mp.set_utxo(&utxo);
+
+    MutableTransaction pin;
+    pin.version = 2; pin.type = 0; pin.locktime = 0;
+    { TxIn i; i.prevout.hash = don; i.prevout.index = 0;
+      i.sequence = 0xffffffffu; pin.vin.push_back(i); }
+    { TxOut o; o.value = 100'000; pin.vout.push_back(o); }
+
+    auto mnstates = single_mn(p2pkh_script(0x30));
+
+    const auto at_tip = dash::coin::pin_gate_verdict(pin, mp, mnstates, H);
+    EXPECT_TRUE(at_tip.ok) << "mature at the real height, cause=" << at_tip.cause;
+    EXPECT_EQ(at_tip.at_height, H) << "the verdict must carry the height it judged at";
+
+    const auto at_zero = dash::coin::pin_gate_verdict(pin, mp, mnstates, 0);
+    EXPECT_FALSE(at_zero.ok)
+        << "height 0 must not silently admit — it cannot evaluate maturity";
+    EXPECT_STREQ(at_zero.cause, "immature-coinbase-input")
+        << "and this is exactly the production line: the SAME coin, refused "
+           "only because the height was never established";
+}
+
+// DEFECT 2 — the serve path binds the fallback arm to a no-op returning an
+// EMPTY template (#1134). Splicing into that judged a throwaway while the real
+// served template went unspliced, so the pin could never ride a block no matter
+// what the log said. A placeholder must be left alone.
+TEST(DashPinGate, PlaceholderFallbackIsNeverSpliced) {
+    UTXOViewCache utxo(nullptr);
+    uint256 don = mint_hash(91);
+    utxo.add_coin(Outpoint(don, 0), Coin(100'000, {}, H - 5'000, /*cb=*/true));
+    Mempool mp; mp.set_utxo(&utxo);
+
+    MutableTransaction pin;
+    pin.version = 2; pin.type = 0; pin.locktime = 0;
+    { TxIn i; i.prevout.hash = don; i.prevout.index = 0;
+      i.sequence = 0xffffffffu; pin.vin.push_back(i); }
+    { TxOut o; o.value = 100'000; pin.vout.push_back(o); }
+
+    auto mnstates = single_mn(p2pkh_script(0x30));
+
+    // NON-VIABLE bundle => the selector takes the fallback arm. The pin is
+    // admissible on the merits, so anything appended here is appended to the
+    // placeholder.
+    dash::coin::EmbeddedWorkInputs e;
+    e.has_state        = false;        // forces the fallback arm
+    e.prev_height      = 0;            // exactly the production shape
+    e.mnstates         = &mnstates;
+    e.mempool          = &mp;
+    std::vector<dash::coin::MutableTransaction> pins{pin};
+    e.pinned_local_txs = &pins;
+
+    auto placeholder = []() -> dash::coin::DashWorkData { return {}; };
+    auto sel = dash::coin::select_dash_work(e, placeholder);
+    ASSERT_EQ(sel.source, dash::coin::WorkSource::DashdFallback);
+    EXPECT_TRUE(sel.work.m_txs.empty())
+        << "a placeholder is not a template — the pin must not be spliced into it";
+    EXPECT_TRUE(sel.work.m_tx_data_hex.empty());
+
+    // A REAL fallback (it has a previous block) still splices here, so the
+    // guard discriminates on placeholder-ness, not on the arm.
+    auto real_fb = []() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_previous_block = raw256(0xAB);
+        w.m_height         = H;
+        return w;
+    };
+    auto sel_real = dash::coin::select_dash_work(e, real_fb);
+    ASSERT_EQ(sel_real.source, dash::coin::WorkSource::DashdFallback);
+    EXPECT_EQ(sel_real.work.m_txs.size(), 1u)
+        << "a genuine fallback template still carries the pin";
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// SIZE — the gate face that did not exist, and the block it cost.
+//
+//   2026-08-07 14:33:45  won block height=2517855 bytes=152889
+//   2026-08-07 14:33:45  submit_block_hex result: "bad-txns-oversize"
+//
+// Height 2517855 went to another miner. The pinned consolidation was 152258
+// bytes (1032 inputs) and EVERY face the gate had — inputs unspent, coinbase
+// maturity, fee exactly zero, no MN-collateral spend — passed it. The tx was
+// admissible by every rule anyone had thought to write, and unmineable by
+// consensus. dashd agreed independently:
+//   testmempoolaccept -> allowed=false reject-reason="bad-txns-oversize"
+//
+// A pin is not worth its own value when it is wrong. It is worth the block.
+// ════════════════════════════════════════════════════════════════════════
+
+// Build a pin with `n` inputs, all mature and unspent, fee exactly zero — so
+// the ONLY thing that can refuse it is size.
+static MutableTransaction make_admissible_pin(UTXOViewCache& utxo, unsigned n,
+                                              unsigned seed_base) {
+    MutableTransaction pin;
+    pin.version = 2; pin.type = 0; pin.locktime = 0;
+    int64_t total = 0;
+    for (unsigned i = 0; i < n; ++i) {
+        uint256 h = mint_hash(seed_base + i);
+        const int64_t v = 1'000 + i;
+        utxo.add_coin(Outpoint(h, 0), Coin(v, {}, H - 5'000, /*cb=*/true));
+        TxIn in; in.prevout.hash = h; in.prevout.index = 0;
+        // A real signed input carries a ~107-byte scriptSig (DER sig +
+        // compressed pubkey). Without it the KAT would measure a shape that
+        // never reaches a block, and the size face would be tested against
+        // fiction.
+        std::vector<unsigned char> sig(107, 0x51);
+        in.scriptSig = OPScript(sig.data(), sig.data() + sig.size());
+        in.sequence = 0xffffffffu;
+        pin.vin.push_back(in);
+        total += v;
+    }
+    TxOut o; o.value = total; pin.vout.push_back(o);   // fee exactly zero
+    return pin;
+}
+
+TEST(DashPinGate, OversizePinIsRefusedByNameNotDiscoveredAtSubmit) {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp; mp.set_utxo(&utxo);
+
+    // 1032 inputs — the production shape, byte-for-byte in spirit.
+    auto pin = make_admissible_pin(utxo, 1032, 5'000);
+    const size_t bytes = ::pack(pin).get_span().size();
+    EXPECT_GT(bytes, dash::coin::Mempool::kMaxPinnedTxBytes)
+        << "the KAT must reproduce an OVERSIZE tx or it proves nothing; got "
+        << bytes << " bytes";
+
+    EXPECT_EQ(mp.pinned_tx_admissible(pin, H),
+              dash::coin::Mempool::PinnedTxGate::TooLarge)
+        << "an oversize pin must be refused BY NAME at gate time — the "
+           "alternative is discovering it from dashd after the block is gone";
+    EXPECT_STREQ(dash::coin::Mempool::pinned_gate_name(
+                     dash::coin::Mempool::PinnedTxGate::TooLarge),
+                 "tx-too-large");
+}
+
+TEST(DashPinGate, SplitPinUnderTheCapIsAdmissible) {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp; mp.set_utxo(&utxo);
+
+    // 258 inputs = the 1032 consolidation split four ways. Same coins, same
+    // zero fee, same maturity — the ONLY change is size.
+    auto pin = make_admissible_pin(utxo, 258, 9'000);
+    const size_t bytes = ::pack(pin).get_span().size();
+    EXPECT_LT(bytes, dash::coin::Mempool::kMaxPinnedTxBytes)
+        << "a quarter-split must fit under the cap; got " << bytes;
+
+    EXPECT_EQ(mp.pinned_tx_admissible(pin, H),
+              dash::coin::Mempool::PinnedTxGate::Ok)
+        << "splitting is the fix, so the split must actually pass";
+}
+
+// The size face runs BEFORE the coin lookups. With no UTXO view wired at all,
+// an oversize tx must still be named TooLarge rather than utxo-view-unset:
+// the verdict is certain without consulting any chain state, and reporting the
+// weaker cause would send the operator hunting a view that is not the problem.
+TEST(DashPinGate, OversizeIsNamedEvenWithNoUtxoViewWired) {
+    UTXOViewCache utxo(nullptr);
+    Mempool sizing; sizing.set_utxo(&utxo);
+    auto pin = make_admissible_pin(utxo, 1032, 13'000);
+
+    Mempool bare;   // no view, no external lookup
+    EXPECT_EQ(bare.pinned_tx_admissible(pin, H),
+              dash::coin::Mempool::PinnedTxGate::TooLarge)
+        << "size is decidable without chain state; say so";
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// UNIFIED SIZE BUDGET — every component competes for ONE block.
+//
+// Before this, mempool selection was handed the WHOLE cap as if it were alone
+// in the block, and the consensus-required qc set plus any pinned transactions
+// were appended ON TOP. The arithmetic overshoots the 2 MB consensus limit,
+// and an oversize block is INVALID — dashd rejects it bad-blk-length and the
+// height goes to another miner. We lost block 2517855 to the same class of
+// error one level down (a single oversize TRANSACTION); this is the same
+// mistake at block scale.
+//
+// dashd accounts the other way round on purpose (node/miner.cpp): nBlockSize
+// starts at a 1000-byte coinbase reserve, each qcTx GetTotalSize() is added,
+// and packages are fitted into what remains. The component that can be dropped
+// safely — mempool txs, worth only fees — yields to the ones that cannot.
+// ════════════════════════════════════════════════════════════════════════
+
+TEST(DashSizeBudget, SelectionBudgetShrinksByTheRequiredSet) {
+    // The arithmetic that was wrong. Selection cap 1'990'000 while the pin set
+    // may hold kMaxPinnedTotalBytes (400'000) and the qc plan adds more — the
+    // sum exceeded the 2'000'000 consensus limit with no accounting anywhere.
+    constexpr uint64_t kConsensusBlockLimit = 2'000'000;
+    constexpr uint64_t kOldSelectionCap     = 1'990'000;
+    constexpr uint64_t kPinBudget = dash::coin::Mempool::kMaxPinnedTotalBytes;
+
+    // Worst case under the OLD scheme: selection fills its cap, pins fill
+    // theirs, qc rides on top. Even ignoring qc entirely this is already over.
+    const uint64_t old_worst = kOldSelectionCap + kPinBudget;
+    EXPECT_GT(old_worst, kConsensusBlockLimit)
+        << "the pre-fix arithmetic must actually overshoot, or this KAT is "
+           "asserting nothing: " << old_worst << " vs " << kConsensusBlockLimit;
+
+    // Under the unified budget the deduction is subtraction, so the total is
+    // bounded by construction no matter how the parts are sized.
+    constexpr uint64_t kCoinbaseReserve = 1'000;
+    const uint64_t qc_bytes  = 12'000;   // a fat rotated-boundary qc plan
+    const uint64_t reserved  = kCoinbaseReserve + qc_bytes + kPinBudget;
+    const uint64_t selection = reserved >= kOldSelectionCap
+                                   ? 0 : kOldSelectionCap - reserved;
+    EXPECT_LE(selection + reserved, kConsensusBlockLimit)
+        << "the unified budget must bound the whole block";
+}
+
+TEST(DashSizeBudget, RequiredSetLargerThanCapYieldsZeroNotUnderflow) {
+    // The face that would silently restore the old behaviour: if the required
+    // set exceeds the cap and the remainder is computed as an unsigned
+    // subtraction, it wraps to ~4 GB and selection fills the block again.
+    constexpr uint32_t MAX_BLOCK_BYTES = 1'990'000;
+    const uint64_t reserved = 2'500'000;   // required set alone over the cap
+
+    const uint32_t budget = reserved >= MAX_BLOCK_BYTES
+                                ? 0u
+                                : static_cast<uint32_t>(MAX_BLOCK_BYTES - reserved);
+    EXPECT_EQ(budget, 0u)
+        << "an over-budget required set must starve selection, never wrap";
+
+    // Demonstrate what the unguarded form would have produced, so the guard's
+    // value is visible rather than asserted.
+    const uint32_t unguarded =
+        static_cast<uint32_t>(MAX_BLOCK_BYTES - reserved);
+    EXPECT_GT(unguarded, MAX_BLOCK_BYTES)
+        << "unguarded subtraction wraps — this is the defect being prevented";
+}
+
+TEST(DashSizeBudget, BuilderDeductsPinsFromSelectionBudget) {
+    // End-to-end through the builder: with a pin configured, the template must
+    // not exceed the limit. The pin is admissible on the merits so it really
+    // does ride, and its bytes really do have to come from somewhere.
+    UTXOViewCache utxo(nullptr);
+    uint256 don = mint_hash(120);
+    utxo.add_coin(Outpoint(don, 0), Coin(50'000, {}, H - 5'000, /*cb=*/true));
+    Mempool mp; mp.set_utxo(&utxo);
+
+    MutableTransaction pin;
+    pin.version = 2; pin.type = 0; pin.locktime = 0;
+    { TxIn i; i.prevout.hash = don; i.prevout.index = 0;
+      i.sequence = 0xffffffffu; pin.vin.push_back(i); }
+    { TxOut o; o.value = 50'000; pin.vout.push_back(o); }
+    std::vector<MutableTransaction> pins{pin};
+
+    auto mnstates = single_mn(p2pkh_script(0x30));
+    auto w = build_embedded_workdata(
+        H - 1, raw256(0xAB), mnstates, mp,
+        0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER,
+        /*curtime=*/1'700'000'100u, /*version=*/0x20000000u,
+        /*underfill=*/nullptr, /*sml=*/nullptr, /*qmgr=*/nullptr,
+        /*best_cl_height=*/0, dash::coin::k_zero_cl_sig,
+        /*credit_pool=*/0, /*qc=*/nullptr, /*root_override=*/nullptr,
+        dash::coin::DASH_MN_RR_HEIGHT_MAINNET, /*superblock=*/nullptr,
+        dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+        /*suppress=*/true, "mempool-txs-disabled", &pins);
+
+    ASSERT_EQ(w.m_txs.size(), 1u) << "the pin rides";
+    uint64_t body = 0;
+    for (const auto& h : w.m_tx_data_hex) body += h.size() / 2;
+    EXPECT_LT(body, 2'000'000u)
+        << "template body must stay under the consensus block limit";
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// F1 — BLOCK-LEVEL SIZE BUDGET ON THE SERVED-DASHD FALLBACK ARM
+//
+// #1177 unified the size budget on the EMBEDDED arm: the consensus-required
+// set is measured BEFORE mempool selection and deducted, with an explicit
+// zero floor. The FALLBACK arm never got that discipline. It spliced up to
+// kMaxPinnedTotalBytes (400000) of pins onto dashd's OWN template with NO
+// block-level accounting — the only cap was pins-vs-400000, never
+// pins-vs-what-the-template-already-holds.
+//
+// dashd fills its template to its own blockmaxsize (node/miner.cpp:212
+// clamps to MaxBlockSize()-1000; policy/policy.h:23 DEFAULT_BLOCK_MAX_SIZE
+// is 2000000). Near that ceiling, +400 KB of pins reproduces EXACTLY the
+// bad-blk-length overshoot that cost block 2517855 — on the arm we describe
+// as the always-reachable safety path. And this arm carries pins in
+// production: block 2518186 was won on arm=dashd-fallback carrying 154 KB of
+// pinned donation.
+//
+// The ORDER is dashd's, deliberately (node/miner.cpp): coinbase reserve
+// (miner.cpp:115, nBlockSize = 1000) and the consensus-required set
+// (miner.cpp:235) may not be dropped; mempool selection is fitted into what
+// is left (miner.cpp:361). On the served-dashd arm all three have already
+// happened INSIDE dashd and arrive as a finished template, so the only
+// component left that may yield is the pin set — and it yields by being
+// REFUSED WITH A NAME, never silently.
+// ════════════════════════════════════════════════════════════════════════
+
+// A dashd template whose BODY is `body_bytes` on the wire. Only the raw hex
+// matters here: template_body_bytes() and serialize_full_block() both read
+// m_tx_data_hex, and those ARE the bytes that go on the wire
+// (block_producer.hpp:220).
+static DashWorkData dashd_template_with_body(uint64_t body_bytes) {
+    DashWorkData fb;
+    fb.m_height = H;
+    fb.m_tx_data_hex.push_back(std::string(body_bytes * 2, '0'));
+    return fb;
+}
+
+static std::vector<dash::coin::PinVerdict> all_ok_verdicts(size_t n) {
+    std::vector<dash::coin::PinVerdict> v(n);
+    for (auto& e : v) { e.ok = true; e.at_height = H; }
+    return v;
+}
+
+// The bytes the ASSEMBLED block would occupy: the same three terms
+// pin_headroom_bytes() budgets against, so the two cannot disagree.
+static uint64_t assembled_block_bytes(const DashWorkData& w) {
+    return dash::coin::kBlockOverheadBytes
+         + dash::coin::kCoinbaseReserveBytes
+         + dash::coin::template_body_bytes(w);
+}
+
+// ── THE RED ONE ─────────────────────────────────────────────────────────
+// A dashd template near blockmaxsize, spliced with a pin that is admissible
+// on every OTHER axis (inside kMaxPinnedTxBytes, inside kMaxPinnedTotalBytes,
+// gate verdict ok). The block-level budget is the ONLY thing that can refuse
+// it. It must be refused, and the refusal must be NAMED.
+TEST(DashFallbackPinBudget, PinOverBlockHeadroomIsRefusedByName) {
+    UTXOViewCache utxo(nullptr);
+    auto pin = make_admissible_pin(utxo, 600, 21'000);
+    const uint64_t pin_bytes = ::pack(pin).get_span().size();
+
+    // The pin must be inside EVERY pre-existing cap, or one of them would
+    // have refused it and this KAT would be proving someone else's guard.
+    ASSERT_LT(pin_bytes, Mempool::kMaxPinnedTxBytes)
+        << "pin must pass the per-tx size face; got " << pin_bytes;
+    ASSERT_LT(pin_bytes, Mempool::kMaxPinnedTotalBytes)
+        << "pin must pass the cumulative pin cap; got " << pin_bytes;
+
+    auto fb = dashd_template_with_body(1'950'000);
+    std::vector<MutableTransaction> pins{pin};
+
+    const uint64_t headroom = dash::coin::pin_headroom_bytes(fb);
+    ASSERT_LT(headroom, pin_bytes)
+        << "the fixture must actually leave too little room (" << headroom
+        << " for a " << pin_bytes << "-byte pin) or nothing is being tested";
+
+    auto rep = dash::coin::splice_verdicted_pins(
+        fb, pins, all_ok_verdicts(1), "dashd-splice",
+        /*enforce_block_budget=*/true);
+
+    EXPECT_EQ(rep.included, 0u) << "the pin must NOT ride a full template";
+    ASSERT_EQ(rep.causes.size(), 1u);
+    EXPECT_STREQ(rep.causes[0], "pin-over-block-headroom")
+        << "a refusal the operator cannot name is a silent drop";
+    EXPECT_LE(assembled_block_bytes(fb), dash::coin::kDashMaxBlockBytes)
+        << "the served block must stay inside the consensus limit; got "
+        << assembled_block_bytes(fb);
+}
+
+// The DEFECT, demonstrated rather than asserted around: with the budget off
+// (today's shipped arithmetic) the identical splice produces an OVERSIZE
+// block. If this ever stops overshooting, the fix above is guarding nothing
+// and this KAT says so by failing.
+TEST(DashFallbackPinBudget, WithoutTheBudgetTheSpliceGoesOversize) {
+    UTXOViewCache utxo(nullptr);
+    auto pin = make_admissible_pin(utxo, 600, 31'000);
+    auto fb = dashd_template_with_body(1'950'000);
+    std::vector<MutableTransaction> pins{pin};
+
+    auto rep = dash::coin::splice_verdicted_pins(
+        fb, pins, all_ok_verdicts(1), "dashd-splice",
+        /*enforce_block_budget=*/false);
+
+    EXPECT_EQ(rep.included, 1u)
+        << "flag OFF must be byte-for-byte the shipped behaviour: the pin "
+           "rides, cap-checked only against " << Mempool::kMaxPinnedTotalBytes;
+    EXPECT_GT(assembled_block_bytes(fb), dash::coin::kDashMaxBlockBytes)
+        << "the pre-fix arithmetic must ACTUALLY overshoot the 2 MB consensus "
+           "limit, or there is no defect here to fix; got "
+        << assembled_block_bytes(fb);
+}
+
+// The normal case must be untouched: a small dashd template with the budget
+// ON still carries the pin. A guard that refuses everything is not a guard.
+TEST(DashFallbackPinBudget, RoomyTemplateStillCarriesThePinWithBudgetOn) {
+    UTXOViewCache utxo(nullptr);
+    auto pin = make_admissible_pin(utxo, 600, 41'000);
+    auto fb = dashd_template_with_body(120'000);   // a typical live body
+    std::vector<MutableTransaction> pins{pin};
+
+    auto rep = dash::coin::splice_verdicted_pins(
+        fb, pins, all_ok_verdicts(1), "dashd-splice",
+        /*enforce_block_budget=*/true);
+
+    EXPECT_EQ(rep.included, 1u) << "a pin that fits must still ride";
+    EXPECT_STREQ(rep.causes[0], "");
+    EXPECT_LE(assembled_block_bytes(fb), dash::coin::kDashMaxBlockBytes);
+}
+
+// Earlier pins keep their places. The donation had to be SPLIT into four
+// transactions; a partial fit must land what fits rather than refuse the set.
+TEST(DashFallbackPinBudget, EarlierPinsKeepTheirPlacesWhenALaterOneOverflows) {
+    UTXOViewCache utxo(nullptr);
+    auto small = make_admissible_pin(utxo, 60,  51'000);   // ~9 KB
+    auto big   = make_admissible_pin(utxo, 600, 52'000);   // ~89 KB
+    const uint64_t small_bytes = ::pack(small).get_span().size();
+
+    // Room for the small pin and not the big one.
+    auto fb = dashd_template_with_body(1'950'000);
+    const uint64_t headroom = dash::coin::pin_headroom_bytes(fb);
+    ASSERT_GT(headroom, small_bytes);
+    ASSERT_LT(headroom, ::pack(big).get_span().size());
+
+    std::vector<MutableTransaction> pins{small, big};
+    auto rep = dash::coin::splice_verdicted_pins(
+        fb, pins, all_ok_verdicts(2), "dashd-splice",
+        /*enforce_block_budget=*/true);
+
+    EXPECT_EQ(rep.included, 1u);
+    EXPECT_STREQ(rep.causes[0], "") << "the pin that fits must ride";
+    EXPECT_STREQ(rep.causes[1], "pin-over-block-headroom");
+    EXPECT_LE(assembled_block_bytes(fb), dash::coin::kDashMaxBlockBytes);
+}
+
+// The underflow face — the one that would SILENTLY restore the old
+// behaviour. An over-cap template must starve the pin set, never wrap to a
+// budget of ~18 EB. Demonstrated against the unguarded form so the guard's
+// value is visible rather than asserted.
+TEST(DashFallbackPinBudget, OverCapTemplateYieldsZeroHeadroomNotAWrap) {
+    auto fb = dashd_template_with_body(2'500'000);   // already over the limit
+    EXPECT_EQ(dash::coin::pin_headroom_bytes(fb), 0u)
+        << "an over-cap template must leave NO room for pins";
+
+    const uint64_t occupied = assembled_block_bytes(fb);
+    const uint64_t unguarded = dash::coin::kDashMaxBlockBytes - occupied;
+    EXPECT_GT(unguarded, dash::coin::kDashMaxBlockBytes)
+        << "unguarded subtraction wraps — this is the defect being prevented";
+
+    UTXOViewCache utxo(nullptr);
+    auto pin = make_admissible_pin(utxo, 60, 61'000);
+    std::vector<MutableTransaction> pins{pin};
+    auto rep = dash::coin::splice_verdicted_pins(
+        fb, pins, all_ok_verdicts(1), "dashd-splice",
+        /*enforce_block_budget=*/true);
+    EXPECT_EQ(rep.included, 0u);
+    EXPECT_STREQ(rep.causes[0], "pin-over-block-headroom");
+}
+
+// The budget may only ever SHRINK the pin allowance, never raise it. An empty
+// template has ~2 MB free, but the pin policy cap still governs.
+TEST(DashFallbackPinBudget, HeadroomNeverExceedsThePinPolicyCap) {
+    DashWorkData empty;
+    EXPECT_EQ(dash::coin::pin_headroom_bytes(empty),
+              Mempool::kMaxPinnedTotalBytes)
+        << "the block budget must never RAISE the pin allowance";
+}
+
+// The two refusals stay distinguishable. "pin-total-too-large" is a property
+// of the pin SET; "pin-over-block-headroom" is a property of the TEMPLATE the
+// pin happened to meet. Neither is "tx-too-large", which blames the
+// transaction for something that is not its fault — and a cause name is the
+// operator's only handle on a refusal.
+TEST(DashFallbackPinBudget, TheTwoRefusalsAreNamedApart) {
+    // Over the pin-set cap, with all the block room in the world.
+    EXPECT_STREQ(dash::coin::pin_budget_refusal(
+                     /*spliced=*/Mempool::kMaxPinnedTotalBytes - 10,
+                     /*pin=*/100, Mempool::kMaxPinnedTotalBytes,
+                     /*headroom=*/1'000'000),
+                 "pin-total-too-large");
+    // Inside the pin-set cap, but the template has no room.
+    EXPECT_STREQ(dash::coin::pin_budget_refusal(
+                     /*spliced=*/0, /*pin=*/50'000,
+                     Mempool::kMaxPinnedTotalBytes, /*headroom=*/1'000),
+                 "pin-over-block-headroom");
+    // Fits both.
+    EXPECT_EQ(dash::coin::pin_budget_refusal(
+                  0, 1'000, Mempool::kMaxPinnedTotalBytes, 400'000),
+              nullptr);
+}
+
+// The occupancy figure is the SERVED one, not a re-derivation: it is read
+// from the same m_tx_data_hex that serialize_full_block() emits verbatim
+// (block_producer.hpp:220). A pin that is appended must be counted.
+TEST(DashFallbackPinBudget, BodyBytesTrackWhatIsActuallyAppended) {
+    UTXOViewCache utxo(nullptr);
+    auto pin = make_admissible_pin(utxo, 60, 71'000);
+    const uint64_t pin_bytes = ::pack(pin).get_span().size();
+
+    auto fb = dashd_template_with_body(100'000);
+    const uint64_t before = dash::coin::template_body_bytes(fb);
+    EXPECT_EQ(before, 100'000u);
+
+    std::vector<MutableTransaction> pins{pin};
+    auto rep = dash::coin::splice_verdicted_pins(
+        fb, pins, all_ok_verdicts(1), "dashd-splice", true);
+    ASSERT_EQ(rep.included, 1u);
+    EXPECT_EQ(dash::coin::template_body_bytes(fb), before + pin_bytes)
+        << "the budget must measure the bytes that actually go on the wire";
+    EXPECT_EQ(rep.spliced_bytes, pin_bytes);
+}
+
+// A gate refusal still reports the GATE's cause, not a size cause — the
+// verdicts arrive already decided (the served-dashd arm cannot run the gate
+// where it appends, #1134) and the splice must not overwrite them.
+TEST(DashFallbackPinBudget, GateRefusalKeepsItsOwnCause) {
+    UTXOViewCache utxo(nullptr);
+    auto pin = make_admissible_pin(utxo, 60, 81'000);
+    auto fb = dashd_template_with_body(1'999'000);   // no room at all
+
+    std::vector<MutableTransaction> pins{pin};
+    std::vector<dash::coin::PinVerdict> verdicts(1);
+    verdicts[0].ok = false;
+    verdicts[0].cause = "input-missing-or-spent";
+    verdicts[0].at_height = H;
+
+    auto rep = dash::coin::splice_verdicted_pins(
+        fb, pins, verdicts, "dashd-splice", /*enforce_block_budget=*/true);
+    EXPECT_EQ(rep.included, 0u);
+    EXPECT_STREQ(rep.causes[0], "input-missing-or-spent")
+        << "the size budget must not relabel a gate refusal";
 }

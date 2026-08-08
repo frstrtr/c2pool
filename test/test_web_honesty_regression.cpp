@@ -1041,6 +1041,35 @@ TEST(WebGaugeParity, MinDifficultyPropagatesThroughP2poolShapeWhenKnown) {
     EXPECT_DOUBLE_EQ(p["min_difficulty"].get<double>(), 8.75);
 }
 
+// (#945) The "Best Share" card claims a RECORD share; it must never present the
+// sharechain window AVERAGE as that record. Pre-fix, rest_best_share()
+// substituted average_difficulty into the all-time/session/round difficulty
+// whenever no local record had been seen -- so a freshly-started node showed the
+// window average under a "Best Share / record" label. Fails-without-fix: the
+// substitution set all three difficulties to 1024.0 (make_stats' average).
+TEST(WebGaugeParity, BestShareRecordIsRealNotSharechainAverage) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    // Live sharechain with a fat average, but NO recorded best share yet.
+    mi.set_sharechain_stats_fn([] { return make_stats(1000, 0, 0, 3.5); });
+
+    json b = mi.rest_best_share();
+
+    // has_best_share is the honest flag the card gates on.
+    ASSERT_TRUE(b.contains("has_best_share"));
+    EXPECT_FALSE(b["has_best_share"].get<bool>())
+        << "no record share was ever recorded; has_best_share must be false";
+
+    for (const char* scope : {"all_time", "session", "round"}) {
+        ASSERT_TRUE(b.contains(scope)) << scope << " entry missing";
+        const double d = b[scope].value("difficulty", -1.0);
+        EXPECT_DOUBLE_EQ(d, 0.0)
+            << scope << " best-share difficulty must read 0 (honest-absent), "
+               "not the sharechain average";
+        EXPECT_NE(d, 1024.0)
+            << scope << " must not be re-sourced from average_difficulty";
+    }
+}
+
 // (c) aps IS the non-stale rate; the gross rate is that grossed UP.
 TEST(WebGaugeParity, StaleRelationshipMatchesP2poolNotItsInverse) {
     MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
@@ -1607,4 +1636,237 @@ TEST(DashboardNoWorkReason, RendersHeaderSyncAndCategorisedReason) {
     EXPECT_NE(fn.find("c.no_work_reason != null"), std::string::npos)
         << "the no-work line must be gated on the reason being present "
            "(honest-absent), not rendered unconditionally.";
+}
+
+// (#945, frontend) renderBestShare must gate the record on has_best_share and
+// must not present a value when absent. Pre-fix it unconditionally wrote
+// bs.round.difficulty / bs.all_time.pct_of_block, so when the backend fell back
+// to the sharechain average the card rendered that average as a record.
+// Fails-without-fix: the pre-fix function never references has_best_share.
+TEST(DashboardBestShare, RecordGatesOnHasBestNotAverage) {
+    const auto html = read_dashboard();
+    auto start = html.find("function renderBestShare(bs)");
+    ASSERT_NE(start, std::string::npos) << "renderBestShare not found";
+    auto end = html.find("\n        function ", start + 1);
+    ASSERT_NE(end, std::string::npos);
+    const std::string fn = html.substr(start, end - start);
+
+    EXPECT_NE(fn.find("has_best_share"), std::string::npos)
+        << "renderBestShare must gate the record on bs.has_best_share; without "
+           "it a syncing node renders the sharechain average as a 'Best Share'.";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #948 — block_value_miner (NET of pool fee) vs block_value_payments (GROSS):
+// the two sibling fields used different conventions with nothing in the name
+// saying so, and block_value_miner + block_value_payments != block_value, so a
+// consumer that assumed the parts sum silently dropped the fee. The fix keeps
+// the legacy keys byte-for-byte and adds explicit gross / net / fee fields such
+// that the reconciliation identity holds on a fee'd node. These pin it.
+//
+// Live hotel primary (DASH, --fee 1) numbers, re-derived per the issue:
+//     block_value           1.77033183
+//     block_value_payments   1.32774887   (75%: masternode + treasury)
+//     miner GROSS 25%        0.44258296
+//     pool fee 1%            0.00442583
+//     miner NET              0.43815713   (== legacy block_value_miner)
+namespace {
+// MiningInterface is non-copyable/non-movable (atomic + mutex members), so we
+// configure a caller-owned instance in place rather than return one by value.
+void feed_coin_work(MiningInterface& mi, double block_value, double payments) {
+    // m_cached_template stays null -> rest_local_stats reads the coin-work feed,
+    // the c2pool-dash topology where WebServer drives no work pipeline of its own.
+    mi.set_coin_work_fn([block_value, payments] {
+        MiningInterface::CoinWorkInfo w;
+        w.valid = true;
+        w.network_difficulty = 28231.0;
+        w.coinbase_value_sat = static_cast<uint64_t>(llround(block_value * 1e8));
+        w.payment_amount_sat = static_cast<uint64_t>(llround(payments * 1e8));
+        w.height = 2200000;
+        return w;
+    });
+}
+} // namespace
+
+TEST(WebBlockValueReconcile, GrossNetFeeReconcileOnFeedNode) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+    mi.set_pool_fee_percent(1.0);
+    feed_coin_work(mi, 1.77033183, 1.32774887);
+    json r = mi.rest_local_stats();
+
+    ASSERT_TRUE(r.contains("block_value_miner_gross"))
+        << "gross miner share must be exposed explicitly (#948)";
+    ASSERT_TRUE(r.contains("block_value_fee"))
+        << "pool-fee deduction must be a visible field so the parts reconcile (#948)";
+    ASSERT_TRUE(r.contains("block_value_miner_net"));
+
+    const double bv    = r["block_value"].get<double>();
+    const double gross = r["block_value_miner_gross"].get<double>();
+    const double fee   = r["block_value_fee"].get<double>();
+    const double net   = r["block_value_miner_net"].get<double>();
+    const double pay   = r["block_value_payments"].get<double>();
+    const double legacy= r["block_value_miner"].get<double>();
+
+    // Values match the live re-derivation.
+    EXPECT_NEAR(bv,    1.77033183, 1e-8);
+    EXPECT_NEAR(gross, 0.44258296, 1e-8);
+    EXPECT_NEAR(fee,   0.00442583, 1e-7);
+    EXPECT_NEAR(net,   0.43815713, 1e-7);
+
+    // The reconciliation identity the issue demands: gross + payments == block_value.
+    EXPECT_NEAR(gross + pay, bv, 1e-8)
+        << "block_value_miner_gross + block_value_payments must equal block_value";
+    // Gross decomposes into the net share plus the fee.
+    EXPECT_NEAR(gross, net + fee, 1e-9)
+        << "gross must equal net + fee so the fee is a derivable deduction";
+    // The legacy field is unchanged and is the NET value (not gross).
+    EXPECT_DOUBLE_EQ(legacy, net)
+        << "legacy block_value_miner must keep its exact NET value (no consumer break)";
+    EXPECT_GT(gross, legacy)
+        << "with a non-zero fee the gross share must exceed the net legacy field, "
+           "which is the whole point of the #948 mislabel";
+}
+
+// A zero-fee node cannot distinguish gross from net, but the fields must still
+// be present and the identity must still hold (fee == 0, gross == net).
+TEST(WebBlockValueReconcile, ZeroFeeStillPresentAndConsistent) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+    mi.set_pool_fee_percent(0.0);
+    feed_coin_work(mi, 1.77033183, 1.32774887);
+    json r = mi.rest_local_stats();
+
+    ASSERT_TRUE(r.contains("block_value_fee"));
+    EXPECT_NEAR(r["block_value_fee"].get<double>(), 0.0, 1e-12);
+    EXPECT_DOUBLE_EQ(r["block_value_miner_gross"].get<double>(),
+                     r["block_value_miner_net"].get<double>());
+    EXPECT_NEAR(r["block_value_miner_gross"].get<double>() +
+                r["block_value_payments"].get<double>(),
+                r["block_value"].get<double>(), 1e-8);
+}
+
+// ===========================================================================
+// Standalone-coin merged-UI purge (follow-up to #896/#912): a coin with no
+// merged child (DASH/BTC/DGB) must not render ANY merged-mining card, column,
+// or SPV row anywhere in the web-static layer -- not just the Username line.
+// These KATs pin the topology gates added to dashboard.html (Merged Payout
+// column), miners.html / miner.html (Merged Mining Blocks sections), and
+// loading.html (SPV rows). Same charter: never imply revenue or a chain
+// topology that does not exist.
+// ===========================================================================
+#ifndef WEB_STATIC_DIR
+#error "WEB_STATIC_DIR must be defined by CMake"
+#endif
+
+namespace {
+std::string read_web_static(const std::string& name) {
+    std::ifstream f(std::string(WEB_STATIC_DIR) + "/" + name);
+    EXPECT_TRUE(f.good()) << "cannot open " << WEB_STATIC_DIR << "/" << name;
+    std::stringstream ss; ss << f.rdbuf();
+    return ss.str();
+}
+} // namespace
+
+// dashboard.html: the Active-Miners "Merged Payout" column (header AND the
+// dynamically appended cells) must carry the merged-child-hint gate. The cells
+// are appended on every table re-render, AFTER the one-shot d3 toggle ran, so
+// the gate must also exist as a CSS rule keyed off a body class the topology
+// handler stamps -- otherwise re-rendered rows resurrect the DOGE column.
+TEST(DashboardMergedGating, MinersTableMergedPayoutColumnIsGated) {
+    const auto html = read_dashboard();
+    for (const auto& line : lines_of(html)) {
+        if (line.find(">Merged Payout</th>") != std::string::npos) {
+            EXPECT_NE(line.find("merged-child-hint"), std::string::npos)
+                << "the Merged Payout column header is not topology-gated; a "
+                   "standalone coin renders a phantom DOGE payout column:\n"
+                << line;
+        }
+    }
+    // Body-class CSS gate covers dynamically appended cells.
+    EXPECT_NE(html.find("body.no-merged-child .merged-child-hint"),
+              std::string::npos)
+        << "missing the body-class CSS gate; merged cells appended after the "
+           "currency_info toggle ran (miner-table re-renders) stay visible on "
+           "a standalone coin.";
+    EXPECT_NE(html.find("classList.toggle('no-merged-child', !mergedChild)"),
+              std::string::npos)
+        << "the topology handler does not stamp the no-merged-child body "
+           "class; the CSS gate never engages.";
+    // The dynamically appended merged-payout cell must carry the gate class.
+    EXPECT_NE(html.find("minerRow.append('td').attr('class', 'merged-child-hint')"),
+              std::string::npos)
+        << "the per-miner merged-payout cell is appended without the gate "
+           "class; every miner row shows '0.0000 DOGE' on a standalone coin.";
+}
+
+// miners.html: the "Merged Mining Blocks" section must be hidden by default
+// and revealed only when currency_info advertises a merged child. Both failure
+// directions: standalone stays hidden, merged parent still shows it.
+TEST(WebStaticMergedGating, MinersPageMergedBlocksSectionIsTopologyGated) {
+    const auto html = read_web_static("miners.html");
+    for (const auto& line : lines_of(html)) {
+        if (line.find("id=\"merged_blocks_header\"") != std::string::npos) {
+            EXPECT_NE(line.find("display: none"), std::string::npos)
+                << "merged_blocks_header renders by default; a standalone coin "
+                   "shows a Merged Mining Blocks card:\n" << line;
+        }
+        if (line.find("id=\"merged_blocks_panel\"") != std::string::npos) {
+            EXPECT_NE(line.find("display: none"), std::string::npos)
+                << "merged_blocks_panel renders by default on a standalone "
+                   "coin:\n" << line;
+        }
+    }
+    EXPECT_NE(html.find("info.merged_child_symbol"), std::string::npos)
+        << "no topology reveal path: a merged parent (LTC) would lose its "
+           "Merged Mining Blocks section.";
+}
+
+// miner.html: same contract for the per-miner page (header + summary stat
+// cards + blocks table), which previously rendered zeroed merged cards
+// unconditionally.
+TEST(WebStaticMergedGating, MinerPageMergedBlocksSectionIsTopologyGated) {
+    const auto html = read_web_static("miner.html");
+    const std::vector<std::string> gated_ids = {
+        "merged_blocks_header", "merged_summary_grid", "merged_blocks_panel"};
+    for (const auto& id : gated_ids) {
+        bool declared = false, hidden = false;
+        for (const auto& line : lines_of(html)) {
+            if (line.find("id=\"" + id + "\"") != std::string::npos) {
+                declared = true;
+                if (line.find("display: none") != std::string::npos) hidden = true;
+            }
+        }
+        EXPECT_TRUE(declared) << "expected element '" << id << "' not found; "
+            "if it moved, re-point this KAT.";
+        EXPECT_TRUE(hidden) << "'" << id << "' renders by default; a "
+            "standalone coin shows zeroed merged-mining cards.";
+    }
+    EXPECT_NE(html.find("info.merged_child_symbol"), std::string::npos)
+        << "no topology reveal path: a merged parent (LTC) would lose its "
+           "merged blocks section on the miner page.";
+}
+
+// loading.html: the startup page must not hardcode LTC/DOGE SPV rows. The
+// parent row's label is currency_info-driven and both rows appear only when
+// the node reports SPV progress; the child row additionally requires a merged
+// child in the topology. A DASH node must show neither an LTC nor a DOGE row.
+TEST(WebStaticMergedGating, LoadingPageSpvRowsAreTopologyDriven) {
+    const auto html = read_web_static("loading.html");
+    EXPECT_EQ(html.find(">LTC SPV</span>"), std::string::npos)
+        << "loading.html hardcodes an LTC SPV row label; a standalone DASH "
+           "node presents itself as an LTC node while starting up.";
+    EXPECT_EQ(html.find(">DOGE SPV</span>"), std::string::npos)
+        << "loading.html hardcodes a DOGE SPV row label; a standalone coin "
+           "advertises a merged chain it does not have.";
+    for (const auto& line : lines_of(html)) {
+        if (line.find("id=\"row-parent-spv\"") != std::string::npos ||
+            line.find("id=\"row-child-spv\"") != std::string::npos) {
+            EXPECT_NE(line.find("display:none"), std::string::npos)
+                << "SPV row renders by default (before the node reports any "
+                   "SPV state):\n" << line;
+        }
+    }
+    EXPECT_NE(html.find("ci.merged_child_symbol"), std::string::npos)
+        << "the child SPV row is not keyed off the merged-child topology.";
+    EXPECT_NE(html.find("ci.symbol"), std::string::npos)
+        << "the parent SPV row label is not currency_info-driven.";
 }

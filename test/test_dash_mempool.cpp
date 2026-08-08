@@ -735,3 +735,201 @@ TEST(DashUtxoLane, MiningMaturityGateAt106)
     EXPECT_TRUE(lane.mining_utxo_ready())
         << "gate must open at exactly " << DASH_MINING_GATE_DEPTH;
 }
+
+// ═══ ConnectBlock reject-surface audit — mempool-TX body-path gap KATs ═══════
+//
+// One KAT (at least) per GAP row of §1 of
+// frstrtr/the docs/DASH_CONNECTBLOCK_REJECT_SURFACE_AUDIT.md. Every behaviour
+// pinned here FAILS against the pre-fix selector (feerate-descending walk with
+// bare parent-in-mempool acceptance, no sigop/maturity/islock accounting):
+//   G1 bad-txns-inputs-missingorspent  → topological (package) selection
+//   G2 bad-blk-sigops                  → 40k cap, 100-sigop coinbase reserve
+//   G3 bad-txns-premature-spend-of-coinbase → maturity vs next_height
+//   G4 conflict-tx-lock                → islock tracking + selection guard
+
+TEST(DashMempoolAuditGaps, G1_CpfpChildNeverPrecedesParent)
+{
+    UTXOViewCache utxo(nullptr);
+    uint256 prev = mint_hash(600);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, {}, 1, false));
+
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    // Parent fee 1'000; the CPFP child spends the parent's output at fee
+    // 49'000 (same 1-in/1-out shape => same size => ~49x the feerate). The
+    // pre-fix selector emitted the child FIRST — dashd validates inputs in
+    // tx order, so that block is bad-txns-inputs-missingorspent.
+    auto parent = make_spend(prev, 0, 99'000, /*salt=*/601);
+    auto child  = make_spend(dash_txid(parent), 0, 50'000, /*salt=*/602);
+    ASSERT_TRUE(mp.add_tx(parent));
+    ASSERT_TRUE(mp.add_tx(child));
+
+    auto [sel, fees] = mp.get_sorted_txs_with_fees(1u << 20);
+    ASSERT_EQ(sel.size(), 2u);
+    EXPECT_EQ(dash_txid(sel[0].tx), dash_txid(parent))
+        << "G1: the parent MUST precede its CPFP child in the selection";
+    EXPECT_EQ(dash_txid(sel[1].tx), dash_txid(child));
+    EXPECT_EQ(fees, 50'000u);
+}
+
+TEST(DashMempoolAuditGaps, G1_ByteCapDropsChildWhenParentDoesNotFit)
+{
+    UTXOViewCache utxo(nullptr);
+    uint256 prev = mint_hash(605);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, {}, 1, false));
+
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    auto parent = make_spend(prev, 0, 99'000, /*salt=*/606);            // fee  1'000
+    auto child  = make_spend(dash_txid(parent), 0, 50'000, /*salt=*/607); // fee 49'000
+    ASSERT_TRUE(mp.add_tx(parent));
+    ASSERT_TRUE(mp.add_tx(child));
+
+    // Byte cap fits exactly ONE tx (both have the same shape/size). The
+    // pre-fix selector packed the higher-feerate CHILD alone — parentless,
+    // consensus-invalid. The fix drops the child with its unfitting parent
+    // and falls through to the parent as the only valid single-tx fill.
+    auto one_tx = mp.get_entry(dash_txid(child))->base_size;
+    auto [sel, fees] = mp.get_sorted_txs_with_fees(one_tx + 1);
+    ASSERT_EQ(sel.size(), 1u);
+    EXPECT_EQ(dash_txid(sel[0].tx), dash_txid(parent))
+        << "G1: a child whose parent does not fit the byte cap must be "
+           "dropped with it";
+    EXPECT_EQ(fees, 1'000u);
+}
+
+TEST(DashMempoolAuditGaps, G1_FeeUnknownParentExcludesPricedChild)
+{
+    UTXOViewCache utxo(nullptr);   // parent's prevout deliberately NOT in UTXO
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    auto parent = make_spend(mint_hash(610), 0, 80'000, /*salt=*/611);
+    ASSERT_TRUE(mp.add_tx(parent));
+    ASSERT_FALSE(mp.get_entry(dash_txid(parent))->fee_known);
+    // The child prices off the parent's in-mempool output — the CPFP fee
+    // path the audit cites (mempool.hpp compute_fee parent branch), so
+    // fee-KNOWN children of fee-UNKNOWN parents are selectable candidates.
+    auto child = make_spend(dash_txid(parent), 0, 40'000, /*salt=*/612);
+    ASSERT_TRUE(mp.add_tx(child));
+    ASSERT_TRUE(mp.get_entry(dash_txid(child))->fee_known);
+
+    auto [sel, fees] = mp.get_sorted_txs_with_fees(1u << 20);
+    EXPECT_TRUE(sel.empty())
+        << "G1: a priced child of an unpriced (unselectable) parent must "
+           "not enter the block without it";
+    EXPECT_EQ(fees, 0u);
+}
+
+TEST(DashMempoolAuditGaps, G2_SigopCapStopsSelectionBeforeBadBlkSigops)
+{
+    UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    // Three standard-shaped txs, each carrying 20'000 legacy sigops in one
+    // output (1'000 bare OP_CHECKMULTISIG bytes × 20 sigops each — the
+    // audit's bare-multisig-stuffed shape), all well inside the byte cap.
+    for (int i = 0; i < 3; ++i) {
+        uint256 prev = mint_hash(620 + i);
+        utxo.add_coin(Outpoint(prev, 0), Coin(100'000, {}, 1, false));
+        auto tx = make_spend(prev, 0, 90'000, /*salt=*/625 + i);
+        tx.vout[0].scriptPubKey.m_data.assign(1'000, 0xae); // OP_CHECKMULTISIG
+        ASSERT_TRUE(mp.add_tx(tx));
+    }
+    auto [sel, fees] = mp.get_sorted_txs_with_fees(1u << 20);
+    EXPECT_EQ(sel.size(), 1u)
+        << "G2: 100 (coinbase reserve) + 2×20'000 sigops crosses the 40k "
+           "bad-blk-sigops cap — selection must stop at one such tx";
+}
+
+TEST(DashMempoolAuditGaps, G2_SigopCountingMatchesDashdRules)
+{
+    using dash::coin::count_script_sigops;
+    using dash::coin::count_p2sh_sigops;
+    using dash::coin::is_p2sh_script;
+    // OP_CHECKSIG counts 1 in either mode.
+    EXPECT_EQ(count_script_sigops({0xac}, false), 1u);
+    EXPECT_EQ(count_script_sigops({0xac}, true), 1u);
+    // OP_2 OP_CHECKMULTISIG: 20 legacy (MAX_PUBKEYS_PER_MULTISIG), 2 accurate.
+    EXPECT_EQ(count_script_sigops({0x52, 0xae}, false), 20u);
+    EXPECT_EQ(count_script_sigops({0x52, 0xae}, true), 2u);
+    // Push data is skipped, not misread as opcodes (0xac INSIDE a push).
+    EXPECT_EQ(count_script_sigops({0x02, 0xac, 0xac}, false), 0u);
+    // Truncated push stops the scan (CScript::GetOp failure semantics).
+    EXPECT_EQ(count_script_sigops({0x4c}, false), 0u);
+    // P2SH: redeemScript = OP_3 OP_CHECKMULTISIG pushed as the scriptSig's
+    // last datum; counted fAccurate ⇒ 3.
+    std::vector<unsigned char> spk{0xa9, 0x14};
+    spk.resize(22, 0x11);
+    spk.push_back(0x87);
+    ASSERT_TRUE(is_p2sh_script(spk));
+    EXPECT_EQ(count_p2sh_sigops({0x02, 0x53, 0xae}), 3u);
+    // A non-push scriptSig contributes 0 P2SH sigops (dashd returns 0 there).
+    EXPECT_EQ(count_p2sh_sigops({0xac}), 0u);
+}
+
+TEST(DashMempoolAuditGaps, G3_ImmatureCoinbaseSpendRefused)
+{
+    UTXOViewCache utxo(nullptr);
+    uint256 cb = mint_hash(640);
+    // A coinbase-flagged coin minted at height 950 (the metadata the pre-fix
+    // stale-input guard fetched and never read).
+    utxo.add_coin(Outpoint(cb, 0),
+                  Coin(100'000, {}, /*height=*/950, /*coinbase=*/true));
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    auto spend = make_spend(cb, 0, 90'000, /*salt=*/641);
+    ASSERT_TRUE(mp.add_tx(spend));   // pricing is not the gate; selection is
+
+    // 99 confirmations at next_height 1049: premature-spend-of-coinbase.
+    EXPECT_TRUE(mp.get_sorted_txs_with_fees(1u << 20, false, 1049).first.empty())
+        << "G3: coinbase spend at 99 confs must be refused";
+    // 100 confirmations at 1050: mature (dashd COINBASE_MATURITY boundary).
+    auto [sel, fees] = mp.get_sorted_txs_with_fees(1u << 20, false, 1050);
+    ASSERT_EQ(sel.size(), 1u);
+    EXPECT_EQ(fees, 10'000u);
+    // Legacy callers (next_height omitted) keep the prior no-check shape.
+    EXPECT_EQ(mp.get_sorted_txs_with_fees(1u << 20).first.size(), 1u);
+}
+
+TEST(DashMempoolAuditGaps, G4_IslockConflictEvictedAndNeverSelected)
+{
+    UTXOViewCache utxo(nullptr);
+    uint256 prev = mint_hash(650);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, {}, 1, false));
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    auto loser = make_spend(prev, 0, 90'000, /*salt=*/651);
+    ASSERT_TRUE(mp.add_tx(loser));
+    ASSERT_EQ(mp.get_sorted_txs_with_fees(1u << 20).first.size(), 1u);
+
+    // An islock forms for the OTHER spend of the same outpoint.
+    uint256 winner_txid = mint_hash(652);
+    mp.add_islock(winner_txid, {{prev, 0}});
+    // Defence 1: the conflicting pool entry is evicted immediately.
+    EXPECT_FALSE(mp.contains(dash_txid(loser)));
+    // Defence 2: even re-admitted (relay race), it must never be selected —
+    // packing it is conflict-tx-lock (validation.cpp:2622).
+    ASSERT_TRUE(mp.add_tx(loser));
+    EXPECT_TRUE(mp.get_sorted_txs_with_fees(1u << 20).first.empty())
+        << "G4: a tx spending an outpoint islocked to a different txid "
+           "must not enter a template";
+
+    // The islock HOLDER itself is not a conflict.
+    uint256 prev2 = mint_hash(655);
+    utxo.add_coin(Outpoint(prev2, 0), Coin(100'000, {}, 1, false));
+    auto holder = make_spend(prev2, 0, 90'000, /*salt=*/656);
+    ASSERT_TRUE(mp.add_tx(holder));
+    mp.add_islock(dash_txid(holder), {{prev2, 0}});
+    EXPECT_TRUE(mp.contains(dash_txid(holder)));
+    auto [sel2, fees2] = mp.get_sorted_txs_with_fees(1u << 20);
+    ASSERT_EQ(sel2.size(), 1u);
+    EXPECT_EQ(dash_txid(sel2[0].tx), dash_txid(holder));
+
+    // Block-confirm resolves a lock: the tracking entry is pruned.
+    ASSERT_EQ(mp.islock_outpoint_count(), 2u);
+    auto winner = make_spend(prev, 0, 95'000, /*salt=*/657);
+    mp.remove_for_block(make_block({make_coinbase({10'000}, 658), winner}, 658));
+    EXPECT_EQ(mp.islock_outpoint_count(), 1u)
+        << "an outpoint spent by a confirmed tx is resolved; its islock "
+           "tracking entry must be pruned";
+}

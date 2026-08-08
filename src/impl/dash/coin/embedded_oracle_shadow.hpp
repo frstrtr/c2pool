@@ -220,6 +220,33 @@ inline uint64_t platform_burn_amount(const std::vector<PackedPayment>& pps) {
     for (const auto& p : pps) if (p.payee == "!6a") return p.amount;
     return 0;
 }
+/// Incident h=2516595 (bad-cb-payee): FEE-INVARIANT digest of the MN payout
+/// SET — owner payee, operator payee, and the operator-reward bps derived
+/// from this side's own amounts (bps = ceil(op*10000/(own+op)), emitted only
+/// when dashd's truncating recomputation floor((own+op)*bps/10000) == op
+/// reproduces the amount exactly; a non-split second output practically
+/// never passes that round-trip). Raw amounts differ across sides whenever
+/// the selected tx sets differ (that is why payee_amounts is Informational),
+/// but the SPLIT — payees and ratio — must be identical, so this field is
+/// counted Equality without fee flap. The owner-address-only compare this
+/// widens is exactly what let h=2516595's missing operator output through.
+inline std::string mn_payout_split_shape_str(const std::vector<PackedPayment>& pps) {
+    std::vector<const PackedPayment*> nb;
+    for (const auto& p : pps) if (p.payee != "!6a") nb.push_back(&p);
+    std::string s = "n=" + std::to_string(nb.size());
+    if (nb.empty()) return s + ";owner=-";
+    s += ";owner=" + nb[0]->payee + ";operator=";
+    if (nb.size() < 2) return s + "-;bps=-";
+    const int64_t own   = static_cast<int64_t>(nb[0]->amount);
+    const int64_t op    = static_cast<int64_t>(nb[1]->amount);
+    const int64_t total = own + op;
+    if (total > 0 && op > 0) {
+        const int64_t bps = (op * 10000 + total - 1) / total;   // ceil
+        if (bps >= 1 && bps <= 10000 && (total * bps) / 10000 == op)
+            return s + nb[1]->payee + ";bps=" + std::to_string(bps);
+    }
+    return s + "-;bps=-";   // 2nd output is not an operator split
+}
 inline uint64_t sum_fees(const std::vector<uint64_t>& fees) {
     uint64_t s = 0; for (auto f : fees) s += f; return s;
 }
@@ -267,6 +294,12 @@ inline std::vector<FieldResult> compare_templates(
     eq("mintime",  Regime::Equality, true, std::to_string(emb.m_mintime),std::to_string(dashd.m_mintime));
     eq("payee_identities", Regime::Equality, true,
        payee_identity_str(emb.m_packed_payments), payee_identity_str(dashd.m_packed_payments));
+    // Incident h=2516595: the FULL MN payout SET (owner + operator + ratio),
+    // not the owner address alone. Fee-invariant by construction, so it may
+    // count as Equality even when the two sides selected different tx sets.
+    eq("mn_payout_split_shape", Regime::Equality, true,
+       mn_payout_split_shape_str(emb.m_packed_payments),
+       mn_payout_split_shape_str(dashd.m_packed_payments));
     eq("platform_burn_amount", Regime::Equality, true,
        std::to_string(e.platform_reward), std::to_string(d.platform_reward));
     // Normalized subsidy core = coinbasevalue − own fees (fees stripped) — this
@@ -604,16 +637,76 @@ public:
     EmbeddedOracleShadow(const EmbeddedOracleShadow&) = delete;
     EmbeddedOracleShadow& operator=(const EmbeddedOracleShadow&) = delete;
 
+    /// One queued tip sample. It is a VALUE — everything the worker needs is
+    /// COPIED into it on the tip thread. It deliberately carries no pointer,
+    /// reference or handle into NodeCoinState; see on_new_tip().
+    struct TipJob {
+        uint32_t     next_height{0};
+        uint256      next_prev_hash;
+        /// Which arm the embedded selector chose FOR THIS TIP, resolved on the
+        /// tip thread (see on_new_tip). false => fall-closed to dashd.
+        bool         is_embedded{false};
+        /// The embedded template, DEEP-COPIED out of the selector. Meaningful
+        /// only when is_embedded; DashWorkData is all-by-value (rpc_data.hpp),
+        /// so once it is here it owns every byte the worker reads.
+        DashWorkData emb;
+        /// Log-only decline diagnostic, sampled beside is_embedded. Empty when
+        /// is_embedded.
+        std::string  decline_reason;
+    };
+
     /// Tip-thread entry: ENQUEUE ONLY (never blocks the caller). The worker
     /// thread runs the compare so a hung dashd cannot perturb tip processing.
     /// Coalescing: if a tip is already pending unprocessed, it is replaced by
     /// the newest (a shadow samples tips; a skipped intermediate is a coverage
     /// gap, never a wrong count — and on the ~2.6 min interval the worker keeps
     /// up with room to spare).
+    ///
+    /// OWNERSHIP (heap-corruption fix, hotel SIGABRT 2026-08-05 21:52:38 MSK):
+    /// the embedded arm is resolved HERE, on the tip/io thread that exclusively
+    /// owns NodeCoinState, and the worker is handed a DEEP COPY. It used to be
+    /// resolved on the WORKER thread (process_tip called coin_state_.
+    /// select_work()), which dereferenced `&m_mnstates` / `&m_sml` — raw
+    /// pointers select_work() hands into live containers (node_coin_state.hpp
+    /// :1066/:1087) — while the io thread was concurrently rebalancing the
+    /// MnStateMachine RB-tree (coin_state_maintainer.hpp:1092), reallocating
+    /// the CSimplifiedMNList vector (:489) and clear()ing it (:482/:716).
+    /// NodeCoinState has ZERO mutexes, and MNState owns two heap vectors
+    /// (mn_state_db.hpp:60), so the overlap corrupted ALLOCATOR METADATA rather
+    /// than merely reading stale values — glibc "malloc(): unaligned tcache
+    /// chunk detected" / "double free or corruption (!prev)".
+    ///
+    /// This is the same shape EmbeddedShadowCompare::on_serve already uses
+    /// (embedded_shadow_compare.hpp:381-387): the io thread resolves, the queue
+    /// carries a value, the worker owns what it reads. It is a lifetime/
+    /// ownership change ONLY — no serve gate, no arm decision, no consensus
+    /// path is touched, and the shadow remains OBSERVE-only.
     void on_new_tip(uint32_t next_height, const uint256& next_prev_hash) {
+        TipJob job;
+        job.next_height    = next_height;
+        job.next_prev_hash = next_prev_hash;
+        // The fallback arm is a NO-OP HERE, deliberately. select_work()'s
+        // fallback is a dashd getblocktemplate RPC (NodeRPC::m_rpc_mutex,
+        // rpc.cpp:211, 12 s socket deadline) and this runs on the io thread,
+        // which must never block on an RPC. The shadow never read the fallback
+        // template anyway — process_tip() consumes sel.work ONLY on the
+        // is_embedded branch — so an empty DashWorkData is byte-equivalent for
+        // every consumer, and one wasted per-tip RPC disappears with it.
+        WorkSelection sel = coin_state_.select_work(
+            []() { return DashWorkData{}; });
+        job.is_embedded = (sel.source == WorkSource::Embedded);
+        if (job.is_embedded) {
+            job.emb = std::move(sel.work);
+        } else {
+            // decline-reason DIAGNOSTIC (log-only): captured on the SAME
+            // sample as is_embedded so it matches the selection decision
+            // exactly — and now on the same thread and in the same instant,
+            // instead of across a worker-side RPC round trip.
+            job.decline_reason = coin_state_.classify_decline();
+        }
         {
             std::lock_guard<std::mutex> lk(q_mu_);
-            pending_ = std::make_pair(next_height, next_prev_hash);
+            pending_ = std::move(job);
         }
         q_cv_.notify_one();
     }
@@ -621,19 +714,22 @@ public:
     /// The actual per-block shadow-compare (worker thread). OBSERVE-ONLY. All
     /// heavy RPCs run here BEFORE mu_ is taken, so /embedded_oracle (stats_json)
     /// never blocks on a dashd RPC.
-    void process_tip(uint32_t next_height, const uint256& next_prev_hash) {
+    ///
+    /// THREAD CONTRACT: this function must NEVER touch coin_state_. Everything
+    /// it needs about the embedded arm arrives in `job`, already copied by
+    /// on_new_tip() on the owning thread. The structural guard in
+    /// test/test_dash_oracle_shadow_ownership.cpp pins that.
+    void process_tip(const TipJob& job) {
+        const uint32_t  next_height    = job.next_height;
+        const uint256&  next_prev_hash = job.next_prev_hash;
         if (!dashd_gbt_) { LOG_WARNING << "[EMB-ORACLE] no dashd oracle bound"; return; }
 
         // ── Phase 1: ALL heavy RPCs, NO lock ────────────────────────────────
         // Runs on the worker thread; taking mu_ here would make /embedded_oracle
         // (stats_json) block on a dashd RPC. So gather everything unlocked, then
         // take mu_ only for the fast analysis + ledger phase.
-        WorkSelection sel = coin_state_.select_work(dashd_gbt_);
-        const bool is_embedded = (sel.source == WorkSource::Embedded);
-        // decline-reason DIAGNOSTIC (log-only): captured on the SAME
-        // sample as is_embedded so it matches the selection decision exactly.
-        const std::string decline_reason =
-            is_embedded ? std::string() : coin_state_.classify_decline();
+        const bool is_embedded = job.is_embedded;
+        const std::string& decline_reason = job.decline_reason;
         DashWorkData emb, dashd;
         bool dashd_rpc_ok = false, aligned = false;
         std::optional<int64_t> base_cp;   // creditPool(N-1) from the CONNECTED block
@@ -641,7 +737,7 @@ public:
         ProposalResult pr;
 
         if (is_embedded) {
-            emb = std::move(sel.work);
+            emb = job.emb;   // deep copy already owned by this job
             try { dashd = dashd_gbt_(); dashd_rpc_ok = true; }
             catch (const std::exception& ex) {
                 LOG_WARNING << "[EMB-ORACLE] dashd oracle threw: " << ex.what() << " — void";
@@ -807,15 +903,17 @@ private:
     // RPCs + file writes) never runs on the tip-dispatch thread.
     void worker_loop() {
         for (;;) {
-            std::pair<uint32_t, uint256> job;
+            TipJob job;
             {
                 std::unique_lock<std::mutex> lk(q_mu_);
                 q_cv_.wait(lk, [this] { return stop_ || pending_.has_value(); });
                 if (stop_ && !pending_.has_value()) return;
-                job = *pending_;
+                job = std::move(*pending_);
                 pending_.reset();
             }
-            try { process_tip(job.first, job.second); }
+            // `job` is a self-contained VALUE: from here on the worker reads
+            // nothing that the io thread can concurrently mutate.
+            try { process_tip(job); }
             catch (const std::exception& e) {
                 LOG_WARNING << "[EMB-ORACLE] worker exception: " << e.what();
             }
@@ -911,6 +1009,11 @@ private:
         }
     }
 
+    // TIP-THREAD ONLY. NodeCoinState carries no mutex and hands raw pointers
+    // into its live containers out of select_work(); it may be read ONLY from
+    // the thread that mutates it (the io/tip thread). The single legal use of
+    // this reference is inside on_new_tip(). The worker thread must never
+    // reach it — that was the 2026-08-05 hotel heap corruption.
     const NodeCoinState&          coin_state_;
     std::function<DashWorkData()> dashd_gbt_;
     ProposalFn                    proposal_fn_;
@@ -925,7 +1028,7 @@ private:
     std::thread             worker_;
     std::mutex              q_mu_;
     std::condition_variable q_cv_;
-    std::optional<std::pair<uint32_t, uint256>> pending_;
+    std::optional<TipJob>   pending_;
     bool                    stop_{false};
 
     // Trackers below are WORKER-THREAD-EXCLUSIVE (process_tip only) — no lock.

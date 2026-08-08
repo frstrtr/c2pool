@@ -63,6 +63,24 @@ public:
         /// The cause the previous emitted decline named ("" if none). Lets the
         /// Resumed / CauseChange lines say what they replaced.
         std::string previous_cause;
+        /// Seconds the arm has been continuously OFF the embedded template, as
+        /// of this decision. -1 when not applicable (the arm was already
+        /// serving) or not yet measurable.
+        ///
+        /// WHY THIS FIELD EXISTS — the COUNT of decline lines is the wrong
+        /// metric and it actively misleads. Measured on the hotel node over
+        /// 5h33m (2026-08-06): 109 `dmn-stale` episodes vs 3
+        /// `qc-plan-underivable`, so BY COUNT dmn-stale looks like 97% of the
+        /// problem. BY TIME ACTUALLY SPENT ON THE FALLBACK ARM, 104 of those
+        /// 109 dmn-stale episodes lasted under one second (~54 ms each — the
+        /// ordinary tip-change -> getmnlistd round trip, 5.6 s in total) while
+        /// the 3 qc-plan episodes cost 351 s. Eight episodes out of 116 carried
+        /// 99.4% of the loss, and the prioritisation flips completely depending
+        /// on which number you read.
+        ///
+        /// A journal that emits only counts cannot express that, so the episode
+        /// duration rides the line that closes the episode.
+        int64_t episode_sec{-1};
 
         bool emit() const { return trigger != Trigger::None; }
     };
@@ -83,6 +101,12 @@ public:
             if (was_declining) {
                 d.trigger    = Trigger::Resumed;
                 d.suppressed = m_suppressed;
+                // How long this episode actually cost us. Measured from the
+                // FIRST decline of the episode, not from the last emitted line,
+                // so a cause-change mid-episode cannot shorten the number.
+                d.episode_sec = (m_episode_start_sec >= 0)
+                                    ? now_sec - m_episode_start_sec : -1;
+                m_episode_start_sec = -1;
                 m_suppressed = 0;
                 m_last_emit_sec = now_sec;
                 m_have_emitted  = true;
@@ -92,6 +116,9 @@ public:
 
         const Arm prev_arm = m_arm;
         m_arm = Arm::Declining;
+        // Episode clock starts at the first decline after serving (or at the
+        // very first observation) and survives cause changes.
+        if (m_episode_start_sec < 0) m_episode_start_sec = now_sec;
 
         if (prev_arm == Arm::Embedded)
             d.trigger = Trigger::Transition;
@@ -109,6 +136,12 @@ public:
             return d;
         }
         d.suppressed    = m_suppressed;
+        // Also carried on the DECLINE lines: a heartbeat that says how long the
+        // arm has already been down is the difference between "the usual
+        // sub-second round trip" and "we have been off the embedded arm for
+        // four minutes", which read identically before.
+        d.episode_sec   = (m_episode_start_sec >= 0)
+                              ? now_sec - m_episode_start_sec : -1;
         m_suppressed    = 0;
         m_last_emit_sec = now_sec;
         m_have_emitted  = true;
@@ -143,6 +176,8 @@ private:
     Arm         m_arm{Arm::Unknown};
     std::string m_last_cause;
     int64_t     m_last_emit_sec{0};
+    /// Start of the CURRENT continuous off-embedded episode; -1 = arm serving.
+    int64_t     m_episode_start_sec{-1};
     bool        m_have_emitted{false};
     uint64_t    m_suppressed{0};
 };

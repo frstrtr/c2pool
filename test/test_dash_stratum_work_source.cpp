@@ -1089,6 +1089,45 @@ TEST(DashStratumWorkSource, InvalidateTemplateCacheForcesRefetchAndBumpsGenerati
     EXPECT_EQ(fallback_calls, 2);
 }
 
+// soak0804e resume-quantization pin: a FAILED sourcing attempt (set-gap /
+// declined gate) is negative-cached for kRetryAfter (5 s) so a down dashd is
+// not hammered by every session's 1 s notify-retry — but a work-generation
+// bump is an EVENT (tip change / coin-state advance, e.g. the credit-pool
+// seed catching up to the tip body) that changes the answer, so it must break
+// THROUGH the negative cache. Before this fix the event-driven resume was
+// quantized to the retry window: the maintainer had already advanced the
+// credit pool and fired state-dirty (bump + notify), the gate was viable, yet
+// cached_work() refused to re-source for up to 5 more seconds — exactly the
+// [5,5,5,5,5] s creditpool-stale episode floor the soak measured.
+TEST(DashStratumWorkSource, GenerationBumpBreaksThroughNegativeTemplateCache)
+{
+    dash::coin::NodeCoinState cs;   // unpopulated -> fallback arm
+    int fallback_calls = 0;
+    auto ws = std::make_unique<dash::stratum::DASHWorkSource>(
+        cs,
+        [&fallback_calls]() {
+            ++fallback_calls;
+            return dash::coin::DashWorkData{};   // set-gap: every attempt FAILS
+        });
+
+    // First pull: sources once, fails, arms the negative cache.
+    EXPECT_TRUE(ws->get_current_work_template().empty());
+    EXPECT_EQ(fallback_calls, 1);
+
+    // Second pull inside kRetryAfter with NO event: the throttle must hold
+    // (the down-dashd protection is unchanged).
+    EXPECT_TRUE(ws->get_current_work_template().empty());
+    EXPECT_EQ(fallback_calls, 1) << "no event => the retry throttle must hold";
+
+    // An event fires (the state-dirty sink's bump_work_generation): the next
+    // pull must re-source IMMEDIATELY instead of waiting out kRetryAfter.
+    ws->bump_work_generation();
+    EXPECT_TRUE(ws->get_current_work_template().empty());
+    EXPECT_EQ(fallback_calls, 2)
+        << "a work-generation bump must break through the negative template "
+           "cache (event-driven resume, not the 5 s retry quantum)";
+}
+
 // Fallback-arm event-driven tip refresh pin: on the dashd-fallback arm the
 // template cache only re-sources on the 30 s staleness TTL, so a new DASH block
 // can leave miners hashing a stale tip for up to ~30 s (accepted pseudoshares
@@ -1695,6 +1734,7 @@ void seed_resolvable_mn(dash::coin::NodeCoinState& cs)
     mn.collateralOutpoint.hash.SetHex(std::string(64, '9'));
     mn.collateralOutpoint.index = 0;
     mn.scriptPayout.m_data = fixture_miner_script();   // standard P2PKH payout
+    mn.payoutSplitProvenance = dash::coin::MNState::SPLIT_KNOWN;   // fixture: proven zero split (h=2516595 gate)
     uint256 protx;
     protx.SetHex(std::string(64, 'a'));
     cs.mnstates().load({{protx, mn}}, /*as_of_height=*/kEmbeddedPrevHeight);
@@ -1900,6 +1940,94 @@ TEST(DashStratumC1MainnetGate, GbtXcheckServesDashdOnCreditPoolMismatch)
     ASSERT_TRUE(dash::coin::vendor::parse_cbtx(t->m_coinbase_payload, served));
     EXPECT_EQ(served.creditPoolBalance, dashd_credit)
         << "on a creditPool mismatch the backstop must serve dashd's template";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tip-transition fallback leak: on every new block the serve path re-sources
+// during the body-pending window and (correctly) gets the dashd fallback; the
+// serve-tip promotion then lands ~0.1-0.4 s later — routinely WHILE that
+// blocking fallback GBT source is still in flight. The promotion fires the
+// state-dirty sink (bump_work_generation + notify_all), but master stamped the
+// stored snapshot with a work_generation_.load() taken AT STORE TIME, which
+// swallows the racing bump: the fallback template reads as current for the
+// full kStaleAfter (30 s) window and several fallback serves leak per block
+// after the embedded arm is already viable.
+//
+// THE MEASUREMENT (fails on master): after the promotion's bump, the very
+// next template request must re-evaluate the arm gates and serve EMBEDDED —
+// not the stale cached fallback decision. Gate semantics are untouched; only
+// the re-evaluation latency is.
+TEST(DashStratumC1MainnetGate, PromotionBumpDuringInFlightSourceMakesNextTemplateEmbedded)
+{
+    dash::coin::NodeCoinState cs;   // NOT populated yet: the pending window
+    dash::stratum::DASHWorkSource* wsp = nullptr;
+    int fallback_calls = 0;
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        if (++fallback_calls == 1) {
+            // The serve-tip promotion lands while this (in prod: blocking
+            // dashd GBT RPC) source is in flight: the maintainer publishes
+            // the now-viable embedded bundle and fires the state-dirty sink.
+            seed_populated(cs);
+            if (wsp) wsp->bump_work_generation();
+        }
+        return rich_work();
+    };
+    auto submit = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    wsp = &ws;
+
+    // Serve 1: sourced during the pending window -> dashd fallback (the
+    // normal propagation-window serve; the promotion lands mid-flight).
+    auto t1 = ws.get_current_work_template();
+    ASSERT_FALSE(t1.empty());
+    EXPECT_EQ(t1.value("previousblockhash", ""), std::string(kPrevHashHex))
+        << "the in-flight serve itself is the fallback — that part is normal";
+
+    // Serve 2 — the very next template request after the promotion: must be
+    // EMBEDDED. On master the fallback snapshot was stamped with the
+    // post-bump generation, so it reads as fresh and this serves fallback.
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    auto t2 = ws.get_current_work_template();
+    ASSERT_FALSE(t2.empty());
+    EXPECT_EQ(t2.value("previousblockhash", ""), emb_prev.GetHex())
+        << "stale cached arm decision leaked a dashd-fallback serve after "
+           "the serve-tip promotion";
+    EXPECT_EQ(t2.value("height", 0u), kEmbeddedPrevHeight + 1u);
+
+    dash::stratum::WorkJobTargetInputs job_in;
+    job_in.sane_target_min.SetHex(
+        "0000000000000000000000000000000000000000000000000000000000000001");
+    job_in.sane_target_max.SetHex(
+        "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    job_in.share_info_bits_target.SetHex(
+        "0000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    auto gw = ws.get_work(job_in);
+    EXPECT_EQ(gw.source, dash::coin::WorkSource::Embedded);
+}
+
+// Negative twin: an ORDINARY re-source with no racing event must keep today's
+// exact caching behaviour — stored fresh, served from cache, ONE sourcing —
+// so the promotion fix cannot regress into a re-source storm.
+TEST(DashStratumC1MainnetGate, UnracedSourceStaysCachedWithoutReSourceStorm)
+{
+    dash::coin::NodeCoinState cs;   // unpopulated: fallback arm throughout
+    int fallback_calls = 0;
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        ++fallback_calls;
+        return rich_work();
+    };
+    auto submit = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    const int calls_after_first = fallback_calls;
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    EXPECT_EQ(fallback_calls, calls_after_first)
+        << "no event fired between serves: the second must be a cache hit";
 }
 
 TEST(DashDashboardWiring, LocalStatsIdleWarningWhenNoWorkers)
@@ -2210,6 +2338,67 @@ TEST(DashRunArmResolution, NoMainnetCombinationWithoutOptInEverEnablesTheArm)
 
 using dash::coin::ServeGateJournal;
 using Trig = dash::coin::ServeGateJournal::Trigger;
+
+// ── Episode DURATION: the metric that actually ranks the causes ─────────────
+// Measured on the hotel node over 5h33m (2026-08-06): 109 `dmn-stale` episodes
+// vs 3 `qc-plan-underivable`. BY COUNT dmn-stale is 97% of the problem. BY TIME
+// OFF THE EMBEDDED ARM, 104 of those 109 lasted under a second (~54 ms each,
+// 5.6 s in total — the ordinary tip-change -> getmnlistd round trip) while the
+// 3 qc-plan episodes cost 351 s. The two readings rank the work in OPPOSITE
+// orders, and the journal could only ever emit the misleading one.
+TEST(DashServeGateJournal, ResumeReportsHowLongTheArmWasDown) {
+    ServeGateJournal j(300);
+    j.observe(true,  "", 1000);                    // serving
+    j.observe(false, "dmn-stale", 1010);           // episode starts
+    auto d = j.observe(true, "", 1130);            // resumes 120 s later
+    ASSERT_EQ(d.trigger, Trig::Resumed);
+    EXPECT_EQ(d.episode_sec, 120)
+        << "the RESUMED line must carry the cost of the episode in seconds; a "
+           "decline COUNT cannot distinguish a 54 ms tip-change round trip from "
+           "a four-minute outage, and those need opposite responses";
+}
+
+// A cause change mid-episode must NOT restart the clock: the arm never came
+// back, so "how long have we been off?" is answered from the FIRST decline,
+// not from the last relabelling.
+TEST(DashServeGateJournal, CauseChangeDoesNotRestartTheEpisodeClock) {
+    ServeGateJournal j(300);
+    j.observe(true,  "", 1000);
+    j.observe(false, "qc-plan-underivable", 1010); // episode starts here
+    j.observe(false, "dmn-stale", 1100);           // cause changes, still down
+    auto d = j.observe(true, "", 1160);
+    ASSERT_EQ(d.trigger, Trig::Resumed);
+    EXPECT_EQ(d.episode_sec, 150)
+        << "measured from the FIRST decline (1010), not the cause change "
+           "(1100) — otherwise every long episode that changes cause reports "
+           "only its final segment and the true loss is understated";
+}
+
+// The decline lines carry it too, so an episode still in flight is readable
+// without waiting for it to end.
+TEST(DashServeGateJournal, DeclineLinesCarryTheRunningEpisodeAge) {
+    ServeGateJournal j(10);
+    j.observe(true,  "", 1000);
+    auto first = j.observe(false, "dmn-stale", 1005);
+    ASSERT_EQ(first.trigger, Trig::Transition);
+    EXPECT_EQ(first.episode_sec, 0);
+    auto beat = j.observe(false, "dmn-stale", 1065);   // heartbeat
+    ASSERT_EQ(beat.trigger, Trig::Heartbeat);
+    EXPECT_EQ(beat.episode_sec, 60)
+        << "a heartbeat that cannot say how long the arm has already been down "
+           "reads identically at 1 s and at 4 min";
+}
+
+// While the arm is serving there is no episode; the field must stay absent
+// rather than report a stale or zero duration.
+TEST(DashServeGateJournal, ServingArmHasNoEpisodeDuration) {
+    ServeGateJournal j(300);
+    j.observe(false, "dmn-stale", 1000);
+    j.observe(true,  "", 1030);
+    auto d = j.observe(true, "", 1090);   // still serving, nothing emitted
+    EXPECT_FALSE(d.emit());
+    EXPECT_EQ(d.episode_sec, -1);
+}
 
 TEST(DashServeGateJournal, FirstObservationEverIsAlwaysEmitted) {
     ServeGateJournal j(300);

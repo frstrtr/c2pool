@@ -7,7 +7,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # F1 retention + F2/F3 broadcast-gate KATs are actually compiled and run;
     # a fresh target would need a build.yml entry and would otherwise report
     # the silently-passing NOT_BUILT sentinel.
-    add_executable(dgb_share_test share_test.cpp known_txs_retention_test.cpp broadcast_gate_test.cpp)
+    add_executable(dgb_share_test share_test.cpp known_txs_retention_test.cpp broadcast_gate_test.cpp race913_lock_guard_test.cpp share_remove_owns_data_test.cpp)
     target_link_libraries(dgb_share_test PRIVATE
         GTest::gtest_main GTest::gtest
         core dgb
@@ -20,6 +20,16 @@ if (BUILD_TESTING AND GTest_FOUND)
     include(GoogleTest)
     include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
     gtest_add_tests(dgb_share_test "" AUTO)
+
+    # D-DGB.RACE913 lock-scope guard reads the shipped node.cpp source.
+    target_compile_definitions(dgb_share_test PRIVATE
+        DGB_NODE_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../node.cpp")
+
+    # #1131 source-structural KAT: verified.remove(bad) must borrow
+    # (owns_data=false), not own -- folded into this EXISTING allowlisted target
+    # (no new executable). Mirror of the dash/btc/ltc guards landed with #1163.
+    target_compile_definitions(dgb_share_test PRIVATE
+        DGB_SHARE_TRACKER_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../share_tracker.hpp")
 
     # --- #905 tx-relay dead-probe regression (port of btc #880) ------------
     # Pins coin/share_tx_relay_refs.hpp: append_share_tx_refs, the SSOT
@@ -336,6 +346,22 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain
         nlohmann_json::nlohmann_json)
     gtest_add_tests(dgb_embedded_coin_node_test "" AUTO)
+
+    # dgb_live_node_status_test: guards the D-DGB.LIVEADAPTER null-handle seam
+    # (EmbeddedCoinNode::has_live_node()/live_status() + make_live_node_status).
+    # Proves an absent live-node handle renders as a labelled "no live node"
+    # state with null height/synced -- never a fake zero -- and that a throwing
+    # probe is treated as not-live (never a crash). Same proven SCC set as
+    # dgb_embedded_coin_node_test. MUST also be in BOTH build.yml --target
+    # allowlists (#143 NOT_BUILT trap).
+    add_executable(dgb_live_node_status_test live_node_status_test.cpp)
+    target_link_libraries(dgb_live_node_status_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb dgb_stratum
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain
+        nlohmann_json::nlohmann_json)
+    gtest_add_tests(dgb_live_node_status_test "" AUTO)
 
     # dgb_embedded_tx_select_test: guards make_mempool_tx_source
     # (embedded_tx_select.cpp), the production Mempool -> GBT transactions[]

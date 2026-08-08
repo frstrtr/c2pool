@@ -412,6 +412,8 @@ TEST(DashGovVoteBLS, BannedMnVoteCountsAtWeightThresholdUsesValidSet) {
     banned_evo.isValid = false;                             // PoSe-banned
     banned_evo.nType   = dash::coin::vendor::MnType::EVO;
 
+    valid_mn.payoutSplitProvenance = dash::coin::MNState::SPLIT_KNOWN;   // fixture (h=2516595 gate)
+    banned_evo.payoutSplitProvenance = dash::coin::MNState::SPLIT_KNOWN;
     ncs.mnstates().load({{h(0x11), valid_mn}, {h(0x12), banned_evo}});
 
     const std::string valid_key =

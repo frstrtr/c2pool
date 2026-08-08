@@ -121,6 +121,10 @@ struct EmbeddedWorkInputs {
     // (per-chainparams in dashcore). Mainnet default; main_dash sets the
     // testnet value via NodeCoinState::set_mn_rr_height (E4 re-soak fix).
     int                              mn_rr_height{DASH_MN_RR_HEIGHT_MAINNET};
+    // Consensus::Params.nMasternodeMinimumConfirmations for the confirmedHash
+    // rollover projection (sml_projection.hpp): mainnet 15, testnet/devnet/
+    // regtest 1. Threaded from NodeCoinState::set_mn_min_confirmations.
+    int                              mn_min_confirmations{DASH_MN_MIN_CONFIRMATIONS_MAINNET};
 
     // E1 daemonless DKG-window seams (dkg_commitments.hpp QcBlockPlan,
     // populated by NodeCoinState::make_embedded_work_inputs when a qc plan fn
@@ -139,6 +143,28 @@ struct EmbeddedWorkInputs {
     // valid schedule; an under-synced superblock view leaves has_state=false
     // (viable()==false) so the arm fails closed to dashd instead.
     std::vector<SuperblockPayment>   superblock_payments;
+
+    // UTXO-IMMATURE SERVING (see NodeCoinState::set_utxo_immature_policy). True
+    // while the UTXO/fee lane is still below its maturity depth AND the policy
+    // is ServeEmptyTxSet: the arm stays VIABLE (has_state true) and the builder
+    // emits a coinbase-only body instead of the arm refusing outright. Does not
+    // participate in viable() -- it is not a reason to serve or not serve, only
+    // a statement about WHAT is served.
+    bool                             suppress_mempool_txs{false};
+
+    // NAME-THE-STATE for the suppressed body: WHY it is coinbase-only.
+    // "utxo-immature-serving" (the historical producer) or
+    // "mempool-txs-disabled" (--embedded-serve-mempool-txs default-OFF
+    // posture; see NodeCoinState::set_serve_mempool_txs). String literal
+    // lifetime only — never a computed string.
+    const char*                      suppress_cause{"utxo-immature-serving"};
+
+    // PINNED LOCAL TX (donation-dust consolidation lane): non-null when the
+    // operator supplied --pin-local-tx-hex and NodeCoinState holds the parsed
+    // tx. The builder gates admission per template; a null pointer is the
+    // byte-unchanged legacy shape. Points into NodeCoinState (same lifetime
+    // discipline as mnstates/mempool).
+    const std::vector<MutableTransaction>* pinned_local_txs{nullptr};
 
     bool viable() const {
         return has_state && mnstates != nullptr && mempool != nullptr;
@@ -178,7 +204,55 @@ inline WorkSelection select_dash_work(
                       + "," + (emb.mempool ? "mempool=ok" : "mempool=null");
         why.threshold = "mnstates!=null,mempool!=null";
     }
-    return WorkSelection{dashd_fallback(), WorkSource::DashdFallback, std::move(why)};
+    WorkSelection out{dashd_fallback(), WorkSource::DashdFallback, std::move(why)};
+    // PINNED LOCAL TX on the SERVED-dashd arm (option B, donation lane): the
+    // dashd mempool cannot carry the >100KB zero-fee consolidation (policy
+    // standardness), so the pin rides OUR served copy of dashd's template
+    // instead. Same shared gate as the embedded arm (splice_pinned_txs);
+    // coinbase value untouched (fee 0) — stratum merkle branches and the
+    // submitblock body both derive from the appended tx vectors. Fail-closed:
+    // without the verify view (mempool+mnstates, i.e. --embedded-utxo) the
+    // pin is EXCLUDED with a named cause, never included unverified.
+    // A PLACEHOLDER fallback is not a template. The serve path binds this arm
+    // to a no-op closure returning DashWorkData{} (#1134: the real dashd RPC
+    // must not run on the io thread), so splicing here judged a throwaway —
+    // that is what produced `pinned tx EXCLUDED h=0` on the production primary
+    // on 2026-08-07 while the REAL served template went unspliced. The serve
+    // path now gates beside the coin state and appends at the real template
+    // (DASHWorkSource::resolve_coin_state_arm + the re-source site); callers
+    // that pass a genuine fallback still splice here.
+    // The test is deliberately narrow: ONLY a value indistinguishable from a
+    // default-constructed DashWorkData counts as a placeholder. Anything
+    // carrying a height, a previous block, or transactions is a template that
+    // told us something, and we splice into it. Refusing on any single missing
+    // field would silently drop the pin from real templates.
+    const bool fallback_is_placeholder =
+        out.work.m_height == 0 && out.work.m_previous_block.IsNull()
+        && out.work.m_txs.empty();
+    if (emb.pinned_local_txs != nullptr && !emb.pinned_local_txs->empty()
+        && !fallback_is_placeholder) {
+        if (emb.mempool == nullptr || emb.mnstates == nullptr) {
+            LOG_INFO << "[dashd-splice] pinned tx EXCLUDED h="
+                     << out.work.m_height << " cause=no-verify-view ("
+                     << (emb.mempool ? "mempool=ok" : "mempool=null") << ","
+                     << (emb.mnstates ? "mnstates=ok" : "mnstates=null")
+                     << ") — enable --embedded-utxo to verify the pin";
+        } else {
+            // HEIGHT (measured on the primary 2026-08-07): dashd's GBT reply
+            // does not always carry m_height by the time we splice — the live
+            // node logged `pinned tx EXCLUDED h=0`. A zero height makes the
+            // coinbase-maturity arm of the gate nonsense (next_height 0 marks
+            // every coinbase input immature), so take the bundle's own tip
+            // when dashd's copy is unset. emb.prev_height is the header tip we
+            // just evaluated the arm against, so prev_height + 1 is the height
+            // this template builds.
+            if (out.work.m_height == 0 && emb.prev_height != 0)
+                out.work.m_height = emb.prev_height + 1;
+            splice_pinned_txs(out.work, *emb.pinned_local_txs,
+                              *emb.mempool, *emb.mnstates, "dashd-splice");
+        }
+    }
+    return out;
 }
 
 /// Production entry point: builds the embedded template from `emb` when viable,
@@ -212,7 +286,17 @@ inline WorkSelection select_dash_work(
                 emb.mn_rr_height,
                 // E-SUPERBLOCK: funded superblock schedule (empty => normal block).
                 emb.superblock_payments.empty() ? nullptr
-                                                : &emb.superblock_payments);
+                                                : &emb.superblock_payments,
+                // confirmedHash rollover projection threshold (sml_projection.hpp).
+                emb.mn_min_confirmations,
+                // Coinbase-only serving: body suppressed, fees exactly 0;
+                // the cause names WHICH suppressed mode this is
+                // (utxo-immature-serving vs mempool-txs-disabled).
+                emb.suppress_mempool_txs,
+                emb.suppress_cause,
+                // Pinned local tx (donation consolidation): admission gated
+                // inside the builder per template; null => byte-unchanged.
+                emb.pinned_local_txs);
         },
         dashd_fallback);
 }

@@ -10,6 +10,7 @@
 #include "vendor/blockencodings.hpp"
 #include "vendor/smldiff.hpp"
 #include "vendor/llmq_commitment.hpp"
+#include "vendor/quorum_rotation_info.hpp"
 
 #include <impl/bitcoin_family/coin/base_p2p_messages.hpp>
 
@@ -89,10 +90,22 @@ END_MESSAGE()
 // SPV A1 (parity audit): Dash ChainLockSig (clsig) message.
 // Reference: dashcore/src/chainlock/clsig.h — ChainLockSig struct.
 // Wire layout: nHeight(i32 LE) + blockHash(32B LE) + sig(96B BLS blob).
-// Peers push this unsolicited when a ChainLock is freshly aggregated,
-// and also on demand via inv+getdata(MSG_CLSIG=29). Parsing the sig is
-// not required — we treat it as opaque bytes; the fact that we received
-// the message at all is dashd's signal that the block is finalized.
+//
+// ACQUISITION: Dash Core ANNOUNCES a ChainLock by inv and serves the object
+// only on getdata (announce: chainlock/handler.cpp:128 + RelayInv; serve:
+// net_processing.cpp:2992-2998). It does NOT push clsig unsolicited — so the
+// inv→getdata(MSG_CLSIG=29) leg in p2p_client's inv handler is what makes this
+// message reachable at all. dashd serves ONLY its current best ChainLock, so a
+// getdata for a superseded announcement returns notfound; that is benign.
+//
+// ⚠ THE SIGNATURE IS NOT OPAQUE. Receiving this message is NOT by itself
+// evidence that the block is finalized — a clsig arrives from an arbitrary
+// peer and its height/blockHash/sig are committed into the coinbase of every
+// template we then serve (CCbTx bestCLHeightDiff/bestCLSignature). The 96-byte
+// recovered threshold signature MUST be BLS-verified against the quorum
+// dashcore's SelectQuorumForSigning designates before any of it is adopted —
+// see chainlock_verify.hpp and CoinStateMaintainer::on_new_chainlock, which is
+// fail-closed without a verifier.
 // ── BIP 152 compact-block messages (Phase S2) ─────────────────────────────
 // Wire types vendored from dashcore at src/impl/dash/coin/vendor/; see
 // vendor/README.md for the adaptation notes.
@@ -140,6 +153,28 @@ BEGIN_MESSAGE(clsig)
         READWRITE(Using<ArrayType<DefaultFormat, 96>>(obj.m_sig));
     }
 END_MESSAGE()
+
+/// The inv-announcement sourcing policy: which inv types the DASH coin-P2P
+/// client answers with a getdata for the object itself.
+///
+/// Dash relays these objects announce-first (inv), serving the body only on
+/// request, so an inv type absent from this set is an object we can NEVER
+/// receive — which is exactly how the ChainLock leg stayed dark: clsig was
+/// decodable and handled, but nothing ever asked for one, so the handler had
+/// never once fired. Kept as a free function (rather than inline in the inv
+/// handler) so the policy is unit-testable without a live socket peer.
+///
+///   MSG_QUORUM_FINAL_COMMITMENT = 21 — relayed DKG final commitments
+///                                      (Phase-L MineableCommitmentCache)
+///   MSG_CLSIG                   = 29 — ChainLocks (dashcore protocol.h:522)
+///
+/// Block invs are deliberately NOT here: they take the getheaders-then-block
+/// path in the inv handler, not a bare getdata.
+inline bool inv_type_is_pulled(inventory_type::inv_type t)
+{
+    return t == inventory_type::quorum_final_commitment
+        || t == inventory_type::clsig;
+}
 
 // ── Phase C-SML step 4: Simplified MN List sync messages ──────────────
 // Wire commands (dashcore protocol.cpp:68-69):
@@ -189,6 +224,52 @@ BEGIN_MESSAGE(mnlistdiff)
     )
     {
         READWRITE(obj.m_diff);
+    }
+END_MESSAGE()
+
+// ── DIP-0024 rotated-quorum sourcing ──────────────────────────────────────
+// "getqrinfo" / "qrinfo" (dashcore llmq/snapshot.h). The rotated member set
+// is NOT derivable from the single work-block snapshot getmnlistd returns —
+// only qrinfo carries the quarter-rotation snapshots + cycle-base mnlistdiffs
+// that ComputeQuorumMembersByQuarterRotation needs. See
+// vendor/quorum_rotation_info.hpp for the wire layout (pinned from a real
+// capture) and for why the reply is carried as raw bytes here.
+BEGIN_MESSAGE(getqrinfo)
+    MESSAGE_FIELDS
+    (
+        (std::vector<uint256>, m_base_block_hashes),
+        (uint256,              m_block_request_hash),
+        (bool,                 m_extra_share)
+    )
+    {
+        READWRITE(obj.m_base_block_hashes,
+                  obj.m_block_request_hash,
+                  obj.m_extra_share);
+    }
+END_MESSAGE()
+
+// The qrinfo payload is carried RAW and decoded by
+// vendor::decode_quorum_rotation_info in the handler. Reason: the nested
+// CSimplifiedMNListDiff reader is fail-closed (returns bool) because it must
+// re-materialise the opaque quorum tail byte-exactly, and a READWRITE body has
+// no way to signal "refuse this message" other than throwing. Keeping the
+// decode out of the codec keeps a malformed qrinfo a LOCAL, logged refusal
+// instead of a stream-level exception on the coin connection.
+BEGIN_MESSAGE(qrinfo)
+    MESSAGE_FIELDS
+    (
+        (std::vector<unsigned char>, m_raw)
+    )
+    {
+        if constexpr (std::is_same_v<Formatter, UnserializeFormatter>) {
+            size_t n = stream.cursor_size();
+            obj.m_raw.resize(n);
+            if (n) stream.read(std::as_writable_bytes(std::span{obj.m_raw}));
+        } else {
+            if (!obj.m_raw.empty()) {
+                stream.write(std::as_bytes(std::span{obj.m_raw}));
+            }
+        }
     }
 END_MESSAGE()
 
@@ -294,6 +375,37 @@ BEGIN_MESSAGE(govsync)
     }
 END_MESSAGE()
 
+// ── SPORK listener ────────────────────────────────────────────────────────
+// "spork" — CSporkMessage (dashd src/spork.h SERIALIZE_METHODS): nSporkID(i32)
+// + nValue(i64) + nTimeSigned(i64) + vchSig (LIMITED_VECTOR, 65-byte compact
+// sig). dashd serves its FULL spork set in reply to "getsporks" (which the
+// client sends once per completed handshake) and relays every new spork
+// unsolicited. The signature is verified in the handler against the hardcoded
+// mainnet spork key (spork.hpp) before any state is touched — an arbitrary
+// peer must not be able to flip a spork by just sending the message.
+BEGIN_MESSAGE(spork)
+    MESSAGE_FIELDS
+    (
+        (int32_t,              m_spork_id),
+        (int64_t,              m_value),
+        (int64_t,              m_time_signed),
+        (std::vector<uint8_t>, m_sig)
+    )
+    {
+        READWRITE(obj.m_spork_id);
+        READWRITE(obj.m_value);
+        READWRITE(obj.m_time_signed);
+        READWRITE(obj.m_sig);
+    }
+END_MESSAGE()
+
+// "getsporks" — empty-payload request; dashd answers with its full spork set.
+// We SEND this on every completed handshake; a peer may also send it to us
+// (masternode sync does), which we acknowledge and do not serve.
+BEGIN_MESSAGE(getsporks)
+    WITHOUT_MESSAGE_FIELDS() { }
+END_MESSAGE()
+
 using Handler = MessageHandler<
     message_version,
     message_verack,
@@ -324,9 +436,26 @@ using Handler = MessageHandler<
     message_qfcommit,
     message_getmnlistd,
     message_mnlistdiff,
+    // ⚠ DIP-24 ROTATED LANE — these two MUST stay in this list.
+    // A message type absent here is NOT in MessageHandler::m_handlers, so
+    // MessageHandler::parse() throws std::out_of_range and CoinClient::handle
+    // drops the payload on the "unhandled command" path — at DEBUG level.
+    // That is exactly how the rotated lane failed silently in production: the
+    // getqrinfo went out, dashd answered, and the ~600 kB qrinfo was discarded
+    // before ADD_P2P_HANDLER(qrinfo) — which existed, fully written, with a
+    // registered consumer — could ever run. Nothing in any log said so.
+    // test_dash_qrinfo_wire.cpp gates the registry membership directly.
+    message_getqrinfo,
+    message_qrinfo,
     message_govobj,
     message_govobjvote,
-    message_govsync
+    message_govsync,
+    // ⚠ SPORK lane — same registry rule as the DIP-24 pair above (#1077): a
+    // handler that exists but whose message type is absent from this list can
+    // never run; the payload dies on the unhandled-command path at DEBUG.
+    // test_dash_spork.cpp gates the registry membership directly.
+    message_spork,
+    message_getsporks
 >;
 
 } // namespace p2p

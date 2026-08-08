@@ -21,6 +21,7 @@
 //   T/3 -> 0x104c8b/3 = 0x056ed9 -> 0x1b056ed9
 //   3*T -> 0x104c8b*3 = 0x30e5a1 -> 0x1b30e5a1
 
+#include <algorithm>   // std::find over the refusal `requires` array
 #include <gtest/gtest.h>
 
 #include <impl/dash/coin/header_chain.hpp>
@@ -611,4 +612,267 @@ TEST(DashChainRpc, ChainQueryRefusesMethodsTheHeaderChainDoesNotOwn) {
     auto ok = chain_rpc::chain_query(*mc.hc, "getbestblockhash", nlohmann::json::array(), now);
     EXPECT_TRUE(ok.is_string()) << ok.dump();
     EXPECT_EQ(ok.get<std::string>(), mc.hashes.back().GetHex());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HEADER-BACKFILL PROGRESS TELEMETRY
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The old line was `[DASH] Header sync: N/M (P%)`, throttled on HEIGHT ALONE
+// by a function-local `static` — i.e. one counter shared by every HeaderChain
+// in the process. On 2026-08-04 that cost real time twice: a backfill that
+// slowed to a crawl went silent for as long as it took to cover 2000 blocks,
+// and rate/ETA had to be reconstructed by diffing log timestamps by hand.
+//
+// What is pinned here: the FIRST batch establishes a baseline and reports
+// nothing (a rate cannot be measured from one sample — reporting one would be
+// a fabricated number), and a LATER batch past the throttle emits the line.
+TEST(DashHeaderChainDiag, BackfillProgressBaselinesThenReports) {
+    auto params = make_easy_test_params();
+    HeaderChain hc(params, /*db_path=*/"");
+    ASSERT_TRUE(hc.init());
+    hc.set_peer_tip_height(100);
+    // Tight throttle so the KAT need not mine 2000 headers to prove the line.
+    hc.set_progress_throttle(/*headers=*/2, /*ms=*/60'000);
+
+    const uint32_t bits = params.pow_limit.GetCompact();
+    uint256  prev = params.genesis_hash;
+    uint32_t t    = 1'800'000'000u;
+
+    auto mine_batch = [&](int n) {
+        std::vector<BlockHeaderType> batch;
+        for (int i = 0; i < n; ++i) {
+            t += 150u;
+            auto h = mine_header(prev, t, bits, params.pow_limit);
+            prev = x11_hash(h);
+            batch.push_back(h);
+        }
+        return batch;
+    };
+
+    // First batch: accepted, and it BASELINES the reporter.
+    auto b1 = mine_batch(3);
+    EXPECT_EQ(hc.add_headers(b1), 3);
+    EXPECT_EQ(hc.height(), 3u);
+
+    // Second batch: three more headers is past the 2-header throttle, so the
+    // progress line is due. The assertion available to a KAT is the state the
+    // line reports — the cursor and the peer target it prints.
+    auto b2 = mine_batch(3);
+    EXPECT_EQ(hc.add_headers(b2), 3);
+    EXPECT_EQ(hc.height(), 6u);
+}
+
+// ─── DAEMONLESS BLOCK-DATA POLICY (#99) ─────────────────────────────────────
+//
+// Three behaviours, one contract:
+//   (a) SERVE what the header chain owns  — getblockheader in full, getblock
+//       verbosity 1 partially.
+//   (b) REFUSE what needs bodies, NAMING the reason and the remedies, in a
+//       shape no empty answer can imitate.
+//   (c) archive mode is the remedy the refusal itself advertises.
+//
+// The regression these pin is the one that motivated the whole task: an
+// unwired seam answered HTTP 200 with a well-formed EMPTY document, so a dead
+// view was indistinguishable from an empty one. Every assertion below exists
+// to keep "no data" and "no capability" in different representations.
+
+namespace {
+
+// A refusal must be recognisable by a machine with ONE predicate and by a
+// human from the prose. Both halves are asserted together so neither can rot.
+void expect_is_refusal(const nlohmann::json& r, const char* expect_code) {
+    ASSERT_TRUE(r.is_object()) << r.dump(2);
+    ASSERT_TRUE(r.contains("code")) << "the machine discriminator is missing; a "
+                                       "caller cannot tell this from data: " << r.dump(2);
+    EXPECT_EQ(r["code"].get<std::string>(), expect_code) << r.dump(2);
+    EXPECT_EQ(r.value("http_status", 0), chain_rpc::REFUSAL_HTTP_STATUS)
+        << "a refusal must carry the non-2xx status the transport will serve";
+    EXPECT_EQ(r.value("source", std::string()), chain_rpc::SOURCE_TAG);
+    EXPECT_EQ(r.value("retained", std::string()), chain_rpc::RETAINED_HEADERS_ONLY);
+    const std::string err = r.value("error", std::string());
+    EXPECT_FALSE(err.empty()) << "a refusal must name the blocking condition";
+    EXPECT_GT(err.size(), 40u) << "refusal prose must be a sentence, not a token: " << err;
+    // Back-compat with the callers of the original three queries.
+    EXPECT_EQ(r.value("unavailable_reason", std::string()), err);
+}
+
+} // namespace
+
+TEST(DashDaemonlessBlockData, GetBlockHeaderIsFullyAnsweredFromOwnedState) {
+    auto mc = build_mined_chain(5, /*tip_time=*/1'800'000'000u);
+    const uint32_t now = mc.tip_time + 60;
+    auto r = chain_rpc::getblockheader(*mc.hc, mc.hashes[3].GetHex(), true, now);
+
+    ASSERT_FALSE(r.contains("code")) << "this query is fully owned: " << r.dump(2);
+    EXPECT_EQ(r["hash"].get<std::string>(), mc.hashes[3].GetHex());
+    EXPECT_EQ(r["height"].get<uint32_t>(), 3u);
+    EXPECT_EQ(r["previousblockhash"].get<std::string>(), mc.hashes[2].GetHex());
+    EXPECT_EQ(r["nextblockhash"].get<std::string>(), mc.hashes[4].GetHex());
+    // 5 - 3 + 1
+    EXPECT_EQ(r["confirmations"].get<int64_t>(), 3);
+    EXPECT_TRUE(r.contains("merkleroot"));
+    EXPECT_TRUE(r.contains("time"));
+    EXPECT_TRUE(r.contains("bits"));
+    EXPECT_TRUE(r.contains("nonce"));
+    EXPECT_TRUE(r.contains("difficulty"));
+    // A fully-owned answer carries NO partial marker and NO unavailable list.
+    EXPECT_FALSE(r.contains("partial")) << r.dump(2);
+    EXPECT_FALSE(r.contains("unavailable")) << r.dump(2);
+}
+
+TEST(DashDaemonlessBlockData, GetBlockHeaderTipHasNoNextBlockHash) {
+    auto mc = build_mined_chain(4, /*tip_time=*/1'800'000'000u);
+    auto r = chain_rpc::getblockheader(*mc.hc, mc.hashes.back().GetHex(), true,
+                                       mc.tip_time + 60);
+    // Absent, never an empty string — the successor does not exist yet.
+    EXPECT_FALSE(r.contains("nextblockhash")) << r.dump(2);
+}
+
+TEST(DashDaemonlessBlockData, GetBlockHeaderNonVerboseReturnsSerialisedHex) {
+    auto mc = build_mined_chain(3, /*tip_time=*/1'800'000'000u);
+    auto r = chain_rpc::getblockheader(*mc.hc, mc.hashes[2].GetHex(), false,
+                                       mc.tip_time + 60);
+    ASSERT_TRUE(r.is_string()) << r.dump(2);
+    // A Dash header is 80 bytes on the wire.
+    EXPECT_EQ(r.get<std::string>().size(), 160u);
+}
+
+TEST(DashDaemonlessBlockData, GetBlockVerbosity1IsPartialAndNeverFakesATxList) {
+    auto mc = build_mined_chain(5, /*tip_time=*/1'800'000'000u);
+    auto r = chain_rpc::getblock(*mc.hc, mc.hashes[3].GetHex(), 1, mc.tip_time + 60);
+
+    // Not a refusal — we own most of it.
+    ASSERT_FALSE(r.contains("code")) << r.dump(2);
+    EXPECT_EQ(r["height"].get<uint32_t>(), 3u);
+    EXPECT_TRUE(r.contains("merkleroot"));
+
+    // ...but it MUST announce that it is incomplete.
+    ASSERT_TRUE(r.value("partial", false)) << r.dump(2);
+    ASSERT_TRUE(r.contains("requires")) << r.dump(2);
+
+    // THE CENTRAL ASSERTION. The withheld fields are ABSENT, not empty. If `tx`
+    // were emitted as [], a consumer reading result.tx.length would render an
+    // empty transaction table and call it data — the exact class of bug this
+    // policy exists to remove. Absent makes that consumer throw instead.
+    for (const char* f : {"tx", "nTx", "size", "strippedsize", "weight"}) {
+        EXPECT_FALSE(r.contains(f))
+            << "field '" << f << "' must be ABSENT, never a plausible empty/zero: "
+            << r.dump(2);
+        ASSERT_TRUE(r["unavailable"].contains(f)) << r.dump(2);
+        EXPECT_NE(r["unavailable"][f].get<std::string>().find("HEADERS ONLY"),
+                  std::string::npos)
+            << "each withheld field must name what we retain: " << r.dump(2);
+    }
+}
+
+TEST(DashDaemonlessBlockData, GetBlockRawAndDecodedShapesAreRefusedWithRemedies) {
+    auto mc = build_mined_chain(3, /*tip_time=*/1'800'000'000u);
+    const std::string h = mc.hashes[2].GetHex();
+
+    for (int verbosity : {0, 2}) {
+        auto r = chain_rpc::getblock(*mc.hc, h, verbosity, mc.tip_time + 60);
+        expect_is_refusal(r, chain_rpc::CODE_REQUIRES_BLOCK_BODIES);
+        // Both product choices are advertised in the payload itself, so the
+        // operator never has to consult docs to learn the way out.
+        ASSERT_TRUE(r.contains("requires")) << r.dump(2);
+        auto req = r["requires"];
+        EXPECT_NE(std::find(req.begin(), req.end(), "external-daemon-rpc"), req.end())
+            << r.dump(2);
+        EXPECT_NE(std::find(req.begin(), req.end(), "archive-mode"), req.end())
+            << r.dump(2);
+    }
+}
+
+TEST(DashDaemonlessBlockData, GetRawTransactionNamesBOTHMissingCapabilities) {
+    auto r = chain_rpc::getrawtransaction(
+        "0000000000000000000000000000000000000000000000000000000000000001");
+    expect_is_refusal(r, chain_rpc::CODE_REQUIRES_BLOCK_BODIES);
+    // Archive mode ALONE does not fix this one: without a txid->block index we
+    // still cannot find which body to open. Saying so prevents an operator
+    // paying the archive disk cost and finding the query still refuses.
+    EXPECT_EQ(r.value("also_requires", std::string()), chain_rpc::CODE_REQUIRES_TX_INDEX);
+    auto req = r["requires"];
+    EXPECT_NE(std::find(req.begin(), req.end(), "archive-mode+txindex"), req.end())
+        << r.dump(2);
+    EXPECT_EQ(std::find(req.begin(), req.end(), "archive-mode"), req.end())
+        << "plain archive-mode must NOT be offered as a sufficient remedy here: "
+        << r.dump(2);
+}
+
+TEST(DashDaemonlessBlockData, UnknownBlockHashIsChainStateNotACapabilityRefusal) {
+    auto mc = build_mined_chain(3, /*tip_time=*/1'800'000'000u);
+    auto r = chain_rpc::getblock(
+        *mc.hc,
+        "00000000000000000000000000000000000000000000000000000000deadbeef",
+        1, mc.tip_time + 60);
+    // "we do not have that block" is a fact about the CHAIN; "we cannot serve
+    // bodies" is a fact about THIS NODE. Different codes, so a caller can tell
+    // a typo from a missing feature.
+    expect_is_refusal(r, chain_rpc::CODE_CHAIN_STATE);
+    EXPECT_NE(r["error"].get<std::string>().find("not in our header index"),
+              std::string::npos) << r.dump(2);
+}
+
+TEST(DashDaemonlessBlockData, MalformedHashIsRejectedBeforeAnyLookup) {
+    auto mc = build_mined_chain(2, /*tip_time=*/1'800'000'000u);
+    auto r = chain_rpc::getblockheader(*mc.hc, "not-a-hash", true, mc.tip_time + 60);
+    expect_is_refusal(r, chain_rpc::CODE_BAD_PARAMS);
+}
+
+TEST(DashDaemonlessBlockData, StaleTipWithholdsConfirmationsRatherThanOverstateFinality) {
+    auto mc = build_mined_chain(5, /*tip_time=*/1'800'000'000u);
+    const uint32_t stale_now = mc.tip_time + 90'000u;   // > TIP_MAX_AGE_SECONDS
+    auto r = chain_rpc::getblockheader(*mc.hc, mc.hashes[2].GetHex(), true, stale_now);
+
+    // Header fields are still ours to serve — PoW does not go stale.
+    EXPECT_EQ(r["height"].get<uint32_t>(), 2u);
+    EXPECT_TRUE(r.contains("merkleroot"));
+    // But confirmations counted against a tip we know is behind would overstate
+    // burial, so it is withheld rather than computed.
+    EXPECT_FALSE(r.contains("confirmations")) << r.dump(2);
+}
+
+TEST(DashDaemonlessBlockData, DispatchRoutesEveryOwnedAndRefusedMethod) {
+    auto mc = build_mined_chain(4, /*tip_time=*/1'800'000'000u);
+    const uint32_t now = mc.tip_time + 60;
+    const std::string h = mc.hashes[3].GetHex();
+
+    auto q = [&](const char* m, nlohmann::json p) {
+        return chain_rpc::chain_query(*mc.hc, m, p, now);
+    };
+
+    // Owned.
+    EXPECT_FALSE(q("getblockheader", {h}).contains("code"));
+    EXPECT_FALSE(q("getblock", {h, 1}).contains("code"));
+    // getblock defaults to verbosity 1 when the caller omits it.
+    EXPECT_TRUE(q("getblock", {h}).value("partial", false));
+
+    // Refused, each with its own code.
+    expect_is_refusal(q("getblock", {h, 0}), chain_rpc::CODE_REQUIRES_BLOCK_BODIES);
+    expect_is_refusal(q("getblock", {h, 2}), chain_rpc::CODE_REQUIRES_BLOCK_BODIES);
+    expect_is_refusal(q("getrawtransaction", {h}), chain_rpc::CODE_REQUIRES_BLOCK_BODIES);
+    expect_is_refusal(q("getblockheader", nlohmann::json::array()), chain_rpc::CODE_BAD_PARAMS);
+    expect_is_refusal(q("getpeerinfo", nlohmann::json::array()), chain_rpc::CODE_UNKNOWN_METHOD);
+}
+
+TEST(DashDaemonlessBlockData, NoSuccessfulAnswerCarriesTheRefusalDiscriminator) {
+    // The one-predicate contract: `code` present <=> refusal. If any owned
+    // answer ever grew a `code` field the caller's check would misfire, so this
+    // sweeps every success path at once.
+    auto mc = build_mined_chain(4, /*tip_time=*/1'800'000'000u);
+    const uint32_t now = mc.tip_time + 60;
+    const std::string h = mc.hashes[2].GetHex();
+
+    for (const auto& r : {
+             chain_rpc::chain_query(*mc.hc, "getblockchaininfo", nlohmann::json::array(), now),
+             chain_rpc::chain_query(*mc.hc, "getbestblockhash", nlohmann::json::array(), now),
+             chain_rpc::chain_query(*mc.hc, "getblockhash", nlohmann::json::array({2}), now),
+             chain_rpc::chain_query(*mc.hc, "getblockheader", nlohmann::json::array({h}), now),
+             chain_rpc::chain_query(*mc.hc, "getblock", nlohmann::json::array({h, 1}), now),
+         }) {
+        if (r.is_object())
+            EXPECT_FALSE(r.contains("code"))
+                << "an ANSWER must never carry the refusal discriminator: " << r.dump(2);
+    }
 }

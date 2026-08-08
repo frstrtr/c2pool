@@ -129,8 +129,35 @@ protected:
     // a RawMessage into a typed message variant. Mirrors dgb::NodeImpl::m_handler.
     dash::Handler m_handler;
 
-    // Callback fired when a bestblock message is received from a peer; wired by
-    // the work layer (slice .4) to trigger a work refresh. Mirrors dgb.
+    // Callback fired when a bestblock message is received from a pool peer.
+    //
+    // NOT WIRED ON THE DASH LANE (audited 2026-08-04) — and that is the norm,
+    // not a DASH regression: btc/dgb/bch declare the identical seam and leave
+    // it unset too; src/c2pool/main_ltc.cpp is the ONLY set_on_bestblock call
+    // site in the tree. Inbound bestblock on DASH is therefore observability
+    // only (the "[Pool] New best block from peer" line in
+    // dash/protocol_actual.cpp + protocol_legacy.cpp). The SEND side IS wired:
+    // main_dash's fallback-arm tip-notify announces via broadcast_bestblock().
+    //
+    // DASH does not need it as a tip source. Both arms already have a
+    // first-party coin-tip signal that the refresh trio (invalidate template
+    // cache + bump work generation + notify_all) hangs off:
+    //   * embedded arm  -> header_chain->set_on_tip_changed (coin-P2P headers),
+    //   * fallback arm  -> --coin-zmq-hashblock (instant) with a 3 s
+    //                      getbestblockhash poll backstop, behind one shared
+    //                      last-seen-tip dedup.
+    // LTC wires it because pool-P2P is its PRIMARY block source; DASH's is not.
+    //
+    // IF IT IS EVER WIRED, the hazard to solve first: the argument is a
+    // PEER-ASSERTED header hash, not our own tip. Feeding it straight into the
+    // fallback arm's fire_refresh would (a) let an unbounded stream of distinct
+    // bogus hashes drive a template-rebuild storm (LTC's leading-edge dedup is
+    // per-hash, so it does not bound that), and (b) POISON the shared tip_dedup
+    // with a hash dashd has not connected yet — the re-source returns the OLD
+    // template and the real tip-change refresh is then suppressed as
+    // "not a new tip", i.e. exactly the stale-work outcome the hook exists to
+    // prevent. Any wiring must confirm the hash against our own tip source
+    // before it is allowed to touch the dedup.
     std::function<void(const uint256&)> m_on_bestblock;
 
     // Thread pool for parallel share_init_verify (X11 CPU work). Keeps the
@@ -350,6 +377,10 @@ protected:
     // on any recent job stays fully backable; a tx leaves m_known_txs only once it
     // has fallen out of EVERY retained set (peer-remembered txs are separate).
     static constexpr size_t RETAINED_TEMPLATE_TX_SETS = 8;
+    // #950: canonical p2pool's max_remembered_txs_size (p2p.py:30). A peer
+    // disconnects if an inbound remember_tx pushes its remembered_txs_size
+    // over this (p2p.py:488), so the standing-remember seed stays under it.
+    static constexpr std::size_t MAX_REMEMBERED_TXS_SIZE = 2500000;
     std::deque<std::set<uint256>> m_recent_template_tx_sets;
     // Fired on the IO thread when run_think() elects a new best share
     // (p2pool: new_work_event) — main_dash binds the stratum work refresh.
@@ -785,6 +816,18 @@ public:
         // landing on top of it. See core/tx_advertiser.hpp.
         advertise_known_txs(peer);
 
+        // #950: seed this freshly-connected peer's STANDING remembered set
+        // (canonical p2p.py:269). A peer's "txpool" for us (web.py:673
+        // remembered_txs_size) is fed ONLY by remember_tx bodies; c2pool
+        // emitted none outside the transient sendShares bracket, so every
+        // peer showed txpool == 0 (#950). Post-#863 the socket write queue
+        // drains composed writes in strict submission order
+        // (core/socket.cpp:110-145), so this no longer risks the mid-message
+        // interleave the comment above warns of — it is safely queued after
+        // the have_tx advert. Bounded by MAX_REMEMBERED_TXS_SIZE so a
+        // canonical peer never disconnects us on overflow (p2p.py:488).
+        send_standing_remember(peer);
+
         // #754 join trigger (oracle p2p.py handle_version → node.py
         // handle_share_hashes): a peer advertising a best share we don't have
         // is THE download entry point for an empty node joining an
@@ -1100,6 +1143,14 @@ public:
             advertise_one(entry.second);
     }
 
+    /// #950: seed a freshly-connected peer's STANDING remembered set with the
+    /// txs we already hold, bounded by MAX_REMEMBERED_TXS_SIZE (canonical
+    /// p2p.py:269, :30/:488). IO-THREAD ONLY (handle_version handler): reads
+    /// IO-confined m_known_txs, same discipline as advertise_known_txs.
+    /// Defined in node.cpp because it serializes tx bytes (pack /
+    /// TX_WITH_WITNESS) to size the per-peer cap.
+    void send_standing_remember(const peer_ptr& peer);
+
     /// Broadcast a new best-block notification to every connected pool peer.
     /// Straight port of the LTC reference (src/impl/ltc/node.hpp:316-320; same
     /// body in dgb node.hpp:339 / btc node.hpp:320 / bch node.hpp:562), which
@@ -1157,7 +1208,10 @@ public:
         catch (const std::invalid_argument&) { /* request already timed out */ }
     }
 
-    // Register a callback fired when a bestblock message is received from a peer.
+    // Register a callback fired when a bestblock message is received from a
+    // pool peer. Currently UNCALLED on the DASH lane by design — see the
+    // m_on_bestblock declaration for why, and for the dedup-poisoning hazard
+    // that must be handled before anything is wired here.
     void set_on_bestblock(std::function<void(const uint256&)> fn) { m_on_bestblock = std::move(fn); }
 
     // ── Tracker accessors ───────────────────────────────────────────────

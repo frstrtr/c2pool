@@ -163,11 +163,17 @@
 /// mining window closes — both are bounded by cycleStart +
 /// dkgMiningWindowEnd, which is why the incident self-healed in 4 blocks.
 ///
-/// MAINTENANCE: the params table + enabled sets + V19 floors below are
-/// copied VERBATIM from dashcore llmq/params.h + chainparams.cpp @
-/// cfad414. RE-DIFF on every vendored-dashcore pin bump (same rule as
-/// dkg_window.hpp) — a params change silently mis-shapes the mandatory
-/// set at window heights.
+/// MAINTENANCE: the params table + V19 floors below are copied VERBATIM
+/// from dashcore llmq/params.h + chainparams.cpp @ cfad414. The ENABLED
+/// SETS are NOT a copy of anything — they are DERIVED (see enabled_llmqs
+/// below) by evaluating dashd's runtime IsQuorumTypeEnabled predicate at
+/// our serve floor, because that predicate, not the chainparams AddLLMQ
+/// list, is what ProcessBlock requires. RE-DERIVE on every
+/// vendored-dashcore pin bump (same rule as dkg_window.hpp) — a params
+/// OR predicate change silently mis-shapes the mandatory set at window
+/// heights, and a type we require that the chain does not mine fails
+/// every window height closed forever. LlmqTypeReconciler
+/// (llmq_type_reconciler.hpp) is the runtime backstop for exactly that.
 
 #include <impl/dash/coin/quorum_manager.hpp>
 #include <impl/dash/coin/quorum_root.hpp>
@@ -178,6 +184,7 @@
 #include <core/pack.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -218,14 +225,75 @@ inline constexpr LlmqParamsView kLlmq400_85 {3, 400, 350, 340, 576, 20, 48, 4,  
 inline constexpr LlmqParamsView kLlmq100_67 {4, 100, 80,  67,  24,  10, 18, 24, false};
 inline constexpr LlmqParamsView kLlmq25_67  {6, 25,  22,  17,  24,  10, 18, 24, false};
 
-/// Enabled LLMQ types per network, IN dashd's AddLLMQ ORDER (chainparams.cpp:
-/// mainnet 269-273, testnet 459-464). The order matters for byte parity: the
-/// miner emits qc txs in GetEnabledQuorumParams enumeration order
-/// (node/miner.cpp CreateNewBlock), which is AddLLMQ insertion order.
+/// Enabled LLMQ types per network, in dashd's enumeration order.
+///
+/// ⚠ THE ENABLED SET IS *NOT* THE chainparams AddLLMQ LIST. That was the bug
+/// this table shipped with (mainnet, fixed 2026-08-03; see LLMQ_50_60 below).
+/// dashd's consensus requirement is driven by
+/// `GetEnabledQuorumParams(chainman, pindexPrev)` (llmq/options.cpp), which
+/// FILTERS the chainparams list through
+/// `ChainstateManager::IsQuorumTypeEnabled` (validation.cpp) — a RUNTIME,
+/// HEIGHT- AND NETWORK-dependent predicate. `CQuorumBlockProcessor::ProcessBlock`
+/// iterates that filtered list, so a chainparams type the predicate rejects is
+/// NOT required (and must NOT be emitted: bad-qc-not-allowed). The filter
+/// preserves chainparams order, so the byte-parity ordering argument is
+/// unchanged: the miner emits qc txs in this enumeration order
+/// (node/miner.cpp CreateNewBlock).
+///
+/// The predicate, verbatim (dashpay/dash v23.1.7 validation.cpp
+/// ChainstateManager::IsQuorumTypeEnabled), for the types we carry:
+///
+///   LLMQ_50_60  : !fDIP0024IsActive || !fHaveDIP0024Quorums
+///                 || network == testnet || network == devnet
+///   LLMQ_60_75  : fDIP0024IsActive
+///   LLMQ_400_60 : true
+///   LLMQ_400_85 : true
+///   LLMQ_100_67 : DeploymentActiveAfter(DIP0020)
+///   LLMQ_25_67  : height >= 847000        (testnet-only type)
+///
+/// where fDIP0024IsActive = DeploymentActiveAfter(pindexPrev, DIP0024) and
+/// fHaveDIP0024Quorums = pindexPrev->nHeight >= consensus.DIP0024QuorumsHeight.
+///
+/// Evaluated at (and only at) the heights this table is ever consulted — i.e.
+/// at or above qc_serve_floor(), which is V19Height on both networks
+/// (compute_required_qc_slots refuses below it):
+///
+///   MAINNET, floor 1899072 (chainparams.cpp: DIP0020Height 1516032,
+///   DIP0024Height 1737792, DIP0024QuorumsHeight 1738698, V19Height 1899072).
+///     * LLMQ_50_60 is DISABLED: at every height >= 1738698 both DIP0024 legs
+///       are true and mainnet is neither testnet nor devnet, so the predicate
+///       returns false — PERMANENTLY, 160374 blocks BELOW our serve floor.
+///       Requiring it emitted a mandatory type-1 slot that can never be
+///       satisfied (has_mined is false forever, no commitment is ever
+///       relayed), failing the WHOLE height closed at every height in the
+///       interval-24 window [10,18] — a structural 9-in-24 outage.
+///       CORROBORATED against a live Dash Core 23.1.7 mainnet node at height
+///       2515629: `quorum list` returns exactly the four keys below, in this
+///       order, and `quorum info 1 <hash>` returns "quorum not found" where
+///       type 4 on the same hash returns a full quorum. (Note `quorum info`
+///       says "invalid LLMQ type" only for types absent from CHAINPARAMS —
+///       type 1 IS in mainnet chainparams; it is the runtime predicate that
+///       disables it. Absence from `quorum list` is the enabled-set evidence,
+///       because quorum_list enumerates GetEnabledQuorumTypes.)
+///     * The other four are all enabled at/above the floor. => 4 types.
+///
+///   TESTNET, floor 850100 (DIP0020Height 414100, DIP0024Height 769700,
+///   DIP0024QuorumsHeight 770730, V19Height 850100).
+///     * LLMQ_50_60 STAYS. The predicate's third disjunct
+///       (`NetworkIDString() == TESTNET`) is unconditional and height-
+///       independent, so LLMQ_50_60 is enabled on testnet FOREVER — it is
+///       also testnet's llmqTypeChainLocks and llmqTypeMnhf. Removing it here
+///       would be a NEW defect, symmetric-looking and wrong.
+///     * LLMQ_25_67 is enabled from height 847000 < 850100. => 6 types.
+///
+/// RE-DERIVE THIS on every vendored-dashcore pin bump, from the PREDICATE, not
+/// from the AddLLMQ list. `LlmqTypeReconciler` (llmq_type_reconciler.hpp) is
+/// the runtime backstop that names a type we require here but that the chain
+/// never actually mines — and the reverse.
 inline const std::vector<LlmqParamsView>& enabled_llmqs(LlmqNetwork net)
 {
     static const std::vector<LlmqParamsView> kMainnet{
-        kLlmq50_60, kLlmq60_75, kLlmq400_60, kLlmq400_85, kLlmq100_67};
+        kLlmq60_75, kLlmq400_60, kLlmq400_85, kLlmq100_67};
     static const std::vector<LlmqParamsView> kTestnet{
         kLlmq50_60, kLlmq60_75, kLlmq400_60, kLlmq400_85, kLlmq100_67,
         kLlmq25_67};
@@ -406,6 +474,55 @@ inline MutableTransaction build_qc_tx(uint32_t height,
     return tx;
 }
 
+// ── PoSe interaction of REAL commitments (the #1083 landmine, enforced) ────
+
+/// dashcore's IsNull predicate over a commitment, exactly as the
+/// merkleRootQuorums fold applies it (CFinalCommitment::IsNull:
+/// CountSigners()==0 && CountValidMembers()==0). Null commitments take the
+/// IsNull() exempt path in dashd's verifier (specialtxman.cpp:427-432), so
+/// they can never trigger a PoSe punishment.
+inline bool qc_commitment_is_null(const vendor::CFinalCommitment& c)
+{
+    return c.CountSigners() == 0 && c.CountValidMembers() == 0;
+}
+
+/// Is the verifier's PoSe pass over this commitment PROVABLY a no-op?
+///
+/// dashd's verifier PoSe-punishes every quorum member the commitment marks
+/// invalid when a NON-NULL commitment is in a block — specialtxman.cpp:159-174
+/// HandleQuorumCommitment: for i over members.size(), `if (!qc.validMembers[i])
+/// ... mnList.PoSePunish(members[i]->proTxHash, mnList.CalcPenalty(66))` — and
+/// a punishment that crosses the ban threshold flips that MN's validity IN THE
+/// SAME BLOCK's MN list, changing the merkleRootMNList the same coinbase
+/// commits. c2pool does not fold that pass into its committed root (the full
+/// fold mirrors the confirmedHash rollover projection and is not built), and
+/// penalty-crossing cannot be computed daemonlessly at all: PoSe penalty state
+/// is not in the SML, so it must never be guessed.
+///
+/// The INTERIM serve predicate is therefore the provable no-op: every LISTED
+/// member — index < member_count, where member_count is the size of the
+/// deterministic member list dashd indexes validMembers with
+/// (GetAllQuorumMembers; daemonlessly the QuorumMemberSource set the BLS
+/// verify already required) — is marked valid, so the punish loop touches
+/// nothing and the committed MN root is exact. validMembers bits at
+/// index >= member_count are DKG padding up to params.size (dashcore's own
+/// Verify requires them unset) and prove nothing either way.
+///
+/// Fail-closed: a member_count of 0 or one exceeding the bitset cannot prove
+/// the no-op (nothing to index the bitset against), so the answer is false —
+/// the caller must refuse, never serve. Null commitments are exempt by the
+/// same IsNull predicate the fold and dashd's verifier use.
+inline bool qc_pose_pass_provably_noop(const vendor::CFinalCommitment& c,
+                                       size_t member_count)
+{
+    if (qc_commitment_is_null(c)) return true;   // IsNull() exempt path
+    if (member_count == 0 || member_count > c.validMembers.size())
+        return false;                            // cannot prove — fail closed
+    for (size_t i = 0; i < member_count; ++i)
+        if (!c.validMembers[i]) return false;    // dashd would PoSePunish members[i]
+    return true;
+}
+
 // ── Mineable-commitment cache (Phase-L seam) ───────────────────────────────
 
 /// Collects REAL finalized commitments off the coin-P2P `qfcommit` relay —
@@ -425,7 +542,15 @@ public:
     /// the distinction is UNEVALUATED and prints n/a — it is never guessed.
     using MembersReadyFn = std::function<bool(uint8_t, const uint256&)>;
 
-    void set_bls_verify_fn(BlsVerifyFn fn) { m_bls_verify = std::move(fn); }
+    /// Installing (or swapping) the verifier RETIRES every memoised verdict:
+    /// a "verified" latch is only ever a proof UNDER THE VERIFIER THAT
+    /// PRODUCED IT, so a verdict must never outlive its prover.
+    void set_bls_verify_fn(BlsVerifyFn fn)
+    {
+        m_bls_verify = std::move(fn);
+        for (auto& e : m_cache)
+            e.second.verified.store(false, std::memory_order_relaxed);
+    }
     bool has_bls_verifier() const { return static_cast<bool>(m_bls_verify); }
     void set_members_ready_fn(MembersReadyFn fn) { m_members_ready = std::move(fn); }
     bool has_members_ready_fn() const { return static_cast<bool>(m_members_ready); }
@@ -451,7 +576,7 @@ public:
     {
         auto it = m_cache.find(Key{llmq_type, quorum_hash});
         if (it == m_cache.end()) return -1;
-        return static_cast<int32_t>(it->second.CountSigners());
+        return static_cast<int32_t>(it->second.c.CountSigners());
     }
 
     /// Classify why `verified_for` withheld this slot. Callers MUST have just
@@ -543,22 +668,98 @@ public:
         const Key k{c.llmqType, c.quorumHash};
         auto it = m_cache.find(k);
         if (it != m_cache.end()
-            && it->second.CountSigners() >= c.CountSigners())
+            && it->second.c.CountSigners() >= c.CountSigners())
             return Admission::NotBetterThanCached;   // hold an equal-or-better one
-        m_cache[k] = c;
+        // Replacement builds a FRESH entry, so the incoming commitment is
+        // UNLATCHED by construction — a verdict proven for the superseded
+        // bytes can never be served for these ones. ERASE-then-default-
+        // construct rather than assign: Entry holds a std::atomic latch and is
+        // therefore neither copyable nor movable, and that is deliberate — the
+        // only way to obtain an entry is to build a fresh, unlatched one.
+        m_cache.erase(k);
+        m_cache[k].c = c;
         return Admission::Accepted;
     }
 
     /// The mineable commitment for a slot — ONLY once BLS-verified. The
     /// Phase-L blocker line: without a verifier this is always nullopt.
+    ///
+    /// THE AGGREGATE VERIFY IS PAID ONCE PER COMMITMENT, NOT ONCE PER READ.
+    /// This is a SERVE-PATH hot function: the pre-emit consensus gate re-runs
+    /// INLINE on the io thread for every read of a cached EMBEDDED template
+    /// (work_source.cpp:852-853), the gate re-derives the mandatory qc plan on
+    /// every call (node_coin_state.hpp:889-893), the plan walks
+    /// daemonless_qc_commitments (:741 below) into here, and notify_all fans
+    /// send_notify_work out SERIALLY per session (stratum_server.cpp:379-384).
+    /// Re-proving a 391-signer LLMQ_400_60 aggregate signature on each of
+    /// those was the 2026-08-07 tip freeze: one send_notify_work measured
+    /// 0.3 ms -> 733 ms, the io thread saturated in userspace, and the tip
+    /// stopped advancing — which is self-sustaining, because the expensive
+    /// slot only retires when the tip advances (:415/:425 below).
+    ///
+    /// The memo is a POSITIVE-ONLY latch carried ON the cache entry, so its
+    /// staleness argument is by construction, not by discipline:
+    ///   * the verifier's inputs are the commitment BYTES and the member set
+    ///     for (llmqType, quorumHash) (bls_verify.hpp);
+    ///   * the bytes cannot change under a live latch: entry replacement is
+    ///     the ONLY mutation (keep-best, ingest_ex above) and it builds a
+    ///     FRESH, unlatched entry;
+    ///   * quorumHash IS the quorum base block hash (:421-426 below), so a
+    ///     reorg gives a DIFFERENT key — never a same-key different member
+    ///     set;
+    ///   * FALSE is never latched, so every recovery path (member set
+    ///     arrives, better commitment lands, verifier installed) is unchanged,
+    ///     as is diagnose()'s classification;
+    ///   * set_bls_verify_fn retires every latch, so a verdict is never served
+    ///     under a verifier that did not produce it.
+    /// A latched TRUE is therefore a retained mathematical proof about
+    /// immutable bytes against a chain-determined member set: it cannot become
+    /// false, and nothing the pre-emit gate CHECKS is checked less often —
+    /// only this leaf predicate's pairing math is reused.
+    ///
+    /// THREADING: the latch is `mutable std::atomic<bool>` read/written
+    /// RELAXED under the cache's existing no-lock discipline. The only
+    /// production caller is the single coin-state-owning thread
+    /// (work_source.cpp:823-827), so the atomic is not load-bearing TODAY —
+    /// it is there so that the safety of this line stops depending on that
+    /// staying true. Relaxed is the right (and sufficient) order: the latch
+    /// publishes nothing — the bytes it guards are immutable for the entry's
+    /// lifetime — so the only race a second reader can lose is a redundant
+    /// re-verify of the same commitment to the same verdict.
+    ///
+    /// BEHAVIOUR CHANGE, ON RECORD (the one thing this is not free): a latched
+    /// slot no longer calls the BLS verifier, and the verifier is what sources
+    /// the member key set (bls_verify.hpp make_commitment_bls_verifier). If
+    /// the member set is EVICTED after a successful verify, the refusal MOVES
+    /// DOWNSTREAM: it used to surface here as nullopt -> underivable plan ->
+    /// cause=qc-plan-underivable (node_coin_state.hpp:892), and now surfaces
+    /// at the PoSe-noop gate, which sources the SAME member set
+    /// (main_dash.cpp:4160-4169) -> cause=emit-qc-real-pose-unfolded
+    /// (node_coin_state.hpp:930). SAME OUTCOME — fail closed, no template
+    /// served, no bytes changed — but a DIFFERENT decline cause string, which
+    /// this project ranks serve-gate episodes by (ServeGateJournal,
+    /// work_source.cpp:749-789). Pinned by
+    /// DashQcVerifyMemoDeclineCause.EvictedMemberSetDeclinesAsPoseUnfolded
+    /// (test_dash_node_coin_state.cpp).
     std::optional<vendor::CFinalCommitment>
     verified_for(uint8_t llmq_type, const uint256& quorum_hash) const
     {
         if (!m_bls_verify) return std::nullopt;
         auto it = m_cache.find(Key{llmq_type, quorum_hash});
         if (it == m_cache.end()) return std::nullopt;
-        if (!m_bls_verify(it->second)) return std::nullopt;
-        return it->second;
+        if (!it->second.verified.load(std::memory_order_relaxed)) {
+            if (!m_bls_verify(it->second.c)) return std::nullopt;
+            // Latched ONLY on success. RELAXED is sufficient and is the WHOLE
+            // safety argument: the latch publishes no data — the commitment
+            // bytes it guards are immutable for the entry's whole lifetime
+            // (replacement builds a fresh entry), so there is nothing for an
+            // acquire/release pair to order. A relaxed atomic gives the one
+            // property a plain `bool` did not: reads and writes cannot tear or
+            // race (no UB), so the worst case of a concurrent reader is a
+            // REDUNDANT re-verify of the same bytes to the same verdict.
+            it->second.verified.store(true, std::memory_order_relaxed);
+        }
+        return it->second.c;
     }
 
     size_t size() const { return m_cache.size(); }
@@ -574,7 +775,31 @@ private:
             return std::memcmp(quorumHash.data(), r.quorumHash.data(), 32) < 0;
         }
     };
-    std::map<Key, vendor::CFinalCommitment> m_cache;
+    /// The admitted commitment plus its memoised BLS verdict. `verified` is
+    /// the POSITIVE-ONLY latch verified_for() sets (see there for why it can
+    /// never go stale); it is `mutable` so the const serve-path read can
+    /// record the proof it just paid for, and it dies with the entry — a
+    /// replacement commitment is unlatched by construction.
+    ///
+    /// The latch is std::atomic<bool>, accessed RELAXED, not a plain bool. The
+    /// production caller is the single coin-state-owning thread
+    /// (work_source.cpp:823-827), so a plain bool would be provably safe BY
+    /// READING THE CODE — which is exactly the argument that preceded the
+    /// 2026-08-05 heap corruption on this same money path
+    /// (oracle_shadow_worker racing lockless coin state). A relaxed atomic
+    /// costs nothing on x86-64 (a plain mov either way) and converts "no
+    /// second thread reaches this today" from an invariant someone must keep
+    /// into one the type enforces: a future off-io reader gets a redundant
+    /// re-verify, never a data race.
+    ///
+    /// Consequence, and it is deliberate: Entry is neither copyable nor
+    /// movable, so an entry can only ever be DEFAULT-CONSTRUCTED (unlatched)
+    /// and then filled — a latched verdict cannot be copied onto other bytes.
+    struct Entry {
+        vendor::CFinalCommitment c;
+        mutable std::atomic<bool> verified{false};
+    };
+    std::map<Key, Entry> m_cache;
     BlsVerifyFn m_bls_verify;   // unset until Phase L lands a BLS12-381 lib
     MembersReadyFn m_members_ready;   // observability only; unset => n/a
 };
@@ -760,6 +985,18 @@ struct QcBlockPlan {
 /// (per-height all-or-nothing) — and the embedded arm must fail closed to
 /// the dashd fallback (exactly the PHASE-1 refusal, but now only when
 /// genuinely unable rather than for the whole window).
+/// `also_has_mined` is the PR-2 forward seam (mined_commitment_index.hpp): a
+/// SECOND source for "this quorum's commitment is already on the chain",
+/// derived from our own block replay instead of from an mnlistdiff/qrinfo
+/// round trip. It is OR'd into the QuorumManager answer, so it can only ever
+/// make FEWER slots mandatory — never more, and never a different commitment.
+///
+/// ⚠ MONEY PATH. A slot dropped from the mandatory set is a type-6 tx the
+/// served template no longer carries. That is byte-visible, so the source must
+/// be a mined record that a reorg cannot invalidate — which is exactly why
+/// MinedCommitmentIndex refuses to arm on a live-tip node until dashd's
+/// UndoBlock half (v23.1.7 llmq/blockprocessor.cpp:383-408) is ported.
+/// Defaulted null: every pre-existing caller keeps byte-identical behaviour.
 inline std::optional<QcBlockPlan> build_daemonless_qc_plan(
     LlmqNetwork net, uint32_t next_height,
     const QuorumManager& qmgr,
@@ -767,10 +1004,12 @@ inline std::optional<QcBlockPlan> build_daemonless_qc_plan(
     const std::function<std::optional<uint32_t>(const uint256&)>& height_of_hash,
     const MineableCommitmentCache* cache = nullptr,
     const DkgNullEvidenceFn& null_evidence = nullptr,
-    RequiredQcSlot* first_gap = nullptr)
+    RequiredQcSlot* first_gap = nullptr,
+    const std::function<bool(uint8_t, const uint256&)>& also_has_mined = nullptr)
 {
-    auto has_mined = [&qmgr](uint8_t t, const uint256& qh) {
-        return qmgr.find(t, qh).has_value();
+    auto has_mined = [&qmgr, &also_has_mined](uint8_t t, const uint256& qh) {
+        if (qmgr.find(t, qh).has_value()) return true;
+        return also_has_mined ? also_has_mined(t, qh) : false;
     };
     auto commitments = daemonless_qc_commitments(
         net, next_height, hash_at_height, has_mined, cache,

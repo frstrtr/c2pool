@@ -130,6 +130,13 @@ jobs:
             conan --version   # pre-provisioned at /usr/local/bin on self-hosted
           fi
 
+      # Prefer the LAN Conan mirror when it answers the probe; conancenter stays
+      # as the fallback and is never removed, so an unreachable mirror is a
+      # no-op. Cuts a fresh runner's cold bootstrap from a measured 1554 s
+      # (170.7 MB Boost tarball over the WAN + from-source build) to ~2 s.
+      - name: Prefer LAN Conan remote
+        run: bash ci/conan/lan-remote.sh
+
       - name: Show committed Conan profile
         run: conan profile show -pr:a=ci/conan/linux-gcc13.profile
 
@@ -178,10 +185,19 @@ jobs:
           ctest --test-dir build_ci -R '^boost_sentinel$' --output-on-failure
 
       - name: Build
-        run: cmake --build build_ci --target c2pool -j8
+        # shell: bash => bash -o pipefail. WITHOUT it the default shell is
+        # `bash -e {0}` (no pipefail), so `cmake ... | tee` would report TEE's
+        # exit status — a FAILING build would go green. Every teed step below
+        # needs this for the same reason.
+        shell: bash
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/ci-logs"
+          cmake --build build_ci --target c2pool -j8 2>&1 | tee "${GITHUB_WORKSPACE}/ci-logs/build.log"
 
       - name: Build tests
+        shell: bash          # pipefail: see the Build step note above
         run: |
+          mkdir -p "${GITHUB_WORKSPACE}/ci-logs"
           cmake --build build_ci \
             --target coin_peer_rearm_kat test_hardening test_share_messages test_coin_broadcaster \
                     test_redistribute_address test_redistribute test_auto_ratchet \
@@ -189,7 +205,7 @@ jobs:
                     core_test sharechain_test share_test btc_share_test \
                     test_threading test_weights \
                     test_header_chain test_mempool test_template_builder \
-                    test_doge_chain test_compact_blocks test_dash_x11_kat test_dash_header_chain test_dash_block_replay test_dash_conformance test_dash_subsidy test_dash_mempool test_dash_simplifiedmns test_dash_quorum test_dash_quorum_root test_dash_mn_state test_dash_embedded_gbt test_dash_underfill_guard test_dash_smldiff test_dash_p2p_messages test_dash_p2p_connection test_dash_p2p_node test_dash_node_interface test_dash_config test_dash_broadcaster test_dash_broadcaster_full test_dash_share_hash_link test_dash_block_relay test_dash_rpc_request test_dash_rpc_conf test_dash_block_producer test_dash_embedded_relay_e2e test_dash_block_relay_plan test_dash_version_activation_latch test_dash_block_relay_binding test_dash_block_relay_dual_arm test_dash_coinbase_parity test_dash_coinbase_muldiv test_dash_donation_combined test_dash_g3_assembled test_dash_work_target test_dash_work_job_targets test_dash_stratum_binding test_dash_job_notify_roundtrip test_dash_cb_payee test_dash_stratum_notify_roundtrip test_dash_poolnode_messages test_dash_peer test_dash_share_tracker test_dash_node test_dash_share_messages test_dash_stratum_extranonce_split test_dash_stratum_submit_reassembly test_dash_difficulty_parity test_dash_auto_ratchet test_dash_min_protocol_gate test_dash_work_source test_dash_node_coin_state test_dash_coin_state_maintainer test_dash_node_embedded_wire test_dash_node_reception_wire test_dash_get_work test_dash_stratum_work_source test_dash_superblock test_dash_oracle_byte_parity \
+                    test_doge_chain test_compact_blocks test_dash_x11_kat test_dash_header_chain test_dash_block_replay test_dash_conformance test_dash_subsidy test_dash_mempool test_dash_simplifiedmns test_dash_quorum test_dash_quorum_root test_dash_mn_state test_dash_embedded_gbt test_dash_underfill_guard test_dash_smldiff test_dash_p2p_messages test_dash_p2p_connection test_dash_p2p_node test_dash_node_interface test_dash_config test_dash_broadcaster test_dash_broadcaster_full test_dash_share_hash_link test_dash_block_relay test_dash_rpc_request test_dash_rpc_conf test_dash_block_producer test_dash_embedded_relay_e2e test_dash_block_relay_plan test_dash_version_activation_latch test_dash_block_relay_binding test_dash_block_relay_dual_arm test_dash_coinbase_parity test_dash_coinbase_muldiv test_dash_donation_combined test_dash_g3_assembled test_dash_work_target test_dash_work_job_targets test_dash_stratum_binding test_dash_job_notify_roundtrip test_dash_cb_payee test_dash_stratum_notify_roundtrip test_dash_poolnode_messages test_dash_peer test_dash_share_tracker test_dash_node test_dash_share_messages test_dash_stratum_extranonce_split test_dash_stratum_submit_reassembly test_dash_difficulty_parity test_dash_auto_ratchet test_dash_min_protocol_gate test_dash_work_source test_dash_node_coin_state test_dash_bestcl_gate test_dash_coin_state_maintainer test_dash_node_embedded_wire test_dash_node_reception_wire test_dash_get_work test_dash_stratum_work_source test_dash_superblock test_dash_oracle_byte_parity test_dash_chainlock_verify \
                     test_multiaddress_pplns test_pplns_stress \
                     test_hash_link test_decay_pplns \
                     test_pplns_consensus \
@@ -199,14 +215,17 @@ jobs:
                     test_address_resolution test_compute_share_target test_web_honesty_regression \
                     test_utxo test_dgb_subsidy test_dgb_coinbase_value dgb_share_test dgb_redistribute_test dgb_block_assembly_test dgb_witness_commitment_test dgb_header_sample_build_test dgb_header_ingest_test dgb_mempool_ingest_test \
                     dgb_gentx_coinbase_test dgb_connection_coinbase_test dgb_won_block_serialize_test dgb_pplns_payout_split_test nmc_auxpow_merkle_test nmc_template_builder_test nmc_underfill_guard_test nmc_auxpow_wire_test nmc_reconstruct_won_block_test nmc_mempool_name_test nmc_block_broadcast_test nmc_host_dualpath_test nmc_fallback_path_conformance_test dgb_gentx_share_path_test dgb_conn_pplns_producer_test dgb_other_tx_resolver_test \
-                    dgb_other_tx_assembler_test dgb_reconstruct_won_block_test dgb_reconstruct_closure_test dgb_gentx_unpack_test dgb_work_source_test dgb_template_builder_test dgb_embedded_coin_node_test dgb_embedded_tx_select_test dgb_template_other_txs_test dgb_coinbase_value_parity_test dgb_submit_classify_test dgb_aux_parent_coinbase_parity_test dgb_template_capture_test dgb_aux_doge_db_commitment_bind_test dgb_aux_doge_mm_commitment_test dgb_aux_doge_dc_proof_test dgb_aux_doge_bind_parsers_test dgb_compact_blocks_bip152_parity_test dgb_aux_dual_target_select_test dgb_aux_broadcast_path_election_test dgb_aux_doge_submit_test dgb_aux_doge_embed_livewire_test dgb_aux_doge_dc_layout_verifier_test \
+                    dgb_other_tx_assembler_test dgb_reconstruct_won_block_test dgb_reconstruct_closure_test dgb_gentx_unpack_test dgb_work_source_test dgb_template_builder_test dgb_embedded_coin_node_test dgb_live_node_status_test dgb_embedded_tx_select_test dgb_template_other_txs_test dgb_coinbase_value_parity_test dgb_submit_classify_test dgb_aux_parent_coinbase_parity_test dgb_template_capture_test dgb_aux_doge_db_commitment_bind_test dgb_aux_doge_mm_commitment_test dgb_aux_doge_dc_proof_test dgb_aux_doge_bind_parsers_test dgb_compact_blocks_bip152_parity_test dgb_aux_dual_target_select_test dgb_aux_broadcast_path_election_test dgb_aux_doge_submit_test dgb_aux_doge_embed_livewire_test dgb_aux_doge_dc_layout_verifier_test \
                     rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test header_chain_test \
                     dgb_coin_node_seam_test dgb_block_broadcast_test dgb_won_block_dispatch_test dgb_forced_won_share_dualpath_test dgb_scrypt_pow_test dgb_nonce_grinder_test dgb_regrind_block_test dgb_won_block_finalize_test dgb_share_target_genesis_test dgb_share_target_retarget_test dgb_share_bits_oracle_pin_test dgb_pool_msg_wire_test dgb_get_shares_walk_test dgb_download_stops_test dgb_think_p1_walk_bounds_test dgb_think_p1_desired_emit_test dgb_think_p6_desired_cutoff_test dgb_think_p4_head_keys_test dgb_think_p3_best_head_test dgb_g1_oracle_byte_parity_test dgb_think_p2_walk_bounds_test dgb_expected_time_to_block_test dgb_tail_score_endpoints_test dgb_pool_attempts_per_second_test dgb_pool_efficiency_test dgb_think_p5_best_share_punish_test dgb_auto_ratchet_tail_guard_test dgb_auto_ratchet_sim_test dgb_binomial_conf_interval_test dgb_desired_version_tally_test dgb_min_protocol_ratchet_test dgb_get_height_and_last_endpoints_test dgb_chain_walk_window_test dgb_redistribute_delegate_ghal_test dgb_share_weight_decay_test dgb_naughty_propagation_test dgb_hash_format_parity_test dgb_emergency_decay_saturation_test dgb_arith256_muldiv_kat_test dgb_share_tx_relay_refs_test dgb_coin_peer_rearm_test v37_test \
-            -j8
+            -j8 2>&1 | tee "${GITHUB_WORKSPACE}/ci-logs/build-tests.log"
 
       - name: Run tests
         working-directory: build_ci
-        run: ctest --output-on-failure -j8 --exclude-regex "LiveTest\."
+        shell: bash          # pipefail: a failing ctest must fail the step
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/ci-logs"
+          ctest --output-on-failure -j8 --exclude-regex "LiveTest\." 2>&1 | tee "${GITHUB_WORKSPACE}/ci-logs/run-tests.log"
 
       - name: Package release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -235,6 +254,13 @@ jobs:
           name: linux-x86_64
           path: c2pool-*-linux-x86_64.tar.gz*
 
+      # tee-captured build/test stdout — survives the case where GitHubs own
+      # per-job log capture returns 0 bytes (905-7 job 92744044447, Build tests).
+      - name: Upload build/test logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with: { name: ci-logs-linux, path: ci-logs/, retention-days: 7, if-no-files-found: ignore }
+
       - name: Upload test results on failure
         if: failure()
         uses: actions/upload-artifact@v7
@@ -262,12 +288,192 @@ jobs:
   # Will flip to required once known UAFs are fixed (Phase 7).
   # ════════════════════════════════════════════════════════════════════════════
   linux-asan:
+    # Reap-guard (#1027/#1031 class): host co-residency of two RAM-heavy legs
+    # (this ASan/UBSan build + CodeQL c-cpp analyze) is what produced the
+    # steps=0 reaps on 198 and 145. Exclusion is enforced HOST-SIDE via an
+    # exclusive flock on /tmp (the "Acquire per-host heavy-leg lock" step
+    # below): runner processes on one physical host (905/905-2..905-8,
+    # 198-2/198-3) share /tmp, so the flock is exactly per-host mutual
+    # exclusion -- a second heavy leg on the same host WAITS (nothing is
+    # ever cancelled) while heavy legs on different hosts run in parallel.
+    # A workflow-level concurrency group is deliberately NOT used: GitHub
+    # keeps at most 1 running + 1 pending run per group and CANCELS older
+    # pending entries, so a shared repo-global group self-cancels sibling
+    # jobs of the same run and serializes/starves all heavy legs repo-wide.
     name: Linux x86_64 (AsAN+UBSan)
     # dash bring-up slices may opt out of sanitizers via dash-skip-sanitizers; KEEP for consensus/payout slices (default = on)
     if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-skip-sanitizers')) }}
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    # RUNS ON c2pool-heavy — and CodeQL analyze deliberately does NOT.
+    # This job and CodeQL analyze are the ONLY two holders of the per-host
+    # reap-guard flock (#1105), so they must sit on DIFFERENT hosts or they
+    # serialize (measured: one held the lock while the second sat blocked in
+    # `flock -x -w 3600`). Which one moves is decided by where each is PROVEN:
+    #   * this leg builds with `conan profile detect --force` (HOST DEFAULT
+    #     compiler). The heavy host now defaults to gcc-13 and a from-scratch
+    #     ASan+UBSan build there — purged conan cache, every dep rebuilt —
+    #     links clean ([100%], 0 link errors). Earlier, under a gcc-15 default,
+    #     it could not link at all (undefined reference to
+    #     `std::ostream::_Disable_exceptions', a libstdc++/dep ABI mismatch);
+    #     that is history, not a live constraint.
+    #   * CodeQL stays on c2pool-build: staging its ~823 MB CLI bundle failed
+    #     on the heavy host 4/4 ("'/usr/bin/tar' failed with exit code 2") —
+    #     a THROUGHPUT problem (that host's egress swings ~258 KB/s..1 MB/s, so
+    #     fixed timeouts cut large transfers short), not corruption and not
+    #     PMTU. See the note in codeql-analysis.yml; it is revisitable, but
+    #     flock separation would still keep these two on different hosts.
+    # Do not consolidate these two onto one label.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-heavy"]') || 'ubuntu-24.04' }}
     continue-on-error: true
     steps:
+      # Reap-guard: host-scoped exclusivity vs the other RAM-heavy leg
+      # (CodeQL c-cpp analyze). The lock is held by a disowned holder
+      # process so it spans every step of this job (the CodeQL sibling's
+      # heavy phase is an action step that cannot be wrapped in a shell
+      # flock, hence the cross-step holder shape on both sides). Released
+      # by the always() step at the end of the job; the holder also has a
+      # 4 h TTL so a host-reaped job can never wedge the lock, and the
+      # runner's end-of-job orphan cleanup is a second net.
+      - name: Acquire per-host heavy-leg lock (reap-guard)
+        if: runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Per-host heavy-leg semaphore (VM905: up to 8 runners on a 32-core/62 GB box).
+          # History: a single slot (1 heavy leg per host) became the #1 CI failure mode --
+          # 8 runners serialized behind one flock while ~2/3 of the box sat idle, and
+          # waiters hard-failed at the -w budget (integrator measurement 2026-08-05). This
+          # guard now offers HEAVY_LEG_SLOTS concurrent slots with first-free acquisition:
+          # a leg takes the first free slot, so up to SLOTS heavy legs (ASan/UBSan build +
+          # CodeQL c-cpp analyze) run concurrently on one host and the (SLOTS+1)th WAITS --
+          # nothing is ever cancelled. 2 ASan/CodeQL legs fit 32c/62G comfortably; do NOT
+          # raise SLOTS past 3 without first measuring an ASan leg's peak RSS.
+          # Two holder invariants preserved from #1112:
+          #  (1) the holder dies WITH the job -- it waits on the runner-worker PID and
+          #      frees its slot the instant that worker dies; TTL is only a ceiling.
+          #  (2) a stale holder from an already-dead job is REAPED at acquire, not blocked
+          #      on: a recorded holder whose worker is gone, or a markerless PPID-1 legacy
+          #      orphan, is by definition dead.
+          # HEAVY_LEG_* env overrides exist ONLY for the honesty-gate test
+          # (.github/actions/heavy-leg-lock/test.sh); production uses the defaults.
+          LOCK="${HEAVY_LEG_LOCK:-/tmp/c2pool-heavy-leg.lock}"
+          HOLDERFILE="${HEAVY_LEG_HOLDERFILE:-/tmp/c2pool-heavy-leg.holder}"
+          WAIT="${HEAVY_LEG_WAIT:-5400}"
+          TTL="${HEAVY_LEG_TTL:-14400}"
+          SWEEP="${HEAVY_LEG_SWEEP:-1}"
+          SLOTS="${HEAVY_LEG_SLOTS:-2}"
+          ACQ="$(mktemp -u /tmp/c2pool-heavy-acq.XXXXXX)"
+
+          # Slot files are ${LOCK}.1 .. ${LOCK}.SLOTS; each slot's live holder records a
+          # ${HOLDERFILE}.<slot> marker ("holderpid workerpid"). Both are per-slot so two
+          # concurrent holders never clobber each other's marker.
+
+          # --- stale-holder sweep: reap the dead on each slot instead of blocking ---
+          if [ "$SWEEP" = 1 ]; then
+            _s=1
+            while [ "$_s" -le "$SLOTS" ]; do
+              _mf="${HOLDERFILE}.${_s}"
+              if [ -f "$_mf" ]; then
+                read -r MH MW _ < "$_mf" 2>/dev/null || true
+                if [ -n "${MW:-}" ] && [ "${MW:-0}" != 0 ] && ! kill -0 "$MW" 2>/dev/null; then
+                  echo "heavy-leg sweep: reaping holder pid ${MH:-?} on slot $_s (worker $MW dead)"
+                  [ -n "${MH:-}" ] && kill "$MH" 2>/dev/null || true
+                  rm -f "$_mf"
+                fi
+              fi
+              # Markerless PPID-1 orphan on this slot = a pre-guard `sleep` holder: our live
+              # holders always keep a marker, and a still-waiting new holder has a live
+              # parent, so PPID==1 + no marker is unambiguously dead.
+              if [ ! -f "$_mf" ] && command -v fuser >/dev/null 2>&1; then
+                for _q in $(fuser "${LOCK}.${_s}" 2>/dev/null | tr -d ' '); do
+                  _qp="$(ps -o ppid= -p "$_q" 2>/dev/null | tr -d ' ' || true)"
+                  if [ "${_qp:-0}" = 1 ]; then
+                    echo "heavy-leg sweep: reaping markerless PPID-1 orphan pid $_q on slot $_s"
+                    kill "$_q" 2>/dev/null || true
+                  fi
+                done
+              fi
+              _s=$((_s+1))
+            done
+          fi
+
+          # --- find the runner-worker so the holder can die with the job ---
+          WORKER=""
+          _p=$$
+          while [ "${_p:-1}" -gt 1 ]; do
+            case "$(ps -o comm= -p "$_p" 2>/dev/null || true)" in
+              Runner.Worker*) WORKER="$_p"; break ;;
+            esac
+            _p="$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ' || true)"
+            [ -z "${_p:-}" ] && break
+          done
+
+          # --- spawn the holder: first-free across SLOTS, holds its fd for the job's life ---
+          # Each slot opens on fd (8+slot); slot 1 -> fd 9 (as before). The held fd is
+          # closed (N>&-) in the sleep child so a kill of this bash frees the slot at once.
+          # The holder exits when the runner-worker dies, or at TTL, whichever is first; if
+          # the worker could not be found it falls back to a pure TTL ceiling.
+          env LOCK="$LOCK" HOLDERFILE="$HOLDERFILE" ACQ="$ACQ" WAIT="$WAIT" TTL="$TTL" SLOTS="$SLOTS" WORKER="$WORKER" \
+          bash -c '
+            _s=1
+            while [ "$_s" -le "$SLOTS" ]; do
+              _fd=$((8+_s))
+              eval "exec ${_fd}>\"\${LOCK}.\${_s}\"" || exit 1
+              _s=$((_s+1))
+            done
+            _held_fd=""
+            _deadline=$(( SECONDS + WAIT ))
+            while [ "$SECONDS" -lt "$_deadline" ]; do
+              _s=1
+              while [ "$_s" -le "$SLOTS" ]; do
+                _fd=$((8+_s))
+                if flock -n "$_fd"; then _held_fd="$_fd"; break; fi
+                _s=$((_s+1))
+              done
+              [ -n "$_held_fd" ] && break
+              sleep 3
+            done
+            [ -z "$_held_fd" ] && exit 1
+            _held_slot=$(( _held_fd - 8 ))
+            printf "%s %s\n" "$$" "${WORKER:-0}" > "${HOLDERFILE}.${_held_slot}"
+            echo "$_held_slot" > "$ACQ"
+            _end=$(( SECONDS + TTL ))
+            while [ "$SECONDS" -lt "$_end" ]; do
+              if [ -n "$WORKER" ] && ! kill -0 "$WORKER" 2>/dev/null; then break; fi
+              eval "sleep 15 ${_held_fd}>&-"
+            done
+            rm -f "${HOLDERFILE}.${_held_slot}"
+          ' </dev/null >/dev/null 2>&1 &
+          HOLDER=$!
+          disown "$HOLDER" 2>/dev/null || true
+          echo "HEAVY_LEG_LOCK_HOLDER=$HOLDER" >> "${GITHUB_ENV:-/dev/null}"
+
+          # --- wait for the acquire handshake ---
+          while kill -0 "$HOLDER" 2>/dev/null && [ ! -s "$ACQ" ]; do
+            sleep 2
+          done
+          if [ ! -s "$ACQ" ]; then
+            echo "::error::per-host heavy-leg lock: all $SLOTS slots busy for $((WAIT/60)) min on ${RUNNER_NAME:-?} -- blocked by live long holders, not this diff"
+            _s=1
+            while [ "$_s" -le "$SLOTS" ]; do
+              echo "  slot $_s (${LOCK}.${_s}):"
+              if command -v fuser >/dev/null 2>&1; then
+                for _q in $(fuser "${LOCK}.${_s}" 2>/dev/null | tr -d ' '); do
+                  # pid ppid age(etimes,s) comm -- names the live holder blocking this slot
+                  echo "    holder [pid ppid age_s comm]: $(ps -o pid=,ppid=,etimes=,comm= -p "$_q" 2>/dev/null | tr -s ' ')"
+                done
+              fi
+              if [ -f "${HOLDERFILE}.${_s}" ]; then
+                echo "    marker (holderpid workerpid): $(cat "${HOLDERFILE}.${_s}" 2>/dev/null)"
+              else
+                echo "    marker: (none)"
+              fi
+              _s=$((_s+1))
+            done
+            exit 1
+          fi
+          _got="$(cat "$ACQ" 2>/dev/null)"
+          rm -f "$ACQ"
+          echo "heavy-leg lock acquired on ${RUNNER_NAME:-?} slot ${_got:-?}/$SLOTS (holder pid $HOLDER, worker ${WORKER:-none})"
       - uses: actions/checkout@v6
 
       # Per-job Conan home under $RUNNER_TEMP so concurrent jobs on the shared
@@ -309,6 +515,13 @@ jobs:
           else
             conan --version   # pre-provisioned at /usr/local/bin on self-hosted
           fi
+
+      # Prefer the LAN Conan mirror when it answers the probe; conancenter stays
+      # as the fallback and is never removed, so an unreachable mirror is a
+      # no-op. Cuts a fresh runner's cold bootstrap from a measured 1554 s
+      # (170.7 MB Boost tarball over the WAN + from-source build) to ~2 s.
+      - name: Prefer LAN Conan remote
+        run: bash ci/conan/lan-remote.sh
 
       - name: Detect Conan profile
         run: |
@@ -381,7 +594,7 @@ jobs:
                     test_threading test_weights \
                     test_header_chain test_mempool test_template_builder \
                     test_doge_chain test_compact_blocks test_dash_x11_kat \
-                    test_dash_header_chain test_dash_block_replay test_dash_conformance test_dash_subsidy test_dash_mempool test_dash_simplifiedmns test_dash_quorum test_dash_quorum_root test_dash_mn_state test_dash_embedded_gbt test_dash_underfill_guard test_dash_smldiff test_dash_p2p_messages test_dash_p2p_connection test_dash_p2p_node test_dash_node_interface test_dash_config test_dash_broadcaster test_dash_broadcaster_full test_dash_share_hash_link test_dash_block_relay test_dash_rpc_request test_dash_rpc_conf test_dash_block_producer test_dash_embedded_relay_e2e test_dash_block_relay_plan test_dash_version_activation_latch test_dash_block_relay_binding test_dash_block_relay_dual_arm test_dash_coinbase_parity test_dash_coinbase_muldiv test_dash_donation_combined test_dash_g3_assembled test_dash_work_target test_dash_work_job_targets test_dash_stratum_binding test_dash_job_notify_roundtrip test_dash_cb_payee test_dash_stratum_notify_roundtrip test_dash_poolnode_messages test_dash_peer test_dash_share_tracker test_dash_node test_dash_share_messages test_dash_stratum_extranonce_split test_dash_stratum_submit_reassembly test_dash_difficulty_parity test_dash_auto_ratchet test_dash_min_protocol_gate test_dash_work_source test_dash_node_coin_state test_dash_coin_state_maintainer test_dash_node_embedded_wire test_dash_node_reception_wire test_dash_get_work test_dash_stratum_work_source test_dash_superblock test_dash_oracle_byte_parity \
+                    test_dash_header_chain test_dash_block_replay test_dash_conformance test_dash_subsidy test_dash_mempool test_dash_simplifiedmns test_dash_quorum test_dash_quorum_root test_dash_mn_state test_dash_embedded_gbt test_dash_underfill_guard test_dash_smldiff test_dash_p2p_messages test_dash_p2p_connection test_dash_p2p_node test_dash_node_interface test_dash_config test_dash_broadcaster test_dash_broadcaster_full test_dash_share_hash_link test_dash_block_relay test_dash_rpc_request test_dash_rpc_conf test_dash_block_producer test_dash_embedded_relay_e2e test_dash_block_relay_plan test_dash_version_activation_latch test_dash_block_relay_binding test_dash_block_relay_dual_arm test_dash_coinbase_parity test_dash_coinbase_muldiv test_dash_donation_combined test_dash_g3_assembled test_dash_work_target test_dash_work_job_targets test_dash_stratum_binding test_dash_job_notify_roundtrip test_dash_cb_payee test_dash_stratum_notify_roundtrip test_dash_poolnode_messages test_dash_peer test_dash_share_tracker test_dash_node test_dash_share_messages test_dash_stratum_extranonce_split test_dash_stratum_submit_reassembly test_dash_difficulty_parity test_dash_auto_ratchet test_dash_min_protocol_gate test_dash_work_source test_dash_node_coin_state test_dash_bestcl_gate test_dash_coin_state_maintainer test_dash_node_embedded_wire test_dash_node_reception_wire test_dash_get_work test_dash_stratum_work_source test_dash_superblock test_dash_oracle_byte_parity test_dash_chainlock_verify \
                     test_hash_link test_decay_pplns \
                     test_pplns_consensus \
                     test_v36_script_sorting test_v36_cross_impl_refhash \
@@ -390,7 +603,7 @@ jobs:
                     test_address_resolution test_compute_share_target test_web_honesty_regression \
                     test_utxo test_dgb_subsidy test_dgb_coinbase_value dgb_share_test dgb_redistribute_test dgb_block_assembly_test dgb_witness_commitment_test dgb_header_sample_build_test dgb_header_ingest_test dgb_mempool_ingest_test \
                     dgb_gentx_coinbase_test dgb_connection_coinbase_test dgb_won_block_serialize_test dgb_pplns_payout_split_test nmc_auxpow_merkle_test nmc_template_builder_test nmc_underfill_guard_test nmc_auxpow_wire_test nmc_reconstruct_won_block_test nmc_mempool_name_test nmc_block_broadcast_test nmc_host_dualpath_test nmc_fallback_path_conformance_test dgb_gentx_share_path_test dgb_conn_pplns_producer_test dgb_other_tx_resolver_test \
-                    dgb_other_tx_assembler_test dgb_reconstruct_won_block_test dgb_reconstruct_closure_test dgb_gentx_unpack_test dgb_work_source_test dgb_template_builder_test dgb_embedded_coin_node_test dgb_embedded_tx_select_test dgb_template_other_txs_test dgb_coinbase_value_parity_test dgb_submit_classify_test dgb_aux_parent_coinbase_parity_test dgb_template_capture_test dgb_aux_doge_db_commitment_bind_test dgb_aux_doge_mm_commitment_test dgb_aux_doge_dc_proof_test dgb_aux_doge_bind_parsers_test dgb_compact_blocks_bip152_parity_test dgb_aux_dual_target_select_test dgb_aux_broadcast_path_election_test dgb_aux_doge_submit_test dgb_aux_doge_embed_livewire_test dgb_aux_doge_dc_layout_verifier_test \
+                    dgb_other_tx_assembler_test dgb_reconstruct_won_block_test dgb_reconstruct_closure_test dgb_gentx_unpack_test dgb_work_source_test dgb_template_builder_test dgb_embedded_coin_node_test dgb_live_node_status_test dgb_embedded_tx_select_test dgb_template_other_txs_test dgb_coinbase_value_parity_test dgb_submit_classify_test dgb_aux_parent_coinbase_parity_test dgb_template_capture_test dgb_aux_doge_db_commitment_bind_test dgb_aux_doge_mm_commitment_test dgb_aux_doge_dc_proof_test dgb_aux_doge_bind_parsers_test dgb_compact_blocks_bip152_parity_test dgb_aux_dual_target_select_test dgb_aux_broadcast_path_election_test dgb_aux_doge_submit_test dgb_aux_doge_embed_livewire_test dgb_aux_doge_dc_layout_verifier_test \
                     rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test header_chain_test \
                     dgb_coin_node_seam_test dgb_block_broadcast_test dgb_won_block_dispatch_test dgb_forced_won_share_dualpath_test dgb_scrypt_pow_test dgb_nonce_grinder_test dgb_regrind_block_test dgb_won_block_finalize_test dgb_share_target_genesis_test dgb_share_target_retarget_test dgb_share_bits_oracle_pin_test dgb_pool_msg_wire_test dgb_get_shares_walk_test dgb_download_stops_test dgb_think_p1_walk_bounds_test dgb_think_p1_desired_emit_test dgb_think_p6_desired_cutoff_test dgb_think_p4_head_keys_test dgb_think_p3_best_head_test dgb_g1_oracle_byte_parity_test dgb_think_p2_walk_bounds_test dgb_expected_time_to_block_test dgb_tail_score_endpoints_test dgb_pool_attempts_per_second_test dgb_pool_efficiency_test dgb_think_p5_best_share_punish_test dgb_auto_ratchet_tail_guard_test dgb_auto_ratchet_sim_test dgb_binomial_conf_interval_test dgb_desired_version_tally_test dgb_min_protocol_ratchet_test dgb_get_height_and_last_endpoints_test dgb_chain_walk_window_test dgb_redistribute_delegate_ghal_test dgb_share_weight_decay_test dgb_naughty_propagation_test dgb_hash_format_parity_test dgb_emergency_decay_saturation_test dgb_arith256_muldiv_kat_test dgb_share_tx_relay_refs_test dgb_coin_peer_rearm_test test_coin_broadcaster test_multiaddress_pplns test_pplns_stress \
                     v37_test \
@@ -414,6 +627,20 @@ jobs:
         if: always()
         uses: ./.github/actions/prune-runner-workspace
 
+      - name: Release per-host heavy-leg lock
+        if: always() && runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          H="${HEAVY_LEG_LOCK_HOLDER:-}"
+          if [ -n "$H" ]; then
+            kill "$H" 2>/dev/null || true
+            # drop whichever per-slot marker this holder owns
+            for MF in "${HEAVY_LEG_HOLDERFILE:-/tmp/c2pool-heavy-leg.holder}".*; do
+              [ -f "$MF" ] || continue
+              read -r _mh _ < "$MF" 2>/dev/null || true
+              [ "${_mh:-}" = "$H" ] && rm -f "$MF" || true
+            done
+          fi
   # ════════════════════════════════════════════════════════════════════════════
   # COIN_BCH leg — Bitcoin Cash (SHA256d standalone parent, V36)
   #
@@ -475,6 +702,13 @@ jobs:
             conan --version   # pre-provisioned at /usr/local/bin on self-hosted
           fi
 
+      # Prefer the LAN Conan mirror when it answers the probe; conancenter stays
+      # as the fallback and is never removed, so an unreachable mirror is a
+      # no-op. Cuts a fresh runner's cold bootstrap from a measured 1554 s
+      # (170.7 MB Boost tarball over the WAN + from-source build) to ~2 s.
+      - name: Prefer LAN Conan remote
+        run: bash ci/conan/lan-remote.sh
+
       - name: Detect Conan profile
         run: |
           conan profile detect --force
@@ -525,6 +759,9 @@ jobs:
                     bch_header_sync_progress_test bch_block_download_test \
                     bch_idle_watchdog_kat_test \
                     bch_seed_tier_kat_test \
+                    bch_graph_db_shutdown_persist_test \
+                    bch_known_txs_evict_wiring_test \
+                    bch_found_block_verify_test \
                     bch_genesis_conformance_test bch_abla_growth_soak_test \
                     bch_coinbase_kat_segwit_predicate_test \
                     bch_coinbase_kat_bytevector_test \
@@ -533,6 +770,7 @@ jobs:
                     bch_cashtokens_transparency_test \
                     bch_cashaddr_kat_test \
                     bch_share_tx_refs_kat_test \
+                    bch_share_remove_owns_data_test \
                     bch_block_connector_test bch_block_ordering_test \
                     bch_utxo_connect_test bch_reorg_connect_test bch_reorg_rerequest_test \
                     bch_compact_block_connector_test \
@@ -610,6 +848,13 @@ jobs:
             conan --version   # pre-provisioned at /usr/local/bin on self-hosted
           fi
 
+      # Prefer the LAN Conan mirror when it answers the probe; conancenter stays
+      # as the fallback and is never removed, so an unreachable mirror is a
+      # no-op. Cuts a fresh runner's cold bootstrap from a measured 1554 s
+      # (170.7 MB Boost tarball over the WAN + from-source build) to ~2 s.
+      - name: Prefer LAN Conan remote
+        run: bash ci/conan/lan-remote.sh
+
       - name: Detect Conan profile
         run: |
           conan profile detect --force
@@ -666,6 +911,9 @@ jobs:
                     bch_header_sync_progress_test bch_block_download_test \
                     bch_idle_watchdog_kat_test \
                     bch_seed_tier_kat_test \
+                    bch_graph_db_shutdown_persist_test \
+                    bch_known_txs_evict_wiring_test \
+                    bch_found_block_verify_test \
                     bch_genesis_conformance_test bch_abla_growth_soak_test \
                     bch_coinbase_kat_segwit_predicate_test \
                     bch_coinbase_kat_bytevector_test \
@@ -674,6 +922,7 @@ jobs:
                     bch_cashtokens_transparency_test \
                     bch_cashaddr_kat_test \
                     bch_share_tx_refs_kat_test \
+                    bch_share_remove_owns_data_test \
                     bch_block_connector_test bch_block_ordering_test \
                     bch_utxo_connect_test bch_reorg_connect_test bch_reorg_rerequest_test \
                     bch_compact_block_connector_test \
@@ -827,7 +1076,10 @@ jobs:
     name: Qt WebEngine leak gate
     needs: changes
     if: ${{ needs.changes.outputs.qt == 'true' || github.event_name != 'pull_request' }}
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    # Pinned to draft-release (persistent 145/198/905 pool: NOPASSWD sudo +
+    # Qt6/xvfb). Excludes transient c2pool-heavy hosts (oplex7020) that lack
+    # Qt6 and NOPASSWD sudo. #1122 routing fix.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","draft-release"]') || 'ubuntu-24.04' }}
     # Hard ceiling: orphaned QtWebEngine/Chromium helper children survive
     # the inner `timeout 180`, holding the xvfb pipe open and hanging the
     # job to the 360-min runner default. Cap it so a hung leak gate is
@@ -1193,7 +1445,8 @@ jobs:
 
       - name: Verify binary
         run: |
-          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-6.dll" build_ci/src/c2pool/Release/
+          # SONAME-agnostic glob: upstream bumps libsecp256k1-N.dll (6->7 etc). Do NOT re-pin a number.
+          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-*.dll" build_ci/src/c2pool/Release/
           # Run the binary to completion and capture its output BEFORE slicing.
           # Piping straight into `Select-Object -First 3` closes the pipe after 3
           # lines while c2pool.exe is still writing its banner, so the next stdout
@@ -1214,8 +1467,9 @@ jobs:
           Copy-Item build_ci/src/c2pool/Release/c2pool.exe "${PKG}/"
           # DLL must be next to exe for Windows DLL search path (portable ZIP)
           # Also copy to lib/ for Inno Setup installer compatibility
-          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-6.dll" "${PKG}/"
-          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-6.dll" "${PKG}/lib/"
+          # SONAME-agnostic glob: upstream bumps libsecp256k1-N.dll (6->7 etc). Do NOT re-pin a number.
+          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-*.dll" "${PKG}/"
+          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-*.dll" "${PKG}/lib/"
           Copy-Item start.bat "${PKG}/"
           Copy-Item -Recurse web-static/* "${PKG}/web-static/"
           Copy-Item explorer/explorer.py "${PKG}/explorer/"
@@ -1269,6 +1523,13 @@ jobs:
           else
             conan --version   # pre-provisioned at /usr/local/bin on self-hosted
           fi
+
+      # Prefer the LAN Conan mirror when it answers the probe; conancenter stays
+      # as the fallback and is never removed, so an unreachable mirror is a
+      # no-op. Cuts a fresh runner's cold bootstrap from a measured 1554 s
+      # (170.7 MB Boost tarball over the WAN + from-source build) to ~2 s.
+      - name: Prefer LAN Conan remote
+        run: bash ci/conan/lan-remote.sh
 
       - name: Detect Conan profile
         run: |
@@ -1397,6 +1658,13 @@ jobs:
             conan --version   # pre-provisioned at /usr/local/bin on self-hosted
           fi
 
+      # Prefer the LAN Conan mirror when it answers the probe; conancenter stays
+      # as the fallback and is never removed, so an unreachable mirror is a
+      # no-op. Cuts a fresh runner's cold bootstrap from a measured 1554 s
+      # (170.7 MB Boost tarball over the WAN + from-source build) to ~2 s.
+      - name: Prefer LAN Conan remote
+        run: bash ci/conan/lan-remote.sh
+
       - name: Restore Conan cache (github-hosted only)
         if: runner.environment == 'github-hosted'
         uses: actions/cache@v5
@@ -1438,6 +1706,7 @@ jobs:
             --target c2pool-dash \
                      test_dash_bls_verify test_dash_quorum_members \
                      test_dash_quorum_member_source test_dash_govvote_bls \
+                     test_dash_chainlock_verify \
             -j8
 
       # LEG 2: the artefact itself carries the dashbls backend.
@@ -1446,7 +1715,7 @@ jobs:
 
       - name: Run BLS KATs
         working-directory: build_dash_bls
-        run: ctest --output-on-failure -j8 -R 'DashBlsVerify|DashQuorumMembers|DashQuorumMemberSource|DashGovVoteBLS'
+        run: ctest --output-on-failure -j8 -R 'DashBlsVerify|DashQuorumMembers|DashQuorumMemberSource|DashGovVoteBLS|DashChainLockVerify'
 
       # LEG 3: the BLS-ONLY cases actually ran. Each of these is inside
       # #ifdef C2POOL_DASH_BLS, so on a stub build they do not fail -- they
@@ -1458,8 +1727,9 @@ jobs:
           # `|| true`: pass/fail is already gated by the ctest step above. Here
           # the only question is which cases EXIST, so a non-zero exit must not
           # abort before the per-case report below is printed.
-          ./test/test_dash_bls_verify     > bls_kat.log 2>&1 || true
-          ./test/test_dash_quorum_members >> bls_kat.log 2>&1 || true
+          ./test/test_dash_bls_verify        > bls_kat.log 2>&1 || true
+          ./test/test_dash_quorum_members    >> bls_kat.log 2>&1 || true
+          ./test/test_dash_chainlock_verify  >> bls_kat.log 2>&1 || true
           log="$(cat bls_kat.log)"
           missing=0
           for t in \
@@ -1468,7 +1738,13 @@ jobs:
             DashBlsVerify.VerifyFinalCommitmentSyntheticRoundTrip \
             DashQuorumMembers.RealCommitmentVerifiesWithComputedMembers \
             DashQuorumMembers.RealPlatformCommitmentVerifiesWithEvoOnlyMembers \
-            DashQuorumMembers.PartialSignersAndValidMembers
+            DashQuorumMembers.PartialSignersAndValidMembers \
+            DashChainLockVerify.RealChainLockVerifies \
+            DashChainLockVerify.TamperedSignatureIsRejected \
+            DashChainLockVerify.ForgedSignatureIsRejected \
+            DashChainLockVerify.InternallyValidSignatureFromWrongQuorumIsRejected \
+            DashChainLockVerify.WrongQuorumKeyIsRejected \
+            DashChainLockVerify.RejectedWhenSigningQuorumIsMissingFromTheSet
           do
             # Pure-shell match, not `grep -q` in a pipeline: under pipefail a
             # `grep -q` that matches SIGPIPEs its producer and the pipeline

@@ -1,0 +1,92 @@
+name: LTC embedded-bootstrap live gate
+
+# Proves the DEFAULT-ON embedded LTC bootstrap end-to-end against the REAL
+# Litecoin P2P network: DNS-seed resolve -> connect -> version/verack ->
+# getheaders -> HeaderChain tip advances. This is the first CI coverage of the
+# bootstrap path that BTC/DGB/BCH/DASH copy as "reuse".
+#
+# Runs on a github-hosted runner for guaranteed internet egress (the whole
+# point is to exercise real DNS + real P2P). The gate GTEST_SKIPs with a NAMED,
+# logged reason if DNS or P2P egress is blocked, so a silent skip can never
+# read as green.
+
+on:
+  push:
+    branches:
+      - 'ltc-doge/embedded-bootstrap-live-gate'
+  pull_request:
+    paths:
+      - 'src/impl/ltc/test/embedded_bootstrap_live_test.cpp'
+      - 'src/impl/ltc/test/CMakeLists.txt'
+      - 'src/impl/ltc/coin/chain_seeds.hpp'
+      - 'src/core/dns_seeder.hpp'
+      - '.github/workflows/ltc-embedded-bootstrap-live-gate.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
+jobs:
+  live-bootstrap-gate:
+    name: LTC embedded-bootstrap live gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set per-job Conan home
+        run: echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            g++ ccache cmake make libleveldb-dev libsecp256k1-dev
+
+      - uses: actions/setup-python@v6
+        with: { python-version: '3.12' }
+
+      - name: Install Conan 2
+        run: |
+          pip install "conan>=2.0,<3.0"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Restore Conan cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/conan2
+          key: conan2-ubuntu24-gcc13-${{ hashFiles('conanfile.txt', 'ci/conan/linux-gcc13.profile') }}
+
+      # Match the green coin-matrix provisioning exactly: lockfile-pinned deps
+      # and an EXPLICIT build_type=Release so conan generates the Release dep
+      # data cmake then consumes (no host/build build_type drift).
+      - name: Conan install
+        run: |
+          for attempt in 1 2 3; do
+            if conan install . \
+              -pr:a=ci/conan/linux-gcc13.profile \
+              --lockfile=conan.lock \
+              --build=missing \
+              --output-folder=build_ci \
+              --settings=build_type=Release; then exit 0; fi
+            echo "conan install failed (attempt $attempt/3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          exit 1
+
+      - name: Configure (LTC live-bootstrap gate ON)
+        run: |
+          cmake -S . -B build_ci \
+            -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLTC_LIVE_BOOTSTRAP_GATE=ON
+
+      - name: Build the gate target
+        run: cmake --build build_ci --target ltc_embedded_bootstrap_gate -j"$(nproc)"
+
+      # Run the gate directly (NOT ctest --exclude-regex 'LiveTest\.'); -V so the
+      # [bootstrap-gate] resolve/handshake/tip-advance lines are on the log.
+      - name: Run the live-bootstrap gate
+        run: ctest --test-dir build_ci -R '^LtcEmbeddedBootstrapGate$' --output-on-failure -V

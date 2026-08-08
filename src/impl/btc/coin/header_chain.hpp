@@ -554,6 +554,12 @@ public:
     /// Set the estimated network tip height (from peer's version message).
     void set_peer_tip_height(uint32_t height) { m_peer_tip_height.store(height); }
 
+    /// Estimated network tip height from the peer version handshake; 0 before
+    /// the first peer reports. Read-only display accessor for the D-BTC
+    /// dashboard sync-progress datum (synced height vs peer tip). Mirrors the
+    /// D-BCH peer_tip_height() getter (PR #1055).
+    uint32_t peer_tip_height() const { return m_peer_tip_height.load(std::memory_order_relaxed); }
+
     /// Dynamically seed a checkpoint at runtime (e.g., from RPC getblockhash).
     /// Only applied if the chain is still at or below the hardcoded checkpoint.
     /// This allows an accessible daemon to provide a more recent starting point.

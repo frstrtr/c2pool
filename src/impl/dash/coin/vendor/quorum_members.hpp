@@ -57,11 +57,12 @@
 ///     legacy_scheme = (nVersion == VER_LEGACY_BLS) — the #812 finding: the SML
 ///     nVersion is the ONLY unambiguous scheme signal for a mixed quorum.
 ///
-/// ROTATED (DIP-24, llmq_60_75): ComputeQuorumMembersByQuarterRotation over
-/// the cycle snapshots (qrinfo) is NOT implemented here — compute_quorum_members
-/// returns std::nullopt for a rotated type, so the verifier FAILS CLOSED and
-/// the rotated-window slot mines the consensus-valid null commitment (reward-
-/// safe). Documented follow-up.
+/// ROTATED (DIP-24, llmq_60_75) LIVES NEXT DOOR: a rotated member set cannot be
+/// selected from ONE snapshot, so compute_quorum_members below returns
+/// std::nullopt for a rotated type — deliberately, and permanently. The
+/// quarter-rotation computation over the qrinfo cycle snapshots is
+/// vendor::compute_quorum_members_by_quarter_rotation in
+/// quorum_members_rotated.hpp; QuorumMemberSource routes rotated types there.
 ///
 /// FAIL-CLOSED throughout: pre-V20 height, rotated type, empty/short SML, a
 /// selected MN with a zero operator key, fewer confirmed+valid MNs than the
@@ -107,9 +108,11 @@ inline constexpr uint8_t kLlmqTypePlatformTestnet = 6;   // LLMQ_25_67
 
 // V20 activation floor (chainparams.cpp DEPLOYMENT_V20 nActivationHeight).
 // This module ONLY serves member sets for quorums whose WORK block is post-V20
-// (the modifier era it reproduces). Below it -> std::nullopt -> null-serve
-// (reward-safe: the DKG-window slot mines the consensus-valid null commitment,
-// or the arm falls back to dashd). RE-DIFF on a vendored-dashcore pin bump.
+// (the modifier era it reproduces). Below it -> std::nullopt -> the member set
+// is unsourced, so the slot cannot be satisfied and the whole DKG-window height
+// falls back to dashd (reward-safe; the slot is NOT null-served — see
+// dkg_commitments.hpp HEIGHT COMPLETENESS). RE-DIFF on a vendored-dashcore pin
+// bump.
 inline constexpr uint32_t kV20FloorMainnet = 1'987'776u;
 inline constexpr uint32_t kV20FloorTestnet =   905'100u;
 
@@ -201,7 +204,9 @@ inline std::optional<std::vector<MemberOperatorKey>> compute_quorum_members(
     const QuorumMemberParams& params, const uint256& modifier,
     const CSimplifiedMNList& sml)
 {
-    if (params.use_rotation) return std::nullopt;   // DIP-24: qrinfo follow-up
+    // DIP-24: rotated selection is quarter rotation over a qrinfo, never a
+    // single snapshot — see quorum_members_rotated.hpp.
+    if (params.use_rotation) return std::nullopt;
     if (params.size == 0) return std::nullopt;
 
     struct Scored {

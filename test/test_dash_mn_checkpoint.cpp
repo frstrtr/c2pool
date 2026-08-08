@@ -40,6 +40,7 @@
 
 #include <impl/dash/coin/mn_checkpoint.hpp>       // parse_mn_checkpoint (DUT)
 #include <impl/dash/coin/mn_checkpoint_lane.hpp>  // MnCheckpointLane (DUT)
+#include <impl/dash/coin/mn_bridge_cursor.hpp>    // MnBridgeCursorStore (DUT, #91)
 #include <impl/dash/coin/vendor/providertx.hpp>   // CProUpServTx (revival leg)
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>// CSimplifiedMNList (attestation source)
 #include <impl/dash/coin/mn_seed.hpp>             // parse_protx_list_seed (E2c cross-check)
@@ -56,7 +57,10 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <span>
@@ -64,6 +68,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <unistd.h>   // getpid — unique temp paths for the #91 cursor KATs
 
 using dash::coin::MNState;
 using dash::coin::MnCheckpoint;
@@ -3364,6 +3370,108 @@ struct DirtyBridge {
 
 } // namespace
 
+// ═══════════════════════════════════════════════════════════════════════════
+// TASK #103 — EVERY pause must re-arm the request window, not just the probe
+//
+// MEASURED (cold MN-CKPT bridge, found while baselining #1151): the bulk
+// fetch runs at ~190 blk/s, but the bridge's wall clock was dead gaps AFTER
+// FOLDS — 4m16s, 5m34s, then 16m25s; 26 of the first 28 minutes doing
+// nothing. Mechanism: a fold pauses the replay, on_block_connected drops
+// every in-flight body while paused, and the resume's request_window()
+// computes from = m_requested_through + 1 — PAST end — so it issues ZERO
+// getdata and the bridge waits for the next tip change (~2.5 min), once per
+// fold. The BAN-STATE PROBE path already set m_rerequest_from_cursor for
+// itself, with a comment naming this exact failure; begin_fold() and
+// begin_ondemand_fold() did not, and they are the pauses a cold bridge
+// actually takes.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashMnCheckpointPoseFold, ResumeAfterAFoldReRequestsTheDroppedWindow)
+{
+    constexpr uint32_t kAnchorH = 2513000;
+    constexpr uint32_t kTip     = 2513010;
+    const uint256 anchor_hash = uint256S(kAnchorHash);
+    const auto cp = synthetic_anchor(64, kAnchorH, anchor_hash);
+
+    // Nobody banned: this test is about scheduling, not adjudication.
+    std::vector<std::pair<uint256, bool>> attest;
+    for (const auto& e : cp.entries) attest.emplace_back(e.first, true);
+
+    SnapshotRig rig;
+    rig.attest = attest;
+    rig.install(kAnchorH, kTip, anchor_hash);
+    rig.by_height[kAnchorH] = make_snapshot(anchor_hash, kAnchorH, attest);
+    // The queue runs rank 0, 1, 2, ... — each block pays the next head.
+    for (uint32_t bh = kAnchorH + 1; bh <= kTip; ++bh)
+        rig.h.blocks[bh] = block_paying(
+            cp.entries[bh - (kAnchorH + 1)].second.scriptPayout.m_data);
+
+    // PRODUCTION SHAPE: bodies are requested but arrive ASYNCHRONOUSLY.
+    // auto_deliver=false records the getdata without answering, which is
+    // exactly the state a paused fold drops on the floor. Snapshot replies
+    // stay inline (rig.answer=true) — the ordered-stream case the flag's
+    // set-before-request ordering exists for.
+    rig.h.auto_deliver = false;
+    rig.h.lane.set_fold_interval(4);      // fold point at cursor 2513004
+
+    rig.h.lane.arm(cp);
+    rig.h.lane.pump();
+    ASSERT_EQ(rig.h.lane.state(), MnCheckpointLane::State::Bridging)
+        << rig.h.lane.status();
+    // The window was requested up front: anchor+1 .. tip (tip < kWindow away).
+    ASSERT_FALSE(rig.h.requested.empty());
+    ASSERT_EQ(rig.h.lane.requested_through(), kTip);
+
+    // Deliver bodies up to the fold point. At 2513004 the lane pauses,
+    // requests the list AS OF 2513004, is answered inline, folds, and
+    // RESUMES. The bodies for 2513005..kTip were requested before the pause
+    // and (auto_deliver=false) never arrived — in production they were
+    // dropped by the paused on_block_connected.
+    rig.h.requested.clear();
+    for (uint32_t bh = kAnchorH + 1; bh <= kAnchorH + 4; ++bh)
+        rig.h.lane.on_block_connected(rig.h.blocks[bh], bh);
+    ASSERT_FALSE(rig.h.lane.snapshot_pending())
+        << "the inline snapshot answer must have resolved the fold";
+    ASSERT_EQ(rig.h.lane.folds_applied(), 2u)   // anchor fold + h=2513004
+        << rig.h.lane.status();
+    ASSERT_EQ(rig.h.lane.cursor_height(), kAnchorH + 4)
+        << "cursor_height() is the LAST FOLDED height; the next block the"
+           " bridge needs is +5";
+
+    // ── THE DEFECT. On master the resume issues ZERO getdata (from =
+    // requested_through + 1 = kTip + 1 > end) and the bridge sits until the
+    // next tip change — ~2.5 minutes per fold, 26 of a cold bridge's first
+    // 28 minutes. Fixed, the resume re-requests from the cursor.
+    std::vector<uint32_t> rerequested = rig.h.requested;
+    ASSERT_FALSE(rerequested.empty())
+        << "resume after a fold issued no getdata: the in-flight bodies were"
+           " dropped by the pause and nothing will ever re-request them —"
+           " the bridge is dead until the next tip change";
+    EXPECT_EQ(rerequested.front(), kAnchorH + 5)
+        << "the re-request must start at the cursor, where the dropped"
+           " window began";
+    EXPECT_EQ(rerequested.back(), kTip);
+
+    // ── NO STORM. The flag is consumed by the ONE re-request pass of the
+    // resume. The next request_window on the ordinary post-apply path (the
+    // end of on_block_connected) must issue NOTHING new: from returns to
+    // requested_through+1, past end. (pump()'s stall detector re-arms per
+    // STALL at tip-change cadence — that is its pre-existing job and is not
+    // exercised here; this asserts the pause's own flag does not linger.)
+    rig.h.requested.clear();
+    rig.h.lane.on_block_connected(rig.h.blocks[kAnchorH + 5], kAnchorH + 5);
+    EXPECT_TRUE(rig.h.requested.empty())
+        << "the resume's re-arm must be one-shot: an ordinary block apply"
+           " after it must not re-request the window again";
+
+    // The bridge still completes: deliver the rest of the tail and publish.
+    for (uint32_t bh = kAnchorH + 6; bh <= kTip; ++bh)
+        rig.h.lane.on_block_connected(rig.h.blocks[bh], bh);
+    EXPECT_TRUE(rig.h.published)
+        << rig.h.lane.status();
+    EXPECT_EQ(rig.h.published_as_of, kTip);
+}
+
+
 TEST(DashMnCheckpointReseed, ReArmResetsEveryFieldArmSets)
 {
     DirtyBridge d;
@@ -4068,6 +4176,14 @@ TEST(DashMnAnchorSeedCompleteness, ReinstatementReportSeparatesNoneFromImpossibl
         const std::string s = h.lane.reinstatement_report();
         EXPECT_NE(s.find("REINSTATEMENT: measurable"), std::string::npos) << s;
         EXPECT_EQ(s.find("NOT MEASURABLE"), std::string::npos) << s;
+        // ...and "measurable" is still not the whole truth. A complete anchor
+        // makes a revive REPRESENTABLE; it does not make an unobserved ban
+        // OBSERVABLE. Both branches of this report have to carry the
+        // second qualification, so a reader of either one is told which zero
+        // they are looking at.
+        EXPECT_NE(s.find("BAN-STATE PROBE"), std::string::npos)
+            << "a complete anchor still cannot see a PoSe ban that starts and"
+               " ends inside one fold interval: " << s;
     }
 }
 
@@ -4177,4 +4293,1213 @@ TEST(DashMnPayeeTiebreak, ScoreOutranksTheHashWhenTheTieIsBroken)
         << "the lower CompareByLastPaid score must win even though the byte"
            " order puts the other masternode first — the tiebreak is a"
            " TIEbreak, not the primary key";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 15. THE BAN-STATE PROBE — a ban that starts AND ends between two folds
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// MEASURED (mainnet, anchor 2513000, fold interval 500, replay to 2515511;
+// hotel dashd 23.1.7 asked directly for the PRE-BLOCK state of every
+// ProUpServTx in the window, 2026-08-03):
+//
+//   22 ProUpServTx in 2513001..2515530
+//   20 landed on a masternode dashd HAD banned            -> dashd revived
+//   15 of those 20 this replay also believed banned       -> applied
+//    5 it did not (banned AND revived between two folds)  -> MISSED
+//    2 landed on a masternode that was NOT banned         -> no revive, and
+//      dashd set no revive height either
+//
+// The replay's own progress line agreed: "+15 reinstated [0 SML-fold, 15
+// ProUpServTx]". Scored our way, the 5 missed masternodes reach the head of
+// our queue at 2515511 / ~2516175 / ~2516176 / ~2516332 / ~2517466 — and the
+// bridge fail-closed at 2515511 projecting the first of them, 80b4892b…,
+// which dashd does not pay until ~2516627. The failure ORDER is predicted by
+// the defect, not just the single failing height.
+//
+// 80b4892b… was PoSe-banned at 2514570 and revived at 2514574: a FOUR-BLOCK
+// ban inside the 2514150..2514650 fold interval. No cadence of fold points can
+// see that — a ban+revive pair fits between any two fixed samples — so the
+// repair is to sample AT the event: fold the list dated at the block BEFORE a
+// ProUpServTx whose revive turns on a ban we have not measured.
+namespace {
+
+constexpr uint32_t kRpAnchor = 2513000;
+constexpr uint32_t kRpTip    = 2513005;
+constexpr uint32_t kRpRevive = 2513003;   // the ProUpServTx block
+constexpr size_t   kRpRank   = 40;        // far from the queue head on purpose
+constexpr size_t   kRpSetSize = 64;
+
+// The ban is invisible to every fold point, by construction.
+static_assert(kRpRevive > kRpAnchor && kRpRevive < kRpTip,
+              "the ProUpServTx must land strictly between the anchor fold and"
+              " the tip fold");
+static_assert(kRpRevive - kRpAnchor < MnCheckpointLane::kDefaultFoldInterval,
+              "and strictly inside one fold interval — that is the defect");
+
+MutableTransaction pro_up_serv_tx_for(const uint256& protx)
+{
+    CProUpServTx p;
+    p.nVersion  = dash::coin::vendor::ProTxVersion::BASIC_BLS;
+    p.nType     = dash::coin::vendor::MnType::REGULAR;
+    p.proTxHash = protx;
+    p.netInfo.port_be = 0x2334;
+
+    MutableTransaction tx;
+    tx.type          = CProUpServTx::SPECIALTX_TYPE;
+    tx.extra_payload = protx_payload_bytes(p);
+    bitcoin_family::coin::TxIn in;
+    in.prevout.hash  = uint256{};
+    in.prevout.index = 0xFFFFFFFF;
+    in.sequence      = 0xFFFFFFFF;
+    tx.vin.push_back(in);
+    return tx;
+}
+
+// The measured shape, network-free:
+//   * every list attests every masternode VALID — including the anchor's and
+//     the tip's, so no fold point can ever learn of the ban;
+//   * EXCEPT the list dated at kRpRevive-1, which attests rank kRpRank banned.
+//     That is the only height at which the ban is observable at all;
+//   * block kRpRevive carries a ProUpServTx for rank kRpRank on top of the
+//     coinbase the chain actually produced.
+MnCheckpoint build_revive_probe_scenario(SnapshotRig& rig)
+{
+    const uint256 anchor_hash = uint256S(kAnchorHash);
+    MnCheckpoint cp = synthetic_anchor(kRpSetSize, kRpAnchor, anchor_hash);
+
+    std::vector<std::pair<uint256, bool>> all_valid, banned_one;
+    for (size_t i = 0; i < cp.entries.size(); ++i) {
+        all_valid.emplace_back(cp.entries[i].first, true);
+        banned_one.emplace_back(cp.entries[i].first, i != kRpRank);
+    }
+    rig.attest = all_valid;                       // the default at ANY height
+    rig.install(kRpAnchor, kRpTip, anchor_hash);
+    // The one height at which the ban exists.
+    rig.by_height[kRpRevive - 1] =
+        make_snapshot(rig.h.headers[kRpRevive - 1], kRpRevive - 1, banned_one);
+
+    rig.h.blocks = simulate_chain(cp, kRpAnchor, kRpTip, 0, {});
+    rig.h.blocks[kRpRevive].m_txs.push_back(
+        pro_up_serv_tx_for(cp.entries[kRpRank].first));
+    return cp;
+}
+
+void drive_to_publish(SnapshotRig& rig)
+{
+    for (uint32_t i = 0; i < 64 && !rig.h.published
+                         && !rig.h.lane.failed_closed(); ++i)
+        rig.h.lane.pump();
+}
+
+} // namespace
+
+// ── CASE 15.1 (THE LOAD-BEARING ONE). The revive must land with dashd's
+// height. PREVIOUSLY RED: no fold covers kRpRevive-1, so the machine believed
+// the masternode never banned, the gate read false, and nPoSeRevivedHeight
+// stayed at 0 while dashd set kRpRevive.
+TEST(DashMnCheckpointReviveProbe, BanBetweenFoldsIsMeasuredAtTheProUpServTx)
+{
+    SnapshotRig rig;
+    const auto cp = build_revive_probe_scenario(rig);
+
+    rig.h.lane.arm(cp);
+    drive_to_publish(rig);
+
+    ASSERT_TRUE(rig.h.published) << rig.h.lane.status();
+    EXPECT_EQ(rig.h.lane.revive_probes(), 1u)
+        << "exactly one ProUpServTx in this replay turned on an unmeasured"
+           " ban, so exactly one list should have been asked for";
+    EXPECT_EQ(rig.h.lane.revive_unmeasured(), 0u)
+        << "nothing may be left unmeasured when a probe was available: "
+        << rig.h.lane.revive_probe_report();
+    EXPECT_EQ(rig.h.lane.tx_revived(), 1u);
+
+    const MNState& revived = published_rank(rig.h, cp, kRpRank);
+    EXPECT_EQ(revived.nPoSeRevivedHeight, kRpRevive)
+        << "dashd scores this masternode by its revive height from here on."
+           " Leaving it at the stale last payment is what put mainnet"
+           " 80b4892b… at the head of our queue at 2515511, ~1100 blocks"
+           " before dashd will pay it.";
+    EXPECT_TRUE(revived.isValid);
+    EXPECT_EQ(revived.nPoSeBanHeight, 0u);
+    EXPECT_EQ(MnStateMachine::payee_score(revived),
+              static_cast<int>(kRpRevive));
+}
+
+// ── CASE 15.2. THE TWIN, with the probe disabled. Same chain, same lists —
+// the pre-change behaviour exactly. The revive is lost, and the ONLY
+// difference the change makes here is that the loss is now NAMED.
+TEST(DashMnCheckpointReviveProbe, ProbeDisabledLosesTheReviveAndSaysSo)
+{
+    SnapshotRig rig;
+    const auto cp = build_revive_probe_scenario(rig);
+    rig.h.lane.set_revive_probe_cap(0);
+
+    rig.h.lane.arm(cp);
+    drive_to_publish(rig);
+
+    ASSERT_TRUE(rig.h.published) << rig.h.lane.status();
+    EXPECT_EQ(rig.h.lane.revive_probes(), 0u);
+    EXPECT_EQ(rig.h.lane.revive_unmeasured(), 1u)
+        << "a ProUpServTx applied without measuring its gate is a BLIND SPOT"
+           " and must be counted, not swallowed into `updated`";
+    EXPECT_EQ(rig.h.lane.tx_revived(), 0u);
+    EXPECT_EQ(published_rank(rig.h, cp, kRpRank).nPoSeRevivedHeight, 0u)
+        << "this IS the defect, reproduced: our score for this masternode is"
+           " now its stale last payment and dashd's is the revive height";
+
+    const std::string s = rig.h.lane.revive_probe_report();
+    EXPECT_NE(s.find("UNKNOWN"), std::string::npos) << s;
+    EXPECT_NE(s.find("ABSENCE OF MEASUREMENT"), std::string::npos)
+        << "the report must say WHICH zero this is: " << s;
+    // And the reinstatement report — the line an operator actually reads —
+    // must carry it too, instead of a bare "reinstated 0".
+    EXPECT_NE(rig.h.lane.reinstatement_report().find("BAN-STATE PROBE"),
+              std::string::npos)
+        << rig.h.lane.reinstatement_report();
+}
+
+// ── CASE 15.3. "n/a", not "0". A replay in which no ProUpServTx ever needed a
+// probe has NOT measured zero blind spots; it has never exercised the path.
+// Same discipline as ondemand_report().
+TEST(DashMnCheckpointReviveProbe, NeverExercisedReportsNotApplicableNotZero)
+{
+    SnapshotRig rig;
+    const uint256 anchor_hash = uint256S(kAnchorHash);
+    const auto cp = synthetic_anchor(kRpSetSize, kRpAnchor, anchor_hash);
+    std::vector<std::pair<uint256, bool>> all_valid;
+    for (const auto& e : cp.entries) all_valid.emplace_back(e.first, true);
+    rig.attest = all_valid;
+    rig.install(kRpAnchor, kRpTip, anchor_hash);
+    rig.h.blocks = simulate_chain(cp, kRpAnchor, kRpTip, 0, {});
+
+    rig.h.lane.arm(cp);
+    drive_to_publish(rig);
+
+    ASSERT_TRUE(rig.h.published) << rig.h.lane.status();
+    EXPECT_EQ(rig.h.lane.revive_probes(), 0u);
+    EXPECT_EQ(rig.h.lane.revive_unmeasured(), 0u);
+    EXPECT_NE(rig.h.lane.revive_probe_report().find("n/a"), std::string::npos)
+        << "no ProUpServTx reached the probe path, so every number here is"
+           " NEVER EVALUATED — printing a bare 0 would claim a measurement: "
+        << rig.h.lane.revive_probe_report();
+}
+
+// ── CASE 15.4. An UNANSWERED probe must not wedge the bridge and must not
+// re-ask forever: the latch is on the height, so a re-delivered block cannot
+// re-open a request that was already abandoned. The blind spot survives and is
+// reported — that is the honest outcome, not a fail-closed.
+TEST(DashMnCheckpointReviveProbe, UnansweredProbeAbandonsWithoutWedgingOrRelooping)
+{
+    SnapshotRig rig;
+    const auto cp = build_revive_probe_scenario(rig);
+    // Answer the fold POINTS (anchor + tip) but never the probe.
+    rig.h.lane.set_request_snapshot_fn([&rig](const uint256& bh) {
+        rig.requested.push_back(bh);
+        auto hi = rig.height_of.find(bh);
+        if (hi == rig.height_of.end()) return;
+        if (hi->second == kRpRevive - 1) return;     // the probe: no reply
+        rig.h.lane.on_historical_snapshot(
+            rig.snapshot_for(hi->second, bh).diff);
+    });
+
+    rig.h.lane.arm(cp);
+    const uint32_t kBound = 8 * (MnCheckpointLane::kFoldGiveUpPumps + 2);
+    for (uint32_t i = 0; i < kBound && !rig.h.published
+                         && !rig.h.lane.failed_closed(); ++i)
+        rig.h.lane.pump();
+
+    EXPECT_TRUE(rig.h.published)
+        << "an unanswered PROBE must degrade, not wedge: " << rig.h.lane.status();
+    EXPECT_EQ(rig.h.lane.revive_probes(), 1u)
+        << "the latch is on the probed height, so the re-delivered block must"
+           " not open a second probe for it";
+    EXPECT_EQ(rig.h.lane.revive_unmeasured(), 1u)
+        << "the ambiguity survived unmeasured and has to say so";
+    size_t asks_for_the_probe = 0;
+    for (const auto& bh : rig.requested)
+        if (rig.height_of[bh] == kRpRevive - 1) ++asks_for_the_probe;
+    EXPECT_LE(asks_for_the_probe, MnCheckpointLane::kFoldRetryPumps + 1u)
+        << "the probe re-asked " << asks_for_the_probe
+        << " times — the give-up path is not bounding it";
+}
+
+// ── CASE 15.5. A re-arm replays the SAME heights from the SAME anchor. A latch
+// or a spent budget carried across would suppress exactly the probe the second
+// attempt exists to take.
+TEST(DashMnCheckpointReviveProbe, ReArmGivesTheSecondBridgeAFreshProbeBudget)
+{
+    SnapshotRig rig;
+    const auto cp = build_revive_probe_scenario(rig);
+    rig.h.lane.arm(cp);
+    drive_to_publish(rig);
+    ASSERT_TRUE(rig.h.published);
+    ASSERT_EQ(rig.h.lane.revive_probes(), 1u);
+
+    SnapshotRig rig2;
+    const auto cp2 = build_revive_probe_scenario(rig2);
+    rig2.h.lane.arm(cp2);
+    drive_to_publish(rig2);
+    ASSERT_TRUE(rig2.h.published);
+    ASSERT_EQ(rig2.h.lane.rearm(cp2, "test re-arm"),
+              MnCheckpointLane::RearmOutcome::Armed)
+        << rig2.h.lane.status();
+    EXPECT_EQ(rig2.h.lane.revive_probes(), 0u);
+    EXPECT_EQ(rig2.h.lane.revive_unmeasured(), 0u);
+    EXPECT_EQ(rig2.h.lane.revive_probe_cap(),
+              MnCheckpointLane::kReviveProbeBase)
+        << "a re-armed bridge must not quote the previous bridge's sized"
+           " budget before its own pump() has sized one";
+
+    rig2.h.published = false;
+    drive_to_publish(rig2);
+    ASSERT_TRUE(rig2.h.published) << rig2.h.lane.status();
+    EXPECT_EQ(rig2.h.lane.revive_probes(), 1u)
+        << "the second bridge must take the probe again — a latch left"
+           " standing would silently skip it";
+    EXPECT_EQ(published_rank(rig2.h, cp2, kRpRank).nPoSeRevivedHeight,
+              kRpRevive);
+}
+
+// ── CASE 15.6. The probe that answers "NOT banned" — mainnet d07e1f49… at
+// 2515068, which had ban height -1 and PoSe penalty 0. dashcore revives
+// nothing there, so neither may we; the point of the probe is that this zero
+// is now a MEASUREMENT rather than an assumption.
+//
+// It is also the case that pins ASK-ONCE. A snapshot answered INLINE re-enters
+// on_block_connected() with this very block while begin_fold() is still on the
+// stack, so "ask once" is a property of the code, not of the call graph. What
+// terminates it here is that the fold RECORDS its own date: the re-entry finds
+// the ban state measured for this height and has nothing left to ask about.
+// Mutating the probe to fold the WRONG height removes that and the request
+// count went to 3377 — which is the mutation this assertion is here for.
+//
+// The height LATCH is the second, independent terminator, and it is the only
+// one left when the probe goes UNANSWERED (no reply, no recorded date). That
+// case is CASE 15.4, not this one.
+TEST(DashMnCheckpointReviveProbe, ProbeAnsweringNotBannedIsAMeasurementAndAsksOnce)
+{
+    SnapshotRig rig;
+    const uint256 anchor_hash = uint256S(kAnchorHash);
+    const auto cp = synthetic_anchor(kRpSetSize, kRpAnchor, anchor_hash);
+    std::vector<std::pair<uint256, bool>> all_valid;
+    for (const auto& e : cp.entries) all_valid.emplace_back(e.first, true);
+    rig.attest = all_valid;                       // NO ban at any height
+    rig.install(kRpAnchor, kRpTip, anchor_hash);
+    rig.h.blocks = simulate_chain(cp, kRpAnchor, kRpTip, 0, {});
+    rig.h.blocks[kRpRevive].m_txs.push_back(
+        pro_up_serv_tx_for(cp.entries[kRpRank].first));
+
+    rig.h.lane.arm(cp);
+    drive_to_publish(rig);
+
+    ASSERT_TRUE(rig.h.published) << rig.h.lane.status();
+    EXPECT_EQ(rig.h.lane.revive_probes(), 1u);
+    EXPECT_EQ(rig.h.lane.revive_declined(), 1u)
+        << "a list dated at h-1 attesting NOT banned is an answer, and has to"
+           " be counted apart from 'we never looked'";
+    EXPECT_EQ(rig.h.lane.revive_unmeasured(), 0u);
+    EXPECT_EQ(rig.h.lane.tx_revived(), 0u);
+    EXPECT_EQ(published_rank(rig.h, cp, kRpRank).nPoSeRevivedHeight, 0u)
+        << "dashd set no revive height here either — writing one would move"
+           " this masternode DOWN the queue and diverge the other way";
+
+    size_t asks = 0;
+    for (const auto& bh : rig.requested)
+        if (rig.height_of[bh] == kRpRevive - 1) ++asks;
+    EXPECT_EQ(asks, 1u)
+        << "the probe asked " << asks << " times for h=" << (kRpRevive - 1)
+        << " — the latch is not closing over an INLINE reply, which re-enters"
+           " on_block_connected() before begin_fold() returns";
+    EXPECT_NE(rig.h.lane.revive_probe_report().find("0 left unmeasured"),
+              std::string::npos)
+        << rig.h.lane.revive_probe_report();
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 16. THE RE-ARM LADDER MUST BE REACHABLE FROM A PATH THE FAILURE DOES NOT KILL
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// MEASURED (contabo daemonless soak0803c/d, 2026-08-03). The bridge failed
+// closed at 06:13:50 announcing "re-arms remaining: 2 — a further payee desync
+// from the maintainer will trigger one". 2h39m later: process alive, tip
+// advanced 69 blocks (68 PAST the 64-block backoff gate), 90 templates served,
+// the EMBED-GATE heartbeat still printing "cause=mn-needs-reseed value=latched"
+// every five minutes — and ZERO further asks, ZERO re-arms, ZERO MN-CKPT lines
+// of any kind.
+//
+// The cause is structural, not a missed if. rearm() had ONE caller
+// (main_dash's set_on_mn_reseed lambda); that callback has ONE invoker
+// (CoinStateMaintainer::on_block_connected's payee-desync/apply-gap branch);
+// that branch needs a PROJECTED payee, i.e. a NON-EMPTY payee queue; and its
+// own first act is to WIPE the queue and zero the apply cursor. Only a lane
+// PUBLISH refills it. A bridge that fails closed never publishes, so a second
+// ask is arithmetically impossible: the ladder's trigger was the one event its
+// own failure had already ruled out.
+//
+// These cases pin the fix AT THE TRIGGER. Each fails on the pre-fix lane,
+// because there pump() returns at its state guard and nothing else ever
+// reaches rearm().
+
+namespace {
+
+// A lane driven exactly the way main_dash drives it: pump() on every tip
+// change and nothing else. No test-only entry point — "reachable from the real
+// driver" is the property under test.
+//
+// Never returned by value: BridgeHarness's seams capture `this`.
+struct TipDrivenLane {
+    BridgeHarness h;
+    MnCheckpoint  cp{good_checkpoint()};
+
+    TipDrivenLane()
+    {
+        h.headers[kAnchorHeight] = uint256S(kAnchorHash);
+        h.blocks[1519544] = block_from_hex(kBlockHex1519544);
+        h.blocks[1519545] = block_from_hex(kBlockHex1519545);
+        h.blocks[1519546] = block_from_hex(kBlockHex1519546);
+        h.tip = 1519546;
+    }
+
+    // main_dash: header_chain->set_on_tip_changed -> mnl->pump().
+    void tip_advances_to(uint32_t height)
+    {
+        h.tip = height;
+        h.lane.pump();
+    }
+};
+
+// Fail the lane closed AFTER a full replay: the bridge reaches the tip and
+// finds no publish seam. Distinct cursor, repairable cause.
+void fail_closed_on_publish_seam(TipDrivenLane& t)
+{
+    t.h.lane.set_publish_fn({});
+    t.h.lane.arm(t.cp);
+    t.h.lane.pump();
+    ASSERT_EQ(t.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << t.h.lane.status();
+}
+
+} // namespace
+
+// ── 16.1 THE FINDING, AND THE FIX. A tip advance past the gate re-arms the
+// bridge with NO maintainer ask — because no maintainer ask is possible.
+TEST(DashMnCheckpointSelfReArm, TipAdvancePastTheGateReArmsWithNoDesyncAsk)
+{
+    TipDrivenLane t;
+    ASSERT_NO_FATAL_FAILURE(fail_closed_on_publish_seam(t));
+    auto& lane = t.h.lane;
+    ASSERT_EQ(lane.rearms(), 0u);
+    ASSERT_EQ(lane.rearm_asks(), 0u)
+        << "the trigger under test is NOT an ask — nothing may have asked";
+
+    const uint32_t gate = lane.rearm_gate_height();
+    ASSERT_NE(gate, 0u) << "a recoverable fail-close must publish a gate";
+
+    // The ONLY input from here on: the chain moves. No ask, no callback, no
+    // restart, no operator.
+    t.tip_advances_to(gate);
+
+    EXPECT_EQ(lane.rearms(), 1u)
+        << "THE DEFECT: the ladder was triggerable only by an event the"
+           " fail-close had already made impossible. "
+        << lane.rearm_posture();
+    EXPECT_EQ(lane.rearm_asks(), 1u);
+    EXPECT_NE(lane.state(), MnCheckpointLane::State::FailedClosed)
+        << "the lane must have left the terminal state: " << lane.status();
+    EXPECT_NE(lane.last_rearm_trigger().find("SELF RE-ARM"), std::string::npos)
+        << "the recovery must name which PATH pulled the trigger — with two"
+           " callers, 'a re-arm happened' no longer identifies it: "
+        << lane.last_rearm_trigger();
+    EXPECT_EQ(lane.anchor_height(), kAnchorHeight)
+        << "a self re-arm is still oldest-first: the release-pinned anchor";
+}
+
+// ── 16.2 BOUNDED. The gate is measured from the tip AT THE FAIL-CLOSE, so the
+// ORIGINAL arm's failure (no ladder backoff applies yet) is never retried over
+// the identical window on the very next block.
+TEST(DashMnCheckpointSelfReArm, TheGateHoldsUntilTheChainHasActuallyMoved)
+{
+    TipDrivenLane t;
+    ASSERT_NO_FATAL_FAILURE(fail_closed_on_publish_seam(t));
+    auto& lane = t.h.lane;
+
+    const uint32_t failed_at = t.h.tip;
+    const uint32_t gate      = lane.rearm_gate_height();
+    ASSERT_EQ(gate, failed_at + MnCheckpointLane::kRearmBackoffBlocks)
+        << "the gate must be the fail-close tip plus the backoff, or the very"
+           " next block replays the identical window";
+
+    // Every block up to gate-1 is a real tip advance through the real driver.
+    for (uint32_t h = failed_at + 1; h < gate; ++h) {
+        t.tip_advances_to(h);
+        ASSERT_EQ(lane.rearms(), 0u)
+            << "re-armed at h=" << h << ", " << (gate - h)
+            << " blocks early: " << lane.rearm_posture();
+        ASSERT_EQ(lane.rearm_asks(), 0u)
+            << "a deferred attempt must not even be ASKED for once per block —"
+               " that is a per-block log storm dressed as recovery";
+        ASSERT_EQ(lane.state(), MnCheckpointLane::State::FailedClosed);
+    }
+
+    t.tip_advances_to(gate);
+    EXPECT_EQ(lane.rearms(), 1u)
+        << "and at the gate it must actually fire: " << lane.rearm_posture();
+}
+
+// ── 16.3 BOUNDED, TERMINALLY. A re-armed replay that dies at the SAME cursor
+// is measured proof the failure is deterministic; the ladder must stop rather
+// than spend its remaining rungs reproducing it.
+TEST(DashMnCheckpointSelfReArm, IdenticalRepeatFailureBlocksTheLadderAndSaysSo)
+{
+    TipDrivenLane t;
+    auto& lane = t.h.lane;
+    // A staleness refusal reproduces EXACTLY: same cursor, every time.
+    lane.set_max_bridge_blocks(10);
+    t.h.tip = kAnchorHeight + 100;
+    lane.arm(t.cp);
+    lane.pump();
+    ASSERT_EQ(lane.state(), MnCheckpointLane::State::FailedClosed);
+    ASSERT_NE(lane.status().find("STALE"), std::string::npos) << lane.status();
+    ASSERT_FALSE(lane.rearm_blocked())
+        << "ONE fail-close is not evidence of determinism — the first recovery"
+           " must not be pre-emptively blocked";
+
+    t.tip_advances_to(lane.rearm_gate_height());
+    EXPECT_EQ(lane.rearms(), 1u)
+        << "the ladder must still get its first rung: " << lane.rearm_posture();
+    EXPECT_TRUE(lane.rearm_blocked())
+        << "the re-armed replay died at the same cursor — deterministic, so"
+           " terminal: " << lane.rearm_posture();
+    EXPECT_NE(lane.rearm_posture().find("IDENTICAL"), std::string::npos)
+        << lane.rearm_posture();
+    EXPECT_EQ(lane.rearm_gate_height(), 0u)
+        << "a blocked ladder has no gate — 0 is 'no height admits one'";
+
+    // ...and it stays blocked however far the chain moves.
+    for (int i = 0; i < 5; ++i) t.tip_advances_to(t.h.tip + 1000);
+    EXPECT_EQ(lane.rearms(), 1u);
+    EXPECT_NE(lane.rearm_posture().find("remaining capacity: NONE"),
+              std::string::npos)
+        << lane.rearm_posture();
+}
+
+// ── 16.4 THE MISLEADING NUMBER. "re-arms remaining: 2" was printed for 2h39m
+// about capacity nothing could spend. The posture must distinguish reachable
+// from unreachable, and it must ride on status(), not only on scrollback.
+TEST(DashMnCheckpointSelfReArm, PostureNamesReachableVersusUnreachableCapacity)
+{
+    TipDrivenLane t;
+    ASSERT_NO_FATAL_FAILURE(fail_closed_on_publish_seam(t));
+    auto& lane = t.h.lane;
+
+    // REACHABLE: says so, and says at which height.
+    EXPECT_NE(lane.status().find("REACHABLE"), std::string::npos)
+        << "the STATE must say its own name, not just the log: " << lane.status();
+    EXPECT_NE(lane.status().find(std::to_string(lane.rearm_gate_height())),
+              std::string::npos)
+        << "an operator must be able to read the gate height off the state: "
+        << lane.status();
+    EXPECT_EQ(lane.status().find("a further payee desync from the maintainer"
+                                 " will trigger one"),
+              std::string::npos)
+        << "THE MISLEADING SENTENCE: no such desync is possible — the"
+           " maintainer's queue is wiped: " << lane.status();
+    EXPECT_TRUE(lane.rearm_self_reachable()) << lane.rearm_posture();
+
+    // STRUCTURALLY UNREACHABLE: with no tip seam there is no live trigger and
+    // no way to measure the backoff. Remaining capacity is still 2 — and it is
+    // still unspendable, which is exactly what must NOT read as availability.
+    lane.set_tip_height_fn({});
+    EXPECT_FALSE(lane.rearm_self_reachable());
+    EXPECT_NE(lane.rearm_posture().find("STRUCTURALLY UNREACHABLE"),
+              std::string::npos)
+        << lane.rearm_posture();
+    EXPECT_NE(lane.rearm_posture().find("CANNOT be spent"), std::string::npos)
+        << lane.rearm_posture();
+}
+
+// ── 16.5 THE CAP STILL BOUNDS THE NEW TRIGGER. An exhausted ladder must not be
+// re-ASKED once per block: that is a per-block ERROR storm, and it is how a
+// bounded mechanism turns back into the fail-loop the cap exists to prevent.
+TEST(DashMnCheckpointSelfReArm, AnExhaustedLadderIsNotReAskedOncePerBlock)
+{
+    TipDrivenLane t;
+    auto& lane = t.h.lane;
+    lane.arm(t.cp);
+    lane.pump();
+    ASSERT_EQ(lane.state(), MnCheckpointLane::State::Published);
+
+    // Spend the whole ladder through the ask path, exactly as case 12 does.
+    ASSERT_EQ(lane.rearm(t.cp, "desync 1"), MnCheckpointLane::RearmOutcome::Armed);
+    t.h.tip += MnCheckpointLane::kRearmBackoffBlocks;
+    ASSERT_EQ(lane.rearm(t.cp, "desync 2"), MnCheckpointLane::RearmOutcome::Armed);
+    t.h.tip += MnCheckpointLane::kRearmBackoffBlocks * 2;
+    ASSERT_EQ(lane.rearm(t.cp, "desync 3"), MnCheckpointLane::RearmOutcome::Armed);
+    ASSERT_EQ(lane.rearms(), MnCheckpointLane::kMaxRearms);
+
+    // Fail it closed with the cap already spent.
+    lane.set_max_bridge_blocks(10);
+    lane.pump();
+    ASSERT_EQ(lane.state(), MnCheckpointLane::State::FailedClosed) << lane.status();
+    const uint32_t asks = lane.rearm_asks();
+
+    for (int i = 0; i < 200; ++i) t.tip_advances_to(t.h.tip + 1);
+
+    EXPECT_EQ(lane.rearms(), MnCheckpointLane::kMaxRearms)
+        << "the cap must survive the new trigger";
+    EXPECT_EQ(lane.rearm_asks(), asks)
+        << "200 tip advances produced " << (lane.rearm_asks() - asks)
+        << " fresh asks — an exhausted ladder must go quiet, not print an ERROR"
+           " per block";
+    EXPECT_EQ(lane.rearm_gate_height(), 0u);
+    EXPECT_FALSE(lane.rearm_self_reachable());
+    EXPECT_NE(lane.rearm_posture().find("EXHAUSTED"), std::string::npos)
+        << lane.rearm_posture();
+}
+
+// ── 16.6 END TO END, through the REAL maintainer. The finding and the fix in
+// one rig: after a fail-closed bridge the maintainer can NEVER ask again, and
+// the lane has to come back without one.
+TEST(DashMnCheckpointSelfReArm, NoSecondAskIsPossibleSoTheLaneMustRecoverAlone)
+{
+    ReseedRig r(/*wire_the_reseed_seam=*/true);
+    r.h.lane.arm(r.anchor);
+    r.h.lane.pump();
+    ASSERT_EQ(r.h.lane.state(), MnCheckpointLane::State::Published);
+    r.fire_tip();
+    ASSERT_TRUE(r.state.populated());
+
+    // Break the publish seam first, so the re-arm the ask produces FAILS
+    // CLOSED — the soak's shape exactly.
+    r.h.lane.set_publish_fn({});
+    ASSERT_TRUE(r.force_apply_gap().gap_detected);
+    ASSERT_EQ(r.reseed_calls, 1u);
+    ASSERT_EQ(r.h.lane.rearms(), 1u);
+    ASSERT_EQ(r.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << r.h.lane.status();
+    ASSERT_TRUE(r.state.mn_needs_reseed());
+    ASSERT_FALSE(r.state.populated());
+
+    // THE FINDING. Keep feeding the maintainer blocks. It cannot ask again:
+    // its payee queue is wiped, so apply_block resolves no projected payee and
+    // the desync branch is unreachable. This holds before AND after the fix —
+    // it is the reason the fix cannot live on the ask path.
+    for (uint32_t h = 1519549; h < 1519559; ++h)
+        r.maint.on_block_connected(block_from_hex(kBlockHex1519546), h);
+    EXPECT_EQ(r.reseed_calls, 1u)
+        << "a second ask is arithmetically impossible after the wipe — any"
+           " recovery that waits for one waits forever";
+
+    // ...so the recovery has to come from the tip seam, which is still alive.
+    const uint32_t gate = r.h.lane.rearm_gate_height();
+    ASSERT_NE(gate, 0u) << r.h.lane.rearm_posture();
+    r.h.tip = gate;
+    r.h.lane.pump();
+
+    EXPECT_EQ(r.reseed_calls, 1u) << "and it must do so WITHOUT a second ask";
+    EXPECT_EQ(r.h.lane.rearms(), 2u) << r.h.lane.rearm_posture();
+    EXPECT_NE(r.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << "the lane stayed terminal with the gate long cleared — this is the"
+           " 2h39m the soak measured: " << r.h.lane.status();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 17. THE UNSEEDED PAYEE FOLD — the phantom desync the 0803 soaks reported.
+//
+// Three independent contabo soaks (0803c/d/e, started at tips 2515478 /
+// 2515518 / 2515558) each reported PAYEE DESYNC at exactly h=2513168 and
+// h=2513261, wiped the payee set, demoted, and spent a bridge re-arm. Neither
+// height is a divergence.
+//
+// The maintainer and MnCheckpointLane subscribe to the SAME
+// Node::block_connected event and hold SEPARATE MnStateMachines. The lane's
+// request_window() downloads historical block bodies from the anchor forward;
+// every one of them was also delivered here, to a payee machine that no
+// authoritative snapshot had ever seeded. apply_block's out-of-order and
+// contiguity guards are both conditioned on `m_last_applied_height != 0`, so a
+// cold cursor accepted the first body and rode the window. The ProRegTx in
+// mainnet block 2513167 then registered the ONE entry this set held, and
+// 2513168 projected it — a one-element queue ranks by nothing, so this was
+// never a payee_score()/nRegisteredHeight fault. The real coinbase paid the
+// real queue head, and the mismatch was reported as a divergence.
+//
+// The lane, replaying the SAME blocks through the SAME apply_block but holding
+// the full 2974-entry anchor, mis-scored NEITHER registration. That contrast is
+// the whole diagnosis, and these cases pin both halves of it.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashMnPayeeLatch, UnseededMaintainerRefusesToFoldBridgeWindowBodies)
+{
+    dash::coin::NodeCoinState st;
+    dash::coin::CoinStateMaintainer m{st};
+    m.set_require_seeded_mn_set(true);          // the embedded-arm posture
+
+    // The pure-daemonless startup state, not a contrived one: the checkpoint is
+    // armed into the LANE, and nothing seeds this machine until the bridge
+    // publishes.
+    ASSERT_EQ(st.mnstates().size(), 0u);
+    ASSERT_EQ(st.mnstates().last_applied_height(), 0u);
+
+    // A historical bridge-window body carrying the window's first ProRegTx —
+    // mainnet 2513167's shape.
+    const uint32_t kReg = 2513167;
+    auto reg_blk = block_from_hex(kBlockHex1519544);
+    reg_blk.m_txs.push_back(pro_reg_tx(synth_script(0x42), 1));
+    latch_bind(reg_blk);   // the body must still bind to its header
+
+    const auto r1 = m.on_block_connected(reg_blk, kReg);
+    EXPECT_EQ(r1.registered, 0u)
+        << "a ProRegTx carried by a bridge-window body must not enter the LIVE"
+           " payee machine — that registration belongs to the lane's private"
+           " replay, which holds the anchored set to put it in context";
+    EXPECT_EQ(st.mnstates().size(), 0u);
+    EXPECT_EQ(st.mnstates().last_applied_height(), 0u)
+        << "the cursor must stay cold. Pinning it to a historical height is what"
+           " manufactured the 2005-block APPLY GAP the moment the live tip"
+           " arrived, and that gap burned a third re-seed ask";
+
+    // The next block is the one that reported PAYEE DESYNC on mainnet, because
+    // its predecessor had left a payment queue of exactly one masternode.
+    auto next_blk = block_from_hex(kBlockHex1519544);
+    const auto r2 = m.on_block_connected(next_blk, kReg + 1);
+    EXPECT_FALSE(r2.payee_desync)
+        << "an unseeded queue cannot diverge from anything. Reporting a desync"
+           " here wiped a masternode set that never existed, demoted the arm,"
+           " and spent one of only three bridge re-arms";
+    EXPECT_FALSE(r2.gap_detected);
+    EXPECT_FALSE(st.mn_needs_reseed());
+
+    // The guard must SAY IT FIRED. Without this witness every expectation above
+    // also passes on a maintainer whose block_connected subscription is simply
+    // dead — an absence and a refusal must not be the same observation.
+    EXPECT_EQ(m.unseeded_payee_folds_skipped(), 2u);
+    EXPECT_EQ(m.unseeded_payee_first_height(), kReg);
+    EXPECT_EQ(m.unseeded_payee_last_height(), kReg + 1);
+}
+
+// The other half: the guard must not have bought its silence by disabling
+// detection. Once a height-stamped snapshot is in force, the SAME machine folds
+// normally and a REAL divergence is still terminal.
+TEST(DashMnPayeeLatch, SeededMaintainerStillFoldsAndStillReportsDivergence)
+{
+    dash::coin::NodeCoinState st;
+    dash::coin::CoinStateMaintainer m{st};
+    m.set_require_seeded_mn_set(true);
+
+    auto cp = good_checkpoint();
+    m.on_mn_list_update(cp.entries, kAnchorHeight);
+    ASSERT_FALSE(st.mn_needs_reseed());
+
+    // A coinbase that pays nobody this set projects: a genuine divergence.
+    auto blk = repay_coinbase(block_from_hex(kBlockHex1519544),
+                              payout_of(cp, kQ1), synth_script(0x7f));
+    latch_bind(blk);   // rewriting the coinbase moved the body's merkle root
+    const auto r = m.on_block_connected(blk, kAnchorHeight + 1);
+
+    EXPECT_TRUE(r.payee_desync)
+        << "the guard must gate on 'is a snapshot in force', never on 'is a"
+           " mismatch inconvenient' — a seeded queue that disagrees with an"
+           " accepted coinbase is exactly the bad-cb-payee this arm exists to"
+           " refuse to serve";
+    EXPECT_TRUE(st.mn_needs_reseed());
+    EXPECT_EQ(m.unseeded_payee_folds_skipped(), 0u)
+        << "a seeded fold must never be counted as an unseeded skip";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #91 — THE RESUMABLE REPLAY CURSOR
+//
+// THE DEFECT, verbatim from a 2026-08-04 restart that had ALREADY finished
+// exactly this work:
+//
+//     [MN-CKPT] bridge START: replaying h=2513001..2516913 (3913 blocks)
+//
+// The lane is EVENT-BOUND — it re-drives its request window on tip changes,
+// ~2.5 min apart on mainnet — so that discard cost ~26 of the ~34 minutes of
+// a pure-daemonless cold start, on EVERY process start.
+//
+// What is pinned below is not "a file appears on disk". It is the two claims
+// that make the file safe to believe:
+//
+//   1. RESTART-EQUIVALENCE. A bridge interrupted and resumed publishes the
+//      SAME masternode set, at the SAME as-of height, with the SAME lifetime
+//      counters, as one that ran straight through. This is the test that does
+//      not rot: it compares OUTCOMES, so a field added to the lane and
+//      forgotten in the record fails here without anyone maintaining a list.
+//      (mn_checkpoint_lane.hpp's own reset_for_arm() comment names that exact
+//      drift risk for the two reset lists it already has.)
+//   2. REFUSE-TO-HALF-RESUME. Every one of R1..R7 is exercised as a REFUSAL
+//      that lands on a COLD replay and still publishes the right answer —
+//      never on a partial resume, and never on a lane that fails to serve
+//      because its cache was stale.
+//
+// #895: nothing here is #ifdef-guarded.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+using dash::coin::MnBridgeCursor;
+using dash::coin::MnBridgeCursorStore;
+
+/// A deterministic, height-distinct stand-in for a header-chain block hash.
+uint256 synth_block_hash(uint32_t height)
+{
+    uint256 h;
+    for (int i = 0; i < 4; ++i)
+        h.data()[i] = static_cast<unsigned char>((height >> (8 * i)) & 0xFF);
+    h.data()[31] = 0x91;
+    return h;
+}
+
+/// A store rooted in a unique temp path, removed on destruction. Tests that
+/// share a path would resume each other's state, which is exactly the class of
+/// bug this feature must not introduce, so each rig gets its own.
+struct TempCursorStore {
+    std::filesystem::path dir;
+    MnBridgeCursorStore   store;
+
+    explicit TempCursorStore(const std::string& tag)
+        : dir(std::filesystem::temp_directory_path()
+              / ("c2pool-t91-" + tag + "-"
+                 + std::to_string(::getpid()) + "-"
+                 + std::to_string(reinterpret_cast<uintptr_t>(this))))
+        , store((dir / "dash_mn_bridge_cursor.dat").string())
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+    }
+    ~TempCursorStore()
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+    bool exists() const
+    {
+        std::error_code ec;
+        return std::filesystem::exists(store.path(), ec);
+    }
+    std::vector<uint8_t> raw() const
+    {
+        std::ifstream in(store.path(), std::ios::binary);
+        return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)),
+                                     std::istreambuf_iterator<char>());
+    }
+    void write_raw(const std::vector<uint8_t>& b) const
+    {
+        std::ofstream out(store.path(),
+                          std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(b.data()),
+                  static_cast<std::streamsize>(b.size()));
+    }
+};
+
+/// One process's run of the bridge, over a persistent store.
+///
+/// Every height's header is published, because the real header chain holds
+/// them: the write site names the block it folded (it will not claim a height
+/// it cannot name) and R4 checks that name against the chain on the way back
+/// in.
+struct CursorRun {
+    BridgeHarness h;
+
+    CursorRun(const MnBridgeCursorStore* store, uint32_t tip)
+    {
+        h.headers[kAnchorHeight] = uint256S(kAnchorHash);
+        h.blocks[1519544] = block_from_hex(kBlockHex1519544);
+        h.blocks[1519545] = block_from_hex(kBlockHex1519545);
+        h.blocks[1519546] = block_from_hex(kBlockHex1519546);
+        // The lane names the block it folded at each height and checks that
+        // name against the header chain on the way back in (R4). It never
+        // compares that name to the body, so a DISTINCT deterministic hash per
+        // height is exactly as strong here as a real one — and it makes the
+        // reorg test's "the chain now holds something else at h" explicit
+        // rather than a re-derivation.
+        for (const auto& [ht, blk] : h.blocks) h.headers[ht] = synth_block_hash(ht);
+        h.tip = tip;
+        if (store) h.lane.set_cursor_store(store);
+        // Per-block writes: the KATs replay three blocks, and the shipped
+        // 250-block interval would make every one of them a no-op.
+        h.lane.set_persist_every(1);
+    }
+    void run() { h.lane.arm(good_checkpoint()); h.lane.pump(); }
+};
+
+std::map<uint256, MNState> as_map(
+    const std::vector<std::pair<uint256, MNState>>& v)
+{
+    return std::map<uint256, MNState>(v.begin(), v.end());
+}
+
+} // namespace
+
+// ── 1. THE CLAIM: a restart RESUMES ────────────────────────────────────────
+TEST(DashMnBridgeCursor, RestartResumesInsteadOfReplayingTheWindow)
+{
+    TempCursorStore cs("resume");
+
+    // Process 1: replay 1519544..1519545 and publish at that tip.
+    {
+        CursorRun r1(&cs.store, 1519545);
+        r1.run();
+        ASSERT_TRUE(r1.h.published) << r1.h.lane.status();
+        EXPECT_FALSE(r1.h.lane.cursor_restored())
+            << "a first run has nothing to resume from";
+        EXPECT_EQ(r1.h.lane.restored_at(), 0u);
+    }
+    ASSERT_TRUE(cs.exists())
+        << "a completed bridge must leave a record, or the next start pays the"
+           " whole replay again";
+
+    // Process 2: same anchor, same store, one more block on the chain.
+    CursorRun r2(&cs.store, 1519546);
+    r2.run();
+
+    ASSERT_TRUE(r2.h.lane.cursor_restored())
+        << "verdict: " << r2.h.lane.restore_verdict();
+    EXPECT_EQ(r2.h.lane.restored_at(), 1519545u);
+    ASSERT_TRUE(r2.h.published) << r2.h.lane.status();
+    EXPECT_EQ(r2.h.published_as_of, 1519546u);
+
+    // THE SAVING, measured the only way that means anything here: the work
+    // NOT redone. The resumed process must never ask for a block a previous
+    // process already folded.
+    for (uint32_t asked : r2.h.requested) {
+        EXPECT_GT(asked, 1519545u)
+            << "h=" << asked << " was already replayed and persisted; asking"
+               " for it again IS the defect #91 exists to remove";
+    }
+    EXPECT_EQ(r2.h.lane.replay_applied(), 1u)
+        << "only the one new block should have been applied by this process";
+    EXPECT_EQ(r2.h.lane.applied_lifetime(), 3u)
+        << "the LIFETIME span from the anchor is still all three blocks — a"
+           " resumed publish that under-reports its own coverage is a report"
+           " that lies";
+}
+
+// ── 2. THE DRIFT-PROOF TEST: outcome equality ──────────────────────────────
+TEST(DashMnBridgeCursor, ResumedBridgePublishesExactlyWhatAContinuousOneDoes)
+{
+    // Continuous control: no store at all, straight through to the tip.
+    CursorRun cont(nullptr, 1519546);
+    cont.run();
+    ASSERT_TRUE(cont.h.published) << cont.h.lane.status();
+
+    // Interrupted + resumed, same chain, same anchor.
+    TempCursorStore cs("equiv");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+    CursorRun b(&cs.store, 1519546);
+    b.run();
+    ASSERT_TRUE(b.h.lane.cursor_restored()) << b.h.lane.restore_verdict();
+    ASSERT_TRUE(b.h.published) << b.h.lane.status();
+
+    // The published SET must be identical field for field. MNState::operator==
+    // covers every payout-relevant field including nLastPaidHeight — the one
+    // GetMNPayee orders the payment queue by, and the one a wrong resume would
+    // corrupt without changing the set's membership at all.
+    EXPECT_EQ(b.h.published_as_of, cont.h.published_as_of);
+    ASSERT_EQ(b.h.published_set.size(), cont.h.published_set.size());
+    const auto want = as_map(cont.h.published_set);
+    const auto got  = as_map(b.h.published_set);
+    ASSERT_EQ(got.size(), want.size());
+    for (const auto& [hash, st] : want) {
+        ASSERT_TRUE(got.count(hash))
+            << "resumed set is missing " << hash.GetHex().substr(0, 16);
+        EXPECT_TRUE(got.at(hash) == st)
+            << "resumed state differs for " << hash.GetHex().substr(0, 16)
+            << " — nLastPaidHeight " << got.at(hash).nLastPaidHeight
+            << " vs " << st.nLastPaidHeight;
+    }
+
+    // ...and so must the LIFETIME accounting. This is the half that catches a
+    // field added to the lane and forgotten in the record: nobody has to
+    // remember to extend a list, the outcome simply stops matching.
+    EXPECT_EQ(b.h.lane.applied_lifetime(), cont.h.lane.applied_lifetime());
+    EXPECT_EQ(b.h.lane.folds_lifetime(),   cont.h.lane.folds_lifetime());
+    EXPECT_EQ(b.h.lane.replay_registered(), cont.h.lane.replay_registered());
+    EXPECT_EQ(b.h.lane.replay_spent(),      cont.h.lane.replay_spent());
+    EXPECT_EQ(b.h.lane.eligible_size(),     cont.h.lane.eligible_size());
+}
+
+// ── 3. R2: a record from a DIFFERENT anchor is refused ─────────────────────
+TEST(DashMnBridgeCursor, RecordFromADifferentAnchorIsRefusedAndReplayedCold)
+{
+    TempCursorStore cs("lineage");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+    ASSERT_TRUE(cs.exists());
+
+    // Rewrite the record's anchor hash: a release cut from a different anchor,
+    // or a data dir carried across builds. Its SET may be perfectly good — and
+    // that is the point: we cannot TIE it to the trust root this binary
+    // carries, so we do not build a payee queue on it.
+    std::string why;
+    auto rec = cs.store.load(why);
+    ASSERT_TRUE(rec.has_value()) << why;
+    rec->anchor_hash = uint256S(
+        "00000000000000000000000000000000000000000000000000000000deadbeef");
+    ASSERT_TRUE(cs.store.store(*rec));
+
+    CursorRun r(&cs.store, 1519546);
+    r.run();
+    EXPECT_FALSE(r.h.lane.cursor_restored());
+    EXPECT_NE(r.h.lane.restore_verdict().find("R2"), std::string::npos)
+        << r.h.lane.restore_verdict();
+    // COLD is not FAILED: the lane must still do its job, just slowly.
+    ASSERT_TRUE(r.h.published) << r.h.lane.status();
+    EXPECT_EQ(r.h.published_as_of, 1519546u);
+    EXPECT_EQ(r.h.lane.replay_applied(), 3u)
+        << "a refused record must produce a FULL cold replay, not a partial one";
+}
+
+// ── 4. R4: the chain REORGED past the persisted cursor ─────────────────────
+TEST(DashMnBridgeCursor, ReorgPastThePersistedCursorIsRefusedAndReplayedCold)
+{
+    TempCursorStore cs("reorg");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+
+    // Our own PoW-validated header chain now holds a DIFFERENT block at the
+    // persisted height. Every payment attributed after the fork point is
+    // wrong, and resuming would carry that wrongness into a coinbase.
+    // auto_deliver OFF so the cold replay that follows the refusal cannot
+    // immediately write a NEW record: the property under test is that the
+    // STALE one is gone, and a rewrite would mask its removal.
+    CursorRun r(&cs.store, 1519546);
+    r.h.auto_deliver = false;
+    r.h.headers[1519545] = uint256S(
+        "00000000000000000000000000000000000000000000000000000000feedface");
+    r.run();
+
+    EXPECT_FALSE(r.h.lane.cursor_restored());
+    EXPECT_NE(r.h.lane.restore_verdict().find("R4"), std::string::npos)
+        << r.h.lane.restore_verdict();
+    EXPECT_EQ(r.h.lane.state(), MnCheckpointLane::State::Bridging)
+        << "a refused record costs a replay, never the lane: " << r.h.lane.status();
+    EXPECT_EQ(r.h.lane.cursor_height(), kAnchorHeight)
+        << "the cold replay must restart at the ANCHOR, not somewhere in the"
+           " middle of the refused record's range";
+    EXPECT_FALSE(cs.exists())
+        << "a refused record must be REMOVED, not left to be re-adjudicated and"
+           " re-refused on every subsequent start";
+
+    // And the cold replay, once the blocks arrive, still lands on the right
+    // answer over the chain we ACTUALLY hold.
+    r.h.auto_deliver = true;
+    for (uint32_t ht = 1519544; ht <= 1519546; ++ht)
+        r.h.lane.on_block_connected(r.h.blocks.at(ht), ht);
+    ASSERT_TRUE(r.h.published) << r.h.lane.status();
+    EXPECT_EQ(r.h.published_as_of, 1519546u);
+    EXPECT_EQ(r.h.lane.replay_applied(), 3u);
+}
+
+// ── 5. R5: the anti-gap arithmetic ─────────────────────────────────────────
+TEST(DashMnBridgeCursor, ARecordThatSkippedHeightsIsRefusedNotResumed)
+{
+    // THE W1/W2 DEFECT, reproduced deliberately: a cursor that claims a height
+    // it did not contiguously reach. There the bulk lane resumed at h=2513098
+    // while the fold sat at h=2513000; here the record says "I am at 1519545"
+    // while its own applied count proves it folded only one block from an
+    // anchor two below. Resuming would silently skip a height's payments.
+    TempCursorStore cs("gap");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+
+    std::string why;
+    auto rec = cs.store.load(why);
+    ASSERT_TRUE(rec.has_value()) << why;
+    ASSERT_TRUE(rec->contiguous()) << "the writer must only ever emit"
+                                      " contiguous records";
+    rec->applied = rec->applied - 1;          // one height unaccounted for
+    ASSERT_FALSE(rec->contiguous());
+    ASSERT_TRUE(cs.store.store(*rec));
+
+    CursorRun r(&cs.store, 1519546);
+    r.run();
+    EXPECT_FALSE(r.h.lane.cursor_restored());
+    EXPECT_NE(r.h.lane.restore_verdict().find("R5"), std::string::npos)
+        << r.h.lane.restore_verdict();
+    ASSERT_TRUE(r.h.published) << r.h.lane.status();
+    EXPECT_EQ(r.h.lane.replay_applied(), 3u);
+}
+
+// ── 6. R1: a torn, truncated or foreign file is never half-read ────────────
+TEST(DashMnBridgeCursor, CorruptTruncatedAndForeignRecordsAllRefuse)
+{
+    // (a) a flipped byte inside the payload
+    {
+        TempCursorStore cs("bitrot");
+        { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+        auto b = cs.raw();
+        ASSERT_GT(b.size(), 100u);
+        b[b.size() / 2] ^= 0xFF;
+        cs.write_raw(b);
+        std::string why;
+        EXPECT_FALSE(cs.store.load(why).has_value());
+        EXPECT_NE(why.find("digest"), std::string::npos) << why;
+    }
+    // (b) a truncated tail — the classic half-flushed write. The rename(2)
+    //     publish makes this unreachable in practice; it is pinned anyway,
+    //     because "unreachable" is a property of today's write path.
+    {
+        TempCursorStore cs("trunc");
+        { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+        auto b = cs.raw();
+        b.resize(b.size() - 40);
+        cs.write_raw(b);
+        std::string why;
+        EXPECT_FALSE(cs.store.load(why).has_value()) << why;
+    }
+    // (c) something else entirely at that path
+    {
+        TempCursorStore cs("foreign");
+        cs.write_raw(std::vector<uint8_t>(200, 0x41));
+        std::string why;
+        EXPECT_FALSE(cs.store.load(why).has_value());
+        EXPECT_NE(why.find("magic"), std::string::npos) << why;
+    }
+    // (d) a future format version. Discarded WHOLE — the MnStateDb v1->v2
+    //     lesson was that entry-by-entry deserialisation silently SKIPS rows
+    //     and leaves a partial set under a believed cursor.
+    {
+        TempCursorStore cs("version");
+        { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+        auto b = cs.raw();
+        b[24] = static_cast<uint8_t>(MnBridgeCursorStore::kFormatVersion + 7);
+        cs.write_raw(b);
+        std::string why;
+        EXPECT_FALSE(cs.store.load(why).has_value());
+        EXPECT_NE(why.find("format"), std::string::npos) << why;
+    }
+}
+
+// ── 7. A fail-closed bridge must not be resumable ──────────────────────────
+TEST(DashMnBridgeCursor, FailClosedErasesTheRecordSoARestartCannotResumeIntoIt)
+{
+    TempCursorStore cs("failclosed");
+
+    // Replay one good block (which persists), then feed a block whose coinbase
+    // pays nobody the anchored set projects: a terminal payee desync.
+    CursorRun r(&cs.store, 1519546);
+    r.h.auto_deliver = false;
+    r.h.lane.arm(good_checkpoint());
+    r.h.lane.pump();
+    ASSERT_EQ(r.h.lane.state(), MnCheckpointLane::State::Bridging);
+    r.h.lane.on_block_connected(block_from_hex(kBlockHex1519544), 1519544);
+    ASSERT_EQ(r.h.lane.cursor_height(), 1519544u);
+    ASSERT_TRUE(cs.exists()) << "a delivered block must have been persisted";
+
+    auto cp  = good_checkpoint();
+    auto bad = repay_coinbase(block_from_hex(kBlockHex1519545),
+                              payout_of(cp, kQ2), synth_script(0x5a));
+    r.h.lane.on_block_connected(bad, 1519545);
+    ASSERT_EQ(r.h.lane.state(), MnCheckpointLane::State::FailedClosed)
+        << r.h.lane.status();
+
+    EXPECT_FALSE(cs.exists())
+        << "the persisted state leads INTO this failure. The re-arm ladder's"
+           " deterministic-repeat block is per-PROCESS, so a surviving record"
+           " would turn a deterministic failure into a resume/fail/restart loop"
+           " that nothing is left to see";
+}
+
+// ── 8. A restored set may not publish unfalsified ──────────────────────────
+TEST(DashMnBridgeCursor, RestoredSetIsNotPublishedUntilThisProcessFalsifiesIt)
+{
+    TempCursorStore cs("falsify");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+
+    // Restart with the cursor EXACTLY at the tip and no fold seam wired: there
+    // is nothing this process has verified for itself yet. The set is bytes off
+    // a local disk that passed a lineage check, and this lane's whole claim on
+    // trust is that its data is falsified against real coinbases.
+    CursorRun r(&cs.store, 1519545);
+    r.run();
+    ASSERT_TRUE(r.h.lane.cursor_restored()) << r.h.lane.restore_verdict();
+    EXPECT_TRUE(r.h.lane.resume_verification_pending());
+    EXPECT_FALSE(r.h.published)
+        << "publishing here would hand the maintainer an authoritative payee"
+           " queue on the strength of a local file alone";
+    EXPECT_NE(r.h.lane.waiting_for().find("resume-falsification"),
+              std::string::npos)
+        << "a HOLD that prints 'tip-advance' is indistinguishable from a"
+           " healthy idle lane: " << r.h.lane.waiting_for();
+
+    // The chain moves on. The first applied block runs the coinbase payee
+    // cross-check — the falsification the resume owed — and the hold clears.
+    r.h.tip = 1519546;
+    r.h.lane.pump();
+    EXPECT_FALSE(r.h.lane.resume_verification_pending());
+    ASSERT_TRUE(r.h.published) << r.h.lane.status();
+    EXPECT_EQ(r.h.published_as_of, 1519546u);
+}
+
+// ── 9. Unwired, nothing changes (the --embedded-mn-bridge-no-cursor posture) ─
+TEST(DashMnBridgeCursor, WithNoStoreWiredTheLaneWritesNothingAndAlwaysStartsCold)
+{
+    TempCursorStore cs("nostore");   // path exists; the lane is never told
+    CursorRun a(nullptr, 1519546);
+    a.run();
+    ASSERT_TRUE(a.h.published);
+    EXPECT_FALSE(a.h.lane.has_cursor_store());
+    EXPECT_FALSE(a.h.lane.cursor_restored());
+    EXPECT_FALSE(cs.exists())
+        << "an unwired lane must not touch the filesystem at all";
+
+    CursorRun b(nullptr, 1519546);
+    b.run();
+    EXPECT_FALSE(b.h.lane.cursor_restored());
+    EXPECT_EQ(b.h.lane.replay_applied(), 3u)
+        << "the pre-#91 behaviour, byte for byte: every start replays the whole"
+           " window";
+}
+
+// ── 10. The record's own encoding ──────────────────────────────────────────
+TEST(DashMnBridgeCursor, RecordRoundTripsEveryFieldAndRejectsTrailingBytes)
+{
+    TempCursorStore cs("roundtrip");
+    { CursorRun a(&cs.store, 1519546); a.run(); ASSERT_TRUE(a.h.published); }
+
+    std::string why;
+    auto rec = cs.store.load(why);
+    ASSERT_TRUE(rec.has_value()) << why;
+    EXPECT_EQ(rec->anchor_height, kAnchorHeight);
+    EXPECT_EQ(rec->anchor_hash, uint256S(kAnchorHash));
+    EXPECT_EQ(rec->cursor_height, 1519546u);
+    EXPECT_EQ(rec->applied, 3u);
+    EXPECT_EQ(rec->entries.size(), 6u);
+    EXPECT_TRUE(rec->contiguous());
+
+    // The set survives the round trip field for field — including the payment
+    // ordering key, which is the field a lossy codec would silently flatten.
+    auto by_hash = as_map(rec->entries);
+    EXPECT_EQ(by_hash.at(uint256S(kQ1)).nLastPaidHeight, 1519544u);
+    EXPECT_EQ(by_hash.at(uint256S(kQ2)).nLastPaidHeight, 1519545u);
+    EXPECT_EQ(by_hash.at(uint256S(kQ3)).nLastPaidHeight, 1519546u);
+    for (const auto& [h, st] : by_hash) {
+        EXPECT_FALSE(st.scriptPayout.m_data.empty())
+            << h.GetHex().substr(0, 16) << " lost its payout script";
+    }
+
+    // A payload that decodes a PREFIX and leaves bytes over is a writer and a
+    // reader that disagree about the record's shape. "It parsed" is not the
+    // bar; "it parsed exactly" is.
+    auto b = cs.raw();
+    b.insert(b.end() - 32, 8, 0x00);              // 8 stray bytes in the payload
+    const size_t len_at = 24 + 4;
+    const uint64_t newlen =
+        b.size() - (24 + 4 + 8) - 32;
+    for (int i = 0; i < 8; ++i)
+        b[len_at + i] = static_cast<uint8_t>((newlen >> (8 * i)) & 0xFF);
+    // Re-seal the digest so this probes the SHAPE check and not the checksum.
+    {
+        uint256 d;
+        CHash256()
+            .Write(std::span<const unsigned char>(b.data() + 24 + 4 + 8,
+                                                  static_cast<size_t>(newlen)))
+            .Finalize(std::span<unsigned char>(d.data(), 32));
+        std::memcpy(b.data() + b.size() - 32, d.data(), 32);
+    }
+    cs.write_raw(b);
+    std::string why2;
+    EXPECT_FALSE(cs.store.load(why2).has_value());
+    EXPECT_NE(why2.find("trailing"), std::string::npos) << why2;
 }

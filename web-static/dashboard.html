@@ -634,6 +634,11 @@
             color: var(--success);
         }
         
+        /* Standalone-parent topology (no merged child, e.g. DASH/BTC/DGB):
+           hide every merged-mining UI element, including ones appended after
+           the currency_info gate ran (dynamic table cells). The body class is
+           set from currency_info.merged_child_symbol — never hardcoded. */
+        body.no-merged-child .merged-child-hint { display: none !important; }
         /* Merged payout sub-rows */
         .merged-payout-row td {
             font-size: 0.72rem;
@@ -1827,6 +1832,10 @@
                         <div class="stat-value success" id="local_rate">-</div>
                         <div class="stat-sub" title="Dead-on-arrival = local dead_hashrate / local hashrate -- the true lost-work / unrewarded fraction. Sourced from live hashrate, not share counts.">DOA: <span id="local_doa">-</span></div>
                         <div class="stat-detail">Expected Share: <span id="time_to_share">-</span></div>
+                        <!-- #expected_payout_amount was written by renderGlobalStats
+                             but had NO element in this page: c2pool computed the
+                             24h expectation and threw it away. -->
+                        <div class="stat-detail" id="expected_payout_line" style="display: none;" title="This node's expected 24h payout = (local share of pool hashrate) x miner block value x (1 - donation) x blocks expected in 24h">Est. 24h: <span id="expected_payout_amount">-</span> <small class="symbol-small">-</small></div>
                     </div>
                     
                     <div class="stat-card" id="shares_card">
@@ -1847,9 +1856,17 @@
                 
                 <!-- Second Row: Miners Block Value -->
                 <div class="stat-card">
-                    <h3><span class="icon">💰</span> Miners Block Value</h3>
+                    <h3><span class="icon">💰</span> Miners Block Value <small style="opacity:0.7;">(gross, pre-fee)</small></h3>
                     <div class="stat-value warning"><span id="block_value_miner">-</span> <small class="symbol-small" id="block_value_symbol">-</small></div>
                     <div class="stat-sub merged-child-hint" style="color: #c3a634; font-size: 1.1em; margin-top: -4px;">+<span id="merged_block_value">-</span> <span class="merged-child-symbol-hint">DOGE</span></div>
+                    <div class="stat-detail" style="white-space: nowrap;" title="#948: this card shows the GROSS miner share; the pool fee is deducted to give the NET amount the API reports as block_value_miner">Fee: <span id="block_value_fee">-</span> &rarr; net <span id="block_value_miner_net">-</span></div>
+                    <!-- #block_value and #block_value_payments were both written
+                         by renderLocalStats but had NO elements in this page. The
+                         card showed the miner slice with nothing to compare it
+                         against, so on DASH there was no way to see that 1.7702
+                         total minus 1.3277 of protocol outputs is what leaves
+                         miners 0.4426. -->
+                    <div class="stat-detail" style="white-space: nowrap;" title="Full coinbase value of the block being worked on, and the protocol-mandated outputs deducted from it before the miner split (masternode / superblock / platform burn). Shown only on coins that have such a lane.">Block: <span id="block_value">-</span><span id="block_value_payments_part" style="display: none;"> &minus; protocol <span id="block_value_payments">-</span><span id="block_value_burn_part" style="display: none;"> (burn <span id="block_value_burn">-</span>)</span></span></div>
                     <div class="stat-detail" style="white-space: nowrap;">Expected: <span id="time_to_block">-</span> <span class="merged-child-hint"><span style="color: #c3a634;">|</span> <span style="color: #c3a634;"><span id="time_to_merged_block">-</span></span></span></div>
                 </div>
                 
@@ -1859,8 +1876,12 @@
                     <div class="stat-value success"><span id="payout_totamount">-</span> <small class="symbol-small" id="node_payout_symbol">-</small></div>
                     <div class="stat-sub merged-child-hint" id="node_merged_payout" style="color: #c3a634; font-size: 1.1em; margin-top: -4px;">+<span id="node_merged_amount">0</span> <span id="node_merged_symbol" class="merged-child-symbol-hint">DOGE</span></div>
                     <div class="stat-detail">Per block found now</div>
+                    <!-- The operator's TOTAL entitlement in the current PPLNS
+                         window (mining payout + fee). Distinct from the fee
+                         above; it used to overwrite it. -->
+                    <div class="stat-detail" id="node_pplns_total_line" style="display: none;" title="Sum of this node's own addresses (/payout_addrs) in the current PPLNS window — the operator's mining payout AND fee, not the fee alone">PPLNS total: <span id="node_pplns_totamount">-</span> <small class="symbol-small">-</small></div>
                 </div>
-                
+
                 <div class="graph-section compact">
                     <div class="graph-header">
                         <h2>📈 Pool Hashrate</h2>
@@ -1882,6 +1903,8 @@
                         <div class="legend-item" data-series="connected" onclick="toggleSeries('connected', this)" title="Click to toggle connected miners (all connections)"><span class="legend-color" style="background: #e91e63;"></span><span>Connected</span></div>
                         <div class="legend-item" data-series="lucktrend" onclick="toggleSeries('lucktrend', this)" title="Click to toggle luck trend line"><span class="legend-color" style="background: #ffc107;"></span><span>Luck</span></div>
                         <div class="legend-item disabled" data-series="netdiff" onclick="toggleSeries('netdiff', this)" title="Click to toggle network difficulty"><span class="legend-color" style="background: #8b5cf6;"></span><span>Net Diff</span></div>
+                        <div class="legend-item" data-series="local" onclick="toggleSeries('local', this)" title="Click to toggle THIS node's own hashrate (as distinct from the pool total)"><span class="legend-color" style="background: #00d4ff;"></span><span>Local</span></div>
+                        <div class="legend-item disabled" data-series="localdoa" onclick="toggleSeries('localdoa', this)" title="Click to toggle this node's dead-on-arrival hashrate"><span class="legend-color" style="background: #ff8800;"></span><span>Local DOA</span></div>
                     </div>
                     <div class="graph-container compact" id="hashrate-graph"></div>
                     <div class="graph-stats compact">
@@ -1891,6 +1914,7 @@
                         <div class="graph-stat" title="Worker connections / Unique payout addresses"><div class="graph-stat-label">Workers/Miners</div><div class="graph-stat-value" id="graph-miners">-</div></div>
                         <div class="graph-stat"><div class="graph-stat-label">Avg Luck</div><div class="graph-stat-value" id="graph-luck">-</div></div>
                     </div>
+                    <div class="graph-diagnostic" id="hashrate-diagnostic" style="margin: 6px 0 2px; font-size: 12px; color: var(--text-muted);" title="Effective hashrate the pool's found blocks imply (Bayesian 95% credible interval on block rate), versus the hashrate the miners report. If reported sits outside the interval, the rigs are not delivering what they claim.">-</div>
                 </div>
             </div>
         </div>
@@ -1913,6 +1937,8 @@
                     <div class="legend-item" data-series="miners" onclick="toggleSeries('miners', this)" title="Click to toggle unique miner addresses" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #673ab7; width: 14px; height: 14px;"></span><span>Miners</span></div>
                     <div class="legend-item" data-series="lucktrend" onclick="toggleSeries('lucktrend', this)" title="Click to toggle luck trend line" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #ffc107; width: 14px; height: 14px;"></span><span>Luck</span></div>
                     <div class="legend-item disabled" data-series="netdiff" onclick="toggleSeries('netdiff', this)" title="Click to toggle network difficulty" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #8b5cf6; width: 14px; height: 14px;"></span><span>Net Diff</span></div>
+                    <div class="legend-item" data-series="local" onclick="toggleSeries('local', this)" title="Click to toggle THIS node's own hashrate (as distinct from the pool total)" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #00d4ff; width: 14px; height: 14px;"></span><span>Local</span></div>
+                    <div class="legend-item disabled" data-series="localdoa" onclick="toggleSeries('localdoa', this)" title="Click to toggle this node's dead-on-arrival hashrate" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #ff8800; width: 14px; height: 14px;"></span><span>Local DOA</span></div>
                 </div>
                 <button class="fullscreen-close" onclick="toggleGraphFullscreen()">✕ Close</button>
             </div>
@@ -1924,6 +1950,7 @@
                 <div class="fullscreen-stat" title="Worker connections / Unique payout addresses"><div class="fullscreen-stat-label">Workers/Miners</div><div class="fullscreen-stat-value" id="fs-graph-miners">-</div></div>
                 <div class="fullscreen-stat"><div class="fullscreen-stat-label">Avg Luck</div><div class="fullscreen-stat-value" id="fs-graph-luck">-</div></div>
             </div>
+            <div class="fullscreen-diagnostic" id="fs-hashrate-diagnostic" style="margin: 8px 16px; font-size: 13px; color: var(--text-muted);">-</div>
         </div>
         
         <!-- Active Miners -->
@@ -1951,7 +1978,7 @@
                                 <th title="Last pseudoshare received">Last Seen</th>
                                 <th title="Dead on Arrival rate">DOA Rate</th>
                                 <th title="Predicted payout if block found now">Predicted Payout</th>
-                                <th title="Predicted merged mining payout if block found now">Merged Payout</th>
+                                <th class="merged-child-hint" title="Predicted merged mining payout if block found now">Merged Payout</th>
                             </tr>
                         </thead>
                         <tbody></tbody>
@@ -2773,9 +2800,11 @@
                     var payoutSymbol = (currency_info && currency_info.symbol) || 'COIN';
                     minerRow.append('td').text(d3.format('.4f')(payout) + ' ' + payoutSymbol);
                     
-                    // Merged payout
+                    // Merged payout — cell carries merged-child-hint so the
+                    // topology CSS gate (body.no-merged-child) hides it on
+                    // standalone parents together with its column header.
                     var mergedEntry = mergedPayouts[miner.address];
-                    var mergedPayoutCell = minerRow.append('td');
+                    var mergedPayoutCell = minerRow.append('td').attr('class', 'merged-child-hint');
                     if (mergedEntry && mergedEntry.merged && mergedEntry.merged.length > 0) {
                         var mp = mergedEntry.merged[0];
                         mergedPayoutCell
@@ -2838,7 +2867,9 @@
                         var doaPercent = worker.hashrate > 0 ? worker.doa_hashrate / worker.hashrate : 0;
                         workerRow.append('td').text(d3.format('.2%')(doaPercent));
                         workerRow.append('td').text('-');
-                        workerRow.append('td').text('-');
+                        // Merged-payout filler cell — hidden with its column on
+                        // standalone parents (body.no-merged-child).
+                        workerRow.append('td').attr('class', 'merged-child-hint').text('-');
                     });
                 });
                 });
@@ -2873,6 +2904,10 @@
             // (DASH/BTC/DGB) shows just PARENT_ADDR.WORKER. Never serve merged-
             // mining worker instructions on a coin with no merged child.
             var mergedChild = info && info.merged_child_symbol;
+            // Body class drives a CSS rule so merged-mining cells appended
+            // later (miner-table re-renders) are hidden too, not only the
+            // elements that existed when this callback ran.
+            document.body.classList.toggle('no-merged-child', !mergedChild);
             if (mergedChild) {
                 d3.selectAll('.merged-child-symbol-hint').text(mergedChild);
                 d3.selectAll('.merged-child-hint').style('display', null);
@@ -3095,10 +3130,23 @@
 
         function renderBestShare(bs) {
             if (!bs || !bs.round) return;
-            d3.select('#best_share_round_pct_fancy').html(format_pct_fancy(bs.round.pct_of_block));
-            d3.select('#best_share_round_diff').text(format_difficulty(bs.round.difficulty));
+            // #945: gate the "Best Share" record on has_best_share. A false flag
+            // (or a 0 difficulty) means no record share has been seen yet -- do
+            // NOT render the value as a record. Pre-fix the backend substituted
+            // the sharechain AVERAGE here, so this card silently showed a window
+            // average under a "Best Share / \u{1F3C6} record" label.
+            var hasBest = (bs.has_best_share !== false) &&
+                          bs.round && bs.round.difficulty > 0;
+            if (hasBest) {
+                d3.select('#best_share_round_pct_fancy').html(format_pct_fancy(bs.round.pct_of_block));
+                d3.select('#best_share_round_diff').text(format_difficulty(bs.round.difficulty));
+                d3.select('#best_share_alltime_pct_fancy').html(format_pct_fancy(bs.all_time.pct_of_block));
+            } else {
+                d3.select('#best_share_round_pct_fancy').html('\u2014');
+                d3.select('#best_share_round_diff').text('no record yet');
+                d3.select('#best_share_alltime_pct_fancy').html('\u2014');
+            }
             d3.select('#best_share_net_diff').text(format_difficulty(bs.network_difficulty));
-            d3.select('#best_share_alltime_pct_fancy').html(format_pct_fancy(bs.all_time.pct_of_block));
             // Record-share hash (the exact hash that got closest to a block).
             var recHash = (bs.round && bs.round.hash) ? bs.round.hash
                         : ((bs.all_time && bs.all_time.hash) ? bs.all_time.hash : '');
@@ -3161,7 +3209,16 @@
             var blocks_in_24h = (24 * 3600) / time_to_block;
             var payout_per_block = (local / global_stats.pool_hash_rate) * local_stats.block_value_miner * (1 - local_stats.donation_proportion);
             var expected_24h_payout = payout_per_block * blocks_in_24h;
-            d3.select('#expected_payout_amount').text(isFinite(expected_24h_payout) ? d3.format('.4f')(expected_24h_payout) : '0');
+            // The element for this now exists (Local Hash Rate card). Reveal it
+            // only when the number is real: with no local miners, or before the
+            // first pool-hashrate sample, the expression is NaN/Infinity and a
+            // formatted '0' would read as a genuine "you will earn nothing".
+            if (isFinite(expected_24h_payout)) {
+                d3.select('#expected_payout_amount').text(d3.format('.4f')(expected_24h_payout));
+                d3.select('#expected_payout_line').style('display', null);
+            } else {
+                d3.select('#expected_payout_line').style('display', 'none');
+            }
         }
 
         function renderLocalStats(local_stats) {
@@ -3181,20 +3238,97 @@
                 d3.select('#efficiency').text(local_stats.efficiency != null ? d3.format('.2p')(local_stats.efficiency) : '???');
                 d3.select('#uptime').text(format_dt(local_stats.uptime));
                 d3.select('#block_value').text(d3.format('.4f')(local_stats.block_value));
-                d3.select('#block_value_payments').text(d3.format('.4f')(local_stats.block_value_payments || 0));
-                d3.select('#block_value_miner').text(d3.format('.4f')(local_stats.block_value_miner || local_stats.block_value));
+                // block_value_payments is the protocol-mandated output lane
+                // (masternode / superblock / platform burn). The API sets it
+                // EQUAL to block_value on coins that have no such lane
+                // (web_server.cpp: `(DASH) ? payment_amount : block_value`), so
+                // showing it unconditionally would tell an LTC operator the
+                // whole block is "protocol payments". Show it only when it is a
+                // genuine deduction.
+                var _bvp = local_stats.block_value_payments;
+                var _hasProtocolLane = (_bvp != null && _bvp > 0
+                                        && _bvp < local_stats.block_value - 1e-12);
+                var _burn = local_stats.block_value_burn;
+                // Both visibilities are set on EVERY pass, never only inside the
+                // positive branch: these cards re-render in place, so a branch
+                // that can turn a line on but not off leaves a stale line behind
+                // the moment the shape changes (a coin whose payments lane goes
+                // away, or a template that arrives before the burn field does).
+                var _hasBurn = _hasProtocolLane && (_burn != null && _burn > 0);
+                d3.select('#block_value_payments_part')
+                    .style('display', _hasProtocolLane ? null : 'none');
+                d3.select('#block_value_burn_part')
+                    .style('display', _hasBurn ? null : 'none');
+                if (_hasProtocolLane)
+                    d3.select('#block_value_payments').text(d3.format('.4f')(_bvp));
+                if (_hasBurn)
+                    d3.select('#block_value_burn').text(d3.format('.4f')(_burn));
+                // #948: the card headline is the GROSS (pre-fee) miner share so it
+                // matches the API block_value_miner_gross field and the label says so;
+                // the fee and the resulting NET (legacy block_value_miner) are shown below.
+                var bvm_gross = (local_stats.block_value_miner_gross != null) ? local_stats.block_value_miner_gross
+                              : (local_stats.block_value_miner != null ? local_stats.block_value_miner : local_stats.block_value);
+                d3.select('#block_value_miner').text(d3.format('.4f')(bvm_gross));
+                if (local_stats.block_value_fee != null)
+                    d3.select('#block_value_fee').text(d3.format('.4f')(local_stats.block_value_fee));
+                if (local_stats.block_value_miner_net != null)
+                    d3.select('#block_value_miner_net').text(d3.format('.4f')(local_stats.block_value_miner_net));
                 
                 // Node fee percentage and computed amounts
                 var nodeFee = local_stats.fee != null ? local_stats.fee : 0;
                 d3.select('#node_fee_percent').text(d3.format('.1f')(nodeFee));
-                // Display computed node fee amounts per block
-                if (local_stats.node_fee_ltc != null) {
-                    d3.select('#payout_totamount').text(d3.format('.4f')(local_stats.node_fee_ltc));
-                    d3.select('#node_payout_symbol').text('LTC');
+                // Display computed node fee amounts per block.
+                //
+                // There is ONE shared dashboard.html for every coin, so the
+                // amount can NEVER be read from a hardcoded per-coin key. This
+                // read `local_stats.node_fee_ltc`, which is absent on DASH:
+                // d3.format('.4f')(undefined) renders nothing, so the card sat
+                // at "-" while the backend had the number
+                // (node_fee_dash = 0.00424). The symbol looked right only by
+                // accident — the .symbol-small sweep from currency_info had
+                // already written "DASH", and line :3229's hardcoded 'LTC'
+                // would have stomped it the moment node_fee_ltc appeared.
+                //
+                // Resolution order, most-general first:
+                //   1. node_fee                     coin-neutral, every coin
+                //   2. node_fee_<currency_info.symbol>   old binary, new page
+                //   3. node_fee_ltc                 the original legacy key
+                // (2) is what lets a newer web-static dropped on an already-
+                // running node render without a restart, and it is why LTC/
+                // DOGE/DASH keep working against binaries that predate (1).
+                var localStatsCoinFee = function(stats, sym, legacyKey) {
+                    if (stats.node_fee != null) return stats.node_fee;
+                    if (sym) {
+                        var k = 'node_fee_' + String(sym).toLowerCase();
+                        if (stats[k] != null) return stats[k];
+                    }
+                    if (legacyKey && stats[legacyKey] != null) return stats[legacyKey];
+                    return null;
+                };
+                var _ci = (typeof currency_info !== 'undefined') ? currency_info : {};
+                var _sym = _ci.symbol || '';
+                var nodeFeeAmount = localStatsCoinFee(local_stats, _sym, 'node_fee_ltc');
+                if (nodeFeeAmount != null) {
+                    d3.select('#payout_totamount').text(d3.format('.4f')(nodeFeeAmount));
+                    // Symbol from currency_info, never a literal — same source
+                    // the .symbol-small sweep uses, so the two agree. When
+                    // currency_info has not landed we leave whatever the sweep
+                    // put there rather than stomping it with a placeholder;
+                    // the old code wrote 'LTC' here unconditionally.
+                    if (_sym) d3.select('#node_payout_symbol').text(_sym.toUpperCase());
                 }
-                if (local_stats.node_fee_doge != null) {
-                    d3.select('#node_merged_amount').text(d3.format(',.2f')(local_stats.node_fee_doge));
-                    d3.select('#node_merged_symbol').text((typeof currency_info!=="undefined"&&currency_info.merged_child_symbol)||'DOGE');
+                // Merged-child fee: coin-neutral node_fee_merged first, then
+                // node_fee_<merged_child_symbol>, then the legacy DOGE key.
+                var mergedSym = _ci.merged_child_symbol || '';
+                var mergedFee = (local_stats.node_fee_merged != null)
+                    ? local_stats.node_fee_merged
+                    : (mergedSym && local_stats['node_fee_' + mergedSym.toLowerCase()] != null
+                        ? local_stats['node_fee_' + mergedSym.toLowerCase()]
+                        : (local_stats.node_fee_doge != null ? local_stats.node_fee_doge : null));
+                if (mergedFee != null) {
+                    d3.select('#node_merged_amount').text(d3.format(',.2f')(mergedFee));
+                    d3.select('#node_merged_symbol').text(
+                        local_stats.node_fee_merged_symbol || mergedSym || 'DOGE');
                 }
 
                 // Warnings
@@ -4456,9 +4590,20 @@
                             }
                         }
                     }
-                    // Only overwrite computed estimates if PPLNS has real data
+                    // This sums the operator's own entries in the CURRENT PPLNS
+                    // window (/payout_addrs intersected with
+                    // /current_merged_payouts). That is the operator's total
+                    // entitlement — their mining payout AND the fee — which is
+                    // NOT the node fee the card above is labelled with. It used
+                    // to overwrite #payout_totamount, silently relabelling one
+                    // quantity as the other; it only escaped notice because
+                    // /current_merged_payouts answered {} wherever the seam was
+                    // unbound, so `totamount > 0` was never true. It gets its
+                    // own, correctly-labelled line instead.
+                    d3.select('#node_pplns_total_line')
+                        .style('display', totamount > 0 ? null : 'none');
                     if (totamount > 0)
-                        d3.select('#payout_totamount').text(d3.format('.4f')(totamount));
+                        d3.select('#node_pplns_totamount').text(d3.format('.4f')(totamount));
 
                     // Show merged payout (always show when merged mining is active)
                     if (window.payoutsMergedSymbol && totMergedAmount > 0) {
@@ -6444,6 +6589,11 @@
         var _cachedPPLNSPayouts = null;
         function renderMainPPLNS(payouts) {
                 if (!payouts || typeof payouts !== 'object') return;
+                // Coin label from currency_info (per-node truthful). This
+                // treemap hardcoded 'LTC', so on a DASH node every cell and
+                // tooltip read "% LTC".
+                var _pplnsSym = ((typeof currency_info !== 'undefined'
+                                  && currency_info.symbol) || 'COIN').toUpperCase();
                 var pl = document.getElementById('pplns-loading');
                 if (pl) pl.style.display = 'none';
                 var grid = document.getElementById('pplns-main-grid');
@@ -6538,7 +6688,7 @@
                         var el = document.createElement('div');
                         el.className = 'pm-pct';
                         el.style.fontSize = fitPct + 'px';
-                        el.textContent = (r.pct * 100).toFixed(1) + (r.w > 60 ? '% LTC' : '%');
+                        el.textContent = (r.pct * 100).toFixed(1) + (r.w > 60 ? '% ' + _pplnsSym : '%');
                         cell.appendChild(el);
                     }
                     // DOGE %
@@ -6650,7 +6800,7 @@
                             if (mHr > 0) hrLine = '<div style="color:var(--text-secondary)">' + format_hashrate(mHr) + '</div>';
                             tooltip.innerHTML =
                                 '<div style="color:var(--primary);font-weight:700;margin-bottom:4px">' + r.addr + '</div>' +
-                                '<div style="font-weight:600">' + (r.pct*100).toFixed(2) + '% \u2014 ' + r.amt.toFixed(8) + ' LTC</div>' +
+                                '<div style="font-weight:600">' + (r.pct*100).toFixed(2) + '% \u2014 ' + r.amt.toFixed(8) + ' ' + _pplnsSym + '</div>' +
                                 dogeLine + hrLine + verLine +
                                 '<div style="color:var(--text-muted);font-size:0.75em;margin-top:4px">Click to view on Blockchair</div>';
                             tooltip.style.display = 'block';
@@ -6757,9 +6907,11 @@
         var graphUniqueMinersData = [];
         var graphBlocks = [];
         var graphNetworkDiffData = [];
+        var graphLocalData = [];
+        var graphLocalDeadData = [];
         var isFullscreen = false;
         var fullscreenChart = null;
-        var seriesVisibility = { good: true, doa: true, blocks: true, workers: false, miners: true, connected: true, lucktrend: true, netdiff: false };
+        var seriesVisibility = { good: true, doa: true, blocks: true, workers: false, miners: true, connected: true, lucktrend: true, netdiff: false, local: true, localdoa: false };
         
         function toggleSeries(seriesName, element) {
             seriesVisibility[seriesName] = !seriesVisibility[seriesName];
@@ -6773,8 +6925,8 @@
                 }
             });
             
-            // Map series names to indices (order: good, doa, blocks, workers, miners, connected, lucktrend, netdiff)
-            var seriesIndexMap = { good: 0, doa: 1, blocks: 2, workers: 3, miners: 4, connected: 5, lucktrend: 6, netdiff: 7 };
+            // Map series names to indices (order: good, doa, blocks, workers, miners, connected, lucktrend, netdiff, local, localdoa)
+            var seriesIndexMap = { good: 0, doa: 1, blocks: 2, workers: 3, miners: 4, connected: 5, lucktrend: 6, netdiff: 7, local: 8, localdoa: 9 };
             var seriesIndex = seriesIndexMap[seriesName];
             
             if (hashrateChart && hashrateChart.series[seriesIndex]) {
@@ -6802,7 +6954,7 @@
                 overlay.classList.add('active');
                 document.body.style.overflow = 'hidden';
                 // Render fullscreen chart
-                renderFullscreenGraph(graphData, graphMinerData, graphUniqueMinersData, graphConnectedMinersData, graphBlocks, graphNetworkDiffData);
+                renderFullscreenGraph(graphData, graphMinerData, graphUniqueMinersData, graphConnectedMinersData, graphBlocks, graphNetworkDiffData, graphLocalData, graphLocalDeadData);
                 // Update button states
                 updatePeriodButtons();
             } else {
@@ -6846,17 +6998,21 @@
             var connectedMinersData = null;
             var blocksData = [];
             var networkDiffData = [];
+            var localData = [];
+            var localDeadData = [];
             
             function tryRender() {
                 loadCount++;
-                if (loadCount === 6) {  // Loading 6 resources: hashrate, worker_count, unique_miner_count, connected_miners, blocks, network_difficulty
+                if (loadCount === 8) {  // hashrate, worker_count, unique_miner_count, connected_miners, blocks, network_difficulty, local_hash_rate, local_dead_hash_rate
                     graphData = hashrateData;
                     graphMinerData = minerCountData;
                     graphUniqueMinersData = uniqueMinerCountData;
                     graphConnectedMinersData = connectedMinersData;
                     graphBlocks = blocksData;
                     graphNetworkDiffData = networkDiffData;
-                    renderHashrateGraph(hashrateData, minerCountData, uniqueMinerCountData, connectedMinersData, blocksData, networkDiffData);
+                    graphLocalData = localData;
+                    graphLocalDeadData = localDeadData;
+                    renderHashrateGraph(hashrateData, minerCountData, uniqueMinerCountData, connectedMinersData, blocksData, networkDiffData, localData, localDeadData);
                 }
             }
             
@@ -6915,8 +7071,49 @@
                 tryRender();
             });
             
-            d3.json('../network_difficulty?period=' + currentGraphPeriod, function(data) {
+            // Net Diff follows the period selector through the same binned
+            // graph_data source as every other series. The old
+            // /network_difficulty?period= ring was sparse (#1140) AND the
+            // series was mis-scaled onto the hashrate axis; both are fixed here.
+            var netDiffEndpoints = {
+                'hour': '../web/graph_data/network_difficulty/last_hour',
+                'day': '../web/graph_data/network_difficulty/last_day',
+                'week': '../web/graph_data/network_difficulty/last_week',
+                'month': '../web/graph_data/network_difficulty/last_month',
+                'year': '../web/graph_data/network_difficulty/last_year'
+            };
+            d3.json(netDiffEndpoints[currentGraphPeriod], function(data) {
                 networkDiffData = data || [];
+                tryRender();
+            });
+            
+            // This node's OWN hashrate, as distinct from the pool total.
+            // Both sources are already served by rest_web_graph_data() and are
+            // populated on every coin -- see web-static/graphs.html, which has
+            // plotted them on a separate legacy page since the p2pool port.
+            var localEndpoints = {
+                'hour': '../web/graph_data/local_hash_rate/last_hour',
+                'day': '../web/graph_data/local_hash_rate/last_day',
+                'week': '../web/graph_data/local_hash_rate/last_week',
+                'month': '../web/graph_data/local_hash_rate/last_month',
+                'year': '../web/graph_data/local_hash_rate/last_year'
+            };
+            
+            var localDeadEndpoints = {
+                'hour': '../web/graph_data/local_dead_hash_rate/last_hour',
+                'day': '../web/graph_data/local_dead_hash_rate/last_day',
+                'week': '../web/graph_data/local_dead_hash_rate/last_week',
+                'month': '../web/graph_data/local_dead_hash_rate/last_month',
+                'year': '../web/graph_data/local_dead_hash_rate/last_year'
+            };
+            
+            d3.json(localEndpoints[currentGraphPeriod], function(data) {
+                localData = data || [];
+                tryRender();
+            });
+            
+            d3.json(localDeadEndpoints[currentGraphPeriod], function(data) {
+                localDeadData = data || [];
                 tryRender();
             });
         }
@@ -7009,7 +7206,78 @@
             });
         }
 
-        function renderHashrateGraph(data, minerData, uniqueMinersData, connectedData, blocks, networkDiffSamples) {
+        // ── CI95 "Effective vs reported" hashrate diagnostic ──────────────────
+        // Ported from our p2pool-dash fork's updateHashrateDiagnostic, WITH its
+        // verdict logic corrected.
+        //
+        // MODEL. Block finding is a Poisson process with rate lambda
+        // (blocks/sec). Gamma is conjugate to Poisson, so with a prior
+        // Gamma(a0, b0) centred on the REPORTED hashrate and k blocks found over
+        // windowSec seconds, the posterior is Gamma(a0+k, b0+windowSec) in
+        // closed form. The 95% band is the normal approximation mean +/- 1.96 sd
+        // clipped at 0, converted back to H/s via netDiff * 2^32.
+        //
+        // The reported hashrate is what the miners CLAIM; the band is what the
+        // blocks they actually found IMPLY. It answers "are the rigs delivering
+        // the hashrate they claim?" -- a misconfiguration / fraud detector. A
+        // 95% band on LUCK would be [~27%, ~3950%] and useless; a band on
+        // effective hashrate over shares/blocks is tight enough to act on.
+        //
+        // Every input is already fetched by the dashboard (bucket-a).
+        function updateHashrateDiagnostic(containerId, avgHashrate, blocksInWindow, windowSec, netDiff, labelPrefix) {
+            var el = document.getElementById(containerId);
+            if (!el) return;
+            if (!netDiff || netDiff <= 0 || !windowSec || windowSec <= 0) {
+                el.textContent = labelPrefix + 'Not enough data yet';
+                el.style.color = 'var(--text-muted)';
+                return;
+            }
+            var blockHashes = netDiff * 4294967296; // 2^32 expected hashes/block
+            var reported = avgHashrate || 0;
+            var k = blocksInWindow;
+            var expectedLambdaPrior = (reported > 0) ? (reported / blockHashes) : 0.0000001;
+            var alpha0 = 5;                                  // prior strength ~5 blocks
+            var beta0  = (expectedLambdaPrior > 0) ? (alpha0 / expectedLambdaPrior) : 1e9;
+            var alpha  = alpha0 + k;
+            var beta   = beta0 + windowSec;
+            var meanLambda = alpha / beta;
+            var stdLambda  = Math.sqrt(alpha / (beta * beta));
+            var z = 1.96;
+            var effLow  = Math.max(0, meanLambda - z * stdLambda) * blockHashes;
+            var effHigh = (meanLambda + z * stdLambda) * blockHashes;
+
+            var statusText = labelPrefix + 'CI95 ' + format_hashrate(effLow) + ' \u2013 ' +
+                             format_hashrate(effHigh) + ' vs reported ' + format_hashrate(reported);
+
+            // VERDICT FIX. The fork tested effHigh against reported*0.8 ONE-SIDEDLY
+            // and printed "OK" while reported sat OUTSIDE the interval (operator
+            // screenshot: reported 51.70 outside [14.18, 45.38], still "OK"). The
+            // honest test is interval MEMBERSHIP.
+            var color, verdict;
+            if (k < 3) {
+                // REPLACE the verdict, never append to it -- the fork appended
+                // "Low evidence" AFTER "OK", asserting a call it then withdrew.
+                verdict = 'Low evidence (' + k + ' block' + (k === 1 ? '' : 's') + ' in window, need 3)';
+                color = 'var(--text-muted)';
+            } else if (reported >= effLow && reported <= effHigh) {
+                verdict = 'OK (reported within CI95)';
+                color = 'var(--success)';
+            } else if (reported > effHigh) {
+                var critical = effHigh < reported * 0.6;
+                verdict = critical ? 'Critical: effective far below reported'
+                                   : 'Warning: reported above CI95';
+                color = critical ? 'var(--danger)' : 'var(--warning)';
+            } else {
+                // reported < effLow: more blocks than the reported rate predicts,
+                // usually a reported-hashrate undercount rather than a problem.
+                verdict = 'Note: reported below CI95';
+                color = 'var(--warning)';
+            }
+            el.textContent = statusText + ' \u2022 ' + verdict;
+            el.style.color = color;
+        }
+
+        function renderHashrateGraph(data, minerData, uniqueMinersData, connectedData, blocks, networkDiffSamples, localSamples, localDeadSamples) {
             var container = document.getElementById('hashrate-graph');
             blocks = blocks || [];
             minerData = minerData || [];
@@ -7089,22 +7357,44 @@
                 }
             });
             
+            // Parse this node's OWN hashrate. Scalar H/s, the same unit as the
+            // pool series, so it shares yAxis 0 -- a node contributing a small
+            // slice of the pool legitimately draws a low line. Both sources are
+            // already served by rest_web_graph_data() on every coin; only the
+            // main chart never asked for them (#919).
+            var localRate = [];
+            var localDeadRate = [];
+            (localSamples || []).forEach(function(d) {
+                var timestamp = d[0] * 1000;
+                if (timestamp >= minTime && timestamp <= maxTime) {
+                    localRate.push([timestamp, d[1] || 0]);
+                }
+            });
+            (localDeadSamples || []).forEach(function(d) {
+                var timestamp = d[0] * 1000;
+                if (timestamp >= minTime && timestamp <= maxTime) {
+                    localDeadRate.push([timestamp, d[1] || 0]);
+                }
+            });
+            
             // Process blocks - filter to exact time range for proper data alignment
             var blockMarkers = [];
             var luckTrendData = [];
             var validLucks = [];
             
-            // Process network difficulty samples - convert to hashrate equivalent
+            // graph_data 4-tuple: [ts_seconds, difficulty, bin_width, default].
+            // Plot the RAW network difficulty on its own axis (yAxis 3). The
+            // leading bins on last_day/last_week are 0.0 (netdiff-at-find was
+            // recorded as 0 before #1127); a 0 here is UNMEASURED, so it is
+            // emitted as null and the spline breaks across it rather than
+            // diving to the floor.
             var netDiffData = [];
-            networkDiffSamples = networkDiffSamples || [];
-            console.log('Compact - Processing network difficulty:', networkDiffSamples.length, 'samples');
-            networkDiffSamples.forEach(function(sample) {
-                var sampleTime = sample.ts * 1000;
-                // Don't filter - backend already provides correctly bounded data with gap filling
-                var netHashrate = sample.network_diff * Math.pow(2, 32) / 150; // 150s avg block time for Dash
-                netDiffData.push([sampleTime, netHashrate]);
+            (networkDiffSamples || []).forEach(function(sample) {
+                if (!Array.isArray(sample)) return;
+                var sampleTime = sample[0] * 1000;
+                var diff = sample[1];
+                netDiffData.push([sampleTime, (diff && diff > 0) ? diff : null]);
             });
-            console.log('Net Diff data points:', netDiffData.length);
             
             // Sort blocks by timestamp
             var sortedBlocks = blocks.slice().sort(function(a, b) { return a.ts - b.ts; });
@@ -7114,8 +7404,11 @@
                 
                 // Check if block is within selected time window (exact range for alignment)
                 if (blockTime >= minTime && blockTime <= maxTime) {
-                    // For luck trend, collect blocks with luck data within time window
-                    if (b.luck !== undefined && b.luck !== null) {
+                    // For luck trend, collect blocks with luck data within time window.
+                    // luck <= 0 means "never computed" (relay-learned row, or a row
+                    // recorded before the netdiff-at-find fix), NOT 0% luck -- plotting
+                    // it drew the 2026-08-05 hotel chart down to zero. Skip, don't draw.
+                    if (b.luck !== undefined && b.luck !== null && b.luck > 0) {
                         luckTrendData.push([blockTime, b.luck]);
                         validLucks.push(b.luck);
                     }
@@ -7317,6 +7610,24 @@
             } else {
                 document.getElementById('graph-luck').textContent = '-';
             }
+            // CI95 effective-vs-reported band. lastNetDiff read defensively so
+            // this is agnostic to the netdiff sample shape; k counts blocks WE
+            // found in the window regardless of whether luck was computable --
+            // that sidesteps the #1138 undercount (a DASH block recorded with
+            // network_difficulty 0 has null luck but is still a real find) and
+            // excludes relay-learned blocks (found_locally === false).
+            var lastNetDiff = 0;
+            for (var _i = (networkDiffSamples || []).length - 1; _i >= 0; _i--) {
+                var _sm = networkDiffSamples[_i];
+                var _v = Array.isArray(_sm) ? _sm[1] : (_sm && _sm.network_diff);
+                if (_v && _v > 0) { lastNetDiff = _v; break; }
+            }
+            var kBlocks = blockMarkers.filter(function(m) {
+                return m.block && m.block.found_locally !== false;
+            }).length;
+            updateHashrateDiagnostic('hashrate-diagnostic', avg, kBlocks,
+                (maxTime - minTime) / 1000, lastNetDiff, 'Effective vs reported: ');
+
             
             // Create Highcharts chart (regular chart for better pan support)
             var isCompact = container.classList.contains('compact');
@@ -7424,6 +7735,21 @@
                     },
                     gridLineWidth: 0,
                     opposite: true
+                }, {
+                    // Fourth Y-axis for network difficulty. Difficulty is ~1e8,
+                    // ~500,000x off the hashrate axis (~5e13), so sharing yAxis 0
+                    // collapsed Net Diff onto a flat line. Its own right axis, in
+                    // millions, matches p2pool-dash's reference dashboard.
+                    title: { text: null },
+                    min: 0,
+                    lineColor: '#8b5cf6',
+                    tickColor: '#8b5cf6',
+                    labels: {
+                        style: { color: '#8b5cf6', fontSize: '10px' },
+                        formatter: function() { return (this.value / 1000000).toFixed(1) + 'M'; }
+                    },
+                    gridLineWidth: 0,
+                    opposite: true
                 }],
                 tooltip: {
                     shared: true,
@@ -7491,6 +7817,9 @@
                             } else if (point.series.name === 'Workers' || point.series.name === 'Miners' || point.series.name === 'Connected') {
                                 s += '<br/><span style="color:' + point.color + '">●</span> ' + 
                                      point.series.name + ': <b>' + Math.round(point.y) + '</b>';
+                            } else if (point.series.name === 'Net Diff') {
+                                s += '<br/><span style="color:' + point.color + '">●</span> ' + 
+                                     point.series.name + ': <b>' + format_difficulty(point.y) + '</b>';
                             } else {
                                 s += '<br/><span style="color:' + point.color + '">●</span> ' + 
                                      point.series.name + ': <b>' + format_hashrate(point.y) + '</b>';
@@ -7659,24 +7988,40 @@
                     data: netDiffData,
                     color: '#8b5cf6',
                     lineWidth: 2,
-                    marker: {
-                        enabled: true,
-                        radius: 3,
-                        fillColor: '#8b5cf6',
-                        symbol: 'circle'
-                    },
+                    marker: { enabled: false },
+                    connectNulls: false,
                     visible: seriesVisibility.netdiff,
+                    yAxis: 3
+                }, {
+                    type: 'spline',
+                    name: 'Local',
+                    data: localRate,
+                    color: '#00d4ff',
+                    lineWidth: 2,
+                    dashStyle: 'ShortDot',
+                    marker: { enabled: false },
+                    visible: seriesVisibility.local,
+                    yAxis: 0
+                }, {
+                    type: 'spline',
+                    name: 'Local DOA',
+                    data: localDeadRate,
+                    color: '#ff8800',
+                    lineWidth: 1,
+                    dashStyle: 'ShortDot',
+                    marker: { enabled: false },
+                    visible: seriesVisibility.localdoa,
                     yAxis: 0
                 }]
             });
             
             // Also update fullscreen if open
             if (isFullscreen) {
-                renderFullscreenGraph(data, minerData, uniqueMinersData, connectedData, blocks, networkDiffSamples);
+                renderFullscreenGraph(data, minerData, uniqueMinersData, connectedData, blocks, networkDiffSamples, localSamples, localDeadSamples);
             }
         }
         
-        function renderFullscreenGraph(data, minerData, uniqueMinersData, connectedData, blocks, networkDiffSamples) {
+        function renderFullscreenGraph(data, minerData, uniqueMinersData, connectedData, blocks, networkDiffSamples, localSamples, localDeadSamples) {
             var container = document.getElementById('fullscreen-graph');
             blocks = blocks || graphBlocks || [];
             minerData = minerData || [];
@@ -7744,19 +8089,39 @@
                 connectedCount.push([timestamp, count]);
             });
             
+            // Parse this node's OWN hashrate. Scalar H/s, the same unit as the
+            // pool series, so it shares yAxis 0 -- a node contributing a small
+            // slice of the pool legitimately draws a low line. Both sources are
+            // already served by rest_web_graph_data() on every coin; only the
+            // main chart never asked for them (#919).
+            var localRate = [];
+            var localDeadRate = [];
+            (localSamples || []).forEach(function(d) {
+                var timestamp = d[0] * 1000;
+                if (timestamp >= minTime && timestamp <= maxTime) {
+                    localRate.push([timestamp, d[1] || 0]);
+                }
+            });
+            (localDeadSamples || []).forEach(function(d) {
+                var timestamp = d[0] * 1000;
+                if (timestamp >= minTime && timestamp <= maxTime) {
+                    localDeadRate.push([timestamp, d[1] || 0]);
+                }
+            });
+            
             // Process blocks - filter to exact time range for proper data alignment
             var blockMarkers = [];
             var luckTrendData = [];
             var validLucks = [];
             
-            // Process network difficulty samples - convert to hashrate equivalent
+            // graph_data 4-tuple [ts_seconds, difficulty, bin_width, default];
+            // raw difficulty on yAxis 3, leading 0.0 bins nulled (see compact).
             var netDiffData = [];
-            networkDiffSamples = networkDiffSamples || [];
-            networkDiffSamples.forEach(function(sample) {
-                var sampleTime = sample.ts * 1000;
-                // Don't filter - backend already provides correctly bounded data with gap filling
-                var netHashrate = sample.network_diff * Math.pow(2, 32) / 150; // 150s avg block time for Dash
-                netDiffData.push([sampleTime, netHashrate]);
+            (networkDiffSamples || []).forEach(function(sample) {
+                if (!Array.isArray(sample)) return;
+                var sampleTime = sample[0] * 1000;
+                var diff = sample[1];
+                netDiffData.push([sampleTime, (diff && diff > 0) ? diff : null]);
             });
             
             // Sort blocks by timestamp
@@ -7767,8 +8132,11 @@
                 
                 // Check if block is within selected time window (exact range for alignment)
                 if (blockTime >= minTime && blockTime <= maxTime) {
-                    // For luck trend, collect blocks with luck data within time window
-                    if (b.luck !== undefined && b.luck !== null) {
+                    // For luck trend, collect blocks with luck data within time window.
+                    // luck <= 0 means "never computed" (relay-learned row, or a row
+                    // recorded before the netdiff-at-find fix), NOT 0% luck -- plotting
+                    // it drew the 2026-08-05 hotel chart down to zero. Skip, don't draw.
+                    if (b.luck !== undefined && b.luck !== null && b.luck > 0) {
                         luckTrendData.push([blockTime, b.luck]);
                         validLucks.push(b.luck);
                     }
@@ -7942,6 +8310,24 @@
             } else {
                 document.getElementById('fs-graph-luck').textContent = '-';
             }
+            // CI95 effective-vs-reported band. lastNetDiff read defensively so
+            // this is agnostic to the netdiff sample shape; k counts blocks WE
+            // found in the window regardless of whether luck was computable --
+            // that sidesteps the #1138 undercount (a DASH block recorded with
+            // network_difficulty 0 has null luck but is still a real find) and
+            // excludes relay-learned blocks (found_locally === false).
+            var lastNetDiff = 0;
+            for (var _i = (networkDiffSamples || []).length - 1; _i >= 0; _i--) {
+                var _sm = networkDiffSamples[_i];
+                var _v = Array.isArray(_sm) ? _sm[1] : (_sm && _sm.network_diff);
+                if (_v && _v > 0) { lastNetDiff = _v; break; }
+            }
+            var kBlocks = blockMarkers.filter(function(m) {
+                return m.block && m.block.found_locally !== false;
+            }).length;
+            updateHashrateDiagnostic('fs-hashrate-diagnostic', avg, kBlocks,
+                (maxTime - minTime) / 1000, lastNetDiff, 'Effective vs reported: ');
+
             
             fullscreenChart = Highcharts.chart('fullscreen-graph', {
                 chart: {
@@ -8031,6 +8417,21 @@
                     },
                     gridLineWidth: 0,
                     opposite: true
+                }, {
+                    // Fourth Y-axis for network difficulty. Difficulty is ~1e8,
+                    // ~500,000x off the hashrate axis (~5e13), so sharing yAxis 0
+                    // collapsed Net Diff onto a flat line. Its own right axis, in
+                    // millions, matches p2pool-dash's reference dashboard.
+                    title: { text: null },
+                    min: 0,
+                    lineColor: '#8b5cf6',
+                    tickColor: '#8b5cf6',
+                    labels: {
+                        style: { color: '#8b5cf6', fontSize: '11px' },
+                        formatter: function() { return (this.value / 1000000).toFixed(1) + 'M'; }
+                    },
+                    gridLineWidth: 0,
+                    opposite: true
                 }],
                 tooltip: {
                     shared: true,
@@ -8099,6 +8500,9 @@
                             } else if (point.series.name === 'Workers' || point.series.name === 'Miners' || point.series.name === 'Connected') {
                                 s += '<br/><span style="color:' + point.color + '">●</span> ' + 
                                      point.series.name + ': <b>' + Math.round(point.y) + '</b>';
+                            } else if (point.series.name === 'Net Diff') {
+                                s += '<br/><span style="color:' + point.color + '">●</span> ' + 
+                                     point.series.name + ': <b>' + format_difficulty(point.y) + '</b>';
                             } else {
                                 s += '<br/><span style="color:' + point.color + '">●</span> ' + 
                                      point.series.name + ': <b>' + format_hashrate(point.y) + '</b>';
@@ -8279,13 +8683,29 @@
                     data: netDiffData,
                     color: '#8b5cf6',
                     lineWidth: 2,
-                    marker: {
-                        enabled: true,
-                        radius: 3,
-                        fillColor: '#8b5cf6',
-                        symbol: 'circle'
-                    },
+                    marker: { enabled: false },
+                    connectNulls: false,
                     visible: seriesVisibility.netdiff,
+                    yAxis: 3
+                }, {
+                    type: 'spline',
+                    name: 'Local',
+                    data: localRate,
+                    color: '#00d4ff',
+                    lineWidth: 2,
+                    dashStyle: 'ShortDot',
+                    marker: { enabled: false },
+                    visible: seriesVisibility.local,
+                    yAxis: 0
+                }, {
+                    type: 'spline',
+                    name: 'Local DOA',
+                    data: localDeadRate,
+                    color: '#ff8800',
+                    lineWidth: 1,
+                    dashStyle: 'ShortDot',
+                    marker: { enabled: false },
+                    visible: seriesVisibility.localdoa,
                     yAxis: 0
                 }]
             });

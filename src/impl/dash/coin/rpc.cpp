@@ -594,6 +594,30 @@ nlohmann::json NodeRPC::getblockheader(uint256 header, bool verbose)
     return CallAPIMethod("getblockheader", {header, verbose});
 }
 
+int NodeRPC::blockcount_cached()
+{
+    constexpr int kBlockCountCacheSecs = 20;
+    const auto now = std::time(nullptr);
+    if (m_blockcount_cache > 0
+        && now - m_blockcount_cache_at < kBlockCountCacheSecs)
+        return m_blockcount_cache;
+    try {
+        auto j = CallAPIMethod("getblockcount", {});
+        if (!j.is_number_integer()) return 0;
+        m_blockcount_cache    = j.get<int>();
+        m_blockcount_cache_at = now;
+        return m_blockcount_cache;
+    } catch (const std::exception&) {
+        return 0;   // unreachable => the caller refuses; never a stale guess
+    }
+}
+
+nlohmann::json NodeRPC::gettxout(const uint256& txid, uint32_t n)
+{
+    return CallAPIMethod("gettxout",
+                         {txid.GetHex(), static_cast<int>(n)});
+}
+
 // verbosity: 0 for hex-encoded data, 1 for a json object, and 2 for json object with transaction data
 nlohmann::json NodeRPC::getblock(uint256 blockhash, int verbosity)
 {

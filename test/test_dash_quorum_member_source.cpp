@@ -502,15 +502,16 @@ TEST(DashQuorumMemberSource, RequestGuardsAndPendingReap)
     EXPECT_TRUE(h.sends.empty());
     EXPECT_EQ(h.src->pending_count(), 0u);
 
-    // rotated type -> refused (qrinfo follow-up).
+    // rotated type -> NEVER a getmnlistd. A rotated member set is sourced from
+    // a qrinfo (quarter rotation), and this Harness wires no getqrinfo seam, so
+    // the request cannot send at all and the quorum stays null-serve. The
+    // rotated SOURCING + SERVING path is gated in
+    // test_dash_rotated_quorum_members.cpp against the real captured cycle.
     const uint256 rot_base = raw256(0xE0);
     h.add_block(1'520'064, rot_base);       // 1520064 % 288 == 0
     h.add_block(1'520'056, raw256(0xE1));
     h.src->request(/*llmq_60_75*/ 5, rot_base);
-    EXPECT_TRUE(h.sends.empty());
-    // ...and no ready set is ever produced for the rotated quorum (fail closed
-    // end-to-end: lookup() returns nullopt, so #812 verify_final_commitment
-    // null-serves and the #816 completeness gate leaves the window to dashd).
+    EXPECT_TRUE(h.sends.empty()) << "the rotated lane must not use getmnlistd";
     EXPECT_FALSE(h.src->lookup(5, rot_base).has_value());
 
     // pending reap: > kPendingCap outstanding requests evict the oldest
@@ -531,15 +532,14 @@ TEST(DashQuorumMemberSource, RequestGuardsAndPendingReap)
     EXPECT_LE(h.src->pending_count(), QuorumMemberSource::kPendingCap);
 }
 
-// ── ITEM 2: rotated (DIP-24) member sourcing — ground truth + fail-closed ────
+// ── rotated (DIP-24) KAT SHAPE + the non-rotated leaf's refusal ─────────────
 // The captured real llmq_60_75 vector (dashd `quorum info 5 <hash>` @testnet
-// 192.168.86.52, height 1520064) is dashd's AUTHORITATIVE ordered member set:
-// the 60-member order + operator BLS keys that the follow-up
-// ComputeQuorumMembersByQuarterRotation port must reproduce before the rotated
-// DKG window can serve real. This KAT (a) pins that vector's shape as the
-// validation target, and (b) proves the rotated path currently FAILS CLOSED
-// end-to-end — so the reward-safe dashd fallback is intact until the qrinfo
-// wire + quarter-rotation compute land (each gated on reproducing THIS vector).
+// 192.168.86.52, height 1520064) is dashd's AUTHORITATIVE ordered member set.
+// This test pins its SHAPE and proves that the SINGLE-SNAPSHOT leaf
+// (compute_quorum_members) still refuses a rotated type — rotation must go
+// through compute_quorum_members_by_quarter_rotation over a qrinfo, never
+// through the non-rotated path. The ORDER assertion against this vector lives
+// in test_dash_rotated_quorum_members.cpp.
 TEST(DashQuorumMemberSource, RotatedRealVectorGroundTruthAndFailClosed)
 {
     using namespace dash::coin::testdata;
@@ -555,9 +555,9 @@ TEST(DashQuorumMemberSource, RotatedRealVectorGroundTruthAndFailClosed)
     EXPECT_EQ(kRot6075_LlmqType, 5);
     EXPECT_EQ(kRot6075_CycleBaseHeight % 24, 0);    // sits on the dkgInterval boundary
 
-    // (b) the rotated compute is fail-closed at the vendor leaf: no single-
-    // snapshot member selection exists for a rotated type (quarter-rotation
-    // over qrinfo is required), so compute_quorum_members refuses.
+    // (b) the SINGLE-SNAPSHOT leaf stays fail-closed for a rotated type: no
+    // single-snapshot member selection exists for one (quarter rotation over a
+    // qrinfo is required), so compute_quorum_members must refuse.
     QuorumMemberParams rp;
     rp.type         = kRot6075_LlmqType;
     rp.size         = static_cast<uint16_t>(kRot6075_MemberCount);
@@ -566,11 +566,10 @@ TEST(DashQuorumMemberSource, RotatedRealVectorGroundTruthAndFailClosed)
     CSimplifiedMNList empty_list{std::vector<CSimplifiedMNListEntry>{}};
     auto refused = compute_quorum_members(rp, uint256::ZERO, empty_list);
     EXPECT_FALSE(refused.has_value())
-        << "rotated member selection must fail closed until the quarter-rotation "
-           "port reproduces the captured 60_75 order";
+        << "a rotated type must never be selected from one snapshot";
 
-    // (c) and end-to-end through the sourcing plumbing: a rotated request emits
-    // no wire traffic and never yields a ready set.
+    // (c) and end-to-end through the sourcing plumbing WITHOUT a getqrinfo seam:
+    // no wire traffic, no ready set — the fallback posture is still reachable.
     Harness h;
     const uint256 rot_base = raw256(0xC0);
     h.add_block(kRot6075_CycleBaseHeight, rot_base);

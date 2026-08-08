@@ -747,7 +747,17 @@ public:
 
                 try {
                     invalidate_weight_caches(bad);
-                    if (verified.contains(bad)) verified.remove(bad);
+                    // #1131 double-free guard: `verified` is a BORROWING view —
+                    // it holds the same raw share pointers `chain` OWNS (every
+                    // node.cpp removal already pairs verified.remove(h, false)
+                    // with chain.remove(h)). Removing from the borrowing view
+                    // must NOT destroy; only the owning chain.remove() below
+                    // may. Omitting owns_data defaults it to true, so if the
+                    // `verified.contains(bad) -> continue` guard 20 lines up is
+                    // ever loosened (e.g. wiring the mint path) this would
+                    // destroy() the share and chain.remove() would destroy() the
+                    // same pointer again -> the exact tcache/double-free abort.
+                    if (verified.contains(bad)) verified.remove(bad, /*owns_data=*/false);
                     if (chain.remove(bad)) ++removed_count;
                 } catch (...) {}
             }

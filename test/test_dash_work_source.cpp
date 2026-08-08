@@ -14,6 +14,11 @@
 ///   4. viable but null mempool  -> fallback (defensive null-guard).
 
 #include <impl/dash/coin/work_source.hpp>
+#include <impl/dash/coin/special_tx_pool_delta.hpp>
+#include <impl/dash/coin/rpc_data.hpp>
+#include <impl/dash/coin/utxo_adapter.hpp>
+#include <core/coin/utxo_view_cache.hpp>
+#include <core/pack.hpp>
 #include <c2pool/hashrate/tracker.hpp>
 
 #include <cmath>
@@ -132,6 +137,113 @@ TEST(DashWorkSource, NullMempoolRoutesFallback)
     EXPECT_FALSE(emb_ran);
     EXPECT_TRUE(fb_ran);
 }
+
+// ─── Option B: pinned-tx splice on the SERVED-dashd arm ──────────────────────
+// The donation consolidation (>100KB, fee 0) cannot enter dashd's mempool
+// (policy standardness), so when the dashd arm serves, the pin must ride OUR
+// copy of the template — gated by the SAME splice_pinned_txs the embedded arm
+// uses. Fail-closed contract: no verify view (mempool/mnstates null) → the
+// template is byte-identical to no-pin; never an unverified inclusion.
+TEST(DashWorkSource, PinnedTxExcludedOnFallbackWithoutVerifyView)
+{
+    EmbeddedWorkInputs emb;            // has_state=false → fallback arm
+    dash::coin::MutableTransaction pin;
+    pin.vin.resize(1);
+    std::vector<dash::coin::MutableTransaction> pins{pin};
+    emb.pinned_local_txs = &pins;        // pin present, but no mempool/mnstates
+
+    bool emb_ran = false, fb_ran = false;
+    WorkSelection sel = select_dash_work(
+        emb,
+        [&] { return embedded_stub(emb_ran); },
+        [&] { return dashd_stub(fb_ran); });
+
+    EXPECT_EQ(sel.source, WorkSource::DashdFallback);
+    EXPECT_TRUE(fb_ran);
+    // Byte-identical to the no-pin shape: nothing appended anywhere.
+    EXPECT_TRUE(sel.work.m_txs.empty());
+    EXPECT_TRUE(sel.work.m_tx_hashes.empty());
+    EXPECT_TRUE(sel.work.m_tx_fees.empty());
+    EXPECT_TRUE(sel.work.m_tx_data_hex.empty());
+}
+
+TEST(DashWorkSource, PinnedTxOnFallbackFailsClosedWithoutUtxoView)
+{
+    // Verify view POINTERS present but the mempool has no UTXO view wired:
+    // pinned_tx_admissible returns UtxoViewUnset and the pin must be EXCLUDED
+    // (the primary without --embedded-utxo lands exactly here).
+    MnStateMachine mn;
+    dash::coin::Mempool mp;
+    EmbeddedWorkInputs emb;            // has_state=false → fallback arm
+    emb.mnstates = &mn;
+    emb.mempool  = &mp;
+    dash::coin::MutableTransaction pin;
+    pin.vin.resize(1);
+    std::vector<dash::coin::MutableTransaction> pins{pin};
+    emb.pinned_local_txs = &pins;
+
+    bool emb_ran = false, fb_ran = false;
+    WorkSelection sel = select_dash_work(
+        emb,
+        [&] { return embedded_stub(emb_ran); },
+        [&] { return dashd_stub(fb_ran); });
+
+    EXPECT_EQ(sel.source, WorkSource::DashdFallback);
+    EXPECT_TRUE(sel.work.m_txs.empty());
+    EXPECT_TRUE(sel.work.m_tx_data_hex.empty());
+}
+
+// POSITIVE PATH: verify view wired (mempool + UTXO + mnstates), pin admissible
+// (mature input, fee exactly 0) -> appended to ALL FOUR tx vectors on the
+// SERVED dashd template, fee recorded as 0, coinbase value untouched. This is
+// the donation-consolidation contract: >100KB standardness never applies here.
+TEST(DashWorkSource, PinnedTxSplicedOnFallbackWithVerifyView)
+{
+    using ::core::coin::UTXOViewCache;
+    using ::core::coin::Outpoint;
+    using ::core::coin::Coin;
+
+    uint256 prev;
+    prev.begin()[0] = 0x42;
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(50'000, {}, /*height=*/1, /*cb=*/false));
+
+    dash::coin::Mempool mp;
+    mp.set_utxo(&utxo);
+    MnStateMachine mn;
+
+    dash::coin::MutableTransaction pin;
+    pin.vin.resize(1);
+    pin.vin[0].prevout.hash  = prev;
+    pin.vin[0].prevout.index = 0;
+    pin.vout.resize(1);
+    pin.vout[0].value = 50'000;   // sum(in) == sum(out): fee exactly zero
+
+    EmbeddedWorkInputs emb;       // has_state=false -> fallback arm
+    emb.mnstates        = &mn;
+    emb.mempool         = &mp;
+    std::vector<dash::coin::MutableTransaction> pins{pin};
+    emb.pinned_local_txs = &pins;
+
+    bool emb_ran = false, fb_ran = false;
+    WorkSelection sel = select_dash_work(
+        emb,
+        [&] { return embedded_stub(emb_ran); },
+        [&] { return dashd_stub(fb_ran); });
+
+    EXPECT_EQ(sel.source, WorkSource::DashdFallback);
+    EXPECT_TRUE(fb_ran);
+    ASSERT_EQ(sel.work.m_txs.size(), 1u);
+    ASSERT_EQ(sel.work.m_tx_hashes.size(), 1u);
+    ASSERT_EQ(sel.work.m_tx_fees.size(), 1u);
+    ASSERT_EQ(sel.work.m_tx_data_hex.size(), 1u);
+    EXPECT_EQ(sel.work.m_tx_fees[0], 0u);
+    EXPECT_EQ(sel.work.m_tx_hashes[0], dash::coin::dash_txid(pin));
+    EXPECT_FALSE(sel.work.m_tx_data_hex[0].empty());
+    // Coinbase value untouched by the splice (fee 0 adds nothing to claim).
+    EXPECT_EQ(sel.work.m_coinbase_value, 0u);
+}
+
 
 // ─── Firmware-grid vardiff quantization KAT (retention fix) ──────────────────
 // HashrateTracker::set_difficulty_from_hashrate must advertise ONLY power-of-two
@@ -335,4 +447,275 @@ TEST(HashrateVardiffHysteresis, LowerMarginHeldButDecisiveDropStepsDown)
             << "decisive drop did not step the advertised bucket (D4=" << D4 << ")";
         EXPECT_LE(t.get_current_difficulty(), D4);   // never advertise above ideal D
     }
+}
+
+
+// HEIGHT WIRING (live defect 2026-08-07): the primary logged
+// `pinned tx EXCLUDED h=0` because dashd's template copy carried no height at
+// the splice point. Zero is not a harmless label — the gate's coinbase
+// maturity arm reads it as next_height, which would mark every coinbase input
+// immature. When dashd's copy is unset the bundle's own tip must fill it in.
+// ─── The PLACEHOLDER fallback (corrected 2026-08-07) ───────────────────────
+//
+// This test previously asserted the OPPOSITE: that a fallback arriving with no
+// height still gets the pin spliced, with the height filled from the bundle
+// tip. It was written from the production log line
+//
+//     [dashd-splice] pinned tx EXCLUDED h=0 cause=input-missing-or-spent
+//
+// on the belief that "the shape the primary produced" was a real dashd
+// template missing its height. It was not. The serve path binds this arm to a
+// NO-OP closure returning DashWorkData{} (#1134 — the real dashd
+// getblocktemplate must not run on the io thread), so that h=0 was a
+// PLACEHOLDER, and every splice into it landed on a value nobody serves while
+// the real template went unspliced.
+//
+// The corrected contract: a value indistinguishable from a default-constructed
+// DashWorkData is not a template and is left alone. The serve path gates
+// beside the coin state and appends at the real template instead
+// (DASHWorkSource::resolve_coin_state_arm).
+TEST(DashWorkSource, PlaceholderFallbackLeavesThePinAlone)
+{
+    using ::core::coin::UTXOViewCache;
+    using ::core::coin::Outpoint;
+    using ::core::coin::Coin;
+
+    uint256 prev;
+    prev.begin()[0] = 0x77;
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(9'000, {}, /*height=*/1, /*cb=*/false));
+
+    dash::coin::Mempool mp;
+    mp.set_utxo(&utxo);
+    MnStateMachine mn;
+
+    // Admissible on the merits: input unspent, fee exactly zero. So anything
+    // that DOES get spliced here is spliced into the placeholder.
+    dash::coin::MutableTransaction pin;
+    pin.vin.resize(1);
+    pin.vin[0].prevout.hash  = prev;
+    pin.vin[0].prevout.index = 0;
+    pin.vout.resize(1);
+    pin.vout[0].value = 9'000;
+
+    EmbeddedWorkInputs emb;          // has_state=false -> fallback arm
+    emb.mnstates        = &mn;
+    emb.mempool         = &mp;
+    std::vector<dash::coin::MutableTransaction> pins{pin};
+    emb.pinned_local_txs = &pins;
+    emb.prev_height     = 2'517'800; // a tip IS known — still not a template
+
+    bool emb_ran = false, fb_ran = false;
+    WorkSelection sel = select_dash_work(
+        emb,
+        [&] { return embedded_stub(emb_ran); },
+        // EXACTLY what the serve path's no-op closure returns.
+        [&] { fb_ran = true; return DashWorkData{}; });
+
+    EXPECT_EQ(sel.source, WorkSource::DashdFallback);
+    EXPECT_TRUE(fb_ran);
+    EXPECT_TRUE(sel.work.m_txs.empty())
+        << "a placeholder is not a template — splicing it is a no-op that "
+           "reads as success in the log";
+    EXPECT_TRUE(sel.work.m_tx_data_hex.empty());
+}
+
+// A fallback that carries ANY information is a real template, and the pin
+// still rides it here. This is the discriminator the guard turns on, so it is
+// asserted rather than assumed.
+TEST(DashWorkSource, FallbackCarryingAHeightIsATemplateAndTakesThePin)
+{
+    using ::core::coin::UTXOViewCache;
+    using ::core::coin::Outpoint;
+    using ::core::coin::Coin;
+
+    uint256 prev;
+    prev.begin()[0] = 0x78;
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(9'000, {}, /*height=*/1, /*cb=*/false));
+
+    dash::coin::Mempool mp;
+    mp.set_utxo(&utxo);
+    MnStateMachine mn;
+
+    dash::coin::MutableTransaction pin;
+    pin.vin.resize(1);
+    pin.vin[0].prevout.hash  = prev;
+    pin.vin[0].prevout.index = 0;
+    pin.vout.resize(1);
+    pin.vout[0].value = 9'000;
+
+    EmbeddedWorkInputs emb;
+    emb.mnstates        = &mn;
+    emb.mempool         = &mp;
+    std::vector<dash::coin::MutableTransaction> pins{pin};
+    emb.pinned_local_txs = &pins;
+    emb.prev_height     = 2'517'800;
+
+    bool emb_ran = false, fb_ran = false;
+    WorkSelection sel = select_dash_work(
+        emb,
+        [&] { return embedded_stub(emb_ran); },
+        [&] { fb_ran = true; DashWorkData w; w.m_height = 2'517'801; return w; });
+
+    EXPECT_EQ(sel.source, WorkSource::DashdFallback);
+    EXPECT_TRUE(fb_ran);
+    ASSERT_EQ(sel.work.m_txs.size(), 1u) << "a real template still carries the pin";
+    EXPECT_EQ(sel.work.m_tx_fees[0], 0u);
+    EXPECT_EQ(sel.work.m_height, 2'517'801u);
+}
+
+// ─── #107: creditPool divergence — explained vs unexplained ─────────────────
+// KAT for special_tx_pool_delta, the arithmetic that decides whether a GBT
+// creditPool divergence is ACCOUNTED FOR by pending DIP-0027 asset movement
+// (dashd includes those txs, we exclude them by design, C-3) or is genuine
+// drift the reward-safety backstop must keep shouting about. Numbers are the
+// ones measured live on mainnet the night of 2026-08-06/07, so a regression
+// here is a regression against reality:
+//   h=2517494 lock   +0.02689906 DASH ; h=2517504 unlock -72.0000019 with a
+//   190-duff payload fee tail.
+// Folded into this EXISTING allowlisted target on purpose: a fresh
+// add_executable absent from the build.yml --target allowlist would be a
+// silently-passing NOT_BUILT sentinel (#143).
+namespace {
+
+template <typename Payload>
+std::vector<unsigned char> pack_payload(const Payload& pl) {
+    auto ps = ::pack(pl);
+    auto span = ps.get_span();
+    return std::vector<unsigned char>(
+        reinterpret_cast<const unsigned char*>(span.data()),
+        reinterpret_cast<const unsigned char*>(span.data()) + span.size());
+}
+
+::bitcoin_family::coin::TxOut out_of(int64_t v) { ::bitcoin_family::coin::TxOut o; o.value = v; return o; }
+
+/// Type-8: pool GAINS sum(payload.creditOutputs).
+dash::coin::MutableTransaction make_lock(int64_t credit_value) {
+    dash::coin::vendor::CAssetLockPayload pl;
+    pl.creditOutputs.push_back(out_of(credit_value));
+    dash::coin::MutableTransaction tx;
+    tx.version = 3;
+    tx.type    = dash::coin::vendor::CAssetLockPayload::SPECIALTX_TYPE;   // 8
+    tx.extra_payload = pack_payload(pl);
+    return tx;
+}
+
+/// Type-9: pool LOSES (payload.fee + sum(vout)); no inputs, outputs are minted.
+dash::coin::MutableTransaction make_unlock(int64_t out_value, uint32_t fee) {
+    dash::coin::vendor::CAssetUnlockPayload pl;
+    pl.index           = 1;
+    pl.fee             = fee;
+    pl.requestedHeight = 1000;
+    dash::coin::MutableTransaction tx;
+    tx.version = 3;
+    tx.type    = dash::coin::vendor::CAssetUnlockPayload::SPECIALTX_TYPE; // 9
+    tx.vout.push_back(out_of(out_value));
+    tx.extra_payload = pack_payload(pl);
+    return tx;
+}
+
+dash::coin::MutableTransaction make_plain() {
+    dash::coin::MutableTransaction tx;
+    tx.version = 2;
+    tx.type    = 0;
+    tx.vout.push_back(out_of(50'000));
+    return tx;
+}
+
+} // namespace
+
+// 1) The mainnet h=2517494 shape: one pending lock of 0.02689906 DASH.
+TEST(DashSpecialPoolDelta, PendingLockExplainsThePositiveDivergence)
+{
+    const int64_t kLock = 2'689'906;                 // measured on mainnet
+    const int64_t ours  = 3'028'884'293'639;         // our CbTx creditPool
+    const int64_t dashd = ours + kLock;              // dashd's, with the lock
+
+    std::vector<dash::coin::MutableTransaction> txs{ make_plain(), make_lock(kLock) };
+    const auto sp = dash::coin::special_tx_pool_delta(txs);
+
+    EXPECT_EQ(sp.count, 1u);
+    EXPECT_FALSE(sp.unparsable);
+    EXPECT_EQ(sp.delta, kLock);
+    EXPECT_TRUE(sp.explains(ours, dashd));
+}
+
+// 2) The h=2517504 shape: an unlock, whose miner fee lives in the payload.
+TEST(DashSpecialPoolDelta, PendingUnlockSubtractsOutputsPlusPayloadFee)
+{
+    const int64_t kOut = 7'200'000'000;              // 72 DASH
+    const uint32_t kFee = 190;                       // the measured fee tail
+    const int64_t ours  = 3'029'419'859'335;
+    const int64_t dashd = ours - (kOut + kFee);
+
+    std::vector<dash::coin::MutableTransaction> txs{ make_unlock(kOut, kFee) };
+    const auto sp = dash::coin::special_tx_pool_delta(txs);
+
+    EXPECT_EQ(sp.count, 1u);
+    EXPECT_EQ(sp.delta, -(kOut + static_cast<int64_t>(kFee)));
+    EXPECT_TRUE(sp.explains(ours, dashd));
+}
+
+// 3) Both directions in one template — the signs must not cancel by accident.
+TEST(DashSpecialPoolDelta, MixedLockAndUnlockSumSigned)
+{
+    const int64_t kLock = 35'000'000;
+    const int64_t kOut  = 2'108'300'000;
+    const uint32_t kFee = 190;
+    const int64_t expected = kLock - (kOut + static_cast<int64_t>(kFee));
+    const int64_t ours  = 3'023'215'610'725;
+    const int64_t dashd = ours + expected;
+
+    std::vector<dash::coin::MutableTransaction> txs{
+        make_lock(kLock), make_plain(), make_unlock(kOut, kFee) };
+    const auto sp = dash::coin::special_tx_pool_delta(txs);
+
+    EXPECT_EQ(sp.count, 2u);
+    EXPECT_EQ(sp.delta, expected);
+    EXPECT_TRUE(sp.explains(ours, dashd));
+}
+
+// 4) A divergence the pending special txs do NOT account for stays a mismatch.
+//    This is the whole reason the check is an equation and not a heuristic.
+TEST(DashSpecialPoolDelta, UnrelatedDivergenceIsNotExplained)
+{
+    const int64_t kLock = 2'689'906;
+    const int64_t ours  = 3'028'884'293'639;
+    const int64_t dashd = ours + kLock + 1;          // one duff off
+
+    std::vector<dash::coin::MutableTransaction> txs{ make_lock(kLock) };
+    const auto sp = dash::coin::special_tx_pool_delta(txs);
+
+    EXPECT_EQ(sp.delta, kLock);
+    EXPECT_FALSE(sp.explains(ours, dashd));
+}
+
+// 5) No special txs: even an exactly-equal pool must not be reported as
+//    "explained by special movement" — there was nothing to explain it with.
+TEST(DashSpecialPoolDelta, NoSpecialTxsNeverExplains)
+{
+    std::vector<dash::coin::MutableTransaction> txs{ make_plain(), make_plain() };
+    const auto sp = dash::coin::special_tx_pool_delta(txs);
+
+    EXPECT_EQ(sp.count, 0u);
+    EXPECT_EQ(sp.delta, 0);
+    EXPECT_FALSE(sp.explains(1'000, 1'000));
+}
+
+// 6) Fail-closed: a special tx whose payload does not parse leaves us knowing
+//    NOTHING about the true movement, so nothing may be explained by it.
+TEST(DashSpecialPoolDelta, UnparsablePayloadExplainsNothing)
+{
+    dash::coin::MutableTransaction broken;
+    broken.version = 3;
+    broken.type    = dash::coin::vendor::CAssetLockPayload::SPECIALTX_TYPE;
+    broken.extra_payload = { 0xff, 0xff, 0xff };     // not a valid payload
+
+    std::vector<dash::coin::MutableTransaction> txs{ make_lock(1'000), broken };
+    const auto sp = dash::coin::special_tx_pool_delta(txs);
+
+    EXPECT_TRUE(sp.unparsable);
+    EXPECT_FALSE(sp.explains(0, 0));
+    EXPECT_FALSE(sp.explains(0, 1'000));
 }

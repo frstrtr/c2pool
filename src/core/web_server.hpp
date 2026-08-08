@@ -271,6 +271,20 @@ public:
     std::string rest_web_log();
     std::string rest_logs_export(const std::string& scope, int64_t from_ts, int64_t to_ts, const std::string& format);
 
+    // WHO FOUND THE BLOCK. Three states, not two: a coin lane that has not
+    // been taught to label its call sites must say so, not inherit a default
+    // that reads as a claim. A two-valued bool defaulting to "not us" would
+    // make every LTC/DGB/BTC/BCH block announce a sharechain peer as its
+    // finder — the same false certainty this whole field exists to retire.
+    // Ordering is deliberate: the values increase with how much is known, so
+    // an enrichment pass can only ever raise the record (see the merge in
+    // record_found_block), never quietly downgrade a known finder.
+    enum class BlockAuthorship : uint8_t {
+        unknown         = 0,  // this coin lane does not label its call sites
+        sharechain_peer = 1,  // another node's template won
+        this_node       = 2,  // we built the template and dispatched it
+    };
+
     // Track a found block for the /recent_blocks endpoint.
     // Extended overload captures dashboard-enriched fields at record time.
     void record_found_block(uint64_t height, const uint256& hash, uint64_t ts = 0,
@@ -280,7 +294,16 @@ public:
                             double network_difficulty = 0,
                             double share_difficulty = 0,
                             double pool_hashrate = 0,
-                            uint64_t subsidy = 0);
+                            uint64_t subsidy = 0,
+                            // WHO FOUND IT — set at the call site that knows.
+                            // `this_node` from the local won-block dispatch;
+                            // `sharechain_peer` from the gossiped-share path
+                            // (another node's template won, so nothing this
+                            // node pins or serves is in it). A coin lane that
+                            // has not labelled its sites leaves `unknown`,
+                            // which reports as unknown and never as a claim.
+                            BlockAuthorship authorship =
+                                BlockAuthorship::unknown);
     
     // Boundary types hoisted to core::stratum (see core/stratum_types.hpp).
     // Aliases kept here so existing references like `MiningInterface::JobSnapshot`
@@ -628,6 +651,22 @@ public:
         uint64_t coinbase_value_sat = 0;      // "coinbasevalue"
         uint64_t payment_amount_sat = 0;      // masternode+treasury share
         uint64_t height = 0;                  // template height
+        // TOTAL of every coinbase output that does NOT go to miners, in
+        // template order: masternode payee + operator split + superblock +
+        // the DIP-0027 platform OP_RETURN burn. Measured on the hotel
+        // (2026-08-05, DASH mainnet h=2516911): payment_amount_sat carried
+        // only the MN payee (0.8298), so the dashboard's "miner" share read
+        // 53% of the block when the ACCEPTED coinbase paid miners 25% -- the
+        // 0.4979 platform burn was silently counted as miner money. 0 =
+        // producer did not fill it; consumers then fall back to
+        // payment_amount_sat (pre-existing behaviour, LTC unchanged).
+        uint64_t payments_total_sat = 0;
+        // Of payments_total_sat, the OP_RETURN burn portion (display split).
+        uint64_t burn_sat = 0;
+        // Wall-clock seconds since this template was sourced (0 = unknown).
+        // A stale template renders as a legitimate-looking block_value; the
+        // age is what lets the dashboard say "this number is N minutes old".
+        int64_t  template_age_sec = -1;
     };
     void set_coin_work_fn(std::function<CoinWorkInfo()> fn) { m_coin_work_fn = thread_safe_wrap(std::move(fn)); }
 
@@ -739,6 +778,14 @@ public:
         double      expected_time{0};      // expected seconds to find at current rate
         double      time_to_find{0};       // actual seconds since previous block
         double      luck{0};              // expected_time / time_to_find * 100
+        // WHO FOUND IT. On a p2pool sharechain the coinbase pays EVERY
+        // participant proportionally, so our payout address appearing in a
+        // block's coinbase means we earned a SHARE of it — never that we found
+        // it. Reading the coinbase for authorship is the mistake this field
+        // exists to make impossible: it is set at the call site that knows,
+        // and the log states it in words. Unlabelled stays `unknown`, which
+        // the log reports as unknown rather than guessing.
+        BlockAuthorship authorship{BlockAuthorship::unknown};
     };
 
     // Block acceptance verification: schedule async checks at +10s, +30s, +120s.
@@ -890,6 +937,16 @@ public:
 
     // Per-chain verify function: register additional verifiers for merged chains
     void add_chain_verify_fn(const std::string& chain, block_verify_fn_t fn);
+
+    // Test/introspection seam: run ONE verification pass for a recorded found
+    // block synchronously (no io_context timer) and return the resulting
+    // verdict — >0 confirmations (confirmed), <0 orphaned, 0 pending,
+    // INT_MIN if the hash is not a recorded found block. This drives the exact
+    // production status-transition code (verify_found_block); the async
+    // schedule_block_verification() above is the live driver. Added for the
+    // DASH orphan-lane tests so the pending→confirmed / pending→orphaned flips
+    // can be asserted deterministically without waiting on real timers.
+    int run_block_verification_now(const std::string& block_hash);
 
     /// Read-only access to found blocks (for sharechain window grid).
     std::vector<FoundBlock> get_found_blocks() const {
@@ -1514,6 +1571,19 @@ private:
     };
     BestDifficulty m_best_difficulty;
     mutable std::mutex m_best_diff_mutex;
+    // ── ALL-TIME best-share persistence ─────────────────────────────────
+    // Measured (hotel primary, 2026-08-05, uptime 36 min): /local_stats
+    // best_share showed all_time == session == round — the "all-time" leg
+    // reset on every restart because it lived only in memory, so the card
+    // was quietly lying about what "all time" means. Persisted as a small
+    // sidecar JSON next to the stat log (all_time leg ONLY: session and
+    // round are honestly per-process/per-round). Display only.
+    std::string best_share_db_path() const {
+        return m_stat_log_path.empty() ? std::string()
+                                       : m_stat_log_path + ".best.json";
+    }
+    void save_best_share_all_time();
+    void load_best_share_all_time();
 
     // Per-miner rolling hashrate ring populated by
     // record_share_difficulty; consumed by rest_pplns_current

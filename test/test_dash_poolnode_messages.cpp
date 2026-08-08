@@ -7,6 +7,8 @@
 
 #include <impl/dash/messages.hpp>
 #include <impl/dash/coin/bestblock_diag.hpp>  // #1046 bestblock out=0 classifier
+#include <impl/dash/config_pool.hpp>   // SharechainConfig net-aware prefix selectors
+#include <btclibs/util/strencodings.h> // ParseHexBytes (prefix isolation primitive)
 
 using namespace dash;
 
@@ -180,4 +182,36 @@ TEST(DashPoolNodeMessages, Bestblock_Classify_BadHexLen_Short) {
     auto cls = dash::coin::classify_bestblock_header(nlohmann::json(std::string(159, 'a')), out);
     EXPECT_EQ(cls, dash::coin::BestblockFetch::BadHexLen);
     EXPECT_EQ(out.size(), 159u);
+}
+
+// ---------------------------------------------------------------------------
+// Connect-mode sharechain prefix wire-proof.
+//
+// The outbound (--connect-only) leg frames every packet with the 8-byte pool
+// prefix set at main_dash.cpp:601:
+//     config.pool()->m_prefix = ParseHexBytes(SharechainConfig::prefix_hex());
+// NodeP2P::get_prefix() (src/pool/node.hpp:88) returns that buffer and
+// Socket::send() (src/core/socket.cpp:122) hands it to Packet::from_message as
+// the on-wire prefix; the peer's read side matches it byte-for-byte over
+// get_prefix().size() (src/core/socket.cpp:223). This KAT proves the SOURCE the
+// connect leg frames with is net-aware -- mainnet vs testnet select DIFFERENT
+// prefixes -- and that the read-side Packet prefix buffer is sized to match.
+// Regression lock for the "connect leg emits the wrong net's prefix" interop
+// break, which is invisible on a mainnet-only soak (is_testnet stays false).
+TEST(DashConnectModePrefix, WirePrefix_NetAware_MainnetVsTestnet) {
+    const bool saved = SharechainConfig::is_testnet;
+
+    SharechainConfig::is_testnet = false;
+    EXPECT_EQ(SharechainConfig::prefix_hex(), std::string("3b3e1286f446b891"));
+    auto main_bytes = ParseHexBytes(SharechainConfig::prefix_hex());
+    EXPECT_EQ(main_bytes.size(), size_t(8));
+
+    SharechainConfig::is_testnet = true;
+    EXPECT_EQ(SharechainConfig::prefix_hex(), std::string("198b644f6821e3b3"));
+    auto test_bytes = ParseHexBytes(SharechainConfig::prefix_hex());
+    EXPECT_EQ(test_bytes.size(), size_t(8));
+
+    EXPECT_NE(main_bytes, test_bytes);
+
+    SharechainConfig::is_testnet = saved;
 }

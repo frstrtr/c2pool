@@ -31,6 +31,9 @@ if(BUILD_TESTING)
         share_tx_refs_kat_test    # #905: bch::new_tx_hashes accessor -- send-side flat-probe regression pin (v17/v33 nested, v34+ none) (pure)
         idle_watchdog_kat_test    # compact-relay: progress-gated block-download stall watchdog -- at-tip anti-churn + IBD stall-drop predicate (pure)
         seed_tier_kat_test        # Option-A discovery ladder: build_ladder tier-3 ordering/dedup + should_run_ladder explicit-peer-bypass gate + CandidateWalk tail-walk/wrap + EmergencyReArm backoff/re-entry/recovery (pure)
+        graph_db_shutdown_persist_test # B-STATS.944: graph_db stat-log save-on-clean-shutdown -- Saved N == Loaded N across a graceful stop (site 3/3) (pure over core web_server)
+        known_txs_evict_wiring_test # B-BCH.EVICT: clean_tracker() live-pass known_txs cap-enforcement wiring gate (wired bounded / unwired grows-past-cap perturbation) (pure over core::evict_known_txs_to_cap)
+        found_block_verify_test    # #995 BCH arm: found-block confirm/orphan verdict logic (resolve_status confirmed/orphaned/pending branches) feeding MiningInterface::set_block_verify_fn (pure over coin/block_confirm.hpp)
     )
     foreach(t IN LISTS BCH_ABLA_TESTS)
         add_executable(bch_${t} ${t}.cpp)
@@ -41,6 +44,16 @@ if(BUILD_TESTING)
             btclibs)
         add_test(NAME bch_${t} COMMAND bch_${t})
     endforeach()
+
+    # #1131 source-structural KAT (BCH-lane mirror of dash/btc/ltc): the think-P1
+    # bad-share removal must borrow from `verified` (owns_data=false) so only the
+    # owning `chain` destroys the share. Its own executable (BCH tree is plain
+    # main()+CHECK, no GTest to fold into); needs the share_tracker.hpp path.
+    add_executable(bch_share_remove_owns_data_test share_remove_owns_data_test.cpp)
+    target_include_directories(bch_share_remove_owns_data_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_definitions(bch_share_remove_owns_data_test PRIVATE
+        BCH_SHARE_TRACKER_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../share_tracker.hpp")
+    add_test(NAME bch_share_remove_owns_data_test COMMAND bch_share_remove_owns_data_test)
 
     # block_connector_test exercises the full-block -> mempool reconciliation
     # path, so it constructs MutableTransaction objects whose ctors are out-of-line

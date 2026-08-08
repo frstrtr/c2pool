@@ -29,6 +29,7 @@
 /// the actual coin_rpc->getwork() output, logging match/mismatch.
 
 #include <impl/dash/coin/mn_state_machine.hpp>
+#include <impl/dash/coin/sml_projection.hpp>    // confirmedHash rollover pass + collateral-spend predicate
 #include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/subsidy.hpp>
 #include <impl/dash/coin/governance_object.hpp>   // SuperblockPayment (daemonless superblock outputs)
@@ -47,6 +48,7 @@
 #include <core/log.hpp>
 #include <core/address_utils.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <ctime>
@@ -98,6 +100,253 @@ inline vendor::CCbTx build_embedded_cbtx(
 inline std::vector<unsigned char> encode_cbtx(const vendor::CCbTx&);
 // Zero CLSIG default for the E2d best_cl_sig seam (no temporary-bound ref).
 inline const std::array<uint8_t, 96> k_zero_cl_sig{};
+
+/// PINNED LOCAL TX splice — the ONE admission-and-append used by BOTH serving
+/// arms (embedded builder and the served-dashd-template arm), so the gate can
+/// never drift between them. `arm` names the caller in the log lines
+/// ("GBT-EMB" / "dashd-splice") so soaks can tell which arm carried the pin.
+/// Exclusion is the only failure mode: gate re-checked on EVERY build (inputs
+/// unspent against OUR UTXO view, coinbase-mature at this height, fee exactly
+/// zero, no MN-collateral spend). A bad pin must never cost a block, and an
+/// unverifiable one (utxo-view-unset) must never be included.
+/// The pin gate's ANSWER as a self-contained VALUE.
+///
+/// The served-dashd arm cannot run the gate where it appends. The gate reads
+/// the mempool UTXO view and the MN state machine, which the coin-P2P
+/// maintainer mutates on the io thread — reading them from the re-source
+/// thread is the #1134 heap-corruption shape on the serve path. So the gate
+/// runs beside the coin state and only this value crosses.
+struct PinVerdict {
+    bool        ok{false};
+    const char* cause{""};     ///< named refusal reason when !ok
+    uint32_t    at_height{0};  ///< the height the gate judged AT
+};
+
+/// Gate only — no template touched. Same checks, same order, same names as the
+/// splice below, because it IS the splice's gate.
+inline PinVerdict pin_gate_verdict(const MutableTransaction& pin,
+                                   const Mempool& mempool,
+                                   const MnStateMachine& mnstates,
+                                   uint32_t next_height)
+{
+    PinVerdict v;
+    v.at_height = next_height;
+    const auto gate = mempool.pinned_tx_admissible(pin, next_height);
+    if (gate != Mempool::PinnedTxGate::Ok) {
+        v.cause = Mempool::pinned_gate_name(gate);
+        return v;
+    }
+    uint256 protx;
+    if (tx_spends_mn_collateral(mnstates, pin, &protx)) {
+        v.cause = "spends-mn-collateral";
+        return v;
+    }
+    v.ok = true;
+    return v;
+}
+
+/// Append only — the caller must already hold an ok PinVerdict for THIS height.
+inline void pin_append(DashWorkData& w, const MutableTransaction& pin)
+{
+    auto stream = ::pack(pin);
+    auto sp = stream.get_span();
+    w.m_txs.emplace_back(pin);
+    w.m_tx_hashes.push_back(dash::coin::dash_txid(pin));
+    w.m_tx_fees.push_back(0);
+    w.m_tx_data_hex.push_back(HexStr(std::span<const unsigned char>(
+        reinterpret_cast<const unsigned char*>(sp.data()), sp.size())));
+}
+
+// ── BLOCK-LEVEL PIN BUDGET ──────────────────────────────────────────────
+// #1177 unified the size budget on the EMBEDDED arm: the consensus-required
+// set is measured BEFORE mempool selection and deducted, with an explicit
+// zero floor. The SERVED-DASHD arm never got that discipline. Its only cap
+// was pins-vs-kMaxPinnedTotalBytes — never pins-vs-what-dashd's-template-
+// ALREADY-HOLDS. dashd fills its own template to its own blockmaxsize
+// (node/miner.cpp:212 clamps to MaxBlockSize()-1000, DEFAULT_BLOCK_MAX_SIZE
+// is 2000000, policy/policy.h:23); splicing 400000 bytes of pins onto a
+// template already near that reproduces EXACTLY the bad-blk-length overshoot
+// #1177 removed — on the arm we describe as the always-reachable safety path.
+//
+// This is not hypothetical: block 2518186 was won on arm=dashd-fallback
+// carrying 154 KB of pinned donation. One large dashd template away.
+//
+// ORDER, mirrored from dashd node/miner.cpp deliberately, because the order
+// encodes which component may be dropped:
+//   1. coinbase reserve   (miner.cpp:115, resetBlock: nBlockSize = 1000)
+//   2. consensus-required (miner.cpp:235, nBlockSize += qcTx->GetTotalSize())
+//   3. mempool selection  (miner.cpp:361, TestPackage against nBlockMaxSize)
+// On the served-dashd arm steps 1-3 have ALREADY happened inside dashd and
+// arrive as a finished template. The only component left that may yield is
+// the pin set — pins are policy, everything already in dashd's template is
+// either required for validity or paid for with fees we would be throwing
+// away. So the pins yield, and they yield by being REFUSED WITH A NAME.
+
+/// dashd consensus.h:10 — MAX_DIP0001_BLOCK_SIZE. A block over this is
+/// INVALID (bad-blk-length), not merely large.
+inline constexpr uint64_t kDashMaxBlockBytes = 2'000'000;
+
+/// dashd node/miner.cpp:115 — resetBlock() starts nBlockSize at 1000 for a
+/// coinbase it has not built yet. We reserve the same, for the same reason:
+/// at splice time our coinbase does not exist either.
+inline constexpr uint64_t kCoinbaseReserveBytes = 1'000;
+
+/// serialize_full_block (block_producer.hpp:207-217) emits an 80-byte header
+/// plus a CompactSize tx count before the coinbase. 9 is the WIDEST
+/// CompactSize, so this over-reserves by at most 8 bytes — in the safe
+/// direction, which is the only direction a budget may err.
+inline constexpr uint64_t kBlockOverheadBytes = 80 + 9;
+
+/// Bytes the template body ALREADY occupies, measured from the exact field
+/// serialize_full_block() emits verbatim (block_producer.hpp:220). Not an
+/// estimate and not a re-derivation: these ARE the bytes that go on the wire.
+inline uint64_t template_body_bytes(const DashWorkData& w)
+{
+    uint64_t n = 0;
+    for (const auto& h : w.m_tx_data_hex) n += h.size() / 2;
+    return n;
+}
+
+/// How many MORE bytes the pin set may add before the ASSEMBLED block
+/// exceeds the consensus limit, capped by the pin policy budget.
+///
+/// The subtraction has an explicit zero floor. An unsigned subtraction of an
+/// over-cap occupancy wraps to ~18 EB and hands the splice an unbounded
+/// budget, silently restoring the very behaviour this removes — the same
+/// underflow face #1177 called out on the embedded arm.
+inline uint64_t pin_headroom_bytes(const DashWorkData& w)
+{
+    const uint64_t occupied =
+        kBlockOverheadBytes + kCoinbaseReserveBytes + template_body_bytes(w);
+    const uint64_t left =
+        occupied >= kDashMaxBlockBytes ? 0ull : kDashMaxBlockBytes - occupied;
+    return std::min<uint64_t>(left, Mempool::kMaxPinnedTotalBytes);
+}
+
+/// The NAMED answer to "may this pin ride?" at BLOCK scale. nullptr == yes.
+///
+/// Two distinct refusals, kept distinct on purpose. "tx-too-large" (the
+/// gate's own TooLarge face) blames the TRANSACTION; neither of these is a
+/// property of the transaction — one is the pin set's own policy budget, the
+/// other is a property of the TEMPLATE this pin happened to meet. A cause
+/// name is the operator's only handle on a refusal, so it must say which.
+inline const char* pin_budget_refusal(uint64_t spliced_bytes,
+                                      uint64_t pin_bytes,
+                                      uint64_t pin_cap,
+                                      uint64_t headroom)
+{
+    if (spliced_bytes + pin_bytes > pin_cap)  return "pin-total-too-large";
+    if (spliced_bytes + pin_bytes > headroom) return "pin-over-block-headroom";
+    return nullptr;
+}
+
+/// What a splice DID, as a value — so a test can assert the NAMED refusal
+/// without scraping a log line, and a caller can report it.
+struct PinSpliceReport {
+    size_t   included{0};
+    size_t   excluded{0};
+    uint64_t spliced_bytes{0};   ///< bytes actually appended
+    uint64_t headroom{0};        ///< the budget this splice ran against
+    /// Per-pin outcome in file order: "" when included, else the named cause.
+    std::vector<const char*> causes;
+};
+
+/// THE splice, in file order, under a CUMULATIVE byte cap AND the block
+/// budget. Both serving arms land here so neither can drift from the other.
+///
+/// The donation consolidation had to be split into four transactions after a
+/// single 152258-byte pin was rejected as bad-txns-oversize and cost block
+/// 2517855. Four quarter-sized transactions ride ONE template, so the money
+/// lands in one block instead of four.
+///
+/// Each pin is judged INDEPENDENTLY: one bad pin excludes itself and the
+/// others still ride. Both caps are checked against what has ALREADY been
+/// accepted, so the answer never depends on the order the caller happened to
+/// pass them in beyond file order itself.
+///
+/// The served-dashd arm cannot run the gate where it appends (the gate reads
+/// coin state the io thread mutates — the #1134 heap-corruption shape), so it
+/// arrives with verdicts already decided beside that state. The embedded arm
+/// gates in place and hands the verdicts straight through. Either way the
+/// SIZE arithmetic below is one implementation.
+///
+/// `enforce_block_budget` is the money-path flag. OFF (default) reproduces
+/// the pre-fix arithmetic byte-for-byte: headroom == the pin policy cap, so
+/// the block-headroom arm of pin_budget_refusal is unreachable and every
+/// splice decision is identical to what shipped. ON measures dashd's real
+/// template and refuses against the REAL remaining room.
+inline PinSpliceReport splice_verdicted_pins(
+    DashWorkData& w,
+    const std::vector<MutableTransaction>& pins,
+    const std::vector<PinVerdict>& verdicts,
+    const char* arm,
+    bool enforce_block_budget)
+{
+    PinSpliceReport rep;
+    rep.causes.assign(pins.size(), "");
+    if (verdicts.size() != pins.size()) return rep;
+
+    constexpr uint64_t pin_cap = Mempool::kMaxPinnedTotalBytes;
+    // Measured ONCE, from the template as dashd handed it over — before a
+    // single pin is appended. `spliced_bytes` then tracks what we add, so the
+    // two together are exactly "occupied now". Re-measuring inside the loop
+    // would double-count the pins already appended.
+    rep.headroom = enforce_block_budget ? pin_headroom_bytes(w) : pin_cap;
+
+    for (size_t i = 0; i < pins.size(); ++i) {
+        const auto& pin = pins[i];
+        const auto& v   = verdicts[i];
+        const auto txid = dash::coin::dash_txid(pin).GetHex().substr(0, 16);
+
+        if (!v.ok) {
+            rep.causes[i] = v.cause;
+            ++rep.excluded;
+            LOG_INFO << "[" << arm << "] pinned tx EXCLUDED h=" << v.at_height
+                     << " cause=" << v.cause << " txid=" << txid
+                     << " (template built without it; re-checked next build)";
+            continue;
+        }
+
+        const uint64_t sz = ::pack(pin).get_span().size();
+        if (const char* why = pin_budget_refusal(rep.spliced_bytes, sz,
+                                                 pin_cap, rep.headroom)) {
+            rep.causes[i] = why;
+            ++rep.excluded;
+            LOG_INFO << "[" << arm << "] pinned tx EXCLUDED h=" << v.at_height
+                     << " cause=" << why << " txid=" << txid
+                     << " (" << rep.spliced_bytes << "+" << sz
+                     << " > pin_cap=" << pin_cap
+                     << " headroom=" << rep.headroom
+                     << " body=" << template_body_bytes(w)
+                     << "; earlier pins keep their places)";
+            continue;
+        }
+
+        pin_append(w, pin);
+        rep.spliced_bytes += sz;
+        ++rep.included;
+        LOG_INFO << "[" << arm << "] pinned tx INCLUDED h=" << v.at_height
+                 << " txid=" << txid << " vin=" << pin.vin.size()
+                 << " fee=0 (rides this template)";
+    }
+    return rep;
+}
+
+/// Splice EVERY admissible pin, in file order, gating each one HERE. The
+/// embedded arm's entry point; the size arithmetic is the shared one above.
+inline PinSpliceReport splice_pinned_txs(DashWorkData& w,
+                                         const std::vector<MutableTransaction>& pins,
+                                         const Mempool& mempool,
+                                         const MnStateMachine& mnstates,
+                                         const char* arm,
+                                         bool enforce_block_budget = false)
+{
+    std::vector<PinVerdict> verdicts;
+    verdicts.reserve(pins.size());
+    for (const auto& pin : pins)
+        verdicts.push_back(pin_gate_verdict(pin, mempool, mnstates, w.m_height));
+    return splice_verdicted_pins(w, pins, verdicts, arm, enforce_block_budget);
+}
 
 inline DashWorkData build_embedded_workdata(
     uint32_t prev_height,
@@ -158,7 +407,54 @@ inline DashWorkData build_embedded_workdata(
     // confidently-UNFUNDED superblock height serves normally). The MN payment /
     // platform burn / mempool selection above are untouched — superblock
     // outputs are purely additive, matching dashcore GetBlockTxOuts ordering.
-    const std::vector<SuperblockPayment>* superblock_payments = nullptr)
+    const std::vector<SuperblockPayment>* superblock_payments = nullptr,
+    // Network seam: Consensus::Params.nMasternodeMinimumConfirmations for the
+    // confirmedHash rollover projection (sml_projection.hpp). Mainnet default
+    // (15, dashcore chainparams.cpp:177); testnet/devnet/regtest are 1. Only
+    // consulted when the CCbTx seams (sml + qmgr) are supplied. SAFE-ADDITIVE:
+    // appended last so every existing positional caller is byte-unchanged.
+    int mn_min_confirmations = DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+    // ── UTXO-IMMATURE SERVING seam ───────────────────────────────────────────
+    // When true, SKIP mempool selection entirely and build a coinbase-only body
+    // (the mandatory type-6 quorum commitments above still ride -- they are
+    // consensus-REQUIRED at a DKG height and carry zero fee, so dropping them
+    // would make the block invalid while keeping none of them costs nothing).
+    //
+    // WHY THIS IS CONSENSUS-SAFE, not a shortcut: consensus never requires any
+    // mempool transaction in a block. With zero selected txs total_fees is
+    // exactly 0, so block_value == subsidy exactly; platform_reward and the
+    // creditPool accrual are height-derived and never touched fees; mn_payment
+    // is a pure function of block_value. Every value this template commits is
+    // therefore EXACT, and exact by the cheapest possible route -- there is no
+    // fee to overstate, so the bad-cb-amount risk the maturity gate exists to
+    // prevent is structurally absent rather than merely unlikely. That matters
+    // here because this builder has no TestBlockValidity equivalent: fee
+    // exactness normally rides entirely on the UTXO lane, and this mode is the
+    // one path that does not depend on it at all.
+    //
+    // Default false => every existing positional caller is byte-unchanged.
+    bool suppress_mempool_txs = false,
+    // NAME-THE-STATE seam for the suppressed body: WHY this template is
+    // coinbase-only. Two producers exist: the UTXO-immature serving window
+    // (the historical default, kept as the default string so every existing
+    // positional caller is byte-unchanged) and the --embedded-serve-mempool-txs
+    // default-OFF posture ("mempool-txs-disabled", node_coin_state.hpp). The
+    // cause rides the template (m_txset_empty_cause) + the log line, so soaks
+    // can tell the two coinbase-only modes apart.
+    const char* txset_empty_cause = "utxo-immature-serving",
+    // ── PINNED LOCAL TX seam (donation-dust consolidation lane) ──────────
+    // An operator-supplied, externally-signed, ZERO-fee tx that can only
+    // reach the chain through OUR OWN block (relay rejects 0-fee). Included
+    // right after the mandatory type-6 commitments when — and only when —
+    // Mempool::pinned_tx_admissible() passes against the live UTXO view; on
+    // ANY failure the tx is EXCLUDED and the template is built exactly as if
+    // no pin existed (a bad pinned tx must never cost a block, and must
+    // never refuse a template). Fee is 0 by the gate's contract, so
+    // total_fees / block_value / mn_payment stay exact untouched. Rides
+    // regardless of suppress_mempool_txs — the coinbase-only posture is
+    // about MEMPOOL selection; the pin is not a mempool tx.
+    // Default nullptr => every existing positional caller byte-unchanged.
+    const std::vector<MutableTransaction>* pinned_local_txs = nullptr)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
@@ -174,14 +470,130 @@ inline DashWorkData build_embedded_workdata(
 
     // Subsidy + tx selection.
     int64_t reward = compute_dash_block_reward_post_v20(w.m_height);
-    constexpr uint32_t MAX_BLOCK_BYTES = 1'990'000;  // leave headroom for cb
+
+    // ── UNIFIED SIZE BUDGET (block 2517855) ────────────────────────────────
+    // Every component of the block competes for ONE budget. Before this, the
+    // mempool selection was handed the WHOLE cap as if it were alone, and the
+    // consensus-required qc set plus any pinned transactions were appended on
+    // top of it. Worst case that overshoots the 2 MB block limit outright, and
+    // an oversize block is INVALID, not merely large — dashd rejects it with
+    // bad-blk-length and the height goes to another miner.
+    //
+    // dashd does the same accounting in the other direction: node/miner.cpp
+    // starts nBlockSize at a 1000-byte coinbase reserve, adds each qcTx's
+    // GetTotalSize(), and packages the rest against nBlockMaxSize minus that
+    // reserve. We mirror the ORDER — reserve, then consensus-required qc, then
+    // pins, then selection gets the remainder — so the component that can be
+    // dropped safely (mempool txs, worth fees) yields to the ones that cannot
+    // (coinbase and qc, required for validity).
+    //
+    // We size qc and pins BEFORE selection rather than after, because a budget
+    // discovered after the fact is not a budget. The pin figure here is an
+    // UPPER BOUND (every configured pin, before the admission gate runs); the
+    // gate can only shrink it, so deducting the bound is conservative and can
+    // never let the block exceed the cap.
+    constexpr uint32_t MAX_BLOCK_BYTES   = 1'990'000;  // leave headroom for cb
+    constexpr uint32_t kCoinbaseReserve  = 1'000;      // dashd node/miner.cpp:115
+    uint64_t reserved_bytes = kCoinbaseReserve;
+    if (qc_commitments != nullptr) {
+        for (const auto& c : *qc_commitments)
+            reserved_bytes += ::pack(build_qc_tx(w.m_height, c)).get_span().size();
+    }
+    if (pinned_local_txs != nullptr) {
+        for (const auto& t : *pinned_local_txs)
+            reserved_bytes += ::pack(t).get_span().size();
+    }
+    // Selection gets what is left. If the required set alone has eaten the
+    // budget, selection gets ZERO rather than a negative number wrapping to a
+    // huge unsigned cap — the underflow face is the one that would silently
+    // restore the old behaviour.
+    const uint32_t selection_budget =
+        reserved_bytes >= MAX_BLOCK_BYTES
+            ? 0u
+            : static_cast<uint32_t>(MAX_BLOCK_BYTES - reserved_bytes);
     // C-3: exclude Dash special txs (tx.type != 0) from the embedded template.
     // dashd recomputes the CbTx roots + creditPool by applying the block's own
     // special txs; including one without accounting for it yields bad-cbtx. The
     // safe-minimal cut keeps the embedded block special-tx-free so the creditPool
     // accrual below is exactly the platform-reward term.
+    // suppress_mempool_txs: coinbase-only body, total_fees == 0 exactly. The
+    // mempool is not even consulted for selection (only, below, for the forgone-
+    // fee report), so no partially-warm UTXO view can price anything into this
+    // template.
+    // next_height threads the G3 coinbase-maturity check into selection: a
+    // vin spending a UTXO coinbase younger than 100 confs AT THIS HEIGHT is
+    // refused (bad-txns-premature-spend-of-coinbase). Selection is also
+    // topological (G1) and sigop-capped (G2) — see mempool.hpp.
     auto [selected, total_fees] =
-        mempool.get_sorted_txs_with_fees(MAX_BLOCK_BYTES, /*exclude_special=*/true);
+        suppress_mempool_txs
+            ? std::pair<std::vector<Mempool::SelectedTx>, uint64_t>{{}, 0ull}
+            : mempool.get_sorted_txs_with_fees(selection_budget,
+                                               /*exclude_special=*/true,
+                                               /*next_height=*/w.m_height);
+    // MN-collateral spend filter (sml_projection.hpp, FINDING-2). The C-3
+    // special-tx cut above is NOT sufficient: dashd's verifier removes a
+    // masternode from the list when ANY block tx — special or not — spends
+    // its collateral outpoint (specialtxman.cpp:457-464, no type guard), and
+    // that removal changes the merkleRootMNList the CbTx must commit. A plain
+    // type-0 collateral spend selected here would poison EVERY template built
+    // while it sits in the mempool (bad-cbtx-mnmerkleroot on a winning share
+    // = a silently lost block). No tx is ever mandatory, so EXCLUDING it is
+    // consensus-clean — dashd's own miner folds the removal instead, but the
+    // exclusion needs no second root computation. Fee follows the tx out of
+    // the template so block_value / mn_payment below stay exact.
+    {
+        size_t kept = 0;
+        for (size_t i = 0; i < selected.size(); ++i) {
+            uint256 protx;
+            if (tx_spends_mn_collateral(mnstates, selected[i].tx, &protx)) {
+                total_fees -= selected[i].fee;
+                LOG_WARNING << "[GBT-EMB] excluding tx "
+                            << dash::coin::dash_txid(selected[i].tx).GetHex().substr(0, 16)
+                            << " from template h=" << (prev_height + 1)
+                            << ": spends collateral of MN "
+                            << protx.GetHex().substr(0, 16)
+                            << " (verifier would remove the MN and expect a "
+                            << "different merkleRootMNList)";
+                continue;
+            }
+            if (kept != i) selected[kept] = std::move(selected[i]);
+            ++kept;
+        }
+        selected.resize(kept);
+    }
+    // ── CANDIDATE-SET RECORDING (observe-without-arming) ────────────────
+    // When the body is deliberately coinbase-only, run the SAME selection the
+    // serving path would run and record only its identities and fees. Nothing
+    // here can reach the served template: `selected` and `total_fees` above
+    // are untouched, so the coinbase value, the tx vectors and the merkle are
+    // byte-identical to a build with this block deleted.
+    //
+    // The property the original comment asserts — "no partially-warm UTXO view
+    // can price anything into this template" — is preserved exactly: a
+    // candidate priced from a partial UTXO view lands in m_txset_candidates,
+    // which no consensus path reads.
+    if (suppress_mempool_txs) {
+        auto [cand, cand_fees] =
+            // Same budget as the served path. Reporting the forgone set
+            // against the FULL cap would overstate it — we could not have
+            // served more than selection_budget even with serving enabled.
+            mempool.get_sorted_txs_with_fees(selection_budget,
+                                             /*exclude_special=*/true,
+                                             /*next_height=*/w.m_height);
+        (void)cand_fees;
+        w.m_txset_candidates.reserve(cand.size());
+        w.m_txset_candidate_fees.reserve(cand.size());
+        for (const auto& c : cand) {
+            // The SAME MN-collateral exclusion the served path applies: a
+            // candidate set that included them would overstate what we could
+            // actually have served and make the coverage gate too generous.
+            uint256 protx;
+            if (tx_spends_mn_collateral(mnstates, c.tx, &protx)) continue;
+            w.m_txset_candidates.push_back(dash::coin::dash_txid(c.tx));
+            w.m_txset_candidate_fees.push_back(c.fee);
+        }
+    }
+
     int64_t block_value      = reward + static_cast<int64_t>(total_fees);
     int64_t platform_reward  = compute_dash_platform_reward_post_v20_mn_rr(
         w.m_height, mn_rr_height);
@@ -213,6 +625,20 @@ inline DashWorkData build_embedded_workdata(
     // (node/miner.cpp CreateNewBlock), and the daemonless template mirrors
     // that for byte parity. Zero fee, zero in/out; consensus-checked via
     // the NodeCoinState emit gate against the same deterministic plan.
+    //
+    // ██ PHASE-L LANDMINE — PoSe punishment on REAL commitments ██
+    // dashd's verifier PoSe-punishes every !validMembers[i] quorum member
+    // when a NON-NULL commitment is in the block (specialtxman.cpp:159-174
+    // HandleQuorumCommitment -> PoSePunish(CalcPenalty(66))), and a penalty
+    // that crosses the ban threshold flips that MN's isValid IN THE SAME
+    // BLOCK's MN list — changing the merkleRootMNList THIS coinbase commits.
+    // Null commitments are exempt (specialtxman.cpp:432 IsNull() guard), so
+    // today's all-null qc plans cannot trip it and the projected root above
+    // stays correct. THE DAY Phase L serves REAL (non-null) commitments,
+    // this inclusion site MUST fold the PoSe pass into the committed MN root
+    // (mirror of the confirmedHash rollover projection above) or every block
+    // carrying a commitment with a failed member is bad-cbtx-mnmerkleroot —
+    // a silently lost block. Do not ship real commitments without it.
     if (qc_commitments != nullptr) {
         for (const auto& c : *qc_commitments) {
             MutableTransaction qtx = build_qc_tx(w.m_height, c);
@@ -222,6 +648,14 @@ inline DashWorkData build_embedded_workdata(
             w.m_tx_data_hex.push_back(tx_hex(qtx));
         }
     }
+    // ── PINNED LOCAL TX — after the consensus-required type-6 set, before
+    // mempool selection. Gate re-checked on EVERY build: inputs unspent,
+    // coinbase-mature at THIS height, fee exactly zero. Exclusion is the
+    // only failure mode (see the parameter note); the MN-collateral filter
+    // applies here too — a pinned tx spending a collateral would poison the
+    // committed merkleRootMNList exactly like a selected one.
+    if (pinned_local_txs != nullptr && !pinned_local_txs->empty())
+        splice_pinned_txs(w, *pinned_local_txs, mempool, mnstates, "GBT-EMB");
     uint64_t selected_bytes = 0;  // wire bytes packed into this template (underfill guard)
     for (auto& s : selected) {
         selected_bytes += s.base_size;
@@ -239,7 +673,7 @@ inline DashWorkData build_embedded_workdata(
     // block as normal. Genuinely empty mempools never trip. Mirrors the
     // LTC/DOGE TemplateBuilder guard; additive only — masternode payment /
     // CbTx / superblock projection below is untouched either way.
-    {
+    if (!suppress_mempool_txs) {
         const uint64_t mempool_bytes = static_cast<uint64_t>(mempool.byte_size());
         const uint64_t mempool_fees  = mempool.total_known_fees();
         const bool tripped = underfill_guard_trips(selected_bytes,
@@ -254,6 +688,27 @@ inline DashWorkData build_embedded_workdata(
                         << " sat fees) — near-empty block on a non-empty "
                         << "mempool; template-fill regression, gates cutover.";
         }
+    } else {
+        // ── NAME THE STATE ───────────────────────────────────────────────────
+        // The underfill guard is DELIBERATELY not consulted here: it exists to
+        // catch an UNEXPLAINED near-empty template, and this one is explained.
+        // Letting it fire would train operators to ignore the one line that is
+        // supposed to mean "template-fill regression".
+        //
+        // Instead the mode says its own name, on the template itself and in the
+        // log, with the price attached. A soak greps this to answer both "how
+        // long did the node run coinbase-only" and "what did that cost".
+        const uint64_t mempool_fees = mempool.total_known_fees();
+        w.m_txset_empty_cause  = txset_empty_cause;
+        w.m_txset_forgone_fees = mempool_fees;
+        if (underfill_tripped) *underfill_tripped = false;
+        LOG_INFO << "[GBT-EMB] arm=EMBEDDED txset=empty"
+                 << " cause=" << txset_empty_cause
+                 << " h=" << w.m_height
+                 << " mempool_tx=" << mempool.size()
+                 << " forgone_fees<=" << mempool_fees
+                 << " sat (coinbase-only body: subsidy exact, no fee to"
+                    " overstate; a valid block beats no block)";
     }
 
     // Platform Credit Pool burn (DIP-0027): emit OP_RETURN payment
@@ -266,38 +721,63 @@ inline DashWorkData build_embedded_workdata(
         w.m_packed_payments.push_back(std::move(burn));
     }
 
-    // MN payee → packed_payment. dashcore GBT returns "payee" as a
+    // MN payee → packed_payment(s). dashcore GBT returns "payee" as a
     // base58 address. We use script_to_address() to produce the same
     // wire form for standard P2PKH/P2SH scripts. Unrecognized script
     // types fall back to the c2pool "!hex" raw-script convention from
     // share_check.hpp::decode_payee_script — preserves bytes for
     // share_check verification while keeping the GBT API clean.
+    auto script_to_payee_token = [&](const std::vector<unsigned char>& script) {
+        // Dash mainnet has no bech32 (P2WPKH/P2WSH inactive); pass
+        // empty hrp so script_to_address() falls through cleanly.
+        std::string addr = ::core::script_to_address(
+            script, /*bech32_hrp=*/"",
+            address_version, address_p2sh_version);
+        if (!addr.empty()) return addr;
+        // Non-standard script: fall back to !hex.
+        std::string hex_script;
+        hex_script.reserve(script.size() * 2 + 1);
+        hex_script.push_back('!');
+        static const char* digits = "0123456789abcdef";
+        for (uint8_t b : script) {
+            hex_script.push_back(digits[(b >> 4) & 0xF]);
+            hex_script.push_back(digits[b & 0xF]);
+        }
+        return hex_script;
+    };
     auto expected = mnstates.find_expected_payee();
     if (expected) {
         auto it = mnstates.entries().find(*expected);
         if (it != mnstates.entries().end() && mn_payment > 0) {
-            const auto& script = it->second.scriptPayout.m_data;
-            // Dash mainnet has no bech32 (P2WPKH/P2WSH inactive); pass
-            // empty hrp so script_to_address() falls through cleanly.
-            std::string addr = ::core::script_to_address(
-                script, /*bech32_hrp=*/"",
-                address_version, address_p2sh_version);
-            PackedPayment pp;
-            if (!addr.empty()) {
-                pp.payee = std::move(addr);
-            } else {
-                // Non-standard script: fall back to !hex.
-                std::string hex_script;
-                hex_script.reserve(script.size() * 2);
-                static const char* digits = "0123456789abcdef";
-                for (uint8_t b : script) {
-                    hex_script.push_back(digits[(b >> 4) & 0xF]);
-                    hex_script.push_back(digits[b & 0xF]);
-                }
-                pp.payee = "!" + hex_script;
+            const auto& st = it->second;
+            // ── Operator-reward split (incident h=2516595 bad-cb-payee) ──
+            // dashd masternode/payments.cpp GetBlockTxOuts pays the MN
+            // share as a SET: when the scheduled MN registered an operator
+            // share (nOperatorReward bps, ProRegTx) AND its operator set a
+            // payout script (ProUpServTx), the coinbase carries
+            //   owner   : mnShare - floor(mnShare * bps / 10000)
+            //   operator: floor(mnShare * bps / 10000)
+            // in that order, and CheckMasternodePayments validates scripts
+            // AND amounts. h=2516595 (mn 0037c2c5…, bps=800) was rejected
+            // bad-cb-payee precisely because this builder paid the whole
+            // share to the owner. The truncating division is dashd's own;
+            // do NOT "fix" the rounding.
+            const int64_t operator_payment = st.operator_payment_of(mn_payment);
+            const int64_t owner_payment    = mn_payment - operator_payment;
+            if (owner_payment > 0) {
+                PackedPayment pp;
+                pp.payee  = script_to_payee_token(st.scriptPayout.m_data);
+                pp.amount = static_cast<uint64_t>(owner_payment);
+                w.m_packed_payments.push_back(std::move(pp));
             }
-            pp.amount = static_cast<uint64_t>(mn_payment);
-            w.m_packed_payments.push_back(std::move(pp));
+            // dashd: `if (operatorReward > 0) emplace_back(...)` — a split
+            // whose floor rounds to zero emits NO operator output.
+            if (operator_payment > 0) {
+                PackedPayment pp;
+                pp.payee  = script_to_payee_token(st.scriptOperatorPayout.m_data);
+                pp.amount = static_cast<uint64_t>(operator_payment);
+                w.m_packed_payments.push_back(std::move(pp));
+            }
         }
     }
 
@@ -361,8 +841,34 @@ inline DashWorkData build_embedded_workdata(
         // (pre-MN_RR) the balance carries forward unchanged, also correct.
         const int64_t accrued_credit_pool =
             last_observed_credit_pool + platform_reward;
+        // confirmedHash rollover (sml_projection.hpp, FINDING-1): the tip SML
+        // is the verifier's PREV list, not the list for the block being
+        // templated — dashd's rebuild starts with a purely height-driven
+        // confirmation pass (specialtxman.cpp:206-215) that flips a
+        // registered MN's confirmedHash at the crossing height with NO tx
+        // causing it. Commit the PROJECTED root, not the tip root. When the
+        // projection is unprojectable (a null-confirmedHash entry with no
+        // known registration height) the root below may be stale; the
+        // NodeCoinState viability + pre-emit gates fail closed on exactly
+        // that condition ("mn-confirm-rollover-pending"), so this build can
+        // never be SERVED — the warning is for callers outside that gate.
+        auto proj = project_sml_confirmations(
+            *sml, prev_height, prev_hash, mnstates, mn_min_confirmations);
+        if (!proj.ok) {
+            LOG_WARNING << "[GBT-EMB] confirmedHash rollover UNPROJECTABLE at h="
+                        << (prev_height + 1) << ": SML entry "
+                        << proj.unprojectable_protx.GetHex().substr(0, 16)
+                        << " has null confirmedHash but no known registration "
+                        << "height — committed merkleRootMNList may be stale "
+                        << "(emit gate refuses this template)";
+        } else if (proj.confirmed > 0) {
+            LOG_INFO << "[GBT-EMB] confirmedHash rollover: " << proj.confirmed
+                     << " MN(s) cross nMasternodeMinimumConfirmations at h="
+                     << (prev_height + 1)
+                     << " — committing projected merkleRootMNList";
+        }
         vendor::CCbTx cb = build_embedded_cbtx(
-            prev_height, *sml, *qmgr, best_cl_height, best_cl_sig,
+            prev_height, proj.sml, *qmgr, best_cl_height, best_cl_sig,
             accrued_credit_pool, quorum_root_override);
         w.m_coinbase_payload = encode_cbtx(cb);
     } else {

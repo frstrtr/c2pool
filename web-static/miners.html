@@ -566,11 +566,13 @@
             </div>
         </div>
         
-        <!-- Merged Mining Blocks -->
-        <div class="section-header" id="merged_blocks_header">
+        <!-- Merged Mining Blocks — hidden by default; revealed only when
+             currency_info advertises a merged child (topology-driven, #896).
+             Standalone parents (DASH/BTC/DGB) must never show merged cards. -->
+        <div class="section-header" id="merged_blocks_header" style="display: none;">
             <h2>🔗 Merged Mining Blocks <span class="badge" id="merged_blocks_count" style="background: #6f42c1;">0</span></h2>
         </div>
-        <div class="chart-container" style="background: var(--card-bg); border-radius: 12px; padding: 20px; border: 1px solid var(--border); margin-bottom: 20px;">
+        <div class="chart-container" id="merged_blocks_panel" style="display: none; background: var(--card-bg); border-radius: 12px; padding: 20px; border: 1px solid var(--border); margin-bottom: 20px;">
             <div id="merged_blocks_loading" class="loading" style="padding: 20px;">
                 <div class="loading-spinner"></div>
                 <div>Loading merged blocks data...</div>
@@ -644,6 +646,13 @@
         d3.json('../web/currency_info', function(info) {
             currency_info = info || {};
             d3.selectAll('.symbol-small').text((info && info.symbol) || 'DASH');
+            // Merged-mining cards are topology-driven: only a merged parent
+            // (currency_info.merged_child_symbol present) shows them. A
+            // standalone coin (DASH/BTC/DGB) keeps them hidden.
+            if (info && info.merged_child_symbol) {
+                document.getElementById('merged_blocks_header').style.display = '';
+                document.getElementById('merged_blocks_panel').style.display = '';
+            }
             if (info && info.explorer_enabled && info.explorer_url) {
                 var nav = document.querySelector('nav');
                 var _old = document.getElementById('nav-explorer'); if (_old) _old.remove();

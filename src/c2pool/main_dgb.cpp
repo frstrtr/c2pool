@@ -60,15 +60,19 @@
 
 #include <core/filesystem.hpp>
 #include <core/stratum_server.hpp>
+#include <core/web_server.hpp>     // H-STATS.944: operator dashboard + graph_db persist
 #include <btclibs/util/strencodings.h>
 
 #include <boost/asio.hpp>
 
 #include <cstdint>
+#include <span>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <atomic>
+#include <algorithm>
 #include <functional>
 #include <optional>
 #include <string>
@@ -101,7 +105,7 @@ void print_banner(const char* argv0, const core::CoinParams& p)
     std::cout
         << "c2pool-dgb " << C2POOL_VERSION << " — DigiByte Scrypt-only (V36)\n\n"
         << "Usage: " << argv0
-        << " [--version] [--help] [--selftest] [--run] [--stratum [H:]P]\n"
+        << " [--version] [--help] [--selftest] [--run] [--stratum [H:]P] [--http [H:]P]\n"
         << "       [--coin-daemon H:P] [--coin-magic HEX] [--regtest]\n"
         << "       [--regtest-force-won-share] [--no-p2p-relay]\n"
         << "       [--redistribute SPEC] [--sharechain-port P]\n"
@@ -179,7 +183,9 @@ int run_node(const core::CoinParams& params, bool testnet,
              bool no_p2p_relay = false,
              const std::string& redistribute_spec = "",
              bool dev_relax_algo_softforks = false,
-             bool coin_p2p_discover = false)
+             bool coin_p2p_discover = false,
+             const std::string& http_addr = "0.0.0.0",
+             uint16_t http_port = 0)
 {
     io::io_context ioc;
 
@@ -515,7 +521,31 @@ int run_node(const core::CoinParams& params, bool testnet,
         };
     }
 
-    p2p_node.tracker().m_on_block_found = dgb::coin::make_on_block_found(
+    // ── D-DGB dashboard: #82 dual-path broadcaster telemetry ──────────────
+    // Lock-free counters bumped by BOTH won-block arms so a dual-path
+    // REGRESSION (an arm silently unwired — the #82 root cause — or bound but
+    // never firing) is observable from /api/node_topology, not only gtest.
+    // shared_ptr so it outlives both run-loop continuations and the web hook.
+    struct DgbBroadcasterTelemetry {
+        std::atomic<uint64_t> p2p_dispatches{0};  // ARM A: m_on_block_found fired
+        std::atomic<uint64_t> rpc_submits{0};     // ARM B: submitblock-RPC arm reached
+        std::atomic<bool>     rpc_last_ok{false}; // last submit_block_hex() result
+        std::atomic<bool>     rpc_ever{false};    // ARM B ever invoked
+    };
+    auto bcast_telem = std::make_shared<DgbBroadcasterTelemetry>();
+
+    // ── #995 DGB arm: found-block dashboard/verdict reporter slot ─────────
+    // m_on_block_found is bound here, BEFORE the WebServer/MiningInterface is
+    // stood up (below, under --http), so the record_found_block + schedule_
+    // block_verification producer is injected via this shared slot: the http
+    // block assigns the real lambda once `mi` exists; until then (or with the
+    // dashboard off) it stays empty and a won block still broadcasts, just
+    // unrecorded. TELEMETRY ONLY -- never on any broadcast/mint/payout path.
+    auto found_block_report = std::make_shared<
+        std::function<void(const uint256&, const std::vector<unsigned char>&,
+                           const std::string&)>>();
+
+    auto dgb_on_block_found = dgb::coin::make_on_block_found(
         /*reconstruct=*/std::move(faithful_reconstruct),
         /*p2p_relay=*/[&ioc, &coin_p2p, no_p2p_relay](const std::vector<unsigned char>& block_bytes) {
             // #82 PRIMARY arm: relay the won block over the embedded coin-daemon
@@ -540,7 +570,22 @@ int run_node(const core::CoinParams& params, bool testnet,
                 if (coin_p2p) coin_p2p->submit_block_p2p_raw(bytes);
             });
         },
-        /*seam=*/&coin_node);                     // external-digibyted submitblock fallback
+        /*seam=*/&coin_node,                       // external-digibyted submitblock fallback
+        /*on_found=*/[found_block_report](const uint256& sh,
+                                          const std::vector<unsigned char>& bytes,
+                                          const std::string& hex) {
+            // Forward to the dashboard/verdict producer once it is bound (below,
+            // under --http). No-op while unbound. Telemetry only.
+            if (*found_block_report) (*found_block_report)(sh, bytes, hex);
+        });
+
+    // ARM A dispatch counter — wrap the closure so every won-block dispatch is
+    // counted before it runs; a stalled P2P-relay arm shows dispatches==0.
+    p2p_node.tracker().m_on_block_found =
+        [dgb_on_block_found, bcast_telem](const uint256& share_hash) {
+            bcast_telem->p2p_dispatches.fetch_add(1, std::memory_order_relaxed);
+            dgb_on_block_found(share_hash);
+        };
 
     // ── #82 dual-path won-block CLOSER: miner-facing Stratum standup ───────
     //
@@ -659,7 +704,7 @@ int run_node(const core::CoinParams& params, bool testnet,
     // p2p_node (the sharechain arm shares it). rpc.cpp:387 submit_block_hex is
     // REAL, not a stub.
     auto stratum_submit_fn =
-        [&coin_node](const std::vector<unsigned char>& block_bytes,
+        [&coin_node, bcast_telem](const std::vector<unsigned char>& block_bytes,
                      uint32_t height) -> bool {
             const std::string block_hex = HexStr(block_bytes);
             std::cout << "[DGB-STRATUM-BLOCK] won block height=" << height
@@ -674,6 +719,10 @@ int run_node(const core::CoinParams& params, bool testnet,
             // INDEPENDENTLY of this Stratum submitblock fallback.
             const bool ok =
                 coin_node.submit_block_hex(block_hex, /*ignore_failure=*/false);
+            // ARM B telemetry — dashboard-visible submitblock-RPC arm state.
+            bcast_telem->rpc_submits.fetch_add(1, std::memory_order_relaxed);
+            bcast_telem->rpc_ever.store(true, std::memory_order_relaxed);
+            bcast_telem->rpc_last_ok.store(ok, std::memory_order_relaxed);
             if (!ok)
                 std::cout << "[DGB-STRATUM-BLOCK] submitblock arm reached NO sink "
                              "(no embedded backend / no digibyted RPC wired yet) "
@@ -1184,16 +1233,276 @@ int run_node(const core::CoinParams& params, bool testnet,
         }
     }
 
+    // ── Operator-facing dashboard + graph_db stats persistence (H-STATS.944) ─
+    // Option A (integrator 2026-08-03, per merged bch #1040 69c09f3c2): stand up
+    // core::WebServer + MiningInterface in THIS run path — the SAME shape btc/bch
+    // adopt — rather than an inline block, held in a function-scope unique_ptr
+    // beside stratum_server so it and its stats timer outlive ioc.run().
+    // ISOLATION: constructs existing core classes only — ZERO src/core edits — so
+    // this stays OFF the four-coin smoke gate; src/impl/dgb + main_dgb only.
+    // p2pool-merged-v36 surface: NONE (operator dashboard, not share/PPLNS/coinbase
+    // bytes). node == nullptr: dgb::Node does not implement core::IMiningNode; the
+    // dashboard + graph_db stat-log path does not require it (a live adapter is a
+    // follow-up slice). Blockchain::DIGIBYTE selects the DGB (Scrypt) graph_db pairing.
+    std::unique_ptr<core::WebServer> web_server;
+    std::shared_ptr<io::steady_timer> stats_timer;
+    if (http_port != 0) {
+        web_server = std::make_unique<core::WebServer>(
+            ioc, http_addr, http_port, testnet,
+            std::shared_ptr<core::IMiningNode>{},              // no IMiningNode adapter yet
+            c2pool::address::Blockchain::DIGIBYTE);            // DGB (Scrypt) graph_db pairing
+        auto* mi = web_server->get_mining_interface();
+#ifdef C2POOL_VERSION
+        mi->set_coin_label("DGB");
+        mi->set_pool_version("c2pool/" C2POOL_VERSION);
+#endif
+        mi->set_io_context(&ioc);
+        web_server->set_stratum_port(stratum_port);
+
+        // ── D-DGB dashboard data hooks (extend the #1051 WebServer seam) ──
+        // Isolation: every source is a main_dgb-scope handle; NO src/core edit.
+        // (1) embedded DGB daemon peers — the coin-network peer set discovery
+        //     tracks (null unless --coin-p2p-discover). Rendered at /api/coin_peers.
+        mi->set_coin_peers_fn([&coin_peer_mgr]() {
+            nlohmann::json r = nlohmann::json::object();
+            nlohmann::json dgb_arr = nlohmann::json::array();
+            if (coin_peer_mgr) {
+                for (const auto& pe : coin_peer_mgr->get_tried_peers(25))
+                    dgb_arr.push_back(pe.to_string());
+            }
+            r["dgb"] = dgb_arr;
+            return r;
+        });
+
+        // (2) embedded DGB daemon synced height + peer count — /api/spv_progress.
+        mi->set_spv_progress_fn([&embedded_coin, &coin_peer_mgr]() {
+            // D-DGB.LIVEADAPTER: when no live embedded node feeds the chain the
+            // status is labelled "no live node" with null height/synced -- NOT a
+            // fake 0/false that reads as a real node at genesis.
+            const nlohmann::json st = embedded_coin.live_status();
+            nlohmann::json r = nlohmann::json::object();
+            r["dgb_live"]   = st["live"];
+            r["dgb_state"]  = st["state"];
+            r["dgb_height"] = st["height"];   // null unless a live node is present
+            r["dgb_synced"] = st["synced"];   // null unless a live node is present
+            r["dgb_peers"]  = coin_peer_mgr ? coin_peer_mgr->connected_count() : 0;
+            return r;
+        });
+
+        // (3) node topology — the DGB coin row (peers/synced/tip) PLUS the #82
+        //     dual-path broadcaster arm state, so a dual-path regression is
+        //     observable from the dashboard, not only from gtest.
+        mi->set_node_topology_fn([&embedded_coin, &coin_node, &coin_p2p,
+                                  &coin_peer_mgr, bcast_telem, no_p2p_relay]() {
+            nlohmann::json dgb_e = nlohmann::json::object();
+            dgb_e["coin"]     = "DGB";
+            dgb_e["primary"]  = true;
+            dgb_e["embedded"] = true;
+            dgb_e["has_rpc"]  = coin_node.has_rpc();
+            dgb_e["peers"]    = coin_peer_mgr ? coin_peer_mgr->connected_count() : 0;
+            // D-DGB.LIVEADAPTER: honest live-node status. No live embedded node
+            // => live:false, state:"no live node", null height/synced (never a
+            // fake zero). Flips to real readings once the M3 node handle lands.
+            const nlohmann::json st = embedded_coin.live_status();
+            dgb_e["live"]     = st["live"];
+            dgb_e["state"]    = st["state"];
+            dgb_e["synced"]   = st["synced"];
+            dgb_e["height"]   = st["height"];
+            nlohmann::json coins = nlohmann::json::array();
+            coins.push_back(dgb_e);
+
+            // #82 dual-path broadcaster — BOTH arms: armed-state + dispatch count.
+            nlohmann::json p2p = nlohmann::json::object();
+            p2p["bound"]      = (coin_p2p != nullptr);  // embedded P2P relay sink present
+            p2p["suppressed"] = no_p2p_relay;           // --no-p2p-relay isolation toggle
+            p2p["dispatches"] = bcast_telem->p2p_dispatches.load(std::memory_order_relaxed);
+            nlohmann::json rpc = nlohmann::json::object();
+            rpc["armed"]      = coin_node.has_rpc();    // digibyted submitblock sink present
+            rpc["submits"]    = bcast_telem->rpc_submits.load(std::memory_order_relaxed);
+            rpc["ever"]       = bcast_telem->rpc_ever.load(std::memory_order_relaxed);
+            rpc["last_ok"]    = bcast_telem->rpc_last_ok.load(std::memory_order_relaxed);
+            nlohmann::json bc = nlohmann::json::object();
+            bc["p2p_arm"]     = p2p;
+            bc["rpc_arm"]     = rpc;
+
+            nlohmann::json r = nlohmann::json::object();
+            r["node_symbol"]  = "DGB";
+            r["coins"]        = coins;
+            r["broadcaster"]  = bc;
+            return r;
+        });
+
+        // (4) scrypt pool stats — sharechain length feeds getinfo poolshares.
+        mi->set_sharechain_stats_fn([&p2p_node]() {
+            nlohmann::json r = nlohmann::json::object();
+            r["total_shares"] =
+                static_cast<uint64_t>(p2p_node.tracker().chain.size());
+            return r;
+        });
+
+        // (5) pool hashrate — attempts/s over the target-lookbehind window off
+        //     the verified best share (SSOT: node.cpp L4 pool-hashrate line).
+        //     Guards to 0 when the window cannot form (no best / height<=2).
+        mi->set_pool_hashrate_fn([&p2p_node, work_source]() -> double {
+            auto best_fn = work_source->get_best_share_hash_fn();
+            if (!best_fn) return 0.0;
+            uint256 best = best_fn();
+            auto& tr = p2p_node.tracker();
+            if (best.IsNull() || !tr.chain.contains(best)) return 0.0;
+            int32_t height = static_cast<int32_t>(tr.chain.get_height(best));
+            if (height <= 2 || tr.m_params == nullptr) return 0.0;
+            int32_t dist = std::min<int32_t>(
+                height - 1, static_cast<int32_t>(tr.m_params->target_lookbehind));
+            auto aps = tr.get_pool_attempts_per_second(best, dist, /*use_min_work=*/false);
+            return static_cast<double>(aps.GetLow64());
+        });
+
+        // (6) share-peers — the pool node sharechain P2P peer snapshot
+        //     (IO-thread-published, lock-free; NEVER iterates the live
+        //     m_peers map). Feeds core MiningInterface::update_stat_log ->
+        //     entry.peers (incoming/outgoing counts), so /web/graph_data
+        //     serves a real "peers" series and the share-peers dashboard
+        //     panel populates. Mirrors bch #1055 (set_peer_info_fn ->
+        //     node.get_peer_info_json()). Display-only; p2pool-merged-v36
+        //     surface: NONE (dashboard reporting, not share/PPLNS bytes).
+        mi->set_peer_info_fn([&p2p_node]() { return p2p_node.get_peer_info_json(); });
+
+        // ── #995 DGB arm: found-block record + chain-sourced confirm/orphan ──
+        // Wire the won-block reporter slot (declared above, fired by
+        // m_on_block_found after a successful reconstruct) to record_found_block
+        // + schedule_block_verification, and install the verdict fn that resolves
+        // a recorded block against the live chain. Mirrors the DASH shape
+        // (main_dash.cpp record sites + set_block_verify_fn) -- SHAPE reference
+        // only, no DASH code copied. Isolation: constructs core classes / calls
+        // core MI methods, ZERO src/core edits. p2pool-merged-v36 surface: NONE
+        // (dashboard telemetry, not share/PPLNS/coinbase bytes).
+        //
+        // PRODUCER. The reconstructed parent block bytes carry the 80-byte header
+        // first; the coin block IDENTITY hash is params.block_hash_func over that
+        // header (sha256d) -- distinct from the scrypt PoW digest AND from the
+        // share hash, and it is the key digibyted getblockheader answers on.
+        // Runs strictly AFTER both broadcast arms; never gates a broadcast.
+        *found_block_report =
+            [mi, &header_chain, block_id = params.block_hash_func](
+                const uint256& /*share_hash*/,
+                const std::vector<unsigned char>& block_bytes,
+                const std::string& /*block_hex*/) {
+                if (block_bytes.size() < 80) return;   // no header -> nothing to key on
+                uint256 block_hash = block_id(
+                    std::span<const unsigned char>(block_bytes.data(), 80));
+                // Height of the block we just won == the pool tip + 1. header_chain
+                // is not yet fed (M3), so this is base (0) until the embedded
+                // header-ingest lands -- display only; the RPC verdict keys on the
+                // hash, not the height.
+                uint64_t height = header_chain.next_block_height();
+                mi->record_found_block(
+                    height, block_hash, static_cast<uint64_t>(std::time(nullptr)),
+                    /*chain=*/"DGB", /*miner=*/"", /*share_hash=*/block_hash.GetHex(),
+                    mi->get_network_difficulty(), /*share_difficulty=*/0.0,
+                    mi->get_local_hashrate(), /*subsidy=*/0);
+                // Arm the post-broadcast confirm/orphan poller. Telemetry only.
+                mi->schedule_block_verification(block_hash.GetHex());
+                std::cout << "[DGB] recorded found block hash="
+                          << block_hash.GetHex().substr(0, 16)
+                          << " -- confirm/orphan poller armed" << std::endl;
+            };
+
+        // VERDICT. Resolve a recorded found block against the chain: >0 accepted
+        // (best-chain depth / confirmations), <0 orphaned (off the active chain),
+        // 0 pending (not yet buried, or the chain cannot answer). DAEMONLESS-first
+        // (embedded HeaderChain) is DEFERRED to M3: header_chain is not yet fed
+        // (block_hash stays 0, tip_hash()==nullopt), so a header-chain arm could
+        // only ever return pending today and would be inert-until-fed -- it lands
+        // with the header-ingest slice, not as dead code now. The LIVE verdict
+        // source is the external digibyted getblockheader RPC (rpc.cpp).
+        mi->set_block_verify_fn(
+            [rp = rpc.get()](const std::string& hash_hex) -> int {
+                if (!rp) return 0;   // no digibyted RPC -> cannot ask the chain -> pending
+                uint256 h; h.SetHex(hash_hex);
+                try {
+                    auto j = rp->getblockheader(h, /*verbose=*/true);
+                    if (j.contains("confirmations") && j["confirmations"].is_number()) {
+                        int c = j["confirmations"].get<int>();
+                        if (c < 0) return -1;      // off the active chain -> orphaned
+                        if (c >= 1) return c;      // on the best chain -> accepted
+                    }
+                } catch (...) { /* unknown to daemon / transport error -> pending */ }
+                return 0;
+            });
+        std::cout << "[DGB] found-block confirm/orphan lane ARMED "
+                  << (rpc ? "(digibyted getblockheader verdict)"
+                          : "(no digibyted RPC -> verdicts stay pending until --coin-rpc)")
+                  << std::endl;
+
+        // graph_db stats persistence — survives restarts (LTC-parity site 2/3).
+        // DGB-namespaced sub-dir isolates the per-coin stat log under config_path().
+        {
+            std::string net_label = testnet ? "testnet" : "mainnet";
+            // #1061 parity: the stat-log parent dir must exist before the first
+            // save_stat_log() tmp-write+rename, otherwise the ofstream silently
+            // fails and rename() throws every 100s — nothing survives a restart
+            // while the build stays green. net_label ("testnet"/"mainnet") is a
+            // DIFFERENT subtree from net_dir ("digibyte_testnet"/"digibyte", L195),
+            // so the L198 create_directories does not cover this path.
+            const std::filesystem::path graph_db_dir =
+                core::filesystem::config_path() / net_label / "dgb";
+            std::error_code stat_mkdir_ec;
+            std::filesystem::create_directories(graph_db_dir, stat_mkdir_ec);  // best effort
+            std::string graph_db_path = (graph_db_dir / "graph_db").string();
+            mi->set_stat_log_path(graph_db_path);
+            mi->load_stat_log();
+            std::cout << "[DGB] graph_db stats persistence -> " << graph_db_path << std::endl;
+        }
+
+        if (web_server->start()) {
+            // LTC-parity site 3/3: periodic save_stat_log every 100s. Self-
+            // rescheduling steady_timer on the SAME ioc the run-loop drives;
+            // captured by shared_ptr so it outlives each async_wait continuation.
+            stats_timer = std::make_shared<io::steady_timer>(ioc);
+            auto save_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+            *save_fn = [stats_timer, save_fn, mi](boost::system::error_code ec) {
+                if (ec) return;
+                mi->save_stat_log();
+                stats_timer->expires_after(std::chrono::seconds(100));
+                stats_timer->async_wait(*save_fn);
+            };
+            stats_timer->expires_after(std::chrono::seconds(100));
+            stats_timer->async_wait(*save_fn);
+            std::cout << "[DGB] dashboard live on http://" << http_addr << ":"
+                      << http_port << " (graph_db persist every 100s)" << std::endl;
+        } else {
+            std::cout << "[DGB] WebServer FAILED to bind " << http_addr << ":"
+                      << http_port << " — dashboard disabled, run-loop continues" << std::endl;
+            web_server.reset();
+        }
+    } else {
+        std::cout << "[DGB] dashboard disabled (no --http flag)" << std::endl;
+    }
+
     std::cout << "[DGB] run-loop up: " << network_summary(params) << "\n";
     std::cout << "[DGB] io_context running. Ctrl-C to stop." << std::endl;
 
     ioc.run();
 
+    // LTC-parity site 3/3 (the TRUE third, missing until now): save the stat
+    // log on clean shutdown. load-on-start (L1367) + periodic-100s (L1379) only
+    // persist at tick boundaries, so without this every restart drops whatever
+    // accumulated since the last 100s tick. Mirrors main_ltc.cpp:7456-7457
+    // ("Save stats on shutdown"). web_server (and thus its MiningInterface)
+    // is still alive here — the reset()s below run after. Display-only stat
+    // log; p2pool-merged-v36 surface: NONE.
+    if (web_server) {
+        if (auto* mi = web_server->get_mining_interface())
+            mi->save_stat_log();
+    }
+
     // Tear the acceptor + sessions down while the work source and the coin
     // objects it references (header_chain / mempool / coin_node) are still
     // alive — explicit reset keeps destruction order safe (stratum_server was
     // declared first, so it would otherwise outlive them).
+    if (found_block_report) *found_block_report = nullptr;  // #995: unbind before mi dies
     stratum_server.reset();
+    web_server.reset();
 
     std::cout << "[DGB] io_context stopped — clean exit" << std::endl;
     return 0;
@@ -1208,6 +1517,8 @@ int main(int argc, char** argv)
     bool want_run = false;
     std::string stratum_addr = "0.0.0.0";  // bind all interfaces by default
     uint16_t    stratum_port = 0;           // 0 disables stratum; --stratum sets it
+    std::string http_addr = "0.0.0.0";     // dashboard bind addr (H-STATS.944)
+    uint16_t    http_port = 0;              // 0 disables dashboard; --http sets it (H-STATS.944)
     uint16_t    sharechain_port = 0;        // 0 = default P2P_PORT (5024); --sharechain-port overrides (opt-in isolation)
     std::string coin_daemon;                // --coin-daemon HOST:PORT (embedded P2P producer target)
     std::vector<std::byte> coin_magic;      // --coin-magic HEX (network pchMessageStart)
@@ -1264,6 +1575,18 @@ int main(int argc, char** argv)
                 stratum_port = static_cast<uint16_t>(std::stoi(ep.substr(colon + 1)));
             }
         }
+        if (std::strcmp(argv[i], "--http") == 0 && i + 1 < argc) {
+            // --http [HOST:]PORT — bind the operator dashboard + graph_db stats
+            // persistence (H-STATS.944). Omit to disable (mirrors --stratum).
+            const std::string ep = argv[++i];
+            const auto colon = ep.find(':');
+            if (colon == std::string::npos) {
+                http_port = static_cast<uint16_t>(std::stoi(ep));
+            } else {
+                http_addr = ep.substr(0, colon);
+                http_port = static_cast<uint16_t>(std::stoi(ep.substr(colon + 1)));
+            }
+        }
         if (std::strcmp(argv[i], "--coin-daemon") == 0 && i + 1 < argc) {
             coin_daemon = argv[++i];               // embedded coin-daemon P2P endpoint
         }
@@ -1312,7 +1635,8 @@ int main(int argc, char** argv)
                         rpc_endpoint, rpc_conf_path,
                         regtest, force_won_share, no_p2p_relay,
                         redistribute_spec, dev_relax_algo_softforks,
-                        coin_p2p_discover);
+                        coin_p2p_discover,
+                        http_addr, http_port);
 
     // --selftest, or a bare invocation: drive the live score path so the
     // binary exercises real consensus code, then exit cleanly.

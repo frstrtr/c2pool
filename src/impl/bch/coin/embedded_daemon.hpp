@@ -53,6 +53,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <limits>       // std::numeric_limits (found-block RPC-fallback sentinel)
 #include <string>
 #include <vector>
 
@@ -548,6 +549,24 @@ public:
     Mempool&            mempool()        { return m_pool; }
     bool                is_wired() const { return m_abla.is_wired(); }
 
+    /// Found-block confirmation depth via the external BCHN-RPC fallback
+    /// (getblockheader "confirmations"). Returns INT_MIN when no external RPC is
+    /// live (embedded-only arm) so the caller falls through to the header-chain
+    /// verdict. TELEMETRY ONLY -- the dashboard found-block verifier's fallback
+    /// arm (#995 BCH arm); never a consensus or broadcast gate. Read-only vs
+    /// VM300 (a getblockheader query issues no qm/control op).
+    int rpc_block_confirmations(const uint256& block_hash)
+    {
+        NodeRPC* r = m_node.rpc();
+        if (!r) return std::numeric_limits<int>::min();
+        try {
+            nlohmann::json j = r->getblockheader(block_hash, /*verbose=*/true);
+            if (j.contains("confirmations") && j["confirmations"].is_number())
+                return j["confirmations"].get<int>();
+        } catch (...) { /* unreachable / unknown -> pending */ }
+        return std::numeric_limits<int>::min();
+    }
+
     // BlockBroadcast result type + the guarded dual-path dispatch live in
     // block_broadcast_guard.hpp (shared single source of guard truth; the
     // throw-injection KATs exercise the same helper).
@@ -622,6 +641,32 @@ public:
         if (m_node.has_p2p()) return "p2p";
         if (m_coin_node && m_coin_node->has_rpc()) return "rpc";
         return "none";
+    }
+
+    /// D-BCH dashboard feed: per-coin embedded-daemon topology surfaced at
+    /// core::WebServer /api/node_topology (MiningInterface::set_node_topology_fn).
+    /// Display-only -- reads live daemon state, mutates no serving/consensus
+    /// path. Each datum is named TRUTHFULLY: BCH embedded transport is
+    /// SINGLE-PEER (one explicit BCHN peer or the RPC fallback, no
+    /// coin_peer_mgr), so `embedded_peers` is 0-or-1 alongside `broadcast_route`,
+    /// NOT a multi-peer getpeerinfo table (acceptance #2: name the datum the
+    /// lane cannot supply rather than render a placeholder). p2pool-merged-v36
+    /// surface: NONE (dashboard reporting, not share/PPLNS/coinbase bytes).
+    nlohmann::json dashboard_topology() {
+        const bool     emb_p2p  = m_node.has_p2p();
+        const bool     ext_rpc  = (m_coin_node && m_coin_node->has_rpc());
+        const uint32_t synced   = ibd_synced_height();
+        const uint32_t peer_tip = m_chain.peer_tip_height();
+        return nlohmann::json{
+            {"coin", "BCH"},
+            {"embedded", true},
+            {"has_rpc", ext_rpc},
+            {"synced_height", synced},
+            {"peer_tip_height", peer_tip},
+            {"sync_pct", (peer_tip > 0 ? 100.0 * synced / peer_tip : 0.0)},
+            {"embedded_peers", emb_p2p ? 1 : 0},   // single-peer embedded transport
+            {"broadcast_route", broadcast_route()},
+        };
     }
 
 private:

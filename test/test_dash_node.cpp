@@ -22,6 +22,7 @@
 
 #include <impl/dash/node.hpp>
 #include <core/uint256.hpp>
+#include <impl/dash/known_txs_retention.hpp>  // dash::select_standing_remember (#950)
 
 #include <memory>
 #include <type_traits>
@@ -455,4 +456,50 @@ TEST(DashBlockWinningMint, AcquirePrimitiveContract)
                            std::chrono::milliseconds(50));
         EXPECT_FALSE(a.owns_lock());
     }
+}
+
+
+// ── #950 standing remembered-set selector ──────────────────────────────────
+// Canonical p2pool seeds a freshly-connected peer with its whole mining-tx set
+// (p2p.py:269), bounded by max_remembered_txs_size (p2p.py:30) because a peer
+// DISCONNECTS if an inbound remember_tx overflows that bound (p2p.py:488).
+// c2pool emitted NO standing remember, so peers showed txpool == 0 (#950).
+// dash::select_standing_remember is what send_standing_remember(peer) (node.cpp,
+// wired into handle_version at node.hpp) uses to pick the seed. REAL uint256
+// keys; tx bytes stand in as ints exactly as test_dash_known_txs_retention.cpp
+// does — the production call binds the SAME template to coin::Transaction + the
+// pack() byte-sizer. These pin the two properties the fix must hold and pre-#950
+// code did not: a non-empty pool yields a non-empty seed (vs the empty standing
+// set that caused txpool==0), and the seed never overshoots the peer cap (vs an
+// unbounded seed that trips p2p.py:488). Selector+cap KAT on real types, NOT a
+// live-socket capture — the wire proof is the hotel #879 remember_tx-out / peer
+// remembered_txs_size read after merge.
+namespace {
+std::size_t as_bytes(int b) { return static_cast<std::size_t>(b); }
+}
+
+TEST(DashStandingRemember, PopulatedPoolYieldsNonEmptySeed)
+{
+    std::map<uint256, int> known;
+    known[uint256(1)] = 500;
+    known[uint256(2)] = 500;
+    known[uint256(3)] = 500;
+    auto chosen = dash::select_standing_remember(known, 2500000u, as_bytes);
+    EXPECT_EQ(chosen.size(), 3u);
+}
+
+TEST(DashStandingRemember, StopsBeforeExceedingPeerCap)
+{
+    std::map<uint256, int> known;
+    for (uint64_t i = 0; i < 10; ++i)
+        known[uint256(i)] = 400;
+    auto chosen = dash::select_standing_remember(known, 1000u, as_bytes);
+    EXPECT_EQ(chosen.size(), 2u);
+}
+
+TEST(DashStandingRemember, EmptyPoolSeedsNothing)
+{
+    std::map<uint256, int> known;
+    auto chosen = dash::select_standing_remember(known, 2500000u, as_bytes);
+    EXPECT_TRUE(chosen.empty());
 }

@@ -105,4 +105,32 @@ inline void retain_template_txs(std::deque<std::set<uint256>>& recent_sets,
     }
 }
 
+// #950 STANDING remembered-set seed. Canonical p2pool keeps a per-peer standing
+// remembered set — its dashboard "txpool" for us (web.py:673 remembered_txs_size)
+// is fed ONLY by remember_tx BODIES, never by have_tx adverts — and seeds a
+// freshly connected peer with the WHOLE current mining-tx set (p2p.py:269). It is
+// bounded by max_remembered_txs_size = 2 500 000 bytes (p2p.py:30): a canonical
+// peer DISCONNECTS if an inbound remember_tx pushes its remembered_txs_size over
+// that bound (p2p.py:488), so the cap here is an interop-safety limit, not a
+// nicety. c2pool held NO standing set — remember_tx went out only as a transient
+// bracket inside sendShares (canonical-faithful, p2p.py:388) — so peers saw
+// txpool == 0 (#950). This selects, from the txs we already hold, the prefix that
+// fits under `cap` bytes to seed the peer. size_of(tx) MUST mirror canonical's
+// `100 + packed_size(tx)` accounting so the running sum never overshoots the cap.
+template <typename TxMap, typename SizeFn>
+inline std::vector<typename TxMap::key_type>
+select_standing_remember(const TxMap& known_txs, std::size_t cap, SizeFn size_of)
+{
+    std::vector<typename TxMap::key_type> chosen;
+    std::size_t acc = 0;
+    for (const auto& kv : known_txs) {
+        const std::size_t sz = size_of(kv.second);
+        if (acc + sz > cap)
+            break;   // stop BEFORE the peer's cap — overshoot => it disconnects us
+        acc += sz;
+        chosen.push_back(kv.first);
+    }
+    return chosen;
+}
+
 } // namespace dash

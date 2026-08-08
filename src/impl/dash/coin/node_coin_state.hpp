@@ -27,6 +27,7 @@
 #include <impl/dash/coin/quorum_root.hpp>        // compute_merkle_root_quorums (pre-emit recompute)
 #include <impl/dash/coin/dkg_commitments.hpp>    // QcBlockPlan (E1 daemonless DKG-window serving)
 #include <impl/dash/coin/vendor/simplifiedmns.hpp> // vendor::CSimplifiedMNList (merkleRootMNList source)
+#include <impl/dash/coin/sml_projection.hpp>     // confirmedHash rollover projection + collateral-spend predicate
 #include <impl/dash/coin/vendor/cbtx.hpp>        // vendor::parse_cbtx (pre-emit CbTx self-check)
 #include <impl/dash/coin/subsidy.hpp>            // compute_dash_platform_reward_post_v20_mn_rr (creditPool re-check)
 
@@ -43,6 +44,85 @@
 
 namespace dash {
 namespace coin {
+
+/// Where the currently-held best ChainLock came from. The bestCL* fields are
+/// COMMITTED into the coinbase of every template we serve, and dashcore
+/// re-verifies a non-null committed signature with BLS
+/// (specialtxman.cpp:164-167 VerifyChainLock => bad-cbtx-invalid-clsig), so
+/// "how do we justify this signature" is a consensus question, not bookkeeping.
+///
+///  - Unknown        : no provenance recorded. FAIL-CLOSED — the consensus-exact
+///                     gate refuses to serve from it. This is the DEFAULT for
+///                     set_best_cl() so that any future/unaudited writer cannot
+///                     silently make the gate permissive.
+///  - ChainCommitted : read out of a connected block's own coinbase CCbTx. The
+///                     network already accepted that signature IN that block, so
+///                     re-committing it needs no local BLS at all — this is
+///                     exactly what dashd's own miner does when it holds nothing
+///                     fresher (dash v23.1.7 src/node/miner.cpp:143-146,153-156).
+///  - BlsVerified    : a live clsig off the wire that PASSED local BLS
+///                     verification against its signing quorum
+///                     (CoinStateMaintainer::on_new_chainlock, itself fail-closed
+///                     when no verifier is installed).
+enum class ClProvenance { Unknown, ChainCommitted, BlsVerified };
+
+/// Policy for the bestCL viability/pre-emit gate. See set_bestcl_policy().
+///
+///  - Off             : no bestCL gate (pre-#780 behaviour).
+///  - Freshness       : the ORIGINAL proxy — require the best observed ChainLock
+///                      to be within one block of the tip. Conservative,
+///                      over-restrictive, and the DEFAULT when the gate is on.
+///  - ConsensusExact  : require exactly what dashcore requires, no more.
+enum class BestClPolicy { Off, Freshness, ConsensusExact };
+
+/// What the embedded arm does while the UTXO/fee lane is below its maturity
+/// depth (UtxoLane::mining_utxo_ready == false, i.e. blocks_connected < 106).
+/// See set_utxo_immature_policy() for the reasoning and the default.
+///
+///  - Refuse          : DEFAULT — p2pool semantics, the project design law: an
+///                      unsynced node does not serve block templates. Refuse
+///                      the arm ("utxo-immature") and route to the dashd
+///                      fallback (full templates where one is armed) for the
+///                      whole immature window.
+///  - ServeEmptyTxSet : explicit OPT-IN for pure-daemonless deployments with
+///                      no fallback to route to: stay viable and serve a
+///                      COINBASE-ONLY template. Consensus never requires a
+///                      mempool transaction, so a tx-free block is fully
+///                      valid; with zero txs the fee term is exactly 0, so
+///                      subsidy / MN payment / creditPool are all exact and
+///                      nothing can be overstated.
+enum class UtxoImmaturePolicy { ServeEmptyTxSet, Refuse };
+
+/// The DISCRIMINATING tail of a block-hash display hex, for log/diagnostic use.
+///
+/// WHY THIS EXISTS (measured, hotel node 109.161.52.148, 2026-08-06). Every
+/// `dmn-stale` refusal in a 5h33m window printed
+///
+///     cause=dmn-stale value=000000000000 threshold=000000000000
+///
+/// — 114 of 114 identical, and the two sides equal, on a refusal whose ENTIRE
+/// meaning is that the two sides DIFFER. The fields were not unpopulated: they
+/// were `uint256::GetHex().substr(0, 12)`, i.e. the twelve MOST-significant
+/// nibbles of a PROOF-OF-WORK hash, which are zero by construction. The live
+/// tip hashes in the same log confirm it directly: `000000000000000e`,
+/// `000000000000001c`, `0000000000000018` — at mainnet difficulty the first
+/// ~14 nibbles are the difficulty padding and carry no information at all.
+///
+/// So the operator contract established by #1039 ("every decline names cause,
+/// value and threshold") was honoured in SHAPE and empty in SUBSTANCE, and no
+/// one could tell a genuinely stale DML from a broken predicate. Taking the
+/// TAIL instead of the head is the whole fix: the low-order nibbles are the
+/// hash's entropy.
+///
+/// Deliberately NOT applied to ProTx / transaction hashes elsewhere in this
+/// file (`mn-confirm-rollover-pending`, `mn-payout-split-unprovable`): those
+/// are ordinary double-SHA256 tx ids with no difficulty padding, so their
+/// leading nibbles ARE discriminating and their existing rendering is correct.
+inline std::string discriminating_hash_tail(const uint256& h, size_t n = 12)
+{
+    const std::string hex = h.GetHex();
+    return hex.size() <= n ? hex : hex.substr(hex.size() - n);
+}
 
 /// In-process coin-state the running node maintains for LOCAL template
 /// assembly. Non-copyable: it owns a Mempool (itself non-copyable) and is
@@ -93,14 +173,76 @@ public:
     void set_sml_current_hash(const uint256& h) { m_sml_current_hash = h; }
     const uint256& sml_current_hash() const { return m_sml_current_hash; }
 
+    /// The HEIGHT that same applied SML is current at, authoritative off the
+    /// accepted diff's own cbTx.nHeight (CoinStateMaintainer::m_sml_current_height).
+    /// -1 = never reported.
+    ///
+    /// DIAGNOSTIC-ONLY — nothing in the viability decision reads it. It exists
+    /// because the `dmn-stale` refusal below compares two BLOCK HASHES, and a
+    /// hash can only ever say "different", never "how far behind". Every long
+    /// dmn-stale episode measured on the hotel node (2026-08-06: 5 episodes,
+    /// 586 s of the 592 s total) was closed by the NEXT BLOCK arriving rather
+    /// than by the SML catching up at the same tip — a distinction the hash
+    /// alone cannot express, and the height makes obvious at a glance.
+    ///
+    /// Published from the SAME statement that publishes the hash, so the pair
+    /// can never disagree about which block it describes.
+    void set_sml_current_height(int64_t h) { m_sml_current_height = h; }
+    int64_t sml_current_height_dbg() const { return m_sml_current_height; }
+
     /// Seed the version-appropriate CCbTx fields the SML/quorum roots do not
     /// carry: the best-ChainLock height+signature and the DIP-0027 credit-pool
     /// balance. Sourced by the maintainer from the diff's embedded cbTx (the
     /// authoritative wire form as-of blockHash) and from new_chainlock events.
-    void set_best_cl(int32_t height, const std::array<uint8_t, 96>& sig) {
+    /// `prov` records HOW this signature is justified — see ClProvenance. It
+    /// defaults to Unknown (fail-closed under BestClPolicy::ConsensusExact) so
+    /// that a writer added later cannot make the gate permissive by omission.
+    void set_best_cl(int32_t height, const std::array<uint8_t, 96>& sig,
+                     ClProvenance prov = ClProvenance::Unknown) {
         m_best_cl_height = height;
         m_best_cl_sig    = sig;
+        m_best_cl_prov   = prov;
     }
+    ClProvenance best_cl_provenance() const { return m_best_cl_prov; }
+
+    /// Record the ChainLock the TIP BLOCK ITSELF committed, straight off that
+    /// block's coinbase CCbTx.
+    ///
+    /// THIS IS THE DATUM THE CONSENSUS RULE IS STATED IN. dashcore's
+    /// CheckCbTxBestChainlock (dash v23.1.7 src/evo/specialtxman.cpp:102-177)
+    /// constrains our block at height H only RELATIVE to what block H-1
+    /// committed:
+    ///
+    ///     prevCL = GetNonNullCoinbaseChainlock(pindex->pprev)   // :129-131
+    ///     if (prevCL) {
+    ///         if (!cbTx.bestCLSignature.IsValid())      -> bad-cbtx-null-clsig    // :134-137
+    ///         if (cbTx.bestCLHeightDiff > prevCL.diff+1) -> bad-cbtx-older-clsig  // :138-140
+    ///     }
+    ///
+    /// i.e. "committed CL height must not go BACKWARDS from the previous
+    /// block's". Nothing in the rule mentions the tip, wall-clock freshness, or
+    /// how recently a ChainLock was produced. Knowing block H-1's committed
+    /// (sig, heightDiff) is therefore NECESSARY AND SUFFICIENT to prove our own
+    /// committed value legal before we serve it.
+    ///
+    /// `block_height` is the height of the block whose coinbase supplied this
+    /// (validated by the caller against the CCbTx's own nHeight), `has_sig` is
+    /// false when that coinbase committed a NULL bestCLSignature (dashcore then
+    /// imposes NO constraint on us at all), and `cl_height` is the absolute
+    /// height that coinbase's committed ChainLock refers to,
+    /// block_height - bestCLHeightDiff - 1.
+    void set_tip_cbtx_chainlock(int32_t block_height, bool has_sig, int32_t cl_height) {
+        // Monotonic on the block axis: a late/duplicate delivery of an OLDER
+        // block must not roll the provenance height back (same discipline as
+        // the credit-pool seed's Nit-C guard).
+        if (block_height <= m_tip_cbtx_at_height) return;
+        m_tip_cbtx_at_height = block_height;
+        m_tip_cbtx_cl_null   = !has_sig;
+        m_tip_cbtx_cl_height = has_sig ? cl_height : -1;
+    }
+    int32_t tip_cbtx_at_height() const { return m_tip_cbtx_at_height; }
+    int32_t tip_cbtx_cl_height() const { return m_tip_cbtx_cl_height; }
+    bool    tip_cbtx_cl_null()   const { return m_tip_cbtx_cl_null; }
     /// Seed the DIP-0027 credit-pool balance, its block hash, AND its HEIGHT.
     /// The seed rides a SEPARATE on_mnlistdiff step (the diff's embedded cbTx)
     /// from the SML/merkleRoot axis and can LAG one block while the SML is already
@@ -146,6 +288,7 @@ public:
     /// template-SERVE refusal (free), never a block-SUBMIT refusal. Exposed
     /// for the negative-pass test.
     void set_require_resolvable_payee(bool v) { m_require_resolvable_payee = v; }
+    void set_require_provable_payout_split(bool v) { m_require_provable_payout_split = v; }
 
     /// creditPool freshness gate (soak fix). dashcore CheckCreditPoolDiffForBlock
     /// rejects a block whose committed creditPoolBalance is off by a block's
@@ -165,6 +308,16 @@ public:
     /// exactly one block's platform reward (constant 66,966,830 duffs).
     void set_mn_rr_height(int h) { m_mn_rr_height = h; }
     int mn_rr_height() const { return m_mn_rr_height; }
+
+    /// Network nMasternodeMinimumConfirmations (dashcore Params().GetConsensus()
+    /// .nMasternodeMinimumConfirmations — per-chainparams: mainnet 15, testnet/
+    /// devnet/regtest 1; see sml_projection.hpp). Gates the confirmedHash
+    /// rollover projection in the template build, the viability clause and the
+    /// pre-emit root re-check. main_dash sets the testnet value next to
+    /// set_mn_rr_height; the mainnet default keeps every existing caller
+    /// byte-unchanged.
+    void set_mn_min_confirmations(int c) { m_mn_min_confirmations = c; }
+    int mn_min_confirmations() const { return m_mn_min_confirmations; }
 
     /// HEADER-SYNC gate (the DASH half of a cross-lane asymmetry: bch 13, ltc
     /// 12, nmc 12, btc 6, dgb 6 callers of is_synced(); DASH had ZERO —
@@ -203,6 +356,24 @@ public:
         m_have_mn_dbg  = have_mn ? 1 : 0;
     }
 
+    /// DIAGNOSTIC (body-first serve tip): the maintainer knows a newer header
+    /// tip whose block inputs (body / tip-targeted mnlistdiff cbTx) have not
+    /// been parsed yet. This is the NORMAL ~1-2 s propagation transient of
+    /// the body-first split, not an error state; publishing it here lets a
+    /// not-populated refusal during that window (cold start / overdue demote)
+    /// carry its own name instead of masquerading as a header-sync fault.
+    /// Never read by any serve or reward path.
+    void set_tip_body_pending_dbg(bool v) { m_tip_body_pending_dbg = v; }
+    bool tip_body_pending_dbg() const { return m_tip_body_pending_dbg; }
+
+    /// The same two bits, READABLE. They existed only inside the decline
+    /// string, so the standing state ("why would this node not serve RIGHT
+    /// NOW, before anyone asks it for work") could not be printed at all — an
+    /// operator had to provoke a decline to learn it. -1 == never reported.
+    /// Telemetry only; no serve or reward path reads these.
+    int have_tip_dbg() const { return m_have_tip_dbg; }
+    int have_mn_dbg()  const { return m_have_mn_dbg; }
+
     /// Enable the SML-required viability gate. main_dash.cpp turns this on for
     /// the embedded coin-P2P arm so a template is only served once the CCbTx
     /// commitment inputs are present (review finding H3: no mid-sync half-built block).
@@ -236,13 +407,135 @@ public:
 
     /// Coinbase-maturity mining gate (E2b/#738) — the dash analog of the LTC
     /// EmbeddedCoinNode::set_utxo_ready_fn (main_ltc.cpp ~1785-1801). When
-    /// set, embedded-template viability additionally requires the predicate
-    /// (UtxoLane::mining_utxo_ready: blocks_connected >= 106) so templates
-    /// cannot include txs spending immature coinbase outputs; until then
-    /// has_state stays false and get_work routes to the retained dashd
-    /// fallback. Unset (default) preserves the pre-E2b behaviour exactly.
+    /// set, the predicate (UtxoLane::mining_utxo_ready: blocks_connected >= 106)
+    /// reports whether the UTXO view is deep enough to price mempool txs, so a
+    /// template can never include a tx whose fee we cannot compute exactly.
+    ///
+    /// WHAT THE ARM DOES while that predicate is false is set separately by
+    /// set_utxo_immature_policy(): by DEFAULT (Refuse -- p2pool semantics, an
+    /// unsynced node does not serve templates) it declines ("utxo-immature")
+    /// and get_work routes to the retained dashd fallback for the whole
+    /// window, the pre-existing behaviour. Under the opt-in
+    /// UtxoImmaturePolicy::ServeEmptyTxSet the arm stays viable and serves a
+    /// COINBASE-ONLY template (fees exactly 0, nothing to overstate). Unset
+    /// (default) leaves both moot: with no predicate installed the window does
+    /// not exist and nothing is suppressed.
     void set_utxo_ready_fn(std::function<bool()> fn) {
         m_utxo_ready_fn = std::move(fn);
+    }
+
+    /// What to do during the immature window the predicate above reports.
+    ///
+    /// ── WHY THE DEFAULT IS Refuse (operator design law, p2pool semantics) ────
+    /// An unsynced node is a node with unverified state, and the project rule --
+    /// stated repeatedly by the operator, and the behaviour p2pool always had --
+    /// is that an unsynced node does not serve block templates. Miners idling is
+    /// the correct posture: cheaper than hashing work the node cannot fully
+    /// stand behind. Where an external dashd fallback is armed, the refusal is
+    /// also strictly better than any degraded serve -- the fallback returns FULL
+    /// templates. So the default refuses ("utxo-immature") for the whole
+    /// blocks_connected < 106 window, exactly as before this policy existed.
+    ///
+    /// ── WHY ServeEmptyTxSet EXISTS AS AN OPT-IN ──────────────────────────────
+    /// On a PURE-DAEMONLESS node there is no fallback to route to: the refusal
+    /// costs the whole window (~106 blocks x ~150 s ~= 4.4 h of a cold start)
+    /// with nothing served by anyone. For operators who prefer a subsidy-only
+    /// block over no block, the opt-in serves a COINBASE-ONLY template instead.
+    /// That is consensus-safe by construction: consensus never requires a
+    /// mempool transaction, and with zero selected txs the fee term is exactly
+    /// 0 -- there is nothing to overstate, so the bad-cb-amount risk the
+    /// maturity gate guards (this builder has no TestBlockValidity equivalent;
+    /// fee exactness rides entirely on the UTXO lane) is structurally absent in
+    /// that mode. Every other viability gate -- chain-synced, qc plan,
+    /// superblock, bestCL, credit pool, payee freshness, SML/quorum roots --
+    /// still has to pass either way. The cost is the forgone fees, which the
+    /// builder reports on every such template (m_txset_forgone_fees).
+    ///
+    /// main_dash: --embedded-utxo-immature-serve-empty selects the opt-in;
+    /// flag absent = Refuse, byte-identical to the pre-policy behaviour.
+    void set_utxo_immature_policy(UtxoImmaturePolicy p) {
+        m_utxo_immature_policy = p;
+    }
+    UtxoImmaturePolicy utxo_immature_policy() const {
+        return m_utxo_immature_policy;
+    }
+
+    /// ── Mempool-tx serving switch (--embedded-serve-mempool-txs) ─────────
+    /// DEFAULT OFF: the embedded arm serves a COINBASE-ONLY body even with a
+    /// mature UTXO lane (suppress_mempool_txs=true, cause
+    /// "mempool-txs-disabled"). Consensus never requires a mempool tx, and
+    /// with zero txs every committed value (subsidy, MN payment, creditPool)
+    /// is exact — the same argument as the utxo-immature serving mode.
+    ///
+    /// Turning it ON puts the whole mempool-tx body path in the block
+    /// production lane: topological selection (G1), sigop caps (G2),
+    /// coinbase-maturity (G3) and islock-conflict (G4) guards all live in
+    /// Mempool::get_sorted_txs_with_fees (see
+    /// DASH_CONNECTBLOCK_REJECT_SURFACE_AUDIT.md). Fees ride the coinbase.
+    /// The switch exists so the fee-carrying path is an explicit operator
+    /// decision, soak-gated like every other production posture — not an
+    /// implicit consequence of the UTXO lane maturing.
+    void set_serve_mempool_txs(bool on) { m_serve_mempool_txs = on; }
+    bool serve_mempool_txs() const { return m_serve_mempool_txs; }
+
+    /// PINNED LOCAL TX (--pin-local-tx-hex, donation-dust consolidation): an
+    /// operator-supplied, externally-signed, zero-fee tx that can only reach
+    /// the chain through OUR OWN block. Stored by value; the work-inputs
+    /// bundle hands the builder a pointer, and the builder re-gates admission
+    /// against the live UTXO view on every template
+    /// (Mempool::pinned_tx_admissible) — exclusion-only failure, never a
+    /// template refusal. Call on the io thread before serving starts.
+    /// PIN GATE for the SERVED-DASHD arm, as a VALUE (#1134).
+    ///
+    /// The embedded builder gates and appends in one place because both happen
+    /// beside the coin state. The served-dashd arm cannot: it appends on the
+    /// re-source thread, where touching m_mempool/m_mnstates is the serve-path
+    /// heap-corruption shape. So the gate runs HERE and only the verdict
+    /// crosses. `out_tx` receives a pointer to the pin, which is safe to hand
+    /// out because it is written once before serving and never mutated.
+    ///
+    /// The height is OURS (m_prev_height + 1), not the template's: a served
+    /// dashd template can reach the splice with height 0, and a zero height
+    /// makes the coinbase-maturity arm read every coinbase-sourced input as
+    /// immature. An unknown tip is REFUSED by name rather than guessed at.
+    /// One verdict PER PIN, in file order. The vector is empty when no pin is
+    /// configured. Judged at OUR tip; an unknown tip refuses by name rather
+    /// than guessing (a zero height marks every coinbase input immature).
+    std::vector<PinVerdict> evaluate_pinned_txs(
+        const std::vector<MutableTransaction>** out_txs) const {
+        std::vector<PinVerdict> out;
+        if (!m_have_pinned_local_tx) return out;
+        if (out_txs) *out_txs = &m_pinned_local_txs;
+        out.reserve(m_pinned_local_txs.size());
+        for (const auto& tx : m_pinned_local_txs) {
+            if (m_prev_height == 0) {
+                PinVerdict v; v.cause = "tip-unknown"; out.push_back(v);
+                continue;
+            }
+            out.push_back(pin_gate_verdict(tx, m_mempool, m_mnstates,
+                                           m_prev_height + 1));
+        }
+        return out;
+    }
+
+    void set_pinned_local_tx(MutableTransaction tx) {
+        m_pinned_local_txs.clear();
+        m_pinned_local_txs.push_back(std::move(tx));
+        m_have_pinned_local_tx = true;
+    }
+    void set_pinned_local_txs(std::vector<MutableTransaction> txs) {
+        m_pinned_local_txs = std::move(txs);
+        m_have_pinned_local_tx = !m_pinned_local_txs.empty();
+    }
+
+    /// Second source for the PIN GATE's coin lookups (money-path). Forwarded
+    /// to the mempool, which consults it only for inputs its own UTXO view
+    /// cannot resolve — see Mempool::set_external_coin_lookup for why that is
+    /// not a relaxation. Wired once at startup, before any template build.
+    void set_pin_external_coin_lookup(
+        std::function<bool(const ::core::coin::Outpoint&, ::core::coin::Coin&)> fn)
+    {
+        m_mempool.set_external_coin_lookup(std::move(fn));
     }
 
     /// Superblock-height guard. On a Dash superblock height the coinbase MUST
@@ -255,7 +548,13 @@ public:
     /// The predicate takes the NEXT block height (prev_height + 1). Unset
     /// (default) preserves prior behaviour exactly.
     void set_is_superblock_fn(std::function<bool(uint32_t)> fn) {
-        m_is_superblock_fn = std::move(fn);
+        m_is_superblock_fn = fn;
+        // Same cycle for the payee machine's pass-3 payout-split
+        // observation: a lone treasury payee at a superblock height
+        // presents the same 2-output shape as an operator split, so
+        // adoption there is ambiguous and must be skipped (h=2516595
+        // split-provenance lane).
+        m_mnstates.set_superblock_height_fn(std::move(fn));
     }
 
     /// Daemonless superblock provider (E-SUPERBLOCK). When enabled (see
@@ -330,6 +629,30 @@ public:
         m_qc_plan_fn = std::move(fn);
     }
 
+    /// PoSe no-op proof for one REAL (non-null) type-6 commitment — the
+    /// enforcement of the #1083 landmine comment at the inclusion site
+    /// (embedded_gbt.hpp). dashd's verifier PoSe-punishes every member a
+    /// non-null in-block commitment marks invalid (specialtxman.cpp:159-174),
+    /// which can flip that MN's validity in the SAME block's list and change
+    /// the merkleRootMNList this coinbase commits — bad-cbtx-mnmerkleroot, a
+    /// silently lost block. c2pool does not fold that pass, so the pre-emit
+    /// gate refuses any real commitment whose PoSe pass is not PROVABLY a
+    /// no-op (qc_pose_pass_provably_noop: every listed member valid).
+    ///
+    /// The fn answers exactly that question for one commitment:
+    ///   true    => the PoSe pass provably touches nothing — servable;
+    ///   false   => at least one listed member would be punished — refuse;
+    ///   nullopt => cannot be established (member set not sourced) — refuse.
+    /// UNSET (default) => the capability is absent and every non-null
+    /// commitment is refused (fail-closed insurance until a real PoSe fold
+    /// into the committed MN root is built). Null commitments are exempt by
+    /// dashd's own IsNull() guard (specialtxman.cpp:427-432) and are never
+    /// consulted, so the all-null production plans are byte-unchanged.
+    void set_qc_pose_noop_fn(
+        std::function<std::optional<bool>(const vendor::CFinalCommitment&)> fn) {
+        m_qc_pose_noop_fn = std::move(fn);
+    }
+
     /// bestCL freshness guard (review PR #780 BLOCKER-2, HIGH). dashcore
     /// CheckCbTxBestChainlock rejects a block whose committed bestCLSignature is
     /// null or older than the previous block's committed ChainLock
@@ -340,7 +663,156 @@ public:
     /// <= prev_height - 1, so a CL that fresh is guaranteed non-null and >= it.
     /// If we have not observed a recent clsig (post-restart / relay gap) the arm
     /// fails closed to the dashd fallback. Default OFF preserves prior behaviour.
-    void set_require_fresh_bestcl(bool v) { m_require_fresh_bestcl = v; }
+    ///
+    /// ⚠ THE FRESHNESS PREDICATE IS A PROXY, AND IT IS EXPENSIVE. See
+    /// set_bestcl_policy() for the consensus-exact replacement and the measured
+    /// cost of keeping this one. This setter is retained verbatim: it selects
+    /// BestClPolicy::Freshness, which stays the default, so every existing
+    /// caller and KAT keeps byte-identical behaviour.
+    void set_require_fresh_bestcl(bool v) {
+        m_require_fresh_bestcl = v;
+        m_bestcl_policy = v ? BestClPolicy::Freshness : BestClPolicy::Off;
+    }
+
+    /// Select the bestCL gate policy. `Freshness` (the default whenever the
+    /// gate is enabled) is the original #780 BLOCKER-2 proxy. `ConsensusExact`
+    /// enforces dashcore's ACTUAL rule and nothing more.
+    ///
+    /// WHY THE PROXY IS WRONG (and it is a proxy — its own docs above call it
+    /// "a sufficient condition"). dashcore constrains the committed ChainLock
+    /// ONLY relative to the previous block's committed ChainLock; it never asks
+    /// for freshness. dashd's own miner, when it holds nothing newer than what
+    /// block H-1 committed, RE-COMMITS block H-1's exact signature with
+    /// heightDiff = prevDiff + 1 and mines on (dash v23.1.7
+    /// src/node/miner.cpp:143-146 "We don't know any CL, therefore inserting the
+    /// CL of the previous block" and :153-156 "Our best CL isn't newer:
+    /// inserting CL from previous block"). That path needs no ChainLock of our
+    /// own and no BLS verification whatsoever. Our builder already produces
+    /// byte-identically the same CCbTx in that situation — embedded_gbt.hpp
+    /// computes heightDiff = prev_height - best_cl_height, which for a bestCL
+    /// sourced from block H-1's coinbase is exactly prevDiff + 1. Only this
+    /// gate stopped us serving it.
+    ///
+    /// WHAT ConsensusExact REQUIRES INSTEAD. Not freshness, but PROVENANCE: we
+    /// must hold block H-1's OWN committed ChainLock (set_tip_cbtx_chainlock,
+    /// fed from the connected block's coinbase), because that is the only term
+    /// the consensus inequality is stated against. Given it, the value we would
+    /// commit is provably legal before we serve. Without it we fail closed to
+    /// the dashd fallback, exactly as before.
+    ///
+    /// FAIL-CLOSED ON A BLS-DARK BUILD. ConsensusExact never becomes permissive
+    /// when BLS is stubbed out. Committing something NEWER than block H-1's
+    /// ChainLock is the only case dashcore makes us prove with BLS, and that
+    /// case additionally requires ClProvenance::BlsVerified — which
+    /// on_new_chainlock can only produce through an installed, succeeding
+    /// verifier. A BLS-dark build therefore holds only ChainCommitted values and
+    /// re-commits block H-1's signature: dashd's own no-ChainLock behaviour.
+    void set_bestcl_policy(BestClPolicy p) {
+        m_bestcl_policy = p;
+        m_require_fresh_bestcl = (p != BestClPolicy::Off);
+    }
+    BestClPolicy bestcl_policy() const { return m_bestcl_policy; }
+
+    /// The ONE bestCL decision, shared by viability and the pre-emit gate so
+    /// they can never drift apart. Returns nullopt when the bestCL axis is
+    /// viable; otherwise {cause, value, threshold} for the decline report.
+    ///
+    /// Every refusal below is a refusal to SERVE — the caller routes to the
+    /// reward-safe dashd fallback, exactly as the freshness proxy did.
+    std::optional<std::array<std::string, 3>> bestcl_decline() const {
+        const int32_t prev_h = static_cast<int32_t>(m_prev_height);
+        auto no = [](const char* c, std::string v, std::string t) {
+            return std::optional<std::array<std::string, 3>>{
+                std::array<std::string, 3>{c, std::move(v), std::move(t)}};
+        };
+        switch (m_bestcl_policy) {
+        case BestClPolicy::Off:
+            return std::nullopt;
+
+        case BestClPolicy::Freshness:
+            // best_cl_height 0 means "no clsig ever observed", NOT "ChainLock at
+            // height 0" — print n/a rather than report a measurement never taken.
+            if (m_best_cl_height < prev_h - 1)
+                return no("bestcl-stale",
+                          m_best_cl_height > 0 ? std::to_string(m_best_cl_height)
+                                               : std::string("n/a"),
+                          ">=" + std::to_string(static_cast<int64_t>(prev_h) - 1));
+            return std::nullopt;
+
+        case BestClPolicy::ConsensusExact:
+            // (1) PROVENANCE OF THE CONSTRAINT. Without block H-1's own
+            // committed ChainLock we cannot evaluate dashcore's inequality at
+            // all, so we must not serve. This is the same INDEPENDENT-HEIGHT
+            // discipline the credit-pool seed uses: a value alone cannot tell
+            // you it is one block behind; its height can.
+            if (m_tip_cbtx_at_height != prev_h)
+                return no("bestcl-tip-cbtx-stale",
+                          m_tip_cbtx_at_height > 0
+                              ? std::to_string(m_tip_cbtx_at_height)
+                              : std::string("n/a"),
+                          std::to_string(prev_h));
+
+            if (m_tip_cbtx_cl_null) {
+                // Block H-1 committed a NULL ChainLock =>
+                // GetNonNullCoinbaseChainlock returns nullopt and dashcore
+                // imposes NO constraint (specialtxman.cpp:130-141 is skipped
+                // entirely). We may commit null, or any signature we can
+                // justify. Committing null is what dashd does here when it
+                // holds nothing (miner.cpp:167-171).
+                if (m_best_cl_height <= 0) return std::nullopt;
+                break;   // non-null: fall through to the justification check
+            }
+
+            // (2) NON-NULL. dashcore :134-137 bad-cbtx-null-clsig — once block
+            // H-1 committed a real ChainLock, ours may not be null.
+            if (m_best_cl_height <= 0)
+                return no("bestcl-absent", "n/a",
+                          "non-null (prev committed CL @"
+                              + std::to_string(m_tip_cbtx_cl_height) + ")");
+            // (3) NOT OLDER. dashcore :138-140 bad-cbtx-older-clsig, restated on
+            // the absolute-height axis: bestCLHeightDiff > prevDiff + 1 is
+            // exactly "our committed CL height < the previous block's".
+            if (m_best_cl_height < m_tip_cbtx_cl_height)
+                return no("bestcl-older-than-prev",
+                          std::to_string(m_best_cl_height),
+                          ">=" + std::to_string(m_tip_cbtx_cl_height));
+            break;
+        }
+
+        // (4) JUSTIFICATION. Reached only under ConsensusExact with a non-null
+        // value about to be committed. dashcore BLS-verifies what we commit
+        // (specialtxman.cpp:164-167 => bad-cbtx-invalid-clsig), so we must be
+        // able to say why this signature is good:
+        //   - ChainCommitted: the network already accepted it inside block H-1.
+        //     Re-committing it is dashd's own fallback and needs no local BLS.
+        //   - BlsVerified: we verified it ourselves against its signing quorum.
+        // Anything ELSE — including a value ADVANCED past block H-1's committed
+        // ChainLock without local verification — is refused. This is what keeps
+        // a BLS-dark build from silently becoming permissive: with no verifier
+        // installed on_new_chainlock adopts nothing, so nothing ever advances
+        // past ChainCommitted and this arm is never reached with an unproven
+        // signature.
+        const bool advancing =
+            !m_tip_cbtx_cl_null && m_best_cl_height > m_tip_cbtx_cl_height;
+        if (advancing && m_best_cl_prov != ClProvenance::BlsVerified)
+            return no("bestcl-unverified-advance",
+                      std::to_string(m_best_cl_height) + "@"
+                          + prov_name(m_best_cl_prov),
+                      ">" + std::to_string(m_tip_cbtx_cl_height)
+                          + " requires bls-verified");
+        if (m_best_cl_prov == ClProvenance::Unknown)
+            return no("bestcl-unjustified", "provenance=unknown",
+                      "chain-committed|bls-verified");
+        return std::nullopt;
+    }
+
+    static const char* prov_name(ClProvenance p) {
+        switch (p) {
+        case ClProvenance::ChainCommitted: return "chain-committed";
+        case ClProvenance::BlsVerified:    return "bls-verified";
+        default:                           return "unknown";
+        }
+    }
 
     /// Quorum-set health (review PR #780 nit): parse_quorum_tail fails SAFE (keeps
     /// SML sync, skips quorum tracking). On a malformed tail the QuorumManager is
@@ -357,6 +829,12 @@ public:
     /// reward path reads it.
     void set_mn_needs_reseed(bool v) { m_mn_needs_reseed = v; }
     bool mn_needs_reseed() const { return m_mn_needs_reseed; }
+
+    /// Number of times embedded_template_emit_ok() has been evaluated on this
+    /// state (counted at the top of the gate, before any early return). Test
+    /// seam: pins that submit-path tip reads never evaluate the serve gate
+    /// (the 2026-08-07/08 hotel freeze amplifier).
+    uint64_t emit_ok_call_count() const { return m_emit_ok_calls; }
 
     /// BLOCKER-3 pre-emit HARD GATE. Before the embedded arm's template is
     /// served/mined, re-validate the BUILT CbTx against consensus invariants;
@@ -378,6 +856,12 @@ public:
     /// existing caller and KAT source-compatible.
     bool embedded_template_emit_ok(const DashWorkData& w,
                                    DeclineReport* why = nullptr) const {
+        // Call counter FIRST, before any early return: the regression gate in
+        // test_dash_submit_gate_scaling.cpp pins that a submit-path tip READ
+        // (get_current_gbt_prevhash) never evaluates this gate -- the
+        // 2026-08-07/08 hotel freeze was this method's SML CalcMerkleRoot
+        // running per share submit on the io thread.
+        ++m_emit_ok_calls;
         auto reject = [why](const char* c, std::string v, std::string t) -> bool {
             if (why) {
                 why->viable    = false;
@@ -433,16 +917,45 @@ public:
                     return reject("emit-qc-payload-drift", "qc[" + std::to_string(i) + "]-bytes",
                                   "planned-qc[" + std::to_string(i) + "]-bytes");
             }
+            // ── PoSe-fold gate on REAL commitments (the #1083 landmine, now
+            // ENFORCED — a comment refuses nothing). A verified real
+            // commitment carrying !validMembers[i] for a listed member makes
+            // dashd's verifier PoSePunish that MN (specialtxman.cpp:159-174),
+            // and a punishment crossing the ban threshold flips the MN's
+            // validity in THIS block's list — the committed merkleRootMNList
+            // above is then wrong: bad-cbtx-mnmerkleroot, a silently lost
+            // block. c2pool folds no PoSe pass, so serve a real commitment
+            // ONLY when its PoSe pass is PROVABLY a no-op (every listed
+            // member valid — the common case, so real-commitment serving
+            // stays unblocked). Absent capability / unprovable => refuse:
+            // fail-closed insurance until a real PoSe fold (mirror of the
+            // confirmedHash rollover projection) is built. Null commitments
+            // are exempt by dashd's own IsNull() guard (specialtxman.cpp:432)
+            // — all-null plans are byte-unchanged through here.
+            for (size_t i = 0; i < qc_plan->commitments.size(); ++i) {
+                const auto& c = qc_plan->commitments[i];
+                if (qc_commitment_is_null(c)) continue;   // IsNull() exempt
+                const std::optional<bool> noop =
+                    m_qc_pose_noop_fn ? m_qc_pose_noop_fn(c) : std::nullopt;
+                if (!noop.has_value() || !*noop)
+                    return reject(
+                        "emit-qc-real-pose-unfolded",
+                        "qc[" + std::to_string(i) + "]:type="
+                            + std::to_string(static_cast<int>(c.llmqType))
+                            + ",quorum=" + c.quorumHash.GetHex().substr(0, 12)
+                            + ",pose_noop="
+                            + (noop.has_value() ? "unproven" : "n/a"),
+                        "pose-pass-provably-noop(all-listed-members-valid)");
+            }
         } else if (m_commitment_window_fn && m_commitment_window_fn(next_h)) {
             return reject("emit-dkg-commitment-window",
                           "in-window@h=" + std::to_string(next_h), "off-window");
         }
-        if (m_require_fresh_bestcl
-            && m_best_cl_height < static_cast<int32_t>(m_prev_height) - 1)
-            return reject("emit-bestcl-stale",
-                          m_best_cl_height > 0 ? std::to_string(m_best_cl_height)
-                                               : std::string("n/a"),
-                          ">=" + std::to_string(static_cast<int64_t>(m_prev_height) - 1));
+        // Same single decision as viability, prefixed for the emit surface.
+        if (auto cl = bestcl_decline()) {
+            const std::string cause = "emit-" + (*cl)[0];
+            return reject(cause.c_str(), (*cl)[1], (*cl)[2]);
+        }
         // SOAK FIX (independent HEIGHT check): the credit-pool seed's OWN cbTx
         // height must be the tip we build on, else the accrual commits a stale
         // creditPoolBalance (bad-cbtx-assetlocked-amount). Independent of the
@@ -465,6 +978,74 @@ public:
                               ? std::to_string(m_mnstates.last_applied_height())
                               : std::string("n/a"),
                           std::to_string(m_prev_height));
+        // Incident h=2516595 (bad-cb-payee) mirror of the viability clause:
+        // a template whose scheduled MN has an UNPROVEN operator-reward
+        // split must never reach a miner, even via a cached template or a
+        // viability bypass.
+        if (m_require_provable_payout_split) {
+            if (auto protx = mn_payout_split_unprovable_at_tip())
+                return reject("emit-mn-payout-split-unprovable",
+                              "protx=" + protx->GetHex().substr(0, 12),
+                              "payout-set-known");
+            // Structural re-derivation (defence in depth against a builder
+            // that ignores the split — the exact h=2516595 defect): the
+            // BUILT template's MN payment amounts must be dashd's
+            // GetBlockTxOuts split of ITS OWN m_payment_amount —
+            //   operator = floor(mn_payment * bps / 10000), owner = rest —
+            // whenever the scheduled entry says a split is due. Amount
+            // presence is checked (not scripts: the packed payee is an
+            // address token; the builder KATs pin script identity).
+            const auto expected = m_mnstates.find_expected_payee();
+            if (expected && w.m_payment_amount > 0) {
+                const auto it = m_mnstates.entries().find(*expected);
+                if (it != m_mnstates.entries().end()) {
+                    const int64_t mn_payment =
+                        static_cast<int64_t>(w.m_payment_amount);
+                    const int64_t op_due =
+                        it->second.operator_payment_of(mn_payment);
+                    if (op_due > 0) {
+                        // Occurrence-counted so a 50/50 split (owner amount
+                        // == operator amount) needs TWO outputs, not one
+                        // double-matched.
+                        const uint64_t own_amt =
+                            static_cast<uint64_t>(mn_payment - op_due);
+                        const uint64_t op_amt = static_cast<uint64_t>(op_due);
+                        size_t own_n = 0, op_n = 0;
+                        for (const auto& p : w.m_packed_payments) {
+                            if (p.payee == "!6a") continue;
+                            if (p.amount == own_amt) ++own_n;
+                            if (p.amount == op_amt)  ++op_n;
+                        }
+                        const bool owner_ok =
+                            own_amt == op_amt ? own_n >= 2 : own_n >= 1;
+                        const bool op_ok =
+                            own_amt == op_amt ? op_n >= 2 : op_n >= 1;
+                        if (!owner_ok || !op_ok)
+                            return reject(
+                                "emit-mn-payout-split-drift",
+                                "owner=" + std::to_string(mn_payment - op_due)
+                                    + (owner_ok ? "-present" : "-MISSING")
+                                    + ",operator=" + std::to_string(op_due)
+                                    + (op_ok ? "-present" : "-MISSING"),
+                                "both-split-amounts-in-template");
+                    }
+                }
+            }
+        }
+        // FINDING-2 defence in depth: no template tx may spend a known MN
+        // collateral outpoint. dashd's verifier removes that MN from the list
+        // for THIS block (specialtxman.cpp:457-464, ALL txs, no special-tx
+        // guard), so a committed root built from the unmodified list is
+        // bad-cbtx-mnmerkleroot — a silently lost block on a winning share.
+        // The builder already filters these out of selection; re-assert here
+        // so a cached/bypassed template can never reach a miner.
+        for (const auto& tx : w.m_txs) {
+            uint256 protx;
+            if (tx_spends_mn_collateral(m_mnstates, tx, &protx))
+                return reject("emit-collateral-spend-in-template",
+                              "mn=" + protx.GetHex().substr(0, 12),
+                              "no-template-tx-spends-mn-collateral");
+        }
         vendor::CCbTx cb;
         if (!vendor::parse_cbtx(w.m_coinbase_payload, cb))
             return reject("emit-cbtx-unparseable",
@@ -473,11 +1054,25 @@ public:
         if (cb.nHeight != static_cast<int32_t>(next_h))
             return reject("emit-cbtx-height-drift", std::to_string(cb.nHeight),
                           std::to_string(next_h));
-        auto sml_copy = m_sml;
-        if (cb.merkleRootMNList != sml_copy.CalcMerkleRoot())
+        // FINDING-1: the root block next_h must commit is the tip SML with the
+        // verifier's height-driven confirmation pass applied (specialtxman.cpp
+        // :206-215 — see sml_projection.hpp). Comparing against the RAW tip
+        // root here would re-approve the exact stale root the rollover
+        // poisons, so re-derive the PROJECTED root; fail closed when the pass
+        // is unprojectable (a null-confirmedHash entry with no known
+        // registration height — at most ~nMasternodeMinimumConfirmations
+        // blocks per unknown registration).
+        auto proj = project_sml_confirmations(m_sml, m_prev_height, m_prev_hash,
+                                              m_mnstates,
+                                              m_mn_min_confirmations);
+        if (!proj.ok)
+            return reject("emit-mn-confirm-rollover-pending",
+                          "protx=" + proj.unprojectable_protx.GetHex().substr(0, 12),
+                          "known-registration-height");
+        if (cb.merkleRootMNList != proj.sml.CalcMerkleRoot())
             return reject("emit-mnlist-root-drift",
                           cb.merkleRootMNList.GetHex().substr(0, 12),
-                          sml_copy.CalcMerkleRoot().GetHex().substr(0, 12));
+                          proj.sml.CalcMerkleRoot().GetHex().substr(0, 12));
         // E1: under a qc plan the committed root must be the WITH-BLOCK root
         // (fold of the plan's commitments over the active set — equal to the
         // plain root while the plan is all-null, diverging only once Phase L
@@ -489,7 +1084,16 @@ public:
             return reject("emit-quorum-root-drift",
                           cb.merkleRootQuorums.GetHex().substr(0, 12),
                           expected_quorum_root.GetHex().substr(0, 12));
-        if (m_require_fresh_bestcl && !cb.has_best_cl_signature())
+        // A null committed clsig is a defect ONLY when dashcore forbids it —
+        // i.e. when block H-1 itself committed a non-null ChainLock
+        // (specialtxman.cpp:134-137). Under ConsensusExact, when block H-1
+        // committed null, a null commit is legal and is what dashd emits
+        // (miner.cpp:167-171); refusing it there would be pure loss.
+        const bool null_commit_forbidden =
+            m_bestcl_policy == BestClPolicy::ConsensusExact
+                ? !m_tip_cbtx_cl_null
+                : m_require_fresh_bestcl;
+        if (null_commit_forbidden && !cb.has_best_cl_signature())
             return reject("emit-bestcl-null-committed", "null-clsig", "non-null-clsig");
         // SOAK RE-FIX (build-vs-serve skew): re-derive the expected creditPool
         // from the CURRENT seed at emit/serve time and require the BUILT CbTx to
@@ -545,6 +1149,11 @@ public:
         // block-SUBMIT refusal.
         const bool payee_resolvable =
             !m_require_resolvable_payee || mn_payee_resolvable_at_tip();
+        // Evaluated ONCE here, like qc_ok / sb_ok, and threaded into BOTH the
+        // viability clause and the tx-suppression flag -- so the decision to
+        // serve and the decision about what to serve cannot observe different
+        // answers from the same predicate.
+        const bool utxo_immature = m_utxo_ready_fn && !m_utxo_ready_fn();
         // ── THE decision, and its reason, from ONE evaluation ────────────────
         // dashd's ValidationState idiom (consensus/validation.h:69): the call
         // that returns false is the call that records why. Previously this was
@@ -553,8 +1162,26 @@ public:
         // logging — and the two had already drifted (classify_decline never
         // checked payee_resolvable, so a #996 money-path refusal surfaced as
         // "viable-race"). There is now exactly one list.
-        e.decline   = evaluate_viability(qc_ok, sb.ok, payee_resolvable);
+        e.decline   = evaluate_viability(qc_ok, sb.ok, payee_resolvable,
+                                         utxo_immature);
         e.has_state = e.decline.viable;
+        // NAME THE STATE: while the UTXO lane is immature under the OPT-IN
+        // serving policy we DO serve, but only a coinbase-only body. The
+        // builder marks the template (m_txset_empty_cause) and logs the
+        // forgone fees, so this degraded-but-valid mode is never silent.
+        // Two suppressed-body producers, most-specific cause first: the
+        // utxo-immature serving window names itself; otherwise the default-OFF
+        // --embedded-serve-mempool-txs posture does. Fee-carrying templates
+        // require BOTH a mature UTXO lane AND the explicit operator opt-in.
+        e.suppress_mempool_txs =
+            (utxo_immature
+             && m_utxo_immature_policy == UtxoImmaturePolicy::ServeEmptyTxSet)
+            || !m_serve_mempool_txs;
+        e.suppress_cause =
+            (utxo_immature
+             && m_utxo_immature_policy == UtxoImmaturePolicy::ServeEmptyTxSet)
+                ? "utxo-immature-serving"
+                : "mempool-txs-disabled";
         if (m_require_resolvable_payee && !payee_resolvable) {
             LOG_WARNING << "[EMBED-GATE] h=" << (m_prev_height + 1)
                         << " REFUSE embedded template: MN payment due but payee"
@@ -574,6 +1201,11 @@ public:
         e.curtime              = m_curtime;
         e.version              = m_version;
         e.mn_rr_height         = m_mn_rr_height;
+        e.mn_min_confirmations = m_mn_min_confirmations;
+        // Pinned local tx: pointer into this state (same lifetime discipline
+        // as mnstates/mempool); the builder gates admission per template.
+        e.pinned_local_txs     = m_have_pinned_local_tx
+                                     ? &m_pinned_local_txs : nullptr;
         // E-SUPERBLOCK: hand the resolved treasury schedule to the builder.
         // Empty at non-superblock heights and confidently-unfunded superblocks
         // (normal block); the winning trigger's payees at a funded superblock.
@@ -657,7 +1289,8 @@ private:
     /// the cost on a per-template path and, worse, could observe a different
     /// answer than the one the bundle was built from.
     DeclineReport evaluate_viability(bool qc_ok, bool sb_ok,
-                                     bool payee_resolvable) const {
+                                     bool payee_resolvable,
+                                     bool utxo_immature) const {
         const uint32_t next_h = m_prev_height + 1;
         const std::string tip = std::to_string(m_prev_height);
         auto refuse = [](const char* c, std::string v, std::string t) {
@@ -668,6 +1301,9 @@ private:
             r.threshold = std::move(t);
             return r;
         };
+
+        // Evaluated once; the SAME value the pre-emit gate uses.
+        const auto cl_decline = bestcl_decline();
 
         DeclineReport d;   // viable by default
 
@@ -689,7 +1325,14 @@ private:
         else if (!qc_ok)
             d = refuse("qc-plan-underivable", "nullopt",
                        "derivable-qc-plan@h=" + std::to_string(next_h));
-        else if (m_utxo_ready_fn && !m_utxo_ready_fn())
+        else if (utxo_immature
+                 && m_utxo_immature_policy == UtxoImmaturePolicy::Refuse)
+            // The DEFAULT posture (p2pool semantics: an unsynced node does not
+            // serve templates). Under the opt-in ServeEmptyTxSet policy the
+            // immature window is SERVED with a coinbase-only body instead --
+            // see set_utxo_immature_policy(); the arm stays viable and
+            // make_embedded_work_inputs sets suppress_mempool_txs so the
+            // builder emits no mempool txs.
             d = refuse("utxo-immature", "utxo_ready=false", "utxo_ready=true");
         else if (!sb_ok)
             d = refuse("superblock-refused", "not-trigger-confident",
@@ -697,14 +1340,9 @@ private:
         else if (!m_qc_plan_fn && m_commitment_window_fn && m_commitment_window_fn(next_h))
             d = refuse("dkg-commitment-window", "in-window@h=" + std::to_string(next_h),
                        "off-window");
-        else if (m_require_fresh_bestcl
-                 && m_best_cl_height < static_cast<int32_t>(m_prev_height) - 1)
-            // best_cl_height 0 means "no clsig ever observed", NOT "ChainLock at
-            // height 0" — print n/a rather than report a measurement never taken.
-            d = refuse("bestcl-stale",
-                       m_best_cl_height > 0 ? std::to_string(m_best_cl_height)
-                                            : std::string("n/a"),
-                       ">=" + std::to_string(static_cast<int64_t>(m_prev_height) - 1));
+        else if (cl_decline)
+            // ONE decision, shared with the pre-emit gate (bestcl_decline()).
+            d = refuse((*cl_decline)[0].c_str(), (*cl_decline)[1], (*cl_decline)[2]);
         else if (m_require_fresh_credit_pool
                  && m_credit_pool_height != static_cast<int32_t>(m_prev_height))
             // -1 is the member's own "never seeded" sentinel.
@@ -727,16 +1365,55 @@ private:
             d = refuse("quorum-unhealthy", "quorum-tail-parse-failed", "parsed-ok");
         else if (m_require_sml && m_sml_current_hash != m_prev_hash)
             // A ZERO sml hash is "cold / wiped by reorg", not a block hash.
+            //
+            // Report the HEIGHT first and the discriminating hash TAIL second.
+            // Both halves are load-bearing:
+            //   * the height answers the only question an operator can act on —
+            //     HOW FAR behind is the DML? one block (the ordinary tip-change
+            //     round trip, ~54 ms measured) or many (a lost diff that will
+            //     not self-heal until the next block)?
+            //   * the hash tail still distinguishes a same-height fork from a
+            //     lag, which the height alone cannot.
+            // Before this, both fields rendered as twelve zeros — see
+            // discriminating_hash_tail() for the measurement.
             d = refuse("dmn-stale",
                        m_sml_current_hash.IsNull()
-                           ? std::string("n/a")
-                           : m_sml_current_hash.GetHex().substr(0, 12),
-                       m_prev_hash.GetHex().substr(0, 12));
+                           ? std::string("cold/wiped")
+                           : "h=" + (m_sml_current_height >= 0
+                                         ? std::to_string(m_sml_current_height)
+                                         : std::string("n/a"))
+                                 + ",..." + discriminating_hash_tail(m_sml_current_hash),
+                       "h=" + tip + ",..." + discriminating_hash_tail(m_prev_hash));
+        else if (m_require_sml && find_unprojectable_confirmation(m_sml, m_mnstates))
+            // FINDING-1 fail-closed fallback: an SML entry awaits its
+            // height-driven confirmedHash rollover (specialtxman.cpp:206-215)
+            // but the DMN view holds no registration height for it, so the
+            // pass — and therefore the merkleRootMNList block next_h must
+            // commit — cannot be projected. Refusing here costs at most
+            // ~nMasternodeMinimumConfirmations blocks of embedded serve per
+            // unknown registration; serving would risk a committed stale root
+            // (bad-cbtx-mnmerkleroot = a silently lost winning share).
+            d = refuse("mn-confirm-rollover-pending",
+                       "protx=" + find_unprojectable_confirmation(m_sml, m_mnstates)
+                                      ->GetHex().substr(0, 12),
+                       "known-registration-height");
         else if (!payee_resolvable)
             d = refuse("payee-unresolvable",
                        std::to_string(m_mnstates.entries().size())
                            + "-entries-none-payable",
                        "expected-payee-in-SML@h=" + std::to_string(next_h));
+        else if (m_require_provable_payout_split) {
+            // Incident h=2516595 (bad-cb-payee): serving a height whose
+            // scheduled MN carries an UNPROVEN operator-reward split builds
+            // a coinbase dashd deterministically rejects — the won block is
+            // lost. The value names the masternode so the operator can see
+            // WHICH entry is starving the arm (a fresh checkpoint reseed or
+            // one canonical payment of that MN clears it).
+            if (auto protx = mn_payout_split_unprovable_at_tip())
+                d = refuse("mn-payout-split-unprovable",
+                           "protx=" + protx->GetHex().substr(0, 12),
+                           "payout-set-known");
+        }
 
         if (d.viable) return d;
 
@@ -754,6 +1431,14 @@ private:
             d.cause     = "mn-needs-reseed";
             d.value     = "latched";
             d.threshold = "cleared-by-authoritative-reseed";
+        } else if (d.cause == "not-populated" && m_tip_body_pending_dbg) {
+            // Body-first serve tip: a header tip is known but its block
+            // inputs have not been parsed yet (cold start before the first
+            // promotion, or an overdue-demoted pending window). The named
+            // transient — NOT a header-sync fault, NOT an error state; the
+            // value keeps both populate halves visible.
+            d.cause     = "tip-body-pending";
+            d.threshold = "tip-body-folded";
         } else if (d.cause == "not-populated" && m_prev_hash.IsNull()
                    && m_have_tip_dbg < 0) {
             // ONLY when the maintainer has told us nothing (never reported).
@@ -811,6 +1496,35 @@ private:
         return m_mnstates.entries().find(*expected) != m_mnstates.entries().end();
     }
 
+    // Incident h=2516595 (bad-cb-payee): the scheduled payee's operator-
+    // reward split must be PROVEN before the embedded arm may build the
+    // height. dashd pays the MN share as a SET (owner + optional operator
+    // output, masternode/payments.cpp GetBlockTxOuts) and validates scripts
+    // AND amounts; the SML wire can never prove the split
+    // (CSimplifiedMNListEntry keeps the payout scripts mem-only), so
+    // provenance comes from checkpoint/seed rows, ProTx replay, or observed
+    // canonical payouts — see MNState::payoutSplitProvenance. Returns the
+    // scheduled proRegTxHash when the height must be REFUSED
+    // (cause=mn-payout-split-unprovable), nullopt when serving is safe.
+    // Follows mn_payee_resolvable_at_tip()'s no-payment-due carve-outs so
+    // it can never over-refuse a height with no MN payment.
+    std::optional<uint256> mn_payout_split_unprovable_at_tip() const {
+        if (m_mnstates.entries().empty()) return std::nullopt;
+        const uint32_t next_h = m_prev_height + 1;
+        const int64_t reward = compute_dash_block_reward_post_v20(next_h);
+        const int64_t platform_reward =
+            compute_dash_platform_reward_post_v20_mn_rr(next_h, m_mn_rr_height);
+        const int64_t mn_payment_floor =
+            compute_dash_mn_payment_post_v20(reward) - platform_reward;
+        if (mn_payment_floor <= 0) return std::nullopt;
+        const auto expected = m_mnstates.find_expected_payee();
+        if (!expected) return std::nullopt;   // payee-unresolvable owns this
+        const auto it = m_mnstates.entries().find(*expected);
+        if (it == m_mnstates.entries().end()) return std::nullopt; // ditto
+        if (it->second.payout_split_provable()) return std::nullopt;
+        return *expected;
+    }
+
     /// Superblock disposition for a candidate next height. ok=false => refuse
     /// (fail closed). payments empty+ok => normal block; non-empty+ok => emit.
     struct SuperblockDisposition {
@@ -847,11 +1561,40 @@ private:
     QuorumManager  m_qmgr;                    // merkleRootQuorums source (quorum-tail-fed)
     int32_t  m_best_cl_height{0};             // best observed ChainLock height
     std::array<uint8_t, 96> m_best_cl_sig{};  // best observed ChainLock signature
+    ClProvenance m_best_cl_prov{ClProvenance::Unknown};  // how it is justified (fail-closed default)
+    // Block H-1's OWN committed ChainLock, off its coinbase CCbTx. This is the
+    // term dashcore's CheckCbTxBestChainlock inequality is written against.
+    int32_t  m_tip_cbtx_at_height{0};         // height of the block that supplied it (0 = never)
+    int32_t  m_tip_cbtx_cl_height{-1};        // absolute CL height it committed (-1 = null/none)
+    bool     m_tip_cbtx_cl_null{false};       // that coinbase committed a NULL bestCLSignature
     int64_t  m_credit_pool{0};                // DIP-0027 credit-pool balance (seeded from cbTx)
     bool     m_have_sml{false};               // a non-empty SML has been applied
     uint256  m_sml_current_hash;              // block hash the SML is current at (ZERO = cold/reorg)
+    int64_t  m_sml_current_height{-1};        // DIAGNOSTIC ONLY, -1 = never reported; see set_sml_current_height
     bool     m_require_sml{false};            // gate viability on have_sml (embedded arm)
+    // How many times embedded_template_emit_ok() was EVALUATED (incremented at
+    // its top, before any early return). Test seam for the 2026-08-07/08 hotel
+    // freeze regression gate: the serve gate re-derives the full SML merkle
+    // root, so the count of evaluations per submit-path tip read must be ZERO
+    // (test_dash_submit_gate_scaling.cpp). mutable because the gate is const.
+    mutable uint64_t m_emit_ok_calls{0};
     std::function<bool()> m_utxo_ready_fn;   // optional UTXO maturity gate (E2b)
+    // Default REFUSES the immature window (p2pool semantics: an unsynced node
+    // does not serve templates) -- byte-identical to the pre-policy behaviour.
+    // ServeEmptyTxSet is the pure-daemonless opt-in (subsidy-only block beats
+    // no block when there is no fallback). See set_utxo_immature_policy().
+    UtxoImmaturePolicy m_utxo_immature_policy{UtxoImmaturePolicy::Refuse};
+    // --embedded-serve-mempool-txs: DEFAULT OFF — coinbase-only serving; the
+    // fee-carrying mempool-tx body path is an explicit operator opt-in (see
+    // set_serve_mempool_txs).
+    bool m_serve_mempool_txs{false};
+    // Pinned local tx (set_pinned_local_tx): held by value for the lifetime of
+    // this state; the bundle exposes a pointer only when the flag is set.
+    // MULTIPLE pins: the donation consolidation had to be SPLIT after
+    // 152258 bytes was rejected as bad-txns-oversize and cost block
+    // 2517855. Four quarter-sized transactions ride ONE template.
+    std::vector<MutableTransaction> m_pinned_local_txs;
+    bool               m_have_pinned_local_tx{false};
     std::function<bool()> m_chain_synced_fn; // optional ABSOLUTE header-sync gate (never serve a stale tip)
     std::function<bool(uint32_t)> m_is_superblock_fn;  // superblock-height predicate
     // E-SUPERBLOCK: daemonless governance-sourced superblock schedule provider
@@ -864,14 +1607,20 @@ private:
     std::function<bool()> m_superblock_sync_complete_fn;
     std::function<bool(uint32_t)> m_commitment_window_fn;  // refuse embedded on DKG commitment heights
     std::function<std::optional<QcBlockPlan>(uint32_t)> m_qc_plan_fn;  // E1: serve DKG windows daemonlessly
+    // PoSe no-op proof for a REAL commitment (emit-qc-real-pose-unfolded gate);
+    // unset => capability absent => every non-null commitment refused.
+    std::function<std::optional<bool>(const vendor::CFinalCommitment&)> m_qc_pose_noop_fn;
     bool     m_require_fresh_bestcl{false};  // refuse embedded on a stale/absent bestCL
+    BestClPolicy m_bestcl_policy{BestClPolicy::Off};  // Freshness stays the default when enabled
     bool     m_require_fresh_credit_pool{false}; // refuse embedded on a lagged credit-pool seed
     bool     m_require_fresh_mn_payee{false};    // refuse embedded on a lagged payee queue (stale cursor)
     // #996: fail-CLOSED default -- reads only mnstates (always present), needs
     // no external freshness wiring, and guards a money path, so unlike the
     // freshness gates above it defaults ON.
     bool     m_require_resolvable_payee{true};   // refuse embedded when a due MN payee is unresolvable (#996)
+    bool     m_require_provable_payout_split{true}; // refuse embedded when the scheduled MN's operator-reward split is unproven (h=2516595 bad-cb-payee)
     int      m_mn_rr_height{DASH_MN_RR_HEIGHT_MAINNET}; // network MN_RR activation height (platform-share gate)
+    int      m_mn_min_confirmations{DASH_MN_MIN_CONFIRMATIONS_MAINNET}; // network nMasternodeMinimumConfirmations (rollover projection)
     uint256  m_credit_pool_current_hash;     // block hash the credit-pool seed is current at
     int32_t  m_credit_pool_height{-1};       // seed cbTx's OWN height (-1 = never seeded)
     bool     m_quorum_healthy{true};         // last diff's quorum tail parsed OK
@@ -882,6 +1631,9 @@ private:
     // Publish-precondition mirror (-1 = the maintainer has never reported).
     int8_t   m_have_tip_dbg{-1};
     int8_t   m_have_mn_dbg{-1};
+    // Body-first serve tip: header tip known, block inputs not yet parsed
+    // (set_tip_body_pending_dbg). Diagnostic only, never gates anything.
+    bool     m_tip_body_pending_dbg{false};
     uint32_t m_prev_height{0};
     uint256  m_prev_hash;
     uint32_t m_bits_for_next{0};

@@ -103,6 +103,7 @@ static void seed_single_mn(NodeCoinState& st, const std::vector<unsigned char>& 
     s.nRegisteredHeight = 2'300'000;
     s.nLastPaidHeight = 0;
     s.scriptPayout.m_data = payout;
+    s.payoutSplitProvenance = MNState::SPLIT_KNOWN;   // fixture: proven zero split (h=2516595 gate)
     st.mnstates().load(std::vector<std::pair<uint256, MNState>>{{raw256(0x01), s}});
 }
 
@@ -140,6 +141,10 @@ TEST(DashNodeCoinState, PopulatedRoutesEmbeddedByteEqualToDirectBuild) {
     st.mempool().set_utxo(&utxo);
     ASSERT_TRUE(st.mempool().add_tx(make_spend(prev, 0, 90'000, /*salt=*/1)));  // fee 10'000
     st.set_tip(H - 1, prev_hash, bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, curtime, version);
+    // This KAT pins the FEE-CARRYING flow; tx-carrying templates are the
+    // --embedded-serve-mempool-txs OPT-IN (default OFF = coinbase-only; the
+    // default posture is pinned by the DashMempoolTxServing suite below).
+    st.set_serve_mempool_txs(true);
 
     ASSERT_TRUE(st.populated());
     ASSERT_TRUE(st.make_embedded_work_inputs().viable());
@@ -398,6 +403,7 @@ TEST(DashNodeCoinState, UnresolvablePayeeFailsClosedToDashd) {
     banned.isValid          = false;
     banned.nRegisteredHeight = 2'300'000;
     banned.scriptPayout.m_data = p2pkh_script(0x30);
+    banned.payoutSplitProvenance = MNState::SPLIT_KNOWN;   // fixture: proven zero split (h=2516595 gate)
     st.mnstates().load(std::vector<std::pair<uint256, MNState>>{
         {raw256(0x01), banned}});
     st.set_tip(H - 1, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
@@ -742,6 +748,7 @@ TEST(DashNodeCoinState, MaintainerOnMnlistdiffPopulatesSmlAndEmitsPayload) {
     // (leg 1), then the SML diff (new leg), then the tip (leg 2).
     MNState pm; pm.isValid = true; pm.nRegisteredHeight = 2'300'000;
     pm.nLastPaidHeight = 0; pm.scriptPayout.m_data = p2pkh_script(0x30);
+    pm.payoutSplitProvenance = MNState::SPLIT_KNOWN;   // fixture: proven zero split (h=2516595 gate)
     maint.on_mn_list_update(
         std::vector<std::pair<uint256, MNState>>{{raw256(0x01), pm}}, 0);
     st.mempool().set_utxo(&utxo);
@@ -821,6 +828,7 @@ static void seed_healthy_armed(NodeCoinState& st) {
         s.nRegisteredHeight = 2'300'000;
         s.nLastPaidHeight = 0;
         s.scriptPayout.m_data = p2pkh_script(0x30);
+        s.payoutSplitProvenance = MNState::SPLIT_KNOWN;   // fixture: proven zero split (h=2516595 gate)
         st.mnstates().load(
             std::vector<std::pair<uint256, MNState>>{{raw256(0x01), s}}, H - 1);
     }
@@ -884,6 +892,7 @@ TEST(DashServeGateNamesRefusal, PayeeStaleNamesValueAndThreshold) {
     s.isValid = true;
     s.nRegisteredHeight = 2'300'000;
     s.scriptPayout.m_data = p2pkh_script(0x30);
+    s.payoutSplitProvenance = MNState::SPLIT_KNOWN;   // fixture: proven zero split (h=2516595 gate)
     st.mnstates().load(
         std::vector<std::pair<uint256, MNState>>{{raw256(0x01), s}}, H - 3);
     const DeclineReport d = st.describe_decline();
@@ -898,14 +907,121 @@ TEST(DashServeGateNamesRefusal, PayeeFreshIsViable) {        // negative twin
     EXPECT_TRUE(st.describe_decline().viable);
 }
 
-TEST(DashServeGateNamesRefusal, DmnStaleNamesSmlHashAndTipHash) {
+// A REALISTIC DASH mainnet block hash. raw256() above is NOT one: its bytes are
+// base+i, so its display hex has no leading zeros and any rendering of it looks
+// discriminating. A real block hash carries the DIFFICULTY PADDING — at mainnet
+// difficulty the display hex opens with ~14 zero nibbles (measured on the hotel
+// node 2026-08-06: 000000000000000e, 000000000000001c, 0000000000000018).
+// Zeroing the top 7 bytes reproduces exactly that shape.
+//
+// This helper exists because THE FIXTURE IS WHAT HID THE DEFECT: the old
+// DmnStaleNamesSmlHashAndTipHash asserted GetHex().substr(0, 12) and passed,
+// while in production both sides of that comparison rendered as twelve zeros
+// on 114 of 114 refusals.
+static uint256 pow256(uint8_t entropy) {
+    uint256 h;
+    std::array<uint8_t, 32> p{};
+    for (size_t i = 0; i < 25; ++i) p[i] = static_cast<uint8_t>(entropy + i);
+    // p[25..31] left ZERO -> 14 leading zero nibbles in GetHex().
+    std::memcpy(h.data(), p.data(), 32);
+    return h;
+}
+
+// Guard the helper itself: if it ever stops producing a padded hash, the tests
+// below would silently stop testing anything.
+TEST(DashServeGateNamesRefusal, PowFixtureActuallyCarriesDifficultyPadding) {
+    EXPECT_EQ(pow256(0x11).GetHex().substr(0, 12), std::string(12, '0'));
+    EXPECT_EQ(pow256(0x22).GetHex().substr(0, 12), std::string(12, '0'))
+        << "two DIFFERENT mainnet-shaped hashes must share their leading "
+           "nibbles — that is the whole reason the old rendering was blind";
+}
+
+TEST(DashServeGateNamesRefusal, DmnStaleNamesSmlHeightAndTipHeight) {
     NodeCoinState st;
     seed_healthy_armed(st);
     st.set_sml_current_hash(raw256(0xCD));   // SML current at a DIFFERENT block
+    st.set_sml_current_height(static_cast<int64_t>(H - 4));
     const DeclineReport d = st.describe_decline();
     EXPECT_EQ(d.cause, "dmn-stale");
-    EXPECT_EQ(d.value, raw256(0xCD).GetHex().substr(0, 12));
-    EXPECT_EQ(d.threshold, raw256(0xAB).GetHex().substr(0, 12));
+    // HEIGHT first (how far behind), discriminating hash TAIL second (which
+    // block — and same-height forks, which the height alone cannot express).
+    EXPECT_EQ(d.value, "h=" + std::to_string(H - 4) + ",..."
+                           + dash::coin::discriminating_hash_tail(raw256(0xCD)));
+    EXPECT_EQ(d.threshold, "h=" + std::to_string(H - 1) + ",..."
+                               + dash::coin::discriminating_hash_tail(raw256(0xAB)));
+}
+
+// THE DEFECT, as production actually presents it. Both hashes are mainnet-
+// shaped, so the pre-fix rendering collapses them onto the same twelve zeros
+// and the refusal reports value == threshold — on a refusal whose entire
+// meaning is that the two DIFFER.
+TEST(DashServeGateNamesRefusal, DmnStaleDistinguishesTwoMainnetPowHashes) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    // Re-stamp the tip with a mainnet-SHAPED hash. set_tip is the last thing
+    // seed_healthy_armed does, so this simply replaces it; the height is
+    // unchanged, so every height-keyed clause above dmn-stale stays satisfied.
+    st.set_tip(H - 1, pow256(0x11), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u);
+    st.set_sml_current_hash(pow256(0x22));
+
+    const DeclineReport d = st.describe_decline();
+    ASSERT_EQ(d.cause, "dmn-stale");
+    EXPECT_NE(d.value, d.threshold)
+        << "dmn-stale refuses BECAUSE the SML hash differs from the tip hash, "
+           "so a report whose value EQUALS its threshold cannot be read at all. "
+           "Measured on the hotel node 2026-08-06: 114 of 114 refusals printed "
+           "value=000000000000 threshold=000000000000, because both sides were "
+           "GetHex().substr(0, 12) of a PROOF-OF-WORK hash and those nibbles "
+           "are the difficulty padding. Report the discriminating TAIL.";
+    EXPECT_EQ(d.value.find(std::string(12, '0')), std::string::npos)
+        << "the reported value is still (or contains) the all-zero difficulty "
+           "padding — it carries no information about which block the SML is at";
+}
+
+// The height half, which is what turns "different" into "how far behind".
+// Uses the diagnostic height seam the maintainer publishes beside the hash.
+TEST(DashServeGateNamesRefusal, DmnStaleNamesHowFarBehindTheDmlIs) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_tip(H - 1, pow256(0x11), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u);
+    st.set_sml_current_hash(pow256(0x22));
+    st.set_sml_current_height(static_cast<int64_t>(H - 3));
+
+    const DeclineReport d = st.describe_decline();
+    ASSERT_EQ(d.cause, "dmn-stale");
+    EXPECT_NE(d.value.find("h=" + std::to_string(H - 3)), std::string::npos)
+        << "the report must say HOW FAR BEHIND the DML is — the only quantity "
+           "an operator can act on. A hash says THAT it differs, never by how "
+           "much, and every long dmn-stale episode measured in production was "
+           "closed by the next block arriving rather than by the SML catching "
+           "up at the same tip.";
+    EXPECT_NE(d.threshold.find("h=" + std::to_string(H - 1)), std::string::npos);
+}
+
+// Never reported (cold maintainer) must read as n/a, not as height 0 — the
+// #1039 discipline: do not print a measurement that was never taken.
+TEST(DashServeGateNamesRefusal, DmnStaleUnreportedHeightIsNotZero) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_sml_current_hash(raw256(0xCD));   // height never published
+    const DeclineReport d = st.describe_decline();
+    ASSERT_EQ(d.cause, "dmn-stale");
+    EXPECT_NE(d.value.find("h=n/a"), std::string::npos);
+    EXPECT_EQ(d.value.find("h=0,"), std::string::npos)
+        << "0 would read as 'we measured the SML height and it was genesis'";
+}
+
+// A cold / reorg-wiped SML is a DIFFERENT operator situation from a lagging
+// one, and "000000000000" could express neither.
+TEST(DashServeGateNamesRefusal, DmnStaleColdSmlSaysColdNotZeros) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_sml_current_hash(uint256::ZERO);
+    const DeclineReport d = st.describe_decline();
+    ASSERT_EQ(d.cause, "dmn-stale");
+    EXPECT_EQ(d.value, "cold/wiped");
 }
 
 TEST(DashServeGateNamesRefusal, DmnCurrentAtTipIsViable) {   // negative twin
@@ -980,6 +1096,8 @@ TEST(DashServeGateNamesRefusal, UtxoImmatureIsNamed) {
     NodeCoinState st;
     seed_healthy_armed(st);
     st.set_utxo_ready_fn([] { return false; });
+    // No policy call: refusing IS the default (p2pool semantics — an unsynced
+    // node does not serve templates), byte-identical to the pre-policy gate.
     EXPECT_EQ(st.describe_decline().cause, "utxo-immature");
 }
 
@@ -988,6 +1106,154 @@ TEST(DashServeGateNamesRefusal, UtxoMatureIsViable) {          // negative twin
     seed_healthy_armed(st);
     st.set_utxo_ready_fn([] { return true; });
     EXPECT_TRUE(st.describe_decline().viable);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// UTXO-IMMATURE SERVING (pure-daemonless OPT-IN)
+//
+// The DEFAULT during the blocks_connected < 106 window is to REFUSE — p2pool
+// semantics, the operator's design law: an unsynced node has unverified state
+// and does not serve block templates; miners idling is correct, and the dashd
+// fallback serves FULL templates where armed. The first test pins that default
+// exactly.
+//
+// ServeEmptyTxSet is the explicit opt-in for pure-daemonless nodes with no
+// fallback to route to: serve a coinbase-only template rather than nothing.
+// Consensus never requires a mempool transaction, and with zero txs the fee
+// term is exactly 0 — no fee to overstate, so the bad-cb-amount risk the gate
+// guards is structurally absent in that mode. The remaining tests pin the
+// opt-in contract: it serves, it suppresses the tx set, it SAYS so, and every
+// other gate still refuses.
+// ════════════════════════════════════════════════════════════════════════
+
+TEST(DashUtxoImmatureServing, DefaultRefusesTheImmatureWindowExactlyAsBefore) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_utxo_ready_fn([] { return false; });
+    // No policy call at all — this is the shipped default.
+    EXPECT_EQ(st.utxo_immature_policy(),
+              dash::coin::UtxoImmaturePolicy::Refuse)
+        << "the default posture is REFUSE (p2pool semantics: an unsynced node "
+           "does not serve templates)";
+    const auto e = st.make_embedded_work_inputs();
+    EXPECT_FALSE(e.has_state);
+    EXPECT_EQ(e.decline.cause, "utxo-immature");
+    EXPECT_EQ(e.decline.value, "utxo_ready=false");
+    EXPECT_EQ(e.decline.threshold, "utxo_ready=true");
+    EXPECT_EQ(st.classify_decline(), "utxo-immature");
+    // (With mempool-tx serving armed, the refusing arm suppresses nothing —
+    // the suppress bit belongs to WHAT is served, and nothing is.)
+    st.set_serve_mempool_txs(true);
+    EXPECT_FALSE(st.make_embedded_work_inputs().suppress_mempool_txs)
+        << "a refusing arm serves nothing, so it suppresses nothing";
+}
+
+TEST(DashUtxoImmatureServing, OptInServesTheImmatureWindow) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_utxo_ready_fn([] { return false; });
+    st.set_utxo_immature_policy(
+        dash::coin::UtxoImmaturePolicy::ServeEmptyTxSet);
+    const auto e = st.make_embedded_work_inputs();
+    EXPECT_TRUE(e.has_state)
+        << "under the opt-in, an immature UTXO lane must not cost the whole "
+           "template";
+    EXPECT_TRUE(e.decline.viable);
+    EXPECT_NE(st.describe_decline().cause, "utxo-immature");
+}
+
+TEST(DashUtxoImmatureServing, OptInSuppressesTheMempoolTxSet) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_utxo_ready_fn([] { return false; });
+    st.set_utxo_immature_policy(
+        dash::coin::UtxoImmaturePolicy::ServeEmptyTxSet);
+    const auto e = st.make_embedded_work_inputs();
+    // THE safety property: we serve, but we serve coinbase-only. Without this
+    // bit the arm would build a normal template off an immature UTXO view.
+    EXPECT_TRUE(e.suppress_mempool_txs)
+        << "serving an immature window WITHOUT suppressing the tx set is the "
+           "one variant that could overstate a fee";
+}
+
+TEST(DashUtxoImmatureServing, MatureLaneNeverSuppresses) {     // negative twin
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_utxo_ready_fn([] { return true; });
+    // Mempool-tx serving armed (--embedded-serve-mempool-txs; without it the
+    // default-OFF posture suppresses regardless — DashMempoolTxServing suite).
+    st.set_serve_mempool_txs(true);
+    // Even WITH the opt-in policy, a mature lane builds normal templates.
+    st.set_utxo_immature_policy(
+        dash::coin::UtxoImmaturePolicy::ServeEmptyTxSet);
+    const auto e = st.make_embedded_work_inputs();
+    EXPECT_TRUE(e.has_state);
+    EXPECT_FALSE(e.suppress_mempool_txs)
+        << "a mature lane must build normal, fee-paying templates";
+    // …and neither does a bundle with no UTXO lane armed at all.
+    NodeCoinState unarmed;
+    seed_healthy_armed(unarmed);
+    unarmed.set_serve_mempool_txs(true);
+    EXPECT_FALSE(unarmed.make_embedded_work_inputs().suppress_mempool_txs);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// --embedded-serve-mempool-txs (default OFF): fee-carrying templates are an
+// explicit operator opt-in; the shipped default serves coinbase-only bodies
+// with the cause named on the template. Audit:
+// DASH_CONNECTBLOCK_REJECT_SURFACE_AUDIT.md (mempool-tx body path G1-G4).
+// ════════════════════════════════════════════════════════════════════════
+TEST(DashMempoolTxServing, DefaultOffSuppressesBodyWithNamedCause) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_utxo_ready_fn([] { return true; });   // even a MATURE lane
+    EXPECT_FALSE(st.serve_mempool_txs()) << "the shipped default is OFF";
+    const auto e = st.make_embedded_work_inputs();
+    EXPECT_TRUE(e.has_state) << "coinbase-only serving is not a refusal";
+    EXPECT_TRUE(e.suppress_mempool_txs)
+        << "default OFF: the body must be coinbase-only";
+    EXPECT_STREQ(e.suppress_cause, "mempool-txs-disabled")
+        << "the state must say its own name";
+}
+
+TEST(DashMempoolTxServing, OptInCarriesMempoolTxs) {           // negative twin
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_utxo_ready_fn([] { return true; });
+    st.set_serve_mempool_txs(true);
+    const auto e = st.make_embedded_work_inputs();
+    EXPECT_TRUE(e.has_state);
+    EXPECT_FALSE(e.suppress_mempool_txs)
+        << "the opt-in with a mature lane serves fee-carrying templates";
+}
+
+TEST(DashMempoolTxServing, UtxoImmatureCauseWinsOverDisabled) {
+    // Both suppressed-body producers active: the more specific state name
+    // (utxo-immature-serving) must win so soak greps attribute the window
+    // correctly.
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_utxo_ready_fn([] { return false; });
+    st.set_utxo_immature_policy(
+        dash::coin::UtxoImmaturePolicy::ServeEmptyTxSet);
+    const auto e = st.make_embedded_work_inputs();
+    EXPECT_TRUE(e.suppress_mempool_txs);
+    EXPECT_STREQ(e.suppress_cause, "utxo-immature-serving");
+}
+
+// The opt-in relaxes ONLY this clause. Every other gate must still refuse —
+// otherwise "serve during immaturity" would have quietly become "serve
+// regardless", which is how a lost block gets shipped as a feature.
+TEST(DashUtxoImmatureServing, OtherGatesStillRefuseUnderTheOptIn) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_utxo_ready_fn([] { return false; });
+    st.set_utxo_immature_policy(
+        dash::coin::UtxoImmaturePolicy::ServeEmptyTxSet);
+    st.set_credit_pool(0, raw256(0xAB), static_cast<int32_t>(H - 4));
+    const DeclineReport d = st.describe_decline();
+    EXPECT_FALSE(d.viable);
+    EXPECT_EQ(d.cause, "creditpool-stale");
 }
 
 TEST(DashServeGateNamesRefusal, QcPlanUnderivableIsNamed) {
@@ -1178,6 +1444,7 @@ TEST(DashServeGateNamesRefusal, SelfConsistentStaleTipPassesEveryRelativeGate) {
         s.isValid = true;
         s.nRegisteredHeight = 1'000'000;
         s.scriptPayout.m_data = p2pkh_script(0x30);
+        s.payoutSplitProvenance = MNState::SPLIT_KNOWN;   // fixture: proven zero split (h=2516595 gate)
         st.mnstates().load(
             std::vector<std::pair<uint256, MNState>>{{raw256(0x01), s}}, ancient);
     }
@@ -1277,4 +1544,325 @@ TEST(DashServeGateNamesRefusal, NoTipOnlyWhenTheMaintainerNeverReported) {
            "evidence there is, and it is worth naming";
     EXPECT_EQ(d.value, "prev_hash=null,maintainer-never-reported")
         << "and it must say that it is inferring, not measuring";
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// The #1083 PoSe landmine, ENFORCED (emit-qc-real-pose-unfolded).
+//
+// dashd's verifier PoSe-punishes every quorum member a NON-NULL in-block
+// commitment marks invalid (specialtxman.cpp:159-174 HandleQuorumCommitment
+// -> PoSePunish(CalcPenalty(66))), and a punishment crossing the ban
+// threshold flips that MN's validity IN THE SAME BLOCK's MN list — changing
+// the merkleRootMNList the same coinbase commits. Null commitments are
+// exempt (specialtxman.cpp:427-432, IsNull() guard). c2pool folds no PoSe
+// pass into its committed root; since #1077 wired rotated member sourcing
+// the real-commitment lane is LIVE, so a verified real commitment carrying
+// !validMembers[i] for a listed member is a servable bad-cbtx-mnmerkleroot —
+// a silently losable block. The pre-emit gate must refuse it; the ONLY thing
+// standing there before this gate was a comment (embedded_gbt.hpp), and a
+// comment refuses nothing.
+//
+// Shared fixture: the QcPlanServesDkgWindowHeightAndEmitGateEnforcesIt
+// posture (tip 1518417 => next 1518418), with the plan fn returning ONE
+// commitment — the same closure shape production installs, minus sourcing.
+// ════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+dash::coin::vendor::CFinalCommitment make_real_qc(bool punish_listed_member)
+{
+    // A structurally real (non-null) testnet LLMQ_50_60 commitment: full
+    // 50-member quorum, non-zero crypto fields. punish_listed_member marks
+    // ONE listed member invalid — the exact landmine input.
+    dash::coin::vendor::CFinalCommitment c;
+    c.nVersion = dash::coin::vendor::CFinalCommitment
+                     ::BASIC_BLS_NON_INDEXED_QUORUM_VERSION;
+    c.llmqType    = 1;                    // LLMQ_50_60 (testnet-enabled)
+    c.quorumHash  = raw256(0x50);
+    c.quorumIndex = 0;
+    c.signers.assign(50, true);
+    c.validMembers.assign(50, true);
+    if (punish_listed_member) c.validMembers[7] = false;
+    c.quorumPublicKey.fill(0x11);
+    c.quorumVvecHash = raw256(0x22);
+    c.quorumSig.fill(0x33);
+    c.membersSig.fill(0x44);
+    return c;
+}
+
+// Seed the same healthy DKG-window serving posture the E1 qc-plan test uses,
+// with a plan fn returning exactly `qc` + a fixed with-block root override.
+void seed_real_qc_serving(NodeCoinState& st,
+                          const dash::coin::vendor::CFinalCommitment& qc)
+{
+    seed_single_mn(st, p2pkh_script(0x30));
+    seed_sml(st);
+    st.set_require_sml(true);
+    st.set_sml_current_hash(raw256(0xAB));
+    dash::coin::QcBlockPlan plan;
+    plan.commitments = {qc};
+    plan.merkle_root_quorums = raw256(0x77);
+    st.set_qc_plan_fn([plan](uint32_t) {
+        return std::optional<dash::coin::QcBlockPlan>{plan};
+    });
+    st.set_tip(1518417, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u);
+}
+
+} // namespace
+
+// THE MASTER DEFECT, pinned. On pre-gate master this test FAILS at the
+// EXPECT_FALSE: the punishing real commitment sails through the pre-emit
+// gate (count/payload/root all self-consistent) and the template SERVES —
+// the silently losable block. No PoSe-noop capability is wired here, which
+// is exactly the state production shipped in: the gate must fail CLOSED on
+// capability absence, not only on a proven punishment.
+TEST(DashQcPoseGate, RealCommitmentPunishingListedMemberIsRefusedAtEmit) {
+    NodeCoinState st;
+    seed_real_qc_serving(st, make_real_qc(/*punish_listed_member=*/true));
+
+    // The template BUILDS and carries the real qc tx — viability alone does
+    // not (and cannot cheaply) prove the PoSe no-op; the emit gate is the
+    // enforcement point, exactly like the other emit re-derivations.
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded);
+    ASSERT_EQ(sel.work.m_txs.size(), 1u);
+    ASSERT_EQ(sel.work.m_txs[0].type, 6);
+
+    DeclineReport why;
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why))
+        << "a REAL commitment that PoSe-punishes a listed member reached the "
+           "miner: dashd's verifier flips that MN in THIS block's list and "
+           "the committed merkleRootMNList is wrong (bad-cbtx-mnmerkleroot = "
+           "a silently lost block)";
+    EXPECT_EQ(why.cause, "emit-qc-real-pose-unfolded");
+    EXPECT_EQ(why.threshold, "pose-pass-provably-noop(all-listed-members-valid)");
+    EXPECT_NE(why.value.find("pose_noop=n/a"), std::string::npos)
+        << "capability ABSENT must print n/a, not a fabricated verdict: "
+        << why.value;
+}
+
+// Negative twin: with the PoSe-noop capability wired and every listed member
+// valid (the common case), the SAME posture serves exactly as before — the
+// gate is punishment-specific, not a blanket real-commitment refuse.
+TEST(DashQcPoseGate, AllListedMembersValidServesExactlyAsBefore) {
+    NodeCoinState st;
+    seed_real_qc_serving(st, make_real_qc(/*punish_listed_member=*/false));
+    st.set_qc_pose_noop_fn(
+        [](const dash::coin::vendor::CFinalCommitment& c)
+            -> std::optional<bool> {
+            // The production shape: judge against the deterministic member
+            // list's size (full 50-member quorum here).
+            return dash::coin::qc_pose_pass_provably_noop(c, 50);
+        });
+
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded);
+    DeclineReport why;
+    EXPECT_TRUE(st.embedded_template_emit_ok(sel.work, &why))
+        << "cause=" << why.cause << " value=" << why.value;
+
+    // And the pre-existing drift enforcement is untouched: dropping the
+    // mandatory commitment still discards the template (bad-qc-missing).
+    DashWorkData tampered = sel.work;
+    tampered.m_txs.clear();
+    EXPECT_FALSE(st.embedded_template_emit_ok(tampered));
+}
+
+// With the capability WIRED, a proven punishment refuses with the measured
+// value naming the offending commitment — cause/value/threshold discipline.
+TEST(DashQcPoseGate, PunishingCommitmentRefusedEvenWithCapabilityWired) {
+    NodeCoinState st;
+    seed_real_qc_serving(st, make_real_qc(/*punish_listed_member=*/true));
+    st.set_qc_pose_noop_fn(
+        [](const dash::coin::vendor::CFinalCommitment& c)
+            -> std::optional<bool> {
+            return dash::coin::qc_pose_pass_provably_noop(c, 50);
+        });
+
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded);
+    DeclineReport why;
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why));
+    EXPECT_EQ(why.cause, "emit-qc-real-pose-unfolded");
+    EXPECT_NE(why.value.find("pose_noop=unproven"), std::string::npos)
+        << "a MEASURED failed proof must say 'unproven', not 'n/a': "
+        << why.value;
+    EXPECT_NE(why.value.find("type=1"), std::string::npos) << why.value;
+}
+
+// A wired capability that CANNOT answer (member set no longer cached) must
+// refuse — nullopt is "cannot prove", and unprovable serves nothing.
+TEST(DashQcPoseGate, UnprovableMemberSetFailsClosed) {
+    NodeCoinState st;
+    seed_real_qc_serving(st, make_real_qc(/*punish_listed_member=*/false));
+    st.set_qc_pose_noop_fn(
+        [](const dash::coin::vendor::CFinalCommitment&)
+            -> std::optional<bool> { return std::nullopt; });
+
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded);
+    DeclineReport why;
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why));
+    EXPECT_EQ(why.cause, "emit-qc-real-pose-unfolded");
+    EXPECT_NE(why.value.find("pose_noop=n/a"), std::string::npos) << why.value;
+}
+
+// Null commitments are exempt by dashd's own IsNull() guard — an all-null
+// plan serves with NO capability wired, byte-unchanged. (The E1 qc-plan test
+// above already proves this through the full daemonless plan; this twin pins
+// it against the gate directly so the exemption cannot silently narrow.)
+TEST(DashQcPoseGate, NullCommitmentPlanIsExemptWithoutCapability) {
+    NodeCoinState st;
+    const auto null_qc = dash::coin::build_null_commitment(
+        dash::coin::kLlmq50_60, raw256(0x50), 0);
+    seed_real_qc_serving(st, null_qc);
+    // No set_qc_pose_noop_fn on purpose.
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded);
+    DeclineReport why;
+    EXPECT_TRUE(st.embedded_template_emit_ok(sel.work, &why))
+        << "cause=" << why.cause << " value=" << why.value;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// C2 — THE ONE REAL BEHAVIOUR CHANGE OF THE verified_for MEMO, PINNED.
+//
+// MineableCommitmentCache::verified_for now memoises its BLS verdict on the
+// cache entry (dkg_commitments.hpp:750-761). Once a slot is latched it no
+// longer calls the BLS verifier — and the verifier is what SOURCES THE MEMBER
+// KEY SET (bls_verify.hpp make_commitment_bls_verifier: provider nullopt =>
+// fail closed). Production feeds that same member source to the PoSe-noop
+// prover as well (main_dash.cpp:4160-4169
+// qc_member_source->lookup(...) -> nullopt => cannot prove).
+//
+// So if the member set is EVICTED after a successful verify, the refusal MOVES
+// DOWNSTREAM by one gate:
+//
+//   before: verified_for -> nullopt -> the whole height is underivable
+//           (dkg_commitments.hpp:869-878) -> cause=emit-qc-plan-underivable
+//           (node_coin_state.hpp:892)
+//   after:  verified_for -> LATCHED commitment -> plan derives -> the PoSe
+//           gate cannot source the member set -> pose_noop=n/a
+//           -> cause=emit-qc-real-pose-unfolded (node_coin_state.hpp:930)
+//
+// SAME OUTCOME — fail closed, nothing served, template bytes unchanged. But a
+// DIFFERENT DECLINE CAUSE STRING, and this project ranks serve-gate episodes
+// by exactly that string (ServeGateJournal, work_source.cpp:749-789), so the
+// change would otherwise show up as an unexplained shift in a soak histogram.
+// These two tests make it a decision on record.
+//
+// RED WITHOUT THE MEMO: revert verified_for to re-verify unconditionally (or
+// mutate the latch read to `if (true)`) and the first test fails at
+// EXPECT_EQ(cause, "emit-qc-real-pose-unfolded") — it gets
+// "emit-qc-plan-underivable", which is precisely the control case below.
+// ════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// A cache-backed plan fn with the shape daemonless_qc_commitments has for a
+// single mandatory slot (dkg_commitments.hpp:849-878): no BLS-verified
+// commitment for a mandatory slot => the WHOLE height is underivable.
+std::function<std::optional<dash::coin::QcBlockPlan>(uint32_t)>
+cache_backed_qc_plan_fn(const dash::coin::MineableCommitmentCache& cache,
+                        uint8_t llmq_type, const uint256& quorum_hash)
+{
+    return [&cache, llmq_type, quorum_hash](uint32_t)
+               -> std::optional<dash::coin::QcBlockPlan> {
+        auto real = cache.verified_for(llmq_type, quorum_hash);
+        if (!real) return std::nullopt;   // fail closed for the whole height
+        dash::coin::QcBlockPlan plan;
+        plan.commitments = {*real};
+        plan.merkle_root_quorums = raw256(0x77);
+        return plan;
+    };
+}
+
+}  // namespace
+
+TEST(DashQcVerifyMemoDeclineCause, EvictedMemberSetDeclinesAsPoseUnfolded) {
+    // ONE flag stands for the member source, exactly as production wires it:
+    // the SAME lookup backs the BLS verifier and the PoSe-noop prover.
+    bool member_set_cached = true;
+
+    const auto qc = make_real_qc(/*punish_listed_member=*/false);
+    dash::coin::MineableCommitmentCache cache;
+    ASSERT_TRUE(cache.ingest(dash::coin::LlmqNetwork::Testnet, qc));
+    cache.set_bls_verify_fn(
+        [&member_set_cached](const dash::coin::vendor::CFinalCommitment&) {
+            return member_set_cached;   // no member keys => fail closed
+        });
+
+    NodeCoinState st;
+    seed_real_qc_serving(st, qc);        // healthy DKG-window serving posture
+    st.set_qc_plan_fn(cache_backed_qc_plan_fn(cache, qc.llmqType, qc.quorumHash));
+    st.set_qc_pose_noop_fn(
+        [&member_set_cached](const dash::coin::vendor::CFinalCommitment& c)
+            -> std::optional<bool> {
+            if (!member_set_cached) return std::nullopt;   // cannot prove
+            return dash::coin::qc_pose_pass_provably_noop(c, 50);
+        });
+
+    // 1) Member set present: the slot verifies (and LATCHES), and the height
+    //    serves exactly as before the memo.
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded);
+    ASSERT_EQ(sel.work.m_txs.size(), 1u);
+    ASSERT_EQ(sel.work.m_txs[0].type, 6);
+    DeclineReport ok_why;
+    ASSERT_TRUE(st.embedded_template_emit_ok(sel.work, &ok_why))
+        << "cause=" << ok_why.cause << " value=" << ok_why.value;
+
+    // 2) The member set is EVICTED. Both the verifier and the PoSe prover go
+    //    blind — but the latch survives, so the plan still derives and the
+    //    refusal lands one gate downstream.
+    member_set_cached = false;
+
+    DeclineReport why;
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why))
+        << "an unprovable PoSe pass was SERVED";
+    EXPECT_EQ(why.cause, "emit-qc-real-pose-unfolded")
+        << "THE behaviour change this test exists for: with the verdict "
+           "latched, the member-set eviction is no longer caught at "
+           "verified_for (cause=emit-qc-plan-underivable) but at the PoSe "
+           "gate. Got cause=" << why.cause << " value=" << why.value;
+    EXPECT_NE(why.value.find("pose_noop=n/a"), std::string::npos)
+        << "the refusal must say the capability could not answer, not "
+           "fabricate a verdict: " << why.value;
+    EXPECT_EQ(why.threshold, "pose-pass-provably-noop(all-listed-members-valid)");
+}
+
+// The CONTROL, and the reason the test above is a change and not a bug: with
+// NO latch in play (a cache never read while the member set was present) the
+// old cause is still exactly what it was. The two tests together say the
+// cause string moved, and moved only for latched slots.
+TEST(DashQcVerifyMemoDeclineCause, UnlatchedSlotStillDeclinesAsPlanUnderivable) {
+    const auto qc = make_real_qc(/*punish_listed_member=*/false);
+
+    NodeCoinState st;
+    seed_real_qc_serving(st, qc);   // fixed plan fn => builds the template
+    st.set_qc_pose_noop_fn(
+        [](const dash::coin::vendor::CFinalCommitment& c)
+            -> std::optional<bool> {
+            return dash::coin::qc_pose_pass_provably_noop(c, 50);
+        });
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded);
+    ASSERT_EQ(sel.work.m_txs.size(), 1u);
+
+    // Now swap in a cache-backed plan whose commitment was NEVER verified
+    // while the member set existed — nothing is latched, so verified_for pays
+    // (and fails) the verify, and the whole height is underivable.
+    dash::coin::MineableCommitmentCache cold;
+    ASSERT_TRUE(cold.ingest(dash::coin::LlmqNetwork::Testnet, qc));
+    cold.set_bls_verify_fn(
+        [](const dash::coin::vendor::CFinalCommitment&) { return false; });
+    st.set_qc_plan_fn(cache_backed_qc_plan_fn(cold, qc.llmqType, qc.quorumHash));
+
+    DeclineReport why;
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why));
+    EXPECT_EQ(why.cause, "emit-qc-plan-underivable")
+        << "the PRE-memo cause must remain reachable for an unlatched slot: "
+        << "cause=" << why.cause << " value=" << why.value;
+    EXPECT_EQ(why.value, "nullopt");
 }

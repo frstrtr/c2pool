@@ -1461,77 +1461,6 @@ void NodeImpl::start_outbound_connections()
     m_connect_timer->start(30, try_connect_peers);
 }
 
-void NodeImpl::prune_shares(const uint256& /*best_share*/)
-{
-    // Tail-dropping (as in p2pool's clean_tracker):
-    // - Check each tail: if min(height(head) for heads) < 2*CL+10 → skip
-    // - Remove ONE child of qualifying tail per iteration
-    // - Loop up to 1000 times (gradual, not bulk)
-    // - Also cascade removal to verified
-    const auto CL = static_cast<int32_t>(PoolConfig::chain_length());
-    const int32_t min_depth = 2 * CL + 10;
-
-    for (int iter = 0; iter < 1000; ++iter)
-    {
-        // p2pool node.py:382-398: find ONE qualifying tail child to remove
-        uint256 to_remove;
-        bool found = false;
-        auto tails_copy = m_tracker.chain.get_tails();
-        for (auto& [tail_hash, head_hashes] : tails_copy)
-        {
-            // Check min height across ALL heads for this tail
-            int32_t min_height = std::numeric_limits<int32_t>::max();
-            for (auto& hh : head_hashes) {
-                if (!m_tracker.chain.contains(hh)) continue;
-                try {
-                    min_height = std::min(min_height, m_tracker.chain.get_height(hh));
-                } catch (...) { continue; }
-            }
-            if (min_height < min_depth) continue;
-
-            // Find ONE child of this tail (p2pool removes one at a time)
-            auto& rev = m_tracker.chain.get_reverse();
-            auto rev_it = rev.find(tail_hash);
-            if (rev_it != rev.end() && !rev_it->second.empty()) {
-                to_remove = *rev_it->second.begin();
-                found = true;
-                break;  // one per iteration
-            }
-        }
-
-        if (!found) break;
-
-        if (!m_tracker.chain.contains(to_remove)) continue;
-        // p2pool node.py:393 — safety check: parent must be a tail
-        auto* idx = m_tracker.chain.get_index(to_remove);
-        if (!idx) continue;
-        bool parent_is_tail = m_tracker.chain.get_tails().contains(idx->tail);
-        if (!parent_is_tail) {
-            LOG_DEBUG_POOL << "prune skip: parent " << idx->tail.ToString().substr(0,16)
-                           << " not a tail";
-            continue;
-        }
-        if (m_tracker.verified.contains(to_remove))
-            m_tracker.verified.remove(to_remove, /*owns_data=*/false);
-        m_tracker.chain.remove(to_remove);
-    }
-
-    // Cache cleanup (kept from original)
-    if (m_shared_share_hashes.size() > m_max_shared_hashes)
-        m_shared_share_hashes.clear();
-    // Recency-preserving bounded eviction (was: wholesale clear()). Dropping the
-    // whole cache at once destroyed every forwardable tx byte, so a share relay
-    // that referenced a just-dropped tx could no longer remember_tx-forward it
-    // and the canonical peer disconnected with "referenced unknown transaction".
-    // Evict oldest-first down to the cap, keeping the most-recently-learned txs.
-    if (m_known_txs.size() > m_max_known_txs)
-        core::evict_known_txs_to_cap(m_known_txs, m_known_txs_order, m_max_known_txs);
-    if (m_raw_share_cache.size() > m_max_raw_shares)
-        m_raw_share_cache.clear();
-}
-
-// (old phases 5-7 removed — replaced by p2pool-style pruning above)
-
 // ── think() watchdog (V36 livelock defense-in-depth) ────────────────────
 // Best-effort recovery if a think() cycle wedges. Runs ENTIRELY on the IO
 // thread and NEVER acquires m_tracker_mutex — so it stays responsive even
@@ -2226,6 +2155,16 @@ void NodeImpl::clean_tracker()
                      << " chain_size=" << m_tracker.chain.size()
                      << " heads=" << m_tracker.chain.get_heads().size();
     }
+
+    // Step 3b: bounded known_txs eviction (B-BCH.EVICT). m_known_txs is the
+    // tx-forward cache, recency-ordered by m_known_txs_order (push-only on learn
+    // in protocol_{legacy,actual}.cpp). Its cap was only ever enforced inside the
+    // dead lockless prune_shares() (zero callers), so m_known_txs grew unbounded.
+    // Enforce it here on the live periodic clean pass, under the exclusive tracker
+    // lock, mirroring btc/ltc/dgb. Tx-forward cache only â no consensus/mint/
+    // payout state is read or written.
+    if (m_known_txs.size() > m_max_known_txs)
+        core::evict_known_txs_to_cap(m_known_txs, m_known_txs_order, m_max_known_txs);
 
     // Step 4: re-score after pruning (inline, already holding lock)
     {
