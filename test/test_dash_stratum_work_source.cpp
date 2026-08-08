@@ -3263,3 +3263,116 @@ TEST(DashStratumSpliceGuards, DropAlarmNamesTheCountValueAndCause)
     EXPECT_TRUE(clean.m_pin_drop_alarm.empty());
     EXPECT_EQ(dash::stratum::detail::served_pins_field(clean, &pins), " pins=2/2");
 }
+
+// THE ALARM MUST BE TRUTHFUL -- `already-in-template` is NOT a dropped donation.
+//
+// The alarm's WARNING asserts "this template IS SERVED to miners without the
+// donation; if it wins, that value does not land". `included` records what THE
+// SPLICE did, not what the SERVED TEMPLATE holds, and exactly one of the seven
+// causes makes those disagree: `already-in-template` refuses BECAUSE
+// w.m_tx_hashes already carries the txid. The money is on the template. It
+// lands. The shipped line contradicted itself inside one string --
+//
+//   pins=1/1 pin_cause=already-in-template DONATION-DROPPED 1/1 pins h=500001 value=50000sat
+//
+// -- pins=1/1 counted by PRESENCE against DONATION-DROPPED 1/1 counted by
+// outcome. An alarm that fires where the money DID land is the alarm the next
+// operator learns to ignore, and then block 2518044 happens again unseen.
+//
+// RED WITHOUT THE FIX: delete `if (o.cause == "already-in-template") continue;`
+// from raise_drop_alarm (work_source.cpp) and arms (a), (b) and (c) all fail --
+// (a) and (b) on a non-empty m_pin_drop_alarm, (c) on the count/value/cause of
+// a real loss being inflated by a pin that is being served.
+TEST(DashStratumSpliceGuards, DropAlarmIsSilentWhenTheDuplicatePinIsActuallyServed)
+{
+    uint256 funding; funding.begin()[0] = 0x68;
+    const auto pin  = admissible_pin(funding);          // 50'000 sat
+    const auto txid = dash::coin::dash_txid(pin);
+    const std::vector<dash::coin::MutableTransaction> pins{pin};
+    const std::vector<dash::coin::PinVerdict> verdicts{ok_verdict(kSpliceHeight)};
+
+    // (a) THE REPORTED LINE. The served template already carries the pin, so the
+    // splice refuses -- and the donation is ON THE TEMPLATE.
+    {
+        auto w = host_template({pin});
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, verdicts, /*from_xcheck_swap=*/false,
+            /*xcheck_arm_enabled=*/false, /*block_budget_enabled=*/false);
+
+        // The refusal itself is unchanged -- this KAT is about the ALARM, not
+        // about relaxing the duplicate guard.
+        ASSERT_EQ(w.m_pin_outcomes.size(), 1u);
+        ASSERT_FALSE(w.m_pin_outcomes[0].included);
+        ASSERT_EQ(w.m_pin_outcomes[0].cause, "already-in-template");
+        ASSERT_EQ(w.m_txs.size(), 1u) << "the duplicate guard stopped guarding";
+
+        // THE POINT: the value is in the block that gets served.
+        ASSERT_TRUE(template_carries(w, txid))
+            << "fixture broken: the alarm would be telling the truth";
+        EXPECT_TRUE(w.m_pin_drop_alarm.empty())
+            << "DONATION-DROPPED on a template that IS carrying the donation: "
+            << w.m_pin_drop_alarm;
+        const auto field = dash::stratum::detail::served_pins_field(w, &pins);
+        EXPECT_EQ(field.find("DONATION-DROPPED"), std::string::npos)
+            << "the arm line claims a loss and a full pin count at once: " << field;
+        EXPECT_NE(field.find("pins=1/1"), std::string::npos) << field;
+    }
+
+    // (b) THE SAME PIN CONFIGURED TWICE. The first copy rides, the second is
+    // refused as already-in-template by the scan reading what pin_append just
+    // wrote. One donation, served once, correctly: nothing was lost.
+    {
+        auto w = host_template();
+        const std::vector<dash::coin::MutableTransaction> twice{pin, pin};
+        const std::vector<dash::coin::PinVerdict> two{ok_verdict(kSpliceHeight),
+                                                      ok_verdict(kSpliceHeight)};
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &twice, two, false, false, false);
+        ASSERT_EQ(w.m_pin_outcomes.size(), 2u);
+        ASSERT_TRUE(w.m_pin_outcomes[0].included);
+        ASSERT_EQ(w.m_pin_outcomes[1].cause, "already-in-template");
+        EXPECT_TRUE(w.m_pin_drop_alarm.empty())
+            << "configuring one donation twice is not losing it: "
+            << w.m_pin_drop_alarm;
+    }
+
+    // (c) MIXED, AND THE REAL LOSS STILL SHOUTS -- with the served duplicate out
+    // of the count, out of the money, and out of the cause list. This arm is
+    // what stops the fix from being "silence the alarm": a genuine drop beside a
+    // served duplicate must still name itself, at 1/2 and 30000sat, not 2/2 and
+    // 80000sat.
+    {
+        uint256 other; other.begin()[0] = 0x69;
+        auto lost_pin = admissible_pin(other);
+        lost_pin.vout[0].value = 30'000;
+        const auto lost_txid = dash::coin::dash_txid(lost_pin);
+
+        auto w = host_template({pin});                  // already carries `pin`
+        const std::vector<dash::coin::MutableTransaction> both{pin, lost_pin};
+        dash::coin::PinVerdict refused;                 // a REAL refusal
+        refused.ok        = false;
+        refused.cause     = "pin-input-unspendable";
+        refused.at_height = kSpliceHeight;
+        const std::vector<dash::coin::PinVerdict> two{ok_verdict(kSpliceHeight),
+                                                      refused};
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &both, two, false, false, false);
+
+        ASSERT_FALSE(template_carries(w, lost_txid));
+        ASSERT_TRUE(template_carries(w, txid));
+        ASSERT_FALSE(w.m_pin_drop_alarm.empty())
+            << "a pin that is genuinely absent stopped raising the alarm";
+        EXPECT_NE(w.m_pin_drop_alarm.find("DONATION-DROPPED 1/2"),
+                  std::string::npos)
+            << "the served duplicate was counted as lost: " << w.m_pin_drop_alarm;
+        EXPECT_NE(w.m_pin_drop_alarm.find("value=30000sat"), std::string::npos)
+            << "the served duplicate's 50000 sat was added to the loss: "
+            << w.m_pin_drop_alarm;
+        EXPECT_NE(w.m_pin_drop_alarm.find("cause=pin-input-unspendable"),
+                  std::string::npos) << w.m_pin_drop_alarm;
+        EXPECT_EQ(w.m_pin_drop_alarm.find("already-in-template"),
+                  std::string::npos)
+            << "a cause that describes a SERVED pin is in a loss report: "
+            << w.m_pin_drop_alarm;
+    }
+}

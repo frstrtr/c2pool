@@ -421,12 +421,34 @@ void splice_pins_onto_served_fallback(
     // "pins=0/4" learns nothing; an operator reading
     // "DONATION-DROPPED 4/4 pins h=2518044 value=... cause=xcheck-swap-pin-gate-off"
     // knows exactly what is being given up and which flag buys it back.
+    //
+    // WHAT THE ALARM ASSERTS, and therefore what it may NOT fire on. The WARNING
+    // says "this template IS SERVED without the donation; if it wins, that value
+    // does not land". `included` is a fact about THE SPLICE (did this call
+    // append?), not about the SERVED TEMPLATE (is the txid in it?), and for one
+    // cause the two disagree: `already-in-template` refuses precisely BECAUSE
+    // w.m_tx_hashes already carries the pin's txid, so the money is on the
+    // template and does land. It produced lines that contradicted themselves
+    // inside one string --
+    //   pins=1/1 pin_cause=already-in-template DONATION-DROPPED 1/1 pins h=500001
+    // -- pins=1/1 counted by txid PRESENCE (served_pins_field, below) against a
+    // DONATION-DROPPED counted by splice outcome. It is the only one of the
+    // seven causes that can false-fire: every other one (pin-verdict-count-
+    // mismatch, xcheck-swap-pin-gate-off, xcheck-swap-height-mismatch,
+    // pin-total-too-large, block-budget, input-spent-by-template) leaves the
+    // txid absent from the served template, which is a real loss.
+    //
+    // An alarm that also fires where the money DID land is worth less than
+    // nothing: block 2518044 dropped four pins and block 2518186 landed all
+    // four, same node, same arm, same pin set -- the next operator reading a
+    // DONATION-DROPPED line has to be able to believe it.
     auto raise_drop_alarm = [&]() {
         size_t      dropped = 0;
         int64_t     lost    = 0;
         std::string causes;
         for (const auto& o : w.m_pin_outcomes) {
             if (o.included) continue;
+            if (o.cause == "already-in-template") continue;  // it IS served
             ++dropped;
             lost += o.value;
             if (causes.find(o.cause) == std::string::npos)
