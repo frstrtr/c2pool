@@ -1678,6 +1678,172 @@ TEST(DashCoinStateMaintainer, BodyFirstServeTipNeverExceedsParsedBodyHeight) {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// PR-5: CREDIT-POOL PUBLICATION HEIGHT
+//
+// The test above asserts "no creditpool-stale window may exist after the
+// atomic advance" and passes only because it never exercises the SML axis:
+// its sml_current_hash is the cold ZERO sentinel, which the fourth-axis
+// carve-out (coin_state_maintainer.hpp:1820-1822) deliberately lets through,
+// so the body fold always promotes and the pool write always lands AT the
+// serve tip.
+//
+// The steady state is different: the SML is current at the serve tip H-1, and
+// it advances only on its own getmnlistd round trip. Between the tip body
+// fold and that round trip, promotion is HELD (by design — promoting first
+// would trade a creditpool-stale window for a dmn-stale one) while
+// advance_credit_pool_on_block writes the pool at the BODY height H. The pool
+// is then ONE BLOCK AHEAD of the serve tip — which is precisely what the soak
+// measured: all 48 creditpool-stale episodes carried value = threshold + 1,
+// exactly, never behind.
+//
+// The scenario below is the one the maintainer actually runs; the two tests
+// differ ONLY in the publication-height flag.
+// ════════════════════════════════════════════════════════════════════════
+namespace {
+// Drives: serve tip established at H-1 (header+body), SML current AT H-1,
+// then header H + body H with the SML still at H-1 (promotion held).
+// Returns the H-block so the caller can address it.
+struct HeldPromotionScenario {
+    BlockType b1;
+    BlockType b2;
+    uint256   h1;
+    uint256   h2;
+    int64_t   bal1{111'000'000LL};
+    int64_t   bal2{0};
+};
+HeldPromotionScenario drive_held_promotion(NodeCoinState& st,
+                                           CoinStateMaintainer& m) {
+    HeldPromotionScenario s;
+    m.set_body_first_serve_tip(true);
+    st.set_require_fresh_credit_pool(true);
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)));
+
+    s.b1 = make_cbtx_block(H - 1, s.bal1, p2pkh_script(0x30));
+    s.h1 = block_hash_of(s.b1);
+    m.on_new_tip(H - 1, s.h1, BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER,
+                 CURTIME, VERSION);
+    m.on_block_connected(s.b1, H - 1);
+    EXPECT_EQ(m.serve_tip_height(), H - 1);
+
+    // STEADY STATE (what the test above never sets): the SML is current AT
+    // the serve tip. A live node is here between every pair of blocks.
+    st.set_sml_current_hash(s.h1);
+
+    s.bal2 = next_balance(st, s.bal1, H);
+    s.b2 = make_cbtx_block(H, s.bal2, p2pkh_script(0x30));
+    s.h2 = block_hash_of(s.b2);
+    m.on_new_tip(H, s.h2, BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER,
+                 CURTIME, VERSION);
+    // The tip BODY lands before the tip-targeted mnlistdiff (the ordinary
+    // order: the body is pushed, the SML must be asked for).
+    m.on_block_connected(s.b2, H);
+    return s;
+}
+}  // namespace
+
+// CHARACTERIZATION of the DEFAULT (flag off) — this is master's behaviour and
+// must stay master's behaviour until an operator arms the flag. It documents
+// the defect rather than asserting it is desirable.
+TEST(DashCoinStateMaintainer, CreditPoolPublishesAtBodyHeightByDefault) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    ASSERT_FALSE(m.credit_pool_publish_at_serve_tip()) << "money path: OFF by default";
+    auto s = drive_held_promotion(st, m);
+
+    // Promotion is held on the SML axis — correct, and unchanged by PR-5.
+    EXPECT_EQ(m.serve_tip_height(), H - 1);
+    EXPECT_TRUE(m.tip_body_pending());
+    // ...but the pool was published at the BODY height: ONE BLOCK AHEAD.
+    EXPECT_EQ(st.credit_pool_height(), static_cast<int32_t>(H));
+    EXPECT_EQ(st.credit_pool(), s.bal2);
+    auto d = st.describe_decline();
+    EXPECT_FALSE(d.viable);
+    EXPECT_EQ(d.cause, "creditpool-stale");
+    EXPECT_EQ(d.value, std::to_string(H)) << "value = threshold + 1, always";
+    EXPECT_EQ(m.held_credit_pool_height(), -1) << "nothing is held when the flag is off";
+}
+
+// THE FIX. Same scenario, publication height armed: the pool is published AT
+// THE SERVE TIP, so no creditpool-stale window can exist while promotion is
+// held — and, the reason this is a correctness fix and not a gate relaxation,
+// the value the template would build from is the pool at the block it is
+// building ON (dashd: GetCreditPool(pindexPrev), creditpool.cpp:224 / :325-333
+// / specialtxman.cpp:565). Publishing H while building on H-1 would commit the
+// wrong creditPoolBalance; today only the refusal prevents that.
+TEST(DashCoinStateMaintainer, CreditPoolPublishesAtServeTipWhilePromotionHeld) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    m.set_credit_pool_publish_at_serve_tip(true);
+    auto s = drive_held_promotion(st, m);
+
+    // Promotion still held on the SML axis — PR-5 does NOT relax the conjunct.
+    EXPECT_EQ(m.serve_tip_height(), H - 1);
+    EXPECT_TRUE(m.tip_body_pending());
+
+    // The published pool is the pool AT THE SERVE TIP.
+    EXPECT_EQ(st.credit_pool_height(), static_cast<int32_t>(H - 1))
+        << "publication height must follow the SERVE tip, not the body height";
+    EXPECT_EQ(st.credit_pool(), s.bal1)
+        << "the VALUE too: a template building on H-1 must commit the pool at H-1";
+    // The derived-but-unpublished pool says its own name.
+    EXPECT_EQ(m.held_credit_pool_height(), static_cast<int32_t>(H));
+
+    // No creditpool-stale window exists — the state it needs is unreachable.
+    auto d = st.describe_decline();
+    EXPECT_TRUE(d.viable)
+        << "creditpool-stale while promotion is held (cause=" << d.cause
+        << " value=" << d.value << " threshold=" << d.threshold << ")";
+    EXPECT_NE(d.cause, "creditpool-stale");
+    {
+        WorkSelection sel = st.select_work([]() { return DashWorkData{}; });
+        EXPECT_EQ(sel.source, WorkSource::Embedded);
+        EXPECT_EQ(sel.work.m_height, H) << "keeps serving H-1-based work, as designed";
+    }
+
+    // ── The SML catches up: promotion + publication are ONE step. ──
+    // In production the SML advances inside on_mnlistdiff, which calls
+    // maybe_promote_pending_tip itself (coin_state_maintainer.hpp:793); here
+    // the currency is set directly and the next maintainer event drives the
+    // promotion, which is the same code path.
+    st.set_sml_current_hash(s.h2);
+    m.on_new_tip(H, s.h2, BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER,
+                 CURTIME, VERSION);
+    EXPECT_EQ(m.serve_tip_height(), H);
+    EXPECT_EQ(st.credit_pool_height(), static_cast<int32_t>(H));
+    EXPECT_EQ(st.credit_pool(), s.bal2);
+    EXPECT_EQ(m.held_credit_pool_height(), -1) << "nothing left held after publication";
+    EXPECT_TRUE(st.describe_decline().viable);
+    {
+        WorkSelection sel = st.select_work([]() { return DashWorkData{}; });
+        EXPECT_EQ(sel.work.m_height, H + 1);
+    }
+}
+
+// The held pool must never be published on its own timeline: a cold-start /
+// post-demote state (no serve tip) has no tip for the pool to run ahead of,
+// and holding there would DEADLOCK the arm (promotion is what publishes, and
+// promotion needs the pool). Pins the carve-out in publish_credit_pool_at.
+TEST(DashCoinStateMaintainer, ColdStartPublishesImmediatelyWithPublicationHeightOn) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    m.set_body_first_serve_tip(true);
+    m.set_credit_pool_publish_at_serve_tip(true);
+    st.set_require_fresh_credit_pool(true);
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)));
+
+    auto b1 = make_cbtx_block(H - 1, 111'000'000LL, p2pkh_script(0x30));
+    const uint256 h1 = block_hash_of(b1);
+    m.on_new_tip(H - 1, h1, BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER,
+                 CURTIME, VERSION);
+    ASSERT_EQ(m.serve_tip_height(), 0u) << "no serve tip yet";
+    m.on_block_connected(b1, H - 1);
+    EXPECT_EQ(m.serve_tip_height(), H - 1) << "cold start must still promote";
+    EXPECT_EQ(st.credit_pool_height(), static_cast<int32_t>(H - 1));
+    EXPECT_EQ(m.held_credit_pool_height(), -1);
+    EXPECT_TRUE(m.live());
+}
+
 // Legacy default pinned: with body-first NOT enabled, on_new_tip promotes the
 // serve tip immediately (header-first) — byte-identical pre-split behaviour
 // for every existing posture (KATs, dashd-RPC/ZMQ tip feed with no body feed).
