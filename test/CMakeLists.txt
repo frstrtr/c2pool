@@ -1001,6 +1001,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     #                       mutation case.
     add_executable(test_dash_stratum_work_source
         test_dash_stratum_work_source.cpp
+        test_dash_submit_gate_scaling.cpp
         test_dash_serve_staleness_seam.cpp
         test_dash_serve_staleness_unit.cpp
         ${CMAKE_SOURCE_DIR}/src/impl/dash/coin/zmq_tip_notify.cpp)

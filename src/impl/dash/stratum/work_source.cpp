@@ -228,14 +228,29 @@ std::function<uint256()> DASHWorkSource::get_best_share_hash_fn() const
 
 std::string DASHWorkSource::get_current_gbt_prevhash() const
 {
-    // GBT-conventional BE display hex of the tip the pool mines on, drawn from
-    // the SAME cached DashWorkData get_current_work_template() serves -- one
-    // truthful source, so the dedicated getter and the assembled template can
-    // never silently diverge. Empty on a set-gap (no template source armed) --
-    // a truthful absence, never a fabricated tip id.
-    auto wd = cached_work();
-    if (!wd) return {};
-    return wd->m_previous_block.GetHex();
+    // GBT-conventional BE display hex of the tip the pool mines on -- a PURE
+    // template_mutex_-guarded PEEK of the cached snapshot, same shape as
+    // peek_template(). Empty on a set-gap (cache null) -- a truthful absence,
+    // never a fabricated tip id.
+    //
+    // 2026-08-07/08 hotel freeze fix (0 of 26 rigs, twice): this getter's only
+    // production caller is StratumSession::handle_submit's DOA statistics
+    // compare (stratum_server.cpp), which runs PER SHARE SUBMIT on the single
+    // io thread. Routing it through cached_work() ran the serve-time embedded
+    // re-check -- embedded_template_emit_ok -> CSimplifiedMNList::
+    // CalcMerkleRoot -- per submit: ~17 submits/s x ~2000 masternodes = ~68k
+    // SHA256d/s on the io thread; the stratum recvQ grew 7 -> 62 MB and the
+    // served tip froze. A submit-time tip READ must not evaluate the serve
+    // gate, must not reset or re-source the cache, and must not record a
+    // served height (note_served_height belongs to the getters through which
+    // a height actually LEAVES the node: get_current_work_template /
+    // build_connection_coinbase). The DOA compare is brace-scoped, guarded by
+    // !current_prevhash.empty(), and statistics-only by its own comment -- a
+    // stale peek costs at worst one wrong DOA counter tick, never a wrong
+    // share or block.
+    std::lock_guard<std::mutex> lk(template_mutex_);
+    if (!template_cache_) return {};
+    return template_cache_->m_previous_block.GetHex();
 }
 
 bool DASHWorkSource::has_merged_chain(uint32_t /*chain_id*/) const
@@ -922,6 +937,11 @@ nlohmann::json DASHWorkSource::embedded_arm_status_json() const
     nlohmann::json j;
     // BEFORE the lock, deliberately -- see serve_staleness_json().
     j["serve_staleness"] = serve_staleness_json();
+    // Atomic, lock-free: how many times the serve-time embedded re-check
+    // dropped a cached template. Published so the fire RATE is measurable
+    // from the operator surface, not inferred from log archaeology.
+    j["serve_recheck_fail_count"] =
+        serve_recheck_fail_count_.load(std::memory_order_relaxed);
 
     // TRY_LOCK, not lock_guard. serve_gate_mutex_ is taken by the SERVE PATH
     // (note_arm_decision, :759; the found-block ledger, :1478). Blocking here
@@ -993,8 +1013,16 @@ std::shared_ptr<const coin::DashWorkData> DASHWorkSource::cached_work() const
             if (!template_cache_is_embedded_
                 || coin_state_.embedded_template_emit_ok(*template_cache_))
                 return template_cache_;
+            // Monotonic fire counter: before this, the re-check failure path
+            // was LOG_WARNING-only, so its rate was unmeasurable and every
+            // claim about how often it fires was unfalsifiable. Relaxed
+            // atomic -- a counter, not a synchronization point.
+            serve_recheck_fail_count_.fetch_add(1, std::memory_order_relaxed);
             LOG_WARNING << "[DASH-STRATUM-GBT] cached EMBEDDED template failed "
-                           "serve-time re-check (stale creditPool/roots) — re-sourcing";
+                           "serve-time re-check (stale creditPool/roots) — re-sourcing"
+                           " (fail_count="
+                        << serve_recheck_fail_count_.load(std::memory_order_relaxed)
+                        << ")";
             template_cache_.reset();
         }
 

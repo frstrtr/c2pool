@@ -435,6 +435,14 @@ public:
     /// live template (display only; never drives coinbase or consensus).
     std::shared_ptr<const coin::DashWorkData> peek_template() const;
 
+    /// Monotonic count of serve-time embedded re-check FAILURES (cached
+    /// template dropped for stale creditPool/roots). Measurability seam:
+    /// the path was LOG_WARNING-only before, so its fire rate could not be
+    /// observed, which made every claim about it unfalsifiable.
+    uint64_t serve_recheck_fail_count() const {
+        return serve_recheck_fail_count_.load(std::memory_order_relaxed);
+    }
+
     /// Seconds since the cached template was sourced, -1 when none / unknown.
     /// Display only (the dashboard's block_value_age_sec): a template that is
     /// an hour old renders exactly like a live one without this, which is how
@@ -763,6 +771,12 @@ private:
     // the CURRENT coin-state before being served, so a template built with a
     // stale credit-pool seed cannot be served after the seed advances.
     mutable bool                template_cache_is_embedded_{false};
+    // Monotonic fire counter for the serve-time re-check FAILURE path (the
+    // "cached EMBEDDED template failed serve-time re-check" drop above).
+    // Formerly LOG_WARNING-only, so its rate was unmeasurable and any claim
+    // about it unfalsifiable. Read via serve_recheck_fail_count() and
+    // published in embedded_arm_status_json().
+    mutable std::atomic<uint64_t> serve_recheck_fail_count_{0};
     mutable std::chrono::steady_clock::time_point template_last_fail_at_{};
     // Generation the last FAILED sourcing attempt was made against (captured
     // BEFORE the blocking source ran). The negative cache only holds while the
