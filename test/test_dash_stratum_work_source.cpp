@@ -2903,7 +2903,8 @@ dash::coin::DashWorkData host_template(
     w.m_height = kSpliceHeight;
     w.m_previous_block.SetHex(kEmbeddedPrevHashHex);
     for (const auto& h : hosts) {
-        auto sp = ::pack(h).get_span();
+        auto packed = ::pack(h);       // keep the packed buffer alive across the HexStr read below
+        auto sp = packed.get_span();
         w.m_txs.emplace_back(h);
         w.m_tx_hashes.push_back(dash::coin::dash_txid(h));
         w.m_tx_fees.push_back(0);
