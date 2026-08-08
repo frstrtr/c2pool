@@ -208,7 +208,7 @@ inline WorkSelection select_dash_work(
     // PINNED LOCAL TX on the SERVED-dashd arm (option B, donation lane): the
     // dashd mempool cannot carry the >100KB zero-fee consolidation (policy
     // standardness), so the pin rides OUR served copy of dashd's template
-    // instead. Same shared gate as the embedded arm (splice_pinned_tx);
+    // instead. Same shared gate as the embedded arm (splice_pinned_txs);
     // coinbase value untouched (fee 0) — stratum merkle branches and the
     // submitblock body both derive from the appended tx vectors. Fail-closed:
     // without the verify view (mempool+mnstates, i.e. --embedded-utxo) the

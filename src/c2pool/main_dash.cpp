@@ -387,6 +387,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-mn-bridge-no-cursor]\n"
         << "           [--embedded-utxo-immature-serve-empty] [--embedded-serve-mempool-txs]\n"
         << "           [--pin-local-tx-hex FILE]  (zero-fee self-mined tx, e.g. donation consolidation)\n"
+        << "           [--dash-pin-block-budget]  (refuse a pin that would push the served block over 2 MB)\n"
         << "           [--bestcl-policy freshness|consensus-exact]\n"
         << "           [--embedded-oracle-shadow]\n"
         << "           [--embedded-shadow-compare]\n"
@@ -787,7 +788,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // safety — there is no code path from an alarm to a serve
              // decision. See coin/serve_staleness.hpp for why report-only was
              // chosen over a detector that can stop serving.
-             bool serve_staleness_sentinel = true)
+             bool serve_staleness_sentinel = true,
+             // --dash-pin-block-budget: MONEY PATH, DEFAULT OFF. Give the
+             // served-dashd splice the same block-level size budget #1177
+             // gave the embedded arm — measure what dashd's template already
+             // occupies and refuse the pin that would push the assembled
+             // block past the 2 MB consensus limit, with a NAMED cause.
+             // OFF reproduces the shipped arithmetic byte-for-byte.
+             bool pin_block_budget = false)
 {
     namespace io = boost::asio;
 
@@ -2503,6 +2511,26 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // consulted, i.e. during an actual embedded outage.
     const bool xcheck_wanted = (testnet || embedded_mainnet);
     work_source->set_gbt_xcheck(xcheck_wanted && static_cast<bool>(rpc));
+
+    // ── BLOCK-LEVEL PIN BUDGET on the served-dashd arm ──────────────────────
+    // MONEY PATH, DEFAULT OFF (--dash-pin-block-budget). #1177 unified the
+    // size budget on the EMBEDDED arm; the fallback arm splices up to 400000
+    // bytes of pins onto dashd's own template with no block-level accounting,
+    // and dashd fills that template to its own blockmaxsize. ON, the splice
+    // measures the real remaining headroom and refuses the overflowing pin
+    // with the named cause pin-over-block-headroom. It is off by default
+    // because a refusal CHANGES SERVED BYTES; say which posture is live so
+    // the journal never has to be guessed at.
+    work_source->set_pin_block_budget(pin_block_budget);
+    std::cout << "[DASH-STRATUM] served-dashd pin block budget: "
+              << (pin_block_budget
+                      ? "ON (--dash-pin-block-budget: a pin that would push "
+                        "the assembled block past 2000000 bytes is REFUSED "
+                        "with cause=pin-over-block-headroom)"
+                      : "OFF (default: pins capped only against 400000, NOT "
+                        "against what dashd's template already holds -- "
+                        "enable with --dash-pin-block-budget)")
+              << "\n";
     if (xcheck_wanted && !rpc) {
         std::cout << "[DASH-STRATUM-GBT] GBT cross-check DISABLED: dashd RPC "
                      "arm UNARMED (pure-daemonless) -- the embedded arm relies "
@@ -7064,6 +7092,7 @@ int main(int argc, char** argv)
     // still the other flag's decision, and that one stays default-OFF until
     // the [SHADOW-TXSET] coverage series says it is safe.
     bool embedded_mempool_ingest = false;
+    bool pin_block_budget = false;
     std::string bestcl_policy = "freshness";   // --bestcl-policy: freshness (default, conservative proxy) | consensus-exact (dashcore's actual CheckCbTxBestChainlock rule)
     bool embedded_oracle_shadow = false;       // --embedded-oracle-shadow: per-block dashd cross-check (OBSERVE-only)
     bool embedded_shadow_compare = false;      // --embedded-shadow-compare: serve-vs-dashd template diff (OBSERVE-only, NOT a gate)
@@ -7161,6 +7190,8 @@ int main(int argc, char** argv)
             embedded_serve_mempool_txs = true;
         else if (std::strcmp(argv[i], "--embedded-mempool-ingest") == 0)
             embedded_mempool_ingest = true;
+        else if (std::strcmp(argv[i], "--dash-pin-block-budget") == 0)
+            pin_block_budget = true;
         else if (std::strcmp(argv[i], "--pin-local-tx-hex") == 0 && i + 1 < argc)
             pin_local_tx_hex_path = argv[++i];
         else if (std::strcmp(argv[i], "--replay-utxo-db") == 0 && i + 1 < argc)
@@ -7441,7 +7472,8 @@ int main(int argc, char** argv)
                         embedded_shadow_compare,
                         embedded_mempool_ingest,
                         pin_local_tx_hex_path,
-                        serve_staleness_sentinel);
+                        serve_staleness_sentinel,
+                        pin_block_budget);
     }
     return run_selftest();
 }

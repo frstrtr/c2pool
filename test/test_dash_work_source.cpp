@@ -141,7 +141,7 @@ TEST(DashWorkSource, NullMempoolRoutesFallback)
 // ─── Option B: pinned-tx splice on the SERVED-dashd arm ──────────────────────
 // The donation consolidation (>100KB, fee 0) cannot enter dashd's mempool
 // (policy standardness), so when the dashd arm serves, the pin must ride OUR
-// copy of the template — gated by the SAME splice_pinned_tx the embedded arm
+// copy of the template — gated by the SAME splice_pinned_txs the embedded arm
 // uses. Fail-closed contract: no verify view (mempool/mnstates null) → the
 // template is byte-identical to no-pin; never an unverified inclusion.
 TEST(DashWorkSource, PinnedTxExcludedOnFallbackWithoutVerifyView)

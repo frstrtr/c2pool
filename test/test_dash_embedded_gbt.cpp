@@ -1576,3 +1576,256 @@ TEST(DashSizeBudget, BuilderDeductsPinsFromSelectionBudget) {
     EXPECT_LT(body, 2'000'000u)
         << "template body must stay under the consensus block limit";
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// F1 — BLOCK-LEVEL SIZE BUDGET ON THE SERVED-DASHD FALLBACK ARM
+//
+// #1177 unified the size budget on the EMBEDDED arm: the consensus-required
+// set is measured BEFORE mempool selection and deducted, with an explicit
+// zero floor. The FALLBACK arm never got that discipline. It spliced up to
+// kMaxPinnedTotalBytes (400000) of pins onto dashd's OWN template with NO
+// block-level accounting — the only cap was pins-vs-400000, never
+// pins-vs-what-the-template-already-holds.
+//
+// dashd fills its template to its own blockmaxsize (node/miner.cpp:212
+// clamps to MaxBlockSize()-1000; policy/policy.h:23 DEFAULT_BLOCK_MAX_SIZE
+// is 2000000). Near that ceiling, +400 KB of pins reproduces EXACTLY the
+// bad-blk-length overshoot that cost block 2517855 — on the arm we describe
+// as the always-reachable safety path. And this arm carries pins in
+// production: block 2518186 was won on arm=dashd-fallback carrying 154 KB of
+// pinned donation.
+//
+// The ORDER is dashd's, deliberately (node/miner.cpp): coinbase reserve
+// (miner.cpp:115, nBlockSize = 1000) and the consensus-required set
+// (miner.cpp:235) may not be dropped; mempool selection is fitted into what
+// is left (miner.cpp:361). On the served-dashd arm all three have already
+// happened INSIDE dashd and arrive as a finished template, so the only
+// component left that may yield is the pin set — and it yields by being
+// REFUSED WITH A NAME, never silently.
+// ════════════════════════════════════════════════════════════════════════
+
+// A dashd template whose BODY is `body_bytes` on the wire. Only the raw hex
+// matters here: template_body_bytes() and serialize_full_block() both read
+// m_tx_data_hex, and those ARE the bytes that go on the wire
+// (block_producer.hpp:220).
+static DashWorkData dashd_template_with_body(uint64_t body_bytes) {
+    DashWorkData fb;
+    fb.m_height = H;
+    fb.m_tx_data_hex.push_back(std::string(body_bytes * 2, '0'));
+    return fb;
+}
+
+static std::vector<dash::coin::PinVerdict> all_ok_verdicts(size_t n) {
+    std::vector<dash::coin::PinVerdict> v(n);
+    for (auto& e : v) { e.ok = true; e.at_height = H; }
+    return v;
+}
+
+// The bytes the ASSEMBLED block would occupy: the same three terms
+// pin_headroom_bytes() budgets against, so the two cannot disagree.
+static uint64_t assembled_block_bytes(const DashWorkData& w) {
+    return dash::coin::kBlockOverheadBytes
+         + dash::coin::kCoinbaseReserveBytes
+         + dash::coin::template_body_bytes(w);
+}
+
+// ── THE RED ONE ─────────────────────────────────────────────────────────
+// A dashd template near blockmaxsize, spliced with a pin that is admissible
+// on every OTHER axis (inside kMaxPinnedTxBytes, inside kMaxPinnedTotalBytes,
+// gate verdict ok). The block-level budget is the ONLY thing that can refuse
+// it. It must be refused, and the refusal must be NAMED.
+TEST(DashFallbackPinBudget, PinOverBlockHeadroomIsRefusedByName) {
+    UTXOViewCache utxo(nullptr);
+    auto pin = make_admissible_pin(utxo, 600, 21'000);
+    const uint64_t pin_bytes = ::pack(pin).get_span().size();
+
+    // The pin must be inside EVERY pre-existing cap, or one of them would
+    // have refused it and this KAT would be proving someone else's guard.
+    ASSERT_LT(pin_bytes, Mempool::kMaxPinnedTxBytes)
+        << "pin must pass the per-tx size face; got " << pin_bytes;
+    ASSERT_LT(pin_bytes, Mempool::kMaxPinnedTotalBytes)
+        << "pin must pass the cumulative pin cap; got " << pin_bytes;
+
+    auto fb = dashd_template_with_body(1'950'000);
+    std::vector<MutableTransaction> pins{pin};
+
+    const uint64_t headroom = dash::coin::pin_headroom_bytes(fb);
+    ASSERT_LT(headroom, pin_bytes)
+        << "the fixture must actually leave too little room (" << headroom
+        << " for a " << pin_bytes << "-byte pin) or nothing is being tested";
+
+    auto rep = dash::coin::splice_verdicted_pins(
+        fb, pins, all_ok_verdicts(1), "dashd-splice",
+        /*enforce_block_budget=*/true);
+
+    EXPECT_EQ(rep.included, 0u) << "the pin must NOT ride a full template";
+    ASSERT_EQ(rep.causes.size(), 1u);
+    EXPECT_STREQ(rep.causes[0], "pin-over-block-headroom")
+        << "a refusal the operator cannot name is a silent drop";
+    EXPECT_LE(assembled_block_bytes(fb), dash::coin::kDashMaxBlockBytes)
+        << "the served block must stay inside the consensus limit; got "
+        << assembled_block_bytes(fb);
+}
+
+// The DEFECT, demonstrated rather than asserted around: with the budget off
+// (today's shipped arithmetic) the identical splice produces an OVERSIZE
+// block. If this ever stops overshooting, the fix above is guarding nothing
+// and this KAT says so by failing.
+TEST(DashFallbackPinBudget, WithoutTheBudgetTheSpliceGoesOversize) {
+    UTXOViewCache utxo(nullptr);
+    auto pin = make_admissible_pin(utxo, 600, 31'000);
+    auto fb = dashd_template_with_body(1'950'000);
+    std::vector<MutableTransaction> pins{pin};
+
+    auto rep = dash::coin::splice_verdicted_pins(
+        fb, pins, all_ok_verdicts(1), "dashd-splice",
+        /*enforce_block_budget=*/false);
+
+    EXPECT_EQ(rep.included, 1u)
+        << "flag OFF must be byte-for-byte the shipped behaviour: the pin "
+           "rides, cap-checked only against " << Mempool::kMaxPinnedTotalBytes;
+    EXPECT_GT(assembled_block_bytes(fb), dash::coin::kDashMaxBlockBytes)
+        << "the pre-fix arithmetic must ACTUALLY overshoot the 2 MB consensus "
+           "limit, or there is no defect here to fix; got "
+        << assembled_block_bytes(fb);
+}
+
+// The normal case must be untouched: a small dashd template with the budget
+// ON still carries the pin. A guard that refuses everything is not a guard.
+TEST(DashFallbackPinBudget, RoomyTemplateStillCarriesThePinWithBudgetOn) {
+    UTXOViewCache utxo(nullptr);
+    auto pin = make_admissible_pin(utxo, 600, 41'000);
+    auto fb = dashd_template_with_body(120'000);   // a typical live body
+    std::vector<MutableTransaction> pins{pin};
+
+    auto rep = dash::coin::splice_verdicted_pins(
+        fb, pins, all_ok_verdicts(1), "dashd-splice",
+        /*enforce_block_budget=*/true);
+
+    EXPECT_EQ(rep.included, 1u) << "a pin that fits must still ride";
+    EXPECT_STREQ(rep.causes[0], "");
+    EXPECT_LE(assembled_block_bytes(fb), dash::coin::kDashMaxBlockBytes);
+}
+
+// Earlier pins keep their places. The donation had to be SPLIT into four
+// transactions; a partial fit must land what fits rather than refuse the set.
+TEST(DashFallbackPinBudget, EarlierPinsKeepTheirPlacesWhenALaterOneOverflows) {
+    UTXOViewCache utxo(nullptr);
+    auto small = make_admissible_pin(utxo, 60,  51'000);   // ~9 KB
+    auto big   = make_admissible_pin(utxo, 600, 52'000);   // ~89 KB
+    const uint64_t small_bytes = ::pack(small).get_span().size();
+
+    // Room for the small pin and not the big one.
+    auto fb = dashd_template_with_body(1'950'000);
+    const uint64_t headroom = dash::coin::pin_headroom_bytes(fb);
+    ASSERT_GT(headroom, small_bytes);
+    ASSERT_LT(headroom, ::pack(big).get_span().size());
+
+    std::vector<MutableTransaction> pins{small, big};
+    auto rep = dash::coin::splice_verdicted_pins(
+        fb, pins, all_ok_verdicts(2), "dashd-splice",
+        /*enforce_block_budget=*/true);
+
+    EXPECT_EQ(rep.included, 1u);
+    EXPECT_STREQ(rep.causes[0], "") << "the pin that fits must ride";
+    EXPECT_STREQ(rep.causes[1], "pin-over-block-headroom");
+    EXPECT_LE(assembled_block_bytes(fb), dash::coin::kDashMaxBlockBytes);
+}
+
+// The underflow face — the one that would SILENTLY restore the old
+// behaviour. An over-cap template must starve the pin set, never wrap to a
+// budget of ~18 EB. Demonstrated against the unguarded form so the guard's
+// value is visible rather than asserted.
+TEST(DashFallbackPinBudget, OverCapTemplateYieldsZeroHeadroomNotAWrap) {
+    auto fb = dashd_template_with_body(2'500'000);   // already over the limit
+    EXPECT_EQ(dash::coin::pin_headroom_bytes(fb), 0u)
+        << "an over-cap template must leave NO room for pins";
+
+    const uint64_t occupied = assembled_block_bytes(fb);
+    const uint64_t unguarded = dash::coin::kDashMaxBlockBytes - occupied;
+    EXPECT_GT(unguarded, dash::coin::kDashMaxBlockBytes)
+        << "unguarded subtraction wraps — this is the defect being prevented";
+
+    UTXOViewCache utxo(nullptr);
+    auto pin = make_admissible_pin(utxo, 60, 61'000);
+    std::vector<MutableTransaction> pins{pin};
+    auto rep = dash::coin::splice_verdicted_pins(
+        fb, pins, all_ok_verdicts(1), "dashd-splice",
+        /*enforce_block_budget=*/true);
+    EXPECT_EQ(rep.included, 0u);
+    EXPECT_STREQ(rep.causes[0], "pin-over-block-headroom");
+}
+
+// The budget may only ever SHRINK the pin allowance, never raise it. An empty
+// template has ~2 MB free, but the pin policy cap still governs.
+TEST(DashFallbackPinBudget, HeadroomNeverExceedsThePinPolicyCap) {
+    DashWorkData empty;
+    EXPECT_EQ(dash::coin::pin_headroom_bytes(empty),
+              Mempool::kMaxPinnedTotalBytes)
+        << "the block budget must never RAISE the pin allowance";
+}
+
+// The two refusals stay distinguishable. "pin-total-too-large" is a property
+// of the pin SET; "pin-over-block-headroom" is a property of the TEMPLATE the
+// pin happened to meet. Neither is "tx-too-large", which blames the
+// transaction for something that is not its fault — and a cause name is the
+// operator's only handle on a refusal.
+TEST(DashFallbackPinBudget, TheTwoRefusalsAreNamedApart) {
+    // Over the pin-set cap, with all the block room in the world.
+    EXPECT_STREQ(dash::coin::pin_budget_refusal(
+                     /*spliced=*/Mempool::kMaxPinnedTotalBytes - 10,
+                     /*pin=*/100, Mempool::kMaxPinnedTotalBytes,
+                     /*headroom=*/1'000'000),
+                 "pin-total-too-large");
+    // Inside the pin-set cap, but the template has no room.
+    EXPECT_STREQ(dash::coin::pin_budget_refusal(
+                     /*spliced=*/0, /*pin=*/50'000,
+                     Mempool::kMaxPinnedTotalBytes, /*headroom=*/1'000),
+                 "pin-over-block-headroom");
+    // Fits both.
+    EXPECT_EQ(dash::coin::pin_budget_refusal(
+                  0, 1'000, Mempool::kMaxPinnedTotalBytes, 400'000),
+              nullptr);
+}
+
+// The occupancy figure is the SERVED one, not a re-derivation: it is read
+// from the same m_tx_data_hex that serialize_full_block() emits verbatim
+// (block_producer.hpp:220). A pin that is appended must be counted.
+TEST(DashFallbackPinBudget, BodyBytesTrackWhatIsActuallyAppended) {
+    UTXOViewCache utxo(nullptr);
+    auto pin = make_admissible_pin(utxo, 60, 71'000);
+    const uint64_t pin_bytes = ::pack(pin).get_span().size();
+
+    auto fb = dashd_template_with_body(100'000);
+    const uint64_t before = dash::coin::template_body_bytes(fb);
+    EXPECT_EQ(before, 100'000u);
+
+    std::vector<MutableTransaction> pins{pin};
+    auto rep = dash::coin::splice_verdicted_pins(
+        fb, pins, all_ok_verdicts(1), "dashd-splice", true);
+    ASSERT_EQ(rep.included, 1u);
+    EXPECT_EQ(dash::coin::template_body_bytes(fb), before + pin_bytes)
+        << "the budget must measure the bytes that actually go on the wire";
+    EXPECT_EQ(rep.spliced_bytes, pin_bytes);
+}
+
+// A gate refusal still reports the GATE's cause, not a size cause — the
+// verdicts arrive already decided (the served-dashd arm cannot run the gate
+// where it appends, #1134) and the splice must not overwrite them.
+TEST(DashFallbackPinBudget, GateRefusalKeepsItsOwnCause) {
+    UTXOViewCache utxo(nullptr);
+    auto pin = make_admissible_pin(utxo, 60, 81'000);
+    auto fb = dashd_template_with_body(1'999'000);   // no room at all
+
+    std::vector<MutableTransaction> pins{pin};
+    std::vector<dash::coin::PinVerdict> verdicts(1);
+    verdicts[0].ok = false;
+    verdicts[0].cause = "input-missing-or-spent";
+    verdicts[0].at_height = H;
+
+    auto rep = dash::coin::splice_verdicted_pins(
+        fb, pins, verdicts, "dashd-splice", /*enforce_block_budget=*/true);
+    EXPECT_EQ(rep.included, 0u);
+    EXPECT_STREQ(rep.causes[0], "input-missing-or-spent")
+        << "the size budget must not relabel a gate refusal";
+}
