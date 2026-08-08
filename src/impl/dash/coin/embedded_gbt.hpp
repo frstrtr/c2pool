@@ -48,6 +48,7 @@
 #include <core/log.hpp>
 #include <core/address_utils.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <ctime>
@@ -156,59 +157,195 @@ inline void pin_append(DashWorkData& w, const MutableTransaction& pin)
         reinterpret_cast<const unsigned char*>(sp.data()), sp.size())));
 }
 
-inline void splice_pinned_tx(DashWorkData& w,
-                             const MutableTransaction& pin,
-                             const Mempool& mempool,
-                             const MnStateMachine& mnstates,
-                             const char* arm)
+// ── BLOCK-LEVEL PIN BUDGET ──────────────────────────────────────────────
+// #1177 unified the size budget on the EMBEDDED arm: the consensus-required
+// set is measured BEFORE mempool selection and deducted, with an explicit
+// zero floor. The SERVED-DASHD arm never got that discipline. Its only cap
+// was pins-vs-kMaxPinnedTotalBytes — never pins-vs-what-dashd's-template-
+// ALREADY-HOLDS. dashd fills its own template to its own blockmaxsize
+// (node/miner.cpp:212 clamps to MaxBlockSize()-1000, DEFAULT_BLOCK_MAX_SIZE
+// is 2000000, policy/policy.h:23); splicing 400000 bytes of pins onto a
+// template already near that reproduces EXACTLY the bad-blk-length overshoot
+// #1177 removed — on the arm we describe as the always-reachable safety path.
+//
+// This is not hypothetical: block 2518186 was won on arm=dashd-fallback
+// carrying 154 KB of pinned donation. One large dashd template away.
+//
+// ORDER, mirrored from dashd node/miner.cpp deliberately, because the order
+// encodes which component may be dropped:
+//   1. coinbase reserve   (miner.cpp:115, resetBlock: nBlockSize = 1000)
+//   2. consensus-required (miner.cpp:235, nBlockSize += qcTx->GetTotalSize())
+//   3. mempool selection  (miner.cpp:361, TestPackage against nBlockMaxSize)
+// On the served-dashd arm steps 1-3 have ALREADY happened inside dashd and
+// arrive as a finished template. The only component left that may yield is
+// the pin set — pins are policy, everything already in dashd's template is
+// either required for validity or paid for with fees we would be throwing
+// away. So the pins yield, and they yield by being REFUSED WITH A NAME.
+
+/// dashd consensus.h:10 — MAX_DIP0001_BLOCK_SIZE. A block over this is
+/// INVALID (bad-blk-length), not merely large.
+inline constexpr uint64_t kDashMaxBlockBytes = 2'000'000;
+
+/// dashd node/miner.cpp:115 — resetBlock() starts nBlockSize at 1000 for a
+/// coinbase it has not built yet. We reserve the same, for the same reason:
+/// at splice time our coinbase does not exist either.
+inline constexpr uint64_t kCoinbaseReserveBytes = 1'000;
+
+/// serialize_full_block (block_producer.hpp:207-217) emits an 80-byte header
+/// plus a CompactSize tx count before the coinbase. 9 is the WIDEST
+/// CompactSize, so this over-reserves by at most 8 bytes — in the safe
+/// direction, which is the only direction a budget may err.
+inline constexpr uint64_t kBlockOverheadBytes = 80 + 9;
+
+/// Bytes the template body ALREADY occupies, measured from the exact field
+/// serialize_full_block() emits verbatim (block_producer.hpp:220). Not an
+/// estimate and not a re-derivation: these ARE the bytes that go on the wire.
+inline uint64_t template_body_bytes(const DashWorkData& w)
 {
-    const auto v = pin_gate_verdict(pin, mempool, mnstates, w.m_height);
-    if (!v.ok) {
-        LOG_INFO << "[" << arm << "] pinned tx EXCLUDED h=" << w.m_height
-                 << " cause=" << v.cause
-                 << " txid=" << dash::coin::dash_txid(pin).GetHex().substr(0, 16)
-                 << " (template built without it; re-checked next build)";
-        return;
-    }
-    pin_append(w, pin);
-    LOG_INFO << "[" << arm << "] pinned tx INCLUDED h=" << w.m_height
-             << " txid=" << dash::coin::dash_txid(pin).GetHex().substr(0, 16)
-             << " vin=" << pin.vin.size() << " fee=0 (rides this template)";
+    uint64_t n = 0;
+    for (const auto& h : w.m_tx_data_hex) n += h.size() / 2;
+    return n;
 }
 
-/// Splice EVERY admissible pin, in file order, under a CUMULATIVE byte cap.
+/// How many MORE bytes the pin set may add before the ASSEMBLED block
+/// exceeds the consensus limit, capped by the pin policy budget.
+///
+/// The subtraction has an explicit zero floor. An unsigned subtraction of an
+/// over-cap occupancy wraps to ~18 EB and hands the splice an unbounded
+/// budget, silently restoring the very behaviour this removes — the same
+/// underflow face #1177 called out on the embedded arm.
+inline uint64_t pin_headroom_bytes(const DashWorkData& w)
+{
+    const uint64_t occupied =
+        kBlockOverheadBytes + kCoinbaseReserveBytes + template_body_bytes(w);
+    const uint64_t left =
+        occupied >= kDashMaxBlockBytes ? 0ull : kDashMaxBlockBytes - occupied;
+    return std::min<uint64_t>(left, Mempool::kMaxPinnedTotalBytes);
+}
+
+/// The NAMED answer to "may this pin ride?" at BLOCK scale. nullptr == yes.
+///
+/// Two distinct refusals, kept distinct on purpose. "tx-too-large" (the
+/// gate's own TooLarge face) blames the TRANSACTION; neither of these is a
+/// property of the transaction — one is the pin set's own policy budget, the
+/// other is a property of the TEMPLATE this pin happened to meet. A cause
+/// name is the operator's only handle on a refusal, so it must say which.
+inline const char* pin_budget_refusal(uint64_t spliced_bytes,
+                                      uint64_t pin_bytes,
+                                      uint64_t pin_cap,
+                                      uint64_t headroom)
+{
+    if (spliced_bytes + pin_bytes > pin_cap)  return "pin-total-too-large";
+    if (spliced_bytes + pin_bytes > headroom) return "pin-over-block-headroom";
+    return nullptr;
+}
+
+/// What a splice DID, as a value — so a test can assert the NAMED refusal
+/// without scraping a log line, and a caller can report it.
+struct PinSpliceReport {
+    size_t   included{0};
+    size_t   excluded{0};
+    uint64_t spliced_bytes{0};   ///< bytes actually appended
+    uint64_t headroom{0};        ///< the budget this splice ran against
+    /// Per-pin outcome in file order: "" when included, else the named cause.
+    std::vector<const char*> causes;
+};
+
+/// THE splice, in file order, under a CUMULATIVE byte cap AND the block
+/// budget. Both serving arms land here so neither can drift from the other.
 ///
 /// The donation consolidation had to be split into four transactions after a
 /// single 152258-byte pin was rejected as bad-txns-oversize and cost block
 /// 2517855. Four quarter-sized transactions ride ONE template, so the money
 /// lands in one block instead of four.
 ///
-/// Each pin is gated INDEPENDENTLY: one bad pin excludes itself and the others
-/// still ride. The cumulative cap is checked against what has ALREADY been
+/// Each pin is judged INDEPENDENTLY: one bad pin excludes itself and the
+/// others still ride. Both caps are checked against what has ALREADY been
 /// accepted, so the answer never depends on the order the caller happened to
 /// pass them in beyond file order itself.
-inline void splice_pinned_txs(DashWorkData& w,
-                              const std::vector<MutableTransaction>& pins,
-                              const Mempool& mempool,
-                              const MnStateMachine& mnstates,
-                              const char* arm)
+///
+/// The served-dashd arm cannot run the gate where it appends (the gate reads
+/// coin state the io thread mutates — the #1134 heap-corruption shape), so it
+/// arrives with verdicts already decided beside that state. The embedded arm
+/// gates in place and hands the verdicts straight through. Either way the
+/// SIZE arithmetic below is one implementation.
+///
+/// `enforce_block_budget` is the money-path flag. OFF (default) reproduces
+/// the pre-fix arithmetic byte-for-byte: headroom == the pin policy cap, so
+/// the block-headroom arm of pin_budget_refusal is unreachable and every
+/// splice decision is identical to what shipped. ON measures dashd's real
+/// template and refuses against the REAL remaining room.
+inline PinSpliceReport splice_verdicted_pins(
+    DashWorkData& w,
+    const std::vector<MutableTransaction>& pins,
+    const std::vector<PinVerdict>& verdicts,
+    const char* arm,
+    bool enforce_block_budget)
 {
-    size_t spliced_bytes = 0;
-    for (const auto& pin : pins) {
-        const size_t sz = ::pack(pin).get_span().size();
-        if (spliced_bytes + sz > Mempool::kMaxPinnedTotalBytes) {
-            LOG_INFO << "[" << arm << "] pinned tx EXCLUDED h=" << w.m_height
-                     << " cause=pin-total-too-large txid="
-                     << dash::coin::dash_txid(pin).GetHex().substr(0, 16)
-                     << " (" << spliced_bytes << "+" << sz << " > "
-                     << Mempool::kMaxPinnedTotalBytes
+    PinSpliceReport rep;
+    rep.causes.assign(pins.size(), "");
+    if (verdicts.size() != pins.size()) return rep;
+
+    constexpr uint64_t pin_cap = Mempool::kMaxPinnedTotalBytes;
+    // Measured ONCE, from the template as dashd handed it over — before a
+    // single pin is appended. `spliced_bytes` then tracks what we add, so the
+    // two together are exactly "occupied now". Re-measuring inside the loop
+    // would double-count the pins already appended.
+    rep.headroom = enforce_block_budget ? pin_headroom_bytes(w) : pin_cap;
+
+    for (size_t i = 0; i < pins.size(); ++i) {
+        const auto& pin = pins[i];
+        const auto& v   = verdicts[i];
+        const auto txid = dash::coin::dash_txid(pin).GetHex().substr(0, 16);
+
+        if (!v.ok) {
+            rep.causes[i] = v.cause;
+            ++rep.excluded;
+            LOG_INFO << "[" << arm << "] pinned tx EXCLUDED h=" << v.at_height
+                     << " cause=" << v.cause << " txid=" << txid
+                     << " (template built without it; re-checked next build)";
+            continue;
+        }
+
+        const uint64_t sz = ::pack(pin).get_span().size();
+        if (const char* why = pin_budget_refusal(rep.spliced_bytes, sz,
+                                                 pin_cap, rep.headroom)) {
+            rep.causes[i] = why;
+            ++rep.excluded;
+            LOG_INFO << "[" << arm << "] pinned tx EXCLUDED h=" << v.at_height
+                     << " cause=" << why << " txid=" << txid
+                     << " (" << rep.spliced_bytes << "+" << sz
+                     << " > pin_cap=" << pin_cap
+                     << " headroom=" << rep.headroom
+                     << " body=" << template_body_bytes(w)
                      << "; earlier pins keep their places)";
             continue;
         }
-        const size_t before = w.m_txs.size();
-        splice_pinned_tx(w, pin, mempool, mnstates, arm);
-        if (w.m_txs.size() != before) spliced_bytes += sz;
+
+        pin_append(w, pin);
+        rep.spliced_bytes += sz;
+        ++rep.included;
+        LOG_INFO << "[" << arm << "] pinned tx INCLUDED h=" << v.at_height
+                 << " txid=" << txid << " vin=" << pin.vin.size()
+                 << " fee=0 (rides this template)";
     }
+    return rep;
+}
+
+/// Splice EVERY admissible pin, in file order, gating each one HERE. The
+/// embedded arm's entry point; the size arithmetic is the shared one above.
+inline PinSpliceReport splice_pinned_txs(DashWorkData& w,
+                                         const std::vector<MutableTransaction>& pins,
+                                         const Mempool& mempool,
+                                         const MnStateMachine& mnstates,
+                                         const char* arm,
+                                         bool enforce_block_budget = false)
+{
+    std::vector<PinVerdict> verdicts;
+    verdicts.reserve(pins.size());
+    for (const auto& pin : pins)
+        verdicts.push_back(pin_gate_verdict(pin, mempool, mnstates, w.m_height));
+    return splice_verdicted_pins(w, pins, verdicts, arm, enforce_block_budget);
 }
 
 inline DashWorkData build_embedded_workdata(

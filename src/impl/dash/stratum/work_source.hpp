@@ -327,6 +327,32 @@ public:
     /// independent seed-height + pre-emit gates.
     void set_gbt_xcheck(bool v) { gbt_xcheck_ = v; }
 
+    /// BLOCK-LEVEL PIN BUDGET on the served-dashd arm
+    /// (--dash-pin-block-budget). MONEY PATH, DEFAULT OFF.
+    ///
+    /// #1177 unified the size budget on the EMBEDDED arm. The fallback arm
+    /// never got it: it splices up to kMaxPinnedTotalBytes (400000) onto
+    /// dashd's OWN template with no block-level accounting, and dashd fills
+    /// that template to its own blockmaxsize (node/miner.cpp:212 clamps to
+    /// MaxBlockSize()-1000; DEFAULT_BLOCK_MAX_SIZE is 2000000). Near the cap,
+    /// +400 KB is the bad-blk-length overshoot that cost block 2517855 — on
+    /// the arm we call the always-reachable safety path. Block 2518186 was
+    /// won on this arm carrying 154 KB of pinned donation, so the shape is
+    /// live, not hypothetical.
+    ///
+    /// ON, the splice measures what dashd's template already occupies and
+    /// refuses the pin that would not fit, with the NAMED cause
+    /// pin-over-block-headroom. OFF, the arithmetic is byte-for-byte what
+    /// shipped: headroom collapses to the pin cap and the block-headroom arm
+    /// of the check is unreachable.
+    ///
+    /// It is OFF by default because it CHANGES SERVED BYTES in exactly the
+    /// case it fires — refusing a pin that today would ride. That is the
+    /// money-path rule, not a judgement that OFF is the better posture: a
+    /// refused pin costs one template's donation, an oversize block costs the
+    /// whole height.
+    void set_pin_block_budget(bool v) { pin_block_budget_ = v; }
+
     /// Embedded-vs-dashd SHADOW-COMPARE DIAGNOSTIC (--embedded-shadow-compare).
     /// OBSERVE-ONLY: on every template re-source the just-resolved template is
     /// handed (by copy) to this probe, which best-effort field-compares it against
@@ -641,6 +667,7 @@ private:
     bool is_testnet_{false};
     bool embedded_mainnet_{false};   // gate-lift opt-in: daemonless embedded arm on mainnet
     bool gbt_xcheck_{false};         // reward-safety backstop: cross-check embedded creditPool vs dashd
+    bool pin_block_budget_{false};   // --dash-pin-block-budget: block-level pin budget on the served-dashd arm
 
     // OBSERVE-only serve-vs-dashd shadow-compare (--embedded-shadow-compare).
     // Unset (default / pure-daemonless) => strict no-op. Never on the hot path:

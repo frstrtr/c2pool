@@ -521,39 +521,25 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                     // pin excludes itself and the rest still ride. The height
                     // logged is the one the gate JUDGED at, never fb.m_height,
                     // so a line can never claim a check it did not make.
-                    size_t spliced_bytes = 0;
-                    for (size_t i = 0; i < arm.pin_txs->size(); ++i) {
-                        const auto& pin = (*arm.pin_txs)[i];
-                        const auto& v   = arm.pin_verdicts[i];
-                        const auto txid = coin::dash_txid(pin)
-                                              .GetHex().substr(0, 16);
-                        if (!v.ok) {
-                            LOG_INFO << "[dashd-splice] pinned tx EXCLUDED h="
-                                     << v.at_height << " cause=" << v.cause
-                                     << " txid=" << txid
-                                     << " (template built without it; "
-                                        "re-checked next build)";
-                            continue;
-                        }
-                        const size_t sz = ::pack(pin).get_span().size();
-                        if (spliced_bytes + sz
-                            > coin::Mempool::kMaxPinnedTotalBytes) {
-                            LOG_INFO << "[dashd-splice] pinned tx EXCLUDED h="
-                                     << v.at_height
-                                     << " cause=pin-total-too-large txid="
-                                     << txid << " (" << spliced_bytes << "+"
-                                     << sz << " > "
-                                     << coin::Mempool::kMaxPinnedTotalBytes
-                                     << ")";
-                            continue;
-                        }
-                        coin::pin_append(fb, pin);
-                        spliced_bytes += sz;
-                        LOG_INFO << "[dashd-splice] pinned tx INCLUDED h="
-                                 << v.at_height << " txid=" << txid
-                                 << " vin=" << pin.vin.size()
-                                 << " fee=0 (rides this template)";
-                    }
+                    //
+                    // THE SHARED SPLICE (embedded_gbt.hpp). This loop used to
+                    // be an inline copy of it, and the copy had NO block-level
+                    // size accounting at all: it capped pins against a fixed
+                    // 400000 and never against what dashd's template already
+                    // held. dashd fills its own template to its own
+                    // blockmaxsize; near 2000000 that reproduces the
+                    // bad-blk-length overshoot #1177 removed from the embedded
+                    // arm — here, on the always-reachable safety path. Block
+                    // 2518186 was won on THIS arm carrying 154 KB of pin.
+                    //
+                    // pin_block_budget_ is the money-path flag: OFF (default)
+                    // is byte-for-byte the pre-fix arithmetic; ON measures
+                    // dashd's real template and refuses the overflowing pin
+                    // with a NAMED cause (pin-over-block-headroom).
+                    coin::splice_verdicted_pins(fb, *arm.pin_txs,
+                                                arm.pin_verdicts,
+                                                "dashd-splice",
+                                                pin_block_budget_);
                 }
                 sel = coin::WorkSelection{ std::move(fb),
                                            coin::WorkSource::DashdFallback,
