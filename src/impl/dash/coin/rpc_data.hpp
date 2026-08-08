@@ -74,6 +74,36 @@ inline bool submitblock_result_accepted(const nlohmann::json& result)
     return already_have && code.find("invalid") == std::string::npos;
 }
 
+// ── NON-CONSENSUS: what happened to each configured pinned local tx on THIS
+// template. One entry per configured pin, in file order, written by the splice
+// that judges it.
+//
+// It exists because a pin that is simply ABSENT is indistinguishable from a pin
+// that was never considered, and that ambiguity cost the donation on block
+// 2518044 (2026-08-07): the embedded builder logged four `pinned tx INCLUDED`
+// lines, the GBT-xcheck backstop swapped in dashd's template 57 ms later, and
+// the served template carried neither the pins nor one word about them.
+//
+// Never serialized, never hashed, never read by any consensus path -- the block
+// assembler reads m_txs / m_tx_data_hex only. It is the ANSWER a test can assert
+// on without scraping a log line.
+struct PinOutcome {
+    uint256     txid;
+    bool        included{false};
+    /// Named refusal reason when !included; empty when included.
+    std::string cause;
+    /// The height the pin GATE judged at (our tip + 1), and the height of the
+    /// template the pin was offered to. They are separate numbers because the
+    /// gate runs beside the coin state and the template may come from dashd.
+    uint32_t    gate_height{0};
+    uint32_t    template_height{0};
+    /// Sum of the pin's outputs, in satoshi. This is WHAT IS LOST when the pin
+    /// does not ride a template that then wins: the donation is a zero-fee
+    /// self-spend, so its output total is the whole amount at stake. Recorded
+    /// so the drop alarm can name a number instead of a count.
+    int64_t     value{0};
+};
+
 struct DashWorkData {
     // Raw getblocktemplate JSON response (kept for fallback access to fields
     // we haven't promoted to members yet).
@@ -143,6 +173,32 @@ struct DashWorkData {
     // what makes the fee lane completable at all.
     std::vector<uint256>  m_txset_candidates;
     std::vector<uint64_t> m_txset_candidate_fees;
+
+    // ── PIN OUTCOMES (see PinOutcome above) ───────────────────────────────
+    // One entry per configured pinned local tx, written by the splice on the
+    // SERVED dashd-fallback arm. Empty on the embedded arm (which splices in
+    // its own builder and logs there) and empty when no pin is configured.
+    std::vector<PinOutcome> m_pin_outcomes;
+
+    // ── THE DROP ALARM (non-consensus) ────────────────────────────────────
+    // Non-empty when this SERVED template is missing at least one configured
+    // pin. It names the count, the height, the satoshi value at stake and the
+    // cause(s), because "pins=0/4" on its own does not tell an operator that
+    // money is going missing or why.
+    //
+    // The flag-off xcheck-swap arm is the case this exists for: with
+    // --pin-splice-xcheck-arm at its default the donation is DELIBERATELY not
+    // spliced, and a deliberate loss that is only visible as an INFO line is
+    // operationally identical to the silent loss that cost h=2518044.
+    std::string m_pin_drop_alarm;
+
+    // ── BLOCK-BUDGET NOT ENFORCED (non-consensus) ─────────────────────────
+    // True when a pin was appended even though it pushed the template past
+    // kMaxPinnedBlockBytes, because --pin-splice-block-budget is OFF (the
+    // default: enforcing it CHANGES SERVED BYTES on the already-live
+    // declined-embedded arm, so it may not be on by default). The block may be
+    // rejected as bad-blk-length if it wins. Always accompanied by a WARNING.
+    bool m_pin_block_budget_unenforced{false};
 };
 
 } // namespace coin

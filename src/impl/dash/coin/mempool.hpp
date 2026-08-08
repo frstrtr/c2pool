@@ -182,6 +182,22 @@ public:
     /// 2 MB block limit, because the pins are not the only thing in the block
     /// and a template we cannot mine is worth nothing.
     static constexpr size_t kMaxPinnedTotalBytes = 400000;
+    /// Dash's consensus maximum serialized block size (DIP-0001, 2 MB).
+    static constexpr size_t kMaxBlockBytes = 2000000;
+    /// Headroom the pin splice refuses to touch: the 80-byte header, the
+    /// tx-count varint, and a coinbase that carries the DIP-0004 payload plus
+    /// every masternode/superblock/platform output. 100 KB is far more than any
+    /// of those need; the point is that the number is CONSERVATIVE and named,
+    /// not that it is tight.
+    static constexpr size_t kBlockBytesReserve = 100000;
+    /// THE BLOCK-LEVEL BUDGET. kMaxPinnedTotalBytes caps the pins against each
+    /// OTHER; this caps them against what the template they are being appended
+    /// to ALREADY holds. Without it a 400 KB pin set is admitted onto a dashd
+    /// template that is already near 2 MB and the block is unmineable
+    /// (bad-blk-length) -- the same class of loss as the 152258-byte pin that
+    /// cost block 2517855, one level up.
+    static constexpr size_t kMaxPinnedBlockBytes =
+        kMaxBlockBytes - kBlockBytesReserve;
     static const char* pinned_gate_name(PinnedTxGate g) {
         switch (g) {
             case PinnedTxGate::Ok:                    return "ok";

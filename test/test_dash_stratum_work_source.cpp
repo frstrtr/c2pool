@@ -2499,3 +2499,1051 @@ TEST(DashServeGateJournal, TwoTransitionsBothEmitEvenWithOneCause) {
         << "expected: first decline (transition), resume, second decline "
            "(transition) -- three edges, none swallowed by the same-cause rule";
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PINNED DONATION TX vs THE SERVED FALLBACK TEMPLATE
+//
+// Measured on the production primary, 2026-08-07 (log c2pool-dash-v024.log.1,
+// window 22:33:35 -> 23:32:45, 197 distinct served dashd-fallback templates):
+//
+//     131  produced by the DECLINED-EMBEDDED branch  -> the splice ran
+//                                                        (28 INCLUDED, 103
+//                                                         EXCLUDED cause=tip-unknown)
+//      66  produced by the GBT-XCHECK SWAP           -> the splice NEVER ran,
+//                                                        and NOTHING was logged
+//
+// The 66 are the defect. The swap replaces the embedded selection -- which
+// already carries the pins -- with a fresh dashd template that no pin splice
+// ever touches, so the donation silently falls off a third of everything we
+// serve. Block h=2518044 was won from one of them:
+//
+//     23:12:31.660-.711  [GBT-EMB] pinned tx INCLUDED x4  h=2518044
+//     23:12:31.768       GBT-xcheck MATCH-MODULO-SPECIAL  h=2518044
+//     23:12:31.768       template sourced: arm=dashd-fallback
+//     23:12:39           won block 2518044                (0 of 4 pins on chain)
+//
+// 57 ms between "the pins are on this template" and serving a different one.
+// ═════════════════════════════════════════════════════════════════════════════
+namespace {
+
+// A pinned tx that the gate ADMITS: one mature non-coinbase input, one output
+// of exactly the input value (fee == 0), well under kMaxPinnedTxBytes.
+dash::coin::MutableTransaction admissible_pin(const uint256& funding)
+{
+    dash::coin::MutableTransaction pin;
+    pin.vin.resize(1);
+    pin.vin[0].prevout.hash  = funding;
+    pin.vin[0].prevout.index = 0;
+    pin.vout.resize(1);
+    pin.vout[0].value  = 50'000;
+    pin.vout[0].scriptPubKey.m_data = fixture_miner_script();
+    return pin;
+}
+
+bool template_carries(const dash::coin::DashWorkData& w, const uint256& txid)
+{
+    return std::find(w.m_tx_hashes.begin(), w.m_tx_hashes.end(), txid)
+        != w.m_tx_hashes.end();
+}
+
+const dash::coin::PinOutcome* find_pin_outcome(const dash::coin::DashWorkData& w,
+                                               const uint256& txid)
+{
+    for (const auto& o : w.m_pin_outcomes)
+        if (o.txid == txid) return &o;
+    return nullptr;
+}
+
+// The xcheck fixture: populated + SML-fresh + credit-pool-fresh coin state whose
+// embedded template is viable, plus a dashd fallback that disagrees on
+// creditPool at the SAME height so the backstop swaps the served arm.
+void seed_xcheck_ready(dash::coin::NodeCoinState& cs, const uint256& emb_prev,
+                       int64_t seed)
+{
+    dash::coin::vendor::CSimplifiedMNListEntry e1;
+    e1.proRegTxHash.SetHex(std::string(64, '4'));
+    e1.confirmedHash.SetHex(std::string(64, '5'));
+    e1.isValid = true;
+    cs.sml().mnList = {e1};
+    cs.sml().sort();
+    cs.set_have_sml(true);
+    cs.set_sml_current_hash(emb_prev);
+    cs.set_require_sml(true);
+    cs.set_require_fresh_credit_pool(true);
+    cs.set_credit_pool(seed, emb_prev, static_cast<int32_t>(kEmbeddedPrevHeight));
+    cs.set_tip(kEmbeddedPrevHeight, emb_prev, 0x1e0ffff0u, 1'700'000'000u,
+               76, 16, kCurtime, static_cast<uint32_t>(kVersion));
+    seed_resolvable_mn(cs);
+}
+
+}  // namespace
+
+// THE DEFECT. An admissible pin rides the EMBEDDED template (proved first, so
+// this test cannot pass vacuously on an inadmissible pin), and then the
+// GBT-xcheck swap serves a dashd template that carries neither the pin nor any
+// record of why it is missing.
+TEST(DashStratumPinSplice, XcheckSwapDropsThePinnedDonationSilently)
+{
+    using ::core::coin::UTXOViewCache;
+    using ::core::coin::Outpoint;
+    using ::core::coin::Coin;
+
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    uint256 funding;  funding.begin()[0] = 0x42;
+    const int64_t seed = 500'000'000LL;
+
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(funding, 0), Coin(50'000, {}, /*height=*/1, /*cb=*/false));
+    const auto pin  = admissible_pin(funding);
+    const auto txid = dash::coin::dash_txid(pin);
+
+    auto submit = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+
+    // ── (a) NON-VACUITY: the same pin, the same gate, xcheck OFF -> the served
+    // EMBEDDED template carries it. If this fails the fixture is wrong, not the
+    // code under test.
+    {
+        dash::coin::NodeCoinState cs;
+        seed_xcheck_ready(cs, emb_prev, seed);
+        cs.mempool().set_utxo(&utxo);
+        cs.set_pinned_local_txs({pin});
+
+        auto fallback = []() -> dash::coin::DashWorkData { return dash::coin::DashWorkData{}; };
+        dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                         core::stratum::StratumConfig{},
+                                         /*is_testnet=*/true);
+        ASSERT_FALSE(ws.get_current_work_template().empty());
+        auto t = ws.peek_template();
+        ASSERT_TRUE(t);
+        ASSERT_TRUE(template_carries(*t, txid))
+            << "fixture broken: the pin is not admissible on the embedded arm, "
+               "so the xcheck assertion below would be vacuous";
+    }
+
+    // ── (b) THE DEFECT: same coin state, xcheck ARMED, dashd disagrees on
+    // creditPool at the same height -> the backstop serves dashd's template.
+    dash::coin::NodeCoinState cs;
+    seed_xcheck_ready(cs, emb_prev, seed);
+    cs.mempool().set_utxo(&utxo);
+    cs.set_pinned_local_txs({pin});
+
+    const int64_t dashd_credit = seed + 424242LL;
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height         = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits           = 0x1e0ffff0u;
+        w.m_version        = static_cast<uint32_t>(kVersion);
+        w.m_curtime        = kCurtime;
+        dash::coin::vendor::CCbTx cb;
+        cb.nVersion           = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+        cb.nHeight            = static_cast<int32_t>(kEmbeddedPrevHeight + 1);
+        cb.creditPoolBalance  = dashd_credit;
+        w.m_coinbase_payload  = dash::coin::encode_cbtx(cb);
+        return w;
+    };
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    ws.set_gbt_xcheck(true);
+
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+    dash::coin::vendor::CCbTx served;
+    ASSERT_TRUE(dash::coin::vendor::parse_cbtx(t->m_coinbase_payload, served));
+    ASSERT_EQ(served.creditPoolBalance, dashd_credit)
+        << "precondition: the xcheck backstop must have swapped in dashd's template";
+
+    // THE CONTRACT: ride, or say why. Never both absent.
+    const bool rides = template_carries(*t, txid);
+    const auto* outcome = find_pin_outcome(*t, dash::coin::dash_txid(pin));
+    EXPECT_TRUE(rides || (outcome != nullptr && !outcome->cause.empty()))
+        << "h=2518044 shape: the served dashd template dropped the pinned "
+           "donation and recorded no reason at all";
+
+    // With the arm flag at its DEFAULT (off) the served bytes are unchanged --
+    // so the resolution must be the NAMED cause, not an inclusion.
+    EXPECT_FALSE(rides)
+        << "--pin-splice-xcheck-arm defaults OFF: no new bytes may be served";
+    ASSERT_NE(outcome, nullptr);
+    EXPECT_EQ(outcome->cause, "xcheck-swap-pin-gate-off");
+    EXPECT_EQ(outcome->gate_height, kEmbeddedPrevHeight + 1);
+    EXPECT_EQ(outcome->template_height, kEmbeddedPrevHeight + 1);
+}
+
+// FLAG ON: the same swap, the same pin, and now it RIDES -- the served dashd
+// template carries the donation and the outcome says so. This is the arm the
+// operator turns on once the flag-off shape has been read in production.
+TEST(DashStratumPinSplice, XcheckSwapCarriesThePinWhenTheArmIsEnabled)
+{
+    using ::core::coin::UTXOViewCache;
+    using ::core::coin::Outpoint;
+    using ::core::coin::Coin;
+
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    uint256 funding;  funding.begin()[0] = 0x44;
+    const int64_t seed = 500'000'000LL;
+
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(funding, 0), Coin(50'000, {}, /*height=*/1, /*cb=*/false));
+    const auto pin  = admissible_pin(funding);
+    const auto txid = dash::coin::dash_txid(pin);
+
+    dash::coin::NodeCoinState cs;
+    seed_xcheck_ready(cs, emb_prev, seed);
+    cs.mempool().set_utxo(&utxo);
+    cs.set_pinned_local_txs({pin});
+
+    const int64_t dashd_credit = seed + 424242LL;
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height         = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits           = 0x1e0ffff0u;
+        w.m_version        = static_cast<uint32_t>(kVersion);
+        w.m_curtime        = kCurtime;
+        dash::coin::vendor::CCbTx cb;
+        cb.nVersion          = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+        cb.nHeight           = static_cast<int32_t>(kEmbeddedPrevHeight + 1);
+        cb.creditPoolBalance = dashd_credit;
+        w.m_coinbase_payload = dash::coin::encode_cbtx(cb);
+        return w;
+    };
+    auto submit = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    ws.set_gbt_xcheck(true);
+    ws.set_pin_splice_xcheck_arm(true);
+
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+    dash::coin::vendor::CCbTx served;
+    ASSERT_TRUE(dash::coin::vendor::parse_cbtx(t->m_coinbase_payload, served));
+    ASSERT_EQ(served.creditPoolBalance, dashd_credit)
+        << "precondition: the xcheck backstop must have swapped in dashd's template";
+
+    EXPECT_TRUE(template_carries(*t, txid))
+        << "--pin-splice-xcheck-arm is ON: the pin must ride the swapped template";
+    const auto* outcome = find_pin_outcome(*t, txid);
+    ASSERT_NE(outcome, nullptr);
+    EXPECT_TRUE(outcome->included);
+    EXPECT_TRUE(outcome->cause.empty());
+    // The append must be COMPLETE -- all four parallel vectors, fee recorded as
+    // zero, coinbase claim untouched. A half-spliced tx is an unmineable block.
+    ASSERT_EQ(t->m_txs.size(), t->m_tx_hashes.size());
+    ASSERT_EQ(t->m_txs.size(), t->m_tx_fees.size());
+    ASSERT_EQ(t->m_txs.size(), t->m_tx_data_hex.size());
+    EXPECT_EQ(t->m_tx_fees.back(), 0u);
+    EXPECT_FALSE(t->m_tx_data_hex.back().empty());
+}
+
+// THE BUDGET. The fallback splice caps pins against 400 KB of PINS and nothing
+// else -- never against what the template it is appending to already holds. A
+// dashd template that is already near the 2 MB block limit therefore accepts
+// the pin and produces a block that cannot be mined (bad-blk-length).
+TEST(DashStratumPinSplice, FallbackSpliceRespectsTheBlockSizeBudget)
+{
+    using ::core::coin::UTXOViewCache;
+    using ::core::coin::Outpoint;
+    using ::core::coin::Coin;
+
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    uint256 funding;  funding.begin()[0] = 0x43;
+
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(funding, 0), Coin(50'000, {}, /*height=*/1, /*cb=*/false));
+    const auto pin  = admissible_pin(funding);
+    const auto txid = dash::coin::dash_txid(pin);
+
+    // Mainnet with --embedded-mainnet OFF: the arm declines by the gate, the
+    // tip is still known (so the pin gate judges at a real height), and the
+    // served template is the dashd fallback that the splice runs on today.
+    dash::coin::NodeCoinState cs;
+    seed_populated(cs);
+    cs.mempool().set_utxo(&utxo);
+    cs.set_pinned_local_txs({pin});
+
+    // A dashd template already holding ~1.95 MB of transaction payload.
+    constexpr size_t kFatBytes = 1'950'000;
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height         = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits           = 0x1e0ffff0u;
+        w.m_version        = static_cast<uint32_t>(kVersion);
+        w.m_curtime        = kCurtime;
+        dash::coin::MutableTransaction fat;   // identity only; the BYTES are the hex
+        fat.vin.resize(1);
+        fat.vin[0].prevout.hash.begin()[0] = 0x77;
+        w.m_txs.emplace_back(fat);
+        w.m_tx_hashes.push_back(dash::coin::dash_txid(fat));
+        w.m_tx_fees.push_back(0);
+        w.m_tx_data_hex.push_back(std::string(kFatBytes * 2, 'a'));
+        return w;
+    };
+    auto submit = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/false);
+    // The budget is FLAG-GATED and OFF by default, because enforcing it removes
+    // a pin from a template this arm is already serving in production -- a
+    // served-bytes change, which may not default on. Arm it here; the companion
+    // test below pins the DEFAULT (off) shape.
+    ws.set_pin_splice_block_budget(true);
+
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t);
+    ASSERT_EQ(t->m_height, kEmbeddedPrevHeight + 1)
+        << "precondition: the dashd fallback template is the one being served";
+
+    EXPECT_FALSE(template_carries(*t, txid))
+        << "the pin was appended to a template already at " << kFatBytes
+        << " bytes -- the only cap that ran was pins-vs-400KB";
+    const auto* outcome = find_pin_outcome(*t, txid);
+    ASSERT_NE(outcome, nullptr) << "an exclusion without a record is the defect";
+    EXPECT_EQ(outcome->cause, "block-budget");
+}
+
+// THE HOIST MUST NOT REGRESS THE PATH THAT ALREADY WORKED. Same declined-
+// embedded producer as the budget KAT above, but a normal-sized dashd template:
+// the pin still rides, still with fee 0, still recorded as INCLUDED. Moving the
+// splice from inside the fallback branch to the final selection is a pure move
+// only if this stays green.
+TEST(DashStratumPinSplice, DeclinedEmbeddedFallbackStillCarriesThePin)
+{
+    using ::core::coin::UTXOViewCache;
+    using ::core::coin::Outpoint;
+    using ::core::coin::Coin;
+
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    uint256 funding;  funding.begin()[0] = 0x45;
+
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(funding, 0), Coin(50'000, {}, /*height=*/1, /*cb=*/false));
+    const auto pin  = admissible_pin(funding);
+    const auto txid = dash::coin::dash_txid(pin);
+
+    dash::coin::NodeCoinState cs;
+    seed_populated(cs);
+    cs.mempool().set_utxo(&utxo);
+    cs.set_pinned_local_txs({pin});
+
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height         = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits           = 0x1e0ffff0u;
+        w.m_version        = static_cast<uint32_t>(kVersion);
+        w.m_curtime        = kCurtime;
+        return w;
+    };
+    auto submit = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+    // mainnet, --embedded-mainnet OFF => the arm declines by the gate and the
+    // dashd fallback is what gets served.
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/false);
+
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t);
+    EXPECT_TRUE(template_carries(*t, txid))
+        << "the declined-embedded fallback has spliced the pin since #1170; "
+           "the hoist must not have taken that away";
+    const auto* outcome = find_pin_outcome(*t, txid);
+    ASSERT_NE(outcome, nullptr);
+    EXPECT_TRUE(outcome->included);
+    ASSERT_FALSE(t->m_tx_fees.empty());
+    EXPECT_EQ(t->m_tx_fees.back(), 0u);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// THE SPLICE GUARDS, DRIVEN DIRECTLY.
+//
+// An adversarial rebuild of this branch replaced two money-path guards with
+// `if (false)`, rebuilt, and every test above still passed. They were
+// unreachable from the pipeline by construction:
+//
+//   * pin-verdict-count-mismatch  -- pins and verdicts both come out of ONE
+//     evaluate_pinned_txs() call, so the pipeline cannot make them disagree;
+//   * xcheck-swap-height-mismatch -- the xcheck backstop only swaps when dashd's
+//     height EQUALS ours, so the pipeline cannot make them disagree either;
+//   * already-in-template / input-spent-by-template -- no fixture hands the
+//     splice a host template that already carries the pin.
+//
+// A guard on the money path that no test can reach is not a guard. The splice
+// is pure (it takes a DashWorkData and mutates only that), so these KATs call
+// dash::stratum::detail::splice_pins_onto_served_fallback directly. Each one is
+// proven red by making exactly the `if (false)` mutation on its own guard.
+// ═════════════════════════════════════════════════════════════════════════════
+namespace {
+
+constexpr uint32_t kSpliceHeight = 500001;
+
+// An ok verdict at a chosen height -- what the gate hands the splice when the
+// pin is admissible beside the coin state.
+dash::coin::PinVerdict ok_verdict(uint32_t at_height)
+{
+    dash::coin::PinVerdict v;
+    v.ok        = true;
+    v.at_height = at_height;
+    return v;
+}
+
+// A served dashd-fallback template at kSpliceHeight carrying `hosts`, with the
+// four parallel vectors kept in step exactly as pin_append keeps them.
+dash::coin::DashWorkData host_template(
+    const std::vector<dash::coin::MutableTransaction>& hosts = {})
+{
+    dash::coin::DashWorkData w;
+    w.m_height = kSpliceHeight;
+    w.m_previous_block.SetHex(kEmbeddedPrevHashHex);
+    for (const auto& h : hosts) {
+        auto packed = ::pack(h);       // keep the packed buffer alive across the HexStr read below
+        auto sp = packed.get_span();
+        w.m_txs.emplace_back(h);
+        w.m_tx_hashes.push_back(dash::coin::dash_txid(h));
+        w.m_tx_fees.push_back(0);
+        w.m_tx_data_hex.push_back(HexStr(std::span<const unsigned char>(
+            reinterpret_cast<const unsigned char*>(sp.data()), sp.size())));
+    }
+    return w;
+}
+
+}  // namespace
+
+// GUARD (verdict/pin count). The verdict vector is indexed BY POSITION against
+// the pin vector. A length disagreement means the two crossed the thread
+// boundary out of step, and indexing into a guess on the money path is how a
+// pin gets spliced under someone else's admission decision.
+//
+// RED WITHOUT THE GUARD: with `if (verdicts.size() != pins->size())` replaced by
+// `if (false)`, the extra-verdict case below indexes verdicts[0] -- which is ok
+// -- and the pin RIDES, so the ASSERT_TRUE(w.m_txs.empty()) fails.
+TEST(DashStratumSpliceGuards, VerdictCountMismatchRefusesEveryPinByName)
+{
+    uint256 f1; f1.begin()[0] = 0x61;
+    const auto pin  = admissible_pin(f1);
+    const auto txid = dash::coin::dash_txid(pin);
+    const std::vector<dash::coin::MutableTransaction> pins{pin};
+
+    // MORE verdicts than pins. Chosen as the load-bearing case on purpose: with
+    // the guard mutated out every index is still in range, so the mutation's
+    // effect is a DETERMINISTIC inclusion rather than an out-of-range read.
+    {
+        auto w = host_template();
+        const std::vector<dash::coin::PinVerdict> verdicts{
+            ok_verdict(kSpliceHeight), ok_verdict(kSpliceHeight)};
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, verdicts, /*from_xcheck_swap=*/false,
+            /*xcheck_arm_enabled=*/false, /*block_budget_enabled=*/false);
+
+        ASSERT_TRUE(w.m_txs.empty())
+            << "2 verdicts for 1 pin: the splice indexed into a mismatched "
+               "vector and appended anyway";
+        ASSERT_FALSE(template_carries(w, txid));
+        ASSERT_EQ(w.m_pin_outcomes.size(), 1u);
+        ASSERT_FALSE(w.m_pin_outcomes[0].included);
+        ASSERT_EQ(w.m_pin_outcomes[0].cause, "pin-verdict-count-mismatch");
+        // The refusal must also reach the operator as a DROP, not just a code.
+        ASSERT_NE(w.m_pin_drop_alarm.find("DONATION-DROPPED 1/1"),
+                  std::string::npos);
+        ASSERT_NE(w.m_pin_drop_alarm.find("pin-verdict-count-mismatch"),
+                  std::string::npos);
+    }
+
+    // FEWER verdicts than pins -- the direction that would be an out-of-range
+    // read. Reached only when the case above already held.
+    {
+        auto w = host_template();
+        const std::vector<dash::coin::PinVerdict> none;
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, none, false, false, false);
+        EXPECT_TRUE(w.m_txs.empty());
+        ASSERT_EQ(w.m_pin_outcomes.size(), 1u);
+        EXPECT_EQ(w.m_pin_outcomes[0].cause, "pin-verdict-count-mismatch");
+    }
+
+    // NON-VACUITY: the same pin, the same height, verdicts in step -> it rides.
+    // Without this the two assertions above would pass on a splice that never
+    // includes anything.
+    {
+        auto w = host_template();
+        const std::vector<dash::coin::PinVerdict> matched{ok_verdict(kSpliceHeight)};
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, matched, false, false, false);
+        EXPECT_TRUE(template_carries(w, txid))
+            << "fixture broken: this pin never rides, so the refusals above "
+               "prove nothing";
+        EXPECT_TRUE(w.m_pin_drop_alarm.empty())
+            << "no pin was dropped -- the alarm must stay silent";
+    }
+}
+
+// GUARD (xcheck-swap height). The verdict is judged at OUR tip+1; the swapped
+// template's height is dashd's. Coinbase maturity is a function of height, so a
+// disagreement means the admission decision does not apply to this template.
+//
+// RED WITHOUT THE GUARD: with the `if (from_xcheck_swap && w.m_height != 0 &&
+// v.at_height != w.m_height)` line replaced by `if (false)`, the mismatched pin
+// rides and EXPECT_FALSE(template_carries(...)) fails.
+TEST(DashStratumSpliceGuards, XcheckSwapHeightMismatchExcludesByName)
+{
+    uint256 f1; f1.begin()[0] = 0x62;
+    const auto pin  = admissible_pin(f1);
+    const auto txid = dash::coin::dash_txid(pin);
+    const std::vector<dash::coin::MutableTransaction> pins{pin};
+
+    // (a) THE GUARD. Arm flag ON (so gate (b) cannot shadow this), swapped arm,
+    // verdict judged one height BELOW the template.
+    {
+        auto w = host_template();
+        const std::vector<dash::coin::PinVerdict> verdicts{
+            ok_verdict(kSpliceHeight - 1)};
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, verdicts, /*from_xcheck_swap=*/true,
+            /*xcheck_arm_enabled=*/true, /*block_budget_enabled=*/false);
+
+        EXPECT_FALSE(template_carries(w, txid))
+            << "the verdict was judged at h=" << (kSpliceHeight - 1)
+            << " and the template is at h=" << kSpliceHeight
+            << " -- maturity is a function of height";
+        ASSERT_EQ(w.m_pin_outcomes.size(), 1u);
+        EXPECT_FALSE(w.m_pin_outcomes[0].included);
+        EXPECT_EQ(w.m_pin_outcomes[0].cause, "xcheck-swap-height-mismatch");
+        EXPECT_EQ(w.m_pin_outcomes[0].gate_height, kSpliceHeight - 1);
+        EXPECT_EQ(w.m_pin_outcomes[0].template_height, kSpliceHeight);
+        EXPECT_NE(w.m_pin_drop_alarm.find("xcheck-swap-height-mismatch"),
+                  std::string::npos);
+    }
+
+    // (b) NON-VACUITY: heights AGREE on the same armed swap -> it rides.
+    {
+        auto w = host_template();
+        const std::vector<dash::coin::PinVerdict> verdicts{ok_verdict(kSpliceHeight)};
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, verdicts, true, true, false);
+        EXPECT_TRUE(template_carries(w, txid))
+            << "fixture broken: the armed swap never carries this pin, so (a) "
+               "proves nothing";
+    }
+
+    // (c) CONFINEMENT. The rule is deliberately xcheck-swap-only: the
+    // declined-embedded branch has always spliced regardless of the height it
+    // was judged at, and widening it there would change bytes this branch is
+    // required not to touch. Same mismatch, same pin, non-swapped arm -> RIDES.
+    {
+        auto w = host_template();
+        const std::vector<dash::coin::PinVerdict> verdicts{
+            ok_verdict(kSpliceHeight - 1)};
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, verdicts, /*from_xcheck_swap=*/false, false, false);
+        EXPECT_TRUE(template_carries(w, txid))
+            << "the height rule leaked onto the declined-embedded arm and "
+               "changed what that arm serves";
+    }
+}
+
+// GUARD (duplicate / conflict vs the host template). The splice appended blind.
+// Splicing a txid the served template already carries is bad-txns-duplicate;
+// splicing a tx whose input the template already spends is
+// bad-txns-inputs-missingorspent. Either one costs the WHOLE block, not the
+// donation -- and unlike the size budget these are consensus-exact, so
+// excluding can only ever change a template that could never have been mined.
+//
+// RED WITHOUT THE GUARD: `if (std::find(...) != w.m_tx_hashes.end())` -> `if
+// (false)` makes case (a) append a second copy (m_txs.size() == 2); nulling the
+// conflict scan makes case (b) append the double-spend.
+TEST(DashStratumSpliceGuards, SpliceRefusesDuplicateAndConflictingPins)
+{
+    uint256 funding; funding.begin()[0] = 0x63;
+    const auto pin  = admissible_pin(funding);
+    const auto txid = dash::coin::dash_txid(pin);
+    const std::vector<dash::coin::MutableTransaction> pins{pin};
+    const std::vector<dash::coin::PinVerdict> verdicts{ok_verdict(kSpliceHeight)};
+
+    // (a) THE TEMPLATE ALREADY CARRIES THIS EXACT TXID.
+    {
+        auto w = host_template({pin});
+        ASSERT_EQ(w.m_txs.size(), 1u);
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, verdicts, false, false, false);
+        EXPECT_EQ(w.m_txs.size(), 1u)
+            << "the same transaction is in the block twice -- bad-txns-duplicate";
+        EXPECT_EQ(w.m_tx_hashes.size(), 1u);
+        ASSERT_EQ(w.m_pin_outcomes.size(), 1u);
+        EXPECT_FALSE(w.m_pin_outcomes[0].included);
+        EXPECT_EQ(w.m_pin_outcomes[0].cause, "already-in-template");
+    }
+
+    // (b) A DIFFERENT TRANSACTION ALREADY SPENDS THE PIN'S INPUT. Same outpoint,
+    // different txid (different output value), so the txid scan cannot catch it.
+    {
+        auto conflicting = admissible_pin(funding);
+        conflicting.vout[0].value = 49'000;    // -> different txid, same input
+        ASSERT_NE(dash::coin::dash_txid(conflicting), txid);
+        auto w = host_template({conflicting});
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, verdicts, false, false, false);
+        EXPECT_EQ(w.m_txs.size(), 1u)
+            << "two transactions in one block spend outpoint " << funding.GetHex()
+            << ":0 -- bad-txns-inputs-missingorspent";
+        EXPECT_FALSE(template_carries(w, txid));
+        ASSERT_EQ(w.m_pin_outcomes.size(), 1u);
+        EXPECT_EQ(w.m_pin_outcomes[0].cause, "input-spent-by-template");
+    }
+
+    // (c) THE SAME PIN CONFIGURED TWICE. The scan reads the containers
+    // pin_append writes, so the second copy is caught inside one call: the
+    // first rides, the second is named.
+    {
+        auto w = host_template();
+        const std::vector<dash::coin::MutableTransaction> twice{pin, pin};
+        const std::vector<dash::coin::PinVerdict> two{ok_verdict(kSpliceHeight),
+                                                     ok_verdict(kSpliceHeight)};
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &twice, two, false, false, false);
+        EXPECT_EQ(w.m_txs.size(), 1u);
+        ASSERT_EQ(w.m_pin_outcomes.size(), 2u);
+        EXPECT_TRUE(w.m_pin_outcomes[0].included);
+        EXPECT_FALSE(w.m_pin_outcomes[1].included);
+        EXPECT_EQ(w.m_pin_outcomes[1].cause, "already-in-template");
+    }
+
+    // (d) NON-VACUITY: a clean host template with an unrelated tx -> it rides.
+    {
+        uint256 other; other.begin()[0] = 0x64;
+        auto w = host_template({admissible_pin(other)});
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, verdicts, false, false, false);
+        EXPECT_TRUE(template_carries(w, txid))
+            << "fixture broken: this pin never rides a populated template";
+        EXPECT_EQ(w.m_txs.size(), 2u);
+    }
+}
+
+// THE BLOCK-SIZE BUDGET IS FLAG-GATED, AND ITS DEFAULT IS BYTE-FOR-BYTE THE
+// BEHAVIOUR THAT WAS ALREADY LIVE. The declined-embedded arm has been splicing
+// pins onto served templates since #1170; turning an inclusion there into an
+// exclusion changes the served transaction set, which a money-path change may
+// not do by default. So the default still SERVES the over-budget pin and SAYS
+// the budget was blown; only --pin-splice-block-budget acts on it.
+//
+// RED WITHOUT THE GATE: `if (block_budget_enabled)` -> `if (true)` makes the
+// default arm exclude the pin, and EXPECT_TRUE(template_carries(...)) fails.
+TEST(DashStratumSpliceGuards, BlockBudgetIsGatedOffAndTheDefaultStillServes)
+{
+    uint256 funding; funding.begin()[0] = 0x65;
+    const auto pin  = admissible_pin(funding);
+    const auto txid = dash::coin::dash_txid(pin);
+    const std::vector<dash::coin::MutableTransaction> pins{pin};
+    const std::vector<dash::coin::PinVerdict> verdicts{ok_verdict(kSpliceHeight)};
+
+    // A host template already holding ~1.95 MB of transaction payload: over the
+    // 1.9 MB pin budget, still 49915 bytes INSIDE the 2 MB consensus limit.
+    constexpr size_t kFatBytes = 1'950'000;
+    static_assert(kFatBytes > dash::coin::Mempool::kMaxPinnedBlockBytes,
+                  "fixture must exceed the budget");
+    static_assert(kFatBytes + 1000 < dash::coin::Mempool::kMaxBlockBytes,
+                  "and must stay inside the consensus limit -- that gap is "
+                  "exactly why the budget may not default on");
+    auto fat_template = [&]() {
+        auto w = host_template();
+        dash::coin::MutableTransaction fat;   // identity only; the BYTES are the hex
+        fat.vin.resize(1);
+        fat.vin[0].prevout.hash.begin()[0] = 0x77;
+        w.m_txs.emplace_back(fat);
+        w.m_tx_hashes.push_back(dash::coin::dash_txid(fat));
+        w.m_tx_fees.push_back(0);
+        w.m_tx_data_hex.push_back(std::string(kFatBytes * 2, 'a'));
+        return w;
+    };
+
+    // (a) DEFAULT (flag OFF): the pin RIDES -- served bytes unchanged from what
+    // this arm already produces -- and the template SAYS the budget was blown.
+    {
+        auto w = fat_template();
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, verdicts, false, false, /*block_budget_enabled=*/false);
+        EXPECT_TRUE(template_carries(w, txid))
+            << "the budget acted at its default and removed a pin the "
+               "declined-embedded arm is already serving";
+        EXPECT_TRUE(w.m_pin_block_budget_unenforced)
+            << "over budget and silent about it -- the operator cannot see the "
+               "bad-blk-length exposure that cost block 2517855";
+        EXPECT_NE(dash::stratum::detail::served_pins_field(w, &pins)
+                      .find("BLOCK-BUDGET-UNENFORCED"),
+                  std::string::npos);
+        ASSERT_EQ(w.m_pin_outcomes.size(), 1u);
+        EXPECT_TRUE(w.m_pin_outcomes[0].included);
+    }
+
+    // (b) ARMED: the same template, the same pin, now EXCLUDED by name.
+    {
+        auto w = fat_template();
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, verdicts, false, false, /*block_budget_enabled=*/true);
+        EXPECT_FALSE(template_carries(w, txid));
+        EXPECT_FALSE(w.m_pin_block_budget_unenforced)
+            << "the budget was ENFORCED, so nothing rode unenforced";
+        ASSERT_EQ(w.m_pin_outcomes.size(), 1u);
+        EXPECT_EQ(w.m_pin_outcomes[0].cause, "block-budget");
+    }
+
+    // (c) The gate is about the BUDGET, not about pins in general: an
+    // under-budget pin rides on both settings.
+    {
+        auto w = host_template();
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, verdicts, false, false, true);
+        EXPECT_TRUE(template_carries(w, txid));
+        EXPECT_FALSE(w.m_pin_block_budget_unenforced);
+    }
+}
+
+// THE DROP ALARM -- what the flag-OFF xcheck-swap arm buys instead of bytes.
+//
+// With --pin-splice-xcheck-arm at its default the h=2518044 loss shape is
+// unchanged in BYTES: the pins are still absent from every swapped template.
+// What changes is that the loss is STATED, per template, with the money counted
+// and the flag that buys it back named. A ratio ("pins=0/4") does not tell an
+// operator that a donation is being given up.
+//
+// RED WITHOUT THE ALARM: `if (dropped == 0) return;` -> `if (true) return;`
+// leaves m_pin_drop_alarm empty and every ASSERT_NE below fails.
+TEST(DashStratumSpliceGuards, DropAlarmNamesTheCountValueAndCause)
+{
+    uint256 f1; f1.begin()[0] = 0x66;
+    uint256 f2; f2.begin()[0] = 0x67;
+    auto p1 = admissible_pin(f1);
+    auto p2 = admissible_pin(f2);
+    p2.vout[0].value = 30'000;
+    const std::vector<dash::coin::MutableTransaction> pins{p1, p2};
+    const std::vector<dash::coin::PinVerdict> verdicts{ok_verdict(kSpliceHeight),
+                                                      ok_verdict(kSpliceHeight)};
+
+    // The shipped default on the swapped arm: both pins dropped by policy.
+    auto w = host_template();
+    dash::stratum::detail::splice_pins_onto_served_fallback(
+        w, &pins, verdicts, /*from_xcheck_swap=*/true,
+        /*xcheck_arm_enabled=*/false, false);
+
+    EXPECT_TRUE(w.m_txs.empty());
+    ASSERT_FALSE(w.m_pin_drop_alarm.empty())
+        << "the donation is being dropped from a SERVED template and the "
+           "template does not say so";
+    // COUNT, HEIGHT, MONEY, CAUSE, SITE -- each one load-bearing for the
+    // operator: without the value it is a ratio, without the cause it is a
+    // mystery, without the site it is the wrong arm.
+    EXPECT_NE(w.m_pin_drop_alarm.find("DONATION-DROPPED 2/2"), std::string::npos)
+        << w.m_pin_drop_alarm;
+    EXPECT_NE(w.m_pin_drop_alarm.find("h=" + std::to_string(kSpliceHeight)),
+              std::string::npos) << w.m_pin_drop_alarm;
+    EXPECT_NE(w.m_pin_drop_alarm.find("value=80000sat"), std::string::npos)
+        << "50000 + 30000 -- the whole amount at stake, not a count: "
+        << w.m_pin_drop_alarm;
+    EXPECT_NE(w.m_pin_drop_alarm.find("cause=xcheck-swap-pin-gate-off"),
+              std::string::npos) << w.m_pin_drop_alarm;
+    EXPECT_NE(w.m_pin_drop_alarm.find("site=xcheck-swap"), std::string::npos)
+        << w.m_pin_drop_alarm;
+    // And it must reach the ONE line an operator greps for arm provenance.
+    EXPECT_NE(dash::stratum::detail::served_pins_field(w, &pins)
+                  .find("DONATION-DROPPED 2/2"),
+              std::string::npos);
+
+    // NO FALSE ALARM: the same two pins on the armed swap ride, and the field
+    // stays a clean pins=2/2 with nothing shouted.
+    auto clean = host_template();
+    dash::stratum::detail::splice_pins_onto_served_fallback(
+        clean, &pins, verdicts, true, /*xcheck_arm_enabled=*/true, false);
+    EXPECT_EQ(clean.m_txs.size(), 2u);
+    EXPECT_TRUE(clean.m_pin_drop_alarm.empty());
+    EXPECT_EQ(dash::stratum::detail::served_pins_field(clean, &pins), " pins=2/2");
+}
+
+// THE ALARM MUST BE TRUTHFUL -- `already-in-template` is NOT a dropped donation.
+//
+// The alarm's WARNING asserts "this template IS SERVED to miners without the
+// donation; if it wins, that value does not land". `included` records what THE
+// SPLICE did, not what the SERVED TEMPLATE holds, and exactly one of the seven
+// causes makes those disagree: `already-in-template` refuses BECAUSE
+// w.m_tx_hashes already carries the txid. The money is on the template. It
+// lands. The shipped line contradicted itself inside one string --
+//
+//   pins=1/1 pin_cause=already-in-template DONATION-DROPPED 1/1 pins h=500001 value=50000sat
+//
+// -- pins=1/1 counted by PRESENCE against DONATION-DROPPED 1/1 counted by
+// outcome. An alarm that fires where the money DID land is the alarm the next
+// operator learns to ignore, and then block 2518044 happens again unseen.
+//
+// RED WITHOUT THE FIX: delete the presence test from raise_drop_alarm
+// (work_source.cpp -- the std::find over w.m_tx_hashes) and arms (a), (b) and
+// (c) all fail -- (a) and (b) on a non-empty m_pin_drop_alarm, (c) on the
+// count/value/cause of a real loss being inflated by a pin that is being served.
+//
+// This test originally rode a skip on the cause STRING. It does not any more:
+// the string skip was one refusal shape short (see
+// DropAlarmKeysOnPresenceNotOnTheCauseString below) and is gone, so this test
+// and that one now both hang on the same single statement, which is the point --
+// one mutation must be able to take them both down.
+TEST(DashStratumSpliceGuards, DropAlarmIsSilentWhenTheDuplicatePinIsActuallyServed)
+{
+    uint256 funding; funding.begin()[0] = 0x68;
+    const auto pin  = admissible_pin(funding);          // 50'000 sat
+    const auto txid = dash::coin::dash_txid(pin);
+    const std::vector<dash::coin::MutableTransaction> pins{pin};
+    const std::vector<dash::coin::PinVerdict> verdicts{ok_verdict(kSpliceHeight)};
+
+    // (a) THE REPORTED LINE. The served template already carries the pin, so the
+    // splice refuses -- and the donation is ON THE TEMPLATE.
+    {
+        auto w = host_template({pin});
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, verdicts, /*from_xcheck_swap=*/false,
+            /*xcheck_arm_enabled=*/false, /*block_budget_enabled=*/false);
+
+        // The refusal itself is unchanged -- this KAT is about the ALARM, not
+        // about relaxing the duplicate guard.
+        ASSERT_EQ(w.m_pin_outcomes.size(), 1u);
+        ASSERT_FALSE(w.m_pin_outcomes[0].included);
+        ASSERT_EQ(w.m_pin_outcomes[0].cause, "already-in-template");
+        ASSERT_EQ(w.m_txs.size(), 1u) << "the duplicate guard stopped guarding";
+
+        // THE POINT: the value is in the block that gets served.
+        ASSERT_TRUE(template_carries(w, txid))
+            << "fixture broken: the alarm would be telling the truth";
+        EXPECT_TRUE(w.m_pin_drop_alarm.empty())
+            << "DONATION-DROPPED on a template that IS carrying the donation: "
+            << w.m_pin_drop_alarm;
+        const auto field = dash::stratum::detail::served_pins_field(w, &pins);
+        EXPECT_EQ(field.find("DONATION-DROPPED"), std::string::npos)
+            << "the arm line claims a loss and a full pin count at once: " << field;
+        EXPECT_NE(field.find("pins=1/1"), std::string::npos) << field;
+    }
+
+    // (b) THE SAME PIN CONFIGURED TWICE. The first copy rides, the second is
+    // refused as already-in-template by the scan reading what pin_append just
+    // wrote. One donation, served once, correctly: nothing was lost.
+    {
+        auto w = host_template();
+        const std::vector<dash::coin::MutableTransaction> twice{pin, pin};
+        const std::vector<dash::coin::PinVerdict> two{ok_verdict(kSpliceHeight),
+                                                      ok_verdict(kSpliceHeight)};
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &twice, two, false, false, false);
+        ASSERT_EQ(w.m_pin_outcomes.size(), 2u);
+        ASSERT_TRUE(w.m_pin_outcomes[0].included);
+        ASSERT_EQ(w.m_pin_outcomes[1].cause, "already-in-template");
+        EXPECT_TRUE(w.m_pin_drop_alarm.empty())
+            << "configuring one donation twice is not losing it: "
+            << w.m_pin_drop_alarm;
+    }
+
+    // (c) MIXED, AND THE REAL LOSS STILL SHOUTS -- with the served duplicate out
+    // of the count, out of the money, and out of the cause list. This arm is
+    // what stops the fix from being "silence the alarm": a genuine drop beside a
+    // served duplicate must still name itself, at 1/2 and 30000sat, not 2/2 and
+    // 80000sat.
+    {
+        uint256 other; other.begin()[0] = 0x69;
+        auto lost_pin = admissible_pin(other);
+        lost_pin.vout[0].value = 30'000;
+        const auto lost_txid = dash::coin::dash_txid(lost_pin);
+
+        auto w = host_template({pin});                  // already carries `pin`
+        const std::vector<dash::coin::MutableTransaction> both{pin, lost_pin};
+        dash::coin::PinVerdict refused;                 // a REAL refusal
+        refused.ok        = false;
+        refused.cause     = "pin-input-unspendable";
+        refused.at_height = kSpliceHeight;
+        const std::vector<dash::coin::PinVerdict> two{ok_verdict(kSpliceHeight),
+                                                      refused};
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &both, two, false, false, false);
+
+        ASSERT_FALSE(template_carries(w, lost_txid));
+        ASSERT_TRUE(template_carries(w, txid));
+        ASSERT_FALSE(w.m_pin_drop_alarm.empty())
+            << "a pin that is genuinely absent stopped raising the alarm";
+        EXPECT_NE(w.m_pin_drop_alarm.find("DONATION-DROPPED 1/2"),
+                  std::string::npos)
+            << "the served duplicate was counted as lost: " << w.m_pin_drop_alarm;
+        EXPECT_NE(w.m_pin_drop_alarm.find("value=30000sat"), std::string::npos)
+            << "the served duplicate's 50000 sat was added to the loss: "
+            << w.m_pin_drop_alarm;
+        EXPECT_NE(w.m_pin_drop_alarm.find("cause=pin-input-unspendable"),
+                  std::string::npos) << w.m_pin_drop_alarm;
+        EXPECT_EQ(w.m_pin_drop_alarm.find("already-in-template"),
+                  std::string::npos)
+            << "a cause that describes a SERVED pin is in a loss report: "
+            << w.m_pin_drop_alarm;
+    }
+}
+
+// THE ALARM KEYS ON PRESENCE, NOT ON A CAUSE STRING.
+//
+// The first cut of this fix skipped outcomes whose cause == "already-in-template",
+// and that was one refusal shape short of the truth condition. `already-in-template`
+// is only ever REACHED by the duplicate scan (work_source.cpp guard (f)), and FIVE
+// guards run BEFORE it and `continue` with a different cause:
+//
+//   the verdict-count-mismatch early return  (cause=pin-verdict-count-mismatch)
+//   (a) the pin's own verdict !v.ok          (cause=<whatever the gate said>)
+//   (b) xcheck-swap-pin-gate-off
+//   (c) xcheck-swap-height-mismatch
+//   (d)/(e) pin-total-too-large / block-budget
+//
+// A pin that IS on the served template but trips any of those records that
+// cause instead, and the cause-string skip never sees it -- so the alarm still
+// says the donation was lost while the donation is sitting in the block.
+//
+// This is not hypothetical shape-hunting. (a) is the PRODUCTION shape: the
+// embedded UTXO view is built forward from the height we started at, so a coin
+// older than that reads back input-missing-or-spent (mempool.hpp:205, and the
+// SECOND SOURCE comment at :212 exists because the production primary refused a
+// perfectly valid pin exactly this way). The dashd fallback template we splice
+// onto was built from dashd's OWN mempool, which can already carry that same
+// donation. Our gate refuses; dashd already included it; the money lands; the
+// alarm shouts that it did not.
+//
+// The truth condition the WARNING asserts is "the txid is NOT in the served
+// template". So that is what the alarm must test. The cause string is a
+// description of a decision; presence is the fact.
+//
+// RED WITHOUT THE FIX: with the presence test removed from raise_drop_alarm
+// (work_source.cpp) -- or replaced by the old cause-string skip, which is what
+// shipped -- arms (a) through (d) all fail on a non-empty m_pin_drop_alarm, and
+// arm (f) fails on a real loss whose count/value is inflated by a served pin.
+TEST(DashStratumSpliceGuards, DropAlarmKeysOnPresenceNotOnTheCauseString)
+{
+    uint256 funding; funding.begin()[0] = 0x6a;
+    const auto pin  = admissible_pin(funding);          // 50'000 sat
+    const auto txid = dash::coin::dash_txid(pin);
+    const std::vector<dash::coin::MutableTransaction> pins{pin};
+
+    // A refusal from the pin's own gate, at the template's height, with a cause
+    // that is NOT "already-in-template" -- the reviewer's scratch KAT.
+    auto bad_verdict = [](const char* cause) {
+        dash::coin::PinVerdict v;
+        v.ok        = false;
+        v.cause     = cause;
+        v.at_height = kSpliceHeight;
+        return v;
+    };
+
+    // Every arm below serves a template that ALREADY CARRIES the pin. Whatever
+    // the splice decided, the donation is in the block. Nothing may claim a loss.
+    auto expect_no_alarm = [&](const dash::coin::DashWorkData& w,
+                               const char* which, const char* expected_cause) {
+        ASSERT_EQ(w.m_pin_outcomes.size(), 1u) << which;
+        ASSERT_FALSE(w.m_pin_outcomes[0].included) << which;
+        // If this ever reads already-in-template the arm has stopped testing
+        // what it was written to test and the cause-string skip covers it.
+        ASSERT_EQ(w.m_pin_outcomes[0].cause, expected_cause)
+            << which << ": fixture no longer reaches the guard it targets";
+        ASSERT_TRUE(template_carries(w, txid))
+            << which << ": fixture broken, the alarm would be telling the truth";
+        EXPECT_TRUE(w.m_pin_drop_alarm.empty())
+            << which << ": DONATION-DROPPED on a template that IS carrying the "
+                        "donation: " << w.m_pin_drop_alarm;
+        const auto field = dash::stratum::detail::served_pins_field(w, &pins);
+        EXPECT_EQ(field.find("DONATION-DROPPED"), std::string::npos)
+            << which << ": the arm line claims a loss and a full pin count at "
+                        "once: " << field;
+        EXPECT_NE(field.find("pins=1/1"), std::string::npos) << which << field;
+    };
+
+    // (a) THE REVIEWER'S KAT. Guard (a) fires on the pin's own verdict and
+    // `continue`s long before the duplicate scan can name it.
+    {
+        auto w = host_template({pin});
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, {bad_verdict("input-missing-or-spent")},
+            /*from_xcheck_swap=*/false, /*xcheck_arm_enabled=*/false,
+            /*block_budget_enabled=*/false);
+        expect_no_alarm(w, "(a) !v.ok", "input-missing-or-spent");
+    }
+
+    // (b) The xcheck-swap money-path flag, default OFF. The swapped template
+    // came from dashd and can already carry the donation.
+    {
+        auto w = host_template({pin});
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, {ok_verdict(kSpliceHeight)},
+            /*from_xcheck_swap=*/true, /*xcheck_arm_enabled=*/false, false);
+        expect_no_alarm(w, "(b) xcheck-swap-pin-gate-off",
+                        "xcheck-swap-pin-gate-off");
+    }
+
+    // (c) Height disagreement on the xcheck arm.
+    {
+        auto w = host_template({pin});
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, {ok_verdict(kSpliceHeight - 1)},
+            /*from_xcheck_swap=*/true, /*xcheck_arm_enabled=*/true, false);
+        expect_no_alarm(w, "(c) xcheck-swap-height-mismatch",
+                        "xcheck-swap-height-mismatch");
+    }
+
+    // (d) The count-mismatch EARLY RETURN, which raises the alarm from its own
+    // exit path. Refusing everything by name is right; calling it a loss is not.
+    {
+        auto w = host_template({pin});
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, /*verdicts=*/{}, false, false, false);
+        expect_no_alarm(w, "(d) pin-verdict-count-mismatch",
+                        "pin-verdict-count-mismatch");
+    }
+
+    // (e) THE CONTROL, and the reason this is not "silence the alarm": the SAME
+    // refusal cause on a pin that is genuinely ABSENT must still shout, with the
+    // money and the cause named.
+    {
+        auto w = host_template();                       // carries nothing
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, {bad_verdict("input-missing-or-spent")}, false, false,
+            false);
+        ASSERT_FALSE(template_carries(w, txid));
+        ASSERT_FALSE(w.m_pin_drop_alarm.empty())
+            << "a pin that is genuinely absent stopped raising the alarm";
+        EXPECT_NE(w.m_pin_drop_alarm.find("DONATION-DROPPED 1/1"),
+                  std::string::npos) << w.m_pin_drop_alarm;
+        EXPECT_NE(w.m_pin_drop_alarm.find("value=50000sat"), std::string::npos)
+            << w.m_pin_drop_alarm;
+        EXPECT_NE(w.m_pin_drop_alarm.find("cause=input-missing-or-spent"),
+                  std::string::npos) << w.m_pin_drop_alarm;
+    }
+
+    // (f) MIXED, the arm that stops presence-keying from swallowing a real loss:
+    // one pin served-but-refused beside one genuinely absent, same cause on
+    // both. The alarm must read 1/2 and 30000sat, not 2/2 and 80000sat.
+    {
+        uint256 other; other.begin()[0] = 0x6b;
+        auto lost_pin = admissible_pin(other);
+        lost_pin.vout[0].value = 30'000;
+        const auto lost_txid = dash::coin::dash_txid(lost_pin);
+
+        auto w = host_template({pin});                  // carries `pin` only
+        const std::vector<dash::coin::MutableTransaction> both{pin, lost_pin};
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &both,
+            {bad_verdict("input-missing-or-spent"),
+             bad_verdict("input-missing-or-spent")},
+            false, false, false);
+
+        ASSERT_TRUE(template_carries(w, txid));
+        ASSERT_FALSE(template_carries(w, lost_txid));
+        ASSERT_FALSE(w.m_pin_drop_alarm.empty())
+            << "the genuinely absent pin stopped raising the alarm";
+        EXPECT_NE(w.m_pin_drop_alarm.find("DONATION-DROPPED 1/2"),
+                  std::string::npos)
+            << "the served pin was counted as lost: " << w.m_pin_drop_alarm;
+        EXPECT_NE(w.m_pin_drop_alarm.find("value=30000sat"), std::string::npos)
+            << "the served pin's 50000 sat was added to the loss: "
+            << w.m_pin_drop_alarm;
+    }
+}

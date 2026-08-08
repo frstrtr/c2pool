@@ -406,7 +406,8 @@ void print_banner(const char* argv0)
         << "           [--embedded-mn-bridge-no-cursor]\n"
         << "           [--embedded-utxo-immature-serve-empty] [--embedded-serve-mempool-txs]\n"
         << "           [--pin-local-tx-hex FILE]  (zero-fee self-mined tx, e.g. donation consolidation)\n"
-        << "           [--dash-pin-block-budget]  (refuse a pin that would push the served block over 2 MB)\n"
+        << "           [--pin-splice-xcheck-arm]  (let pins ride an xcheck-SWAPPED dashd template; default OFF)\n"
+        << "           [--pin-splice-block-budget] (EXCLUDE a pin that pushes the template past the block size cap; default OFF)\n"
         << "           [--bestcl-policy freshness|consensus-exact]\n"
         << "           [--embedded-oracle-shadow]\n"
         << "           [--embedded-shadow-compare]\n"
@@ -809,14 +810,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // decision. See coin/serve_staleness.hpp for why report-only was
              // chosen over a detector that can stop serving.
              bool serve_staleness_sentinel = true,
-             // --dash-pin-block-budget: MONEY PATH, DEFAULT OFF. Give the
-             // served-dashd splice the same block-level size budget #1177
-             // gave the embedded arm — measure what dashd's template already
-             // occupies and refuse the pin that would push the assembled
-             // block past the 2 MB consensus limit, with a NAMED cause.
-             // OFF reproduces the shipped arithmetic byte-for-byte.
-             bool pin_block_budget = false,
-             // --embedded-creditpool-publish-at-serve-tip: publish the derived
+// --embedded-creditpool-publish-at-serve-tip: publish the derived
              // DIP-0027 credit pool AT THE SERVE TIP instead of at the folded
              // body height (dashd derives the pool for the block you ask
              // about -- creditpool.cpp:224 GetCreditPool(block_index), read at
@@ -825,7 +819,32 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // the fourth-axis conjunct holds promotion. MONEY PATH: it makes
              // the arm SERVE where it previously refused, so default false.
              // Only meaningful on the body-first (coin-P2P daemonless) arm.
-             bool embedded_creditpool_publish_at_serve_tip = false)
+             bool embedded_creditpool_publish_at_serve_tip = false,
+             // --pin-splice-xcheck-arm: let the pinned txs ride a template the
+             // GBT cross-check SWAPPED IN. DEFAULT OFF -- money path.
+             //
+             // The cross-check discards an embedded template that already
+             // carries the pins and serves a fresh dashd one; that replacement
+             // has never run the splice. Measured on the primary 2026-08-07,
+             // 66 of 197 served fallback templates came from that swap and one
+             // of them won h=2518044 without the donation. OFF, the miss is now
+             // NAMED (cause=xcheck-swap-pin-gate-off) and served bytes are
+             // unchanged; ON, the pins ride it too, through the same unchanged
+             // admission gate plus a height check and a block-size budget that
+             // can only EXCLUDE.
+             bool pin_splice_xcheck_arm = false,
+             // --pin-splice-block-budget: ENFORCE the block-level size budget
+             // in the pin splice. DEFAULT OFF -- money path.
+             //
+             // The budget caps a pin against what the template already holds
+             // (2 MB minus a named reserve). Enforcing it turns an inclusion
+             // into an exclusion on the declined-embedded arm, which has been
+             // splicing pins onto served templates in production since before
+             // this flag existed -- so it CHANGES SERVED BYTES and may not
+             // default on. OFF, the overflow is a WARNING and a recorded flag
+             // on the template; ON, the pin is excluded with cause=block-budget
+             // (block 2517855 was lost to bad-txns-oversize).
+             bool pin_splice_block_budget = false)
 {
     namespace io = boost::asio;
 
@@ -2541,25 +2560,28 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // consulted, i.e. during an actual embedded outage.
     const bool xcheck_wanted = (testnet || embedded_mainnet);
     work_source->set_gbt_xcheck(xcheck_wanted && static_cast<bool>(rpc));
-
-    // ── BLOCK-LEVEL PIN BUDGET on the served-dashd arm ──────────────────────
-    // MONEY PATH, DEFAULT OFF (--dash-pin-block-budget). #1177 unified the
-    // size budget on the EMBEDDED arm; the fallback arm splices up to 400000
-    // bytes of pins onto dashd's own template with no block-level accounting,
-    // and dashd fills that template to its own blockmaxsize. ON, the splice
-    // measures the real remaining headroom and refuses the overflowing pin
-    // with the named cause pin-over-block-headroom. It is off by default
-    // because a refusal CHANGES SERVED BYTES; say which posture is live so
-    // the journal never has to be guessed at.
-    work_source->set_pin_block_budget(pin_block_budget);
-    std::cout << "[DASH-STRATUM] served-dashd pin block budget: "
-              << (pin_block_budget
-                      ? "ON (--dash-pin-block-budget: a pin that would push "
-                        "the assembled block past 2000000 bytes is REFUSED "
-                        "with cause=pin-over-block-headroom)"
-                      : "OFF (default: pins capped only against 400000, NOT "
-                        "against what dashd's template already holds -- "
-                        "enable with --dash-pin-block-budget)")
+    // Pin splice on the xcheck-SWAPPED arm (default OFF). Announce the state
+    // either way: with it off the donation still misses every swapped
+    // template -- it just no longer does so silently.
+    work_source->set_pin_splice_xcheck_arm(pin_splice_xcheck_arm);
+    std::cout << "[DASH-STRATUM-GBT] pin splice on xcheck-swapped arm: "
+              << (pin_splice_xcheck_arm ? "ON (--pin-splice-xcheck-arm)"
+                                        : "OFF (default; misses are named, "
+                                          "not spliced)")
+              << "\n";
+    // Block-size budget for the pin splice (default OFF). It is a flag because
+    // ENFORCING it removes a pin from a template the declined-embedded arm is
+    // already serving -- that changes served bytes, which is exactly what a
+    // money-path change may not do unannounced. OFF it still SAYS the budget
+    // was blown; it just does not act.
+    work_source->set_pin_splice_block_budget(pin_splice_block_budget);
+    std::cout << "[DASH-STRATUM-GBT] pin splice block-size budget: "
+              << (pin_splice_block_budget
+                      ? "ENFORCED (--pin-splice-block-budget; an over-budget "
+                        "pin is EXCLUDED)"
+                      : "OFF (default; an over-budget pin still rides and the "
+                        "overflow is logged BLOCK-BUDGET EXCEEDED, NOT "
+                        "ENFORCED)")
               << "\n";
     if (xcheck_wanted && !rpc) {
         std::cout << "[DASH-STRATUM-GBT] GBT cross-check DISABLED: dashd RPC "
@@ -7290,13 +7312,14 @@ int main(int argc, char** argv)
     // currently refuses with `creditpool-stale`.
     bool embedded_creditpool_publish_at_serve_tip = false;
     std::string pin_local_tx_hex_path;
+    bool pin_splice_xcheck_arm = false;
+    bool pin_splice_block_budget = false;
     // --embedded-mempool-ingest: arm the coin-P2P MSG_TX pull (phase 1).
     // SEPARATE from --embedded-serve-mempool-txs on purpose: this only makes
     // the mempool FILL. Whether its contents ever reach a served template is
     // still the other flag's decision, and that one stays default-OFF until
     // the [SHADOW-TXSET] coverage series says it is safe.
     bool embedded_mempool_ingest = false;
-    bool pin_block_budget = false;
     std::string bestcl_policy = "freshness";   // --bestcl-policy: freshness (default, conservative proxy) | consensus-exact (dashcore's actual CheckCbTxBestChainlock rule)
     bool embedded_oracle_shadow = false;       // --embedded-oracle-shadow: per-block dashd cross-check (OBSERVE-only)
     bool embedded_shadow_compare = false;      // --embedded-shadow-compare: serve-vs-dashd template diff (OBSERVE-only, NOT a gate)
@@ -7394,13 +7417,15 @@ int main(int argc, char** argv)
             embedded_serve_mempool_txs = true;
         else if (std::strcmp(argv[i], "--embedded-mempool-ingest") == 0)
             embedded_mempool_ingest = true;
-        else if (std::strcmp(argv[i], "--dash-pin-block-budget") == 0)
-            pin_block_budget = true;
         else if (std::strcmp(argv[i],
                              "--embedded-creditpool-publish-at-serve-tip") == 0)
             embedded_creditpool_publish_at_serve_tip = true;
         else if (std::strcmp(argv[i], "--pin-local-tx-hex") == 0 && i + 1 < argc)
             pin_local_tx_hex_path = argv[++i];
+        else if (std::strcmp(argv[i], "--pin-splice-xcheck-arm") == 0)
+            pin_splice_xcheck_arm = true;
+        else if (std::strcmp(argv[i], "--pin-splice-block-budget") == 0)
+            pin_splice_block_budget = true;
         else if (std::strcmp(argv[i], "--replay-utxo-db") == 0 && i + 1 < argc)
             replay_utxo_db = argv[++i];
         else if (std::strcmp(argv[i], "--replay-utxo-hash") == 0)
@@ -7683,8 +7708,9 @@ int main(int argc, char** argv)
                         embedded_mempool_ingest,
                         pin_local_tx_hex_path,
                         serve_staleness_sentinel,
-                        pin_block_budget,
-                        embedded_creditpool_publish_at_serve_tip);
+                        embedded_creditpool_publish_at_serve_tip,
+                        pin_splice_xcheck_arm,
+                        pin_splice_block_budget);
     }
     return run_selftest();
 }
