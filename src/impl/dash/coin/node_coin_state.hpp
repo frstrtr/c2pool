@@ -137,7 +137,22 @@ public:
 
     // Mutable accessors for the maintainer (the reception / think slices seed
     // these from mnlistdiff + relayed mempool txs).
-    MnStateMachine& mnstates() { return m_mnstates; }
+    //
+    // D2 (2026-08-07/08 hotel freeze, remaining half of the class): handing
+    // out a MUTABLE reference to any input of the two committed-root
+    // computations bumps the root-memo epoch — the caller MAY mutate, and a
+    // memoized root that survives a mutation is a WRONG BLOCK
+    // (bad-cbtx-mnmerkleroot / bad-cbtx-quorummerkleroot, silently lost).
+    // Over-invalidation on a read-through-non-const access only costs one
+    // recompute; under-invalidation costs a block — so the bump rides the
+    // accessor, not the callers' discipline. Read-only callers on the
+    // emit-ok hot path must use the const accessors (std::as_const at the
+    // main_dash qc-plan sites) or they re-chill the memo every evaluation.
+    // mnstates() bumps too: the confirmation-pass projection reads MN
+    // registration heights from it (sml_projection.hpp).
+    MnStateMachine& mnstates() { bump_root_memo_epoch(); return m_mnstates; }
+    // Mempool contents feed the template TX SET, not either committed root —
+    // no epoch bump (a per-tx bump would chill the memo for nothing).
     Mempool&        mempool()  { return m_mempool; }
 
     // ── SML / quorum consensus-commitment state (daemonless CCbTx) ────────
@@ -150,10 +165,19 @@ public:
     // from the last root-verified state and requests an INCREMENTAL
     // mnlistdiff(persisted-tip, tip) rather than a cold mnlistdiff(zero, tip);
     // a corrupt/stale store fails closed to the cold path.
-    vendor::CSimplifiedMNList& sml() { return m_sml; }
-    QuorumManager&             qmgr() { return m_qmgr; }
+    // Non-const access == possible mutation == root-memo epoch bump (see the
+    // mnstates() note above; same rule, same failure mode).
+    vendor::CSimplifiedMNList& sml() { bump_root_memo_epoch(); return m_sml; }
+    QuorumManager&             qmgr() { bump_root_memo_epoch(); return m_qmgr; }
     const vendor::CSimplifiedMNList& sml() const { return m_sml; }
     const QuorumManager&             qmgr() const { return m_qmgr; }
+
+    /// Root-memo mutation epoch (D2). Bumped by every non-const accessor /
+    /// setter whose target feeds the projected-SML root or the quorum root; a
+    /// cached root is valid only while its epoch matches. All mutators run on
+    /// the single-threaded ioc, so a plain uint64 needs no lock — do not add
+    /// one. Exposed read-only as a test seam.
+    uint64_t root_memo_epoch() const { return m_root_memo_epoch; }
 
     /// Mark whether a valid SML is present (set by the maintainer after the
     /// first accepted mnlistdiff yields a non-empty list). When require_sml
@@ -316,7 +340,10 @@ public:
     /// pre-emit root re-check. main_dash sets the testnet value next to
     /// set_mn_rr_height; the mainnet default keeps every existing caller
     /// byte-unchanged.
-    void set_mn_min_confirmations(int c) { m_mn_min_confirmations = c; }
+    void set_mn_min_confirmations(int c) {
+        bump_root_memo_epoch();   // D2: projection threshold input
+        m_mn_min_confirmations = c;
+    }
     int mn_min_confirmations() const { return m_mn_min_confirmations; }
 
     /// HEADER-SYNC gate (the DASH half of a cross-lane asymmetry: bch 13, ltc
@@ -388,6 +415,10 @@ public:
                  uint32_t bits_for_next, uint32_t mtp_at_tip,
                  uint8_t address_version, uint8_t address_p2sh_version,
                  uint32_t curtime = 0, uint32_t version = 0) {
+        // D2: prev_height/prev_hash are inputs of the confirmation-pass
+        // projection (confirmations = prev_height - reg_height; confirmedHash
+        // = prev_hash), so a tip move invalidates the memoized projected root.
+        bump_root_memo_epoch();
         m_prev_height          = prev_height;
         m_prev_hash            = prev_hash;
         m_bits_for_next        = bits_for_next;
@@ -1062,24 +1093,56 @@ public:
         // is unprojectable (a null-confirmedHash entry with no known
         // registration height — at most ~nMasternodeMinimumConfirmations
         // blocks per unknown registration).
-        auto proj = project_sml_confirmations(m_sml, m_prev_height, m_prev_hash,
-                                              m_mnstates,
-                                              m_mn_min_confirmations);
-        if (!proj.ok)
-            return reject("emit-mn-confirm-rollover-pending",
-                          "protx=" + proj.unprojectable_protx.GetHex().substr(0, 12),
-                          "known-registration-height");
-        if (cb.merkleRootMNList != proj.sml.CalcMerkleRoot())
+        //
+        // D2 (2026-08-07/08 hotel freeze, remaining half of the class): the
+        // projection returns a FRESH ~450 KB copy of the SML by value and its
+        // root was re-hashed (~2000 x SHA256d) on EVERY evaluation — ~3 per
+        // session per notify on the single io thread even after D1 removed
+        // the per-share amplifier. Both the projected root and the quorum
+        // root below are memoized at THIS level (per-NodeCoinState, epoch-
+        // invalidated), because a memo on the per-call projection object is
+        // cold by construction — that dead-end is what the deleted
+        // "CalcMerkleRoot() caches upstream" comment in embedded_gbt.hpp
+        // wrongly assumed. On an epoch match the projection copy itself is
+        // skipped, not just the hashing. WHERE-and-HOW-OFTEN only: the
+        // memoized value is byte-identical to the fresh computation
+        // (test_dash_root_memo.cpp T3), and any epoch bump forces a full
+        // recompute (T2 — a memo that never invalidates serves a stale root,
+        // which is a silently LOST BLOCK, strictly worse than the freeze).
+        if (!(m_sml_root_memo_valid
+              && m_sml_root_memo_epoch == m_root_memo_epoch)) {
+            auto proj = project_sml_confirmations(m_sml, m_prev_height,
+                                                  m_prev_hash, m_mnstates,
+                                                  m_mn_min_confirmations);
+            if (!proj.ok)   // NOT memoized: fail-closed stays re-evaluated
+                return reject("emit-mn-confirm-rollover-pending",
+                              "protx=" + proj.unprojectable_protx.GetHex().substr(0, 12),
+                              "known-registration-height");
+            m_sml_root_memo       = proj.sml.CalcMerkleRoot();
+            m_sml_root_memo_epoch = m_root_memo_epoch;
+            m_sml_root_memo_valid = true;
+        }
+        if (cb.merkleRootMNList != m_sml_root_memo)
             return reject("emit-mnlist-root-drift",
                           cb.merkleRootMNList.GetHex().substr(0, 12),
-                          proj.sml.CalcMerkleRoot().GetHex().substr(0, 12));
+                          m_sml_root_memo.GetHex().substr(0, 12));
         // E1: under a qc plan the committed root must be the WITH-BLOCK root
         // (fold of the plan's commitments over the active set — equal to the
         // plain root while the plan is all-null, diverging only once Phase L
-        // serves real commitments). Without a plan, the plain PROVEN root.
+        // serves real commitments). Without a plan, the plain PROVEN root —
+        // memoized on the same epoch (D2: compute_merkle_root_quorums
+        // re-serializes and SHA256d's every active commitment per call, the
+        // second unmemoized root on this same path).
+        if (!qc_plan
+            && !(m_quorum_root_memo_valid
+                 && m_quorum_root_memo_epoch == m_root_memo_epoch)) {
+            m_quorum_root_memo       = compute_merkle_root_quorums(m_qmgr);
+            m_quorum_root_memo_epoch = m_root_memo_epoch;
+            m_quorum_root_memo_valid = true;
+        }
         const uint256 expected_quorum_root = qc_plan
             ? qc_plan->merkle_root_quorums
-            : compute_merkle_root_quorums(m_qmgr);
+            : m_quorum_root_memo;
         if (cb.merkleRootQuorums != expected_quorum_root)
             return reject("emit-quorum-root-drift",
                           cb.merkleRootQuorums.GetHex().substr(0, 12),
@@ -1554,6 +1617,23 @@ private:
         if (!sched) return SuperblockDisposition{false, {}};
         return SuperblockDisposition{true, std::move(*sched)};
     }
+
+    // D2 root memo (2026-08-07/08 hotel freeze, remaining half of the class).
+    // The epoch is bumped by every non-const accessor / setter whose target
+    // feeds either committed root (sml()/qmgr()/mnstates()/set_tip()/
+    // set_mn_min_confirmations()); the cached roots are valid only while
+    // their captured epoch matches. Single-threaded ioc => plain uint64, no
+    // lock (same discipline as every other member here). The cached values
+    // are mutable because embedded_template_emit_ok() is const — same
+    // pattern as m_emit_ok_calls below.
+    void bump_root_memo_epoch() { ++m_root_memo_epoch; }
+    uint64_t m_root_memo_epoch{0};
+    mutable bool     m_sml_root_memo_valid{false};
+    mutable uint64_t m_sml_root_memo_epoch{0};
+    mutable uint256  m_sml_root_memo;         // projected-SML merkle root
+    mutable bool     m_quorum_root_memo_valid{false};
+    mutable uint64_t m_quorum_root_memo_epoch{0};
+    mutable uint256  m_quorum_root_memo;      // plain active-set quorum root
 
     MnStateMachine m_mnstates;
     Mempool        m_mempool;
