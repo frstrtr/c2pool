@@ -78,6 +78,9 @@ public:
     void set_whitelist_path(const std::string& path)
     {
         m_whitelist_path = path;
+        // Containment base = the directory the caller placed the file in
+        // (the node's config dir). load/save refuse a path that escapes it.
+        m_whitelist_dir = std::filesystem::path(path).parent_path();
         if (!path.empty()) load_whitelist_from_disk();
     }
 
@@ -144,9 +147,39 @@ public:
     }
 
 protected:
+    // Defense-in-depth containment guard for the persisted whitelist path.
+    // The path is derived from the node's config directory joined with a
+    // fixed filename (see main_ltc.cpp), so it is not attacker-controlled
+    // today; this guard hardens against any future caller by rejecting a
+    // resolved path that escapes its configured base directory — e.g. via
+    // ".." traversal or an absolute override. Returns true when the path is
+    // safe to open. An empty base disables the check (no persistence).
+    static bool path_within_base(const std::string& path,
+                                 const std::filesystem::path& base)
+    {
+        if (base.empty()) return true;
+        std::error_code ec;
+        auto canon = std::filesystem::weakly_canonical(path, ec);
+        if (ec) return false;
+        auto canon_base = std::filesystem::weakly_canonical(base, ec);
+        if (ec) return false;
+        auto rel = std::filesystem::relative(canon, canon_base, ec);
+        if (ec) return false;
+        // Contained iff the relative path stays inside the base: it must not
+        // be absolute and must not begin a ".." ascent out of the base.
+        const std::string s = rel.generic_string();
+        if (s.empty() || rel.is_absolute()) return false;
+        return s != ".." && s.rfind("../", 0) != 0;
+    }
+
     void load_whitelist_from_disk()
     {
         if (m_whitelist_path.empty()) return;
+        if (!path_within_base(m_whitelist_path, m_whitelist_dir)) {
+            LOG_WARNING << "[Pool] Refusing to load whitelist outside config dir: "
+                        << m_whitelist_path;
+            return;
+        }
         std::ifstream f(m_whitelist_path);
         if (!f) return;
         try {
@@ -238,6 +271,9 @@ protected:
     std::set<std::string> m_whitelist_ips;
     std::set<NetService> m_whitelist_hosts;
     std::string m_whitelist_path;
+    // Allowed base directory for m_whitelist_path (the caller's config dir).
+    // Used by path_within_base() to keep whitelist I/O contained.
+    std::filesystem::path m_whitelist_dir;
 };
 
 } // namespace pool
