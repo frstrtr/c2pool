@@ -139,15 +139,14 @@ test('Middleware chain: error-taxonomy normalises thrown errors', async () => {
   registerBaseline(host);
   const angryTransport: Transport = {
     ...mockTransport(),
-    fetchWindow: async () => { throw { status: 429, retryAfter: 2000 }; },
+    fetchWindow: async () => { throw { status: 429, retryAfter: 25 }; },
   };
   // This test's subject is error-taxonomy normalisation, not retry/timeout.
   // Disable both transport retry and timeout so the normalised error
-  // propagates immediately. (With retry enabled, the chain honours the
-  // server-supplied Retry-After of 2000ms — Math.max(delay, retryAfterMs)
-  // in retry.ts — and sleeps the full 2s before the final throw, pushing
-  // this test onto the CI per-test deadline. maxAttempts:1 still performs
-  // one retry, so it does not avoid the sleep.)
+  // propagates immediately: retry.ts honours a server Retry-After via
+  // Math.max(delay, retryAfterMs), so an enabled retry would really sleep
+  // and trip CI's per-test deadline. retryAfter is also kept small (25ms)
+  // so the retryAfterMs assertion below fences in ms regardless.
   await host.init({
     kind: 'shared-core',
     transport: angryTransport,
@@ -162,7 +161,7 @@ test('Middleware chain: error-taxonomy normalises thrown errors', async () => {
     (err: unknown) => {
       if (typeof err !== 'object' || err === null) return false;
       const e = err as { type?: unknown; retryAfterMs?: unknown };
-      return e.type === 'rate_limited' && e.retryAfterMs === 2000;
+      return e.type === 'rate_limited' && e.retryAfterMs === 25;
     },
   );
   await host.destroy();
