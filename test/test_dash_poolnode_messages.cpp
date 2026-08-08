@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include <impl/dash/messages.hpp>
+#include <impl/dash/coin/bestblock_diag.hpp>  // #1046 bestblock out=0 classifier
 #include <impl/dash/config_pool.hpp>   // SharechainConfig net-aware prefix selectors
 #include <btclibs/util/strencodings.h> // ParseHexBytes (prefix isolation primitive)
 
@@ -143,6 +144,45 @@ TEST(DashPoolNodeMessages, Handler_TypeList_Compiles) {
     EXPECT_GT(sizeof(HandlerResult), 0u);
 }
 
+
+// #1046: the bestblock-origination fetch classifier. Drives the REAL
+// nlohmann::json type (not a mock). These FAIL to compile/pass without
+// classify_bestblock_header + the three-way BestblockFetch enum, which is the
+// diagnostic change that distinguishes RpcNotString vs BadHexLen on the soak
+// node's silent out=0 bail (announce_bestblock lambda, main_dash.cpp).
+TEST(DashPoolNodeMessages, Bestblock_Classify_Ok) {
+    std::string hex(160, 'a');  // exactly an 80-byte header, 160 hex chars
+    std::string out = "sentinel";
+    auto cls = dash::coin::classify_bestblock_header(nlohmann::json(hex), out);
+    EXPECT_EQ(cls, dash::coin::BestblockFetch::Ok);
+    EXPECT_EQ(out, hex);
+    EXPECT_STREQ(dash::coin::bestblock_fetch_name(cls), "Ok");
+}
+
+TEST(DashPoolNodeMessages, Bestblock_Classify_RpcNotString) {
+    std::string out = "sentinel";
+    // getblockheader(verbose=false) that came back as an object/number/null.
+    auto cls = dash::coin::classify_bestblock_header(
+        nlohmann::json::object({{"result", "deadbeef"}}), out);
+    EXPECT_EQ(cls, dash::coin::BestblockFetch::RpcNotString);
+    EXPECT_TRUE(out.empty());  // left cleared, not the string branch
+    EXPECT_STREQ(dash::coin::bestblock_fetch_name(cls), "RpcNotString");
+}
+
+TEST(DashPoolNodeMessages, Bestblock_Classify_BadHexLen_Empty) {
+    std::string out = "sentinel";
+    auto cls = dash::coin::classify_bestblock_header(nlohmann::json(std::string()), out);
+    EXPECT_EQ(cls, dash::coin::BestblockFetch::BadHexLen);
+    EXPECT_TRUE(out.empty());  // captured for the len= log line
+    EXPECT_STREQ(dash::coin::bestblock_fetch_name(cls), "BadHexLen");
+}
+
+TEST(DashPoolNodeMessages, Bestblock_Classify_BadHexLen_Short) {
+    std::string out;
+    auto cls = dash::coin::classify_bestblock_header(nlohmann::json(std::string(159, 'a')), out);
+    EXPECT_EQ(cls, dash::coin::BestblockFetch::BadHexLen);
+    EXPECT_EQ(out.size(), 159u);
+}
 
 // ---------------------------------------------------------------------------
 // Connect-mode sharechain prefix wire-proof.
