@@ -812,7 +812,18 @@ if (BUILD_TESTING AND GTest_FOUND)
         # qrinfo (dash_mainnet_qrinfo_2516785.bin) and dashd's own `quorum
         # info` member lists. Folded here per the same #769 rule; reads
         # DASH_FIXTURE_DIR.
-        test_dash_replay_quorum_engine.cpp)
+        test_dash_replay_quorum_engine.cpp
+        # test_dash_mined_commitment_index.cpp: PR-2 FORWARD
+        # (mined_commitment_index.hpp) — dashd's mined-commitment store
+        # (v23.1.7 llmq/blockprocessor.cpp ProcessBlock/ProcessCommitment/
+        # HasMinedCommitment/GetMinedCommitmentsUntilBlock) rebuilt from OUR
+        # OWN block replay: 3101-block mainnet merkleRootQuorums byte-parity
+        # over the DERIVED active set, plus the arm/contiguity/null-skip
+        # guards and the money-path has_mined seam. Reuses the same
+        # dash_mainnet_quorum_scan_* / _active_quorums_ fixtures as the W4
+        # suite above, and is folded into this target for the same #769
+        # reason (the push bot cannot add a build.yml --target).
+        test_dash_mined_commitment_index.cpp)
     target_compile_definitions(test_dash_embedded_gbt PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_embedded_gbt PRIVATE

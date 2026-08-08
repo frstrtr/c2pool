@@ -55,6 +55,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 
 namespace dash {
 namespace coin {
@@ -141,6 +142,12 @@ public:
     using BlockHook = std::function<std::string(uint32_t, const uint256&,
                                                 const BlockType&)>;
     void set_pre_fold(BlockHook h)  { m_pre_fold = std::move(h); }
+    /// Hand the installed pre_fold hook back so a LATER wiring can CHAIN onto
+    /// it instead of silently replacing it (PR-2 forward: the mined-commitment
+    /// index is armed after the quorum seam and must not evict it). Leaves the
+    /// consumer with no hook — the caller is expected to install the chained
+    /// one immediately.
+    BlockHook take_pre_fold() { return std::exchange(m_pre_fold, BlockHook{}); }
     void set_post_fold(std::function<void(uint32_t)> h)
     {
         m_post_fold = std::move(h);

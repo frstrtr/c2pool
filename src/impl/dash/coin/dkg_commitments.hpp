@@ -876,6 +876,18 @@ struct QcBlockPlan {
 /// (per-height all-or-nothing) — and the embedded arm must fail closed to
 /// the dashd fallback (exactly the PHASE-1 refusal, but now only when
 /// genuinely unable rather than for the whole window).
+/// `also_has_mined` is the PR-2 forward seam (mined_commitment_index.hpp): a
+/// SECOND source for "this quorum's commitment is already on the chain",
+/// derived from our own block replay instead of from an mnlistdiff/qrinfo
+/// round trip. It is OR'd into the QuorumManager answer, so it can only ever
+/// make FEWER slots mandatory — never more, and never a different commitment.
+///
+/// ⚠ MONEY PATH. A slot dropped from the mandatory set is a type-6 tx the
+/// served template no longer carries. That is byte-visible, so the source must
+/// be a mined record that a reorg cannot invalidate — which is exactly why
+/// MinedCommitmentIndex refuses to arm on a live-tip node until dashd's
+/// UndoBlock half (v23.1.7 llmq/blockprocessor.cpp:383-408) is ported.
+/// Defaulted null: every pre-existing caller keeps byte-identical behaviour.
 inline std::optional<QcBlockPlan> build_daemonless_qc_plan(
     LlmqNetwork net, uint32_t next_height,
     const QuorumManager& qmgr,
@@ -883,10 +895,12 @@ inline std::optional<QcBlockPlan> build_daemonless_qc_plan(
     const std::function<std::optional<uint32_t>(const uint256&)>& height_of_hash,
     const MineableCommitmentCache* cache = nullptr,
     const DkgNullEvidenceFn& null_evidence = nullptr,
-    RequiredQcSlot* first_gap = nullptr)
+    RequiredQcSlot* first_gap = nullptr,
+    const std::function<bool(uint8_t, const uint256&)>& also_has_mined = nullptr)
 {
-    auto has_mined = [&qmgr](uint8_t t, const uint256& qh) {
-        return qmgr.find(t, qh).has_value();
+    auto has_mined = [&qmgr, &also_has_mined](uint8_t t, const uint256& qh) {
+        if (qmgr.find(t, qh).has_value()) return true;
+        return also_has_mined ? also_has_mined(t, qh) : false;
     };
     auto commitments = daemonless_qc_commitments(
         net, next_height, hash_at_height, has_mined, cache,

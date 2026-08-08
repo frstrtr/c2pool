@@ -471,10 +471,24 @@ public:
         uint64_t lists_retained{0};
         uint64_t quorum_roots_matched{0}; // informational: folded == committed
         uint64_t quorum_roots_differed{0};
+        /// Height at which the root self-check ARMED (0 = never). Issue #90:
+        /// while this is 0 the matched/differed pair is a warm-up artefact and
+        /// must not be read as divergence; from this height on it is a real
+        /// consensus comparison and a differ POISONS the lane.
+        uint32_t self_check_armed_at{0};
         std::string last_skip_reason;
         std::string first_member_miss;    // the named first miss, verbatim
     };
     const Stats& stats() const { return m_stats; }
+
+    /// Issue #90, the reporting half: WHY the self-check is still unarmed.
+    /// Never a bare bool — the counter that gates it reads 0/N forever on
+    /// mainnet and the reason (24 frozen LLMQ_50_60 commitments no forward
+    /// replay can observe) is not inferable from the number.
+    std::string active_set_shortfall_text() const
+    {
+        return m_quorum.active_set_shortfall_text();
+    }
 
     /// Seed per-cycle rotated snapshots (Phase-1 only).
     ///
@@ -630,6 +644,38 @@ public:
                 ++m_stats.quorum_roots_matched;
             else
                 ++m_stats.quorum_roots_differed;
+        }
+        // ── ISSUE #90: the arming criterion finally has a caller ──────────
+        // replay_quorum_engine.hpp documented "callers arm it once the
+        // commitment store is complete (… a warm-from-scan harness — once
+        // every type has reached its active quota)". Nothing ever did, so
+        // fold_root_vs_committed ran UNARMED for the life of every run and
+        // reported 0/N — a counter that could not disagree with anything.
+        //
+        // Arm it the moment the reconstructed active set IS dashd's set. From
+        // that block on the comparison is a real consensus check and a
+        // mismatch poisons the lane, which is the whole point.
+        //
+        // On MAINNET this will not fire, and that is a FACT about the chain,
+        // not a bug here: LLMQ_50_60's last 24 commitments were mined before
+        // DIP0024 and stay in dashd's active set forever, so a forward replay
+        // from a modern anchor is permanently short by 24. The shortfall is
+        // now NAMED (active_set_shortfall_text()) instead of being an
+        // unexplained zero.
+        if (!m_quorum.self_check_armed() && m_quorum.active_sets_complete()) {
+            m_quorum.arm_self_check();
+            m_stats.self_check_armed_at = height;
+            LOG_INFO << "[REPLAY-SEAM] quorum-root SELF-CHECK ARMED at h="
+                     << height
+                     << ": every chainparams llmq type has reached its full"
+                        " active quota, so the reconstructed active set IS"
+                        " dashd's set. fold_root_vs_committed is a consensus"
+                        " comparison from here on; a differ now POISONS the"
+                        " lane. Warm-up counts before this height: matched="
+                     << m_stats.quorum_roots_matched << " differed="
+                     << m_stats.quorum_roots_differed;
+            m_stats.quorum_roots_matched  = 0;
+            m_stats.quorum_roots_differed = 0;
         }
         if (m_cfg.debug_logs && r.member_cycles_derived > 0)
             LOG_INFO << "[REPLAY-SEAM] h=" << height << " derived "
