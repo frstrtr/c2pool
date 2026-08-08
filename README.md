@@ -23,6 +23,61 @@ c2pool builds one binary per **parent chain** (`c2pool-<coin>`). Several parents
 
 ¹ DigiByte is a MultiAlgo chain; c2pool runs its **Scrypt** algorithm as a standalone parent — it is **not** an AuxPoW child of Litecoin.
 
+## Status & Maturity — read this before evaluating
+
+c2pool is a decentralized mining-pool codebase and the home of the **v37 research
+line** (Roundabout / Work Receipts / MRR). This section states, plainly, what does
+and does not yet exist, so the work can be judged on what it actually is.
+
+**v37 is design- and prototype-stage. Do not run it in production.**
+
+### What exists
+- A **formally specified** settlement/lanes core: TLA⁺ specs, model-checked with
+  TLC (green over the bounded configurations checked in). This is a proof over a
+  *model*, not evidence at scale.
+- **Reference prototypes** under `proto/` (TLA⁺, MRR refimpl + goldens, the M4 sync
+  feasibility harness, testbeds) and the v37 spec/headers under
+  `src/sharechain/v37/`. These are for study and reproduction, not deployment.
+- The production multi-coin pool code (v36 line) that c2pool actually runs.
+
+### What does NOT yet exist — the honest gaps
+- **No performance benchmark.** The only performance artifact is a Python
+  *feasibility* harness (M4). There is **no benchmark of the real engine**;
+  throughput, latency, and scaling claims are **unproven** until one exists.
+- **No live v37 testnet.** There is no running v37 network. The runnable v37
+  artifacts are the prototypes above.
+- **Formal ≠ empirical.** Model-checking bounds behavior over small configurations;
+  it does **not** substitute for a benchmark or a live network.
+
+### v36 consensus note
+- In July 2026 the LTC v36 line hit a consensus incident: specific **false-activation
+  modes** of the AutoRatchet (an automatic protocol-upgrade latch) could trip on
+  absence-as-assent and flap without hysteresis, desynchronizing the share chain.
+  Those specific modes were caught and are now **guarded by regression tests** — see
+  commit `a7e5b29b8` (LTC ratchet mode-2 false-activation guard, PR #930) and its C5
+  regression KATs. A deeper redesign — deterministic ancestry-depth activation with
+  hysteresis and chain self-heal, to close the whole *class* rather than the known
+  modes — is **in progress on the design track and not yet landed. We do not claim
+  the class is fully closed.**
+- **Donation script (legacy key, disclosed):** the v36 donation output currently
+  uses a P2SH script that **inherits a legacy p2pool donation key** from the
+  upstream codebase. This is **not an endorsement by, or involvement of, any third
+  party** — it is inherited code. It is scheduled for replacement with a
+  **c2pool-only script in v37**. v36 blocks already produced with the inherited
+  script are immutable consensus history and cannot be retroactively changed; the
+  clean script becomes the default at the v37 boundary.
+
+### CI / repo state
+- The v37 research line is merged to `master` (PR #809, "V37 dev"). **Current master
+  CI is green across the required per-coin gates and the coin matrix** (DASH / LTC /
+  BCH / DGB / DOGE); the CodeQL security scan is a non-gating job.
+
+### Provenance
+c2pool builds on ideas from p2pool but is an **independent codebase**. No outside
+party is represented as endorsing, maintaining, or being involved in c2pool.
+
+---
+
 ## Credits
 
 c2pool is an independent C++ implementation of the P2Pool sharechain concept originally created by Forrest Voight (forrestv, <https://github.com/forrestv/p2pool>).
