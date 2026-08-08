@@ -752,6 +752,12 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_mn_state PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    # The seam TU's issue-#90 arming KAT seeds the mainnet anchor's full
+    # 88-commitment active set from dash_mainnet_active_quorums_2513685.txt —
+    # the same fixture the W4 engine suite uses. Test-only define; no source
+    # in this target reads it otherwise.
+    target_compile_definitions(test_dash_mn_state PRIVATE
+        DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     gtest_add_tests(test_dash_mn_state "" AUTO)
 
     # DASH embedded getblocktemplate bit-parity capstone (S7 main): fuses the

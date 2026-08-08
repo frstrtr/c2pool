@@ -5982,17 +5982,23 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                  << bs.quorum_roots_differed
                                  << " self_check="
                                  << (br->self_check_armed()
-                                        ? "armed@h="
-                                              + std::to_string(
-                                                    bs.self_check_armed_at)
+                                        ? std::string("armed")
                                         : std::string("UNARMED"))
                                  // ── ISSUE #90 ─────────────────────────
-                                 // The counter now either MEASURES (armed:
-                                 // the reconstructed active set IS dashd's,
-                                 // a differ poisons) or NAMES ITS BLOCKING
-                                 // CONDITION (unarmed: which llmq type is
-                                 // short and by how many). It can no longer
-                                 // read `0/N` with nothing to say.
+                                 // The counter now NAMES ITS BLOCKING
+                                 // CONDITION — which llmq type is short and
+                                 // by how many — instead of reading `0/N`
+                                 // with nothing to say. NOTHING IN THIS
+                                 // BINARY ARMS THE SELF-CHECK: the arming
+                                 // half of #90 is deliberately not in this
+                                 // PR (see the ISSUE #90 note in
+                                 // ReplayQuorumBridge::observe — armed, a
+                                 // root differ is a hard stop that can stop
+                                 // SERVING, so it needs its own default-OFF
+                                 // flag and its own KAT). The armed branch
+                                 // below reads the real state rather than
+                                 // asserting a constant, so the line stays
+                                 // truthful when #90 lands.
                                  << (br->self_check_armed()
                                         ? std::string()
                                         : std::string(

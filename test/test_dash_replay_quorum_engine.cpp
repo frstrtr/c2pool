@@ -60,6 +60,7 @@
 #include <array>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -1092,4 +1093,97 @@ TEST(DashReplayQuorumEngine, MembersForResolvesAfterACycleBaseObservation)
     unknown.SetHex(
         "00000000000000000000000000000000000000000000000000000000000ffff1");
     EXPECT_FALSE(eng.members_for(1, unknown).has_value());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ISSUE #90 — active_set_shortfall() NAMES the blocking type, exactly, and
+// closes only when the last missing commitment arrives.
+//
+// active_sets_complete() is the criterion any future self-check arming will
+// key on (the arming itself is NOT in this PR — see
+// DashReplayQuorumSeam.BridgeNeverArmsTheRootSelfCheckByItself and the
+// ISSUE #90 note in ReplayQuorumBridge::observe). A bare bool cannot say WHY
+// a run never completes, which is how the fold_root_vs_committed line came to
+// print `0/4684` with no blocking condition named. The shortfall is the
+// missing half and it must be EXACT: the right type, the right count, and
+// "complete" only when nothing is short.
+//
+// This engine-level KAT is what the MinedCommitmentIndex KAT-G does NOT
+// cover: MinedCommitmentIndex::active_set_shortfall and
+// QuorumReplayEngine::active_set_shortfall are two different functions on two
+// different stores, and only the latter feeds the bridge's reporting surface.
+//
+// RED: make QuorumReplayEngine::active_set_shortfall() return {}, or make
+//      active_set_shortfall_text() return "complete".
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashReplayQuorumEngine, ActiveSetShortfallNamesTheTypeAndClosesExactly)
+{
+    // Seed the anchor fixture MINUS one llmq type / minus one row, so the
+    // shortfall has a known, checkable value.
+    auto seed_except = [](QuorumReplayEngine& eng, int skip_type,
+                          int skip_nth_of_type) {
+        size_t seeded = 0, skipped = 0;
+        std::map<int, int> seen_of_type;
+        for (const auto& l :
+             read_lines("dash_mainnet_active_quorums_2513685.txt")) {
+            auto f = split_ws(l);
+            EXPECT_EQ(f.size(), 5u);
+            if (f.size() != 5) continue;
+            const int type = std::stoi(f[0]);
+            const int nth  = seen_of_type[type]++;
+            if (type == skip_type
+                && (skip_nth_of_type < 0 || nth == skip_nth_of_type)) {
+                ++skipped;
+                continue;
+            }
+            auto c = parse_commitment_hex(f[4]);
+            EXPECT_TRUE(c.has_value());
+            if (!c) continue;
+            std::string err;
+            EXPECT_TRUE(eng.seed_commitment(
+                static_cast<uint32_t>(std::stoul(f[2])), *c, err)) << err;
+            ++seeded;
+        }
+        EXPECT_GT(skipped, 0u) << "the skip must actually skip something";
+        return seeded;
+    };
+
+    // ── (1) The mainnet reality: type 1 (LLMQ_50_60) entirely absent, which
+    //        is what a forward replay from a modern anchor produces — its 24
+    //        commitments were mined before DIP0024 and can never be observed.
+    {
+        QuorumReplayEngine eng(mainnet_cfg());
+        seed_except(eng, /*skip_type=*/1, /*skip_nth_of_type=*/-1);
+        EXPECT_FALSE(eng.active_sets_complete());
+        const auto miss = eng.active_set_shortfall();
+        ASSERT_EQ(miss.size(), 1u) << eng.active_set_shortfall_text();
+        EXPECT_EQ(int(miss[0].first), 1);
+        EXPECT_EQ(miss[0].second, 24u);
+        EXPECT_EQ(eng.active_set_shortfall_text(), "type1:short24");
+    }
+
+    // ── (2) ONE commitment short of complete is still SHORT, and says so by
+    //        name. This is the precision an arming criterion needs: it must
+    //        not round 3-of-4 up to "the reconstructed set IS dashd's set".
+    {
+        QuorumReplayEngine eng(mainnet_cfg());
+        seed_except(eng, /*skip_type=*/2, /*skip_nth_of_type=*/0);
+        EXPECT_FALSE(eng.active_sets_complete())
+            << "one type-2 commitment short must NOT read as complete";
+        const auto miss = eng.active_set_shortfall();
+        ASSERT_EQ(miss.size(), 1u) << eng.active_set_shortfall_text();
+        EXPECT_EQ(int(miss[0].first), 2);
+        EXPECT_EQ(miss[0].second, 1u);
+        EXPECT_EQ(eng.active_set_shortfall_text(), "type2:short1");
+    }
+
+    // ── (3) The full 88-commitment anchor closes it, and the text says so —
+    //        so "complete" is a reachable value, not a branch nothing hits.
+    {
+        QuorumReplayEngine eng(mainnet_cfg());
+        ASSERT_EQ(seed_engine_from_anchor(eng), 88u);
+        EXPECT_TRUE(eng.active_sets_complete());
+        EXPECT_TRUE(eng.active_set_shortfall().empty());
+        EXPECT_EQ(eng.active_set_shortfall_text(), "complete");
+    }
 }

@@ -33,9 +33,18 @@
 //      an already-mined slot from the mandatory set — and does NOT when the
 //      seam is absent (the default every existing caller keeps).
 //   G  issue #90: active_set_shortfall names WHICH type is short.
+//   H  bad-qc-block: a commitment whose quorumHash is not our chain's block
+//      hash at the derived base height is REFUSED (:407).
+//   I  bad-qc-height: a commitment mined outside its type's DKG mining window
+//      is REFUSED (:435).
+//   J  bad-qc-dup: two non-rotated commitments of one type in one block are
+//      REFUSED on the parsed entry point too (:377).
 //
-// Every one of C, D, E, F is red-provable by deleting the guard it names; the
-// comment on each says exactly which line to break.
+// Every one of C, D, E, F, H, I, J is red-provable by deleting the guard it
+// names; the comment on each says exactly which line to break. H/I/J each
+// carry a CONTROL that differs from the subject in exactly one property, so
+// the rejection is attributable to the arm under test and not to some other
+// refusal upstream of it.
 //
 // Fixture provenance: identical files to test_dash_replay_quorum_engine.cpp
 // (captured 2026-08-05 from a read-only mainnet Dash Core v23 node).
@@ -716,4 +725,244 @@ TEST(DashMinedCommitmentIndex, ShortfallNamesTheTypeThatBlocksSelfCheckArming)
     warm.seed_cursor(2513685);
     EXPECT_NE(warm.summary().find("active_set=COMPLETE"), std::string::npos)
         << warm.summary();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KAT-H / KAT-I / KAT-J — THE THREE PORTED REJECTION ARMS, each with a
+// CONTROL that differs in exactly one property.
+//
+// The 3101-block KAT-A only ever feeds VALID mainnet blocks, so it exercises
+// none of dashd's rejections: all three of these arms could be replaced with
+// `if (false)` and the suite stayed green. None of them can produce a false
+// TRUE has_mined_commitment (a rejected block writes nothing either way), so
+// this was a COVERAGE hole rather than a serving hole — but an arm nothing
+// constrains is an arm that can be deleted by accident, and then the store
+// starts accepting commitments dashd's ConnectBlock would have rejected.
+//
+// Each KAT below runs the SAME real mainnet commitment twice: once in the
+// shape the chain actually had (CONTROL → Applied) and once with exactly one
+// property broken (SUBJECT → the named dashd rejection). Delete the arm and
+// the subject becomes Applied too, which is the red.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+struct SubjectQc {
+    dash::coin::vendor::CFinalCommitment commitment;
+    uint32_t mined_height{0};
+};
+
+/// The first real non-null NON-ROTATED (type 4, LLMQ_100_67, dkgInterval 24,
+/// mining window [10,18]) commitment in the scan window, with the height the
+/// chain mined it at.
+std::optional<SubjectQc> first_type4_commitment(const std::vector<ScanBlock>& scan)
+{
+    for (const auto& b : scan) {
+        for (const auto& hex : b.qc_hex) {
+            auto p = parse_qc_payload_hex(hex);
+            if (!p) continue;
+            const auto& c = p->commitment;
+            if (c.llmqType != 4) continue;
+            if (MinedCommitmentIndex::is_null_commitment(c)) continue;
+            SubjectQc s;
+            s.commitment   = c;
+            s.mined_height = b.height;
+            return s;
+        }
+    }
+    return std::nullopt;
+}
+
+} // namespace
+
+// ── KAT-H — bad-qc-block: the commitment's quorumHash must BE our chain's
+//    block hash at the derived quorum base height.
+//    Upstream: llmq/blockprocessor.cpp:300-307 (GetQuorumBlockHash, :487) and
+//    the `quorumHash != qc.quorumHash` reject at :311.
+//    Port: mined_commitment_index.hpp:407.
+//
+//    Without it, a commitment naming ANY quorumHash — including one from
+//    another chain or one a peer invented — gets recorded as mined, and
+//    has_mined_commitment() then answers true for a quorum that does not
+//    exist on our chain, dropping a MANDATORY qfcommit slot out of the
+//    served template (dashd bad-qc-missing, a lost block).
+//
+//    RED: replace `if (*base_hash != qc.quorumHash)` with `if (false)`.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashMinedCommitmentIndex, BadQcBlockRejectsACommitmentNotBoundToOurChain)
+{
+    const auto scan   = load_scan();
+    const auto hashes = build_hash_map(scan);
+    auto at_h = hash_fn(hashes);
+
+    const auto subj = first_type4_commitment(scan);
+    ASSERT_TRUE(subj.has_value())
+        << "the fixture window must contain a real non-null type-4 commitment";
+
+    MinedBlockInput in;
+    in.height     = subj->mined_height;
+    for (const auto& b : scan)
+        if (b.height == subj->mined_height) in.block_hash = b.block_hash;
+    ASSERT_FALSE(in.block_hash.IsNull());
+
+    // ── CONTROL: the commitment exactly as the chain mined it.
+    {
+        auto idx = make_armed();
+        idx.seed_cursor(subj->mined_height - 1);
+        MinedBlockInput ok = in;
+        ok.commitments.push_back(subj->commitment);
+        std::string err;
+        ASSERT_EQ(idx.process_input(ok, at_h, &err), MinedIngestResult::Applied)
+            << err;
+        EXPECT_TRUE(idx.has_mined_commitment(subj->commitment.llmqType,
+                                             subj->commitment.quorumHash));
+    }
+
+    // ── SUBJECT: one byte of quorumHash flipped. Everything else — height,
+    //    type, mining window, contents — is identical.
+    {
+        auto idx = make_armed();
+        idx.seed_cursor(subj->mined_height - 1);
+        MinedBlockInput bad = in;
+        auto tampered = subj->commitment;
+        tampered.quorumHash.data()[0] ^= 0xff;
+        bad.commitments.push_back(tampered);
+        std::string err;
+        EXPECT_EQ(idx.process_input(bad, at_h, &err),
+                  MinedIngestResult::BadQcBlock)
+            << "a commitment whose quorumHash is not our chain's block hash at "
+               "the derived base height must be rejected bad-qc-block "
+               "(blockprocessor.cpp:311); got err=" << err;
+        EXPECT_NE(err.find("bad-qc-block"), std::string::npos) << err;
+        // Nothing may be written by a refused block.
+        EXPECT_FALSE(idx.has_mined_commitment(tampered.llmqType,
+                                              tampered.quorumHash));
+        EXPECT_EQ(idx.height(), subj->mined_height - 1)
+            << "a refused block must not advance the cursor";
+        EXPECT_EQ(idx.stats().commitments_mined, 0u);
+    }
+}
+
+// ── KAT-I — bad-qc-height: a commitment may only be mined INSIDE its type's
+//    DKG mining window.
+//    Upstream: llmq/blockprocessor.cpp:327 (`!IsMiningPhase` → bad-qc-height).
+//    Port: mined_commitment_index.hpp:435.
+//
+//    Type 4 is dkgInterval 24, window [10,18]. Control and subject use the
+//    SAME commitment and the SAME quorum base (same cycle), so the only
+//    difference between Applied and rejected is the block height's phase.
+//
+//    RED: replace `if (!is_mining_phase(*p, height))` with `if (false)`.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashMinedCommitmentIndex, BadQcHeightRejectsMiningOutsideTheDkgWindow)
+{
+    const auto scan   = load_scan();
+    const auto hashes = build_hash_map(scan);
+    auto at_h = hash_fn(hashes);
+
+    const auto subj = first_type4_commitment(scan);
+    ASSERT_TRUE(subj.has_value());
+
+    // A whole type-4 cycle that lies inside the scanned window.
+    const uint32_t cycle = (subj->mined_height / 24u) * 24u;
+    const uint32_t h_in  = cycle + 12;   // phase 12 ∈ [10,18]
+    const uint32_t h_out = cycle + 20;   // phase 20 ∉ [10,18]
+    ASSERT_EQ(dash::coin::is_mining_phase(dash::coin::kLlmq100_67, h_in), true);
+    ASSERT_EQ(dash::coin::is_mining_phase(dash::coin::kLlmq100_67, h_out), false);
+
+    // Bind the commitment honestly to OUR chain at the cycle's quorum base,
+    // so the bad-qc-block arm cannot be what answers here.
+    const uint32_t base_h =
+        cycle + static_cast<uint32_t>(subj->commitment.quorumIndex);
+    auto base_hash = at_h(base_h);
+    ASSERT_TRUE(base_hash.has_value()) << "base h=" << base_h;
+    auto qc = subj->commitment;
+    qc.quorumHash = *base_hash;
+
+    auto run_at = [&](uint32_t height, std::string& err) {
+        auto idx = make_armed();
+        idx.seed_cursor(height - 1);
+        MinedBlockInput in;
+        in.height = height;
+        auto it = hashes.find(height);
+        EXPECT_NE(it, hashes.end());
+        if (it != hashes.end()) in.block_hash = it->second;
+        in.commitments.push_back(qc);
+        return idx.process_input(in, at_h, &err);
+    };
+
+    // ── CONTROL: inside the window.
+    std::string err_in;
+    ASSERT_EQ(run_at(h_in, err_in), MinedIngestResult::Applied) << err_in;
+
+    // ── SUBJECT: same commitment, same quorum base, 8 blocks later.
+    std::string err_out;
+    EXPECT_EQ(run_at(h_out, err_out), MinedIngestResult::BadQcHeight)
+        << "h=" << h_out << " is phase " << (h_out % 24)
+        << ", outside the type-4 DKG mining window [10,18]; dashd rejects "
+           "bad-qc-height (blockprocessor.cpp:327). err=" << err_out;
+    EXPECT_NE(err_out.find("bad-qc-height"), std::string::npos) << err_out;
+}
+
+// ── KAT-J — bad-qc-dup (the PER-BLOCK arm): at most one commitment per
+//    NON-ROTATED type per block.
+//    Upstream: llmq/blockprocessor.cpp:445-450 ("only allow one commitment
+//    per type and per block (This was changed with rotation)").
+//    Port: mined_commitment_index.hpp:377 — the re-assert on the PARSED entry
+//    point, which is the one a caller that assembled MinedBlockInput itself
+//    reaches (the body path's copy is at :332).
+//
+//    Without it a caller can smuggle two type-4 commitments into one block;
+//    both stage, both write, and the store's last-K-mined walk now holds a
+//    history no dashd would have accepted.
+//
+//    RED: replace `if (!p->use_rotation && ++per_type_count[p->type] > 1)`
+//         at :377 with `if (false)`.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashMinedCommitmentIndex, BadQcDupRejectsTwoNonRotatedOfOneTypeInABlock)
+{
+    const auto scan   = load_scan();
+    const auto hashes = build_hash_map(scan);
+    auto at_h = hash_fn(hashes);
+
+    const auto subj = first_type4_commitment(scan);
+    ASSERT_TRUE(subj.has_value());
+
+    MinedBlockInput base;
+    base.height = subj->mined_height;
+    for (const auto& b : scan)
+        if (b.height == subj->mined_height) base.block_hash = b.block_hash;
+    ASSERT_FALSE(base.block_hash.IsNull());
+
+    // ── CONTROL: one type-4 commitment — the chain's own shape.
+    {
+        auto idx = make_armed();
+        idx.seed_cursor(subj->mined_height - 1);
+        MinedBlockInput one = base;
+        one.commitments.push_back(subj->commitment);
+        std::string err;
+        ASSERT_EQ(idx.process_input(one, at_h, &err),
+                  MinedIngestResult::Applied) << err;
+        EXPECT_EQ(idx.stats().commitments_mined, 1u);
+    }
+
+    // ── SUBJECT: the SAME commitment twice in one block.
+    {
+        auto idx = make_armed();
+        idx.seed_cursor(subj->mined_height - 1);
+        MinedBlockInput two = base;
+        two.commitments.push_back(subj->commitment);
+        two.commitments.push_back(subj->commitment);
+        std::string err;
+        EXPECT_EQ(idx.process_input(two, at_h, &err),
+                  MinedIngestResult::BadQcDupInBlock)
+            << "two non-rotated type-4 commitments in one block is dashd's "
+               "bad-qc-dup (blockprocessor.cpp:448); got err=" << err;
+        EXPECT_NE(err.find("bad-qc-dup"), std::string::npos) << err;
+        EXPECT_FALSE(idx.has_mined_commitment(subj->commitment.llmqType,
+                                              subj->commitment.quorumHash))
+            << "a refused block must write NOTHING — the staging rule";
+        EXPECT_EQ(idx.height(), subj->mined_height - 1);
+        EXPECT_EQ(idx.stats().commitments_mined, 0u);
+    }
 }

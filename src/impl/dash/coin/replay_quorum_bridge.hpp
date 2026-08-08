@@ -471,20 +471,31 @@ public:
         uint64_t lists_retained{0};
         uint64_t quorum_roots_matched{0}; // informational: folded == committed
         uint64_t quorum_roots_differed{0};
-        /// Height at which the root self-check ARMED (0 = never). Issue #90:
-        /// while this is 0 the matched/differed pair is a warm-up artefact and
-        /// must not be read as divergence; from this height on it is a real
-        /// consensus comparison and a differ POISONS the lane.
-        uint32_t self_check_armed_at{0};
         std::string last_skip_reason;
         std::string first_member_miss;    // the named first miss, verbatim
     };
     const Stats& stats() const { return m_stats; }
 
-    /// Issue #90, the reporting half: WHY the self-check is still unarmed.
-    /// Never a bare bool — the counter that gates it reads 0/N forever on
-    /// mainnet and the reason (24 frozen LLMQ_50_60 commitments no forward
-    /// replay can observe) is not inferable from the number.
+    /// Issue #90, the REPORTING half — and the only half this PR ships.
+    /// WHY the self-check is still unarmed. Never a bare bool: the counter it
+    /// gates reads 0/N forever on mainnet and the reason (24 frozen
+    /// LLMQ_50_60 commitments no forward replay can observe) is not inferable
+    /// from the number. Pure text; it changes no serving decision.
+    ///
+    /// THE ARMING HALF IS DELIBERATELY ABSENT. An earlier revision of this
+    /// file armed the root self-check from inside observe() the moment
+    /// active_sets_complete() went true. That path was NOT behind
+    /// --replay-mined-commitment-index — it was reachable with the
+    /// PRE-EXISTING --replay-fold-quorums — and once armed, a
+    /// merkleRootQuorums differ is a HARD STOP (replay_quorum_engine.hpp
+    /// observe_block, the m_self_check branch) that poisons the engine. A
+    /// poisoned engine hands the fold no member sets, the replay payee
+    /// publisher stops publishing, and the node stops SERVING. Fail-closed,
+    /// but a stop. It was inert on mainnet only because type 1 is short by 24
+    /// forever — a fact about the chain, not a property of this code.
+    /// Arming stays with issue #90, behind its own flag and its own KAT.
+    /// DashReplayQuorumSeam.BridgeNeverArmsTheRootSelfCheckByItself holds
+    /// the line: a complete active set must not arm anything by itself.
     std::string active_set_shortfall_text() const
     {
         return m_quorum.active_set_shortfall_text();
@@ -645,38 +656,34 @@ public:
             else
                 ++m_stats.quorum_roots_differed;
         }
-        // ── ISSUE #90: the arming criterion finally has a caller ──────────
-        // replay_quorum_engine.hpp documented "callers arm it once the
-        // commitment store is complete (… a warm-from-scan harness — once
-        // every type has reached its active quota)". Nothing ever did, so
-        // fold_root_vs_committed ran UNARMED for the life of every run and
-        // reported 0/N — a counter that could not disagree with anything.
+        // ── ISSUE #90: NO AUTO-ARM HERE, ON PURPOSE ──────────────────────
+        // The obvious move at this point is
+        //     if (!m_quorum.self_check_armed() && m_quorum.active_sets_complete())
+        //         m_quorum.arm_self_check();
+        // and this file shipped exactly that for one revision. It is removed.
         //
-        // Arm it the moment the reconstructed active set IS dashd's set. From
-        // that block on the comparison is a real consensus check and a
-        // mismatch poisons the lane, which is the whole point.
-        //
-        // On MAINNET this will not fire, and that is a FACT about the chain,
-        // not a bug here: LLMQ_50_60's last 24 commitments were mined before
-        // DIP0024 and stay in dashd's active set forever, so a forward replay
-        // from a modern anchor is permanently short by 24. The shortfall is
-        // now NAMED (active_set_shortfall_text()) instead of being an
-        // unexplained zero.
-        if (!m_quorum.self_check_armed() && m_quorum.active_sets_complete()) {
-            m_quorum.arm_self_check();
-            m_stats.self_check_armed_at = height;
-            LOG_INFO << "[REPLAY-SEAM] quorum-root SELF-CHECK ARMED at h="
-                     << height
-                     << ": every chainparams llmq type has reached its full"
-                        " active quota, so the reconstructed active set IS"
-                        " dashd's set. fold_root_vs_committed is a consensus"
-                        " comparison from here on; a differ now POISONS the"
-                        " lane. Warm-up counts before this height: matched="
-                     << m_stats.quorum_roots_matched << " differed="
-                     << m_stats.quorum_roots_differed;
-            m_stats.quorum_roots_matched  = 0;
-            m_stats.quorum_roots_differed = 0;
-        }
+        // Reasons, in order of how much they cost:
+        //   1. It is not behind --replay-mined-commitment-index. It rides the
+        //      PRE-EXISTING --replay-fold-quorums, so it would change what a
+        //      node already running that flag does — an unflagged change to a
+        //      lane that feeds serving.
+        //   2. Once armed, a merkleRootQuorums differ is a HARD STOP: it
+        //      poisons the engine (see the m_self_check branch of
+        //      QuorumReplayEngine::observe_block). A poisoned engine answers
+        //      no member sets, the fold stops, the replay payee publisher
+        //      stops publishing, and the node stops SERVING. It cannot mint a
+        //      WRONG payee — but "fail-closed" is still "stopped".
+        //   3. This very site runs BEFORE `if (!r.ok) return r.error;`, so it
+        //      armed even on an observation the engine REFUSED.
+        //   4. Its safety argument was "inert on mainnet, because type 1 is
+        //      short by 24 forever". That is a fact about the chain, not
+        //      about this code, and premises of that shape have inverted on
+        //      this fleet before.
+        // The REPORTING half of #90 stays (active_set_shortfall_text() names
+        // the blocking type instead of printing an unexplained 0/N); it is
+        // text and gates nothing. Arming belongs to #90's own PR, with its own
+        // default-OFF flag and a KAT that drives a complete active set through
+        // and asserts it arms — and does NOT arm one commitment short.
         if (m_cfg.debug_logs && r.member_cycles_derived > 0)
             LOG_INFO << "[REPLAY-SEAM] h=" << height << " derived "
                      << r.member_cycles_derived << " member cycle(s)";
