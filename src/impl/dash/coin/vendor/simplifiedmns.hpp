@@ -227,6 +227,19 @@ struct CSimplifiedMNListEntry
     }
 };
 
+// TEST SEAM (D2 root-memo regression gates, the 2026-08-07/08 hotel freeze
+// class): process-wide count of FULL SML merkle-root computations. The memo
+// tests count the actual hashing work — not calls to some wrapper a future
+// refactor could bypass — so a memo defeated by hashing a fresh per-call
+// object (the exact defect that made the first CalcMerkleRoot-level memo
+// worthless) still shows up as a scaling hash count. Single io-thread
+// discipline (same as NodeCoinState): plain uint64, no atomics.
+inline uint64_t& sml_calc_merkle_root_count()
+{
+    static uint64_t n = 0;
+    return n;
+}
+
 // Holds the CURRENT SML at a given block. Entries are kept sorted by
 // proRegTxHash ascending — required for both equality comparisons and
 // for the merkle-root calculation to match dashcore bit-for-bit.
@@ -267,6 +280,8 @@ public:
 
     uint256 CalcMerkleRoot() const
     {
+        ++sml_calc_merkle_root_count();   // D2 test seam — counted even for
+                                          // the empty case: a call is a call
         if (mnList.empty()) return uint256::ZERO;
         std::vector<uint256> leaves;
         leaves.reserve(mnList.size());

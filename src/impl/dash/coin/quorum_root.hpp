@@ -49,6 +49,18 @@
 namespace dash {
 namespace coin {
 
+/// TEST SEAM (D2 root-memo regression gates, the 2026-08-07/08 hotel freeze
+/// class): process-wide count of FULL quorum-root computations (each one
+/// re-serializes + SHA256d's every active commitment). Mirrors
+/// vendor::sml_calc_merkle_root_count() — the memo tests count the actual
+/// hashing work, not calls to a wrapper. Single io-thread discipline:
+/// plain uint64, no atomics.
+inline uint64_t& quorum_root_compute_count()
+{
+    static uint64_t n = 0;
+    return n;
+}
+
 inline bool llmq_uses_rotation(uint8_t llmqType)
 {
     // Mainnet rotation flags: types 5 (LLMQ_60_75) and 6 (LLMQ_25_67).
@@ -114,6 +126,7 @@ inline uint256 compute_merkle_root_quorums(const QuorumManager& qmgr)
     // members), this yields dashd's committed merkleRootQuorums
     // (test_dash_mnlistdiff_root_parity.cpp). The earlier per-index dedup of
     // rotated types dropped ring-member leaves and diverged (bad-cbtx).
+    ++quorum_root_compute_count();   // D2 test seam
     std::vector<uint256> vec_hashes_final;
     vec_hashes_final.reserve(qmgr.active_entries().size());
     for (const auto& e : qmgr.active_entries()) {

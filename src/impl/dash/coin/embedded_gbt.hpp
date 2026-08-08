@@ -985,12 +985,16 @@ inline vendor::CCbTx build_embedded_cbtx(
     vendor::CCbTx c;
     c.nVersion           = vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
     c.nHeight            = static_cast<int32_t>(prev_height + 1);
-    // CalcMerkleRoot() caches upstream; take a mutable copy to call
-    // into it without breaking const-correctness of the caller. The
-    // cost is one ~450 KB SML vector copy per 5s shadow tick — within
-    // budget for log-only validation.
-    auto sml_mut = sml;
-    c.merkleRootMNList   = sml_mut.CalcMerkleRoot();
+    // CalcMerkleRoot() is const and does NOT cache — every call hashes the
+    // full list (~2000 x SHA256d on mainnet). A prior comment here claimed
+    // "CalcMerkleRoot() caches upstream" and budgeted the ~450 KB copy it
+    // took to call it "per 5s shadow tick"; BOTH clauses were false — this
+    // builder runs on the live serve path, and that assumed-cheap root
+    // recompute is the class behind the 2026-08-07/08 hotel freeze (26
+    // rigs -> 0, twice). The serve-time re-derivations are memoized at
+    // NodeCoinState level (root-memo epoch); this build-time call runs once
+    // per template build, directly on the caller's list, no copy.
+    c.merkleRootMNList   = sml.CalcMerkleRoot();
     c.merkleRootQuorums  = quorum_root_override
         ? *quorum_root_override
         : compute_merkle_root_quorums(qmgr);

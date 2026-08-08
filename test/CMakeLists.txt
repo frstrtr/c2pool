@@ -805,6 +805,13 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_embedded_shadow_compare.cpp
         test_dash_mn_confirm_rollover.cpp
         test_dash_collateral_spend_filter.cpp
+        # test_dash_root_memo.cpp: D2 of the 2026-08-07/08 hotel freeze —
+        # NodeCoinState-level memo of the projected-SML root + quorum root
+        # (epoch-invalidated). Pins: warm emit_ok does no hashing (T1),
+        # any SML/quorum mutation invalidates (T2 — the stale-root/lost-
+        # block pin), memoized == fresh byte-for-byte (T3). Folded here per
+        # the same #769 rule as the rollover suite above.
+        test_dash_root_memo.cpp
         # test_dash_operator_split.cpp: incident h=2516595 bad-cb-payee — the
         # MN operator-reward split KATs (builder dual-output + serve-gate
         # cause=mn-payout-split-unprovable + ResetOperatorFields mirror +

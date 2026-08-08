@@ -140,6 +140,7 @@
 #include <cstdint>
 #include <cctype>       // std::tolower (--replay-utxo-expect normalize)
 #include <cstdlib>      // std::getenv
+#include <utility>      // std::as_const (qc-plan lambda: read-only qmgr access)
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -4372,9 +4373,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 (uint32_t next_h) -> std::optional<dash::coin::QcBlockPlan> {
                     if (*qc_first_plan_h == 0u) *qc_first_plan_h = next_h;
                     // Observe the MINED set at the tip we are building on.
+                    // D2 root memo: this lambda runs INSIDE emit_ok on the
+                    // serve path. Reads of qmgr() here must go through the
+                    // CONST accessor — the non-const one bumps the root-memo
+                    // epoch (it hands out a mutable reference) and would
+                    // re-chill the memo on every single gate evaluation,
+                    // silently reinstating the recompute the memo removes.
                     if (next_h > 0)
                         qc_type_recon->observe(next_h - 1u,
-                                               node_coin_state.qmgr());
+                                               std::as_const(node_coin_state).qmgr());
                     // Log when the DEFECT SHAPE changes — a new offending
                     // type must never be swallowed by dedup on an old one —
                     // and otherwise at most once per 5 minutes, carrying the
@@ -4406,7 +4413,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     }
                     dash::coin::RequiredQcSlot gap{};
                     auto plan = dash::coin::build_daemonless_qc_plan(
-                        qc_net, next_h, node_coin_state.qmgr(),
+                        qc_net, next_h, std::as_const(node_coin_state).qmgr(),
                         [hc](uint32_t h) -> std::optional<uint256> {
                             if (auto e = hc->get_header_by_height(h))
                                 return e->hash;
@@ -4550,7 +4557,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             const bool ep_cache_has = qc_cache->has_commitment(
                                 slot->llmq_type, slot->quorum_hash);
                             const bool ep_mined =
-                                node_coin_state.qmgr()
+                                std::as_const(node_coin_state).qmgr()
                                     .find(slot->llmq_type, slot->quorum_hash)
                                     .has_value();
                             if (auto ended = qc_episode->observe_derivable(
