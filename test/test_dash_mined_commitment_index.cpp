@@ -39,8 +39,12 @@
 //      is REFUSED (:435).
 //   J  bad-qc-dup: two non-rotated commitments of one type in one block are
 //      REFUSED on the parsed entry point too (:377).
+//   K  body-not-bound: process_block — the BODY entry point production wires
+//      into the pre_fold hook — itself refuses a body that does not fold to
+//      the header's committed merkle root (:302), writes nothing, and does
+//      not advance the cursor.
 //
-// Every one of C, D, E, F, H, I, J is red-provable by deleting the guard it
+// Every one of C, D, E, F, H, I, J, K is red-provable by deleting the guard it
 // names; the comment on each says exactly which line to break. H/I/J each
 // carry a CONTROL that differs from the subject in exactly one property, so
 // the rejection is attributable to the arm under test and not to some other
@@ -964,5 +968,138 @@ TEST(DashMinedCommitmentIndex, BadQcDupRejectsTwoNonRotatedOfOneTypeInABlock)
             << "a refused block must write NOTHING — the staging rule";
         EXPECT_EQ(idx.height(), subj->mined_height - 1);
         EXPECT_EQ(idx.stats().commitments_mined, 0u);
+    }
+}
+
+// ── KAT-K — process_block: the BODY entry point must ITSELF refuse a body
+//    that does not bind to its header.
+//    Port: mined_commitment_index.hpp:302 (`block_body_binds_to_header`).
+//
+//    Every other KAT in this file drives process_input — the PARSED entry
+//    point, where the body↔header binding is the CALLER's proof. Production
+//    wires process_block into the pre_fold hook (main_dash.cpp), and
+//    process_block is where the store asserts the binding for itself (the
+//    TRUST BOUNDARY note in the header). Without this test the suite is green
+//    around the one function production actually calls.
+//
+//    Consequence if the guard is absent — the same chain KAT-H proves for
+//    :407: a forged/mutated body writes mined records, has_mined_commitment()
+//    answers true for a quorum not on our chain, a MANDATORY qfcommit slot
+//    leaves the served template, and dashd rejects the found block
+//    bad-qc-missing (blockprocessor.cpp:198) — a LOST BLOCK.
+//
+//    CONTROL and SUBJECT share one body: the real type-6 payload set the
+//    chain mined at the subject height, byte-exact from the mainnet capture,
+//    behind a coinbase-shaped tx 0. The header commits the merkle root over
+//    exactly that tx set (the same fold block_body_binds_to_header applies),
+//    so the control is Applied. The subject mutates ONE transaction — the
+//    coinbase — while the header keeps committing the ORIGINAL tx set: the
+//    delivered body no longer folds to the committed root, and nothing else
+//    about it changed. That is the real-PoW-header + forged-body attack the
+//    E2 finding-A guard exists for.
+//
+//    RED: replace `if (!block_body_binds_to_header(block))` at :302 with
+//    `if (false)`. The subject then parses cleanly (the mutated tx is the
+//    type-0 coinbase, which the type-6 walk skips), every downstream arm
+//    passes, and the forged body is Applied: records written, cursor
+//    advanced — all five subject expectations fail.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashMinedCommitmentIndex, ProcessBlockRefusesABodyNotBoundToItsHeader)
+{
+    const auto scan   = load_scan();
+    const auto hashes = build_hash_map(scan);
+    auto at_h = hash_fn(hashes);
+
+    const auto subj = first_type4_commitment(scan);
+    ASSERT_TRUE(subj.has_value())
+        << "the fixture window must contain a real non-null type-4 commitment";
+
+    const ScanBlock* sb = nullptr;
+    for (const auto& b : scan)
+        if (b.height == subj->mined_height) sb = &b;
+    ASSERT_NE(sb, nullptr);
+    ASSERT_FALSE(sb->qc_hex.empty());
+
+    // Assemble the BODY the entry point sees: coinbase-shaped tx 0, then
+    // every type-6 tx the chain mined at this height, extra_payload
+    // byte-exact from the capture.
+    dash::coin::BlockType blk;
+    blk.m_bits = 0x19158dc7u;   // non-null header
+    {
+        dash::coin::MutableTransaction coinbase;
+        coinbase.version = 3;
+        coinbase.type    = 0;
+        dash::coin::TxIn cin;
+        cin.prevout.hash  = uint256::ZERO;
+        cin.prevout.index = 0xffffffffu;
+        coinbase.vin.push_back(cin);
+        blk.m_txs.push_back(std::move(coinbase));
+    }
+    for (const auto& hex : sb->qc_hex) {
+        dash::coin::MutableTransaction tx;
+        tx.version       = 3;
+        tx.type          = CFinalCommitmentTxPayload::SPECIALTX_TYPE;   // 6
+        tx.extra_payload = from_hex(hex);
+        ASSERT_FALSE(tx.extra_payload.empty());
+        blk.m_txs.push_back(std::move(tx));
+    }
+    ASSERT_GE(blk.m_txs.size(), 2u);
+
+    // Bind body to header: commit the root over the actual tx set — the same
+    // fold block_body_binds_to_header applies (compute_merkle_root over
+    // sha256d(canonical tx bytes)).
+    {
+        std::vector<uint256> txids;
+        for (const auto& tx : blk.m_txs) {
+            auto packed = ::pack(tx);
+            txids.push_back(::Hash(packed.get_span()));
+        }
+        blk.m_merkle_root = dash::coin::compute_merkle_root(txids);
+    }
+    ASSERT_TRUE(dash::coin::block_body_binds_to_header(blk));
+
+    // ── CONTROL: the bound body at its real height → Applied, records
+    //    written, cursor advanced.
+    {
+        auto idx = make_armed();
+        idx.seed_cursor(subj->mined_height - 1);
+        std::string err;
+        ASSERT_EQ(idx.process_block(subj->mined_height, sb->block_hash, blk,
+                                    at_h, &err),
+                  MinedIngestResult::Applied) << err;
+        EXPECT_TRUE(idx.has_mined_commitment(subj->commitment.llmqType,
+                                             subj->commitment.quorumHash))
+            << "the real block's type-4 commitment must be recorded as mined";
+        EXPECT_EQ(idx.height(), subj->mined_height);
+        EXPECT_EQ(idx.stats().blocks_ingested, 1u);
+        // Every payload the body carried was either mined or a null skip.
+        EXPECT_EQ(idx.stats().commitments_mined + idx.stats().commitments_null,
+                  static_cast<uint64_t>(sb->qc_hex.size()));
+    }
+
+    // ── SUBJECT: ONE transaction mutated (the coinbase), header unchanged —
+    //    the delivered body no longer folds to the committed root.
+    {
+        auto idx = make_armed();
+        idx.seed_cursor(subj->mined_height - 1);
+        dash::coin::BlockType forged = blk;
+        forged.m_txs[0].locktime ^= 1u;         // m_merkle_root NOT updated
+        ASSERT_FALSE(dash::coin::block_body_binds_to_header(forged));
+        std::string err;
+        EXPECT_EQ(idx.process_block(subj->mined_height, sb->block_hash,
+                                    forged, at_h, &err),
+                  MinedIngestResult::BodyNotBound)
+            << "a body that does not fold to the header's committed merkle "
+               "root must be refused body-not-bound at the entry point "
+               "(mined_commitment_index.hpp:302); got err=" << err;
+        EXPECT_NE(err.find("body-not-bound"), std::string::npos) << err;
+        // Nothing may be written by a refused body — the staging rule.
+        EXPECT_FALSE(idx.has_mined_commitment(subj->commitment.llmqType,
+                                              subj->commitment.quorumHash));
+        EXPECT_EQ(idx.height(), subj->mined_height - 1)
+            << "a refused body must not advance the cursor";
+        EXPECT_EQ(idx.stats().commitments_mined, 0u);
+        EXPECT_EQ(idx.stats().blocks_ingested, 0u);
+        EXPECT_EQ(idx.stats().blocks_refused, 1u);
     }
 }
