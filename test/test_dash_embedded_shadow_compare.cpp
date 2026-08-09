@@ -412,9 +412,14 @@ TEST(DashShadowCompare, TxSetCoverageIsMeasuredAgainstDashd) {
     EXPECT_FALSE(o.served_mismatch);
 }
 
-// The dangerous direction is called out in the line itself, because the
-// operator reads the line, not the struct.
-TEST(DashShadowCompare, TxWeHaveThatDashdDoesNotIsFlaggedLoudly) {
+// ours_only is INFORMATIONAL. It is still measured and still printed — as a
+// COVERAGE STATISTIC — and it no longer tells the operator not to arm the serve
+// flag. `ours_only == 0` was unreachable (two independently-connected mempools
+// never coincide: MEASURED non-zero in 8.8% of 6056 hotel samples, mean 65.3,
+// max 287) AND blind to the case that costs money (a strict SUBSET of dashd's
+// set can still contain a transaction dashd would refuse). The serve flag is
+// now gated on transaction VALIDITY — mempool_validity_gate.hpp.
+TEST(DashShadowCompare, OursOnlyIsReportedButNoLongerBlocksTheServeFlag) {
     auto cb = make_cbtx(2500000, 11, 22);
     auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
     auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
@@ -427,10 +432,15 @@ TEST(DashShadowCompare, TxWeHaveThatDashdDoesNotIsFlaggedLoudly) {
 
     const auto o = shadow_evaluate(WorkSource::Embedded, emb,
                                    std::optional<DashWorkData>(dref));
+    // Still MEASURED and still PRINTED — a coverage statistic nobody stops
+    // watching just because it stopped being a gate.
     EXPECT_TRUE(has_line_with(o.log_lines, "ours_only=1"));
-    EXPECT_TRUE(has_line_with(o.log_lines, "OURS-ONLY"));
-    EXPECT_TRUE(has_line_with(o.log_lines,
-                              "do NOT enable --embedded-serve-mempool-txs"));
+    EXPECT_TRUE(has_line_with(o.log_lines, "INFORMATIONAL"));
+    // ... and it no longer issues the blocking instruction.
+    EXPECT_FALSE(has_line_with(o.log_lines,
+                               "do NOT enable --embedded-serve-mempool-txs"));
+    // A tx-set divergence is not, and never was, a served mismatch.
+    EXPECT_FALSE(o.served_mismatch);
 }
 
 // A coinbase-only dashd template means there was no fee to capture at this
@@ -678,10 +688,11 @@ TEST(DashShadowCompare, NoServedAndNoCandidatesIsModeNone) {
     EXPECT_TRUE(has_line_with(o.log_lines, "mode=none"));
 }
 
-// The candidate path must still refuse the dangerous direction: a candidate we
-// hold that dashd does not is exactly as disqualifying as a served one, because
-// it is what we WOULD have put in a block.
-TEST(DashShadowCompare, CandidateOursOnlyIsStillFlagged) {
+// The candidate path measures ours_only the same way the served path does —
+// and, like the served path, reports it as INFORMATION. What disqualifies a
+// candidate is dashd REFUSING it (mempool_validity_gate.hpp), not dashd's
+// template happening not to carry it.
+TEST(DashShadowCompare, CandidateOursOnlyIsMeasuredAndReportedInformational) {
     auto cb = make_cbtx(2500000, 11, 22);
     auto emb  = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
     auto dref = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
@@ -695,7 +706,8 @@ TEST(DashShadowCompare, CandidateOursOnlyIsStillFlagged) {
 
     const auto o = shadow_evaluate(WorkSource::Embedded, emb,
                                    std::optional<DashWorkData>(dref));
-    EXPECT_TRUE(has_line_with(o.log_lines, "OURS-ONLY"));
-    EXPECT_TRUE(has_line_with(o.log_lines,
-                              "do NOT enable --embedded-serve-mempool-txs"));
+    EXPECT_TRUE(has_line_with(o.log_lines, "ours_only=1"));
+    EXPECT_TRUE(has_line_with(o.log_lines, "INFORMATIONAL"));
+    EXPECT_FALSE(has_line_with(o.log_lines,
+                               "do NOT enable --embedded-serve-mempool-txs"));
 }

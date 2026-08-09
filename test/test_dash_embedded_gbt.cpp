@@ -48,6 +48,7 @@
 #include <impl/dash/coin/mn_state_machine.hpp>
 #include <impl/dash/coin/mn_state_db.hpp>
 #include <impl/dash/coin/mempool.hpp>
+#include <impl/dash/coin/mempool_validity_gate.hpp>    // probe-set assembly (the serve-flag gate)
 #include <impl/dash/coin/subsidy.hpp>
 #include <impl/dash/coin/utxo_adapter.hpp>
 #include <impl/dash/coin/quorum_manager.hpp>
@@ -1059,6 +1060,90 @@ TEST(DashUtxoImmatureServing, SuppressedTemplateNamesItselfAndReportsThePrice) {
     EXPECT_EQ(empty.m_txset_forgone_fees, f.mp.total_known_fees());
     EXPECT_EQ(empty.m_txset_forgone_fees,
               static_cast<uint64_t>(ImmatureFixture::FEE));
+}
+
+// ── THE MEMPOOL VALIDITY GATE's PROBE SET (mempool_validity_gate.hpp) ───────
+// The condition that decides when --embedded-serve-mempool-txs may be armed
+// needs the WIRE BYTES of every transaction we would serve, so each one can be
+// put to dashd's testmempoolaccept. These pin that the builder hands the gate
+// exactly those transactions and no others, in both postures.
+
+TEST(DashMempoolProbeSet, SuppressedTemplateCarriesCandidateWireHexForTheGate) {
+    ImmatureFixture f;
+    auto empty = f.build(/*suppress=*/true);
+
+    // Nothing served, but the candidate set — what selection WOULD have chosen
+    // — now carries its wire hex: ids alone cannot be put to
+    // testmempoolaccept, and while the flag is OFF the candidate set is the
+    // only place the transactions we would serve exist.
+    ASSERT_TRUE(empty.m_txs.empty());
+    ASSERT_EQ(empty.m_txset_candidates.size(), 1u);
+    ASSERT_EQ(empty.m_txset_candidate_data_hex.size(),
+              empty.m_txset_candidates.size());
+    EXPECT_FALSE(empty.m_txset_candidate_data_hex[0].empty());
+    ASSERT_EQ(empty.m_mempool_probe_depends_in_set.size(), 1u);
+    EXPECT_EQ(empty.m_mempool_probe_depends_in_set[0], 0u)
+        << "a single independent tx has no in-set parent";
+
+    const auto set = dash::coin::mempool_probe_set(empty);
+    ASSERT_EQ(set.size(), 1u);
+    EXPECT_EQ(set[0].txid, dash::coin::dash_txid(f.tx).GetHex());
+    EXPECT_EQ(set[0].raw_hex, empty.m_txset_candidate_data_hex[0]);
+}
+
+TEST(DashMempoolProbeSet, ServedTemplateRangeNamesTheMempoolTxsWithoutDuplicatingThem) {
+    ImmatureFixture f;
+    auto normal = f.build(/*suppress=*/false);
+
+    // The served body here is exactly the one selected mempool tx: no type-6
+    // commitments, no pins. The range must name it and nothing else.
+    ASSERT_EQ(normal.m_txs.size(), 1u);
+    EXPECT_EQ(normal.m_mempool_tx_first_index, 0u);
+    EXPECT_EQ(normal.m_mempool_tx_count, 1u);
+
+    const auto set = dash::coin::mempool_probe_set(normal);
+    ASSERT_EQ(set.size(), 1u);
+    EXPECT_EQ(set[0].txid, dash::coin::dash_txid(f.tx).GetHex());
+    EXPECT_EQ(set[0].raw_hex, normal.m_tx_data_hex[0]);
+
+    // The probe set is a VIEW of the served body, not a second copy of it —
+    // the money path must not grow a duplicate block body for a diagnostic.
+    EXPECT_TRUE(normal.m_txset_candidate_data_hex.empty());
+}
+
+TEST(DashMempoolProbeSet, ProbeRangeSkipsTheMandatoryQuorumCommitmentPrefix) {
+    // A type-6 quorum commitment is consensus-REQUIRED and is not a mempool
+    // transaction: relay refuses it by design. Probing it would manufacture an
+    // INVALID verdict out of correct behaviour, so the range must start AFTER
+    // the commitments.
+    ImmatureFixture f;
+    std::vector<dash::coin::vendor::CFinalCommitment> qcs(1);
+    qcs[0].llmqType   = 1;
+    qcs[0].quorumHash = raw256(0x77);
+
+    auto w = build_embedded_workdata(
+        /*prev_height=*/H - 1, f.prev_hash, f.mnstates, f.mp,
+        ImmatureFixture::BITS, ImmatureFixture::MTP,
+        DASH_PUBKEY_VER, DASH_P2SH_VER,
+        /*curtime=*/1'700'000'123u, /*version=*/0x20000000u,
+        /*underfill_tripped=*/nullptr,
+        /*sml=*/nullptr, /*qmgr=*/nullptr,
+        /*best_cl_height=*/0, dash::coin::k_zero_cl_sig, /*credit_pool=*/0,
+        &qcs, /*quorum_root_override=*/nullptr,
+        dash::coin::DASH_MN_RR_HEIGHT_MAINNET,
+        /*superblock_payments=*/nullptr,
+        dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+        /*suppress_mempool_txs=*/false);
+
+    ASSERT_EQ(w.m_txs.size(), 2u) << "one qc tx + one mempool tx";
+    EXPECT_EQ(w.m_txs[0].type, 6);
+    EXPECT_EQ(w.m_mempool_tx_first_index, 1u);
+    EXPECT_EQ(w.m_mempool_tx_count, 1u);
+
+    const auto set = dash::coin::mempool_probe_set(w);
+    ASSERT_EQ(set.size(), 1u);
+    EXPECT_EQ(set[0].txid, dash::coin::dash_txid(f.tx).GetHex())
+        << "the quorum commitment must never be put to testmempoolaccept";
 }
 
 TEST(DashUtxoImmatureServing, SuppressedTemplateCbTxIsByteIdenticalToNormal) {

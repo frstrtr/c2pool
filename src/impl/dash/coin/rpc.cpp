@@ -527,6 +527,28 @@ std::string NodeRPC::propose_block_hex(const std::string& block_hex)
     }
 }
 
+nlohmann::json NodeRPC::test_mempool_accept(const std::string& raw_tx_hex)
+{
+    // THE MEMPOOL VALIDITY GATE's only question to dashd: would you accept
+    // THIS transaction? The answer array carries exactly one result object for
+    // a one-element request.
+    //
+    // A transport error, a daemon that is down, or a malformed answer all
+    // return a NULL json — the caller classifies that as UNPROBED. Returning
+    // anything that could be read as `allowed` would turn "we could not ask"
+    // into "dashd said yes", which is the failure mode this whole gate exists
+    // to remove.
+    try {
+        nlohmann::json arr = nlohmann::json::array();
+        arr.push_back(raw_tx_hex);
+        auto res = CallAPIMethod("testmempoolaccept", {arr});
+        if (res.is_array() && !res.empty() && res[0].is_object()) return res[0];
+        return nlohmann::json();
+    } catch (const std::exception&) {
+        return nlohmann::json();
+    }
+}
+
 nlohmann::json NodeRPC::getnetworkinfo()
 {
     return CallAPIMethod("getnetworkinfo");

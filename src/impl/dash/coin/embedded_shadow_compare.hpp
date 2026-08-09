@@ -70,6 +70,7 @@
 
 #include <impl/dash/coin/work_source.hpp>       // WorkSource
 #include <impl/dash/coin/rpc_data.hpp>          // DashWorkData, PackedPayment
+#include <impl/dash/coin/mempool_validity_gate.hpp>  // THE serve-flag gate (testmempoolaccept)
 #include <impl/dash/coin/vendor/cbtx.hpp>       // vendor::CCbTx, vendor::parse_cbtx
 
 #include <core/log.hpp>
@@ -132,17 +133,30 @@ inline const char* shadow_txset_mode_name(ShadowTxSetMode m)
 ///
 /// While dashd is still present, its template's tx set is a free, per-block
 /// answer key for our own mempool. This is the cheapest possible proof that
-/// our ingest is working and, more importantly, the gate for ever turning
-/// --embedded-serve-mempool-txs on: a wrong tx set costs a whole block, and a
-/// shadow run costs nothing.
+/// our ingest is working.
 ///
-/// The two directions are NOT symmetric:
+/// ⚠ THIS IS A COVERAGE MEASUREMENT, NOT THE SERVE-FLAG GATE. It used to be
+/// both: `ours_only == 0` was the stated condition for ever turning
+/// --embedded-serve-mempool-txs on. Set membership is the wrong question in
+/// two directions at once —
+///   * UNREACHABLE: two independently-connected nodes never hold identical
+///     mempools. MEASURED on the production hotel over 6056 samples,
+///     ours_only == 0 in 91.2% and > 0 in 8.8%, mean 65.3 when non-zero, max
+///     287; over the LAST 200 samples it was zero only 37% of the time.
+///   * BLIND to the case that costs money: FEWER transactions than dashd but
+///     INVALID ones. A strict subset passes `ours_only == 0` and can still
+///     mint a rejected block.
+/// The gate is now TRANSACTION VALIDITY, asked of dashd directly with
+/// testmempoolaccept — see mempool_validity_gate.hpp. `ours_only` keeps being
+/// measured and printed as an INFORMATIONAL coverage statistic and blocks
+/// nothing.
+///
+/// The two directions are still not symmetric, as INFORMATION:
 ///   * dashd-only  — transactions dashd had and we did not. Pure REVENUE loss;
 ///     the coverage number the whole mempool project is trying to move.
-///   * ours-only   — transactions WE selected and dashd did not. The dangerous
-///     direction: it means we would have built a block on something dashd's
-///     mempool rejected, did not know about, or had already seen conflict. Any
-///     sustained non-zero here BLOCKS enabling the serve flag.
+///   * ours-only   — transactions WE selected and dashd's template did not
+///     carry. Reads as "our view is ahead of, or simply different from, this
+///     one dashd's" — worth watching as a trend, never a pass/fail.
 /// Diagnostic only — nothing in the served decision reads this.
 struct ShadowTxSetDiff
 {
@@ -151,7 +165,7 @@ struct ShadowTxSetDiff
     size_t theirs{0};
     size_t both{0};
     size_t dashd_only{0};   // revenue we are leaving on the table
-    size_t ours_only{0};    // the dangerous direction
+    size_t ours_only{0};    // INFORMATIONAL coverage statistic — NOT a gate
 
     // ── PER-TX FEE AGREEMENT — the VALUATION half ────────────────────────
     // Membership (above) proves we HAVE the transaction. It says nothing
@@ -416,8 +430,10 @@ inline ShadowOutcome shadow_evaluate(WorkSource source,
            + " fee_over=" + std::to_string(o.tx_set.fee_overstated)
            + " fee_unknown=" + std::to_string(o.tx_set.fee_unknown);
         if (o.tx_set.ours_only)
-            l += " ⚠ OURS-ONLY txs present — do NOT enable"
-                 " --embedded-serve-mempool-txs until this is zero";
+            l += " ours_only_note=INFORMATIONAL (coverage statistic, NOT a"
+                 " gate: two independently-connected mempools never coincide,"
+                 " and a strict subset can still be invalid — serving is gated"
+                 " on dashd testmempoolaccept validity, see [MEMPOOL-VALIDITY])";
         if (o.tx_set.fee_overstated)
             l += " ⚠⚠ FEE OVERSTATED on " + std::to_string(o.tx_set.fee_overstated)
                + " tx (worst +" + std::to_string(o.tx_set.worst_overstatement)
@@ -551,10 +567,26 @@ public:
     /// to a `no-oracle` log line, never a stall). Bound in main_dash.cpp.
     using OracleFn = std::function<std::optional<DashWorkData>()>;
 
-    explicit EmbeddedShadowCompare(OracleFn oracle)
-        : oracle_(std::move(oracle)) {
+    /// dashd `testmempoolaccept` for ONE raw transaction hex -> the single
+    /// result object, or a null json on any failure/absence. Optional: unbound
+    /// leaves the MEMPOOL VALIDITY GATE unevaluated (and therefore CLOSED),
+    /// which is the correct reading of "we could not ask".
+    using AcceptFn = std::function<nlohmann::json(const std::string& raw_tx_hex)>;
+
+    explicit EmbeddedShadowCompare(OracleFn oracle, AcceptFn accept = nullptr)
+        : oracle_(std::move(oracle)), accept_(std::move(accept)) {
         LOG_INFO << "[SHADOW] embedded-vs-dashd shadow-compare ARMED (diagnostic "
                     "only; NOT a serve gate; oracle fetch off the hot path)";
+        if (accept_)
+            LOG_INFO << "[MEMPOOL-VALIDITY] gate ARMED: every transaction we"
+                        " would serve is put to dashd testmempoolaccept."
+                        " Condition to arm --embedded-serve-mempool-txs = ZERO"
+                        " INVALID over "
+                     << MempoolValidityGate::kCleanHeightsRequired
+                     << " consecutive evidence-bearing heights (~25h at DASH's"
+                        " 2.625 min/block). ours_only is INFORMATIONAL and"
+                        " gates nothing. This gate arms NOTHING by itself --"
+                        " the flag stays an operator decision";
         worker_ = std::thread([this] { worker_loop(); });
     }
 
@@ -585,6 +617,13 @@ public:
         nlohmann::json j = counters_.to_json();
         j["mode"] = "embedded-shadow-compare";
         j["note"] = "diagnostic only — NOT a serve gate";
+        // The serve-FLAG readiness verdict. Still not a serve gate: it decides
+        // whether --embedded-serve-mempool-txs MAY be armed, never what is
+        // served at this instant.
+        j["mempool-validity-gate"] = accept_
+            ? validity_.to_json()
+            : nlohmann::json{{"gate", "CLOSED"},
+                             {"reason", "no dashd testmempoolaccept oracle bound"}};
         return j;
     }
 
@@ -629,14 +668,54 @@ private:
             if (o.served_mismatch) LOG_WARNING << line;   // the real-problem signal
             else                   LOG_INFO    << line;
         }
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            counters_.apply(o);
+        }
+        probe_validity(served);
+    }
+
+    /// THE MEMPOOL VALIDITY GATE, on the SAME worker thread as the oracle
+    /// fetch — off the miner-facing path by construction. One
+    /// testmempoolaccept per transaction we would serve (Dash Core's
+    /// testmempoolaccept takes exactly one raw transaction per call), three-
+    /// valued classification, then the sustained-window verdict.
+    ///
+    /// This CANNOT change what is served. Its only outputs are log lines, the
+    /// counters, and a readiness verdict on a DEFAULT-OFF flag.
+    void probe_validity(const DashWorkData& w) {
+        if (!accept_) return;
+        const auto set = mempool_probe_set(w);
+
+        std::vector<nlohmann::json> answers;
+        answers.reserve(set.size());
+        for (const auto& t : set) {
+            nlohmann::json a;
+            try { a = accept_(t.raw_hex); }
+            catch (const std::exception& e) {
+                LOG_WARNING << "[MEMPOOL-VALIDITY] testmempoolaccept threw for"
+                               " txid=" << t.txid << ": " << e.what()
+                            << " — counted UNPROBED, never VALID";
+                a = nlohmann::json();
+            }
+            answers.push_back(std::move(a));
+        }
+
+        const auto sample = mempool_validity_sample(w.m_height, set, answers);
         std::lock_guard<std::mutex> lk(mu_);
-        counters_.apply(o);
+        validity_.apply(sample);
+        for (const auto& line : mempool_validity_log_lines(sample, validity_)) {
+            if (sample.invalid > 0) LOG_WARNING << line;   // the refusal
+            else                    LOG_INFO    << line;
+        }
     }
 
     OracleFn oracle_;
+    AcceptFn accept_;
 
-    mutable std::mutex mu_;          // guards counters_
+    mutable std::mutex mu_;          // guards counters_ + validity_
     ShadowCounters     counters_;
+    MempoolValidityGate validity_;
 
     std::thread             worker_;
     std::mutex              q_mu_;

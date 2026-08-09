@@ -84,6 +84,7 @@
 #include <impl/dash/coin/tip_ingest.hpp>         // wire_tip_ingest (leg 2)
 #include <impl/dash/coin/embedded_oracle_shadow.hpp> // dash::coin::EmbeddedOracleShadow — per-block dashd cross-check (OBSERVE-only)
 #include <impl/dash/coin/embedded_shadow_compare.hpp> // dash::coin::EmbeddedShadowCompare — serve-vs-dashd template diff (OBSERVE-only, NOT a gate)
+#include <impl/dash/coin/mempool_validity_gate.hpp>   // dash::coin::MempoolValidityGate — THE --embedded-serve-mempool-txs arming condition
 #include <impl/dash/coin/block_connect_ingest.hpp>   // wire_block_connect_ingest (leg 3)
 #include <impl/dash/coin/mn_list_ingest.hpp>     // wire_mn_list_ingest (leg 4)
 #include <impl/dash/coin/govsync_ingest.hpp>     // wire_govobject_ingest / wire_govvote_ingest (E-SUPERBLOCK)
@@ -788,7 +789,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // on changes what this node asks its peers for. It does NOT by
              // itself put a single transaction into a served template — that
              // remains --embedded-serve-mempool-txs' decision, gated on the
-             // [SHADOW-TXSET] coverage series.
+             // [MEMPOOL-VALIDITY] testmempoolaccept series
+             // (mempool_validity_gate.hpp) -- NOT on the [SHADOW-TXSET]
+             // ours_only coverage number, which is informational.
              bool embedded_mempool_ingest = false,
              // --pin-local-tx-hex <file>: PINNED LOCAL TX (donation-dust
              // consolidation). File holds the hex of an externally-signed,
@@ -2085,6 +2088,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // implicit consequence of UTXO maturity. Audit:
     // DASH_CONNECTBLOCK_REJECT_SURFACE_AUDIT.md §1. The dashd fallback arm is
     // unaffected (its GBT bodies come from dashd itself).
+    //
+    // THE CONDITION for that opt-in is the MEMPOOL VALIDITY GATE
+    // (mempool_validity_gate.hpp): zero transactions refused by dashd's
+    // testmempoolaccept over a sustained window of consecutive
+    // evidence-bearing heights. It is NOT `ours_only == 0` -- that
+    // set-membership test is unreachable (two independently-connected mempools
+    // never coincide) and blind to a strict SUBSET that contains an invalid
+    // transaction, which is exactly the case that costs a whole block.
     node_coin_state.set_serve_mempool_txs(embedded_serve_mempool_txs);
     std::cout << "[run] embedded mempool-tx serving: "
               << (embedded_serve_mempool_txs
@@ -2611,11 +2622,28 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 [rp = rpc.get()]() -> std::optional<dash::coin::DashWorkData> {
                     try { return rp->getwork(); }
                     catch (...) { return std::nullopt; }
+                },
+                // AcceptFn: dashd testmempoolaccept for ONE transaction we hold
+                // and would serve. THE condition that decides when
+                // --embedded-serve-mempool-txs may be armed, replacing the
+                // unreachable-and-blind `ours_only == 0` set-membership test.
+                // Runs on the SAME worker thread as the oracle fetch, so it is
+                // off the miner-facing path; a null answer counts UNPROBED,
+                // never as a pass. It arms NOTHING -- the flag stays OFF.
+                [rp = rpc.get()](const std::string& raw_tx_hex) -> nlohmann::json {
+                    return rp->test_mempool_accept(raw_tx_hex);
                 });
             work_source->set_shadow_compare(std::move(shadow));
             std::cout << "[run] --embedded-shadow-compare ARMED: OBSERVE-only "
                          "serve-vs-dashd template diff (worker-thread dashd fetch; "
-                         "NOT a serve gate; [SHADOW] log lines + counters)\n";
+                         "NOT a serve gate; [SHADOW] log lines + counters)\n"
+                      << "      [MEMPOOL-VALIDITY] gate ARMED with it: every tx we "
+                         "would serve goes to dashd testmempoolaccept. Condition "
+                         "for arming --embedded-serve-mempool-txs = ZERO INVALID "
+                         "over "
+                      << dash::coin::MempoolValidityGate::kCleanHeightsRequired
+                      << " consecutive evidence-bearing heights. ours_only is "
+                         "INFORMATIONAL and gates nothing.\n";
         } else {
             std::cout << "[run] --embedded-shadow-compare given but no dashd RPC "
                          "arm is armed (pure-daemonless) -- no oracle to compare "
@@ -4982,8 +5010,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                          " The mempool will now FILL from the DASH network.\n"
                       << "      This does NOT put transactions into served"
                          " templates: that stays --embedded-serve-mempool-txs"
-                         " (default OFF), gated on the [SHADOW-TXSET]"
-                         " coverage series.\n";
+                         " (default OFF), gated on the [MEMPOOL-VALIDITY]"
+                         " testmempoolaccept series -- zero INVALID over "
+                      << dash::coin::MempoolValidityGate::kCleanHeightsRequired
+                      << " consecutive evidence-bearing heights.\n";
         }
 
         // Kick the initial sync once the version/verack handshake completes:
@@ -7303,7 +7333,9 @@ int main(int argc, char** argv)
     // Default OFF = coinbase-only serving (values exact, fees forgone); the
     // mempool-tx body path with its G1-G4 guards (mempool.hpp; audit
     // DASH_CONNECTBLOCK_REJECT_SURFACE_AUDIT.md) arms only on explicit
-    // operator decision.
+    // operator decision, and only once the MEMPOOL VALIDITY GATE
+    // (mempool_validity_gate.hpp) reports zero transactions refused by dashd's
+    // testmempoolaccept over its sustained window.
     bool embedded_serve_mempool_txs = false;
     // --embedded-creditpool-publish-at-serve-tip: publish the derived credit
     // pool AT THE SERVE TIP rather than at the folded body height (PR-5,
@@ -7318,7 +7350,10 @@ int main(int argc, char** argv)
     // SEPARATE from --embedded-serve-mempool-txs on purpose: this only makes
     // the mempool FILL. Whether its contents ever reach a served template is
     // still the other flag's decision, and that one stays default-OFF until
-    // the [SHADOW-TXSET] coverage series says it is safe.
+    // the [MEMPOOL-VALIDITY] series says it is safe: ZERO transactions that
+    // dashd's testmempoolaccept refuses, over a sustained window
+    // (mempool_validity_gate.hpp). NOT the [SHADOW-TXSET] ours_only number --
+    // that is a coverage statistic and gates nothing.
     bool embedded_mempool_ingest = false;
     std::string bestcl_policy = "freshness";   // --bestcl-policy: freshness (default, conservative proxy) | consensus-exact (dashcore's actual CheckCbTxBestChainlock rule)
     bool embedded_oracle_shadow = false;       // --embedded-oracle-shadow: per-block dashd cross-check (OBSERVE-only)
