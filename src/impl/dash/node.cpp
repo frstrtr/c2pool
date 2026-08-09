@@ -129,11 +129,20 @@ void NodeImpl::add_verified_shares(HandleSharesData& data, NetService addr)
         {
             // Skip shares that failed phase-1 verification (hash still null).
             if (share.hash().IsNull())
+            {
+                // ShareVariants owns a heap Args* with no destructor; a share
+                // that is never handed to m_tracker.add() must be freed here or
+                // it leaks when HandleSharesData is destroyed.
+                share.destroy();
                 continue;
+            }
 
             if (m_chain->contains(share.hash()))
             {
                 ++dup_count;
+                // Duplicate of a share the chain already owns: this incoming
+                // copy is a distinct heap Args* that never reaches the tracker.
+                share.destroy();
                 continue;
             }
 
