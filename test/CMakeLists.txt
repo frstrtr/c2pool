@@ -826,7 +826,15 @@ if (BUILD_TESTING AND GTest_FOUND)
     # ReplayMNState->MNState dialect change, and the fail-closed guard — a
     # diverged, poisoned, unchecked or behind-the-tip fold must NOT publish.
     # Same allowlisted target, same #143 NOT_BUILT reason.
+    # Sixth TU (dashd evodb port): test_dash_mn_diff_store.cpp — the MN
+    # diff/snapshot store (coin/mn_diff_store.hpp): the dmn_D4/dmn_S3
+    # mechanism over ReplayMNState — CDeterministicMNStateDiff bitmask
+    # semantics, BuildDiff/ApplyDiff refusals, the GetListForBlockInternal
+    # backward-walk with the fail-closed missing-row inversion, 'F'
+    # wipe-on-mismatch and the startup newest-pair verify. Same allowlisted
+    # target, same #143 NOT_BUILT reason. Links leveldb (via core).
     add_executable(test_dash_mn_state test_dash_mn_state.cpp
+                   test_dash_mn_diff_store.cpp
                    test_dash_replay_fold.cpp
                    test_dash_replay_run.cpp
                    test_dash_replay_quorum_seam.cpp
