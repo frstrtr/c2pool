@@ -205,4 +205,135 @@ TEST(DashServeGateJournal, NoWorkIsTheDistinctThirdArmState) {
     EXPECT_EQ(up.prev_cause_sec, 7);
 }
 
+// ── #119 FOLLOW-UP: cumulative per-cause TIME roll-up with a denominator ─────
+//
+// THE DEFECT THIS PINS (soak-dl-master, 2026-08-09, 36,854 s window): the
+// serve-gate log carried a duration for ONLY qc-plan-underivable; the cause
+// with 10x the episodes (creditpool-stale, 107 episodes) carried NONE, so
+// "what fraction of wall clock did each cause cost" was unanswerable and every
+// serving-percentage claim rested on episode COUNTS. counts and seconds are not
+// commensurable. The fix is a cumulative roll-up that (1) attributes seconds to
+// EVERY cause and (2) prints the DENOMINATOR (wall clock observed) so a share
+// is never implicit.
+
+using Rollup = ServeGateJournal::Rollup;
+
+// A short, high-count cause and a long, low-count cause — the brief's shape.
+// By count creditpool-stale dominates (many episodes); by TIME qc-plan owns the
+// loss. The roll-up must attribute NON-ZERO seconds to the high-count cause AND
+// rank by time, not count.
+TEST(DashServeGateJournal, RollupAttributesTimePerCauseNotCount) {
+    ServeGateJournal j(1000000);  // heartbeat off; segments still bank on close
+    int64_t t = 0;
+
+    // 20 creditpool-stale episodes, ~1 s each (the "107 episodes, 0 s" cause):
+    // each is decline -> resume, so each segment closes and banks ~1 s.
+    for (int i = 0; i < 20; ++i) {
+        j.observe(false, "creditpool-stale", t);
+        j.observe(true, "", t + 1);
+        t += 60;  // 59 s of serving between episodes
+    }
+    // ONE qc-plan-underivable episode of 500 s (few episodes, most of the loss).
+    j.observe(false, "qc-plan-underivable", t);
+    j.observe(true, "", t + 500);
+    t += 500;
+
+    const int64_t now = t + 10;  // arm serving now
+    Rollup r = j.rollup(now);
+
+    // Denominator present and is the WHOLE observed window, not just decline time.
+    EXPECT_EQ(r.observed_sec, now);           // first observation was at t=0
+    EXPECT_GT(r.observed_sec, r.off_embedded_sec);  // most of it was serving
+
+    // BOTH causes carry seconds — the high-count cause is no longer 0 s.
+    ASSERT_EQ(r.per_cause.size(), 2u);
+    int64_t credit = 0, qc = 0;
+    for (const auto& c : r.per_cause) {
+        if (c.first == "creditpool-stale")    credit = c.second;
+        if (c.first == "qc-plan-underivable") qc     = c.second;
+    }
+    EXPECT_EQ(credit, 20);   // 20 episodes x ~1 s
+    EXPECT_EQ(qc, 500);
+
+    // Ranked by TIME: qc-plan first despite having 1/20th the episode count.
+    EXPECT_EQ(r.per_cause.front().first, "qc-plan-underivable");
+    // Numerators sum to off_embedded (no time lost or double-counted).
+    EXPECT_EQ(credit + qc, r.off_embedded_sec);
+    EXPECT_EQ(r.off_embedded_sec, 520);
+}
+
+// A roll-up read MID-EPISODE includes the in-progress segment's partial, so a
+// long-running cause is never undercounted until it happens to close.
+TEST(DashServeGateJournal, RollupIncludesOpenSegmentPartial) {
+    ServeGateJournal j(1000000);
+    j.observe(false, "cause-a", 100);          // segment opens at 100, still open
+    Rollup r = j.rollup(250);                   // 150 s into the open segment
+    ASSERT_EQ(r.per_cause.size(), 1u);
+    EXPECT_EQ(r.per_cause.front().first, "cause-a");
+    EXPECT_EQ(r.per_cause.front().second, 150);
+    EXPECT_EQ(r.off_embedded_sec, 150);
+    EXPECT_EQ(r.observed_sec, 150);             // denominator = 250 - first obs (100)
+
+    // The same cause re-observed across a cause change accumulates, and the open
+    // partial does not double-count what already closed.
+    j.observe(false, "cause-b", 260);           // closes cause-a segment (160 s)
+    Rollup r2 = j.rollup(300);                   // cause-b open 40 s
+    int64_t a = 0, b = 0;
+    for (const auto& c : r2.per_cause) {
+        if (c.first == "cause-a") a = c.second;
+        if (c.first == "cause-b") b = c.second;
+    }
+    EXPECT_EQ(a, 160);   // closed segment, banked once
+    EXPECT_EQ(b, 40);    // open partial
+    EXPECT_EQ(r2.off_embedded_sec, 200);
+}
+
+// The denominator is wall clock since the FIRST observation, serving included.
+TEST(DashServeGateJournal, RollupDenominatorIsObservedWallClock) {
+    ServeGateJournal j(300);
+    j.observe(true, "", 1000);                  // first observation: serving
+    j.observe(false, "cause-a", 1010);          // 10 s of serving, then decline
+    j.observe(true, "", 1015);                  // 5 s declining
+    Rollup r = j.rollup(1020);
+    EXPECT_EQ(r.observed_sec, 20);              // 1020 - 1000
+    EXPECT_EQ(r.off_embedded_sec, 5);           // only the 5 s decline segment
+    ASSERT_EQ(r.per_cause.size(), 1u);
+    EXPECT_EQ(r.per_cause.front().second, 5);
+}
+
+// An empty journal names no cause and invents no denominator.
+TEST(DashServeGateJournal, RollupEmptyBeforeAnyObservation) {
+    ServeGateJournal j(300);
+    Rollup r = j.rollup(500);
+    EXPECT_EQ(r.observed_sec, 0);
+    EXPECT_EQ(r.off_embedded_sec, 0);
+    EXPECT_TRUE(r.per_cause.empty());
+}
+
+// seg_terminal_name gives every CLOSING decision a qc-shaped terminal, and
+// nullptr for decisions that close no segment.
+TEST(DashServeGateJournal, SegTerminalNamesCoverClosuresOnly) {
+    using Trig = ServeGateJournal::Trigger;
+    EXPECT_STREQ(ServeGateJournal::seg_terminal_name(Trig::Resumed), "resumed");
+    EXPECT_STREQ(ServeGateJournal::seg_terminal_name(Trig::CauseChange),
+                 "cause-change");
+    EXPECT_EQ(ServeGateJournal::seg_terminal_name(Trig::Heartbeat), nullptr);
+    EXPECT_EQ(ServeGateJournal::seg_terminal_name(Trig::First), nullptr);
+    EXPECT_EQ(ServeGateJournal::seg_terminal_name(Trig::Transition), nullptr);
+    EXPECT_EQ(ServeGateJournal::seg_terminal_name(Trig::None), nullptr);
+
+    // The closing decisions the consumer emits a [EMBED-GATE-SEG] line for carry
+    // BOTH a non-null terminal and a prev_cause_sec — they always co-occur.
+    ServeGateJournal j(300);
+    j.observe(false, "cause-a", 0);
+    auto change = j.observe(false, "cause-b", 10);
+    EXPECT_STREQ(ServeGateJournal::seg_terminal_name(change.trigger),
+                 "cause-change");
+    EXPECT_EQ(change.prev_cause_sec, 10);
+    auto resumed = j.observe(true, "", 25);
+    EXPECT_STREQ(ServeGateJournal::seg_terminal_name(resumed.trigger),
+                 "resumed");
+    EXPECT_EQ(resumed.prev_cause_sec, 15);
+}
+
 }  // namespace

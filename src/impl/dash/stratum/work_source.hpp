@@ -741,6 +741,13 @@ private:
     // answers "why is the arm not serving".
     static constexpr int64_t kDeclineHeartbeatSec = 300;
 
+    // Cadence of the cumulative [EMBED-GATE-ROLLUP] line: seconds-per-cause
+    // since start with the wall-clock DENOMINATOR printed alongside, so a soak
+    // is readable without hand-reconstructing episodes (the #119 follow-up).
+    // Hourly is far below the decline heartbeat's flood risk and dense enough
+    // that any soak window carries at least one denominator-bearing summary.
+    static constexpr int64_t kRollupHeartbeatSec = 3600;
+
     // DEFECT-3: the serve gate must NAME its refusal. `serve_gate_journal_` is
     // the rate policy (transition / cause-change / heartbeat); `last_decline_`
     // is the most recent DeclineReport as returned BY the arm-selection branch
@@ -751,6 +758,10 @@ private:
     mutable coin::DeclineReport     last_decline_;
     mutable bool                    last_arm_embedded_{false};
     mutable bool                    arm_ever_observed_{false};
+    // Monotonic second of the last emitted cumulative roll-up; -1 until the
+    // first arm decision, so the first observation seeds the cadence without
+    // emitting an empty summary. Guarded by serve_gate_mutex_.
+    mutable int64_t                 last_rollup_sec_{-1};
 
     // ── Serve-staleness observation (lock-free by requirement) ─────────────
     // Written on the serve path (get_current_work_template /

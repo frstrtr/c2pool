@@ -36,8 +36,12 @@
 /// seconds), no coin state. Header-only so it folds into the already
 /// allowlisted dash test targets.
 
+#include <algorithm>
 #include <cstdint>
+#include <map>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace dash {
 namespace coin {
@@ -143,6 +147,9 @@ public:
     Decision observe(Served served, const std::string& cause, int64_t now_sec) {
         Decision d;
         d.previous_cause = m_last_cause;
+        // The roll-up denominator starts at the very first observation, serving
+        // or not — it is wall clock OBSERVED, not wall clock declined.
+        if (m_first_observed_sec < 0) m_first_observed_sec = now_sec;
 
         if (served == Served::Embedded) {
             const bool was_declining = (m_arm == Arm::Declining);
@@ -161,6 +168,10 @@ public:
                 // duration to the cause it names (d.previous_cause).
                 d.prev_cause_sec = (m_cause_start_sec >= 0)
                                        ? now_sec - m_cause_start_sec : -1;
+                // The final segment closes; bank it in the cumulative roll-up
+                // under the cause that owned it (terminal=resumed).
+                if (d.prev_cause_sec >= 0 && !d.previous_cause.empty())
+                    m_cause_totals[d.previous_cause] += d.prev_cause_sec;
                 m_cause_start_sec   = -1;
                 m_episode_start_sec = -1;
                 m_suppressed = 0;
@@ -198,8 +209,14 @@ public:
         // at ZERO. This is what keeps a cause-change line from attributing the
         // whole episode to the cause it names (the h=2518004 trap).
         if (prev_arm == Arm::Declining && cause != m_last_cause &&
-            m_cause_start_sec >= 0)
+            m_cause_start_sec >= 0) {
             d.prev_cause_sec = now_sec - m_cause_start_sec;
+            // A cause segment closes at a cause change; bank it in the
+            // cumulative roll-up under the cause that owned it
+            // (terminal=cause-change). d.previous_cause is the OLD cause here.
+            if (d.prev_cause_sec >= 0 && !d.previous_cause.empty())
+                m_cause_totals[d.previous_cause] += d.prev_cause_sec;
+        }
         if (prev_arm != Arm::Declining || cause != m_last_cause)
             m_cause_start_sec = now_sec;
 
@@ -235,6 +252,76 @@ public:
             case Trigger::None:        break;
         }
         return "none";
+    }
+
+    /// The named outcome of the CAUSE SEGMENT a decision closes (qc-shape
+    /// `terminal=`), or nullptr when the decision closes no segment
+    /// (`prev_cause_sec < 0`). A serve-gate cause segment ends in exactly one of
+    /// two ways, the direct analogue of QcEpisodeClassifier::Terminal:
+    ///   * `resumed`      — the arm resumed the embedded template; the episode's
+    ///                      final segment ends here (Trigger::Resumed);
+    ///   * `cause-change` — a DIFFERENT first-unmet condition took over; this
+    ///                      cause's segment ends and the next one's clock starts
+    ///                      at zero (Trigger::CauseChange).
+    /// Copying qc's `cause=<name> dur=<n>s terminal=<named-outcome>` discipline
+    /// onto every serve-gate segment is what makes a per-cause TIME histogram
+    /// greppable without hand-pairing lines — the #119 follow-up.
+    static const char* seg_terminal_name(Trigger t) {
+        switch (t) {
+            case Trigger::Resumed:     return "resumed";
+            case Trigger::CauseChange: return "cause-change";
+            default:                   break;
+        }
+        return nullptr;
+    }
+
+    /// A cumulative, denominator-carrying view of where wall clock went, so a
+    /// soak can be read WITHOUT reconstructing episodes from raw lines.
+    ///
+    /// WHY THE DENOMINATOR RIDES HERE — a per-cause seconds figure with an
+    /// implicit denominator is exactly how the best-share percentage shipped:
+    /// `observed_sec` (the wall clock seen since the first observation) is the
+    /// ONLY honest base for "what fraction of wall clock did this cause cost",
+    /// and it is printed alongside the numerators so no reader has to supply it.
+    struct Rollup {
+        /// Denominator: monotonic seconds observed since the first observation.
+        int64_t observed_sec{0};
+        /// Sum of every per-cause numerator below (total seconds off the
+        /// embedded arm, closed segments + the currently-open one). <=
+        /// observed_sec; the remainder is time the embedded arm was serving.
+        int64_t off_embedded_sec{0};
+        /// Per-cause attributed seconds, closed segments PLUS the currently-open
+        /// segment's partial, sorted by seconds desc then name (deterministic).
+        /// Built by summing the per-cause segment clock — NEVER episode_sec —
+        /// so the histogram matches the seg lines and cannot invert the way a
+        /// count- or episode_sec-based one does.
+        std::vector<std::pair<std::string, int64_t>> per_cause;
+    };
+
+    /// Cumulative roll-up as of `now_sec` (monotonic). Includes the partial
+    /// duration of any segment currently in progress, so a roll-up read
+    /// mid-episode is accurate and never lags a long-running cause.
+    Rollup rollup(int64_t now_sec) const {
+        Rollup r;
+        r.observed_sec = (m_first_observed_sec >= 0) ? now_sec - m_first_observed_sec : 0;
+        std::map<std::string, int64_t> acc = m_cause_totals;  // closed segments
+        // Fold the currently-open segment's partial so nothing in-flight is
+        // undercounted; it is NOT in m_cause_totals until it closes, so there
+        // is no double count.
+        if (m_arm == Arm::Declining && m_cause_start_sec >= 0 && !m_last_cause.empty())
+            acc[m_last_cause] += now_sec - m_cause_start_sec;
+        r.per_cause.reserve(acc.size());
+        for (const auto& kv : acc) {
+            r.off_embedded_sec += kv.second;
+            r.per_cause.emplace_back(kv.first, kv.second);
+        }
+        std::sort(r.per_cause.begin(), r.per_cause.end(),
+                  [](const std::pair<std::string, int64_t>& a,
+                     const std::pair<std::string, int64_t>& b) {
+                      if (a.second != b.second) return a.second > b.second;
+                      return a.first < b.first;
+                  });
+        return r;
     }
 
     /// The cause of the most recent decline ("" while the arm is serving or
@@ -276,6 +363,13 @@ private:
     int64_t     m_cause_start_sec{-1};
     bool        m_have_emitted{false};
     uint64_t    m_suppressed{0};
+    /// Wall clock observed since the FIRST observation (serving or declining);
+    /// the roll-up denominator. -1 until the first observe() call.
+    int64_t     m_first_observed_sec{-1};
+    /// Cumulative attributed seconds per cause, summed from CLOSED segment
+    /// durations (the per-cause segment clock, never episode_sec). Ordered by
+    /// name for a deterministic roll-up before the by-seconds sort.
+    std::map<std::string, int64_t> m_cause_totals;
 };
 
 }  // namespace coin
