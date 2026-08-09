@@ -123,9 +123,17 @@
 /// of a relayed qfcommit is NOT that evidence (absence != vote — the
 /// 07-14 ratchet lesson). Otherwise the WHOLE height is underivable:
 /// return nullopt so the embedded arm fails closed to the dashd
-/// fallback. Until rotated (DIP-24) member sourcing lands, any height
-/// whose mandatory set includes a rotated slot therefore falls back
-/// unless every rotated slot has attested-null evidence.
+/// fallback. Rotated (DIP-24) member sourcing IS live
+/// (quorum_member_source.hpp: one authenticated qrinfo per cycle
+/// publishes all 32 member sets, with a retained-cycle republish for a
+/// slot whose base header arrives after the reply finalizes), so a
+/// rotated slot refuses only while that lane has not yet delivered for
+/// its cycle — qrinfo round-trip latency, a timed-out or
+/// failed-authentication reply, or an ambiguous member computation —
+/// and the refusal still fails the WHOLE height closed, per this rule.
+/// (An earlier revision of this comment predated that landing and
+/// described rotated sourcing as unimplemented; the code below always
+/// consulted the live m_members_ready seam.)
 ///
 /// COLD-START HOLE — WHY THERE IS NO BACK-FILL (prior art, settled against
 /// dashpay/dash v21.1.0, 2026-08-03; mainnet incident h=2515381 type=1 qi=0):

@@ -77,7 +77,11 @@
 /// (DIP-0024; dashcore stores them as {cycleBaseHash, quorumIndex} internally
 /// but the COMMITMENT carries the per-index base block hash). So no key,
 /// provider signature or commitment-cache change was needed: one authenticated
-/// reply simply populates 32 distinct keys at once.
+/// reply simply populates 32 distinct keys at once. A slot whose base header
+/// is not held when the reply finalizes is published LATE instead of lost:
+/// the cycle's computed sets are retained (FIFO-bounded) and request()
+/// republishes the slot the moment a qfcommit kick proves its header exists
+/// (see the qi=11 wedge note at finalize_rotated / try_republish_rotated_slot).
 ///
 /// DELIBERATE REVERSAL (was: "issue no getqrinfo"): the previous slice left
 /// request() silent for rotated types on the reasoning that a live request
@@ -170,6 +174,9 @@ enum class RotatedOutcome {
     kComputeAmbiguous,
     kNoSlotHeaders,
     kReady,
+    // request() — a slot published LATE from the retained cycle compute
+    // (its base header was not held when the qrinfo was finalized)
+    kSlotRepublished,
     // expire_rotated_requests()
     kTimedOut,                   // getqrinfo sent, no reply inside the window
 };
@@ -199,6 +206,7 @@ inline const char* rotated_outcome_name(RotatedOutcome o)
     case RotatedOutcome::kComputeAmbiguous:         return "member_compute_ambiguous";
     case RotatedOutcome::kNoSlotHeaders:            return "no_slot_base_headers";
     case RotatedOutcome::kReady:                    return "ready";
+    case RotatedOutcome::kSlotRepublished:          return "slot_republished_from_cycle";
     case RotatedOutcome::kTimedOut:                 return "request_timed_out";
     }
     return "unnamed";   // unreachable; a new enumerator without a name is a bug
@@ -296,13 +304,12 @@ public:
             // A rotated reply publishes one member set per slot, keyed by the
             // header at cycleBase + quorumIndex (finalize_rotated). At the tip
             // that CROSSES the boundary only cycleBase itself exists, so 31 of
-            // 32 slots are skipped for want of a header — and the one slot that
-            // does publish is index 0, whose key IS the cycle key. From then on
-            // request_rotated short-circuits on "cycle already ready" and the
-            // qfcommit kick can never re-ask: the cycle is permanently stuck at
-            // 1/32 sourced. That would REGRESS the rotated lane proven live by
-            // #1077, which works precisely because the qfcommit kick fires
-            // inside the mining window, when every slot header exists.
+            // 32 slots would be skipped for want of a header. Skipped slots
+            // now recover via the retained-cycle republish in request() (the
+            // qi=11 wedge fix), so this is no longer a permanent-wedge hazard
+            // — but asking before the slot headers exist still buys nothing:
+            // every skipped slot waits for its header anyway, exactly what
+            // waiting here achieves without spending a 600 kB reply early.
             //
             // So wait until the last slot's base header is in the chain. With
             // signing_active_quorum_count=32 and mining_window_start=42 the
@@ -411,6 +418,28 @@ public:
                              who + " cycle_base_h=" + std::to_string(cycle_h));
                 return;
             }
+            // LATE-SLOT REPUBLISH (the qi=11 member-set-unsourced wedge).
+            // finalize_rotated() publishes each slot under the header at
+            // cycleBase+qi and SKIPS a slot whose header is not held yet. If
+            // index 0 published, the cycle key was in m_ready, and the old
+            // code short-circuited every later request of the SAME cycle as
+            // "already ready" — so a slot skipped at finalize time could never
+            // become ready, ever: the refusal persisted through its entire
+            // mining window (measured live: type=5 qi=11, whole window
+            // [2517450,2517458], qfcommit cached with 59 signers).
+            //
+            // dashd has no such state: GetAllQuorumMembers (utils.cpp:569)
+            // recomputes any missed quorum from its local evoDB stores on
+            // cache miss. Our inputs are transient qrinfo replies, so the
+            // structural equivalent is retaining the cycle's COMPUTED sets
+            // and publishing a late slot from them here — same computation,
+            // same bytes, just published when the slot's header (which this
+            // request's own quorum_hash proves we now hold) has arrived.
+            // (request() already returned above when this slot key is ready,
+            // so reaching here means the slot is genuinely unsourced.)
+            if (try_republish_rotated_slot(key, llmq_type, *cycle_hash,
+                                           quorum_index))
+                return;
             request_rotated(llmq_type, *cycle_hash);
             return;
         }
@@ -554,11 +583,27 @@ public:
             m_last_rotated = RotatedOutcome::kRequestDeduped;
             return true;
         }
-        // The cycle's index-0 quorum hash IS the cycle base hash, so a ready
-        // cycle needs no re-request.
-        if (m_ready.count(ckey)) {
+        // A cycle whose COMPUTED sets are retained needs no traffic: every
+        // slot whose base header is held republishes from them in request()
+        // before this function is reached, and a slot whose header is missing
+        // cannot be helped by a fresh 600 kB reply either (finalize would
+        // skip it again for the same missing header).
+        if (m_rotated_cycles.count(ckey)) {
             m_last_rotated = RotatedOutcome::kRequestAlreadyReady;
             return true;
+        }
+        // Cycle key ready in m_ready but its retained compute is GONE
+        // (FIFO-evicted). The pre-fix code returned "already ready" here on
+        // the cycle key alone — the wedge: request() only reaches this point
+        // for a slot that is NOT ready, and short-circuiting on index 0's key
+        // meant that slot could never be sourced again. Fall through and
+        // re-request; the traffic is bounded exactly like a first request
+        // (one outstanding per cycle, timeout, FIFO reap).
+        if (m_ready.count(ckey)) {
+            LOG_INFO << "[QC-MEMBERS] rotated cycle " << who
+                     << " is served at index 0 but a later slot is unsourced "
+                        "and the retained cycle compute was evicted — "
+                        "re-requesting qrinfo";
         }
         reap_rotated_if_needed();
 
@@ -742,25 +787,35 @@ public:
 
         // Each of the 32 quorums in the cycle carries its OWN quorumHash: the
         // block at cycleBase + quorumIndex (DIP-0024). A slot whose header we
-        // do not hold yet is simply skipped — it will be re-requested and the
-        // ride-the-outstanding dedup will not fire once the cycle is ready,
-        // because index 0's key IS the cycle key.
+        // do not hold YET is skipped here — and recovered later: the cycle's
+        // computed sets are RETAINED below, and request() republishes a
+        // skipped slot from them the moment a qfcommit kick arrives with that
+        // slot's now-held header. (The previous comment claimed a skipped
+        // slot "will be re-requested"; it could not be — index 0's key IS the
+        // cycle key, so once index 0 published, the re-request path
+        // short-circuited on "cycle already ready" and the skipped slot
+        // stayed unsourced for its whole mining window. That was the live
+        // type=5 qi=11 member-set-unsourced wedge.)
         size_t published = 0;
-        for (size_t qi = 0; qi < sets->size(); ++qi) {
+        const size_t computed = sets->size();   // read BEFORE the move below
+        for (size_t qi = 0; qi < computed; ++qi) {
             auto qh = m_hash_at_height(in.cycle_base_height
                                        + static_cast<uint32_t>(qi));
             if (!qh || qh->IsNull()) continue;
-            insert_ready(Key{in.llmq_type, *qh}, std::move((*sets)[qi]));
+            insert_ready(Key{in.llmq_type, *qh},
+                         std::vector<vendor::MemberOperatorKey>((*sets)[qi]));
             ++published;
         }
+        retain_cycle(Key{in.llmq_type, in.quorum_hash}, std::move(*sets));
         if (published == 0) {
             note_rotated(RotatedOutcome::kNoSlotHeaders,
                          "type=" + std::to_string(static_cast<int>(in.llmq_type))
                          + " cycle_base_h=" + std::to_string(in.cycle_base_height)
                          + " value=published:0 threshold=computed:"
-                         + std::to_string(sets->size())
-                         + " -- no slot base-block header held; nothing published, "
-                           "cycle stays unsourced (its slots refuse)");
+                         + std::to_string(computed)
+                         + " -- no slot base-block header held; nothing published "
+                           "yet, but the cycle compute is retained and slots "
+                           "republish as their headers arrive");
         } else {
             m_last_rotated = RotatedOutcome::kReady;
             // Mirrors the non-rotated "[QC-MEMBERS] READY type=" token so a
@@ -770,13 +825,22 @@ public:
                      << " members=" << p->size
                      << " outcome=" << rotated_outcome_name(RotatedOutcome::kReady)
                      << " lane=ROTATED cycle_base_h=" << in.cycle_base_height
-                     << " slots=" << published << "/" << sets->size()
+                     << " slots=" << published << "/" << computed
                      << " (real-commitment serving ENABLED for this cycle)";
         }
         return published;
     }
 
     size_t rotated_pending_count() const { return m_rotated_pending.size(); }
+
+    /// Cycles whose computed member sets are retained for late-slot republish.
+    size_t retained_cycle_count() const { return m_rotated_cycles.size(); }
+
+    /// Test seam ONLY (like set_clock): shrink the retention bound so the
+    /// evicted-retention re-request path is reachable in a KAT without
+    /// fabricating eight more authenticated cycles. Production keeps the
+    /// default; 0 disables retention entirely.
+    void set_retained_cycles_cap(size_t cap) { m_retained_cycles_cap = cap; }
 
     /// The most recent named outcome of the rotated lane. Exists so a test can
     /// assert that a failure NAMED ITSELF, not merely that it failed — the
@@ -1004,6 +1068,56 @@ private:
         }
     }
 
+    /// Publish ONE slot of an already-computed cycle from the retained sets.
+    /// Returns false when the cycle is not retained (never computed, or
+    /// FIFO-evicted) — the caller then falls through to request_rotated().
+    /// The published bytes are the SAME compute_quorum_members_by_quarter_
+    /// rotation output finalize_rotated() published for the other slots; only
+    /// the publish TIME differs (the slot's base header arrived later).
+    bool try_republish_rotated_slot(const Key& slot_key, uint8_t llmq_type,
+                                    const uint256& cycle_hash,
+                                    uint32_t quorum_index)
+    {
+        auto it = m_rotated_cycles.find(Key{llmq_type, cycle_hash});
+        if (it == m_rotated_cycles.end()) return false;
+        // Unreachable in practice: request() bounds quorum_index by
+        // signingActiveQuorumCount and the retained vector is exactly that
+        // wide — but an out-of-range read on the money path is worth a guard.
+        if (quorum_index >= it->second.size()) return false;
+        insert_ready(slot_key, std::vector<vendor::MemberOperatorKey>(
+                                   it->second[quorum_index]));
+        m_last_rotated = RotatedOutcome::kSlotRepublished;
+        // Same READY token as finalize_rotated so one grep finds both lanes.
+        LOG_INFO << "[QC-MEMBERS] READY type="
+                 << static_cast<int>(llmq_type)
+                 << " quorum=" << slot_key.quorumHash.GetHex().substr(0, 16)
+                 << " members=" << it->second[quorum_index].size()
+                 << " outcome="
+                 << rotated_outcome_name(RotatedOutcome::kSlotRepublished)
+                 << " lane=ROTATED slot=" << quorum_index
+                 << " cycle_base=" << cycle_hash.GetHex().substr(0, 16)
+                 << " (slot header was not held when the cycle finalized; "
+                    "published now from the retained cycle compute)";
+        return true;
+    }
+
+    /// Retain a cycle's computed member sets (FIFO-bounded). For type 5 one
+    /// cycle is 32 sets x 60 members x 49 bytes ~ 94 kB; the default cap of
+    /// 8 cycles bounds this under 1 MB across all rotated types.
+    void retain_cycle(const Key& ckey,
+                      std::vector<std::vector<vendor::MemberOperatorKey>>&& sets)
+    {
+        if (m_retained_cycles_cap == 0) return;
+        if (m_rotated_cycles.find(ckey) == m_rotated_cycles.end()) {
+            while (m_rotated_cycles_fifo.size() >= m_retained_cycles_cap) {
+                m_rotated_cycles.erase(m_rotated_cycles_fifo.front());
+                m_rotated_cycles_fifo.pop_front();
+            }
+            m_rotated_cycles_fifo.push_back(ckey);
+        }
+        m_rotated_cycles[ckey] = std::move(sets);
+    }
+
     void erase_rotated_pending(const Key& key)
     {
         m_rotated_pending.erase(key);
@@ -1096,6 +1210,16 @@ private:
     SendGetQrInfo                  m_send_qrinfo;
     std::map<Key, RotatedPending>  m_rotated_pending;  // cycle-base key -> when/where
     std::deque<Key>                m_rotated_fifo;
+    // Computed member sets of finalized cycles, kept so a slot whose base
+    // header arrived AFTER the qrinfo finalized can still be published (the
+    // qi=11 wedge fix). dashd needs no such store — utils.cpp:569
+    // GetAllQuorumMembers recomputes any quorum from evoDB on cache miss; our
+    // compute inputs are transient wire replies, so we retain the OUTPUT.
+    static constexpr size_t kRetainedCyclesCapDefault = 8;
+    size_t                         m_retained_cycles_cap{kRetainedCyclesCapDefault};
+    std::map<Key, std::vector<std::vector<vendor::MemberOperatorKey>>>
+                                   m_rotated_cycles;   // cycle-base key -> 32 sets
+    std::deque<Key>                m_rotated_cycles_fifo;
     RotatedOutcome                 m_last_rotated{RotatedOutcome::kNone};
     NowSeconds                     m_now{[] {
         return std::chrono::duration_cast<std::chrono::seconds>(

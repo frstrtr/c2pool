@@ -53,6 +53,7 @@
 
 using dash::coin::QuorumMemberSource;
 using dash::coin::LlmqNetwork;
+using dash::coin::RotatedOutcome;
 using dash::coin::vendor::CQuorumRotationInfo;
 using dash::coin::vendor::CQuorumSnapshot;
 using dash::coin::vendor::CSimplifiedMNList;
@@ -605,6 +606,100 @@ TEST(DashRotatedQuorumMembers, IndexBeyondSigningActiveCountIsRefused)
     src.request(kType, far);
     EXPECT_EQ(h.sends, 0);
     EXPECT_EQ(src.rotated_pending_count(), 0u);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// THE qi=11 WEDGE (measured live: type=5 qi=11 member-set-unsourced through
+// the whole mining window [2517450,2517458] with the qfcommit cached at 59
+// signers). Reproduction: the qrinfo reply finalizes while one slot's base
+// header is not yet held — finalize skips that slot — and index 0 publishes,
+// making the CYCLE key ready. Before the fix, every later request for the
+// skipped slot short-circuited on "cycle already ready" and the slot stayed
+// unsourced FOREVER. The fix retains the cycle's computed sets and publishes
+// the late slot from them the moment its header is proven held.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST(DashRotatedQuorumMembers, LateSlotHeaderRepublishesFromTheRetainedCycle)
+{
+    SourceHarness h;
+    h.load();
+    auto src = h.make();
+
+    // The chain has not reached cycleBase+11 when the reply arrives: slot 11's
+    // base header is unknown to hash_at_height.
+    const uint256 late = h.by_height[kCycleBase + 11];
+    h.by_height.erase(kCycleBase + 11);
+
+    uint256 cycle;
+    cycle.SetHex(dash::coin::testdata::kRot6075_QuorumHash);
+    ASSERT_TRUE(src.request_rotated(kType, cycle));
+    ASSERT_EQ(h.sends, 1);
+    ASSERT_TRUE(src.on_qrinfo(h.info).has_value());
+    EXPECT_EQ(src.ready_count(), kNQuorums - 1) << "slot 11 must be skipped";
+    EXPECT_FALSE(src.lookup(kType, late).has_value());
+    EXPECT_EQ(src.retained_cycle_count(), 1u);
+
+    // The chain grows past cycleBase+11 and the slot's qfcommit kick re-asks
+    // with the slot's own — now held — base hash.
+    h.by_height[kCycleBase + 11] = late;
+    src.request(kType, late);
+
+    // No second 600 kB reply is drawn…
+    EXPECT_EQ(h.sends, 1);
+    // …the outcome names itself…
+    EXPECT_EQ(src.last_rotated_outcome(), RotatedOutcome::kSlotRepublished);
+    // …and the slot serves.
+    auto m = src.lookup(kType, late);
+    ASSERT_TRUE(m.has_value())
+        << "the qi=11 wedge: a cycle ready at index 0 must not orphan a "
+           "slot whose header arrived after finalize";
+    EXPECT_EQ(m->size(), kQuorumSz);
+
+    // Byte parity: the republished slot must be EXACTLY the full-cycle
+    // compute's slot 11 — same ordered key sequence, merkleRootQuorums folds
+    // over it.
+    RealInputs in;
+    ASSERT_TRUE(in.load());
+    RotatedQuorumParams p{kType, kQuorumSz, kNQuorums};
+    auto sets = compute_quorum_members_by_quarter_rotation(p, in.cycles, in.snaps);
+    ASSERT_TRUE(sets.has_value());
+    EXPECT_EQ(key_sequence(*m), key_sequence((*sets)[11]));
+}
+
+// The retention itself can be gone (FIFO-evicted after kRetainedCyclesCap
+// newer cycles) while index 0 is still in m_ready. That state must RE-REQUEST
+// — bounded like any first request — never wedge. Cap 0 models the eviction
+// without fabricating eight more authenticated cycles.
+TEST(DashRotatedQuorumMembers, EvictedRetentionReRequestsInsteadOfWedging)
+{
+    SourceHarness h;
+    h.load();
+    auto src = h.make();
+    src.set_retained_cycles_cap(0);
+
+    const uint256 late = h.by_height[kCycleBase + 11];
+    h.by_height.erase(kCycleBase + 11);
+
+    uint256 cycle;
+    cycle.SetHex(dash::coin::testdata::kRot6075_QuorumHash);
+    ASSERT_TRUE(src.request_rotated(kType, cycle));
+    ASSERT_TRUE(src.on_qrinfo(h.info).has_value());
+    EXPECT_EQ(src.ready_count(), kNQuorums - 1);
+    EXPECT_EQ(src.retained_cycle_count(), 0u);
+    EXPECT_FALSE(src.lookup(kType, late).has_value());
+
+    h.by_height[kCycleBase + 11] = late;
+    src.request(kType, late);
+    EXPECT_EQ(h.sends, 2)
+        << "with the retained compute gone the cycle must be re-requested, "
+           "not short-circuited on index 0's readiness";
+
+    // The second reply — all headers now held — completes the cycle.
+    ASSERT_TRUE(src.on_qrinfo(h.info).has_value());
+    EXPECT_EQ(src.ready_count(), kNQuorums);
+    auto m = src.lookup(kType, late);
+    ASSERT_TRUE(m.has_value());
+    EXPECT_EQ(m->size(), kQuorumSz);
 }
 
 // A tampered operator key breaks the SML root, so the WHOLE cycle fails closed
