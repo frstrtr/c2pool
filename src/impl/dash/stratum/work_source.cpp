@@ -55,6 +55,7 @@
 #include <ctime>
 #include <mutex>
 #include <span>
+#include <sstream>
 #include <utility>
 
 namespace dash::stratum {
@@ -1169,13 +1170,66 @@ void DASHWorkSource::note_arm_decision(coin::ServeGateJournal::Served served,
                              std::chrono::steady_clock::now().time_since_epoch())
                              .count();
     coin::ServeGateJournal::Decision d;
+    coin::ServeGateJournal::Rollup rollup;
+    bool emit_rollup = false;
     {
         std::lock_guard<std::mutex> lk(serve_gate_mutex_);
         d = serve_gate_journal_.observe(served, why.cause, now_sec);
         last_decline_      = served_embedded ? coin::DeclineReport{} : why;
         last_arm_embedded_ = served_embedded;
         arm_ever_observed_ = true;
+        // Cumulative roll-up on its own slow cadence, INDEPENDENT of whether
+        // this decision emits a per-line entry: it must fire during a long
+        // healthy (serving) stretch too, so the denominator keeps growing and a
+        // soak is readable from the roll-up alone. Seed the cadence on the first
+        // decision so the very first observation never prints an empty summary.
+        if (last_rollup_sec_ < 0) {
+            last_rollup_sec_ = now_sec;
+        } else if (now_sec - last_rollup_sec_ >= kRollupHeartbeatSec) {
+            last_rollup_sec_ = now_sec;
+            rollup           = serve_gate_journal_.rollup(now_sec);
+            emit_rollup      = true;
+        }
     }
+
+    if (emit_rollup) {
+        // DENOMINATOR FIRST, then the numerators it divides — a percentage
+        // whose denominator is implicit is how the best-share bug shipped, so
+        // observed= is never omitted and each cause carries its own share.
+        std::ostringstream os;
+        os << "[EMBED-GATE-ROLLUP] observed=" << rollup.observed_sec << "s"
+           << " off_embedded=" << rollup.off_embedded_sec << "s";
+        if (rollup.observed_sec > 0)
+            os << " (" << (rollup.off_embedded_sec * 100 / rollup.observed_sec)
+               << "% of wall clock)";
+        os << " causes:";
+        if (rollup.per_cause.empty()) {
+            os << " (none)";
+        } else {
+            for (const auto& c : rollup.per_cause) {
+                os << " " << c.first << "=" << c.second << "s";
+                if (rollup.observed_sec > 0)
+                    os << "(" << (c.second * 100 / rollup.observed_sec) << "%)";
+            }
+        }
+        LOG_WARNING << os.str();
+    }
+
+    // A CAUSE SEGMENT closed on THIS decision (a cause change or a resume):
+    // emit it in qc's exact shape so a `grep 'cause=... dur='` sums to the
+    // CORRECT per-cause histogram. This is deliberately a SEPARATE line from the
+    // episode line below — its dur= is the per-cause segment clock, never the
+    // whole-episode dur=, so counts and seconds are never mixed on one line.
+    if (d.emit() && d.prev_cause_sec >= 0 && !d.previous_cause.empty()) {
+        if (const char* term =
+                coin::ServeGateJournal::seg_terminal_name(d.trigger)) {
+            LOG_WARNING << "[EMBED-GATE-SEG] h=" << height
+                        << " cause=" << d.previous_cause
+                        << " dur=" << d.prev_cause_sec << "s"
+                        << " terminal=" << term;
+        }
+    }
+
     if (!d.emit()) return;
 
     // The COST of the episode, in seconds off the embedded arm. This is the
@@ -1186,6 +1240,13 @@ void DASHWorkSource::note_arm_decision(coin::ServeGateJournal::Served served,
     const std::string dur =
         d.episode_sec >= 0 ? " dur=" + std::to_string(d.episode_sec) + "s"
                            : std::string();
+    // The CURRENT cause's own clock, distinct from the whole-episode dur= above:
+    // on a heartbeat this separates "the arm has been down 4 min" (episode) from
+    // "this particular cause has held for 20 s" (segment), which read identically
+    // when only episode_sec was printed (the h=2518004 attribution trap).
+    const std::string cause_dur =
+        d.cause_sec >= 0 ? " cause_dur=" + std::to_string(d.cause_sec) + "s"
+                         : std::string();
 
     if (d.trigger == coin::ServeGateJournal::Trigger::Resumed) {
         LOG_WARNING << "[EMBED-GATE] h=" << height
@@ -1205,6 +1266,7 @@ void DASHWorkSource::note_arm_decision(coin::ServeGateJournal::Served served,
                 << " DECLINED " << why.one_line()
                 << " trigger=" << coin::ServeGateJournal::trigger_name(d.trigger)
                 << dur
+                << cause_dur
                 << " suppressed=" << d.suppressed;
 }
 
