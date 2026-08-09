@@ -409,6 +409,55 @@ TEST(DashReplayPayeePublish, AtTipStillPublishes)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// KAT 3c — THE G7 SPLIT AGAINST A MOVING TIP (the vm905 death shape)
+//
+// The defect the epsilon exists for cannot be expressed on a static tip: with
+// the tip parked, fold==tip eventually holds and the old exact-tip G7 passes
+// trivially. The fault is that the TARGET RUNS — blocks land on the header
+// chain faster than the fold fetches bodies, so `fold == tip` is never true
+// at any evaluation instant, the publisher withholds forever, and a node
+// whose fold is provably one block behind a 2.5-minute chain pushes ZERO
+// mining.notify (vm905: bridge stuck ~20 behind live tip, ARMED but never
+// PUBLISHES, latch eternal). So here the tip MOVES between every evaluation
+// and never once equals the fold cursor.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashReplayPayeePublish, PublishesWithinEpsilonAgainstAMovingTip)
+{
+    auto rig = make_clean_rig();
+    ASSERT_TRUE(rig.fold_through(kFirstBody + 2));   // fold cursor 2516758
+    rig.tip = kFirstBody + 3;                        // tip ALREADY ahead
+    auto pub = rig.make_publisher();
+
+    // One behind, and the tip is about to move again: within epsilon, the
+    // guard passes NOW (on the old exact-tip G7 this evaluation refuses, and
+    // with the tip running it refuses at every later instant too).
+    const auto g1 = pub.evaluate();
+    EXPECT_TRUE(g1.ok) << g1.blocker;
+
+    // The tip moves BEFORE the publish fires — the fold is now two behind,
+    // the epsilon bound exactly. Still allowed.
+    rig.tip = kFirstBody + 4;
+    const auto g2 = pub.evaluate();
+    EXPECT_TRUE(g2.ok) << g2.blocker;
+    EXPECT_TRUE(pub.maybe_publish());
+    ASSERT_EQ(rig.sink.calls.size(), 1u);
+
+    // The stamp is the FOLD height — the honest as-of — never the tip: the
+    // consumer's currency gate needs the true as-of to know what to catch up
+    // from the diff store before it may arm serving.
+    EXPECT_EQ(rig.sink.calls.back().as_of, kFirstBody + 2);
+    EXPECT_LT(rig.sink.calls.back().as_of, rig.tip)
+        << "this publish happened while the tip was AHEAD — that is the point";
+
+    // The tip keeps running: three behind is beyond epsilon and the guard
+    // closes again. The relaxation is a 2-block window, not a repeal.
+    rig.tip = kFirstBody + 5;
+    const auto g3 = pub.evaluate();
+    EXPECT_FALSE(g3.ok);
+    EXPECT_EQ(g3.blocker.substr(0, 2), "G7") << g3.blocker;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // KAT 4 — THE FAIL-CLOSED GUARD: a DIVERGED / POISONED fold must never publish
 //
 // Built the only honest way: tamper with the anchor (drop one masternode) so
@@ -562,6 +611,121 @@ TEST(DashReplayPayeePublish, EveryGuardConditionNamesItself)
         EXPECT_EQ(g.blocker.substr(0, 2), "G8") << g.blocker;
         EXPECT_NE(g.blocker.find("EMPTY scriptPayout"), std::string::npos)
             << g.blocker;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KAT 5b — REGRESSION FENCE: the epsilon relaxed G7 and ONLY G7
+//
+// Every other guard is a money-path correctness proof and must refuse at the
+// WIDEST distance the epsilon now admits (tip = fold + kPublishEpsilon) —
+// i.e. the new window must not have reordered guard precedence or opened a
+// publish for a fold that is diverged/unchecked/mutated/scriptless within it.
+// Each block below synthesises exactly one failure and pins the guard CODE.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashReplayPayeePublish, EpsilonRelaxedOnlyG7EveryOtherGuardStillRefuses)
+{
+    auto rig = make_clean_rig();
+    ASSERT_TRUE(rig.fold_through(kLastBody - 1));   // fold cursor 2516759
+    const uint32_t eps = dash::coin::replay::kPublishEpsilon;
+    const uint32_t tip = (kLastBody - 1) + eps;     // the widest admitted gap
+    const FoldConsumerStats good = rig.consumer.stats();
+    ASSERT_TRUE(evaluate_payee_guard(rig.engine, good, tip).ok)
+        << "precondition: the healthy fold passes at the epsilon bound";
+
+    // G1 — a POISONED engine refuses inside the window too.
+    {
+        auto fx = pp_parse_prestate(kDashReplayPrestate2516755);
+        ASSERT_GT(fx.entries.size(), 10u);
+        fx.entries.erase(fx.entries.begin() + 7);       // tamper the anchor
+        uint256 anchor;
+        anchor.SetHex(fx.blockhash_display);
+        Rig bad(fx.entries, fx.height, anchor);
+        EXPECT_FALSE(bad.fold_through(kFirstBody));
+        ASSERT_TRUE(bad.engine.poisoned());
+        const auto g = evaluate_payee_guard(bad.engine, bad.consumer.stats(),
+                                            bad.engine.height() + eps);
+        EXPECT_FALSE(g.ok);
+        EXPECT_EQ(g.blocker.substr(0, 2), "G1") << g.blocker;
+    }
+    // G2 — a recorded divergence.
+    {
+        FoldConsumerStats s = good;
+        s.diverged          = true;
+        s.divergence_height = kLastBody - 1;
+        const auto g = evaluate_payee_guard(rig.engine, s, tip);
+        EXPECT_FALSE(g.ok);
+        EXPECT_EQ(g.blocker.substr(0, 2), "G2") << g.blocker;
+    }
+    // G3 — nothing folded.
+    {
+        FoldConsumerStats s;
+        const auto g = evaluate_payee_guard(rig.engine, s, tip);
+        EXPECT_FALSE(g.ok);
+        EXPECT_EQ(g.blocker.substr(0, 2), "G3") << g.blocker;
+    }
+    // G4 — a folded-but-unchecked block.
+    {
+        FoldConsumerStats s = good;
+        s.roots_matched -= 1;
+        const auto g = evaluate_payee_guard(rig.engine, s, tip);
+        EXPECT_FALSE(g.ok);
+        EXPECT_EQ(g.blocker.substr(0, 2), "G4") << g.blocker;
+    }
+    // G5 — a cursor that is not the height that passed.
+    {
+        FoldConsumerStats s = good;
+        s.last_height -= 1;
+        const auto g = evaluate_payee_guard(rig.engine, s, tip);
+        EXPECT_FALSE(g.ok);
+        EXPECT_EQ(g.blocker.substr(0, 2), "G5") << g.blocker;
+    }
+    // G6 — a list that no longer re-hashes to the matched root.
+    {
+        FoldConsumerStats s = good;
+        s.last_matched_root.data()[0] ^= 0xff;
+        const auto g = evaluate_payee_guard(rig.engine, s, tip);
+        EXPECT_FALSE(g.ok);
+        EXPECT_EQ(g.blocker.substr(0, 2), "G6") << g.blocker;
+    }
+    // G7 — an UNKNOWN tip still refuses outright (epsilon needs an operand).
+    {
+        const auto g = evaluate_payee_guard(rig.engine, good, 0);
+        EXPECT_FALSE(g.ok);
+        EXPECT_EQ(g.blocker.substr(0, 2), "G7") << g.blocker;
+    }
+    // G7 — one past the epsilon refuses (the boundary itself, both sides).
+    {
+        const auto g = evaluate_payee_guard(rig.engine, good, tip + 1);
+        EXPECT_FALSE(g.ok);
+        EXPECT_EQ(g.blocker.substr(0, 2), "G7") << g.blocker;
+    }
+    // G8 — a payout-scriptless entry, root-clean and inside the window.
+    {
+        ReplayMNState st;
+        st.nRegisteredHeight = 2500000;
+        st.nPoSeBanHeight    = ReplayMNState::NEVER;
+        st.collateralOutpoint.hash.data()[0] = 0x11;
+        std::vector<std::pair<uint256, ReplayMNState>> one;
+        uint256 protx;
+        protx.data()[0] = 0x22;
+        one.emplace_back(protx, st);
+        DmlFoldEngine scriptless(Rig::make_cfg());
+        scriptless.seed(std::move(one), 1, kLastBody - 1, uint256{}, "mainnet");
+        FoldConsumerStats s = good;
+        s.last_matched_root = scriptless.compute_sml_root();
+        ASSERT_FALSE(s.last_matched_root.IsNull());
+        const auto g = evaluate_payee_guard(scriptless, s, tip);
+        EXPECT_FALSE(g.ok);
+        EXPECT_EQ(g.blocker.substr(0, 2), "G8") << g.blocker;
+    }
+    // G9 — a block whose payee was not proven paid.
+    {
+        FoldConsumerStats s = good;
+        s.payees_verified -= 1;
+        const auto g = evaluate_payee_guard(rig.engine, s, tip);
+        EXPECT_FALSE(g.ok);
+        EXPECT_EQ(g.blocker.substr(0, 2), "G9") << g.blocker;
     }
 }
 

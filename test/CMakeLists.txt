@@ -1132,7 +1132,14 @@ if (BUILD_TESTING AND GTest_FOUND)
     # CoinStateMaintainer: drives NodeCoinState off async tip/MN/mempool update
     # events (readiness gate: MN+tip required before publish). Same link set as
     # test_dash_node_coin_state -- header-only over the work_source selector set.
-    add_executable(test_dash_coin_state_maintainer test_dash_coin_state_maintainer.cpp)
+    # Second TU: test_dash_mn_gap_repair.cpp — the diff-store gap-repair seam
+    # (mn_gap_repair.hpp) at its money-path caller: an APPLY GAP against a
+    # MOVING tip repaired from real MnDiffStore rows byte-identical to a
+    # contiguous fold; the unrepairable-gap fail-closed floor (wipe + demote +
+    # re-seed ask) unchanged; and the consumer half of the G7 split (below-tip
+    # seed catch-up / refusal-to-arm). Links leveldb via core.
+    add_executable(test_dash_coin_state_maintainer test_dash_coin_state_maintainer.cpp
+                   test_dash_mn_gap_repair.cpp)
     target_link_libraries(test_dash_coin_state_maintainer PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
