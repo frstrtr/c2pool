@@ -62,15 +62,28 @@ bool has_line_with(const std::vector<std::string>& lines, const std::string& nee
     return false;
 }
 
-// A run of `n` clean, evidence-bearing heights.
+// ONE clean, evidence-bearing sample AT a given height.
+void feed_clean_sample_at(MempoolValidityGate& g, uint32_t height)
+{
+    const auto set = std::vector<MempoolProbeTx>{tx("aa")};
+    const auto ans = std::vector<nlohmann::json>{allowed_true("aa")};
+    g.apply(mempool_validity_sample(height, set, ans));
+}
+
+// A run of `n` clean, evidence-bearing heights — one sample each, ADVANCING.
 void feed_clean(MempoolValidityGate& g, uint64_t n, uint32_t from_height = 1000)
 {
-    for (uint64_t i = 0; i < n; ++i) {
-        const auto set = std::vector<MempoolProbeTx>{tx("aa")};
-        const auto ans = std::vector<nlohmann::json>{allowed_true("aa")};
-        g.apply(mempool_validity_sample(
-            static_cast<uint32_t>(from_height + i), set, ans));
-    }
+    for (uint64_t i = 0; i < n; ++i)
+        feed_clean_sample_at(g, static_cast<uint32_t>(from_height + i));
+}
+
+// `n` clean samples that all land on THE SAME height — the shape the probe
+// cadence actually produces (on_serve fires per template re-source: every
+// work-generation bump and every 30 s staleness re-poll, ~5-6 times inside one
+// 157.5 s DASH block).
+void feed_clean_repeats_at(MempoolValidityGate& g, uint64_t n, uint32_t height)
+{
+    for (uint64_t i = 0; i < n; ++i) feed_clean_sample_at(g, height);
 }
 
 } // namespace
@@ -222,7 +235,7 @@ TEST(DashMempoolValidityGate, EmptyHeightsNeitherAdvanceNorResetTheRun) {
     EXPECT_FALSE(g.open());
     EXPECT_EQ(g.consecutive_clean, 0u);
     EXPECT_EQ(g.heights_with_evidence, 0u);
-    EXPECT_EQ(g.heights_without_evidence, g.required + 10);
+    EXPECT_EQ(g.samples_without_evidence, g.required + 10);
 
     // Nor do they RESET a run in progress.
     feed_clean(g, 5, 20000);
@@ -262,6 +275,148 @@ TEST(DashMempoolValidityGate, AlreadyInMempoolAloneIsEnoughEvidenceToAdvance) {
     g.apply(s);
     EXPECT_EQ(g.consecutive_clean, 1u);
     EXPECT_EQ(g.txs_already_in_mempool, 2u);
+}
+
+// ── 5b. THE WINDOW COUNTS DISTINCT HEIGHTS, NOT SAMPLES ─────────────────────
+//
+// apply() is called ONCE PER SAMPLE, and a sample is one probe run — not one
+// block. probe_validity() runs from process(), process() runs from on_serve,
+// and on_serve fires on EVERY template re-source: every work-generation bump
+// plus a 30 s staleness re-poll (work_source.cpp kStaleAfter). DASH targets
+// 157.5 s/block, so ~5-6 samples land on ONE height. If a repeated sample
+// advanced the window, 576 counter ticks would be ~110 real heights (~4.8 h),
+// not the 576 heights (~25.2 h) the threshold is argued from — and the
+// "rule of three" power argument would be counting the same transaction, at
+// the same height, five times over as five independent trials.
+//
+// These KATs feed the input the rest of the suite never presents: REPEATS.
+
+TEST(DashMempoolValidityGate, RepeatedSamplesAtOneHeightAdvanceTheWindowOnce) {
+    MempoolValidityGate g;
+    feed_clean_repeats_at(g, 5, 2518500);
+
+    EXPECT_EQ(g.consecutive_clean, 1u)
+        << "five probes of one height are ONE height of evidence";
+    EXPECT_EQ(g.heights_with_evidence, 1u);
+
+    // The four that advanced nothing are not erased — they are RECORDED as
+    // what they were, so probe cadence can never be read as progress.
+    EXPECT_EQ(g.samples_seen,          5u);
+    EXPECT_EQ(g.samples_repeat_height, 4u);
+    EXPECT_EQ(g.txs_probed,            1u) << "one observation per tx per height";
+    EXPECT_EQ(g.repeat_txs_probed,     4u);
+    EXPECT_EQ(g.last_disposition,
+              MempoolValidityGate::SampleDisposition::RepeatHeight);
+
+    // And the log line SAYS SO rather than leaving it to be inferred.
+    const auto set = std::vector<MempoolProbeTx>{tx("aa")};
+    const auto ans = std::vector<nlohmann::json>{allowed_true("aa")};
+    const auto s   = mempool_validity_sample(2518500, set, ans);
+    const auto lines = mempool_validity_log_lines(s, g);
+    EXPECT_TRUE(has_line_with(lines, "sample=REPEAT-HEIGHT(no-advance)"));
+    EXPECT_TRUE(has_line_with(lines, "heights_with_evidence=1"));
+}
+
+TEST(DashMempoolValidityGate, AWholeWindowOfSamplesAtOneHeightCannotOpenTheGate) {
+    // The failure this whole fix exists to stop: a node parked on ONE height
+    // (frozen tip, stalled bridge) re-probing the same transactions for hours
+    // and calling it a full day of evidence.
+    MempoolValidityGate g;
+    feed_clean_repeats_at(g, g.required + 50, 2518501);
+
+    EXPECT_FALSE(g.open()) << "one height, however often probed, is one height";
+    EXPECT_EQ(g.consecutive_clean, 1u);
+    EXPECT_EQ(g.heights_with_evidence, 1u);
+    EXPECT_EQ(g.samples_seen, g.required + 50);
+    EXPECT_EQ(g.to_json()["gate"], "CLOSED");
+}
+
+TEST(DashMempoolValidityGate, ARepeatedHeightIsNotEvidenceButAnInvalidOnItStillKillsTheRun) {
+    // The ASYMMETRY, stated as a test: a repeat cannot ADVANCE the run (it is
+    // not new evidence) but it CAN kill it (a defect is a defect whenever it is
+    // observed). Trading "over-counts clean" for "under-counts invalid" would
+    // be swapping one blindness for another.
+    MempoolValidityGate g;
+    feed_clean(g, 4, 2518600);                 // heights 2518600..2518603
+    ASSERT_EQ(g.consecutive_clean, 4u);
+
+    // A LATER probe of the height already counted clean — this time dashd
+    // refuses one of the transactions (a conflicting spend arrived).
+    const std::vector<MempoolProbeTx> set{tx("aa"), tx("bad")};
+    const std::vector<nlohmann::json> ans{allowed_true("aa"),
+                                          refused("bad", "bad-txns-inputs-spent")};
+    g.apply(mempool_validity_sample(2518603, set, ans));
+
+    EXPECT_EQ(g.consecutive_clean, 0u) << "a repeat must still be able to RESET";
+    EXPECT_EQ(g.last_invalid_txid, "bad");
+    EXPECT_EQ(g.last_invalid_height, 2518603u);
+    EXPECT_EQ(g.txs_invalid, 1u);
+
+    // The defect was seen on a REPEAT, so the height is not re-banked...
+    EXPECT_EQ(g.heights_with_evidence, 4u);
+    // ...but it IS counted, because a defect counts wherever it is observed.
+    EXPECT_EQ(g.last_disposition,
+              MempoolValidityGate::SampleDisposition::RepeatHeight);
+
+    // And a clean re-probe of that same height does NOT resurrect the run.
+    feed_clean_sample_at(g, 2518603);
+    EXPECT_EQ(g.consecutive_clean, 0u);
+
+    // Only a genuinely NEW height restarts it, from one.
+    feed_clean_sample_at(g, 2518604);
+    EXPECT_EQ(g.consecutive_clean, 1u);
+}
+
+TEST(DashMempoolValidityGate, AHeightThatDoesNotADVANCEContributesNoEvidence) {
+    // Reorg / rollback: the cursor is MONOTONE. A template height at or below
+    // the last counted one carries no evidence the window has not already
+    // banked, and alternating H, H-1, H must not be read as three heights.
+    MempoolValidityGate g;
+    feed_clean_sample_at(g, 2518700);
+    feed_clean_sample_at(g, 2518699);   // rolled back
+    feed_clean_sample_at(g, 2518700);   // and forward again — same height
+    EXPECT_EQ(g.consecutive_clean, 1u);
+    EXPECT_EQ(g.heights_with_evidence, 1u);
+
+    feed_clean_sample_at(g, 2518701);   // a genuinely NEW height does advance
+    EXPECT_EQ(g.consecutive_clean, 2u);
+    EXPECT_EQ(g.heights_with_evidence, 2u);
+}
+
+TEST(DashMempoolValidityGate, AnEmptyProbeAtAHeightDoesNotBurnThatHeight) {
+    // A height whose first probe found nothing has NOT been measured. When a
+    // later probe of the SAME height does find transactions, that is the first
+    // evidence at that height and it must count.
+    MempoolValidityGate g;
+    g.apply(mempool_validity_sample(2518800, {}, {}));
+    EXPECT_EQ(g.consecutive_clean, 0u);
+    feed_clean_sample_at(g, 2518800);
+    EXPECT_EQ(g.consecutive_clean, 1u);
+    EXPECT_EQ(g.heights_with_evidence, 1u);
+}
+
+// ── 5c. THE IN-SET-PARENT EXEMPTION IS PER-TRANSACTION, SO IT MUST BE NARROW ─
+
+TEST(DashMempoolValidityGate, MissingOrSpentIsNeverExemptedEvenWithAnInSetParent) {
+    // `bad-txns-inputs-missingorspent` says in its own NAME that it cannot
+    // tell a missing input from a SPENT one, and testmempoolaccept never names
+    // WHICH outpoint failed. `depends_on_in_set_parent` is a fact about the
+    // TRANSACTION, not about the failing INPUT: a tx spending one in-set parent
+    // output AND one genuinely double-spent output has the flag set and is a
+    // real defect. Excusing it would let exactly the loss this gate exists to
+    // prevent through as UNPROBED.
+    const auto r = classify_mempool_accept(
+        tx("gg", /*depends=*/true),
+        refused("gg", "bad-txns-inputs-missingorspent"));
+    EXPECT_EQ(r.verdict, MempoolAcceptVerdict::Invalid);
+    EXPECT_EQ(r.reason, "bad-txns-inputs-missingorspent");
+
+    // The narrow reason — dashd saying only "I do not know this input" — stays
+    // excused, because that IS what a one-tx probe of a child does to a parent
+    // dashd has not seen.
+    const auto narrow = classify_mempool_accept(
+        tx("gg", /*depends=*/true), refused("gg", "missing-inputs"));
+    EXPECT_EQ(narrow.verdict, MempoolAcceptVerdict::Unprobed);
 }
 
 // ── 6. THE TWO DIRECTIONS THE OLD CONDITION GOT WRONG ───────────────────────

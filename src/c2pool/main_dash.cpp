@@ -2642,7 +2642,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                          "for arming --embedded-serve-mempool-txs = ZERO INVALID "
                          "over "
                       << dash::coin::MempoolValidityGate::kCleanHeightsRequired
-                      << " consecutive evidence-bearing heights. ours_only is "
+                      << " consecutive evidence-bearing DISTINCT heights (the "
+                         "probe fires ~5-6x per block; repeats do not advance "
+                         "the window). ours_only is "
                          "INFORMATIONAL and gates nothing.\n";
         } else {
             std::cout << "[run] --embedded-shadow-compare given but no dashd RPC "
@@ -5013,7 +5015,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                          " (default OFF), gated on the [MEMPOOL-VALIDITY]"
                          " testmempoolaccept series -- zero INVALID over "
                       << dash::coin::MempoolValidityGate::kCleanHeightsRequired
-                      << " consecutive evidence-bearing heights.\n";
+                      << " consecutive evidence-bearing DISTINCT heights.\n";
         }
 
         // Kick the initial sync once the version/verack handshake completes:

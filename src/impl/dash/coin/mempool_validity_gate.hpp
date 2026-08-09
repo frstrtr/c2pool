@@ -45,19 +45,52 @@
 ///
 /// ══ HARD GATE ══════════════════════════════════════════════════════════════
 /// ZERO INVALID over a SUSTAINED window of kCleanHeightsRequired consecutive
-/// EVIDENCE-BEARING heights (see below). One INVALID anywhere in the run resets
-/// the run to zero. The gate is a READINESS verdict on a FLAG, not a serve
-/// decision: nothing in this header can change, delay, or re-order a served
-/// template. --embedded-serve-mempool-txs remains DEFAULT-OFF; this file
-/// changes the condition under which it may be armed.
+/// EVIDENCE-BEARING, DISTINCT heights (see both qualifiers below). One INVALID
+/// anywhere in the run resets the run to zero. The gate is a READINESS verdict
+/// on a FLAG, not a serve decision: nothing in this header can change, delay,
+/// or re-order a served template. --embedded-serve-mempool-txs remains
+/// DEFAULT-OFF; this file changes the condition under which it may be armed.
 ///
 /// ══ EVIDENCE-BEARING, and why a height with no transactions does not count ══
 /// A height where our probe set was empty (empty mempool, coinbase-only
 /// candidate set) produced NO observation of validity. Counting it as "clean"
 /// would let 576 empty heights open the gate on zero evidence — the same
 /// unreachable/vacuous failure the old condition had, with the sign flipped.
-/// Such heights therefore neither ADVANCE the clean run nor RESET it: they are
-/// counted separately as `heights_without_evidence` and are visible in the log.
+/// Such samples therefore neither ADVANCE the clean run nor RESET it: they are
+/// counted separately as `samples_without_evidence` and are visible in the log.
+///
+/// ══ DISTINCT, and why a SAMPLE is not a HEIGHT ══════════════════════════════
+/// apply() is fed ONE SAMPLE PER PROBE RUN, and a probe run is NOT a block.
+/// probe_validity() runs from process(), process() runs from on_serve, and
+/// on_serve fires on EVERY template re-source: every work-generation bump plus
+/// a 30 s staleness re-poll (stratum/work_source.cpp kStaleAfter). DASH targets
+/// 157.5 s/block, so roughly FIVE TO SIX samples land on ONE height.
+///
+/// Counting samples would therefore have made 576 counter ticks mean ~110 real
+/// heights — about 4.8 hours, not the ~25.2 hours the threshold is argued
+/// from — and a node parked on a FROZEN TIP could tick the counter to 576
+/// without ever advancing a block. That is precisely the "a shorter window can
+/// be passed by a quiet night" failure the threshold exists to exclude, so the
+/// window counts DISTINCT heights and the cursor is MONOTONE.
+///
+/// The rule is DELIBERATELY ASYMMETRIC, and the asymmetry is the point:
+///
+///   * A sample at a height that does NOT advance the cursor (a repeat of the
+///     last counted height, or a rollback below it) contributes NO new
+///     evidence: it cannot advance `consecutive_clean`, cannot raise
+///     `heights_with_evidence`, and its transactions are not added to the
+///     independent-trial totals. It is counted as `samples_repeat_height`.
+///   * That same sample CAN STILL KILL THE RUN. An INVALID is an OBSERVED
+///     DEFECT whenever it is observed — the mempool at one height is not
+///     constant, and a conflicting spend that arrives between two probes of
+///     the same height is exactly the event that costs a block. Ignoring it
+///     because "we already counted this height" would trade over-counting
+///     clean evidence for under-counting defects: one blindness for another.
+///
+/// So a repeat can only ever HURT the run, never help it. Everything the
+/// non-advancing samples DID see stays visible in `samples_seen`,
+/// `samples_repeat_height` and `repeat_txs_probed` — dropped from the window
+/// arithmetic, never dropped from the record.
 ///
 /// ══ ours_only IS NOW INFORMATIONAL ══════════════════════════════════════════
 /// It keeps being measured and keeps being printed — as a COVERAGE STATISTIC.
@@ -94,13 +127,20 @@ namespace coin {
 /// "txn-already-in-mempool"). The ONE exempted reason. Compared for EQUALITY.
 inline constexpr const char* kAlreadyInMempoolReason = "txn-already-in-mempool";
 
-/// The reject-reason family a SINGLE-transaction probe produces for a child
-/// whose parent is in the same template but not in dashd's mempool. Only ever
-/// consulted together with a build-time `depends_on_in_set_parent` fact.
-inline bool is_missing_inputs_reason(const std::string& reason)
+/// The ONE reject-reason that can mean ONLY "I do not know this input" — the
+/// answer a SINGLE-transaction probe gets for a child whose parent rides the
+/// same template but has not reached dashd's mempool. Only ever consulted
+/// together with a build-time `depends_on_in_set_parent` fact.
+inline bool is_unknown_input_only_reason(const std::string& reason)
 {
-    return reason == "missing-inputs"
-        || reason == "bad-txns-inputs-missingorspent";
+    return reason == "missing-inputs";
+}
+
+/// The reject-reason that CONFLATES a missing input with a SPENT one, and says
+/// so in its own name. NEVER exempted — see the note on the exemption below.
+inline bool is_missing_or_spent_reason(const std::string& reason)
+{
+    return reason == "bad-txns-inputs-missingorspent";
 }
 
 /// Three-valued logic, plus the honest fourth state for "no answer".
@@ -175,8 +215,35 @@ inline MempoolAcceptResult classify_mempool_accept(const MempoolProbeTx& tx,
     }
 
     // The ONLY excused rejection beyond the named one: a child probed alone
-    // whose parent rides the SAME template. Requires the build-time fact.
-    if (tx.depends_on_in_set_parent && is_missing_inputs_reason(r.reason)) {
+    // whose parent rides the SAME template. Requires the build-time fact AND a
+    // reason that can mean nothing else.
+    //
+    // WHY `bad-txns-inputs-missingorspent` IS **NOT** IN HERE.
+    // `depends_on_in_set_parent` is a fact about the TRANSACTION, not about the
+    // INPUT that failed, and testmempoolaccept never names WHICH outpoint it
+    // refused. So a recorded dependency does not imply the failing input was
+    // the in-set parent: a transaction spending ONE in-set parent output AND
+    // ONE genuinely double-spent output carries the flag and is a real defect —
+    // the exact loss this gate exists to prevent, classified as UNPROBED and
+    // waved through.
+    //
+    // A per-INPUT fix is NOT AVAILABLE from the data dashd gives us. Even with
+    // the full per-input in-set map on our side, the answer is a bare reason
+    // string with no outpoint, so nothing can attribute the failure to a
+    // specific input. The exemption is therefore NARROWED instead, to the one
+    // reason whose meaning is unambiguous: "missing-inputs" = "this input is
+    // not known to me". `bad-txns-inputs-missingorspent` conflates unknown with
+    // SPENT in its own name and is now INVALID even with the flag set.
+    //
+    // The cost is stated rather than hidden: an in-set-parent child that dashd
+    // answers with the conflating reason will now RESET the clean run. That
+    // fails toward a CLOSED gate on ambiguous evidence, which is the direction
+    // a gate is allowed to be wrong in. The residual the narrow exemption still
+    // carries is likewise per-transaction: a tx spending an in-set parent AND
+    // an input dashd does not know for an unrelated reason. That case is not a
+    // double-spend, and our selection is topological (mempool.hpp G1), so every
+    // in-our-mempool ancestor rides the same template.
+    if (tx.depends_on_in_set_parent && is_unknown_input_only_reason(r.reason)) {
         r.verdict        = MempoolAcceptVerdict::Unprobed;
         r.unprobed_cause = "in-set-parent(single-tx-probe-cannot-see-it)";
         return r;
@@ -241,20 +308,35 @@ mempool_validity_sample(uint32_t height,
 /// INVALID. Justification, in full, because a threshold without one is a
 /// number somebody made up:
 ///
-///   * DURATION. DASH mainnet targets 2.625 min/block, so 576 blocks is
-///     ~25.2 hours — one full day plus a margin. That is the shortest window
+///   * DURATION. DASH mainnet targets 2.625 min/block, so 576 DISTINCT heights
+///     is AT LEAST ~25.2 hours — one full day plus a margin, and longer
+///     whenever heights go by without evidence. That is the shortest window
 ///     that contains every DAILY period in mempool composition: the fee/traffic
 ///     diurnal cycle, at least one full DKG mining window for each active LLMQ
 ///     type, and at least one ChainLock-less stretch. A shorter window can be
-///     passed by a quiet night.
-///   * STATISTICAL POWER. Evidence-bearing heights on the hotel carry a mean of
-///     ~30 selectable transactions, so 576 of them is ~1.7e4 transaction
-///     probes. Zero events in n trials bounds the true per-transaction invalid
-///     rate at 3/n (rule of three, 95%) = ~1.7e-4. At ~30 transactions per
-///     template that is a <=0.5% chance that any given template we build
-///     carries a rejectable transaction — roughly one at-risk block per 190
-///     mined. THAT IS THE RESIDUAL, stated rather than implied; it is not zero,
-///     and the number is why the window is 576 and not 100.
+///     passed by a quiet night. This bound holds ONLY because the counter
+///     advances per distinct height; counting samples would have made the same
+///     576 mean ~110 heights (~4.8 h), because the probe fires ~5-6 times per
+///     block — see "DISTINCT" at the top of this file.
+///   * STATISTICAL POWER, stated at the unit the window actually counts. Zero
+///     INVALID heights in 576 evidence-bearing heights bounds the per-HEIGHT
+///     rate at 3/576 (rule of three, 95%) = 5.2e-3: at most a ~0.52% chance
+///     that any given template we build carries a rejectable transaction,
+///     roughly ONE AT-RISK BLOCK PER 192 MINED. THAT IS THE RESIDUAL, stated
+///     rather than implied; it is not zero, and it is why the window is 576 and
+///     not 100.
+///
+///     The per-HEIGHT rate is the honest form of this claim, and the per-
+///     TRANSACTION form is deliberately NOT made. Evidence-bearing heights on
+///     the hotel carry a mean of ~30 selectable transactions, so the window
+///     does accumulate ~1.7e4 probes — but they are not 1.7e4 INDEPENDENT
+///     trials: a transaction that sits in the mempool for several blocks is
+///     re-probed at each of them. Only the HEIGHTS are separated by a fresh
+///     tip, a fresh selection and a fresh mempool, so only the height-level
+///     bound is claimed. (Before the distinct-height fix the counter's true
+///     unit was ~110 heights, which bounds the per-template rate at 3/110 =
+///     2.7% — one at-risk block per 37, 5.2x worse than the number the
+///     threshold was argued from.)
 ///   * REACHABILITY. Unlike `ours_only == 0`, this condition is satisfiable by
 ///     a correct node: it asks dashd whether OUR transactions are acceptable,
 ///     not whether dashd's mempool coincides with ours.
@@ -264,23 +346,65 @@ mempool_validity_sample(uint32_t height,
 struct MempoolValidityGate {
     static constexpr uint64_t kCleanHeightsRequired = 576;
 
+    /// What the LAST applied sample did to the window. Named so a log reader
+    /// never has to infer it from two counters moving.
+    enum class SampleDisposition : uint8_t {
+        None,           // nothing applied yet
+        Counted,        // new height, evidence-bearing: the window moved
+        RepeatHeight,   // at/below the counted cursor: no new evidence
+        NoEvidence      // nothing to probe, or every answer was Unprobed
+    };
+
+    static const char* disposition_name(SampleDisposition d)
+    {
+        switch (d) {
+            case SampleDisposition::Counted:      return "COUNTED";
+            case SampleDisposition::RepeatHeight: return "REPEAT-HEIGHT(no-advance)";
+            case SampleDisposition::NoEvidence:   return "NO-EVIDENCE(no-advance)";
+            default:                              return "NONE";
+        }
+    }
+
     uint64_t required{kCleanHeightsRequired};
 
-    uint64_t heights_seen{0};
+    /// THE MONOTONE HEIGHT CURSOR. Only a sample ABOVE it can advance the
+    /// window, and only an evidence-bearing sample moves it — so a height whose
+    /// first probe found nothing is not burned, and a rollback cannot make the
+    /// window count the same block twice.
+    uint32_t last_counted_height{0};
+    bool     has_counted_height{false};
+
+    /// Every apply() call: the PROBE cadence, ~5-6 per block. NOT a height.
+    uint64_t samples_seen{0};
+    /// ... of which landed at/below the cursor and so advanced nothing.
+    uint64_t samples_repeat_height{0};
+    /// ... of which observed no validity at all.
+    uint64_t samples_without_evidence{0};
+
+    /// THE WINDOW'S UNIT: distinct evidence-bearing heights.
     uint64_t heights_with_evidence{0};
-    uint64_t heights_without_evidence{0};
     uint64_t consecutive_clean{0};
     uint64_t best_consecutive_clean{0};
 
+    /// Transaction totals over the COUNTED samples only — one observation per
+    /// transaction per height, which is what the power argument is entitled to
+    /// read. Re-probes are kept apart in `repeat_txs_probed` so nothing is
+    /// hidden, only kept out of the arithmetic.
     uint64_t txs_probed{0};
     uint64_t txs_valid{0};
     uint64_t txs_already_in_mempool{0};
-    uint64_t txs_invalid{0};
     uint64_t txs_unprobed{0};
+    uint64_t repeat_txs_probed{0};
+
+    /// DEFECTS ARE COUNTED WHEREVER THEY ARE OBSERVED — counted sample or
+    /// repeat. See the asymmetry note at the top of this file.
+    uint64_t txs_invalid{0};
 
     uint32_t    last_invalid_height{0};
     std::string last_invalid_txid;
     std::string last_invalid_reason;
+
+    SampleDisposition last_disposition{SampleDisposition::None};
 
     /// TRUE == the condition for arming --embedded-serve-mempool-txs is met.
     /// It does NOT arm anything; the flag stays an operator decision.
@@ -288,30 +412,54 @@ struct MempoolValidityGate {
 
     void apply(const MempoolValiditySample& s)
     {
-        ++heights_seen;
-        txs_probed             += s.probed;
-        txs_valid              += s.valid;
-        txs_already_in_mempool += s.already_in_mempool;
-        txs_invalid            += s.invalid;
-        txs_unprobed           += s.unprobed;
+        ++samples_seen;
 
         if (!s.evidence_bearing()) {
             // Neither advances nor resets — it is not evidence in either
             // direction. Said out loud so a long quiet stretch cannot be
-            // mistaken for progress toward the threshold.
-            ++heights_without_evidence;
+            // mistaken for progress toward the threshold. The cursor is NOT
+            // moved: a later probe of this same height that DOES find
+            // transactions is the first evidence there, and must count.
+            ++samples_without_evidence;
+            txs_unprobed     += s.unprobed;
+            last_disposition  = SampleDisposition::NoEvidence;
             return;
         }
-        ++heights_with_evidence;
 
+        // A DEFECT KILLS THE RUN WHEREVER IT IS SEEN — before the distinct-
+        // height test, deliberately. The mempool at one height is not constant;
+        // a conflicting spend arriving between two probes of the same height is
+        // exactly the event that costs a block. A repeat may only ever HURT.
         if (s.invalid > 0) {
-            const auto& first = s.invalids.front();
+            txs_invalid        += s.invalid;
+            const auto& first   = s.invalids.front();
             last_invalid_height = s.height;
             last_invalid_txid   = first.txid;
             last_invalid_reason = first.reason;
             consecutive_clean   = 0;      // the run dies on ONE defect
+        }
+
+        const bool advances = !has_counted_height || s.height > last_counted_height;
+        if (!advances) {
+            // No new evidence: the window has already banked this height. The
+            // reset above (if any) still stands.
+            ++samples_repeat_height;
+            repeat_txs_probed += s.probed;
+            last_disposition   = SampleDisposition::RepeatHeight;
             return;
         }
+
+        last_counted_height = s.height;
+        has_counted_height  = true;
+        ++heights_with_evidence;
+        txs_probed             += s.probed;
+        txs_valid              += s.valid;
+        txs_already_in_mempool += s.already_in_mempool;
+        txs_unprobed           += s.unprobed;
+        last_disposition        = SampleDisposition::Counted;
+
+        if (s.invalid > 0) return;        // already reset above
+
         ++consecutive_clean;
         if (consecutive_clean > best_consecutive_clean)
             best_consecutive_clean = consecutive_clean;
@@ -324,10 +472,17 @@ struct MempoolValidityGate {
         j["clean-heights-required"]    = required;
         j["consecutive-clean-heights"] = consecutive_clean;
         j["best-consecutive-clean-heights"] = best_consecutive_clean;
-        j["heights-seen"]              = heights_seen;
         j["heights-with-evidence"]     = heights_with_evidence;
-        j["heights-without-evidence"]  = heights_without_evidence;
+        j["last-counted-height"]       = last_counted_height;
+        // The window's unit is a HEIGHT; these three say how many PROBES it
+        // took and how many of them the window was entitled to count, so a
+        // reader can never mistake probe cadence for progress.
+        j["samples-seen"]              = samples_seen;
+        j["samples-repeat-height"]     = samples_repeat_height;
+        j["samples-without-evidence"]  = samples_without_evidence;
+        j["last-sample-disposition"]   = disposition_name(last_disposition);
         j["txs-probed"]                = txs_probed;
+        j["txs-probed-repeat-height"]  = repeat_txs_probed;
         j["txs-valid"]                 = txs_valid;
         j["txs-already-in-mempool"]    = txs_already_in_mempool;
         j["txs-invalid"]               = txs_invalid;
@@ -373,10 +528,17 @@ mempool_validity_log_lines(const MempoolValiditySample& s,
         + " unprobed="  + std::to_string(s.unprobed)
         + " clean_run=" + std::to_string(g.consecutive_clean) + "/"
         + std::to_string(g.required)
+        + " heights_with_evidence=" + std::to_string(g.heights_with_evidence)
+        + " sample=" + MempoolValidityGate::disposition_name(g.last_disposition)
         + " gate=" + (g.open() ? "OPEN" : "CLOSED");
     if (!s.evidence_bearing())
         l += " (no-evidence: nothing to probe at this height — the run neither"
              " advances nor resets)";
+    else if (g.last_disposition == MempoolValidityGate::SampleDisposition::RepeatHeight)
+        l += " (repeat-height: h<=" + std::to_string(g.last_counted_height)
+           + " is already banked — the probe fires ~5-6x per block, so this"
+             " sample is NOT new evidence and does NOT advance the window;"
+             " an INVALID on it would still RESET the run)";
     out.push_back(std::move(l));
     return out;
 }

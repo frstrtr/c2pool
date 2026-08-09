@@ -583,8 +583,10 @@ public:
                         " Condition to arm --embedded-serve-mempool-txs = ZERO"
                         " INVALID over "
                      << MempoolValidityGate::kCleanHeightsRequired
-                     << " consecutive evidence-bearing heights (~25h at DASH's"
-                        " 2.625 min/block). ours_only is INFORMATIONAL and"
+                     << " consecutive evidence-bearing DISTINCT heights (>=25h"
+                        " at DASH's 2.625 min/block; this probe fires ~5-6x per"
+                        " block and repeats do NOT advance the window)."
+                        " ours_only is INFORMATIONAL and"
                         " gates nothing. This gate arms NOTHING by itself --"
                         " the flag stays an operator decision";
         worker_ = std::thread([this] { worker_loop(); });
