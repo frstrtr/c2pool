@@ -393,6 +393,25 @@ public:
     void set_tip_body_pending_dbg(bool v) { m_tip_body_pending_dbg = v; }
     bool tip_body_pending_dbg() const { return m_tip_body_pending_dbg; }
 
+    /// WHICH promotion conjunct is the one still unmet, as a static string
+    /// literal ("credit-pool-seed" / "payee-cursor" / "sml-currency" /
+    /// "header-tip"). `tip-body-pending` names a WAIT; on its own it does NOT
+    /// name what is being waited FOR, and the three axes have different owners
+    /// and different repair paths — the credit-pool seed and the payee cursor
+    /// both come from the tip BLOCK BODY (one getdata BLOCK on the coin-P2P
+    /// leg), while the SML currency comes from a SEPARATE getmnlistd round
+    /// trip that the block body cannot supply (a cbTx commits
+    /// merkleRootMNList, and a root is not a list). An operator reading
+    /// `cause=tip-body-pending` alone cannot tell a slow body from a silently
+    /// dropped diff request; `awaiting=sml-currency` says it in one line.
+    ///
+    /// LIFETIME: the pointer must be a string literal (every call site passes
+    /// one). Diagnostic only; no serve or reward path reads it.
+    void set_tip_body_pending_axis(const char* axis) {
+        m_tip_body_pending_axis = axis ? axis : "";
+    }
+    const char* tip_body_pending_axis() const { return m_tip_body_pending_axis; }
+
     /// The same two bits, READABLE. They existed only inside the decline
     /// string, so the standing state ("why would this node not serve RIGHT
     /// NOW, before anyone asks it for work") could not be printed at all — an
@@ -1534,14 +1553,45 @@ private:
             d.cause     = "mn-needs-reseed";
             d.value     = "latched";
             d.threshold = "cleared-by-authoritative-reseed";
-        } else if (d.cause == "not-populated" && m_tip_body_pending_dbg) {
+        } else if (d.cause == "not-populated" && m_tip_body_pending_dbg
+                   && m_have_tip_dbg == 0 && m_have_mn_dbg == 1) {
             // Body-first serve tip: a header tip is known but its block
             // inputs have not been parsed yet (cold start before the first
             // promotion, or an overdue-demoted pending window). The named
             // transient — NOT a header-sync fault, NOT an error state; the
             // value keeps both populate halves visible.
+            //
+            // ONLY WHEN THE TIP HALF IS THE ONE UNMET (have_tip=0, have_mn=1).
+            // The pending flag says a header tip is awaiting its body; it does
+            // NOT say the body is what is holding serving back. Two states the
+            // unguarded rename got wrong, both measured on the instrumented
+            // daemonless soak (86406d07, 2026-08-09 14:39–15:53):
+            //
+            //   have_tip=0, have_mn=0 — cold start. At 14:40:55 the arm was
+            //   relabelled `tip-body-pending` while BOTH halves were unmet,
+            //   and the MN half was the LONGER pole: the body folded at
+            //   14:41:15 (have_tip 0→1) but the arm stayed down another 5 s
+            //   waiting on have_mn. 19 s were charged to the block body when
+            //   the MN seed owned the whole 126 s cold-start episode.
+            //
+            //   have_tip=1, have_mn=0 — a body-pending window opened while a
+            //   serve tip already exists (steady state: we keep serving H-1
+            //   work, which is correct and not a decline at all) and the MN
+            //   set is what went away. There the tip body is not blocking
+            //   ANYTHING and naming it sends the operator at the wrong lane.
+            //
+            // Both now keep `not-populated`, whose value already names the two
+            // halves. The rename survives exactly where it is true: no serve
+            // tip, MN set ready, the tip block's inputs the only thing missing.
             d.cause     = "tip-body-pending";
             d.threshold = "tip-body-folded";
+            // …and WHICH input. See set_tip_body_pending_axis: the credit-pool
+            // seed and the payee cursor arrive with the block body, the SML
+            // currency only with a getmnlistd reply, so the two point at
+            // different repair paths. Appended, never substituted — the
+            // populate halves stay visible.
+            if (m_tip_body_pending_axis && *m_tip_body_pending_axis)
+                d.value += std::string(",awaiting=") + m_tip_body_pending_axis;
         } else if (d.cause == "not-populated" && m_prev_hash.IsNull()
                    && m_have_tip_dbg < 0) {
             // ONLY when the maintainer has told us nothing (never reported).
@@ -1756,6 +1806,9 @@ private:
     // Body-first serve tip: header tip known, block inputs not yet parsed
     // (set_tip_body_pending_dbg). Diagnostic only, never gates anything.
     bool     m_tip_body_pending_dbg{false};
+    // Which promotion conjunct is unmet (set_tip_body_pending_axis). Always a
+    // string literal — never an owning pointer. Diagnostic only.
+    const char* m_tip_body_pending_axis{""};
     uint32_t m_prev_height{0};
     uint256  m_prev_hash;
     uint32_t m_bits_for_next{0};
