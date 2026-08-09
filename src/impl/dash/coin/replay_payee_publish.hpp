@@ -101,6 +101,25 @@ inline constexpr const char* kPayeeSourceReplayFold = "replay-fold";
 inline constexpr const char* kPayeeSourceDashdSeed  = "dashd-seed";
 inline constexpr const char* kPayeeSourceMnCkpt     = "mn-ckpt";
 
+/// ── THE G7 SPLIT (publisher half) ─────────────────────────────────────────
+/// G7 used to demand fold cursor == header tip EXACTLY. With the MN diff
+/// store (mn_diff_store.hpp) the consumer (CoinStateMaintainer::
+/// on_mn_list_update) now holds its own currency gate: it accepts a seed
+/// with as_of below the serve tip but arms SERVING only after catching the
+/// queue up to the tip from stored diffs — so the publisher may release a
+/// proven list within a small ε of the tip without a serve ever projecting
+/// a below-tip queue front. ε is deliberately tiny: the engine's live tail
+/// lags by seconds against a 2.5-minute block interval, and every block in
+/// the ε window must still be root+payee-verified in the diff store before
+/// the consumer arms. The consumer-side gate does NOT replace this guard —
+/// the cheap refusal stays here (the pre-existing consumer-side backstop,
+/// gap_detected, fires one block late at the cost of a serve window + wipe
+/// + one of 3 re-arms).
+/// NOT measured from soak data: 2 is a design bound (engine-tail-lag vs
+/// block interval); re-derive from the live tail-lag distribution before
+/// widening it.
+inline constexpr uint32_t kPublishEpsilon = 2;
+
 /// ReplayMNState (fold state, dashd's CDeterministicMNState field-for-field,
 /// -1 == NEVER) -> MNState (payee state, 0 == never, isValid derived).
 ///
@@ -251,17 +270,23 @@ inline ReplayPayeeGuard evaluate_payee_guard(const DmlFoldEngine&     engine,
     }
     // G7 — CURRENCY. A proven-correct list AS OF a height below the tip has
     // not seen the registrations, bans and payments in between; its queue
-    // front is stale and the coinbase it projects is wrong.
+    // front is stale and the coinbase it projects is wrong. The exact-tip
+    // demand is relaxed by kPublishEpsilon (see the constant's comment): the
+    // consumer's own currency gate holds serving until the queue cursor
+    // reaches the tip, so within ε the publish carries a correct-as-of
+    // snapshot the consumer completes from the diff store. The blocker keeps
+    // the "G7" 2-char prefix — the withheld-log dedup keys on it.
     if (tip_height == 0) {
         g.blocker = "G7 header-chain tip height unknown (0)";
         return g;
     }
-    if (g.fold_height < tip_height) {
-        g.blocker = "G7 fold is BEHIND the tip: fold h="
+    if (g.fold_height + kPublishEpsilon < tip_height) {
+        g.blocker = "G7 fold is BEHIND the tip beyond epsilon: fold h="
                   + std::to_string(g.fold_height) + ", tip h="
                   + std::to_string(tip_height) + " ("
                   + std::to_string(tip_height - g.fold_height)
-                  + " blocks to go)";
+                  + " blocks to go, epsilon="
+                  + std::to_string(kPublishEpsilon) + ")";
         return g;
     }
     // G8 — usability. An empty set is a set-gap (the maintainer demotes on it

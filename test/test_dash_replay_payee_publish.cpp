@@ -356,13 +356,17 @@ TEST(DashReplayPayeePublish, OneShotThenOnlyReseedRepublishes)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// KAT 3 — THE FAIL-CLOSED GUARD: a fold BEHIND THE TIP must never publish
+// KAT 3 — THE FAIL-CLOSED GUARD: a fold BEHIND THE TIP beyond epsilon must
+// never publish; within epsilon it may (the G7 split: the CONSUMER's currency
+// gate — CoinStateMaintainer::on_mn_list_update — holds serving until the
+// queue cursor is caught up to the tip from the diff store, so a publish
+// within epsilon never lets a below-tip queue front reach a template)
 // ═══════════════════════════════════════════════════════════════════════════
-TEST(DashReplayPayeePublish, BehindTheTipMustNotPublish)
+TEST(DashReplayPayeePublish, BehindTheTipBeyondEpsilonMustNotPublish)
 {
     auto rig = make_clean_rig();
     ASSERT_TRUE(rig.fold_through(kLastBody - 1));   // 4 of the 5 bodies
-    rig.tip = kLastBody;                            // one block behind
+    rig.tip = kLastBody - 1 + dash::coin::replay::kPublishEpsilon + 1;  // one past the epsilon
 
     auto pub = rig.make_publisher();
     const auto g = pub.evaluate();
@@ -378,11 +382,30 @@ TEST(DashReplayPayeePublish, BehindTheTipMustNotPublish)
     EXPECT_FALSE(pub.republish_for_reseed());
     EXPECT_TRUE(rig.sink.calls.empty());
 
-    // ... and the very next block closes it.
-    ASSERT_TRUE(rig.fold_through(kLastBody));
+    // ... and AT the epsilon boundary (tip - fold == kPublishEpsilon) the
+    // publisher releases, stamped as_of the FOLD height — the consumer's
+    // currency gate takes over from there.
+    rig.tip = kLastBody - 1 + dash::coin::replay::kPublishEpsilon;
     EXPECT_TRUE(pub.evaluate().ok);
     EXPECT_TRUE(pub.maybe_publish());
-    EXPECT_EQ(rig.sink.calls.size(), 1u);
+    ASSERT_EQ(rig.sink.calls.size(), 1u);
+    EXPECT_EQ(rig.sink.calls.back().as_of, kLastBody - 1);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KAT 3b — the exact-tip publish (epsilon = 0 distance) is unchanged
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashReplayPayeePublish, AtTipStillPublishes)
+{
+    auto rig = make_clean_rig();
+    ASSERT_TRUE(rig.fold_through(kLastBody));
+    rig.tip = kLastBody;
+
+    auto pub = rig.make_publisher();
+    EXPECT_TRUE(pub.evaluate().ok);
+    EXPECT_TRUE(pub.maybe_publish());
+    ASSERT_EQ(rig.sink.calls.size(), 1u);
+    EXPECT_EQ(rig.sink.calls.back().as_of, kLastBody);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
