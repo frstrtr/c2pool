@@ -700,7 +700,7 @@ private:
     /// Record ONE arm-selection outcome and, if the rate policy says so, emit
     /// the single named line. `why` MUST be the report the selecting branch
     /// returned -- never one recomputed here.
-    void note_arm_decision(bool served_embedded,
+    void note_arm_decision(coin::ServeGateJournal::Served served,
                            const coin::DeclineReport& why,
                            uint32_t height) const;
 

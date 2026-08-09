@@ -55,6 +55,15 @@ public:
         Resumed      ///< fallback -> EMBEDDED: the arm is serving again
     };
 
+    /// The THREE serve dispositions, so the journal stops collapsing the third
+    /// (neither arm produced a mineable template) into the dashd-fallback arm.
+    ///   Embedded  -- the embedded arm served a mineable template;
+    ///   Fallback  -- a real dashd getblocktemplate was served instead;
+    ///   NoWork    -- SET-GAP: m_bits==0 || previous_block.IsNull(); an honest
+    ///                absence, nothing was served (the caller drops the cache).
+    /// Fallback and NoWork are both "off embedded" and time IDENTICALLY.
+    enum class Served { Embedded, Fallback, NoWork };
+
     struct Decision {
         Trigger  trigger{Trigger::None};
         /// Declines suppressed since the previous emitted line (0 on the
@@ -114,15 +123,31 @@ public:
     explicit ServeGateJournal(int64_t heartbeat_sec = 300)
         : m_heartbeat_sec(heartbeat_sec) {}
 
-    /// Feed ONE arm-selection outcome. `cause` is ignored when
+    /// Feed ONE arm-selection outcome (LEGACY bool). Retained verbatim for the
+    /// existing serve-path caller and the four timing KATs. false maps to
+    /// Served::Fallback: Fallback and NoWork are BOTH "off the embedded arm"
+    /// and share identical episode/partition timing, so every invariant and
+    /// every existing test stays green. `cause` is ignored when
     /// `served_embedded` is true. `now_sec` is monotonic seconds.
     Decision observe(bool served_embedded, const std::string& cause, int64_t now_sec) {
+        return observe(served_embedded ? Served::Embedded : Served::Fallback,
+                       cause, now_sec);
+    }
+
+    /// Feed ONE arm-selection outcome, THREE-VALUED. Served::Embedded takes the
+    /// serving path; Served::Fallback and Served::NoWork take the SAME decline
+    /// path (identical timing) but record a distinct disposition so the arm can
+    /// name the third state -- neither arm produced a mineable template
+    /// (set-gap / no-work) -- instead of mis-reporting it as a dashd-fallback
+    /// serve. `cause` is ignored for Served::Embedded. `now_sec` is monotonic.
+    Decision observe(Served served, const std::string& cause, int64_t now_sec) {
         Decision d;
         d.previous_cause = m_last_cause;
 
-        if (served_embedded) {
+        if (served == Served::Embedded) {
             const bool was_declining = (m_arm == Arm::Declining);
             m_arm = Arm::Embedded;
+            m_disposition = Disposition::Serving;
             m_last_cause.clear();
             if (was_declining) {
                 d.trigger    = Trigger::Resumed;
@@ -147,6 +172,12 @@ public:
 
         const Arm prev_arm = m_arm;
         m_arm = Arm::Declining;
+        // The third arm state rides HERE: Fallback vs NoWork share this decline
+        // path's timing exactly, and differ only in the disposition the arm
+        // name renders. Recorded every decline so a cause-stable set-gap is
+        // never mis-named a dashd-fallback serve on a later heartbeat.
+        m_disposition = (served == Served::NoWork) ? Disposition::NoWork
+                                                   : Disposition::Fallback;
         // Episode clock starts at the first decline after serving (or at the
         // very first observation) and survives cause changes.
         if (m_episode_start_sec < 0) m_episode_start_sec = now_sec;
@@ -214,11 +245,28 @@ public:
     bool observed() const { return m_arm != Arm::Unknown; }
     uint64_t suppressed_since_emit() const { return m_suppressed; }
 
+    /// True iff the arm is off the embedded template because NEITHER arm
+    /// produced a mineable template (set-gap / no-work) -- the third state,
+    /// distinct from a genuine dashd-fallback serve. False while serving.
+    bool no_work() const { return m_disposition == Disposition::NoWork; }
+
+    /// Three-valued arm name for the serve journal and the operator surface.
+    const char* arm_name() const {
+        if (m_arm == Arm::Unknown)  return "unknown";
+        if (m_arm == Arm::Embedded) return "embedded";
+        return m_disposition == Disposition::NoWork ? "none(set-gap/no-work)"
+                                                    : "dashd-fallback";
+    }
+
 private:
     enum class Arm { Unknown, Embedded, Declining };
+    /// Which off-embedded disposition the current decline is (Serving while the
+    /// embedded arm is up). This is the state that makes arm_name() three-valued.
+    enum class Disposition { Serving, Fallback, NoWork };
 
     int64_t     m_heartbeat_sec;
     Arm         m_arm{Arm::Unknown};
+    Disposition m_disposition{Disposition::Serving};
     std::string m_last_cause;
     int64_t     m_last_emit_sec{0};
     /// Start of the CURRENT continuous off-embedded episode; -1 = arm serving.

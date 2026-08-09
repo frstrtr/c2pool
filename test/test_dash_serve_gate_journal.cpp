@@ -149,4 +149,60 @@ TEST(DashServeGateJournal, ServingLinesCarryNoCauseClock) {
     EXPECT_EQ(d.episode_sec, -1);
 }
 
+/// THE THIRD-ARM DEFECT THIS PINS (daemonless soak, reconstructing the
+/// integrator's 2026-08-09 three-edit spec): the serve gate knew only two arm
+/// states, EMBEDDED and dashd-fallback, and recorded the THIRD real state --
+/// SET-GAP / NO-WORK, where NEITHER arm produced a mineable template (the
+/// disposition predicate m_bits==0 || previous_block.IsNull(), nothing is
+/// served) -- as a plain "dashd-fallback DECLINED". A fallback serve and an
+/// honest absence read IDENTICALLY, so an operator could not tell a node that
+/// was serving real dashd templates from one serving nothing at all.
+///
+/// The fix is the three-valued observe(Served): NoWork shares the decline
+/// path's timing with Fallback EXACTLY (both are off the embedded arm) but
+/// carries a distinct disposition, so arm_name()/no_work() separate them while
+/// every episode/partition invariant above is preserved.
+///
+/// RED ON MASTER: master's ServeGateJournal has no Served enum, so this TU does
+/// not COMPILE there -- the intended failure this branch turns green.
+TEST(DashServeGateJournal, NoWorkIsTheDistinctThirdArmState) {
+    using Served = ServeGateJournal::Served;
+    ServeGateJournal j(300);
+    const int64_t t0 = 2000;
+
+    // A genuine dashd-fallback serve: off the embedded arm, but a template WAS
+    // served. The arm names the fallback, and it is NOT the no-work state.
+    auto fb = j.observe(Served::Fallback, "qc-plan-underivable", t0);
+    EXPECT_EQ(fb.trigger, Trigger::First);
+    EXPECT_FALSE(j.no_work());
+    EXPECT_STREQ(j.arm_name(), "dashd-fallback");
+
+    // The arm flips to SET-GAP: neither arm produced mineable work. The
+    // DISPOSITION changed, and that is the third state the journal must now
+    // name distinctly from the fallback above.
+    auto ng = j.observe(Served::NoWork, "set-gap", t0 + 5);
+    EXPECT_TRUE(ng.emit());
+    EXPECT_TRUE(j.no_work());
+    EXPECT_STREQ(j.arm_name(), "none(set-gap/no-work)");
+    EXPECT_STRNE(j.arm_name(), "dashd-fallback");
+
+    // Timing STILL partitions: NoWork rides the identical decline path, so the
+    // episode survives the disposition change (whole-episode semantics) and the
+    // fallback segment it closes is attributed to the previous cause.
+    ASSERT_EQ(ng.trigger, Trigger::CauseChange);
+    EXPECT_EQ(ng.episode_sec, 5);
+    EXPECT_EQ(ng.previous_cause, "qc-plan-underivable");
+    EXPECT_EQ(ng.prev_cause_sec, 5);
+    EXPECT_EQ(ng.cause_sec, 0);
+
+    // Resuming onto the embedded arm clears the third state.
+    auto up = j.observe(Served::Embedded, "", t0 + 12);
+    ASSERT_EQ(up.trigger, Trigger::Resumed);
+    EXPECT_FALSE(j.no_work());
+    EXPECT_STREQ(j.arm_name(), "embedded");
+    EXPECT_EQ(up.episode_sec, 12);
+    EXPECT_EQ(up.previous_cause, "set-gap");
+    EXPECT_EQ(up.prev_cause_sec, 7);
+}
+
 }  // namespace

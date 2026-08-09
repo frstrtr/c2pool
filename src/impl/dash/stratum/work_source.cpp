@@ -1029,9 +1029,20 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
             std::string mn_payee = "(none)";
             for (const auto& pp : sel.work.m_packed_payments)
                 if (pp.payee != "!6a") { mn_payee = pp.payee; break; }
+            // THE THIRD ARM STATE. `sel` is FINAL here (every arm producer has
+            // written it above), so this is where the set-gap disposition is
+            // known: a zeroed bits or a null prev-block is not mineable work on
+            // ANY chain, so NEITHER arm produced a template -- that is not a
+            // dashd-fallback serve, and the arm line must not say it is. Same
+            // predicate the serve disposition at the store below (m_bits==0 ||
+            // previous_block.IsNull()) uses, computed once on the pre-move sel.
+            const bool no_work =
+                (sel.work.m_bits == 0 || sel.work.m_previous_block.IsNull());
             LOG_INFO << "[DASH-STRATUM-GBT] template sourced: arm="
-                     << (sel.source == coin::WorkSource::Embedded
-                             ? "EMBEDDED" : "dashd-fallback")
+                     << (no_work
+                             ? "none(set-gap/no-work)"
+                             : (sel.source == coin::WorkSource::Embedded
+                                    ? "EMBEDDED" : "dashd-fallback"))
                      << " h=" << sel.work.m_height
                      << " mn_payee=" << mn_payee
                      // A deliberately coinbase-only template says so ON THE ARM
@@ -1056,14 +1067,30 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
             // decision the way a reason recomputed here would. Rate policy:
             // the EMBEDDED->fallback transition and any change of cause emit
             // immediately; an unchanged cause emits on a slow heartbeat.
-            note_arm_decision(work_is_embedded, sel.decline, sel.work.m_height);
+            //
+            // THREE-VALUED: a set-gap template is neither an embedded serve nor
+            // a dashd-fallback serve -- it is the NoWork third state, and it is
+            // the FINAL disposition (the store below drops the cache and returns
+            // without serving anything). Record THAT, so the journal's last word
+            // is not the two-valued mis-report the daemonless soak surfaced.
+            const coin::ServeGateJournal::Served served =
+                no_work ? coin::ServeGateJournal::Served::NoWork
+                        : (work_is_embedded
+                               ? coin::ServeGateJournal::Served::Embedded
+                               : coin::ServeGateJournal::Served::Fallback);
+            note_arm_decision(served, sel.decline, sel.work.m_height);
             // OBSERVE-only serve-vs-dashd SHADOW-COMPARE (--embedded-shadow-compare).
             // Hand the JUST-RESOLVED template (by const-ref; on_serve copies) to
             // the diagnostic probe. This is ENQUEUE-ONLY: the dashd oracle fetch +
             // field-compare + [SHADOW] log all run on the probe's WORKER THREAD, so
             // nothing here waits on dashd and the served bytes below are untouched.
             // No-op when the probe is unset (default / pure-daemonless).
-            if (shadow_compare_)
+            // on_serve treats `sel.work` as a SERVED template; a set-gap NoWork
+            // template is NOT served (the store below drops the cache and
+            // returns), so the shadow-compare must not fire for it -- consistent
+            // with the :1077 disposition. Genuine embedded/fallback serves are
+            // unchanged.
+            if (shadow_compare_ && !no_work)
                 shadow_compare_->on_serve(sel.source, sel.work);
             work = std::move(sel.work);
         } catch (const std::exception& e) {
@@ -1132,17 +1159,19 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
 // This is the one place the answer is emitted, and it emits the report the
 // selecting branch RETURNED, so it cannot drift from the decision.
 // ─────────────────────────────────────────────────────────────────────────────
-void DASHWorkSource::note_arm_decision(bool served_embedded,
+void DASHWorkSource::note_arm_decision(coin::ServeGateJournal::Served served,
                                        const coin::DeclineReport& why,
                                        uint32_t height) const
 {
+    const bool served_embedded =
+        (served == coin::ServeGateJournal::Served::Embedded);
     const auto now_sec = std::chrono::duration_cast<std::chrono::seconds>(
                              std::chrono::steady_clock::now().time_since_epoch())
                              .count();
     coin::ServeGateJournal::Decision d;
     {
         std::lock_guard<std::mutex> lk(serve_gate_mutex_);
-        d = serve_gate_journal_.observe(served_embedded, why.cause, now_sec);
+        d = serve_gate_journal_.observe(served, why.cause, now_sec);
         last_decline_      = served_embedded ? coin::DeclineReport{} : why;
         last_arm_embedded_ = served_embedded;
         arm_ever_observed_ = true;
@@ -1167,9 +1196,13 @@ void DASHWorkSource::note_arm_decision(bool served_embedded,
         return;
     }
     // ONE named cause with its measured value and threshold -- never a list of
-    // maybes, and never "declined" alone.
+    // maybes, and never "declined" alone. THREE-VALUED arm: a set-gap decline
+    // names the NoWork third state, not a dashd-fallback serve it never made.
     LOG_WARNING << "[EMBED-GATE] h=" << height
-                << " arm=dashd-fallback DECLINED " << why.one_line()
+                << " arm="
+                << (served == coin::ServeGateJournal::Served::NoWork
+                        ? "none(set-gap/no-work)" : "dashd-fallback")
+                << " DECLINED " << why.one_line()
                 << " trigger=" << coin::ServeGateJournal::trigger_name(d.trigger)
                 << dur
                 << " suppressed=" << d.suppressed;
