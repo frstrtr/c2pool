@@ -1016,6 +1016,53 @@ public:
     /// tip is. Between header and body the arm keeps serving prev=old-tip
     /// work — the same propagation-window behaviour every pool has — named
     /// `tip-body-pending`, which is a NORMAL TRANSIENT, not an error state.
+    ///
+    /// ── WHAT `tip-body-pending` ACTUALLY NAMES ──────────────────────────────
+    /// It is one state with two very different costs, and they must not be
+    /// confused (they were: see the guard in node_coin_state.hpp's decline
+    /// refinement).
+    ///
+    /// THE STATE: we hold the tip HEADER (h, hash) but at least one of the
+    /// three per-block derived axes is still at h-1, so
+    /// maybe_promote_pending_tip() has not run. The header commits to those
+    /// axes; it does not carry them:
+    ///   • credit-pool seed — the next block's DIP4 CbTx must carry
+    ///     creditPoolBalance derived AT the tip. That number moves with the
+    ///     tip block's asset-lock/unlock special txs, which live in the tip
+    ///     block's BODY. Outstanding fetch: getdata BLOCK <tip hash> on the
+    ///     coin-P2P leg (or a tip-targeted mnlistdiff whose cbTx carries it).
+    ///   • payee cursor — nLastPaidHeight advances by the tip block's own
+    ///     masternode payment, which is a coinbase output in the same BODY.
+    ///     Without it the next template pays the previous winner again:
+    ///     bad-cb-payee, a rejected block, a lost share.
+    ///   • SML currency — merkleRootMNList must be computed over the list AS
+    ///     OF the tip. A cbTx commits that ROOT; a root is not a list, so the
+    ///     body CANNOT supply it. Outstanding fetch: a separate getmnlistd
+    ///     round trip (base = serve tip, target = header tip).
+    /// So the template cannot be built not because we lack the header's
+    /// difficulty/time fields — we stashed those above — but because three
+    /// coinbase-committed values are functions of the tip BLOCK.
+    ///
+    /// COST A (steady state): a serve tip already exists, we keep serving
+    /// h-1 work, and no refusal is emitted at all. The window is the block's
+    /// propagation + parse latency and nothing else. MEASURED on the
+    /// instrumented daemonless soak (86406d07, 2026-08-09 14:39–16:05,
+    /// h=2519019..2519049): 31 windows opened, 31 closed BY PROMOTION, 0
+    /// overdue demotes; median 0.771 s, p90 2.909 s. 30 of the 31 cost ZERO
+    /// seconds off the embedded arm.
+    ///
+    /// COST B (cold start / post-demote): no serve tip exists yet, so the
+    /// pending window IS the refusal. One-time, and it shares its episode
+    /// with `not-populated` — on that same soak the whole cold start was a
+    /// single 126 s episode (not-populated 102 s → tip-body-pending 19 s →
+    /// not-populated 5 s → RESUMED), the 19 s being the sole window of the 31
+    /// that cost anything, and the MN seed, not the block body, being its
+    /// longest pole (the body folded 5 s before have_mn came up). It belongs
+    /// to the cold-start lane (#1162/#1151), not to a steady-state budget.
+    ///
+    /// SO: do NOT try to shorten this wait. Promotion already fires the
+    /// instant the inputs land; the residue is network. The defect this
+    /// state had was in its NAME, not its duration.
     void on_new_tip(uint32_t prev_height, const uint256& prev_hash,
                     uint32_t bits_for_next, uint32_t mtp_at_tip,
                     uint8_t address_version, uint8_t address_p2sh_version,
@@ -1314,6 +1361,7 @@ public:
         m_have_hdr_tip = false;
         m_tip_body_pending = false;
         m_state.set_tip_body_pending_dbg(false);
+        m_state.set_tip_body_pending_axis("");
         demote();
     }
 
@@ -1947,14 +1995,22 @@ private:
     /// Returns true iff promotion happened; caller republishes.
     bool maybe_promote_pending_tip() {
         if (!m_body_first_serve_tip || !m_tip_body_pending) return false;
-        if (!m_have_hdr_tip) return false;
+        // Every early return below records WHICH conjunct is the unmet one, so
+        // a `tip-body-pending` refusal can say what it is waiting FOR. Static
+        // literals only (NodeCoinState stores the pointer, never a copy).
+        if (!m_have_hdr_tip) {
+            m_state.set_tip_body_pending_axis("header-tip");
+            return false;
+        }
         // Credit-pool axis: the pool must be DERIVED at this exact block —
         // published already (flag off / at-or-below the serve tip), or HELD
         // pending publication (PR-5). Asking "do we have the pool for this
         // block" rather than "is the published slot at this block" is what
         // lets the publication ride the promotion instead of preceding it.
-        if (!credit_pool_derived_at(m_hdr_prev_hash, m_hdr_prev_height))
+        if (!credit_pool_derived_at(m_hdr_prev_hash, m_hdr_prev_height)) {
+            m_state.set_tip_body_pending_axis("credit-pool-seed");
             return false;
+        }
         // The PAYEE axis must be current at the tip too (its cursor advances
         // in the tip-body apply_block, or a snapshot loaded as-of the tip):
         // promoting off a tip-targeted mnlistdiff that outraced the body
@@ -1964,8 +2020,10 @@ private:
         // has no cursor to be stale and does not hold promotion back — the
         // MN-readiness half of populated() already gates serving there.
         if (!m_state.mnstates().entries().empty()
-            && m_state.mnstates().last_applied_height() != m_hdr_prev_height)
+            && m_state.mnstates().last_applied_height() != m_hdr_prev_height) {
+            m_state.set_tip_body_pending_axis("payee-cursor");
             return false;
+        }
         // ── FOURTH AXIS: the SML currency (dmn-stale, clause 12) ────────────
         // Folding the tip body we already hold cannot advance the SML — a cbTx
         // commits merkleRootMNList, and a root is not a list — so the currency
@@ -1985,8 +2043,10 @@ private:
         // first. Test: ColdSmlDoesNotBlockPromotion pins that a future reader
         // cannot "tighten" this into a cold-start deadlock.
         if (!m_state.sml_current_hash().IsNull()
-            && m_state.sml_current_hash() != m_hdr_prev_hash)
+            && m_state.sml_current_hash() != m_hdr_prev_hash) {
+            m_state.set_tip_body_pending_axis("sml-currency");
             return false;
+        }
         // PUBLISH-WITH-PROMOTION (PR-5): the held pool for this exact block
         // becomes the published pool in the same indivisible step that makes
         // the block the serve tip. No observer can see the pool at H with the
@@ -1995,6 +2055,7 @@ private:
         publish_held_credit_pool_at(m_hdr_prev_hash, m_hdr_prev_height);
         promote_serve_tip();
         m_state.set_tip_body_pending_dbg(false);
+        m_state.set_tip_body_pending_axis("");
         LOG_INFO << "[EMB-DASH] serve tip promoted h=" << m_prev_height << " "
                  << m_prev_hash.GetHex().substr(0, 16)
                  << "... (body-first: tip block inputs parsed, credit-pool"

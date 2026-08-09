@@ -2090,6 +2090,84 @@ TEST(DashCoinStateMaintainer, BodyFirstOverduePendingDemotesThenBodyReArms) {
 }
 
 // ════════════════════════════════════════════════════════════════════════
+// `tip-body-pending` must name a WAIT WE ARE ACTUALLY IN, and name what it
+// is waiting FOR. Both pinned against the instrumented daemonless soak
+// (86406d07, 2026-08-09 14:39–15:53).
+// ════════════════════════════════════════════════════════════════════════
+
+// MEASURED MISATTRIBUTION. Soak line 14:40:55 read
+//   cause=tip-body-pending value=have_tip=0,have_mn=0 threshold=tip-body-folded
+// — the body-pending flag was set, but BOTH populate halves were unmet and
+// the MN half was the LONGER pole: the body folded at 14:41:15 (have_tip 0→1)
+// and the arm still stayed down 5 s more waiting on have_mn. 19 s of the
+// 126 s cold-start episode were charged to the block body; the MN seed owned
+// them. The threshold made it worse by dropping `have_mn=1` from the
+// requirement it printed.
+//
+// FAILS ON MASTER: the rename there is guarded only by the pending flag.
+TEST(DashCoinStateMaintainer, TipBodyPendingIsNotNamedWhileTheMnHalfIsAlsoMissing) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    m.set_body_first_serve_tip(true);
+    st.set_require_fresh_credit_pool(true);
+
+    // Make the maintainer REPORT both halves as unmet without seeding the MN
+    // set — the cold-start shape (have_tip=0, have_mn=0), and the reason the
+    // "no-tip" refinement below must not fire either (the halves were
+    // measured, not merely never reported).
+    m.on_invalidate();
+    ASSERT_EQ(st.have_tip_dbg(), 0);
+    ASSERT_EQ(st.have_mn_dbg(), 0);
+
+    auto b1 = make_cbtx_block(H - 1, 111'000'000LL, p2pkh_script(0x30));
+    m.on_new_tip(H - 1, block_hash_of(b1), BITS, MTP,
+                 DASH_PUBKEY_VER, DASH_P2SH_VER, CURTIME, VERSION);
+    ASSERT_TRUE(m.tip_body_pending()) << "the pending flag IS set here";
+
+    const auto d = st.describe_decline();
+    EXPECT_EQ(d.cause, "not-populated")
+        << "with the MN seed also missing, the block body is not the binding "
+           "constraint — naming it sends the operator at the wrong lane";
+    EXPECT_EQ(d.value, "have_tip=0,have_mn=0");
+    EXPECT_EQ(d.threshold, "have_tip=1,have_mn=1")
+        << "the threshold must keep requiring BOTH halves";
+}
+
+// The rename SURVIVES exactly where it is true: MN set ready, no serve tip,
+// the tip block's own inputs the only thing missing — and it now says WHICH
+// input. `awaiting=` is appended, never substituted, so the populate halves
+// stay readable on the same line.
+//
+// FAILS ON MASTER: no axis exists there, so the value is the bare pair.
+TEST(DashCoinStateMaintainer, TipBodyPendingNamesTheUnmetPromotionAxis) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    m.set_body_first_serve_tip(true);
+    st.set_require_fresh_credit_pool(true);
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)));
+    ASSERT_EQ(st.have_mn_dbg(), 1);
+
+    auto b1 = make_cbtx_block(H - 1, 111'000'000LL, p2pkh_script(0x30));
+    m.on_new_tip(H - 1, block_hash_of(b1), BITS, MTP,
+                 DASH_PUBKEY_VER, DASH_P2SH_VER, CURTIME, VERSION);
+    ASSERT_TRUE(m.tip_body_pending());
+
+    const auto d = st.describe_decline();
+    EXPECT_EQ(d.cause, "tip-body-pending");
+    EXPECT_EQ(d.threshold, "tip-body-folded");
+    // The credit-pool seed is the first unmet conjunct: it is derived from the
+    // tip block's BODY, which is exactly what has not arrived.
+    EXPECT_EQ(d.value, "have_tip=0,have_mn=1,awaiting=credit-pool-seed")
+        << "a wait must say what it is waiting FOR — the body and the "
+           "getmnlistd reply are different fetches with different repair paths";
+
+    // The body lands: promotion clears both the flag and the axis.
+    m.on_block_connected(b1, H - 1);
+    EXPECT_FALSE(m.tip_body_pending());
+    EXPECT_STREQ(st.tip_body_pending_axis(), "");
+}
+
+// ════════════════════════════════════════════════════════════════════════
 // Bounded full-block buffer (LTC-style retention): eviction proven at the
 // bound — cap 24 with no ChainLock, shrink-to-floor 6 with a fresh one.
 // FAILS-ON-MASTER: no retention exists there at all.

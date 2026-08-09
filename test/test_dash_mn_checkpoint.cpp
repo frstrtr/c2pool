@@ -5503,3 +5503,147 @@ TEST(DashMnBridgeCursor, RecordRoundTripsEveryFieldAndRejectsTrailingBytes)
     EXPECT_FALSE(cs.store.load(why2).has_value());
     EXPECT_NE(why2.find("trailing"), std::string::npos) << why2;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 11-13. A RE-ARM RE-ADJUDICATES. IT DOES NOT REUSE THE VERDICT.
+//
+// pump() has exactly one call site for try_restore():
+//     if (!m_restore_settled && !try_restore()) return;
+// and m_restore_settled was the one #91 field reset_for_arm() forgot. With it
+// latched, a second arm in the same process walks with whatever verdict the
+// FIRST one reached — against an anchor, a header chain and a divergence record
+// that have all since moved on. Both directions of that reuse are defects:
+//
+//   * a preserved REFUSAL pins every re-arm to the anchor. MEASURED on mainnet
+//     2026-08-08: 5743 blocks, 374 minutes of replay the persisted cursor could
+//     have skipped, on the cold-start/re-arm line that is the single largest
+//     entry in the serve-gate roll-up.
+//   * a preserved ACCEPTANCE resumes at a height adjudicated for a DIFFERENT
+//     arm, skipping the reorg refusal (R4) that adjudication exists to run. A
+//     fast wrong start is harder to notice than a slow right one.
+//
+// So the tests below assert the ADJUDICATION, not an outcome: the same record
+// must be re-decided on every arm, and it must be allowed to come out ACCEPT
+// (11), REFUSE-on-reorg (12) or REFUSE-on-divergence (13) purely from the
+// evidence that exists at that arm.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── 11. The re-arm re-runs the adjudication and resumes when the chain says so
+TEST(DashMnBridgeCursor, ReArmReAdjudicatesTheCursorInsteadOfWalkingFromTheAnchor)
+{
+    TempCursorStore cs("rearm-readjudicate");
+
+    // Process 1 replays 1519544..1519545 and persists a cursor there.
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+    ASSERT_TRUE(cs.exists());
+
+    // Process 2 arms at that same tip. The cursor is adjudicated and ACCEPTED;
+    // nothing is applied (cursor == tip), so the record on disk is untouched.
+    CursorRun r(&cs.store, 1519545);
+    r.run();
+    ASSERT_TRUE(r.h.lane.cursor_restored()) << r.h.lane.restore_verdict();
+    ASSERT_EQ(r.h.lane.restored_at(), 1519545u);
+
+    // The chain moves on and the maintainer asks for a re-seed.
+    r.h.requested.clear();
+    r.h.tip = 1519546;
+    ASSERT_EQ(r.h.lane.rearm(good_checkpoint(), "unit test: payee desync"),
+              MnCheckpointLane::RearmOutcome::Armed)
+        << r.h.lane.last_rearm_reason();
+
+    // The re-arm carries NO verdict forward — not even the favourable one.
+    EXPECT_FALSE(r.h.lane.cursor_restored())
+        << "a re-arm that starts out already 'restored' is standing on a"
+           " verdict reached for a different arm, and has skipped R4";
+    EXPECT_EQ(r.h.lane.restored_at(), 0u);
+
+    // It re-runs the rules, and on this chain they say ACCEPT.
+    r.h.lane.pump();
+    ASSERT_TRUE(r.h.lane.cursor_restored())
+        << "the re-arm never called try_restore() again; verdict: "
+        << r.h.lane.restore_verdict();
+    EXPECT_EQ(r.h.lane.restored_at(), 1519545u);
+
+    for (uint32_t asked : r.h.requested) {
+        EXPECT_GT(asked, 1519545u)
+            << "h=" << asked << ": the re-armed bridge walked from the anchor"
+               " across heights a previous process had already folded AND"
+               " persisted. On mainnet that walk measured 5743 blocks / 374"
+               " minutes while the embedded arm stayed demoted";
+    }
+    EXPECT_EQ(r.h.lane.cursor_height(), 1519546u) << r.h.lane.status();
+}
+
+// ── 12. ...and it RE-VALIDATES: a reorg under the cursor is caught by R4
+TEST(DashMnBridgeCursor, ReArmReValidatesTheCursorAgainstTheChainItNowRunsOn)
+{
+    TempCursorStore cs("rearm-revalidate");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+
+    CursorRun r(&cs.store, 1519545);
+    r.run();
+    ASSERT_TRUE(r.h.lane.cursor_restored()) << r.h.lane.restore_verdict();
+    ASSERT_EQ(r.h.lane.restored_at(), 1519545u);
+
+    // The chain REORGS past the persisted cursor. The record's bytes have not
+    // changed; the chain underneath them has — which is exactly the state a
+    // reused verdict cannot see, because R4 only runs during adjudication.
+    r.h.headers[1519545] = synth_block_hash(0xdead);
+    r.h.requested.clear();
+    r.h.tip = 1519546;
+    // Bodies stop arriving here, so the COLD walk this refusal starts cannot
+    // persist a fresh record over the erased one. Without that, "the file
+    // exists" would be a measurement of the replay, not of the erasure.
+    r.h.auto_deliver = false;
+    ASSERT_EQ(r.h.lane.rearm(good_checkpoint(), "unit test: payee desync"),
+              MnCheckpointLane::RearmOutcome::Armed)
+        << r.h.lane.last_rearm_reason();
+    r.h.lane.pump();
+
+    EXPECT_FALSE(r.h.lane.cursor_restored());
+    EXPECT_EQ(r.h.lane.restored_at(), 0u);
+    EXPECT_NE(r.h.lane.restore_verdict().find("R4"), std::string::npos)
+        << "R4 is the reorg refusal and it can only have fired if this arm"
+           " re-ran the adjudication; verdict: " << r.h.lane.restore_verdict();
+    EXPECT_FALSE(cs.exists())
+        << "a REFUSED record must be erased, not left for a later start to"
+           " re-adopt";
+    ASSERT_FALSE(r.h.requested.empty());
+    EXPECT_EQ(r.h.requested.front(), kAnchorHeight + 1)
+        << "a refused cursor means a COLD walk from the anchor — a legitimate"
+           " verdict, and the one this chain gives";
+}
+
+// ── 13. R8: the one rule the header chain cannot supply
+TEST(DashMnBridgeCursor, ReArmRefusesACursorFoldedThroughTheDivergence)
+{
+    TempCursorStore cs("rearm-diverged");
+    { CursorRun a(&cs.store, 1519546); a.run(); ASSERT_TRUE(a.h.published); }
+
+    // The SAME record, adjudicated with no divergence evidence: ACCEPTED.
+    CursorRun r(&cs.store, 1519546);
+    r.run();
+    ASSERT_TRUE(r.h.lane.cursor_restored()) << r.h.lane.restore_verdict();
+    ASSERT_EQ(r.h.lane.restored_at(), 1519546u);
+
+    // Now the maintainer reports a desync at that very tip. The cursor was
+    // folded THROUGH the diverged height, so resuming it would re-arm the queue
+    // that produced the desync — fast, and wrong. Nothing about the header
+    // chain changed, so R4 still passes: R8 is the rule that has to catch this.
+    r.h.requested.clear();
+    r.h.auto_deliver = false;   // same reason as case 12: keep the erasure visible
+    ASSERT_EQ(r.h.lane.rearm(good_checkpoint(), "unit test: payee desync"),
+              MnCheckpointLane::RearmOutcome::Armed)
+        << r.h.lane.last_rearm_reason();
+    r.h.lane.pump();
+
+    EXPECT_FALSE(r.h.lane.cursor_restored());
+    EXPECT_NE(r.h.lane.restore_verdict().find("R8"), std::string::npos)
+        << r.h.lane.restore_verdict();
+    EXPECT_FALSE(cs.exists())
+        << "the implicated record must be erased where the rule refused it";
+    ASSERT_FALSE(r.h.requested.empty());
+    EXPECT_EQ(r.h.requested.front(), kAnchorHeight + 1)
+        << "the anchor IS the right answer here; the point is that it was"
+           " REACHED by a rule, not inherited from a latch";
+}

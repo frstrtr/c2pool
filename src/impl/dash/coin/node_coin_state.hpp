@@ -393,6 +393,25 @@ public:
     void set_tip_body_pending_dbg(bool v) { m_tip_body_pending_dbg = v; }
     bool tip_body_pending_dbg() const { return m_tip_body_pending_dbg; }
 
+    /// WHICH promotion conjunct is the one still unmet, as a static string
+    /// literal ("credit-pool-seed" / "payee-cursor" / "sml-currency" /
+    /// "header-tip"). `tip-body-pending` names a WAIT; on its own it does NOT
+    /// name what is being waited FOR, and the three axes have different owners
+    /// and different repair paths — the credit-pool seed and the payee cursor
+    /// both come from the tip BLOCK BODY (one getdata BLOCK on the coin-P2P
+    /// leg), while the SML currency comes from a SEPARATE getmnlistd round
+    /// trip that the block body cannot supply (a cbTx commits
+    /// merkleRootMNList, and a root is not a list). An operator reading
+    /// `cause=tip-body-pending` alone cannot tell a slow body from a silently
+    /// dropped diff request; `awaiting=sml-currency` says it in one line.
+    ///
+    /// LIFETIME: the pointer must be a string literal (every call site passes
+    /// one). Diagnostic only; no serve or reward path reads it.
+    void set_tip_body_pending_axis(const char* axis) {
+        m_tip_body_pending_axis = axis ? axis : "";
+    }
+    const char* tip_body_pending_axis() const { return m_tip_body_pending_axis; }
+
     /// The same two bits, READABLE. They existed only inside the decline
     /// string, so the standing state ("why would this node not serve RIGHT
     /// NOW, before anyone asks it for work") could not be printed at all — an
@@ -661,8 +680,30 @@ public:
     /// reward-safe outcome as the PHASE-1 refusal, but now only when
     /// genuinely unable instead of for the whole 9-block window. Unset
     /// (default) preserves the refusal posture exactly.
-    void set_qc_plan_fn(std::function<std::optional<QcBlockPlan>(uint32_t)> fn) {
+    ///
+    /// TWO shapes, and the two-argument one is what production wires. A bare
+    /// `std::optional<QcBlockPlan>` throws away the identity of what was
+    /// missing, and the refusal downstream then had nothing to print but the
+    /// literal "nullopt" — a value that cannot disagree with anything. The
+    /// QcPlanGap out-parameter carries the offending quorum (llmqType,
+    /// quorumIndex, quorumHash, per-slot gap reason) to the decline's VALUE
+    /// field. The one-argument overload stays for providers that genuinely
+    /// have no reason to report; it names ITSELF ("reason-unreported") rather
+    /// than pretending the gap was measured.
+    void set_qc_plan_fn(
+        std::function<std::optional<QcBlockPlan>(uint32_t, QcPlanGap*)> fn) {
         m_qc_plan_fn = std::move(fn);
+    }
+    void set_qc_plan_fn(std::function<std::optional<QcBlockPlan>(uint32_t)> fn) {
+        m_qc_plan_fn = [f = std::move(fn)](uint32_t h, QcPlanGap* gap)
+            -> std::optional<QcBlockPlan> {
+            auto plan = f(h);
+            if (!plan && gap != nullptr) {
+                *gap = QcPlanGap{};
+                gap->stage = QcPlanStage::Unreported;
+            }
+            return plan;
+        };
     }
 
     /// PoSe no-op proof for one REAL (non-null) type-6 commitment — the
@@ -935,9 +976,10 @@ public:
         // a plan fn the PHASE-1 refusal stays.
         std::optional<QcBlockPlan> qc_plan;
         if (m_qc_plan_fn) {
-            qc_plan = m_qc_plan_fn(next_h);
-            if (!qc_plan)   // underivable — fail closed
-                return reject("emit-qc-plan-underivable", "nullopt",
+            QcPlanGap qc_gap;
+            qc_plan = m_qc_plan_fn(next_h, &qc_gap);
+            if (!qc_plan)   // underivable — fail closed, NAMING what was missing
+                return reject("emit-qc-plan-underivable", qc_gap.describe(),
                               "derivable-qc-plan@h=" + std::to_string(next_h));
             // Collect the type-6 payloads actually in the template.
             std::vector<std::vector<unsigned char>> got;
@@ -1197,9 +1239,12 @@ public:
         // serve floor) refuses exactly like the PHASE-1 posture. Without a
         // plan fn the BLOCKER-1 window refusal below stays authoritative.
         std::optional<QcBlockPlan> qc_plan;
+        // The gap is the qc clause's VALUE. It travels WITH the bool, because
+        // a bare bool is exactly what left the refusal with nothing to print.
+        QcPlanGap qc_gap;
         bool qc_ok = true;
         if (m_qc_plan_fn && m_populated) {
-            qc_plan = m_qc_plan_fn(m_prev_height + 1);
+            qc_plan = m_qc_plan_fn(m_prev_height + 1, &qc_gap);
             qc_ok = qc_plan.has_value();
         }
         // Resolve the superblock disposition ONCE (fail-closed unless the
@@ -1230,7 +1275,7 @@ public:
         // logging — and the two had already drifted (classify_decline never
         // checked payee_resolvable, so a #996 money-path refusal surfaced as
         // "viable-race"). There is now exactly one list.
-        e.decline   = evaluate_viability(qc_ok, sb.ok, payee_resolvable,
+        e.decline   = evaluate_viability(qc_ok, qc_gap, sb.ok, payee_resolvable,
                                          utxo_immature);
         e.has_state = e.decline.viable;
         // NAME THE STATE: while the UTXO lane is immature under the OPT-IN
@@ -1356,7 +1401,12 @@ private:
     /// the builder regardless); re-invoking those predicates here would double
     /// the cost on a per-template path and, worse, could observe a different
     /// answer than the one the bundle was built from.
-    DeclineReport evaluate_viability(bool qc_ok, bool sb_ok,
+    /// `qc_gap` rides alongside `qc_ok` for the same reason the other inputs
+    /// are passed in: it was measured at the one place that CAN measure it —
+    /// the plan call — and re-deriving it here would mean a second plan build
+    /// that could answer differently. It is meaningful only when !qc_ok.
+    DeclineReport evaluate_viability(bool qc_ok, const QcPlanGap& qc_gap,
+                                     bool sb_ok,
                                      bool payee_resolvable,
                                      bool utxo_immature) const {
         const uint32_t next_h = m_prev_height + 1;
@@ -1391,7 +1441,11 @@ private:
             d = refuse("chain-not-synced", "tip=" + tip + ",synced=false",
                        "header-tip-current");
         else if (!qc_ok)
-            d = refuse("qc-plan-underivable", "nullopt",
+            // NAME THE MISSING QUORUM. "nullopt" satisfied the #1038/#1039
+            // cause/value/threshold shape and defeated its purpose: it is a
+            // value that cannot disagree with anything, so the largest
+            // addressable refusal class was unactionable from the log alone.
+            d = refuse("qc-plan-underivable", qc_gap.describe(),
                        "derivable-qc-plan@h=" + std::to_string(next_h));
         else if (utxo_immature
                  && m_utxo_immature_policy == UtxoImmaturePolicy::Refuse)
@@ -1499,14 +1553,45 @@ private:
             d.cause     = "mn-needs-reseed";
             d.value     = "latched";
             d.threshold = "cleared-by-authoritative-reseed";
-        } else if (d.cause == "not-populated" && m_tip_body_pending_dbg) {
+        } else if (d.cause == "not-populated" && m_tip_body_pending_dbg
+                   && m_have_tip_dbg == 0 && m_have_mn_dbg == 1) {
             // Body-first serve tip: a header tip is known but its block
             // inputs have not been parsed yet (cold start before the first
             // promotion, or an overdue-demoted pending window). The named
             // transient — NOT a header-sync fault, NOT an error state; the
             // value keeps both populate halves visible.
+            //
+            // ONLY WHEN THE TIP HALF IS THE ONE UNMET (have_tip=0, have_mn=1).
+            // The pending flag says a header tip is awaiting its body; it does
+            // NOT say the body is what is holding serving back. Two states the
+            // unguarded rename got wrong, both measured on the instrumented
+            // daemonless soak (86406d07, 2026-08-09 14:39–15:53):
+            //
+            //   have_tip=0, have_mn=0 — cold start. At 14:40:55 the arm was
+            //   relabelled `tip-body-pending` while BOTH halves were unmet,
+            //   and the MN half was the LONGER pole: the body folded at
+            //   14:41:15 (have_tip 0→1) but the arm stayed down another 5 s
+            //   waiting on have_mn. 19 s were charged to the block body when
+            //   the MN seed owned the whole 126 s cold-start episode.
+            //
+            //   have_tip=1, have_mn=0 — a body-pending window opened while a
+            //   serve tip already exists (steady state: we keep serving H-1
+            //   work, which is correct and not a decline at all) and the MN
+            //   set is what went away. There the tip body is not blocking
+            //   ANYTHING and naming it sends the operator at the wrong lane.
+            //
+            // Both now keep `not-populated`, whose value already names the two
+            // halves. The rename survives exactly where it is true: no serve
+            // tip, MN set ready, the tip block's inputs the only thing missing.
             d.cause     = "tip-body-pending";
             d.threshold = "tip-body-folded";
+            // …and WHICH input. See set_tip_body_pending_axis: the credit-pool
+            // seed and the payee cursor arrive with the block body, the SML
+            // currency only with a getmnlistd reply, so the two point at
+            // different repair paths. Appended, never substituted — the
+            // populate halves stay visible.
+            if (m_tip_body_pending_axis && *m_tip_body_pending_axis)
+                d.value += std::string(",awaiting=") + m_tip_body_pending_axis;
         } else if (d.cause == "not-populated" && m_prev_hash.IsNull()
                    && m_have_tip_dbg < 0) {
             // ONLY when the maintainer has told us nothing (never reported).
@@ -1691,7 +1776,9 @@ private:
     // heights refuse the embedded arm even when the provider is confident.
     std::function<bool()> m_superblock_sync_complete_fn;
     std::function<bool(uint32_t)> m_commitment_window_fn;  // refuse embedded on DKG commitment heights
-    std::function<std::optional<QcBlockPlan>(uint32_t)> m_qc_plan_fn;  // E1: serve DKG windows daemonlessly
+    // E1: serve DKG windows daemonlessly. The QcPlanGap out-param is how a
+    // refusal learns WHICH quorum it lacked (see set_qc_plan_fn).
+    std::function<std::optional<QcBlockPlan>(uint32_t, QcPlanGap*)> m_qc_plan_fn;
     // PoSe no-op proof for a REAL commitment (emit-qc-real-pose-unfolded gate);
     // unset => capability absent => every non-null commitment refused.
     std::function<std::optional<bool>(const vendor::CFinalCommitment&)> m_qc_pose_noop_fn;
@@ -1719,6 +1806,9 @@ private:
     // Body-first serve tip: header tip known, block inputs not yet parsed
     // (set_tip_body_pending_dbg). Diagnostic only, never gates anything.
     bool     m_tip_body_pending_dbg{false};
+    // Which promotion conjunct is unmet (set_tip_body_pending_axis). Always a
+    // string literal — never an owning pointer. Diagnostic only.
+    const char* m_tip_body_pending_axis{""};
     uint32_t m_prev_height{0};
     uint256  m_prev_hash;
     uint32_t m_bits_for_next{0};
