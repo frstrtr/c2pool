@@ -661,8 +661,30 @@ public:
     /// reward-safe outcome as the PHASE-1 refusal, but now only when
     /// genuinely unable instead of for the whole 9-block window. Unset
     /// (default) preserves the refusal posture exactly.
-    void set_qc_plan_fn(std::function<std::optional<QcBlockPlan>(uint32_t)> fn) {
+    ///
+    /// TWO shapes, and the two-argument one is what production wires. A bare
+    /// `std::optional<QcBlockPlan>` throws away the identity of what was
+    /// missing, and the refusal downstream then had nothing to print but the
+    /// literal "nullopt" — a value that cannot disagree with anything. The
+    /// QcPlanGap out-parameter carries the offending quorum (llmqType,
+    /// quorumIndex, quorumHash, per-slot gap reason) to the decline's VALUE
+    /// field. The one-argument overload stays for providers that genuinely
+    /// have no reason to report; it names ITSELF ("reason-unreported") rather
+    /// than pretending the gap was measured.
+    void set_qc_plan_fn(
+        std::function<std::optional<QcBlockPlan>(uint32_t, QcPlanGap*)> fn) {
         m_qc_plan_fn = std::move(fn);
+    }
+    void set_qc_plan_fn(std::function<std::optional<QcBlockPlan>(uint32_t)> fn) {
+        m_qc_plan_fn = [f = std::move(fn)](uint32_t h, QcPlanGap* gap)
+            -> std::optional<QcBlockPlan> {
+            auto plan = f(h);
+            if (!plan && gap != nullptr) {
+                *gap = QcPlanGap{};
+                gap->stage = QcPlanStage::Unreported;
+            }
+            return plan;
+        };
     }
 
     /// PoSe no-op proof for one REAL (non-null) type-6 commitment — the
@@ -935,9 +957,10 @@ public:
         // a plan fn the PHASE-1 refusal stays.
         std::optional<QcBlockPlan> qc_plan;
         if (m_qc_plan_fn) {
-            qc_plan = m_qc_plan_fn(next_h);
-            if (!qc_plan)   // underivable — fail closed
-                return reject("emit-qc-plan-underivable", "nullopt",
+            QcPlanGap qc_gap;
+            qc_plan = m_qc_plan_fn(next_h, &qc_gap);
+            if (!qc_plan)   // underivable — fail closed, NAMING what was missing
+                return reject("emit-qc-plan-underivable", qc_gap.describe(),
                               "derivable-qc-plan@h=" + std::to_string(next_h));
             // Collect the type-6 payloads actually in the template.
             std::vector<std::vector<unsigned char>> got;
@@ -1197,9 +1220,12 @@ public:
         // serve floor) refuses exactly like the PHASE-1 posture. Without a
         // plan fn the BLOCKER-1 window refusal below stays authoritative.
         std::optional<QcBlockPlan> qc_plan;
+        // The gap is the qc clause's VALUE. It travels WITH the bool, because
+        // a bare bool is exactly what left the refusal with nothing to print.
+        QcPlanGap qc_gap;
         bool qc_ok = true;
         if (m_qc_plan_fn && m_populated) {
-            qc_plan = m_qc_plan_fn(m_prev_height + 1);
+            qc_plan = m_qc_plan_fn(m_prev_height + 1, &qc_gap);
             qc_ok = qc_plan.has_value();
         }
         // Resolve the superblock disposition ONCE (fail-closed unless the
@@ -1230,7 +1256,7 @@ public:
         // logging — and the two had already drifted (classify_decline never
         // checked payee_resolvable, so a #996 money-path refusal surfaced as
         // "viable-race"). There is now exactly one list.
-        e.decline   = evaluate_viability(qc_ok, sb.ok, payee_resolvable,
+        e.decline   = evaluate_viability(qc_ok, qc_gap, sb.ok, payee_resolvable,
                                          utxo_immature);
         e.has_state = e.decline.viable;
         // NAME THE STATE: while the UTXO lane is immature under the OPT-IN
@@ -1356,7 +1382,12 @@ private:
     /// the builder regardless); re-invoking those predicates here would double
     /// the cost on a per-template path and, worse, could observe a different
     /// answer than the one the bundle was built from.
-    DeclineReport evaluate_viability(bool qc_ok, bool sb_ok,
+    /// `qc_gap` rides alongside `qc_ok` for the same reason the other inputs
+    /// are passed in: it was measured at the one place that CAN measure it —
+    /// the plan call — and re-deriving it here would mean a second plan build
+    /// that could answer differently. It is meaningful only when !qc_ok.
+    DeclineReport evaluate_viability(bool qc_ok, const QcPlanGap& qc_gap,
+                                     bool sb_ok,
                                      bool payee_resolvable,
                                      bool utxo_immature) const {
         const uint32_t next_h = m_prev_height + 1;
@@ -1391,7 +1422,11 @@ private:
             d = refuse("chain-not-synced", "tip=" + tip + ",synced=false",
                        "header-tip-current");
         else if (!qc_ok)
-            d = refuse("qc-plan-underivable", "nullopt",
+            // NAME THE MISSING QUORUM. "nullopt" satisfied the #1038/#1039
+            // cause/value/threshold shape and defeated its purpose: it is a
+            // value that cannot disagree with anything, so the largest
+            // addressable refusal class was unactionable from the log alone.
+            d = refuse("qc-plan-underivable", qc_gap.describe(),
                        "derivable-qc-plan@h=" + std::to_string(next_h));
         else if (utxo_immature
                  && m_utxo_immature_policy == UtxoImmaturePolicy::Refuse)
@@ -1691,7 +1726,9 @@ private:
     // heights refuse the embedded arm even when the provider is confident.
     std::function<bool()> m_superblock_sync_complete_fn;
     std::function<bool(uint32_t)> m_commitment_window_fn;  // refuse embedded on DKG commitment heights
-    std::function<std::optional<QcBlockPlan>(uint32_t)> m_qc_plan_fn;  // E1: serve DKG windows daemonlessly
+    // E1: serve DKG windows daemonlessly. The QcPlanGap out-param is how a
+    // refusal learns WHICH quorum it lacked (see set_qc_plan_fn).
+    std::function<std::optional<QcBlockPlan>(uint32_t, QcPlanGap*)> m_qc_plan_fn;
     // PoSe no-op proof for a REAL commitment (emit-qc-real-pose-unfolded gate);
     // unset => capability absent => every non-null commitment refused.
     std::function<std::optional<bool>(const vendor::CFinalCommitment&)> m_qc_pose_noop_fn;
