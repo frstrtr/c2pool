@@ -1,0 +1,10 @@
+# GitHub funding sidebar. Only the keys GitHub itself recognises take effect;
+# anything else must stay commented or the sidebar silently stops rendering.
+custom: https://www.paypal.com/donate/?hosted_button_id=9DF676HUWAHKY
+
+# Bitcoin — PLACEHOLDER, NOT AN ADDRESS. Do not uncomment until a real address
+# is pasted in. FUNDING.yml has no native crypto field, so this line is inert by
+# design: a syntactically valid but WRONG address would silently send donations
+# somewhere nobody controls, and nothing would report it.
+#
+# btc: REPLACE-WITH-REAL-BTC-ADDRESS
