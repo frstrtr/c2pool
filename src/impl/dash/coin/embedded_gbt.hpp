@@ -52,6 +52,7 @@
 #include <array>
 #include <cstdint>
 #include <ctime>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -143,6 +144,34 @@ inline PinVerdict pin_gate_verdict(const MutableTransaction& pin,
     }
     v.ok = true;
     return v;
+}
+
+/// Wire-form hex of one transaction — the shape dashd's testmempoolaccept and
+/// submitblock both take.
+inline std::string embedded_tx_hex(const MutableTransaction& mtx)
+{
+    auto stream = ::pack(mtx);
+    auto sp = stream.get_span();
+    return HexStr(std::span<const unsigned char>(
+        reinterpret_cast<const unsigned char*>(sp.data()), sp.size()));
+}
+
+/// TRUE when `tx` spends an output of a transaction ALREADY in `in_set`.
+///
+/// The MEMPOOL VALIDITY GATE (mempool_validity_gate.hpp) probes one
+/// transaction at a time, because that is the only shape Dash Core's
+/// testmempoolaccept takes. A child probed alone answers `missing-inputs`
+/// whenever its parent rides the same template but is not (yet) in dashd's own
+/// mempool — an artefact of the probe, not a defect of the transaction, since
+/// selection is topological (mempool.hpp G1) and the parent IS in the block.
+/// Recording the dependency HERE, from the real vins, is what lets the gate
+/// excuse exactly that case without excusing a genuine missing input.
+inline bool spends_earlier_in_set(const MutableTransaction& tx,
+                                  const std::set<uint256>& in_set)
+{
+    for (const auto& vin : tx.vin)
+        if (in_set.count(vin.prevout.hash)) return true;
+    return false;
 }
 
 /// Append only — the caller must already hold an ok PinVerdict for THIS height.
@@ -583,14 +612,29 @@ inline DashWorkData build_embedded_workdata(
         (void)cand_fees;
         w.m_txset_candidates.reserve(cand.size());
         w.m_txset_candidate_fees.reserve(cand.size());
+        w.m_txset_candidate_data_hex.reserve(cand.size());
+        w.m_mempool_probe_depends_in_set.reserve(cand.size());
+        // In-set parents, accumulated in SELECTION order: selection is
+        // topological (mempool.hpp G1), so a parent that rides this template
+        // has already been pushed when its child is considered.
+        std::set<uint256> candidate_ids;
         for (const auto& c : cand) {
             // The SAME MN-collateral exclusion the served path applies: a
             // candidate set that included them would overstate what we could
             // actually have served and make the coverage gate too generous.
             uint256 protx;
             if (tx_spends_mn_collateral(mnstates, c.tx, &protx)) continue;
-            w.m_txset_candidates.push_back(dash::coin::dash_txid(c.tx));
+            const uint256 cid = dash::coin::dash_txid(c.tx);
+            w.m_mempool_probe_depends_in_set.push_back(
+                spends_earlier_in_set(c.tx, candidate_ids) ? 1u : 0u);
+            w.m_txset_candidates.push_back(cid);
             w.m_txset_candidate_fees.push_back(c.fee);
+            // Wire hex for the MEMPOOL VALIDITY GATE's testmempoolaccept
+            // probe. Still NEVER served: this vector is not m_tx_data_hex, no
+            // consensus path reads it, and the coinbase value and merkle are
+            // byte-identical to a build with this line deleted.
+            w.m_txset_candidate_data_hex.push_back(embedded_tx_hex(c.tx));
+            candidate_ids.insert(cid);
         }
     }
 
@@ -615,10 +659,7 @@ inline DashWorkData build_embedded_workdata(
     // ids were already folded into the job merkle — fill it here for every
     // template tx (E1; additive, the dashd fallback path is untouched).
     auto tx_hex = [](const MutableTransaction& mtx) {
-        auto stream = ::pack(mtx);
-        auto sp = stream.get_span();
-        return HexStr(std::span<const unsigned char>(
-            reinterpret_cast<const unsigned char*>(sp.data()), sp.size()));
+        return embedded_tx_hex(mtx);
     };
     // E1: mandatory type-6 quorum-commitment txs FIRST — dashd's miner
     // places them immediately after the coinbase, before mempool txs
@@ -657,13 +698,25 @@ inline DashWorkData build_embedded_workdata(
     if (pinned_local_txs != nullptr && !pinned_local_txs->empty())
         splice_pinned_txs(w, *pinned_local_txs, mempool, mnstates, "GBT-EMB");
     uint64_t selected_bytes = 0;  // wire bytes packed into this template (underfill guard)
+    // ── THE MEMPOOL-SOURCED RANGE (validity-gate probe set) ─────────────
+    // Everything appended from here on is mempool-sourced; the type-6
+    // commitments and the pinned local txs are already in. Recorded as a
+    // RANGE so the gate probes exactly these and does not have to guess which
+    // entries relay policy is entitled to refuse.
+    w.m_mempool_tx_first_index = static_cast<uint32_t>(w.m_txs.size());
+    std::set<uint256> selected_ids;
     for (auto& s : selected) {
         selected_bytes += s.base_size;
+        const uint256 sid = dash::coin::dash_txid(s.tx);
+        w.m_mempool_probe_depends_in_set.push_back(
+            spends_earlier_in_set(s.tx, selected_ids) ? 1u : 0u);
+        selected_ids.insert(sid);
         w.m_txs.emplace_back(s.tx);
-        w.m_tx_hashes.push_back(dash::coin::dash_txid(s.tx));
+        w.m_tx_hashes.push_back(sid);
         w.m_tx_fees.push_back(s.fee);
         w.m_tx_data_hex.push_back(tx_hex(s.tx));
     }
+    w.m_mempool_tx_count = static_cast<uint32_t>(selected.size());
 
     // ── Underfill guard ─────────────────────────────────────────────
     // Do not silently treat a near-empty DASH template as healthy when the

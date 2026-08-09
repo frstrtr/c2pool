@@ -173,6 +173,39 @@ struct DashWorkData {
     // what makes the fee lane completable at all.
     std::vector<uint256>  m_txset_candidates;
     std::vector<uint64_t> m_txset_candidate_fees;
+    // Wire-form hex of each candidate, parallel to m_txset_candidates. The
+    // MEMPOOL VALIDITY GATE (mempool_validity_gate.hpp) feeds these to dashd's
+    // testmempoolaccept: the condition that decides whether
+    // --embedded-serve-mempool-txs may be armed cannot be evaluated from ids
+    // alone, and while the flag is OFF the candidate set is the ONLY place the
+    // transactions we would serve exist. Diagnostic: no consensus path reads it.
+    std::vector<std::string> m_txset_candidate_data_hex;
+
+    // ── THE MEMPOOL-SOURCED RANGE OF THE SERVED BODY ──────────────────────
+    // When the template DOES carry mempool transactions they are appended
+    // LAST, after the consensus-mandatory type-6 quorum commitments and any
+    // pinned local tx, so they occupy the contiguous range
+    // [m_mempool_tx_first_index, m_mempool_tx_first_index + m_mempool_tx_count)
+    // of m_txs / m_tx_hashes / m_tx_fees / m_tx_data_hex.
+    //
+    // The validity gate must probe EXACTLY that range and nothing else: a
+    // type-6 commitment and a zero-fee pinned tx are both refused by relay
+    // policy BY DESIGN, so probing them would manufacture INVALID verdicts out
+    // of correct behaviour. Carried as a RANGE rather than a second copy of
+    // the hex so the money path does not grow a duplicate block body for a
+    // diagnostic. count == 0 means "no mempool-sourced tx in this body".
+    uint32_t m_mempool_tx_first_index{0};
+    uint32_t m_mempool_tx_count{0};
+
+    // Per-entry "this tx spends an output of an EARLIER entry of the same
+    // probe set" flag, parallel to whichever probe set is populated (the
+    // served range above, or the candidate set). dashd's testmempoolaccept
+    // takes ONE transaction, so a child probed alone answers `missing-inputs`
+    // when its parent is only in OUR template — an artefact of the probe, not
+    // a defect of the transaction. The flag is computed at build time from the
+    // real vins, so the exemption is a FACT about the set rather than an
+    // inference from a reject string. Diagnostic: no consensus path reads it.
+    std::vector<uint8_t>  m_mempool_probe_depends_in_set;
 
     // ── PIN OUTCOMES (see PinOutcome above) ───────────────────────────────
     // One entry per configured pinned local tx, written by the splice on the

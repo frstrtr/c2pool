@@ -167,6 +167,17 @@ public:
     // assembled block. Returns "" on ACCEPT (dashd TestBlockValidity passed) or
     // the reject reason. Mempool-independent; never throws (RPC blip -> reason).
     std::string propose_block_hex(const std::string& block_hex);
+    // MEMPOOL VALIDITY GATE (mempool_validity_gate.hpp): dashd's own verdict on
+    // ONE transaction we hold and would serve. Returns the single result object
+    // -- {"txid":..,"allowed":..,"reject-reason":..} -- or a NULL json when the
+    // daemon could not be asked. Never throws, and a failure is deliberately
+    // indistinguishable from "no answer" rather than from "allowed": the gate
+    // counts a missing answer as UNPROBED, never as a pass.
+    //
+    // ONE transaction per call, because that is the only shape Dash Core's
+    // testmempoolaccept takes ("Array must contain exactly one raw
+    // transaction"). Always called off the miner-facing path.
+    nlohmann::json test_mempool_accept(const std::string& raw_tx_hex);
     nlohmann::json getnetworkinfo();
     nlohmann::json getblockchaininfo();
     nlohmann::json getmininginfo();

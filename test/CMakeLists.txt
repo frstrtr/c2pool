@@ -849,7 +849,18 @@ if (BUILD_TESTING AND GTest_FOUND)
         # dash_mainnet_quorum_scan_* / _active_quorums_ fixtures as the W4
         # suite above, and is folded into this target for the same #769
         # reason (the push bot cannot add a build.yml --target).
-        test_dash_mined_commitment_index.cpp)
+        test_dash_mined_commitment_index.cpp
+        # test_dash_mempool_validity_gate.cpp: THE condition that decides when
+        # --embedded-serve-mempool-txs may be armed
+        # (mempool_validity_gate.hpp). Pins the three-valued
+        # testmempoolaccept logic, the exact-name "txn-already-in-mempool"
+        # exemption, "a missing answer is never a pass", the refusal line's
+        # txid/reason/threshold (#1038/#1039 discipline), the sustained-window
+        # arithmetic, and the two directions the retired `ours_only == 0`
+        # set-membership test got wrong. Folded into this target per the same
+        # #769 rule as the leaves above (the push bot cannot add a build.yml
+        # --target, so a standalone executable would be a NOT_BUILT sentinel).
+        test_dash_mempool_validity_gate.cpp)
     target_compile_definitions(test_dash_embedded_gbt PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_embedded_gbt PRIVATE
