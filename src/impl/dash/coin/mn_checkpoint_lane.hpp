@@ -631,8 +631,8 @@ public:
             LOG_ERROR << "[MN-CKPT] " << m_status;
             return;
         }
-        reset_for_arm(cp);
-        // ── #91. READ the persisted record here, but BELIEVE nothing yet.
+        // ── #91. reset_for_arm() READS the persisted record, but BELIEVES
+        // nothing yet.
         //
         // The decisive checks (R4: does our own PoW-validated header chain
         // hold the block this record was folded at?) need a header chain that
@@ -641,7 +641,11 @@ public:
         // evidence than is about to be available — so the record is parked and
         // try_restore() adjudicates it from pump(), at the same moment the
         // anchor's own chain position is verified.
-        load_pending_cursor();
+        //
+        // The read lives in reset_for_arm() rather than here because rearm()
+        // owes it too, and "two hand-maintained lists drift" is the argument
+        // that put every other field in there.
+        reset_for_arm(cp);
         m_status = "armed at h=" + std::to_string(cp.height) + " ("
                    + std::to_string(m_anchor_count) + " masternodes), waiting"
                      " for headers to reach the anchor";
@@ -859,22 +863,33 @@ public:
         ++m_rearms;
         m_last_rearm_at       = at;
         m_last_rearm_at_known = have_tip;
+        // #91: reset_for_arm() re-reads the persisted record and re-opens the
+        // adjudication. It deliberately does NOT erase it here, and it does not
+        // carry the previous arm's verdict either.
+        //
+        // WHAT THIS USED TO DO, AND WHY IT WAS WRONG. It erased the record
+        // unconditionally and latched m_restore_settled, on the argument that
+        // "a re-arm abandons the lineage the record belongs to". That argument
+        // is right about ONE shape and wrong as a blanket: the record is only
+        // implicated when it was folded THROUGH the divergence. A cursor
+        // strictly older than the earliest height we have evidence of
+        // divergence at describes a window we have no evidence against — and
+        // throwing it away costs the full anchor replay (mainnet 2026-08-08:
+        // 5743 blocks, 374 minutes) to buy nothing.
+        //
+        // The implicated shape is not dropped, it is DECIDED: rule R8 in
+        // try_restore() refuses a cursor at or after m_first_divergence — the
+        // same OLDEST-FIRST doctrine the anchor guard above applies, and the
+        // one thing the header chain cannot tell us, because a payee desync is
+        // not a reorg and R4 would pass straight over it. R8 refuses through
+        // restore_cold(), which erases the record, so "leave nothing behind"
+        // still holds exactly where it was earned.
+        //
+        // A re-arm that lands while a restore is still DEFERRING is safe for
+        // the same reason: the deferral counter is reset with everything else
+        // and the record is re-adjudicated from scratch against this arm's
+        // evidence, R8 included.
         reset_for_arm(cp);
-        // #91: a re-arm ABANDONS the lineage the persisted record belongs to —
-        // that state produced a payee queue the maintainer rejected, which is
-        // the whole reason we are here. fail_closed() has usually erased it
-        // already; do it again unconditionally rather than reason about which
-        // paths reach rearm() with a record still on disk. Two sources of
-        // truth for "where is this lane" is the defect this design exists to
-        // prevent, and the cheapest way to have one is to leave nothing behind.
-        if (m_cursor_store) m_cursor_store->erase();
-        // ...and settle the adjudication explicitly, so a re-arm that happened
-        // while a restore was still DEFERRING cannot later adopt a record that
-        // describes the lineage this re-arm is walking away from.
-        m_pending_restore.reset();
-        m_restore_settled = true;
-        m_restore_verdict = "COLD (re-arm): the persisted lineage produced the"
-                            " payee desync this re-arm is recovering from";
         m_status = "RE-ARMED " + std::to_string(m_rearms) + "/"
                    + std::to_string(kMaxRearms) + " at h="
                    + std::to_string(cp.height) + " ("
@@ -1756,6 +1771,16 @@ private:
     /// R7  the cursor is not beyond the replay this lane would do anyway
     ///     (cursor <= tip), and the remaining distance is inside the bridge
     ///     bound.
+    /// R8  the cursor is strictly OLDER than the earliest height we have
+    ///     evidence of divergence at. Checked next to R2 because both ask the
+    ///     same question — "is this record's lineage one we may continue?" —
+    ///     and it is the ONE rule the header chain cannot answer: a payee
+    ///     desync is not a reorg, so R4 passes straight over it. See rearm().
+    ///
+    /// EVERY ONE OF THESE IS RE-RUN ON EVERY ARM. reset_for_arm() clears the
+    /// settled latch and re-parks the record precisely so that no arm inherits
+    /// another arm's verdict — the anchor, the header chain and
+    /// m_first_divergence are all different evidence by then.
     bool try_restore()
     {
         if (m_restore_settled) return true;
@@ -1785,6 +1810,34 @@ private:
                     + m_anchor_hash.GetHex().substr(0, 16) + " source='"
                     + m_anchor_source + "' count="
                     + std::to_string(m_anchor_count));
+            return true;
+        }
+
+        // R8 — DIVERGENCE lineage. m_first_divergence is 0 until a re-seed ask
+        // gives us positive evidence that our replayed queue disagreed with the
+        // chain, so this rule is INERT on a cold start and only speaks on a
+        // re-arm. When it does speak it applies rearm()'s own OLDEST-FIRST
+        // doctrine to the record rather than to the anchor: a cursor folded
+        // THROUGH the divergence carries the divergence, and resuming it would
+        // re-arm the wrong queue at speed. A cursor strictly older than the
+        // divergence describes a window we have no evidence against, and
+        // R2/R4/R5 above and below adjudicate it exactly as they would on a
+        // cold start. restore_cold() erases the refused record, so nothing is
+        // left behind for a later start to re-adopt.
+        if (m_first_divergence != 0
+            && rec.cursor_height >= m_first_divergence) {
+            restore_cold(
+                "R8 divergence-lineage",
+                "the record was folded through h="
+                    + std::to_string(rec.cursor_height)
+                    + ", at or after the earliest height we have evidence of"
+                      " divergence at (h="
+                    + std::to_string(m_first_divergence)
+                    + "). A cursor inside the diverged window resumes the very"
+                      " set that produced the desync — the same trap the"
+                      " anchor-selection guard refuses a newer anchor for, and"
+                      " one our own header chain cannot see: a payee desync is"
+                      " not a reorg, so R4 would pass");
             return true;
         }
 
@@ -3285,6 +3338,10 @@ public:
     /// m_last_rearm_reason). It MUST survive a re-arm or the cap can never
     /// fire. Nor the configured seams / m_max_bridge / m_fold_interval /
     /// m_has_sml_fn, which are wiring, not bridge state.
+    ///
+    /// This function ENDS by re-reading the persisted cursor, so arm() and
+    /// rearm() get one reset list rather than two — see the #91 block below
+    /// for why the adjudication latch in particular may not be inherited.
     void reset_for_arm(const MnCheckpoint& cp)
     {
         // The lane KEEPS its own anchor. poll_rearm() has no caller to hand it
@@ -3386,9 +3443,9 @@ public:
         // legitimate publish behind a debt that was already paid block by block.
         //
         // Note what is deliberately NOT done here: the record on disk is not
-        // erased. arm() reads it immediately after this call, and a re-arm
-        // erases it at ITS own call site, where the reason (the previous
-        // lineage is being abandoned) is local and legible.
+        // erased. It is RE-READ instead (below), and a verdict of COLD erases
+        // it at the rule that reached that verdict, where the reason is local
+        // and legible.
         m_cursor_restored  = false;
         m_restored_at      = 0;
         m_restored_applied = 0;
@@ -3399,6 +3456,34 @@ public:
         m_persist_arith_warned = false;
         m_resume_hold_logged   = 0;
         m_restore_defers       = 0;
+        // ── THE ADJUDICATION ITSELF, not merely its result. ───────────────
+        //
+        // m_restore_settled is the LATCH that says "this process no longer
+        // owes an adjudication". It was the one #91 field this list forgot,
+        // and forgetting it is not a cosmetic omission: pump()'s
+        //     if (!m_restore_settled && !try_restore()) return;
+        // is the ONLY call site of try_restore(), so a latch left standing
+        // makes the guard unfireable for the rest of the process. Every later
+        // arm then walks with WHATEVER verdict the first one reached —
+        // adjudicated against a header chain, an anchor and a divergence
+        // record that have all since moved on.
+        //
+        // Both directions of that reuse are wrong, and the fast one is worse:
+        //   * a preserved REFUSAL pins every re-arm to m_anchor_height, which
+        //     on mainnet 2026-08-08 was 5743 blocks / 374 minutes of replay
+        //     the persisted cursor could have skipped;
+        //   * a preserved ACCEPTANCE resumes at a height adjudicated for a
+        //     DIFFERENT arm, never re-checked against the current chain — it
+        //     silently skips R4, the reorg refusal. A fast wrong start is
+        //     harder to notice than a slow right one.
+        //
+        // So the verdict is not carried in EITHER direction. The record is
+        // re-loaded and re-parked, and try_restore() decides again from the
+        // evidence that exists NOW — which may legitimately say COLD.
+        m_pending_restore.reset();
+        m_restore_verdict.clear();
+        m_restore_settled = true;    // the declared default: nothing owed…
+        load_pending_cursor();       // …re-opened here iff a record exists
         m_progress.start(0, m_now());
         m_watchdog.disarm();         // re-armed at the Waiting->Bridging edge
         m_anchor_eligible   = m_machine.eligible_size();
