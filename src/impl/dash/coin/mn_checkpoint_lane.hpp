@@ -1657,6 +1657,20 @@ public:
         if (!m_tip_height) return;
         const uint32_t tip = m_tip_height();
         if (m_next > tip) { publish(tip); return; }
+        // #1103 chase-log. The cursor is advancing but has not yet reached the
+        // LIVE tip: this is a CHASE across the header/body-availability gap
+        // (the header tip leads what block bodies are locally available), NOT a
+        // wedge. The lane watchdog resets on every cursor move, so a healthy
+        // tail-chase and a genuine stall are indistinguishable from outside —
+        // "33 min no publish" on contabo 2026-08-09 was in fact this chase
+        // creeping the last handful of bodies to the tip. Emit the lag
+        // explicitly for the tail (lag<=8), where the coarse 500-block progress
+        // line does not fire, so the silent window becomes greppable.
+        if ((tip - m_next + 1) <= 8) {
+            LOG_INFO << "[MN-CKPT] chase: cursor h=" << (m_next - 1)
+                     << " live-tip h=" << tip << " lag=" << (tip - m_next + 1)
+                     << " block(s) — chasing block-bodies to tip, not wedged";
+        }
         request_window(tip);
     }
 
