@@ -1274,6 +1274,191 @@ TEST(DashServeGateNamesRefusal, QcPlanDerivableIsViable) {     // negative twin
     EXPECT_TRUE(st.describe_decline().viable);
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// THE REFUSAL MUST NAME THE MISSING QUORUM
+//
+// #1038/#1039 established that every serve-gate decline carries cause, VALUE
+// and threshold. qc-plan-underivable satisfied the shape with the literal
+// string "nullopt" — a value that cannot disagree with anything. The identity
+// of the missing quorum was known at the producer (main_dash's plan closure
+// already logs it as [QC-COMPLETENESS]) and thrown away at the std::function
+// boundary, which returned a bare std::optional.
+//
+// RED WITHOUT THE FIX: revert m_qc_plan_fn to the one-argument shape and both
+// tests below fail on the value — the first gets "nullopt" where it demands a
+// quorum hash, the second gets "nullopt" where it demands a named stage.
+// ════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// A synthetic header chain: the hash is a pure function of the height, and the
+// height lands in the bytes GetHex() prints FIRST, so the 16-char prefix the
+// refusal carries actually discriminates one quorum base height from another.
+std::optional<uint256> synth_hash_at_height(uint32_t h)
+{
+    uint256 u;
+    std::memset(u.data(), 0xCD, 32);
+    std::memcpy(u.data() + 28, &h, 4);
+    return u;
+}
+
+}  // namespace
+
+TEST(DashServeGateNamesRefusal, QcPlanUnderivableNamesTheMissingQuorum) {
+    NodeCoinState st;
+    seed_single_mn(st, p2pkh_script(0x30));
+    seed_sml(st);
+    st.set_require_sml(true);
+    st.set_sml_current_hash(raw256(0xAB));
+
+    // The REAL producer, with no commitment cache and no failed-DKG evidence:
+    // the slot list derives, and the first mandatory slot is unsatisfiable.
+    // `first_gap` is captured independently so the expected identity comes from
+    // the sourcing layer, not from a constant transcribed into the assertion.
+    dash::coin::RequiredQcSlot observed{};
+    st.set_qc_plan_fn(
+        [&st, &observed](uint32_t next_h, dash::coin::QcPlanGap* gap)
+            -> std::optional<dash::coin::QcBlockPlan> {
+            return dash::coin::build_daemonless_qc_plan(
+                dash::coin::LlmqNetwork::Testnet, next_h, st.qmgr(),
+                synth_hash_at_height,
+                [](const uint256&) -> std::optional<uint32_t> {
+                    return std::nullopt;
+                },
+                /*cache=*/nullptr, /*null_evidence=*/nullptr, &observed,
+                /*also_has_mined=*/nullptr, gap);
+        });
+
+    // Phase 10 of a testnet interval-24 cycle: mandatory slots exist here.
+    st.set_tip(1518417, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u);
+
+    const DeclineReport d = st.describe_decline();
+    ASSERT_FALSE(d.viable);
+    ASSERT_EQ(d.cause, "qc-plan-underivable");
+    ASSERT_FALSE(observed.quorum_hash.IsNull())
+        << "fixture check: this height must have a mandatory slot to miss";
+
+    EXPECT_NE(d.value, "nullopt")
+        << "THE defect: the refusal named nothing an operator could act on";
+    EXPECT_NE(d.value.find("llmqType="
+                           + std::to_string(
+                                 static_cast<int>(observed.params.type))),
+              std::string::npos)
+        << "the refusal must name the llmqType it lacked: " << d.value;
+    EXPECT_NE(d.value.find("quorumIndex="
+                           + std::to_string(
+                                 static_cast<int>(observed.quorum_index))),
+              std::string::npos)
+        << "the refusal must name the quorum slot index: " << d.value;
+    EXPECT_NE(d.value.find(observed.quorum_hash.GetHex().substr(0, 16)),
+              std::string::npos)
+        << "the refusal must name the quorum HASH -- that is the identity a "
+           "[QC-COMPLETENESS] line can be joined on: " << d.value;
+    EXPECT_NE(d.value.find("gap=no-commitment-cached"), std::string::npos)
+        << "and WHY that slot was unsatisfiable: " << d.value;
+    EXPECT_EQ(d.threshold, "derivable-qc-plan@h=1518418");
+}
+
+// The structural nullopts have no single offending quorum. They must still
+// name themselves rather than fall back to a word that means nothing.
+TEST(DashServeGateNamesRefusal, QcPlanUnderivableNamesTheStageWhenNoQuorumExists) {
+    NodeCoinState st;
+    seed_single_mn(st, p2pkh_script(0x30));
+    seed_sml(st);
+    st.set_require_sml(true);
+    st.set_sml_current_hash(raw256(0xAB));
+
+    // No header for the quorum base height => compute_required_qc_slots cannot
+    // even build the slot list, so there is no quorum to point at.
+    st.set_qc_plan_fn(
+        [&st](uint32_t next_h, dash::coin::QcPlanGap* gap)
+            -> std::optional<dash::coin::QcBlockPlan> {
+            return dash::coin::build_daemonless_qc_plan(
+                dash::coin::LlmqNetwork::Testnet, next_h, st.qmgr(),
+                [](uint32_t) -> std::optional<uint256> {
+                    return std::nullopt;   // header gap
+                },
+                [](const uint256&) -> std::optional<uint32_t> {
+                    return std::nullopt;
+                },
+                /*cache=*/nullptr, /*null_evidence=*/nullptr,
+                /*first_gap=*/nullptr, /*also_has_mined=*/nullptr, gap);
+        });
+    st.set_tip(1518417, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u);
+
+    const DeclineReport d = st.describe_decline();
+    ASSERT_FALSE(d.viable);
+    ASSERT_EQ(d.cause, "qc-plan-underivable");
+    EXPECT_EQ(d.value, "slot-set-underivable")
+        << "a header gap is a DIFFERENT operator response from a missing "
+           "commitment; collapsing both into \"nullopt\" hid that: " << d.value;
+    EXPECT_NE(d.value, "nullopt");
+}
+
+// A provider that reports no reason says SO. It must not borrow the shape of a
+// measurement it never took.
+TEST(DashServeGateNamesRefusal, QcPlanUnderivableWithoutAReasonSaysUnreported) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_qc_plan_fn([](uint32_t) {
+        return std::optional<dash::coin::QcBlockPlan>{};
+    });
+    const DeclineReport d = st.describe_decline();
+    ASSERT_EQ(d.cause, "qc-plan-underivable");
+    EXPECT_EQ(d.value, "reason-unreported");
+    EXPECT_NE(d.value, "nullopt");
+}
+
+// Same carriage on the PRE-EMIT gate: that refusal discards a BUILT template,
+// so it is the one an operator reads when a block was nearly served.
+TEST(DashServeGateNamesRefusal, EmitQcPlanRefusalCarriesTheQuorumIdentity) {
+    NodeCoinState st;
+    seed_single_mn(st, p2pkh_script(0x30));
+    seed_sml(st);
+    st.set_require_sml(true);
+    st.set_sml_current_hash(raw256(0xAB));
+
+    // Serve once with a derivable plan so there IS a template to re-check.
+    dash::coin::QcBlockPlan plan;
+    plan.merkle_root_quorums = uint256::ZERO;
+    st.set_qc_plan_fn([plan](uint32_t, dash::coin::QcPlanGap*) {
+        return std::optional<dash::coin::QcBlockPlan>{plan};
+    });
+    st.set_tip(1518417, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u);
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded);
+
+    // Now the slot's commitment goes missing between build and emit.
+    const uint256 missing = raw256(0x9E);
+    st.set_qc_plan_fn(
+        [missing](uint32_t, dash::coin::QcPlanGap* gap)
+            -> std::optional<dash::coin::QcBlockPlan> {
+            if (gap != nullptr) {
+                gap->stage        = dash::coin::QcPlanStage::SlotUnsatisfied;
+                gap->slot_known   = true;
+                gap->llmq_type    = 4;
+                gap->quorum_index = 0;
+                gap->quorum_hash  = missing;
+                gap->slot_gap     = dash::coin::QcSlotGap::BlsVerifyFailed;
+            }
+            return std::nullopt;
+        });
+
+    DeclineReport why;
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why));
+    EXPECT_EQ(why.cause, "emit-qc-plan-underivable");
+    EXPECT_NE(why.value, "nullopt");
+    EXPECT_NE(why.value.find("llmqType=4"), std::string::npos) << why.value;
+    EXPECT_NE(why.value.find(missing.GetHex().substr(0, 16)), std::string::npos)
+        << why.value;
+    EXPECT_NE(why.value.find("gap=bls-verify-failed"), std::string::npos)
+        << "a hostile/corrupt signature and a cold-start relay hole are not "
+           "the same incident: " << why.value;
+}
+
 TEST(DashServeGateNamesRefusal, NotPopulatedIsNamed) {
     NodeCoinState st;
     seed_healthy_armed(st);
@@ -1864,5 +2049,8 @@ TEST(DashQcVerifyMemoDeclineCause, UnlatchedSlotStillDeclinesAsPlanUnderivable) 
     EXPECT_EQ(why.cause, "emit-qc-plan-underivable")
         << "the PRE-memo cause must remain reachable for an unlatched slot: "
         << "cause=" << why.cause << " value=" << why.value;
-    EXPECT_EQ(why.value, "nullopt");
+    // This fixture's plan fn is the ONE-argument shape, which reports no
+    // reason — and now says exactly that instead of "nullopt", a word that
+    // could not disagree with anything.
+    EXPECT_EQ(why.value, "reason-unreported");
 }

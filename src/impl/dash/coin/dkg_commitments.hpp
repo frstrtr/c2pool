@@ -190,6 +190,7 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -979,6 +980,88 @@ struct QcBlockPlan {
     uint256 merkle_root_quorums;
 };
 
+/// WHICH of build_daemonless_qc_plan's three structurally different refusals
+/// produced the std::nullopt. Before this existed the serve gate printed the
+/// SAME word — "nullopt" — for all three, which is a value that cannot
+/// disagree with anything: it satisfies the #1038/#1039 cause/value/threshold
+/// shape while naming nothing an operator can act on.
+enum class QcPlanStage : uint8_t {
+    None = 0,             // a plan WAS produced — no refusal to name
+    Unreported,           // provider does not report a reason (1-arg plan fn)
+    SlotSetUnderivable,   // compute_required_qc_slots said no: below the serve
+                          // floor inside a window, or a quorum base header the
+                          // slot list needs is not held locally
+    SlotUnsatisfied,      // the slot list derived, but one mandatory slot has
+                          // no BLS-verified real / attested-null commitment.
+                          // THIS is the case that carries a quorum identity.
+    RootFoldUnderivable,  // every slot satisfied, but merkleRootQuorums could
+                          // not be folded (a leaf's base height is unknown)
+};
+
+inline const char* qc_plan_stage_name(QcPlanStage s)
+{
+    switch (s) {
+        case QcPlanStage::None:                return "n/a";
+        case QcPlanStage::Unreported:          return "reason-unreported";
+        case QcPlanStage::SlotSetUnderivable:  return "slot-set-underivable";
+        case QcPlanStage::SlotUnsatisfied:     return "slot-unsatisfied";
+        case QcPlanStage::RootFoldUnderivable: return "root-fold-underivable";
+    }
+    return "n/a";
+}
+
+/// The identity of what the plan LACKED, carried from the producer to the
+/// refusal site so the decline's VALUE names a quorum instead of a monad.
+/// Observability only: nothing here is ever consulted by a serve decision.
+struct QcPlanGap {
+    QcPlanStage stage{QcPlanStage::None};
+    // Populated only for QcPlanStage::SlotUnsatisfied — the other stages have
+    // no single offending quorum, and inventing one would be worse than "n/a".
+    bool        slot_known{false};
+    uint8_t     llmq_type{0};
+    int16_t     quorum_index{-1};
+    uint256     quorum_hash;
+    QcSlotGap   slot_gap{QcSlotGap::Unevaluated};
+    int32_t     cached_signers{-1};   // -1 == not evaluated -> prints n/a
+
+    /// The decline VALUE. Never the literal "nullopt": either the offending
+    /// quorum's identity + why that slot failed, or the named stage that has
+    /// no quorum to point at.
+    std::string describe() const {
+        if (stage == QcPlanStage::None) return "n/a";
+        if (!slot_known) return qc_plan_stage_name(stage);
+        return "llmqType=" + std::to_string(static_cast<int>(llmq_type))
+             + ",quorumIndex=" + std::to_string(static_cast<int>(quorum_index))
+             + ",quorum=" + quorum_hash.GetHex().substr(0, 16)
+             + ",gap=" + qc_slot_gap_name(slot_gap)
+             + ",signers="
+             + (cached_signers >= 0 ? std::to_string(cached_signers)
+                                    : std::string("n/a"));
+    }
+};
+
+/// Fill a QcPlanGap from the slot the commitment sourcing failed on. A null
+/// quorum_hash IS the discriminator daemonless_qc_commitments documents for
+/// "the slot set itself was underivable" (it leaves `first_gap` untouched in
+/// that case), so it maps to the stage that has no quorum, not to a
+/// fabricated all-zero one.
+inline QcPlanGap qc_plan_gap_from_slot(const RequiredQcSlot& s)
+{
+    QcPlanGap g;
+    if (s.quorum_hash.IsNull()) {
+        g.stage = QcPlanStage::SlotSetUnderivable;
+        return g;
+    }
+    g.stage          = QcPlanStage::SlotUnsatisfied;
+    g.slot_known     = true;
+    g.llmq_type      = s.params.type;
+    g.quorum_index   = s.quorum_index;
+    g.quorum_hash    = s.quorum_hash;
+    g.slot_gap       = s.gap;
+    g.cached_signers = s.cached_signers;
+    return g;
+}
+
 /// Compose the full daemonless plan. std::nullopt => cannot be derived
 /// safely at this height — slot set underivable, root fold underivable, or
 /// ANY mandatory slot lacking a verified real / attested-null commitment
@@ -997,6 +1080,10 @@ struct QcBlockPlan {
 /// MinedCommitmentIndex refuses to arm on a live-tip node until dashd's
 /// UndoBlock half (v23.1.7 llmq/blockprocessor.cpp:383-408) is ported.
 /// Defaulted null: every pre-existing caller keeps byte-identical behaviour.
+/// `plan_gap`, when non-null, receives WHY the plan could not be built — the
+/// offending quorum's identity when there is one, otherwise the named stage.
+/// It is written ONLY on the nullopt paths; a successful plan leaves it at
+/// QcPlanStage::None.
 inline std::optional<QcBlockPlan> build_daemonless_qc_plan(
     LlmqNetwork net, uint32_t next_height,
     const QuorumManager& qmgr,
@@ -1005,19 +1092,34 @@ inline std::optional<QcBlockPlan> build_daemonless_qc_plan(
     const MineableCommitmentCache* cache = nullptr,
     const DkgNullEvidenceFn& null_evidence = nullptr,
     RequiredQcSlot* first_gap = nullptr,
-    const std::function<bool(uint8_t, const uint256&)>& also_has_mined = nullptr)
+    const std::function<bool(uint8_t, const uint256&)>& also_has_mined = nullptr,
+    QcPlanGap* plan_gap = nullptr)
 {
     auto has_mined = [&qmgr, &also_has_mined](uint8_t t, const uint256& qh) {
         if (qmgr.find(t, qh).has_value()) return true;
         return also_has_mined ? also_has_mined(t, qh) : false;
     };
+    // Sink the slot locally so `first_gap`'s documented contract is preserved
+    // verbatim (untouched when the slot set itself was underivable) while
+    // plan_gap still gets an answer with no caller opt-in.
+    RequiredQcSlot slot{};
     auto commitments = daemonless_qc_commitments(
         net, next_height, hash_at_height, has_mined, cache,
-        null_evidence, first_gap);
-    if (!commitments) return std::nullopt;
+        null_evidence, &slot);
+    if (first_gap != nullptr && !slot.quorum_hash.IsNull()) *first_gap = slot;
+    if (!commitments) {
+        if (plan_gap != nullptr) *plan_gap = qc_plan_gap_from_slot(slot);
+        return std::nullopt;
+    }
     auto root = compute_merkle_root_quorums_with_block(
         net, qmgr, *commitments, height_of_hash);
-    if (!root) return std::nullopt;
+    if (!root) {
+        if (plan_gap != nullptr) {
+            *plan_gap = QcPlanGap{};
+            plan_gap->stage = QcPlanStage::RootFoldUnderivable;
+        }
+        return std::nullopt;
+    }
     return QcBlockPlan{std::move(*commitments), *root};
 }
 

@@ -4393,7 +4393,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                  // by-value capture would freeze the null it holds today.
                  // Same lifetime class as &node_coin_state above.
                  &mined_commitment_index]
-                (uint32_t next_h) -> std::optional<dash::coin::QcBlockPlan> {
+                (uint32_t next_h, dash::coin::QcPlanGap* plan_gap)
+                    -> std::optional<dash::coin::QcBlockPlan> {
                     if (*qc_first_plan_h == 0u) *qc_first_plan_h = next_h;
                     // Observe the MINED set at the tip we are building on.
                     // D2 root memo: this lambda runs INSIDE emit_ok on the
@@ -4471,7 +4472,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                       uint8_t t, const uint256& qh) {
                                       return mi->has_mined_commitment(t, qh);
                                   })
-                            : std::function<bool(uint8_t, const uint256&)>());
+                            : std::function<bool(uint8_t, const uint256&)>(),
+                        // The identity of what was missing, handed straight to
+                        // the serve-gate refusal so its VALUE names a quorum
+                        // instead of the word "nullopt".
+                        plan_gap);
                     if (!plan && !gap.quorum_hash.IsNull()
                         && *qc_gap_logged_h != next_h) {
                         *qc_gap_logged_h = next_h;
