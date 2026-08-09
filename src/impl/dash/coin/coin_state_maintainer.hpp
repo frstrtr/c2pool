@@ -34,6 +34,7 @@
 #include <impl/dash/coin/governance_object.hpp>  // parse_superblock_trigger, govvote_signature_hash
 #include <impl/dash/coin/superblock.hpp>         // get_superblock_payments (R6 cross-check + provider)
 #include <impl/dash/coin/mn_state_machine.hpp>   // MNState
+#include <impl/dash/coin/mn_gap_repair.hpp>      // MnGapRepairFn (diff-store gap repair seam)
 #include <impl/dash/coin/lane_diag.hpp>          // diag::MnSource (population attribution)
 #include <impl/dash/coin/block.hpp>            // BlockType
 #include <impl/dash/coin/transaction.hpp>        // MutableTransaction
@@ -388,6 +389,55 @@ public:
         // fetch and the first live full-block ingest were the soak's
         // 2-slot cursor lag -> bad-cb-payee at the address-group boundary).
         m_state.mnstates().load(std::move(mnstates), as_of_height);
+        // ── CONSUMER CURRENCY GATE (the G7 split, consumer half) ─────────
+        // This consumer holds BOTH operands — the seed's as_of_height and
+        // serve_tip_height() — and historically compared neither: currency
+        // was enforced only publisher-side (replay_payee_publish.hpp G7).
+        // With the publisher's exact-tip demand relaxed by kPublishEpsilon,
+        // the enforcement moves HERE: accept and STORE a below-tip seed, but
+        // arm m_have_mn for SERVING only when the queue cursor is current.
+        // If the seed is behind the serve tip, immediately attempt the
+        // diff-store catch-up for (as_of .. tip]; arming happens only at
+        // cursor == tip. A catch-up refusal costs nothing (mirror of G7's
+        // publisher-side economics): the seed stays stored, serving stays
+        // un-armed, and the incumbent lane keeps its job. This gate does NOT
+        // replace publisher G7 — the ε bound keeps the cheap refusal there;
+        // this is the zero-cost currency check that guarantees no serve ever
+        // projects a below-tip queue front.
+        {
+            const uint32_t serve_tip = serve_tip_height();
+            if (m_have_mn && as_of_height != 0 && serve_tip != 0
+                && as_of_height < serve_tip) {
+                bool caught_up = false;
+                if (m_mn_gap_repair) {
+                    auto rep = m_mn_gap_repair(serve_tip);
+                    if (rep.ok && !rep.entries.empty()
+                        && rep.as_of == serve_tip) {
+                        LOG_INFO << "[PAYEE-QUEUE] below-tip seed as_of_h="
+                                 << as_of_height << " CAUGHT UP to serve tip"
+                                    " h=" << serve_tip
+                                 << " from the diff store ("
+                                 << rep.entries.size() << " MNs)";
+                        m_state.mnstates().load(std::move(rep.entries),
+                                                rep.as_of);
+                        m_mn_snapshot_height = rep.as_of;
+                        as_of_height         = rep.as_of;
+                        caught_up            = true;
+                    }
+                }
+                if (!caught_up) {
+                    LOG_WARNING
+                        << "[PAYEE-QUEUE] seed as_of_h=" << as_of_height
+                        << " is BEHIND serve tip h=" << serve_tip
+                        << " and the diff-store catch-up "
+                        << (m_mn_gap_repair ? "refused" : "is not wired")
+                        << " — seed STORED but serving NOT armed (a queue"
+                           " front below the tip must never back a"
+                           " template); the incumbent lane keeps its job";
+                    m_have_mn = false;
+                }
+            }
+        }
         // Startup / reseed join (2026-07-30): the PAYEE axis was just (re)seeded
         // -- reconcile it against an already-present SML so a warm-loaded or
         // live-advanced SML's authoritative isValid lands on the fresh queue
@@ -1401,6 +1451,44 @@ private:
             return r;
         }
         auto r    = m_state.mnstates().apply_block(block, height);
+        // ── DIFF-STORE GAP REPAIR (dashd GetListForBlockInternal analogue,
+        // evo/deterministicmns.cpp:778-870, as a cold repair path). An APPLY
+        // GAP means blocks between the cursor and this one were never folded
+        // into the payee queue. dashd never wipes on that — it reconstructs
+        // the list for ANY block from its per-block diff store. When the
+        // ported store (mn_diff_store.hpp) is wired and can reconstruct the
+        // list AT height-1 — every row present, digest-good, root_matched
+        // AND payee_verified, SML root equal to the chain's committed root —
+        // reseed through the EXISTING single sink (on_mn_list_update: the
+        // reseed latch clears on a non-empty height-stamped set, the anti-
+        // mint invariant below is respected, not bypassed) and re-apply the
+        // block the caller still holds. ANY refusal falls through to the
+        // unchanged wipe chain below; repair only ADDS a lane in front of
+        // it, it removes nothing. payee_desync is NOT repairable this way
+        // (the queue disagreed with the chain at a contiguous height — that
+        // is a divergence, not a gap) and takes the wipe path as always.
+        if (r.gap_detected && !r.payee_desync && m_mn_gap_repair) {
+            auto rep = m_mn_gap_repair(height - 1);
+            if (rep.ok && !rep.entries.empty() && rep.as_of == height - 1) {
+                LOG_INFO << "[EMB-DASH] MN payee APPLY GAP at h=" << height
+                         << " REPAIRED from the diff store: queue reseeded"
+                            " as-of h=" << rep.as_of << " ("
+                         << rep.entries.size() << " MNs, source="
+                         << kPayeeSourceMnDiffRepair
+                         << "); re-applying the held block";
+                on_mn_list_update(std::move(rep.entries), rep.as_of,
+                                  kPayeeSourceMnDiffRepair);
+                // Pass-3's coinbase cross-check inside this re-apply is the
+                // final tripwire: a payee_desync here falls through to the
+                // wipe chain below exactly as an unrepaired gap would.
+                r = m_state.mnstates().apply_block(block, height);
+            } else {
+                LOG_WARNING << "[EMB-DASH] MN payee APPLY GAP at h=" << height
+                            << " NOT repairable from the diff store ("
+                            << (rep.error.empty() ? "refused" : rep.error)
+                            << ") — falling through to the wipe/demote path";
+            }
+        }
         // PAYEE DESYNC (soak-found 2026-07-22, bad-cb-payee class): the
         // connected block's coinbase does not pay the MN our queue projects.
         // The payee set can no longer back a template — serving from it
@@ -1652,6 +1740,22 @@ public:
     /// which is the safe terminal state (never serve a guessed payee).
     void set_on_mn_reseed(std::function<void()> fn) {
         m_on_mn_reseed = std::move(fn);
+    }
+
+    /// Wire the MN diff-store gap-repair seam (mn_gap_repair.hpp; main_dash
+    /// points this at MnDiffStore::reconstruct over the PoW-validated header
+    /// chain — the c2pool port of dashd's snapshot+diff walk,
+    /// evo/deterministicmns.cpp:778-870). Consulted in exactly two places:
+    ///   * on_block_connected's APPLY-GAP branch, BEFORE the wipe chain —
+    ///     a gap that CAN be repaired from stored, root+payee-verified diffs
+    ///     re-seeds through on_mn_list_update and re-applies the held block;
+    ///   * on_mn_list_update's consumer currency gate (the G7 split) —
+    ///     a below-tip seed is caught up to the serve tip before it may arm
+    ///     serving.
+    /// Optional: unset leaves BOTH paths byte-identical to their historical
+    /// fail-closed behavior (wipe/demote/re-seed; exact-currency arming).
+    void set_mn_gap_repair(MnGapRepairFn fn) {
+        m_mn_gap_repair = std::move(fn);
     }
 
     /// Wire a "force a full mnlistdiff re-sync from ZERO" sink (main_dash resets
@@ -2318,6 +2422,7 @@ private:
     std::function<int64_t(uint32_t)> m_sb_budget_fn;  // superblock budget cap (duffs)
     std::function<void()> m_on_state_dirty;  // SML/bestCL/reorg -> re-issue work
     std::function<void()> m_on_mn_reseed;    // payee desync -> authoritative protx re-seed
+    MnGapRepairFn m_mn_gap_repair;           // diff-store gap repair (mn_gap_repair.hpp); unset = historical fail-closed
     std::function<void()> m_on_full_resync;  // H-1 heal -> reset sml_base + full re-sync
     std::function<void(const uint256&, const uint256&)> m_on_sml_rerequest;  // SML-behind-tip -> bounded getmnlistd(base,target)
     // #1153 policy: bounds the getmnlistd re-request to at most a few attempts

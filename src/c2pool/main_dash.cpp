@@ -101,6 +101,8 @@
 #include <impl/dash/coin/replay_fold_consumer.hpp> // W5: bulk lane -> W1 DML fold + per-block root check
 #include <impl/dash/coin/replay_quorum_bridge.hpp> // SEAM: W4 quorum lane <-> W1 MembersFn
 #include <impl/dash/coin/replay_payee_publish.hpp> // SEAM: W1 fold -> the PAYEE queue that gates serving
+#include <impl/dash/coin/mn_diff_store.hpp>      // dashd evodb dmn_D4/dmn_S3 port: per-block MN list diffs + snapshots
+#include <impl/dash/coin/mn_gap_repair.hpp>      // payee-queue gap-repair seam (maintainer + checkpoint bridge)
 #include <impl/dash/node.hpp>          // dash::Node — sharechain pool-node (NodeBridge<NodeImpl,Legacy,Actual>)
 #include <impl/dash/config.hpp>        // dash::Config (PoolConfig/CoinConfig)
 #include <impl/dash/config_pool.hpp>   // dash::SharechainConfig — P2P_PORT / PREFIX / min-proto SSOT
@@ -3465,6 +3467,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // Constructed only alongside the fold engine.
     std::unique_ptr<dash::coin::replay::FoldLiveTail>          replay_live_tail;
     std::unique_ptr<dash::coin::replay::ReplayPayeePublisher>  replay_payee_pub;
+    // MN DIFF/SNAPSHOT STORE (dashd evodb dmn_D4/dmn_S3 port,
+    // evo/deterministicmns.cpp:689-694): per-block list diffs + 576-cadence
+    // snapshots written by the fold's per-block commit, read by the payee-
+    // queue gap-repair seam. Constructed only alongside the fold engine.
+    std::unique_ptr<dash::coin::replay::MnDiffStore>           mn_diff_store;
+    std::unique_ptr<dash::coin::replay::MnDiffWriter>          mn_diff_writer;
     // PR-2 FORWARD: dashd's mined-commitment store, fed from the same replayed
     // bodies. shared_ptr because the qc-plan lambda (installed far above, on
     // the serve path) captures it by value and must see it appear later — it
@@ -6398,6 +6406,119 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                 if (pp && pp->republish_for_reseed()) return;
                                 if (fb) fb();
                             });
+                    }
+                }
+
+                // ── MN DIFF/SNAPSHOT STORE (dashd evodb dmn_D4/dmn_S3 port,
+                // evo/deterministicmns.cpp:689-694) ──────────────────────────
+                // Written by the fold's per-block commit (post root-match, via
+                // the consumer's diff sink); read ONLY by the gap-repair seam.
+                // Opened next to dash_replay_headers. On open/verify failure
+                // the store is simply absent and both repair callers keep
+                // their historical wipe/demote fail-closed behavior — the
+                // store is an accelerator, never consensus-required.
+                if (replay_fold_consumer) {
+                    mn_diff_store = std::make_unique<rp::MnDiffStore>(
+                        (core::filesystem::config_path() / net_subdir
+                            / "dash_mn_diff_db").string());
+                    if (!mn_diff_store->open()) {
+                        LOG_WARNING << "[MN-DIFF-DB] open failed — diff store"
+                                       " DISABLED (gap repair unavailable;"
+                                       " wipe/demote floor unchanged)";
+                        mn_diff_store.reset();
+                    } else {
+                        // hash -> (height, prev_hash) off OUR PoW-validated
+                        // header chain — the walk's cross-check at every hop.
+                        auto diff_hlookup =
+                            [hc = header_chain.get()](const uint256& h)
+                                -> std::optional<std::pair<uint32_t, uint256>> {
+                            if (!hc) return std::nullopt;
+                            auto e = hc->get_header(h);
+                            if (!e) return std::nullopt;
+                            return std::make_pair(e->height, e->prev_hash);
+                        };
+                        // Startup: 'B' sentinel cross-check + newest snapshot
+                        // pair verify (dashd VerifyBestBlock /
+                        // VerifySnapshotPair posture, scope-reduced). A
+                        // failure wipes THIS store alone; the live fold
+                        // repopulates it.
+                        std::string vnote;
+                        mn_diff_store->startup_verify(diff_hlookup, vnote);
+                        if (!vnote.empty())
+                            LOG_INFO << "[MN-DIFF-DB] startup verify: "
+                                     << vnote;
+                        mn_diff_writer = std::make_unique<rp::MnDiffWriter>(
+                            *mn_diff_store, *replay_fold_engine);
+                        // Seed/anchor snapshot: the explicit grounding row
+                        // every backward walk must reach (the fail-closed
+                        // inversion of dashd's initial-empty-list default).
+                        mn_diff_writer->arm();
+                        replay_fold_consumer->set_diff_sink(
+                            [w = mn_diff_writer.get()](
+                                uint32_t h, const uint256& bh,
+                                const dash::coin::BlockType& blk,
+                                const rp::FoldResult& fr) {
+                                w->on_folded(h, bh, blk, fr);
+                            });
+                        // DELIBERATELY NOT added to set_on_sml_clear's reorg
+                        // wipe cascade: dashd's UndoBlock keeps disk rows too
+                        // (deterministicmns.cpp:736-769) — hash-keyed rows
+                        // for orphaned blocks are harmless residue, and
+                        // wiping diff history on reorg would destroy exactly
+                        // what repair depends on.
+
+                        // ── The GAP-REPAIR seam, wired at BOTH callers ─────
+                        // want_height -> reconstruct(hash(want)) -> MNState
+                        // projection through the same to_payee_state boundary
+                        // every other lane uses.
+                        dash::coin::MnGapRepairFn repair_fn =
+                            [store = mn_diff_store.get(),
+                             hc = header_chain.get()](uint32_t want)
+                                -> dash::coin::MnGapRepairResult {
+                            dash::coin::MnGapRepairResult out;
+                            out.as_of = want;
+                            if (store == nullptr || hc == nullptr) {
+                                out.error = "diff store / header chain absent";
+                                return out;
+                            }
+                            auto e = hc->get_header_by_height(want);
+                            if (!e) {
+                                out.error = "h=" + std::to_string(want)
+                                          + " is not on our PoW-validated"
+                                            " header chain";
+                                return out;
+                            }
+                            auto hlookup = [hc](const uint256& h)
+                                -> std::optional<std::pair<uint32_t, uint256>> {
+                                auto ie = hc->get_header(h);
+                                if (!ie) return std::nullopt;
+                                return std::make_pair(ie->height,
+                                                      ie->prev_hash);
+                            };
+                            rp::DmlFoldEngine::Entries list;
+                            uint64_t trc = 0;
+                            std::string err;
+                            if (!store->reconstruct(e->hash, hlookup, list,
+                                                    trc, err)) {
+                                out.error = err;
+                                return out;
+                            }
+                            out.entries.reserve(list.size());
+                            for (const auto& [protx, st] : list)
+                                out.entries.emplace_back(
+                                    protx, rp::to_payee_state(st));
+                            out.ok = true;
+                            return out;
+                        };
+                        if (maintainer)
+                            maintainer->set_mn_gap_repair(repair_fn);
+                        if (mn_ckpt_lane)
+                            mn_ckpt_lane->set_gap_repair(repair_fn);
+                        std::cout << "[run] MN DIFF STORE ARMED: per-block"
+                                     " list diffs + 576-cadence snapshots"
+                                     " (dashd dmn_D4/dmn_S3 mechanism);"
+                                     " payee-queue gap repair wired at the"
+                                     " maintainer and the checkpoint bridge\n";
                     }
                 }
             }

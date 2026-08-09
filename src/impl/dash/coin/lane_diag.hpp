@@ -377,21 +377,24 @@ private:
 /// payee queue" is never again an inference.
 enum class MnSource
 {
-    None,        ///< nothing has populated the queue
-    DashdSeed,   ///< dashd RPC `protx list registered` startup seed (mn_seed)
-    MnCkpt,      ///< the release-pinned checkpoint + forward-replay bridge
-    ReplayFold,  ///< a masternode-list fold produced by the block replay lane
-    Unknown      ///< populated by a path that did not name itself: a BUG
+    None,         ///< nothing has populated the queue
+    DashdSeed,    ///< dashd RPC `protx list registered` startup seed (mn_seed)
+    MnCkpt,       ///< the release-pinned checkpoint + forward-replay bridge
+    ReplayFold,   ///< a masternode-list fold produced by the block replay lane
+    MnDiffRepair, ///< gap repair: list reconstructed from the MN diff store's
+                  ///< stored root+payee-verified fold outputs (mn_diff_store)
+    Unknown       ///< populated by a path that did not name itself: a BUG
 };
 
 inline const char* mn_source_name(MnSource s)
 {
     switch (s) {
-        case MnSource::None:       return "none";
-        case MnSource::DashdSeed:  return "dashd-seed";
-        case MnSource::MnCkpt:     return "mn-ckpt";
-        case MnSource::ReplayFold: return "replay-fold";
-        case MnSource::Unknown:    return "unknown";
+        case MnSource::None:         return "none";
+        case MnSource::DashdSeed:    return "dashd-seed";
+        case MnSource::MnCkpt:       return "mn-ckpt";
+        case MnSource::ReplayFold:   return "replay-fold";
+        case MnSource::MnDiffRepair: return "mn-diff-repair";
+        case MnSource::Unknown:      return "unknown";
     }
     return "unknown";
 }
@@ -399,19 +402,23 @@ inline const char* mn_source_name(MnSource s)
 /// Parse back, so a test (or a scraper) can round-trip the token.
 inline MnSource mn_source_from_name(const std::string& n)
 {
-    if (n == "dashd-seed")  return MnSource::DashdSeed;
-    if (n == "mn-ckpt")     return MnSource::MnCkpt;
-    if (n == "replay-fold") return MnSource::ReplayFold;
-    if (n == "none")        return MnSource::None;
+    if (n == "dashd-seed")     return MnSource::DashdSeed;
+    if (n == "mn-ckpt")        return MnSource::MnCkpt;
+    if (n == "replay-fold")    return MnSource::ReplayFold;
+    if (n == "mn-diff-repair") return MnSource::MnDiffRepair;
+    if (n == "none")           return MnSource::None;
     return MnSource::Unknown;
 }
 
 /// Whether a source is daemon-independent. The A/B that exposed the misreading
 /// is exactly this predicate, and encoding it here means the log can state the
 /// conclusion instead of leaving it to the reader.
+/// MnDiffRepair qualifies: the store's rows are fold OUTPUTS, written only
+/// after the engine's own root+payee self-checks — no daemon involved.
 inline bool mn_source_is_daemonless(MnSource s)
 {
-    return s == MnSource::MnCkpt || s == MnSource::ReplayFold;
+    return s == MnSource::MnCkpt || s == MnSource::ReplayFold
+        || s == MnSource::MnDiffRepair;
 }
 
 } // namespace diag
