@@ -1,0 +1,11 @@
+{
+  "_comment": "Lane-keyed minimum test-case floors for the zero-test guard. A ctest lane whose -R subset stops matching (a renamed case, a gtest_discover_tests race dropping cases, or #ifdef'd-out cases on a stub build) reports GREEN over an empty set. A FLAT floor would false-red the scoped lanes (^bch_, the DASH-BLS 5, boost_sentinel), so the floor is lane-keyed. These are COLLAPSE detectors set safely below each lane's true count, NOT exact expectations; raise a lane's floor only after capturing a green-baseline junit for it. Enforced by scripts/ci/test_floor_guard.sh against `ctest --output-junit`.",
+  "lanes": {
+    "linux": 10,
+    "linux-asan": 10,
+    "coin-bch": 1,
+    "coin-bch-asan": 1,
+    "linux-dash-bls": 5,
+    "boost-sentinel": 1
+  }
+}

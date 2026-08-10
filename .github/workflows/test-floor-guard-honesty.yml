@@ -1,0 +1,85 @@
+name: test-floor-guard-honesty
+
+# Fail-loud demo for the zero-test guard (scripts/ci/test_floor_guard.sh).
+# It proves the guard actually catches an empty run: the guard is fed a
+# synthetic ctest --output-junit report with ZERO testcases and MUST reject it.
+# If "Guard must RED on an empty run" ever goes green, the zero-test guard has
+# stopped catching hollow-green lanes -- this workflow is the tripwire.
+
+on:
+  push:
+    branches:
+      - master
+      - v37-dev
+      - 'ci-steward/**'
+  pull_request:
+    branches:
+      - master
+      - v37-dev
+
+jobs:
+  honesty:
+    name: Test-floor guard honesty
+    runs-on: [self-hosted, X64, Linux]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard must RED on an empty run
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp)"
+          cat > "$tmp" <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <testsuite name="ci" tests="0" failures="0" errors="0">
+          </testsuite>
+          XML
+          # Invert the exit: the guard MUST fail on an empty report.
+          if bash scripts/ci/test_floor_guard.sh linux "$tmp"; then
+            echo "::error::HONESTY FAILURE: guard accepted an empty (0-testcase) junit -- it would let a hollow green through." >&2
+            exit 1
+          fi
+          echo "OK: guard correctly REJECTED an empty run"
+
+      - name: Guard must RED on a missing report
+        shell: bash
+        run: |
+          set -euo pipefail
+          if bash scripts/ci/test_floor_guard.sh linux /nonexistent/junit.xml; then
+            echo "::error::HONESTY FAILURE: guard accepted a missing junit -- ctest producing no report at all would pass." >&2
+            exit 1
+          fi
+          echo "OK: guard correctly REJECTED a missing report"
+
+      - name: Guard must PASS a populated run at floor
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp)"
+          {
+            echo '<?xml version="1.0" encoding="UTF-8"?>'
+            echo '<testsuite name="ci" tests="5" failures="0">'
+            for i in 1 2 3 4 5; do echo "<testcase name=\"DashBlsVerify.case$i\"/>"; done
+            echo '</testsuite>'
+          } > "$tmp"
+          # linux-dash-bls floor is 5; a populated report at floor MUST pass,
+          # else the guard is a false-red generator on the scoped lanes.
+          bash scripts/ci/test_floor_guard.sh linux-dash-bls "$tmp"
+          echo "OK: guard correctly PASSED a populated run at floor"
+
+      - name: Guard must RED when skips mask an empty run
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp)"
+          {
+            echo '<?xml version="1.0" encoding="UTF-8"?>'
+            echo '<testsuite name="ci" tests="5" failures="0">'
+            for i in 1 2 3 4 5; do echo "<testcase name=\"skipped.case$i\" status=\"notrun\"/>"; done
+            echo '</testsuite>'
+          } > "$tmp"
+          if bash scripts/ci/test_floor_guard.sh linux-dash-bls "$tmp"; then
+            echo "::error::HONESTY FAILURE: guard let 5 skipped cases satisfy a floor of 5 -- skips must not count as run." >&2
+            exit 1
+          fi
+          echo "OK: guard correctly REJECTED a floor satisfied only by skips"
