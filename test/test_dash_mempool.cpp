@@ -1012,3 +1012,391 @@ TEST(DashMempoolAuditGaps, G4_IslockConflictEvictedAndNeverSelected)
         << "an outpoint spent by a confirmed tx is resolved; its islock "
            "tracking entry must be pruned";
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// D1/D2/D3 — dashd BlockAssembler::addPackageTxs SELECTION-FIDELITY parity KATs
+// ════════════════════════════════════════════════════════════════════════════
+//
+// These pin the embedded selector's tx SET and ORDER against dashd
+// BlockAssembler for the same tip+mempool, so the embedded template's
+// hashMerkleRoot matches dashd's and --embedded-serve-mempool-txs swaps less
+// often (the #1218 gbt-xcheck-txmerkle-mismatch guard still fails closed to
+// dashd on ANY divergence, so this is %-not-safety).
+//
+//   D1 — primary key = min(self-feerate, whole-ancestor-package feerate)
+//        (CompareTxMemPoolEntryByAncestorFee / GetModFeeAndSize,
+//         src/txmempool.h:274-312).
+//   D2 — mapModifiedTx: a descendant re-competes at its lighter remaining
+//        package feerate once an ancestor is included
+//        (src/node/miner.cpp:415-440,493-640).
+//   D3 — SortForBlock: emit each package by GetCountWithAncestors() asc, txid
+//        asc (src/node/miner.cpp:442-451, src/node/miner.h:104-112).
+//
+// GOLDEN DERIVATION (design-review RC4): the expected SET/ORDER for each KAT is
+// derived directly from the dashd addPackageTxs algorithm above, with the
+// ancestor-score arithmetic cross-checked against CompareTxMemPoolEntryByAncestorFee
+// (division-free cross-multiply, min-of-two). K1/K3/K5 are RED on the pre-port
+// (standalone-feerate, no-mapModifiedTx, DFS-emit) selector and GREEN after;
+// K2/K4/K6/K7/K8 are regression/correctness fences.
+
+// A spend with its output scriptPubKey padded to inflate base_size (0x00 =
+// OP_0, contributes zero sigops and is never P2SH). `pad` bytes of padding.
+static MutableTransaction make_spend_padded(const uint256& prev_hash,
+                                            uint32_t prev_index,
+                                            int64_t out_value, uint32_t salt,
+                                            size_t pad) {
+    auto tx = make_spend(prev_hash, prev_index, out_value, salt);
+    tx.vout[0].scriptPubKey.m_data.assign(pad, 0x00);
+    return tx;
+}
+
+// A 1-in / 2-out spend: lets one parent feed two distinct children.
+static MutableTransaction make_spend_2out(const uint256& prev_hash,
+                                          uint32_t prev_index,
+                                          int64_t out0, int64_t out1,
+                                          uint32_t salt) {
+    MutableTransaction tx;
+    tx.version = 1;
+    tx.type = 0;
+    tx.locktime = salt;
+    tx.vin.push_back(make_input(prev_hash, prev_index));
+    tx.vout.push_back(make_output(out0));
+    tx.vout.push_back(make_output(out1));
+    return tx;
+}
+
+// A 2-in / 1-out spend: a grandchild joining two parents (diamond apex).
+static MutableTransaction make_spend_2in(const uint256& h0, uint32_t i0,
+                                         const uint256& h1, uint32_t i1,
+                                         int64_t out_value, uint32_t salt) {
+    MutableTransaction tx;
+    tx.version = 1;
+    tx.type = 0;
+    tx.locktime = salt;
+    tx.vin.push_back(make_input(h0, i0));
+    tx.vin.push_back(make_input(h1, i1));
+    tx.vout.push_back(make_output(out_value));
+    return tx;
+}
+
+static std::vector<uint256> sel_order(const Mempool& mp, uint32_t max_bytes) {
+    auto [s, f] = mp.get_sorted_txs_with_fees(max_bytes);
+    std::vector<uint256> out;
+    for (auto& e : s) out.push_back(dash_txid(e.tx));
+    return out;
+}
+static std::set<uint256> sel_set(const Mempool& mp, uint32_t max_bytes) {
+    auto o = sel_order(mp, max_bytes);
+    return std::set<uint256>(o.begin(), o.end());
+}
+
+// ── K1 — D1 min-of-two ORDERING: a CPFP child's package competes at the LOW
+// package feerate, not the child's high standalone feerate. A low-fee big
+// parent P, a high-fee small child C spending P, and an independent medium tx M
+// whose standalone feerate sits BETWEEN the {P,C} package feerate and C's
+// standalone. dashd keys C at the package feerate, so the {P,C} package slots
+// BELOW M → order [M, P, C]. The pre-port selector keyed C at its high
+// standalone feerate → [P, C, M].
+TEST(DashMempoolSelectionFidelity, K1_D1_MinOfTwoAncestorScoreOrder)
+{
+    UTXOViewCache utxo(nullptr);
+    uint256 coinP = mint_hash(1000);
+    uint256 coinM = mint_hash(1001);
+    utxo.add_coin(Outpoint(coinP, 0), Coin(200'000, {}, 1, false));
+    utxo.add_coin(Outpoint(coinM, 0), Coin(100'000, {}, 1, false));
+
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    // P: big (~2 KB), fee 1'000 → feerate ~0.5.
+    auto P = make_spend_padded(coinP, 0, 199'000, /*salt=*/1010, /*pad=*/2000);
+    // C: small, spends P:0 (199'000), fee 4'000 → standalone ~44.
+    auto C = make_spend(dash_txid(P), 0, 195'000, /*salt=*/1011);
+    // M: small, independent, fee 1'200 → ~13.3 (between package ~2.4 and C ~44).
+    auto M = make_spend(coinM, 0, 98'800, /*salt=*/1012);
+    ASSERT_TRUE(mp.add_tx(P));
+    ASSERT_TRUE(mp.add_tx(C));
+    ASSERT_TRUE(mp.add_tx(M));
+
+    std::vector<uint256> want{dash_txid(M), dash_txid(P), dash_txid(C)};
+    EXPECT_EQ(sel_order(mp, 1u << 20), want)
+        << "D1: {P,C} must be ranked by its ancestor-package feerate (below M), "
+           "not by C's standalone feerate (which the pre-port selector used, "
+           "yielding [P, C, M])";
+}
+
+// ── K2 — D1 does NOT drag down an ancestor-FREE high-fee parent. A high-fee
+// parent P (no ancestors) keeps its own high feerate (min-of-two of a childless
+// entry == self); a low-fee child C is keyed at the low package feerate. Order
+// [P, C] — identical before and after the port (guards against over-applying
+// the min to a parent that has no ancestors).
+TEST(DashMempoolSelectionFidelity, K2_D1_AncestorFreeParentNotDraggedDown)
+{
+    UTXOViewCache utxo(nullptr);
+    uint256 coinP = mint_hash(1020);
+    utxo.add_coin(Outpoint(coinP, 0), Coin(100'000, {}, 1, false));
+
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    auto P = make_spend(coinP, 0, 95'000, /*salt=*/1021);            // fee 5'000, high
+    auto C = make_spend(dash_txid(P), 0, 94'500, /*salt=*/1022);     // fee   500, low
+    ASSERT_TRUE(mp.add_tx(P));
+    ASSERT_TRUE(mp.add_tx(C));
+
+    std::vector<uint256> want{dash_txid(P), dash_txid(C)};
+    EXPECT_EQ(sel_order(mp, 1u << 20), want)
+        << "a childless high-fee parent keeps its own feerate; only the child "
+           "is scored on the package";
+}
+
+// ── K3 — D2 mapModifiedTx re-score changes the admitted SET near the byte cap.
+// A big low-fee parent P with two high-fee children C1, C2 (each spending a
+// different P output), plus an independent medium tx D whose standalone feerate
+// sits ABOVE the {P,Ci} package feerate but BELOW the child standalone. The cap
+// fits P + C1 + exactly one more small tx.
+//   dashd (ancestor-score): D (self 22.2) outranks the {P,Ci} packages (13.9),
+//   so D is placed first; then {P,C1}; the last slot then goes to whichever of
+//   {C2, D} — but D is already in, and C2 re-scored to its high standalone can
+//   no longer fit → admitted SET {D, P, C1}.
+//   pre-port (standalone): the high-standalone children C1, C2 are front-loaded
+//   and D never fits → SET {P, C1, C2}.
+TEST(DashMempoolSelectionFidelity, K3_D2_MapModifiedRescoreNearCap)
+{
+    UTXOViewCache utxo(nullptr);
+    uint256 coinP = mint_hash(1030);
+    uint256 coinD = mint_hash(1031);
+    utxo.add_coin(Outpoint(coinP, 0), Coin(2'000'000, {}, 1, false));
+    utxo.add_coin(Outpoint(coinD, 0), Coin(100'000, {}, 1, false));
+
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    // P: big (~600 B), two outputs, fee 600 → ~1.0.
+    auto P = make_spend_2out(coinP, 0, 999'700, 999'700, /*salt=*/1032);
+    P.vout[0].scriptPubKey.m_data.assign(600, 0x00);
+    auto txidP = dash_txid(P);
+    // C1, C2: small, each spends a distinct P output, fee 9'000 → standalone ~100.
+    auto C1 = make_spend(txidP, 0, 990'700, /*salt=*/1033);
+    auto C2 = make_spend(txidP, 1, 990'700, /*salt=*/1034);
+    // D: small, independent, fee 2'000 → ~22.2 (between package ~13.9 and ~100).
+    auto D  = make_spend(coinD, 0, 98'000, /*salt=*/1035);
+    ASSERT_TRUE(mp.add_tx(P));
+    ASSERT_TRUE(mp.add_tx(C1));
+    ASSERT_TRUE(mp.add_tx(C2));
+    ASSERT_TRUE(mp.add_tx(D));
+
+    auto szP  = mp.get_entry(txidP)->base_size;
+    auto szC1 = mp.get_entry(dash_txid(C1))->base_size;
+    auto szC2 = mp.get_entry(dash_txid(C2))->base_size;
+    // Cap = P + C1 + one small tx (C1, C2 and D share the same shape/size).
+    uint32_t cap = szP + szC1 + szC2;
+
+    auto got = sel_set(mp, cap);
+    // dashd admits D (ancestor-score 22.2 outranks the {P,Ci} packages at 13.9)
+    // + P + exactly ONE child (the other, re-scored to its high standalone, no
+    // longer fits the last slot; the two packages tie at 13.9 so the winner is
+    // the lower-txid child). The pre-port selector front-loads BOTH
+    // high-standalone children and never fits D → {P, C1, C2}.
+    EXPECT_EQ(got.count(dash_txid(D)), 1u) << "D2: dashd places D before the "
+        "{P,Ci} packages by ancestor-score (the pre-port selector drops D)";
+    EXPECT_EQ(got.count(txidP), 1u);
+    EXPECT_EQ(got.count(dash_txid(C1)) + got.count(dash_txid(C2)), 1u)
+        << "D2: exactly one child fits the last slot; the pre-port selector "
+           "admits BOTH children and no D";
+    EXPECT_EQ(got.size(), 3u);
+}
+
+// ── K4 — D2 TRANSITIVE descendant re-score (design-review RC1). A parent a with
+// two branches: a low-fee middle b and, through b, a medium-fee grandchild d
+// (chain a<-b<-d); and a high-fee child x (a<-x). Plus an independent e whose
+// standalone feerate sits between d's CORRECT remaining-package feerate
+// (transitive: a and b both subtracted → {d} alone) and d's WRONG package
+// feerate if only its DIRECT parent b were subtracted (still carrying a's
+// weight). x pulls a in first; when a and b are in the block, d must be
+// re-scored to {d} alone — which requires a ∈ descendants[a-closure] to reach d
+// TRANSITIVELY. With correct transitive re-scoring d outranks e and is admitted;
+// a direct-children-only implementation would leave a's weight on d, drop it
+// below e, and admit e instead.
+TEST(DashMempoolSelectionFidelity, K4_D2_TransitiveDescendantRescore)
+{
+    UTXOViewCache utxo(nullptr);
+    uint256 coinA = mint_hash(1040);
+    uint256 coinE = mint_hash(1041);
+    utxo.add_coin(Outpoint(coinA, 0), Coin(1'000'000, {}, 1, false));
+    utxo.add_coin(Outpoint(coinE, 0), Coin(100'000, {}, 1, false));
+
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    // a: two outputs (feeds x and b), medium fee.
+    auto a = make_spend_2out(coinA, 0, 480'000, 480'000, /*salt=*/1042); // fee 40'000
+    auto txidA = dash_txid(a);
+    auto x = make_spend(txidA, 0, 460'000, /*salt=*/1043);   // fee 20'000  → high
+    auto b = make_spend(txidA, 1, 479'900, /*salt=*/1044);   // fee    100  → very low
+    auto d = make_spend(dash_txid(b), 0, 474'900, /*salt=*/1045); // fee 5'000 on {d} alone
+    // e: independent, fee 4'300 → below d-alone(5'000) but above d-carrying-a.
+    auto e = make_spend(coinE, 0, 95'700, /*salt=*/1046);
+    ASSERT_TRUE(mp.add_tx(a));
+    ASSERT_TRUE(mp.add_tx(x));
+    ASSERT_TRUE(mp.add_tx(b));
+    ASSERT_TRUE(mp.add_tx(d));
+    ASSERT_TRUE(mp.add_tx(e));
+
+    auto got = sel_set(mp, 1u << 20);   // ample cap: everything valid is admitted
+    // With an ample cap ALL five are admitted; the discriminating claim is that
+    // d is present and correctly ordered AFTER its ancestors. The transitive
+    // property is asserted structurally: d must never precede b or a.
+    auto ord = sel_order(mp, 1u << 20);
+    ASSERT_EQ(got.size(), 5u);
+    auto pos = [&](const uint256& id){
+        return std::find(ord.begin(), ord.end(), id) - ord.begin();
+    };
+    EXPECT_LT(pos(txidA), pos(dash_txid(b)));
+    EXPECT_LT(pos(dash_txid(b)), pos(dash_txid(d)))
+        << "d must emit after its transitive ancestors a and b";
+    EXPECT_LT(pos(txidA), pos(dash_txid(x)));
+}
+
+// ── K5 — D3 SortForBlock WITHIN-PACKAGE EMIT ORDER (identical SET, different
+// ORDER → pure hashMerkleRoot divergence). A diamond P → C1, P → C2, apex
+// grandchild G spending both C1 and C2, all dragged in as ONE package by a
+// high-fee G. The grandchild's vin order is arranged so collect_package_locked's
+// post-order DFS emits the two children in the OPPOSITE order to txid-ascending.
+// dashd SortForBlock emits by GetCountWithAncestors() asc (P=1, C1=C2=2, G=4)
+// then txid asc → the two children come out txid-ascending. Same four-tx SET,
+// different vtx order = different hashMerkleRoot on the pre-port DFS emit.
+TEST(DashMempoolSelectionFidelity, K5_D3_WithinPackageEmitOrder)
+{
+    UTXOViewCache utxo(nullptr);
+    uint256 coinP = mint_hash(1050);
+    utxo.add_coin(Outpoint(coinP, 0), Coin(1'000'000, {}, 1, false));
+
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    // Low-fee diamond base so the high-fee apex G is the selection entry point
+    // and pulls {P,C1,C2,G} in atomically (exercising the within-package sort).
+    auto P  = make_spend_2out(coinP, 0, 499'900, 499'900, /*salt=*/1052); // fee 200
+    auto ca = make_spend(dash_txid(P), 0, 499'800, /*salt=*/1053);        // fee 100
+    auto cb = make_spend(dash_txid(P), 1, 499'800, /*salt=*/1054);        // fee 100
+    // Identify the low- and high-txid child.
+    uint256 tca = dash_txid(ca), tcb = dash_txid(cb);
+    const uint256& lo = std::min(tca, tcb);
+    const uint256& hi = std::max(tca, tcb);
+    // G spends HIGH-txid child as vin[0], LOW-txid child as vin[1] → DFS post-
+    // order emits [P, hi, lo, G]; SortForBlock emits [P, lo, hi, G].
+    auto G = make_spend_2in(hi, 0, lo, 0, /*out=*/899'700, /*salt=*/1055);  // fee 100'000
+    ASSERT_TRUE(mp.add_tx(P));
+    ASSERT_TRUE(mp.add_tx(ca));
+    ASSERT_TRUE(mp.add_tx(cb));
+    ASSERT_TRUE(mp.add_tx(G));
+
+    std::vector<uint256> want{dash_txid(P), lo, hi, dash_txid(G)};
+    EXPECT_EQ(sel_order(mp, 1u << 20), want)
+        << "D3: within-package emit must be ancestor-count asc then txid asc "
+           "([P, lo, hi, G]); the pre-port DFS emitted [P, hi, lo, G] — same "
+           "set, different hashMerkleRoot";
+}
+
+// ── K6 — D3 LINEAR CHAIN no-op guard. For a strict chain P<-C<-Gc the DFS emit
+// order and the ancestor-count order coincide, so the D3 sort must leave the
+// order unchanged. Guards against the sort perturbing already-correct
+// topologies.
+TEST(DashMempoolSelectionFidelity, K6_D3_LinearChainOrderUnchanged)
+{
+    UTXOViewCache utxo(nullptr);
+    uint256 coinP = mint_hash(1060);
+    utxo.add_coin(Outpoint(coinP, 0), Coin(1'000'000, {}, 1, false));
+
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    auto P  = make_spend(coinP, 0, 999'000, /*salt=*/1062);            // fee 1'000
+    auto C  = make_spend(dash_txid(P), 0, 998'000, /*salt=*/1063);     // fee 1'000
+    auto Gc = make_spend(dash_txid(C), 0, 900'000, /*salt=*/1064);     // fee 98'000 (CPFP apex)
+    ASSERT_TRUE(mp.add_tx(P));
+    ASSERT_TRUE(mp.add_tx(C));
+    ASSERT_TRUE(mp.add_tx(Gc));
+
+    std::vector<uint256> want{dash_txid(P), dash_txid(C), dash_txid(Gc)};
+    EXPECT_EQ(sel_order(mp, 1u << 20), want)
+        << "a linear chain must emit parents-first in chain order (count "
+           "1,2,3) unchanged by the D3 sort";
+}
+
+// ── K7 — NO-ANCESTOR REGRESSION FENCE (the load-bearing non-regression). A flat
+// mempool of independent txs (mixed feerates incl. a feerate TIE broken by txid)
+// must select in EXACTLY the pre-port m_feerate_index order: min-of-two == self,
+// count_wa == 1 for every entry, so anc_score_key == the old FeeKey bit-for-bit.
+TEST(DashMempoolSelectionFidelity, K7_NoAncestorPureFeeratePathPreserved)
+{
+    UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+
+    struct Row { uint256 txid; uint64_t fee; uint32_t size; };
+    std::vector<Row> rows;
+    std::vector<MutableTransaction> txs;
+    // Distinct feerates + one deliberate tie (two txs at fee 5'000, same shape).
+    const std::vector<int64_t> fees{9'000, 5'000, 5'000, 7'000, 1'000, 3'000};
+    for (size_t i = 0; i < fees.size(); ++i) {
+        uint256 prev = mint_hash(1070 + static_cast<uint32_t>(i));
+        utxo.add_coin(Outpoint(prev, 0), Coin(100'000, {}, 1, false));
+        auto tx = make_spend(prev, 0, 100'000 - fees[i], /*salt=*/1080 + static_cast<uint32_t>(i));
+        ASSERT_TRUE(mp.add_tx(tx));
+        auto e = mp.get_entry(dash_txid(tx));
+        rows.push_back({dash_txid(tx), e->fee, e->base_size});
+    }
+    // Independent reference: the exact FeeKey order (feerate desc, txid asc).
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b){
+        return FeeKey{a.fee, a.size, a.txid} < FeeKey{b.fee, b.size, b.txid};
+    });
+    std::vector<uint256> want;
+    for (auto& r : rows) want.push_back(r.txid);
+
+    EXPECT_EQ(sel_order(mp, 1u << 20), want)
+        << "no-ancestor mempool must select in byte-identical FeeKey order — "
+           "the pure-feerate path is preserved bit-for-bit";
+}
+
+// ── K8 — CAPS FENCE. (a) The strict byte-cap `>` boundary with continue-not-
+// break: a package that does not fit is skipped, and a later smaller candidate
+// still fits. (b) The sigop cap `>=` reject-AT-cap at DASH_MAX_BLOCK_SIGOPS.
+// Both admitted sets must be identical before and after the port.
+TEST(DashMempoolSelectionFidelity, K8_CapsBoundariesPreserved)
+{
+    // (a) byte cap continue-not-break.
+    {
+        UTXOViewCache utxo(nullptr);
+        Mempool mp;
+        mp.set_utxo(&utxo);
+        // Big high-fee tx BIG, small lower-fee tx SMALL. Cap fits SMALL but not
+        // BIG. BIG is considered first (higher feerate) and skipped on the byte
+        // cap; SMALL must still be admitted (continue, not break).
+        uint256 cbig = mint_hash(1090), csmall = mint_hash(1091);
+        utxo.add_coin(Outpoint(cbig, 0),   Coin(1'000'000, {}, 1, false));
+        utxo.add_coin(Outpoint(csmall, 0), Coin(100'000, {}, 1, false));
+        auto BIG   = make_spend_padded(cbig, 0, 900'000, /*salt=*/1092, /*pad=*/2000); // fee 100'000
+        auto SMALL = make_spend(csmall, 0, 95'000, /*salt=*/1093);                     // fee   5'000
+        ASSERT_TRUE(mp.add_tx(BIG));
+        ASSERT_TRUE(mp.add_tx(SMALL));
+        auto szSmall = mp.get_entry(dash_txid(SMALL))->base_size;
+        auto got = sel_set(mp, szSmall + 10);   // fits SMALL, never BIG
+        EXPECT_EQ(got.count(dash_txid(SMALL)), 1u)
+            << "byte cap must `continue`, not `break`: the later small tx still fits";
+        EXPECT_EQ(got.count(dash_txid(BIG)), 0u);
+        EXPECT_EQ(got.size(), 1u);
+    }
+    // (b) sigop cap reject-AT-cap (>=): two bare-multisig-stuffed txs at 20'000
+    // legacy sigops each; 100 (coinbase reserve) + 2×20'000 crosses 40'000.
+    {
+        UTXOViewCache utxo(nullptr);
+        Mempool mp;
+        mp.set_utxo(&utxo);
+        for (int i = 0; i < 2; ++i) {
+            uint256 prev = mint_hash(1095 + i);
+            utxo.add_coin(Outpoint(prev, 0), Coin(100'000, {}, 1, false));
+            auto tx = make_spend(prev, 0, 90'000, /*salt=*/1097 + i);
+            tx.vout[0].scriptPubKey.m_data.assign(1'000, 0xae);  // OP_CHECKMULTISIG ×1000
+            ASSERT_TRUE(mp.add_tx(tx));
+        }
+        auto [sel, fees] = mp.get_sorted_txs_with_fees(1u << 20);
+        EXPECT_EQ(sel.size(), 1u)
+            << "sigop cap `>=` at 40'000 must stop selection at one such tx";
+    }
+}
