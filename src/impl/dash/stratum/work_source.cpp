@@ -1010,6 +1010,53 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                     served_via_xcheck_swap = true;
                     }
                 }
+                // #127 null-arm reward-safety — merkleRootQuorums / merkleRootMNList
+                // xcheck. UNLIKE the creditPool delta above, a divergent quorum/MN
+                // merkle-root can NEVER be "explained" by anything: it is the exact
+                // bad-cbtx-quorummerkleroot / bad-cbtx-mnmerkleroot reject vector, so
+                // ANY difference is a HARD swap to dashd's template. This is
+                // UNCONDITIONAL (not behind --embedded-null-arm): it protects EVERY
+                // embedded template, and it is byte-neutral whenever the roots already
+                // match — which they do for every non-null template today, so current
+                // hotel behaviour is unchanged. The sel.source==Embedded guard skips
+                // this when the creditPool branch above already swapped (and MOVED
+                // dref), so dref is never double-served.
+                if (emb_ok && dref_ok
+                    && sel.source == coin::WorkSource::Embedded
+                    && dref.m_height == sel.work.m_height
+                    && (emb_cb.merkleRootQuorums != dref_cb.merkleRootQuorums
+                        || emb_cb.merkleRootMNList != dref_cb.merkleRootMNList)) {
+                    const bool quorums_differ =
+                        emb_cb.merkleRootQuorums != dref_cb.merkleRootQuorums;
+                    LOG_WARNING << "[DASH-STRATUM-GBT] GBT-xcheck "
+                                << (quorums_differ ? "merkleRootQuorums"
+                                                   : "merkleRootMNList")
+                                << " MISMATCH at h=" << sel.work.m_height
+                                << " embedded quorums="
+                                << emb_cb.merkleRootQuorums.GetHex().substr(0, 16)
+                                << " dashd quorums="
+                                << dref_cb.merkleRootQuorums.GetHex().substr(0, 16)
+                                << " embedded mnlist="
+                                << emb_cb.merkleRootMNList.GetHex().substr(0, 16)
+                                << " dashd mnlist="
+                                << dref_cb.merkleRootMNList.GetHex().substr(0, 16)
+                                << " — serving dashd template (reward-safety backstop:"
+                                   " a wrong quorum/MN root is the bad-cbtx-"
+                                   "quorummerkleroot reject vector)";
+                    coin::DeclineReport xcheck;
+                    xcheck.viable    = false;
+                    xcheck.cause     = quorums_differ
+                                           ? "gbt-xcheck-quorumroot-mismatch"
+                                           : "gbt-xcheck-mnroot-mismatch";
+                    xcheck.value     = (quorums_differ ? emb_cb.merkleRootQuorums
+                                                       : emb_cb.merkleRootMNList).GetHex();
+                    xcheck.threshold = (quorums_differ ? dref_cb.merkleRootQuorums
+                                                       : dref_cb.merkleRootMNList).GetHex();
+                    sel = coin::WorkSelection{ std::move(dref),
+                                               coin::WorkSource::DashdFallback,
+                                               std::move(xcheck) };
+                    served_via_xcheck_swap = true;
+                }
             }
             // ── THE SINGLE PIN SPLICE POINT ─────────────────────────────────
             // The arm is FINAL here: every producer of a served dashd-fallback
