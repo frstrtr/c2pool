@@ -322,6 +322,22 @@ public:
     /// reward-safe dashd fallback. Default OFF preserves prior unit-test posture.
     void set_require_fresh_credit_pool(bool v) { m_require_fresh_credit_pool = v; }
 
+    /// #107 PHASE 2 (--embedded-accrue-asset-locks, default OFF). When ON, the
+    /// embedded CbTx creditPoolBalance accrues the pending type-8 DIP-0027
+    /// asset-lock term (Σ first-OP_RETURN value over the mempool's pending
+    /// locks, asset_lock_fold.hpp / dashd creditpool.cpp:262-276) so it matches
+    /// what dashd commits — the gbt-xcheck-modulo-special-explained swap then
+    /// stops firing on the type-8-only case. The SAME term is added to the
+    /// emit-gate's expected creditPool (embedded_template_emit_ok) so a fresh
+    /// build satisfies the freshness gate instead of tripping
+    /// emit-creditpool-value-drift (PR body B2). Consensus caveat (B1): a block
+    /// committing this accrual is valid ONLY once the same type-8 txs ride the
+    /// served body (tx-serving, blocked on #125); until then the accrual makes
+    /// the classification match but a submitted coinbase-only block would be
+    /// bad-cbtx-assetlocked-amount. Hence default OFF.
+    void set_accrue_pending_asset_locks(bool v) { m_accrue_pending_asset_locks = v; }
+    bool accrue_pending_asset_locks() const { return m_accrue_pending_asset_locks; }
+
     /// Network MN_RR activation height (dashcore Params().GetConsensus()
     /// .MN_RRHeight — per-chainparams). Gates the DIP-0027 platform-share
     /// credit-pool accrual in the template build, the pre-emit value re-check,
@@ -1215,10 +1231,21 @@ public:
         // Uses the SAME accrual build_embedded_workdata does, so it is a pure
         // seed-delta check (the platform reward cancels): built == current seed.
         if (m_require_fresh_credit_pool) {
-            const int64_t expected_credit_pool =
+            int64_t expected_credit_pool =
                 m_credit_pool
                 + compute_dash_platform_reward_post_v20_mn_rr(next_h,
                                                               m_mn_rr_height);
+            // #107 PHASE 2 (B2): when the asset-lock fold is armed the builder
+            // ADDED the pending type-8 term to the committed pool. Re-derive it
+            // here from the SAME source (m_mempool's pending type-8 locks) with
+            // the SAME arithmetic (asset_lock_fold.hpp) so the freshness gate
+            // EXPECTS the accrued value instead of rejecting it. Off (default)
+            // this term is 0 and the check is byte-identical to before.
+            if (m_accrue_pending_asset_locks) {
+                expected_credit_pool +=
+                    pending_asset_lock_fold(m_mempool.pending_asset_lock_txs())
+                        .accrued;
+            }
             if (cb.creditPoolBalance != expected_credit_pool)
                 return reject("emit-creditpool-value-drift",
                               std::to_string(cb.creditPoolBalance),
@@ -1319,6 +1346,8 @@ public:
         // as mnstates/mempool); the builder gates admission per template.
         e.pinned_local_txs     = m_have_pinned_local_tx
                                      ? &m_pinned_local_txs : nullptr;
+        // #107 phase 2: accrue pending type-8 asset locks into the CbTx pool.
+        e.accrue_pending_asset_locks = m_accrue_pending_asset_locks;
         // E-SUPERBLOCK: hand the resolved treasury schedule to the builder.
         // Empty at non-superblock heights and confidently-unfunded superblocks
         // (normal block); the winning trigger's payees at a funded superblock.
@@ -1758,6 +1787,11 @@ private:
     // fee-carrying mempool-tx body path is an explicit operator opt-in (see
     // set_serve_mempool_txs).
     bool m_serve_mempool_txs{false};
+    // #107 PHASE 2 (--embedded-accrue-asset-locks): DEFAULT OFF — accrue the
+    // pending type-8 asset-lock term into the CbTx creditPoolBalance. See
+    // set_accrue_pending_asset_locks. Consumed by make_embedded_work_inputs
+    // (builder) and embedded_template_emit_ok (matching emit-gate re-derivation).
+    bool m_accrue_pending_asset_locks{false};
     // Pinned local tx (set_pinned_local_tx): held by value for the lifetime of
     // this state; the bundle exposes a pointer only when the flag is set.
     // MULTIPLE pins: the donation consolidation had to be SPLIT after
