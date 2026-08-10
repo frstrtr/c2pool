@@ -166,6 +166,13 @@ struct EmbeddedWorkInputs {
     // discipline as mnstates/mempool).
     const std::vector<MutableTransaction>* pinned_local_txs{nullptr};
 
+    // #107 PHASE 2 (--embedded-accrue-asset-locks): accrue the pending type-8
+    // DIP-0027 asset-lock term into the CbTx creditPoolBalance so it matches
+    // dashd's and the gbt-xcheck-modulo-special-explained swap stops firing on
+    // the type-8-only case. Default false => byte-unchanged accrual. Set by
+    // NodeCoinState::make_embedded_work_inputs from set_accrue_pending_asset_locks.
+    bool                             accrue_pending_asset_locks{false};
+
     bool viable() const {
         return has_state && mnstates != nullptr && mempool != nullptr;
     }
@@ -296,7 +303,10 @@ inline WorkSelection select_dash_work(
                 emb.suppress_cause,
                 // Pinned local tx (donation consolidation): admission gated
                 // inside the builder per template; null => byte-unchanged.
-                emb.pinned_local_txs);
+                emb.pinned_local_txs,
+                // #107 phase 2: accrue pending type-8 asset-lock term into the
+                // CbTx creditPoolBalance (default false => byte-unchanged).
+                emb.accrue_pending_asset_locks);
         },
         dashd_fallback);
 }

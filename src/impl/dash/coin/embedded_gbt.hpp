@@ -31,6 +31,7 @@
 #include <impl/dash/coin/mn_state_machine.hpp>
 #include <impl/dash/coin/sml_projection.hpp>    // confirmedHash rollover pass + collateral-spend predicate
 #include <impl/dash/coin/mempool.hpp>
+#include <impl/dash/coin/asset_lock_fold.hpp>   // #107 phase 2: DIP-0027 type-8 credit-pool fold
 #include <impl/dash/coin/subsidy.hpp>
 #include <impl/dash/coin/governance_object.hpp>   // SuperblockPayment (daemonless superblock outputs)
 #include <impl/dash/coin/utxo_adapter.hpp>
@@ -483,7 +484,26 @@ inline DashWorkData build_embedded_workdata(
     // regardless of suppress_mempool_txs — the coinbase-only posture is
     // about MEMPOOL selection; the pin is not a mempool tx.
     // Default nullptr => every existing positional caller byte-unchanged.
-    const std::vector<MutableTransaction>* pinned_local_txs = nullptr)
+    const std::vector<MutableTransaction>* pinned_local_txs = nullptr,
+    // ── #107 PHASE 2 seam: ACCRUE PENDING TYPE-8 ASSET LOCKS ──────────────
+    // --embedded-accrue-asset-locks (default OFF). When true, the CbTx
+    // creditPoolBalance below accrues the DIP-0027 asset-lock (type-8) term
+    // dashd would commit for this block — Σ first-OP_RETURN value over the
+    // pending type-8 locks in the mempool (asset_lock_fold.hpp, dashd
+    // creditpool.cpp:262-276). This makes our committed pool match dashd's so
+    // the gbt-xcheck-modulo-special-explained swap stops firing on the
+    // EXPLAINED (type-8-only) case. DEFAULT false => the accrual is exactly
+    // last_observed + platform_reward, byte-identical to today. Type-9
+    // (unlock) is OUT OF SCOPE and never accrued.
+    //
+    // CONSENSUS NOTE (why default OFF): the value committed here is re-derived
+    // and compared by the validator (specialtxman.cpp:749-755) against the
+    // block's OWN txs. A block that commits this accrual is VALID only if the
+    // SAME type-8 txs are in the served body (which requires tx-serving,
+    // --embedded-serve-mempool-txs, itself blocked on #125). Committing the
+    // accrual with a coinbase-only body would be a bad-cbtx-assetlocked-amount
+    // REJECTED block — see the PR body B1.
+    bool accrue_pending_asset_locks = false)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
@@ -892,8 +912,38 @@ inline DashWorkData build_embedded_workdata(
         // exactly the platform reward (66966830 duff) each block — see
         // test_dash_embedded_cbtx_byte_parity.cpp. When platform_reward is 0
         // (pre-MN_RR) the balance carries forward unchanged, also correct.
+        //
+        // #107 PHASE 2: when --embedded-accrue-asset-locks is armed, ADD the
+        // DIP-0027 type-8 (asset-lock) term dashd commits for this block. dashd
+        // builds its template from the pending locks in its mempool and adds,
+        // for each, the value of the lock tx's FIRST OP_RETURN output
+        // (creditpool.cpp:262-276) to GetTotalLocked() (creditpool.h:98-100),
+        // written to the CbTx at miner.cpp:314. We fold the SAME source — the
+        // pending type-8 locks in OUR mempool — with the SAME arithmetic
+        // (asset_lock_fold.hpp), each validated by check_asset_lock_tx
+        // (assetlocktx.cpp:44-95) so only would-be-valid block members count.
+        // Off (default) the term is 0 and the accrual is byte-identical to the
+        // pre-phase-2 template. The emit gate (node_coin_state.hpp
+        // embedded_template_emit_ok) re-derives this SAME term over the SAME
+        // mempool snapshot, so a fresh build cannot trip emit-creditpool-value-
+        // drift (PR body B2).
+        int64_t asset_lock_accrual = 0;
+        if (accrue_pending_asset_locks) {
+            const AssetLockFold f =
+                pending_asset_lock_fold(mempool.pending_asset_lock_txs());
+            asset_lock_accrual = f.accrued;
+            if (f.count > 0 || f.rejected > 0) {
+                LOG_INFO << "[GBT-EMB] #107 asset-lock accrual h="
+                         << (prev_height + 1) << " folded=" << f.count
+                         << " rejected=" << f.rejected
+                         << " accrual=" << asset_lock_accrual
+                         << " duff (committed creditPoolBalance now INCLUDES the"
+                            " pending type-8 locks; block is valid ONLY if those"
+                            " same txs ride the served body -- #125/tx-serving)";
+            }
+        }
         const int64_t accrued_credit_pool =
-            last_observed_credit_pool + platform_reward;
+            last_observed_credit_pool + platform_reward + asset_lock_accrual;
         // confirmedHash rollover (sml_projection.hpp, FINDING-1): the tip SML
         // is the verifier's PREV list, not the list for the block being
         // templated — dashd's rebuild starts with a purely height-driven

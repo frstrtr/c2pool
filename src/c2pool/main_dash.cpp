@@ -406,6 +406,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-utxo] [--embedded-mainnet] [--embedded-mn-bridge-max N]\n"
         << "           [--embedded-mn-bridge-no-cursor]\n"
         << "           [--embedded-utxo-immature-serve-empty] [--embedded-serve-mempool-txs]\n"
+        << "           [--embedded-accrue-asset-locks]\n"
         << "           [--pin-local-tx-hex FILE]  (zero-fee self-mined tx, e.g. donation consolidation)\n"
         << "           [--pin-splice-xcheck-arm]  (let pins ride an xcheck-SWAPPED dashd template; default OFF)\n"
         << "           [--pin-splice-block-budget] (EXCLUDE a pin that pushes the template past the block size cap; default OFF)\n"
@@ -847,7 +848,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // default on. OFF, the overflow is a WARNING and a recorded flag
              // on the template; ON, the pin is excluded with cause=block-budget
              // (block 2517855 was lost to bad-txns-oversize).
-             bool pin_splice_block_budget = false)
+             bool pin_splice_block_budget = false,
+             // --embedded-accrue-asset-locks (#107 PHASE 2): accrue the pending
+             // type-8 DIP-0027 asset-lock term into the embedded CbTx
+             // creditPoolBalance so it matches dashd's and the
+             // gbt-xcheck-modulo-special-explained swap stops firing on the
+             // type-8-only case. DEFAULT OFF — money/consensus path. A block
+             // committing this accrual is valid ONLY once the same type-8 txs
+             // ride the served body (tx-serving, blocked on #125); with a
+             // coinbase-only body a submitted block is bad-cbtx-assetlocked-
+             // amount. See asset_lock_fold.hpp + set_accrue_pending_asset_locks.
+             bool embedded_accrue_asset_locks = false)
 {
     namespace io = boost::asio;
 
@@ -2097,6 +2108,21 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // never coincide) and blind to a strict SUBSET that contains an invalid
     // transaction, which is exactly the case that costs a whole block.
     node_coin_state.set_serve_mempool_txs(embedded_serve_mempool_txs);
+    // #107 PHASE 2 (--embedded-accrue-asset-locks): DEFAULT OFF. When ON the
+    // embedded CbTx creditPoolBalance accrues the pending type-8 asset-lock term
+    // dashd commits, so the gbt-xcheck-modulo-special-explained swap stops
+    // firing on the type-8-only case (asset_lock_fold.hpp). CONSENSUS: a block
+    // committing this accrual is valid only once the same type-8 txs ride the
+    // served body (blocked on #125); otherwise a submitted coinbase-only block
+    // is bad-cbtx-assetlocked-amount. Hence OFF by default.
+    node_coin_state.set_accrue_pending_asset_locks(embedded_accrue_asset_locks);
+    std::cout << "[run] embedded #107 asset-lock accrual: "
+              << (embedded_accrue_asset_locks
+                      ? "ON (--embedded-accrue-asset-locks: CbTx creditPool "
+                        "accrues pending type-8 locks; VALID block needs those "
+                        "txs in the served body -- #125/tx-serving)"
+                      : "OFF (default: creditPool = seed + platform reward only)")
+              << "\n";
     std::cout << "[run] embedded mempool-tx serving: "
               << (embedded_serve_mempool_txs
                       ? "ON (--embedded-serve-mempool-txs: fee-carrying "
@@ -7344,6 +7370,7 @@ int main(int argc, char** argv)
     // (mempool_validity_gate.hpp) reports zero transactions refused by dashd's
     // testmempoolaccept over its sustained window.
     bool embedded_serve_mempool_txs = false;
+    bool embedded_accrue_asset_locks = false;  // #107 PHASE 2, default OFF
     // --embedded-creditpool-publish-at-serve-tip: publish the derived credit
     // pool AT THE SERVE TIP rather than at the folded body height (PR-5,
     // dashd GetCreditPool(pindexPrev) parity). MONEY PATH -> default OFF: it
@@ -7457,6 +7484,8 @@ int main(int argc, char** argv)
             embedded_utxo_immature_serve_empty = true;
         else if (std::strcmp(argv[i], "--embedded-serve-mempool-txs") == 0)
             embedded_serve_mempool_txs = true;
+        else if (std::strcmp(argv[i], "--embedded-accrue-asset-locks") == 0)
+            embedded_accrue_asset_locks = true;   // #107 PHASE 2
         else if (std::strcmp(argv[i], "--embedded-mempool-ingest") == 0)
             embedded_mempool_ingest = true;
         else if (std::strcmp(argv[i],
@@ -7752,7 +7781,8 @@ int main(int argc, char** argv)
                         serve_staleness_sentinel,
                         embedded_creditpool_publish_at_serve_tip,
                         pin_splice_xcheck_arm,
-                        pin_splice_block_budget);
+                        pin_splice_block_budget,
+                        embedded_accrue_asset_locks);   // #107 PHASE 2
     }
     return run_selftest();
 }

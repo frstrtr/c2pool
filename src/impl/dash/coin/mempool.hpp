@@ -551,6 +551,25 @@ public:
         return out;
     }
 
+    /// #107 PHASE 2: the pending type-8 (TRANSACTION_ASSET_LOCK) txs currently
+    /// resident in the pool. The credit-pool fold (asset_lock_fold.hpp) accrues
+    /// these into the embedded CbTx creditPoolBalance so it matches dashd's,
+    /// which builds its template from the SAME pending locks. Returns the raw
+    /// txs (not entries) — the fold reads only tx.vout / tx.extra_payload, and
+    /// validity is re-checked by check_asset_lock_tx, so no fee/UTXO context is
+    /// needed here. Deterministic order (std::map is txid-ascending) so the
+    /// builder and the emit-gate re-derivation over the same snapshot agree.
+    std::vector<MutableTransaction> pending_asset_lock_txs() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<MutableTransaction> out;
+        for (const auto& [_, e] : m_pool) {
+            if (e.tx.type == 8 /*CAssetLockPayload::SPECIALTX_TYPE*/)
+                out.push_back(e.tx);
+        }
+        return out;
+    }
+
     /// Snapshot of all transactions keyed by txid. Used (eventually)
     /// by BIP 152 compact-block reconstruction + by block-template
     /// builder in Phase C-TEMPLATE.

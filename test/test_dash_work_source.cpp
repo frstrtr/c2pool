@@ -15,6 +15,8 @@
 
 #include <impl/dash/coin/work_source.hpp>
 #include <impl/dash/coin/special_tx_pool_delta.hpp>
+#include <impl/dash/coin/asset_lock_fold.hpp>      // #107 PHASE 2 fold-under-test
+#include <impl/dash/coin/mempool.hpp>              // #107 PHASE 2 mempool accessor
 #include <impl/dash/coin/rpc_data.hpp>
 #include <impl/dash/coin/utxo_adapter.hpp>
 #include <core/coin/utxo_view_cache.hpp>
@@ -718,4 +720,179 @@ TEST(DashSpecialPoolDelta, UnparsablePayloadExplainsNothing)
     EXPECT_TRUE(sp.unparsable);
     EXPECT_FALSE(sp.explains(0, 0));
     EXPECT_FALSE(sp.explains(0, 1'000));
+}
+
+// ─── #107 PHASE 2: ACCRUE the pending type-8 asset-lock term into OUR CbTx ────
+// These KATs pin asset_lock_fold.hpp — the arithmetic that lets our embedded
+// template COMMIT the same creditPoolBalance dashd does, so the
+// gbt-xcheck-modulo-special-explained swap stops firing on the type-8-only
+// case. Unlike special_tx_pool_delta (phase 1, which EXPLAINS dashd's list
+// after the fact via Σ creditOutputs), the fold reads the value dashd actually
+// commits with: the FIRST OP_RETURN output of the lock tx
+// (dashd creditpool.cpp:262-276), validated by a CheckAssetLockTx port
+// (assetlocktx.cpp:44-95). Shapes are the ones measured live on mainnet the
+// night of 2026-08-06/07 (same night as the phase-1 numbers).
+//
+// NEUTER PROOF (executed, not asserted from a comment): with
+// asset_lock_first_op_return_value() forced to `return 0;` — a fold that
+// accrues nothing — DashAssetLockFold.RealMainnetLockAccruesFirstOpReturn
+// FAILS at `EXPECT_EQ(f.accrued, kLock)` (0 != 2689906) and
+// PoolMatchesDashdAfterFold FAILS at `EXPECT_EQ(ours + f.accrued, dashd)`.
+// With check_asset_lock_tx() forced to `return true;` (skip validation),
+// InvalidLockCreditMismatchIsRejected FAILS at `EXPECT_EQ(f.rejected, 1u)`.
+namespace {
+
+using ::bitcoin_family::coin::TxOut;
+
+// A bare 2-byte OP_RETURN marker output carrying `v` duffs — the shape a real
+// asset-lock uses to encode the locked amount (dashd scans vout for the first
+// OP_RETURN and takes its value).
+TxOut op_return_out(int64_t v) {
+    TxOut o;
+    o.value = v;
+    o.scriptPubKey.m_data = { 0x6a, 0x00 };   // OP_RETURN OP_0 (2 bytes)
+    return o;
+}
+
+// A VALID mainnet-shaped type-8: exactly one 2-byte OP_RETURN output of value
+// `amount`, and payload.creditOutputs summing to the SAME amount (the
+// CheckAssetLockTx invariant, assetlocktx.cpp:90-92). Splits the credit across
+// `n_credit_outputs` outputs to exercise the sum, defaulting to one.
+dash::coin::MutableTransaction make_valid_lock(int64_t amount,
+                                               unsigned n_credit_outputs = 1) {
+    dash::coin::vendor::CAssetLockPayload pl;
+    int64_t remaining = amount;
+    for (unsigned i = 0; i + 1 < n_credit_outputs; ++i) {
+        pl.creditOutputs.push_back(out_of(1));
+        --remaining;
+    }
+    pl.creditOutputs.push_back(out_of(remaining));   // last carries the rest
+
+    dash::coin::MutableTransaction tx;
+    tx.version = 3;
+    tx.type    = dash::coin::vendor::CAssetLockPayload::SPECIALTX_TYPE;  // 8
+    tx.vout.push_back(op_return_out(amount));
+    tx.extra_payload = pack_payload(pl);
+    return tx;
+}
+
+} // namespace
+
+// 1) The h=2517494 lock (0.02689906 DASH): the fold's accrual is the value of
+//    the tx's FIRST OP_RETURN output — dashd's exact source.
+TEST(DashAssetLockFold, RealMainnetLockAccruesFirstOpReturn)
+{
+    const int64_t kLock = 2'689'906;                 // measured on mainnet
+    std::vector<dash::coin::MutableTransaction> txs{ make_valid_lock(kLock) };
+
+    const auto f = dash::coin::pending_asset_lock_fold(txs);
+
+    EXPECT_EQ(f.count, 1u);
+    EXPECT_EQ(f.rejected, 0u);
+    EXPECT_EQ(f.accrued, kLock);
+    // The raw dashd-source reader agrees with the fold.
+    EXPECT_EQ(dash::coin::asset_lock_first_op_return_value(txs[0]), kLock);
+}
+
+// 2) THE GOAL: our seed + fold lands exactly on dashd's committed pool, so the
+//    xcheck swap stops firing. Mirror of the phase-1 explain test, but in the
+//    COMMIT direction — our template now MATCHES instead of being swapped.
+TEST(DashAssetLockFold, PoolMatchesDashdAfterFold)
+{
+    const int64_t kLock = 2'689'906;
+    const int64_t ours  = 3'028'884'293'639;         // our seed+reward pool
+    const int64_t dashd = ours + kLock;              // dashd, with the lock
+
+    const auto f = dash::coin::pending_asset_lock_fold(
+        std::vector<dash::coin::MutableTransaction>{ make_valid_lock(kLock) });
+
+    EXPECT_EQ(ours + f.accrued, dashd);
+}
+
+// 3) Multiple pending locks sum; multi-output credit payloads still balance.
+TEST(DashAssetLockFold, MultipleLocksSumFirstOpReturns)
+{
+    const int64_t a = 35'000'000;
+    const int64_t b =  2'689'906;
+    std::vector<dash::coin::MutableTransaction> txs{
+        make_valid_lock(a, /*n_credit_outputs=*/3),
+        make_plain(),
+        make_valid_lock(b) };
+
+    const auto f = dash::coin::pending_asset_lock_fold(txs);
+
+    EXPECT_EQ(f.count, 2u);
+    EXPECT_EQ(f.rejected, 0u);
+    EXPECT_EQ(f.accrued, a + b);
+}
+
+// 4) VALIDATION, not assumption: a lock whose creditOutputs do NOT equal its
+//    OP_RETURN value is not a valid block member (CheckAssetLockTx fails,
+//    assetlocktx.cpp:90-92). It is REJECTED and contributes nothing — dashd
+//    would not include it, and neither may our accrual.
+TEST(DashAssetLockFold, InvalidLockCreditMismatchIsRejected)
+{
+    auto bad = make_valid_lock(2'689'906);
+    // Break the invariant: OP_RETURN now says one duff more than the credits.
+    bad.vout[0].value += 1;
+
+    const auto f = dash::coin::pending_asset_lock_fold(
+        std::vector<dash::coin::MutableTransaction>{ bad });
+
+    EXPECT_EQ(f.count, 0u);
+    EXPECT_EQ(f.rejected, 1u);
+    EXPECT_EQ(f.accrued, 0);
+    EXPECT_FALSE(dash::coin::check_asset_lock_tx(bad));
+}
+
+// 5) A type-8 with NO OP_RETURN output is invalid (returnCount != 1) and is
+//    rejected; the raw reader reports -1 (no source to commit).
+TEST(DashAssetLockFold, LockWithoutOpReturnIsRejected)
+{
+    // Reuse the phase-1 make_lock(): it sets creditOutputs but NO vout, so it
+    // has no OP_RETURN marker — exactly the missing-source case.
+    auto no_marker = make_lock(1'000);
+
+    EXPECT_FALSE(dash::coin::check_asset_lock_tx(no_marker));
+    EXPECT_EQ(dash::coin::asset_lock_first_op_return_value(no_marker), -1);
+
+    const auto f = dash::coin::pending_asset_lock_fold(
+        std::vector<dash::coin::MutableTransaction>{ no_marker });
+    EXPECT_EQ(f.count, 0u);
+    EXPECT_EQ(f.rejected, 1u);
+    EXPECT_EQ(f.accrued, 0);
+}
+
+// 6) Type-9 (unlock) is OUT OF SCOPE and never folded; type-0 is ignored. Only
+//    valid type-8 locks accrue.
+TEST(DashAssetLockFold, UnlockAndPlainNeverAccrue)
+{
+    std::vector<dash::coin::MutableTransaction> txs{
+        make_unlock(7'200'000'000, 190), make_plain() };
+
+    const auto f = dash::coin::pending_asset_lock_fold(txs);
+
+    EXPECT_EQ(f.count, 0u);
+    EXPECT_EQ(f.rejected, 0u);   // type-9/type-0 are not even candidates
+    EXPECT_EQ(f.accrued, 0);
+}
+
+// 7) THE WIRED PATH: the exact source-accessor the builder and the emit gate
+//    call — Mempool::pending_asset_lock_txs() — returns the resident type-8
+//    locks, and folding them reproduces the accrual. This is the seam that
+//    keeps build_embedded_workdata and embedded_template_emit_ok in agreement.
+TEST(DashAssetLockFold, MempoolAccessorFeedsTheFold)
+{
+    const int64_t kLock = 2'689'906;
+    dash::coin::Mempool pool;
+    pool.add_tx(make_valid_lock(kLock));
+    pool.add_tx(make_plain());                       // type-0, ignored
+    pool.add_tx(make_unlock(1'000, 5));              // type-9, out of scope
+
+    const auto pending = pool.pending_asset_lock_txs();
+    ASSERT_EQ(pending.size(), 1u);                   // only the type-8 lock
+
+    const auto f = dash::coin::pending_asset_lock_fold(pending);
+    EXPECT_EQ(f.count, 1u);
+    EXPECT_EQ(f.accrued, kLock);
 }
