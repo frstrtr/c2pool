@@ -278,6 +278,69 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_pool.count(txid)) return false;
 
+        // #125 — REJECT ALREADY-CONFIRMED TRANSACTIONS AT ADMISSION.
+        //
+        // A peer can relay a transaction that is ALREADY MINED. The txid-dedup
+        // above only catches a tx already in OUR pool (the benign
+        // txn-already-in-mempool case); it does NOT catch one that is already
+        // in a block but never passed through our pool. Admitting such a tx and
+        // then packing it into a template produces an INVALID BLOCK (a lost
+        // block), so it must be refused here — upstream of the mempool validity
+        // gate, which is correct and untouched.
+        //
+        // Ported EXACTLY from dashd MemPoolAccept::PreChecks
+        // (/tmp/dashsrc/src/validation.cpp:851-857):
+        //     if (!m_view.HaveCoin(txin.prevout)) {
+        //         for (size_t out = 0; out < tx.vout.size(); out++)
+        //             if (coins_cache.HaveCoinInCache(COutPoint(hash, out)))
+        //                 return state.Invalid(TX_CONFLICT, "txn-already-known");
+        //         return state.Invalid(TX_MISSING_INPUTS, ...);
+        //     }
+        // The signal: when an input's coin is MISSING from the view but one of
+        // the tx's OWN outputs is already a coin in the view, that output can
+        // only exist because the identical tx (txid = Hash(tx)) is already in a
+        // block. A genuine unconfirmed tx has its inputs PRESENT and its own
+        // outputs ABSENT, so it never reaches the own-output scan.
+        //
+        // ORDERING IS LOAD-BEARING (dashd's !HaveCoin guard): we consult
+        // own-outputs ONLY when at least one input is missing. We must NEVER
+        // reject a tx whose inputs are all present (a normal unconfirmed tx),
+        // and — unlike dashd's else-branch — we do NOT reject on
+        // input-missing-alone: CPFP chains, coins older than the node's start
+        // height, and orphans are admitted today with fee_known=false and must
+        // stay admitted. The reject fires ONLY on own-output-present.
+        //
+        // FAIL-OPEN (false-negative-safe): the check runs only when a UTXO view
+        // is wired; if the forward-built view cannot tell (no view, or a
+        // confirmed tx whose outputs were since spent / predate our start
+        // height), we ADMIT and let the mempool validity gate / serve path
+        // decide. This is deliberate: a false REJECT of a genuinely-unconfirmed
+        // valid tx would silently DROP its fees once --embedded-serve-mempool-txs
+        // arms. A false positive is impossible here — for an own output
+        // (txid:n) to already be a coin, some tx must have produced the
+        // identical outpoint, and identical outpoint ⇒ identical txid ⇒
+        // identical tx, i.e. the already-confirmed instance, never a distinct
+        // unconfirmed tx.
+        if (utxo != nullptr) {
+            bool any_input_missing = false;
+            for (const auto& vin : tx.vin) {
+                ::core::coin::Outpoint op(vin.prevout.hash, vin.prevout.index);
+                if (!utxo->have_coin(op)) { any_input_missing = true; break; }
+            }
+            if (any_input_missing) {
+                for (size_t out = 0; out < tx.vout.size(); ++out) {
+                    ::core::coin::Outpoint own(txid, static_cast<uint32_t>(out));
+                    if (utxo->have_coin(own)) {
+                        LOG_INFO << "[MEMPOOL] reject txn-already-known txid="
+                                 << txid.GetHex().substr(0, 16)
+                                 << " (own output " << out
+                                 << " already a coin, an input is missing)";
+                        return false;
+                    }
+                }
+            }
+        }
+
         MempoolEntry entry;
         entry.tx         = tx;
         entry.txid       = txid;
