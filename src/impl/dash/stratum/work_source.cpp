@@ -1057,6 +1057,90 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                                                std::move(xcheck) };
                     served_via_xcheck_swap = true;
                 }
+                // #130 tx-serving reward-safety — NON-COINBASE tx-merkleroot
+                // xcheck. The #1216 creditPool / quorum / MN branches above
+                // guard the CbTx (coinbase) axis; this guards the TRANSACTION-
+                // SELECTION axis, which lives entirely in the non-coinbase txid
+                // vector m_tx_hashes (mempool selection AND the type-6
+                // commitment order both fold into it). Once
+                // --embedded-serve-mempool-txs is armed, a divergent mempool tx
+                // SELECTION or commitment ORDER yields a different block body ->
+                // a different hashMerkleRoot -> the exact bad-txns- / orphan
+                // reject vector. The embedded selector is KNOWN to diverge from
+                // dashd's BlockAssembler (D1 ancestor-score primary key, D2
+                // mapModifiedTx CPFP re-scoring, D3 within-package emit order --
+                // see the PR body); this backstop makes that divergence
+                // reward-SAFE by swapping to dashd's template on ANY non-
+                // coinbase-body mismatch, exactly as the quorum branch does for
+                // the CbTx roots. The selection-fidelity port that CLOSES D1/D2/
+                // D3 in mempool.hpp is a separate follow-up; it only lowers the
+                // swap rate, it is not needed for safety once this guard is in.
+                //
+                // FIELD — the fold over the ORDERED non-coinbase body,
+                // coin::compute_merkle_root(m_tx_hashes), NOT the full-block
+                // hashMerkleRoot. The full-block root folds [coinbase_txid]+
+                // m_tx_hashes, and the embedded vs dashd-fallback coinbases
+                // differ BY CONSTRUCTION (extranonce / payload / timestamp), so
+                // a full-block-root compare would mismatch on EVERY template and
+                // swap-to-dashd always, defeating the daemonless mandate.
+                // Coinbase correctness is already covered by the #1216 CbTx
+                // branches above; the tx-selection axis lives entirely here.
+                // DashWorkData carries no hashMerkleRoot member, so the fold is
+                // recomputed on the fly exactly as the assembler commits it
+                // (block_producer.hpp compute_merkle_root).
+                //
+                // GATE — sel.work.m_mempool_tx_count > 0. When
+                // --embedded-serve-mempool-txs is OFF (the default) the embedded
+                // body is coinbase-only (m_tx_hashes empty, m_mempool_tx_count
+                // ==0) while dref (a real getblocktemplate) carries mempool txs;
+                // comparing the folds without this gate would mismatch on every
+                // template and collapse embedded serving to always-dashd. The
+                // gate is also SEMANTICALLY correct: a body with no mempool-
+                // selected txs can never orphan for a bad-txset reason, so it
+                // needs no tx-selection guard (pin-only bodies are owned by the
+                // pin-splice machinery below, not by this axis). This is NOT a
+                // feature-flag gate -- like #1216 it protects EVERY armed
+                // template unconditionally; m_mempool_tx_count>0 is the natural
+                // applicability precondition of a tx-selection guard, a body
+                // that actually carries mempool txs. Byte-neutral today: with
+                // the flag OFF the branch is skipped, so hotel behaviour is
+                // bit-identical. Deliberately NOT gated on emb_ok && dref_ok:
+                // the tx-merkle axis is a body/header axis independent of the
+                // CbTx, so requiring cbtx-parse-success would create a silent
+                // safety miss if a divergent-set template happened to fail cbtx
+                // parse. The sel.source==Embedded re-check skips this branch when
+                // a prior branch already swapped (and MOVED dref), so dref is
+                // never double-served -- and it is evaluated FIRST so the moved
+                // dref is never read.
+                if (sel.source == coin::WorkSource::Embedded
+                    && dref.m_height == sel.work.m_height
+                    && sel.work.m_mempool_tx_count > 0) {
+                    const uint256 emb_txroot =
+                        coin::compute_merkle_root(sel.work.m_tx_hashes);
+                    const uint256 dref_txroot =
+                        coin::compute_merkle_root(dref.m_tx_hashes);
+                    if (emb_txroot != dref_txroot) {
+                        LOG_WARNING << "[DASH-STRATUM-GBT] GBT-xcheck tx-merkleroot"
+                                    << " MISMATCH at h=" << sel.work.m_height
+                                    << " embedded txs=" << sel.work.m_tx_hashes.size()
+                                    << " root=" << emb_txroot.GetHex().substr(0, 16)
+                                    << " dashd txs=" << dref.m_tx_hashes.size()
+                                    << " root=" << dref_txroot.GetHex().substr(0, 16)
+                                    << " — serving dashd template (reward-safety"
+                                       " backstop: a divergent mempool tx selection"
+                                       " / commitment order is the bad-txns-"
+                                       "merkleroot orphan vector)";
+                        coin::DeclineReport xcheck;
+                        xcheck.viable    = false;
+                        xcheck.cause     = "gbt-xcheck-txmerkle-mismatch";
+                        xcheck.value     = emb_txroot.GetHex();
+                        xcheck.threshold = dref_txroot.GetHex();
+                        sel = coin::WorkSelection{ std::move(dref),
+                                                   coin::WorkSource::DashdFallback,
+                                                   std::move(xcheck) };
+                        served_via_xcheck_swap = true;
+                    }
+                }
             }
             // ── THE SINGLE PIN SPLICE POINT ─────────────────────────────────
             // The arm is FINAL here: every producer of a served dashd-fallback

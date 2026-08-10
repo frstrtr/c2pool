@@ -2091,6 +2091,218 @@ TEST(DashStratumC1MainnetGate, GbtXcheckQuorumRootMatchServesEmbeddedUnchanged)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GBT-xcheck reward-safety BACKSTOP — NON-COINBASE tx-merkleroot axis (#130,
+// tx-serving analog of #1216). The #1216 branches guard the CbTx (coinbase)
+// roots; this one guards the TRANSACTION-SELECTION axis, which lives entirely in
+// the non-coinbase txid vector m_tx_hashes. Once --embedded-serve-mempool-txs is
+// armed the embedded selector — KNOWN to diverge from dashd's BlockAssembler
+// (ancestor-score key, mapModifiedTx CPFP, within-package emit order) — can pick
+// a different tx SET/ORDER at the same tip, folding to a different block body
+// hashMerkleRoot: the exact bad-txns-merkleroot orphan vector. A served embedded
+// template whose non-coinbase fold disagrees with dashd's GBT for the same
+// height MUST swap to dashd's template with cause=gbt-xcheck-txmerkle-mismatch.
+// Neuter the new compare in work_source.cpp (`if (false && ...)`) and the swap
+// KAT goes RED while the byte-neutral KAT stays GREEN — the load-bearing proof.
+namespace {
+// The mempool spend the embedded arm SELECTS: a positive-fee spend of a mature
+// non-coinbase coin the fixture funds. Deterministic id.
+dash::coin::MutableTransaction txmerkle_mempool_spend(const uint256& funding)
+{
+    dash::coin::MutableTransaction tx;
+    tx.vin.resize(1);
+    tx.vin[0].prevout.hash  = funding;
+    tx.vin[0].prevout.index = 0;
+    tx.vout.resize(1);
+    tx.vout[0].value = 90'000;   // 100k funded − 90k = 10k fee (>0 → selected)
+    tx.vout[0].scriptPubKey.m_data = fixture_miner_script();
+    return tx;
+}
+// make_quorumroot_xcheck_cs() + a served mempool tx: with --embedded-serve-
+// mempool-txs ON and a funded UTXO the embedded template comes back with
+// m_mempool_tx_count==1 and m_tx_hashes carrying the spend's txid, so the tx-
+// merkle axis is LIVE (the m_mempool_tx_count>0 gate is satisfied). The caller
+// OWNS `utxo`; it must outlive the returned coin state / any DASHWorkSource
+// built over it.
+std::unique_ptr<dash::coin::NodeCoinState>
+make_txmerkle_xcheck_cs(::core::coin::UTXOViewCache& utxo, const uint256& funding)
+{
+    utxo.add_coin(::core::coin::Outpoint(funding, 0),
+                  ::core::coin::Coin(100'000, {}, /*height=*/1, /*cb=*/false));
+    auto cs = make_quorumroot_xcheck_cs();
+    cs->mempool().set_utxo(&utxo);
+    EXPECT_TRUE(cs->mempool().add_tx(txmerkle_mempool_spend(funding)))
+        << "fixture: the mempool spend must price against the funded UTXO";
+    cs->set_serve_mempool_txs(true);
+    return cs;
+}
+}  // namespace
+
+TEST(DashStratumC1MainnetGate, GbtXcheckServesDashdOnTxMerkleMismatch)
+{
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    uint256 funding;  funding.begin()[0] = 0x51;
+
+    // (0) Capture the EMBEDDED template with the xcheck OFF: its CbTx roots
+    // become the values dashd must MATCH (so ONLY the tx axis is under test),
+    // and its non-empty served tx set proves the fixture actually carries
+    // mempool txs (so the m_mempool_tx_count>0 gate does not make the assertion
+    // below vacuous).
+    dash::coin::vendor::CCbTx emb_cb;
+    std::vector<uint256> emb_txids;
+    uint32_t emb_mempool_n = 0;
+    {
+        ::core::coin::UTXOViewCache utxo(nullptr);
+        auto cs = make_txmerkle_xcheck_cs(utxo, funding);
+        auto never = []() -> dash::coin::DashWorkData { return {}; };
+        dash::stratum::DASHWorkSource ws(*cs, never, xcheck_submit,
+                                         core::stratum::StratumConfig{},
+                                         /*is_testnet=*/true);
+        ASSERT_FALSE(ws.get_current_work_template().empty());
+        auto t = ws.peek_template();
+        ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+        ASSERT_TRUE(dash::coin::vendor::parse_cbtx(t->m_coinbase_payload, emb_cb));
+        emb_txids     = t->m_tx_hashes;
+        emb_mempool_n = t->m_mempool_tx_count;
+    }
+    ASSERT_GT(emb_mempool_n, 0u)
+        << "fixture broken: the embedded arm served no mempool txs, so the "
+           "m_mempool_tx_count>0 gate would skip the branch and this KAT would "
+           "be vacuous";
+    ASSERT_FALSE(emb_txids.empty());
+    const uint256 emb_txroot = dash::coin::compute_merkle_root(emb_txids);
+
+    // dashd fallback: SAME height, SAME creditPool / merkleRootMNList /
+    // merkleRootQuorums (so the #1216 CbTx branches do NOT fire), but a
+    // DIFFERENT non-coinbase tx set → ONLY the tx-merkle axis diverges.
+    std::vector<uint256> dref_txids(1);
+    dref_txids[0].SetHex(std::string(64, 'e'));
+    const uint256 dref_txroot = dash::coin::compute_merkle_root(dref_txids);
+    ASSERT_NE(emb_txroot, dref_txroot)
+        << "fixture: the dashd tx set must actually fold to a different root";
+
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height         = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits           = 0x1e0ffff0u;
+        w.m_version        = static_cast<uint32_t>(kVersion);
+        w.m_curtime        = kCurtime;
+        dash::coin::vendor::CCbTx cb;
+        cb.nVersion           = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+        cb.nHeight            = static_cast<int32_t>(kEmbeddedPrevHeight + 1);
+        cb.merkleRootMNList   = emb_cb.merkleRootMNList;   // MATCH → not the mn axis
+        cb.merkleRootQuorums  = emb_cb.merkleRootQuorums;  // MATCH → not the quorum axis
+        cb.creditPoolBalance  = emb_cb.creditPoolBalance;  // MATCH → not the creditPool axis
+        w.m_coinbase_payload  = dash::coin::encode_cbtx(cb);
+        w.m_tx_hashes         = dref_txids;                // DIFFER → the axis under test
+        w.m_mempool_tx_count  = 1;
+        return w;
+    };
+
+    ::core::coin::UTXOViewCache utxo(nullptr);
+    auto cs = make_txmerkle_xcheck_cs(utxo, funding);
+    dash::stratum::DASHWorkSource ws(*cs, fallback, xcheck_submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    ws.set_gbt_xcheck(true);
+
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+    // The served body is now dashd's: its non-coinbase set folds to dashd's
+    // root, NOT the embedded one.
+    EXPECT_EQ(dash::coin::compute_merkle_root(t->m_tx_hashes), dref_txroot)
+        << "on a tx-merkleroot mismatch the backstop must serve dashd's body";
+    EXPECT_NE(dash::coin::compute_merkle_root(t->m_tx_hashes), emb_txroot);
+    dash::coin::vendor::CCbTx served;
+    ASSERT_TRUE(dash::coin::vendor::parse_cbtx(t->m_coinbase_payload, served));
+    EXPECT_EQ(served.creditPoolBalance, emb_cb.creditPoolBalance)
+        << "the swap is on the tx axis: the CbTx roots MATCHED, proving the "
+           "#1216 branches did not fire and this is the tx-merkle branch";
+    const auto st = ws.embedded_arm_status_json();
+    EXPECT_EQ(st.value("arm", std::string{}), "dashd-fallback")
+        << "the swap must leave the served arm as the dashd fallback";
+    EXPECT_EQ(st.value("no_work_reason", std::string{}), "gbt-xcheck-txmerkle-mismatch")
+        << "the swap must be recorded with the distinct tx-merkleroot cause";
+}
+
+// Byte-neutral proof: when the embedded non-coinbase fold already MATCHES dashd's
+// (and the CbTx roots match too) the unconditional xcheck adds NO swap and the
+// served bytes ARE the embedded template's, unchanged — coinbase and body. This
+// is why arming the guard changes nothing on a template whose selection already
+// agrees with dashd.
+TEST(DashStratumC1MainnetGate, GbtXcheckTxMerkleMatchServesEmbeddedUnchanged)
+{
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    uint256 funding;  funding.begin()[0] = 0x51;
+
+    // Capture the embedded template (xcheck OFF): CbTx roots, the served tx set,
+    // and the raw served CbTx bytes.
+    dash::coin::vendor::CCbTx emb_cb;
+    std::vector<uint256> emb_txids;
+    std::vector<unsigned char> emb_raw;
+    {
+        ::core::coin::UTXOViewCache utxo(nullptr);
+        auto cs = make_txmerkle_xcheck_cs(utxo, funding);
+        auto never = []() -> dash::coin::DashWorkData { return {}; };
+        dash::stratum::DASHWorkSource ws(*cs, never, xcheck_submit,
+                                         core::stratum::StratumConfig{},
+                                         /*is_testnet=*/true);
+        ASSERT_FALSE(ws.get_current_work_template().empty());
+        auto t = ws.peek_template();
+        ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+        ASSERT_TRUE(dash::coin::vendor::parse_cbtx(t->m_coinbase_payload, emb_cb));
+        ASSERT_GT(t->m_mempool_tx_count, 0u)
+            << "fixture broken: no mempool txs served, byte-neutral claim vacuous";
+        emb_txids = t->m_tx_hashes;
+        emb_raw   = t->m_coinbase_payload;
+    }
+    ASSERT_FALSE(emb_raw.empty());
+
+    // dashd fallback: SAME height, SAME CbTx roots, AND the SAME non-coinbase tx
+    // set → every axis matches, so the unconditional xcheck adds no swap.
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height         = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits           = 0x1e0ffff0u;
+        w.m_version        = static_cast<uint32_t>(kVersion);
+        w.m_curtime        = kCurtime;
+        dash::coin::vendor::CCbTx cb;
+        cb.nVersion           = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+        cb.nHeight            = static_cast<int32_t>(kEmbeddedPrevHeight + 1);
+        cb.merkleRootMNList   = emb_cb.merkleRootMNList;
+        cb.merkleRootQuorums  = emb_cb.merkleRootQuorums;
+        cb.creditPoolBalance  = emb_cb.creditPoolBalance;
+        w.m_coinbase_payload  = dash::coin::encode_cbtx(cb);
+        w.m_tx_hashes         = emb_txids;                              // MATCH → byte-neutral
+        w.m_mempool_tx_count  = static_cast<uint32_t>(emb_txids.size());
+        return w;
+    };
+
+    ::core::coin::UTXOViewCache utxo(nullptr);
+    auto cs = make_txmerkle_xcheck_cs(utxo, funding);
+    dash::stratum::DASHWorkSource ws(*cs, fallback, xcheck_submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    ws.set_gbt_xcheck(true);
+
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+    EXPECT_EQ(t->m_coinbase_payload, emb_raw)
+        << "tx roots match → byte-neutral: the embedded template is served "
+           "unchanged, coinbase and all";
+    EXPECT_EQ(t->m_tx_hashes, emb_txids)
+        << "the served non-coinbase body is the embedded one, untouched";
+    const auto st = ws.embedded_arm_status_json();
+    EXPECT_EQ(st.value("arm", std::string{}), "EMBEDDED")
+        << "a matching tx-merkleroot must leave the embedded arm serving, not swap";
+    EXPECT_NE(st.value("no_work_reason", std::string{}), "gbt-xcheck-txmerkle-mismatch")
+        << "a matching tx-merkleroot must NOT record a swap";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tip-transition fallback leak: on every new block the serve path re-sources
 // during the body-pending window and (correctly) gets the dashd fallback; the
 // serve-tip promotion then lands ~0.1-0.4 s later — routinely WHILE that
