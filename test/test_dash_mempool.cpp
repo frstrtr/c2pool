@@ -165,6 +165,85 @@ TEST(DashMempool, FeeComputedFromUtxo)
     EXPECT_EQ(mp.total_known_fees(), 10'000u);
 }
 
+// ─── #125 — reject already-confirmed transactions at admission ───────────────
+//
+// Ported from dashd validation.cpp:851-857: when an input's coin is MISSING
+// from the view but one of the tx's OWN outputs is already a coin, the tx is
+// already in a block → reject "txn-already-known". The three cases pin the
+// full behaviour: (a) confirmed tx is REJECTED; (b) a normal unconfirmed tx
+// (inputs present, outputs absent) is still ADMITTED — proves no false
+// positive; (c) an input-missing/output-absent tx (CPFP/old-coin/orphan) is
+// still ADMITTED — proves dashd's else-branch reject was NOT adopted.
+
+TEST(DashMempool, AlreadyConfirmedTxRejected)
+{
+    // Model a confirmed tx: its OWN output is a coin in the view, and its
+    // input is ABSENT (a confirmed tx has had its input spent/removed).
+    uint256 prevA = mint_hash(60);
+    auto tx = make_spend(prevA, 0, 90'000, /*salt=*/1);
+    uint256 txid = dash_txid(tx);
+
+    UTXOViewCache utxo(nullptr);
+    // Own output present as a coin (tx already mined) …
+    utxo.add_coin(Outpoint(txid, 0), Coin(90'000, {}, /*height=*/5, false));
+    // … and DELIBERATELY do NOT add the input prevA — input missing = the
+    // already-confirmed state.
+
+    Mempool mp;
+    mp.set_utxo(&utxo);
+
+    EXPECT_FALSE(mp.add_tx(tx))
+        << "a tx whose own output is already a coin and whose input is "
+           "missing is already confirmed — must be rejected (txn-already-known)";
+    EXPECT_EQ(mp.size(), 0u) << "the already-confirmed tx must not enter the pool";
+}
+
+TEST(DashMempool, NormalUnconfirmedTxStillAdmitted)
+{
+    // Genuine unconfirmed tx: input PRESENT (unspent coin), own output ABSENT.
+    // The input-present guard must stop the own-output scan from ever running,
+    // so this admits exactly as before the #125 check existed.
+    uint256 prevB = mint_hash(61);
+    auto tx = make_spend(prevB, 0, 90'000, /*salt=*/2);
+
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prevB, 0), Coin(100'000, {}, 1, false));  // input present
+    // own output (txid:0) intentionally ABSENT
+
+    Mempool mp;
+    mp.set_utxo(&utxo);
+
+    EXPECT_TRUE(mp.add_tx(tx))
+        << "a normal unconfirmed tx (inputs present) must NEVER be rejected";
+    auto entry = mp.get_entry(dash_txid(tx));
+    ASSERT_TRUE(entry.has_value());
+    EXPECT_TRUE(entry->fee_known);
+    EXPECT_EQ(entry->fee, 10'000u);
+}
+
+TEST(DashMempool, InputMissingOutputAbsentStillAdmitted)
+{
+    // CPFP / coin-older-than-start-height / orphan: input ABSENT and own
+    // output ABSENT. dashd's else-branch would reject this
+    // (bad-txns-inputs-missingorspent); we must NOT adopt that — today's
+    // admission keeps it with fee_known=false.
+    uint256 prevC = mint_hash(62);
+    auto tx = make_spend(prevC, 0, 90'000, /*salt=*/3);
+
+    UTXOViewCache utxo(nullptr);   // empty view: neither input nor own output present
+
+    Mempool mp;
+    mp.set_utxo(&utxo);
+
+    EXPECT_TRUE(mp.add_tx(tx))
+        << "input-missing with own-output-absent must still be admitted "
+           "(the else-branch reject must NOT be adopted)";
+    auto entry = mp.get_entry(dash_txid(tx));
+    ASSERT_TRUE(entry.has_value());
+    EXPECT_FALSE(entry->fee_known)
+        << "unresolvable input → fee unknown, but still admitted";
+}
+
 TEST(DashMempool, RecomputeUnknownFeesAfterUtxoArrives)
 {
     Mempool mp;
