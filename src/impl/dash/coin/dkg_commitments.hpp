@@ -813,6 +813,64 @@ private:
     MembersReadyFn m_members_ready;   // observability only; unset => n/a
 };
 
+// ── #127 INSTANT-UPGRADE decision (null arm) ───────────────────────────────
+//
+/// When the null arm is armed it serves a consensus-valid NULL commitment for
+/// a required, not-yet-mined DKG slot so miners always have work. The moment
+/// the REAL commitment for that slot arrives on the wire (qfcommit push) it is
+/// admitted to the cache, and the NEXT template build would fold the real
+/// commitment in place of the null — but only IF a template rebuild is
+/// triggered. Nothing in the ingest path bumps work generation, so stratum
+/// keeps handing out the cached NULL job (a ~1 s re-notify) until an unrelated
+/// tip/state-dirty signal happens to fire. "Upgrade the instant it arrives"
+/// was therefore a claim, not a mechanism.
+///
+/// This predicate is that mechanism's DECISION, kept pure so it is KAT-able
+/// away from the main_dash wiring: TRUE iff a freshly-admitted relayed
+/// commitment should trigger a work-generation bump. The wiring
+/// (bump_work_generation + stratum notify_all) at main_dash.cpp calls it on
+/// every qfcommit ingest and bumps exactly when it returns true.
+///
+/// The three conjuncts, each of which must hold:
+///   1. `null_arm_armed`  — the --embedded-null-arm flag. OFF => ALWAYS false,
+///      so an OFF build never bumps here: byte-for-byte the pre-#127 ingest.
+///   2. `adm == Accepted` — a genuinely NEW or strictly-better commitment. A
+///      duplicate (NotBetterThanCached) is already in the cache, so the plan
+///      already had it and no upgrade is owed; a structural reject is not a
+///      commitment at all. (Accepted also implies a REAL commitment — ingest_ex
+///      rejects null-crypto-fields, so a null can never be Accepted.)
+///   3. the arriving (llmq_type, quorum_hash) is a CURRENTLY-REQUIRED
+///      mining-window slot at `next_height`, decided by the SAME
+///      compute_required_qc_slots / phase schedule the null arm itself uses to
+///      choose what to null-serve, read against the SAME has_mined active-set
+///      view. This is the anti-bump-storm gate: an arrival for a closed-window
+///      quorum, an already-mined slot, or a quorum outside the mandatory set
+///      returns FALSE and no bump fires. So the ONLY commitments that bump are
+///      exactly the ones the arm is (or would be) serving null for — the
+///      upgrade case and nothing else.
+///
+/// `has_mined` MUST be the same active-set answer the plan reads (qmgr.find);
+/// pass it via the const QuorumManager accessor so the D2 root-memo epoch is
+/// untouched.
+inline bool qc_ingest_triggers_work_bump(
+    LlmqNetwork net, uint32_t next_height,
+    bool null_arm_armed,
+    MineableCommitmentCache::Admission adm,
+    uint8_t llmq_type, const uint256& quorum_hash,
+    const std::function<std::optional<uint256>(uint32_t)>& hash_at_height,
+    const std::function<bool(uint8_t, const uint256&)>& has_mined)
+{
+    if (!null_arm_armed) return false;
+    if (adm != MineableCommitmentCache::Admission::Accepted) return false;
+    auto slots = compute_required_qc_slots(net, next_height,
+                                           hash_at_height, has_mined);
+    if (!slots) return false;   // set underivable => the plan fails closed too
+    for (const auto& s : *slots)
+        if (s.params.type == llmq_type && s.quorum_hash == quorum_hash)
+            return true;
+    return false;
+}
+
 // ── Daemonless provider (the piece main_dash wires in) ─────────────────────
 
 /// May this required-and-not-yet-mined slot be served the consensus-valid

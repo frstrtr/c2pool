@@ -4206,7 +4206,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             auto qc_ingest_from =
                 [qc_cache, qc_net, qc_member_source](
                     const dash::coin::vendor::CFinalCommitment& c,
-                    const char* source, bool kick_member_fetch) {
+                    const char* source, bool kick_member_fetch)
+                    -> dash::coin::MineableCommitmentCache::Admission {
                     using Adm = dash::coin::MineableCommitmentCache::Admission;
                     const auto adm = qc_cache->ingest_ex(qc_net, c);
                     if (adm == Adm::Accepted) {
@@ -4249,6 +4250,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                  << " source=" << source
                                  << " cache=" << qc_cache->size();
                     }
+                    return adm;
                 };
 
             // Member-set fetch amplification guard for the BATCH transports:
@@ -4379,16 +4381,71 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     });
             }
 
+            // #127 INSTANT-UPGRADE wiring. The arm's "upgrade the template the
+            // instant the real commitment arrives" needs a template REBUILD on
+            // ingest — without one, stratum keeps handing out the cached NULL
+            // job until an unrelated tip/state-dirty bump happens to fire. Drive
+            // the same re-issue path tip-change/state-dirty use
+            // (bump_work_generation + stratum notify_all), but ONLY when the
+            // pure, KAT-tested predicate qc_ingest_triggers_work_bump says so:
+            //   * flag OFF               => never (byte-unchanged when off);
+            //   * duplicate/rejected adm => no upgrade owed (already cached);
+            //   * quorum not a CURRENT required mining-window slot => no bump
+            //     (the anti-bump-storm gate — same compute_required_qc_slots /
+            //     phase schedule the arm null-serves by, same has_mined view).
+            std::weak_ptr<dash::stratum::DASHWorkSource> qc_upgrade_ws =
+                work_source;
             coin_feed_subs.push_back(
                 coin_state.new_qfcommit.subscribe(
-                    [qc_ingest_from]
+                    [qc_ingest_from, embedded_null_arm, qc_upgrade_ws,
+                     &node_coin_state, hc = header_chain.get(), qc_net,
+                     &stratum_server]
                     (const dash::coin::vendor::CFinalCommitment& c) {
                         // PUSH transport: relayed once at DKG finalize, so a
                         // live arrival is inside (or just ahead of) an open
                         // window by construction — kick the member fetch
                         // unconditionally, exactly the pre-fix behaviour.
-                        qc_ingest_from(c, "qfcommit-push",
-                                       /*kick_member_fetch=*/true);
+                        const auto adm =
+                            qc_ingest_from(c, "qfcommit-push",
+                                           /*kick_member_fetch=*/true);
+                        // Flag OFF => early-out before any upgrade work: the
+                        // ingest above is byte-for-byte the pre-#127 path. (The
+                        // predicate's own first conjunct also returns false when
+                        // off — this guard just avoids the tip read entirely.)
+                        if (!embedded_null_arm) return;
+                        auto tip = hc->tip();
+                        if (!tip) return;
+                        // has_mined via the CONST accessor (the D2 root-memo
+                        // epoch must not be re-chilled by a read) — the SAME
+                        // active-set answer the plan's merkleRootQuorums fold
+                        // reads (single-snapshot discipline).
+                        const bool bump =
+                            dash::coin::qc_ingest_triggers_work_bump(
+                                qc_net, tip->height + 1u,
+                                embedded_null_arm, adm,
+                                c.llmqType, c.quorumHash,
+                                [hc](uint32_t h) -> std::optional<uint256> {
+                                    if (auto e = hc->get_header_by_height(h))
+                                        return e->hash;
+                                    return std::nullopt;
+                                },
+                                [&node_coin_state](uint8_t t,
+                                                   const uint256& qh) {
+                                    return std::as_const(node_coin_state)
+                                               .qmgr().find(t, qh).has_value();
+                                });
+                        if (bump) {
+                            if (auto ws = qc_upgrade_ws.lock())
+                                ws->bump_work_generation();
+                            if (stratum_server) stratum_server->notify_all();
+                            LOG_INFO << "[QC-NULL-ARM] instant upgrade: real"
+                                        " commitment for a required slot type="
+                                     << static_cast<int>(c.llmqType)
+                                     << " quorum="
+                                     << c.quorumHash.GetHex().substr(0, 16)
+                                     << "... admitted -> work bumped, template"
+                                        " re-issued (was null-served)";
+                        }
                     }));
             // ── qc-plan-underivable CLOSURE: the request/response tee ──────
             // mnlistdiff is the transport that measurably ALWAYS works

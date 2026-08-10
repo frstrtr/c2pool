@@ -2353,3 +2353,83 @@ TEST(DashNullArm, FoldSeqIsMonotoneAndStableBuildDoesNotRace)
     EXPECT_EQ(qm.fold_seq(), before) << "a synchronous build must not mutate "
                                         "the active set";
 }
+
+// ── #127 INSTANT-UPGRADE bump decision (qc_ingest_triggers_work_bump) ───────
+// The arm serves NULL for a required, not-yet-mined slot and promises to
+// "upgrade the template the instant the real commitment arrives". That upgrade
+// needs a template REBUILD when the real commitment is ingested off the
+// qfcommit push; without it stratum keeps handing out the cached null job
+// (~1 s re-notify) until an unrelated tip/state-dirty bump happens to fire.
+// main_dash wires bump_work_generation()+stratum notify_all() to fire exactly
+// when this pure predicate returns true. These KATs pin that decision: the
+// bump FIRES on an armed, Accepted, required-quorum ingest, and does NOT fire
+// when the flag is off, on a duplicate/rejected admission, on a non-required
+// quorum, on an already-mined slot, or off-window.
+//
+// RED PROOF (documented neuter): in qc_ingest_triggers_work_bump
+// (dkg_commitments.hpp) replace the required-slot match
+//     if (s.params.type == llmq_type && s.quorum_hash == quorum_hash)
+//         return true;
+// with a bare `return false;` (never treat any arrival as a required-slot
+// upgrade — i.e. neuter the bump). The three FIRES assertions below go RED
+// while every negative case stays green, proving the assertions bind to the
+// required-slot decision and not to a constant.
+TEST(DashNullArm, InstantUpgradeBumpFiresOnlyForArmedRequiredSlotIngest)
+{
+    using Adm = MineableCommitmentCache::Admission;
+    // Types 1/4/6 (interval-24) share the cycle-base quorumHash at qi 0 — the
+    // exact three slots the (a) KAT null-serves at this window-open height.
+    const uint256 q = *fake_hash_at(kNullArmCycleBase);
+    ASSERT_TRUE(is_dkg_commitment_window(kNullArmWindowOpen));
+
+    // FIRES: armed + Accepted + a required, not-yet-mined slot. All three
+    // interval-24 types are required at phase 10 on a not-yet-mined view.
+    for (uint8_t t : {uint8_t{1}, uint8_t{4}, uint8_t{6}})
+        EXPECT_TRUE(qc_ingest_triggers_work_bump(
+            LlmqNetwork::Testnet, kNullArmWindowOpen,
+            /*null_arm_armed=*/true, Adm::Accepted, t, q,
+            fake_hash_at, never_mined)) << "required type=" << int(t);
+
+    // FLAG OFF: never bump (byte-unchanged when off), identical inputs.
+    EXPECT_FALSE(qc_ingest_triggers_work_bump(
+        LlmqNetwork::Testnet, kNullArmWindowOpen,
+        /*null_arm_armed=*/false, Adm::Accepted, 4, q,
+        fake_hash_at, never_mined));
+
+    // DUPLICATE / STRUCTURALLY-REJECTED admission: already cached, or not a
+    // commitment at all -> no upgrade owed, no bump.
+    for (Adm a : {Adm::NotBetterThanCached, Adm::NullCryptoFields,
+                  Adm::SignersBelowMin, Adm::UnknownType})
+        EXPECT_FALSE(qc_ingest_triggers_work_bump(
+            LlmqNetwork::Testnet, kNullArmWindowOpen,
+            /*null_arm_armed=*/true, a, 4, q,
+            fake_hash_at, never_mined)) << "adm=" << int(a);
+
+    // NOT A REQUIRED SLOT (wrong quorum): the arriving quorum is outside the
+    // mandatory set for this height -> no bump (the anti-bump-storm gate).
+    EXPECT_FALSE(qc_ingest_triggers_work_bump(
+        LlmqNetwork::Testnet, kNullArmWindowOpen,
+        /*null_arm_armed=*/true, Adm::Accepted, 4, h256(0x99),
+        fake_hash_at, never_mined));
+
+    // ALREADY MINED: has_mined==true suppresses type 4's slot, so a type-4
+    // arrival for that quorum is not required -> no bump...
+    auto mined_t4 = [&](uint8_t t, const uint256& qh) {
+        return t == 4 && qh == q;
+    };
+    EXPECT_FALSE(qc_ingest_triggers_work_bump(
+        LlmqNetwork::Testnet, kNullArmWindowOpen,
+        /*null_arm_armed=*/true, Adm::Accepted, 4, q,
+        fake_hash_at, mined_t4));
+    // ...but types 1 and 6 at the same quorum are still required -> still bump.
+    EXPECT_TRUE(qc_ingest_triggers_work_bump(
+        LlmqNetwork::Testnet, kNullArmWindowOpen,
+        /*null_arm_armed=*/true, Adm::Accepted, 1, q,
+        fake_hash_at, mined_t4));
+
+    // OFF-WINDOW height (phase 4): no interval-24 slot is required -> no bump.
+    EXPECT_FALSE(qc_ingest_triggers_work_bump(
+        LlmqNetwork::Testnet, kNullArmCycleBase + 4u,
+        /*null_arm_armed=*/true, Adm::Accepted, 4, q,
+        fake_hash_at, never_mined));
+}
