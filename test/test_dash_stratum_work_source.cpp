@@ -1943,6 +1943,154 @@ TEST(DashStratumC1MainnetGate, GbtXcheckServesDashdOnCreditPoolMismatch)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GBT-xcheck reward-safety BACKSTOP — merkleRootQuorums axis (#127 null arm).
+// UNLIKE the creditPool delta (which by-design special-tx exclusion can EXPLAIN),
+// a divergent merkleRootQuorums is never explained by anything: it is the exact
+// bad-cbtx-quorummerkleroot reject vector. A served embedded template whose
+// merkleRootQuorums disagrees with dashd's GBT for the same height MUST swap to
+// dashd's template with cause=gbt-xcheck-quorumroot-mismatch — a wrong (e.g. an
+// optimistic null) quorum root must NEVER reach a rig. This is the KAT the null
+// arm rides on; neuter the new compare in work_source.cpp and it goes RED.
+namespace {
+std::unique_ptr<dash::coin::NodeCoinState> make_quorumroot_xcheck_cs()
+{
+    auto cs = std::make_unique<dash::coin::NodeCoinState>();
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    dash::coin::vendor::CSimplifiedMNListEntry e1;
+    e1.proRegTxHash.SetHex(std::string(64, '4'));
+    e1.confirmedHash.SetHex(std::string(64, '5'));
+    e1.isValid = true;
+    cs->sml().mnList = {e1};
+    cs->sml().sort();
+    cs->set_have_sml(true);
+    cs->set_sml_current_hash(emb_prev);
+    cs->set_require_sml(true);
+    cs->set_require_fresh_credit_pool(true);
+    const int64_t seed = 500000000LL;
+    cs->set_credit_pool(seed, emb_prev, static_cast<int32_t>(kEmbeddedPrevHeight));
+    cs->set_tip(kEmbeddedPrevHeight, emb_prev, 0x1e0ffff0u, 1'700'000'000u,
+                76, 16, kCurtime, static_cast<uint32_t>(kVersion));
+    return cs;
+}
+bool xcheck_submit(const std::vector<unsigned char>&, uint32_t, bool) { return true; }
+// Serve the EMBEDDED template with the xcheck OFF and read back the CbTx the
+// builder produced — its merkleRootMNList / creditPool become the values dashd
+// must MATCH so the ONLY axis under test is merkleRootQuorums.
+dash::coin::vendor::CCbTx capture_embedded_cbtx(std::vector<unsigned char>* raw_out)
+{
+    auto cs = make_quorumroot_xcheck_cs();
+    auto never = []() -> dash::coin::DashWorkData { return {}; };
+    dash::stratum::DASHWorkSource ws(*cs, never, xcheck_submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    // xcheck stays OFF (default) -> the embedded selection is served untouched.
+    EXPECT_FALSE(ws.get_current_work_template().empty());
+    auto t = ws.peek_template();
+    EXPECT_TRUE(t && !t->m_coinbase_payload.empty());
+    dash::coin::vendor::CCbTx emb;
+    EXPECT_TRUE(dash::coin::vendor::parse_cbtx(t->m_coinbase_payload, emb));
+    if (raw_out) *raw_out = t->m_coinbase_payload;
+    return emb;
+}
+} // namespace
+
+TEST(DashStratumC1MainnetGate, GbtXcheckServesDashdOnQuorumRootMismatch)
+{
+    const dash::coin::vendor::CCbTx emb = capture_embedded_cbtx(nullptr);
+
+    // dashd fallback: SAME height, SAME creditPool, SAME merkleRootMNList, but a
+    // DIFFERENT merkleRootQuorums -> ONLY the quorum-root axis diverges.
+    uint256 dashd_quorums; dashd_quorums.SetHex(std::string(64, 'a'));
+    ASSERT_NE(emb.merkleRootQuorums, dashd_quorums)
+        << "fixture: dashd quorum root must actually differ from the embedded one";
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height         = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits           = 0x1e0ffff0u;
+        w.m_version        = static_cast<uint32_t>(kVersion);
+        w.m_curtime        = kCurtime;
+        dash::coin::vendor::CCbTx cb;
+        cb.nVersion           = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+        cb.nHeight            = static_cast<int32_t>(kEmbeddedPrevHeight + 1);
+        cb.merkleRootMNList   = emb.merkleRootMNList;   // MATCH -> not the mn-list axis
+        cb.merkleRootQuorums  = dashd_quorums;          // DIFFER -> the axis under test
+        cb.creditPoolBalance  = emb.creditPoolBalance;  // MATCH -> not the creditPool axis
+        w.m_coinbase_payload  = dash::coin::encode_cbtx(cb);
+        return w;
+    };
+
+    auto cs = make_quorumroot_xcheck_cs();
+    dash::stratum::DASHWorkSource ws(*cs, fallback, xcheck_submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    ws.set_gbt_xcheck(true);
+
+    const auto j = ws.get_current_work_template();
+    ASSERT_FALSE(j.empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+    dash::coin::vendor::CCbTx served;
+    ASSERT_TRUE(dash::coin::vendor::parse_cbtx(t->m_coinbase_payload, served));
+    EXPECT_EQ(served.merkleRootQuorums, dashd_quorums)
+        << "on a merkleRootQuorums mismatch the backstop must serve dashd's template";
+    const auto st = ws.embedded_arm_status_json();
+    EXPECT_EQ(st.value("arm", std::string{}), "dashd-fallback")
+        << "the swap must leave the served arm as the dashd fallback";
+    EXPECT_EQ(st.value("no_work_reason", std::string{}), "gbt-xcheck-quorumroot-mismatch")
+        << "the swap must be recorded with the distinct quorum-root cause";
+}
+
+// Byte-neutral proof: when the embedded merkleRootQuorums (and merkleRootMNList
+// and creditPool) already MATCH dashd's, the unconditional xcheck adds NO swap and
+// the served bytes ARE the embedded template's, unchanged. This is why extending
+// the xcheck changes nothing on today's non-null hotel templates (whose roots
+// match dashd byte-for-byte).
+TEST(DashStratumC1MainnetGate, GbtXcheckQuorumRootMatchServesEmbeddedUnchanged)
+{
+    std::vector<unsigned char> emb_raw;
+    const dash::coin::vendor::CCbTx emb = capture_embedded_cbtx(&emb_raw);
+    ASSERT_FALSE(emb_raw.empty());
+
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height         = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits           = 0x1e0ffff0u;
+        w.m_version        = static_cast<uint32_t>(kVersion);
+        w.m_curtime        = kCurtime;
+        dash::coin::vendor::CCbTx cb;
+        cb.nVersion           = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+        cb.nHeight            = static_cast<int32_t>(kEmbeddedPrevHeight + 1);
+        cb.merkleRootMNList   = emb.merkleRootMNList;   // MATCH
+        cb.merkleRootQuorums  = emb.merkleRootQuorums;  // MATCH
+        cb.creditPoolBalance  = emb.creditPoolBalance;  // MATCH
+        w.m_coinbase_payload  = dash::coin::encode_cbtx(cb);
+        return w;
+    };
+
+    auto cs = make_quorumroot_xcheck_cs();
+    dash::stratum::DASHWorkSource ws(*cs, fallback, xcheck_submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    ws.set_gbt_xcheck(true);
+
+    const auto j = ws.get_current_work_template();
+    ASSERT_FALSE(j.empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+    EXPECT_EQ(t->m_coinbase_payload, emb_raw)
+        << "roots match -> byte-neutral: the embedded template must be served unchanged";
+    const auto st = ws.embedded_arm_status_json();
+    EXPECT_EQ(st.value("arm", std::string{}), "EMBEDDED")
+        << "a matching quorum root must leave the embedded arm serving, not swap";
+    EXPECT_NE(st.value("no_work_reason", std::string{}), "gbt-xcheck-quorumroot-mismatch")
+        << "a matching quorum root must NOT record a swap";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tip-transition fallback leak: on every new block the serve path re-sources
 // during the body-pending window and (correctly) gets the dashd fallback; the
 // serve-tip promotion then lands ~0.1-0.4 s later — routinely WHILE that
