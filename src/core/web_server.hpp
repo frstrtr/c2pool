@@ -625,6 +625,16 @@ public:
     void set_stratum_rate_stats_fn(std::function<RateStats()> fn) { m_stratum_rate_stats_fn = thread_safe_wrap(std::move(fn)); }
     RateStats get_stratum_rate_stats() const { return m_stratum_rate_stats_fn ? m_stratum_rate_stats_fn() : RateStats{}; }
 
+    // Per-user hashrate + dead-hashrate from the stratum RateMonitor (p2pool
+    // get_local_rates, work.py:1965-1973). The stat-log graph series reads from
+    // THIS, not per-session WorkerInfo.hashrate: the latter is refreshed only on
+    // pseudoshare-accept and always carries dead=0, which flattened the local
+    // hashrate history graph to zero on live prod (founding-bug class).
+    using local_rates_fn_t = std::function<std::pair<
+        std::unordered_map<std::string, double>,
+        std::unordered_map<std::string, double>>()>;
+    void set_local_rates_fn(local_rates_fn_t fn) { m_local_rates_fn = std::move(fn); }
+
     // Per-worker stratum registry provider (display only). On the LTC path the
     // dashboard's OWN core::StratumServer registers workers straight into
     // m_stratum_workers (register_stratum_worker). Coin targets that run their
@@ -1257,6 +1267,7 @@ private:
     std::vector<unsigned char> m_donation_script;   // protocol donation scriptPubKey
     std::function<double()> m_stratum_hashrate_fn;  // callback to get stratum total hashrate
     std::function<RateStats()> m_stratum_rate_stats_fn;  // callback to get rate monitor stats
+    local_rates_fn_t m_local_rates_fn;  // RateMonitor per-user rates for stat-log graph series
 
     // Cached network difficulty (computed from bits in refresh_work)
     std::atomic<double> m_network_difficulty{0.0};
