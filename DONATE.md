@@ -14,4 +14,8 @@ https://www.paypal.com/donate/?hosted_button_id=9DF676HUWAHKY
 1Gd1bjFqCCrx9AkiHUcBuuEYUuVuvncBTc
 ```
 
-<!-- DASH donation address: to be added (pending a confirmed address). -->
+## Dash (DASH)
+
+```
+XdgF55wEHBRWwbuBniNYH4GvvaoYMgL84u
+```
