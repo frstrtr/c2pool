@@ -7171,13 +7171,28 @@ void MiningInterface::update_stat_log()
         entry.connected_count = static_cast<int>(workers.size());  // raw TCP connections
         std::set<std::string> worker_combos;
         for (const auto& [sid, w] : workers) {
-            double existing = entry.local_hash_rates.value(w.username, 0.0);
-            entry.local_hash_rates[w.username] = existing + w.hashrate;
-            double existing_dead = entry.local_dead_hash_rates.value(w.username, 0.0);
-            entry.local_dead_hash_rates[w.username] = existing_dead + w.dead_hashrate;
             std::string combo = w.username;
             if (!w.worker_name.empty()) combo += "." + w.worker_name;
             worker_combos.insert(combo);
+        }
+        // Hash-rate series: source from the RateMonitor (windowed, p2pool-correct
+        // get_local_rates), NOT the per-session WorkerInfo.hashrate estimate. The
+        // per-session field is updated only on pseudoshare-accept and always
+        // carries dead=0, which rendered the local-hashrate history graph flat/zero
+        // on live prod. Fall back to the per-session sum only if the seam is unset.
+        if (m_local_rates_fn) {
+            auto [rates, dead_rates] = m_local_rates_fn();
+            for (const auto& [user, hr] : rates)
+                entry.local_hash_rates[user] = hr;
+            for (const auto& [user, dhr] : dead_rates)
+                entry.local_dead_hash_rates[user] = dhr;
+        } else {
+            for (const auto& [sid, w] : workers) {
+                double existing = entry.local_hash_rates.value(w.username, 0.0);
+                entry.local_hash_rates[w.username] = existing + w.hashrate;
+                double existing_dead = entry.local_dead_hash_rates.value(w.username, 0.0);
+                entry.local_dead_hash_rates[w.username] = existing_dead + w.dead_hashrate;
+            }
         }
         entry.miner_count = static_cast<int>(entry.local_hash_rates.size());
         entry.worker_count = static_cast<int>(worker_combos.size());
@@ -8714,6 +8729,12 @@ bool WebServer::start_stratum_server()
             mining_interface_->set_stratum_rate_stats_fn([ss]() -> MiningInterface::RateStats {
                 auto s = ss->get_rate_stats();
                 return {s.hashrate, s.effective_dt, s.total_datums, s.dead_datums};
+            });
+            // Feed the stat-log graph series from the RateMonitor per-user rates
+            // (get_local_rates), so the local-hashrate history graph reflects live
+            // windowed hashrate instead of the flat per-session estimate.
+            mining_interface_->set_local_rates_fn([ss]() {
+                return ss->get_local_rates();
             });
         }
         return started;
