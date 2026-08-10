@@ -1,9 +1,11 @@
 # GitHub funding sidebar. Only the keys GitHub itself recognises take effect;
 # anything else must stay commented or the sidebar silently stops rendering.
-# FUNDING.yml has no native bitcoin key, so the BTC address is offered through
-# the `custom` list as a bitcoin: URI (opens a wallet with the address filled in).
-# A bare `btc:` key would silently break the whole sidebar and take the PayPal
-# link down with it, which is why it must never be uncommented.
+# The BTC address is offered via a linked DONATE.md page rather than a raw
+# `bitcoin:` URI: client-side crypto-clipper / security browser extensions scan
+# the sidebar for a standalone wallet address and drop a warning "stop sign"
+# badge on the button when they find one. Keeping the raw address off the button
+# and behind a link avoids that false flag. A bare `btc:` key would silently
+# break the whole sidebar (taking the PayPal link down too), so never uncomment one.
 custom:
   - https://www.paypal.com/donate/?hosted_button_id=9DF676HUWAHKY
-  - bitcoin:1Gd1bjFqCCrx9AkiHUcBuuEYUuVuvncBTc
+  - https://github.com/frstrtr/c2pool/blob/master/DONATE.md
