@@ -105,8 +105,15 @@ struct MempoolEntry {
 /// two representations can order a tie-pair differently. We therefore
 /// carry (fee, base_size) and reproduce the exact double cross-multiply;
 /// equal feerate is broken by GetHash()/txid ascending, as the oracle
-/// does. (No ancestor packages in this simplified mempool, so
-/// GetModFeeAndSize reduces to the entry's own (fee, base_size).)
+/// does.
+///
+/// The persistent m_feerate_index keys FeeKey by an entry's STANDALONE
+/// (fee, base_size). The block-template selector (get_sorted_txs_with_fees)
+/// additionally reuses this exact comparator over the ANCESTOR-SCORE
+/// (min-of-two) values — see anc_score_key / build_anc_state_locked — which
+/// is precisely how dashd shares CompareTxMemPoolEntryByAncestorFee between
+/// mapTx and mapModifiedTx (D1/D2). The struct and its operator< are
+/// identical either way; only the (fee, size) fed in differ.
 struct FeeKey {
     uint64_t fee;        // satoshi
     uint32_t base_size;  // serialized bytes (>0 for every indexed entry)
@@ -718,17 +725,98 @@ public:
         uint32_t total_sigops = DASH_COINBASE_SIGOPS_RESERVE;   // G2
         auto* utxo = m_utxo.load();
 
-        for (const auto& fk : m_feerate_index) {
-            const uint256& txid = fk.txid;
-            if (selected.count(txid)) continue;  // packed earlier as an ancestor
-            if (m_pool.find(txid) == m_pool.end()) continue;
+        // ── D1: static ancestor closure + LOCAL ancestor-score index ─────────
+        // The persistent m_feerate_index (keyed by standalone feerate) is left
+        // untouched; the ancestor-score index is rebuilt locally per template,
+        // so add/remove maintenance can never regress (design-review invariant
+        // (6)). Built over fee_known, non-over_limit entries only (R1) so the
+        // no-package pure-feerate path stays byte-identical: a tx with no
+        // in-pool ancestors has size_wa==base_size, modfee_wa==fee, count_wa==1,
+        // so its anc_score_key == its old FeeKey bit-for-bit.
+        const AncState anc = build_anc_state_locked();
+        std::set<FeeKey> anc_index;
+        for (const auto& [txid, e] : m_pool) {
+            if (!e.fee_known) continue;
+            if (anc.over_limit.count(txid)) continue;
+            anc_index.insert(anc_score_key(e.fee, e.base_size,
+                                           anc.modfee_wa.at(txid),
+                                           anc.size_wa.at(txid), txid));
+        }
 
-            // ── G1: expand to the ancestor package, parents-first ────────
+        // ── D2: mapModifiedTx equivalent (dashd miner.cpp:480) ───────────────
+        std::map<uint256, ModEntry> mod_by_txid;   // dashd's by-txiter unique index
+        std::set<FeeKey>            mod_score;      // dashd's ancestor_score index
+        std::set<uint256>           failed;        // dashd failedTx (:482)
+
+        auto mod_key = [](const ModEntry& m) {
+            return anc_score_key(m.self_fee, m.self_size,
+                                 m.mod_modfee_wa, m.mod_size_wa, m.txid);
+        };
+        auto erase_mod = [&](const uint256& id) {
+            auto it = mod_by_txid.find(id);
+            if (it == mod_by_txid.end()) return;
+            mod_score.erase(mod_key(it->second));   // recompute-and-erase BEFORE drop (R2)
+            mod_by_txid.erase(it);
+        };
+
+        // dashd addPackageTxs main loop (miner.cpp:493-641). Two candidate
+        // sources — the static ancestor-score index (anc_index / `mi`) and the
+        // re-scored mapModifiedTx (mod_score) — scored on the SAME min-of-two
+        // basis (FeeKey::operator<), so a CPFP descendant re-competes at its
+        // lighter remaining-package feerate once an ancestor is included.
+        auto mi = anc_index.begin();
+        while (mi != anc_index.end() || !mod_by_txid.empty()) {
+            // (a) SKIP GUARD (dashd :507-514): a mapTx entry already staged in
+            //     mapModifiedTx / selected / failed carries stale ancestor
+            //     state — advance past it.
+            if (mi != anc_index.end()) {
+                const uint256& mt = mi->txid;
+                if (mod_by_txid.count(mt) || selected.count(mt)
+                    || failed.count(mt)) {
+                    ++mi;
+                    continue;
+                }
+            }
+
+            // (b) PICK BETTER OF TWO (dashd :517-540). FeeKey::operator< IS
+            //     CompareTxMemPoolEntryByAncestorFee, and both indices already
+            //     hold min-of-two keys, so this is dashd's wrap-mapTx-entry-in-
+            //     CTxMemPoolModifiedEntry comparison exactly.
+            bool    using_mod = false;
+            uint256 txid;
+            if (mi == anc_index.end()) {
+                txid = mod_score.begin()->txid;          // mapTx exhausted
+                using_mod = true;
+            } else if (!mod_score.empty() && *mod_score.begin() < *mi) {
+                txid = mod_score.begin()->txid;          // modified entry strictly better
+                using_mod = true;
+            } else {
+                txid = mi->txid;
+                ++mi;
+            }
+
+            // (d) A vanished / already-selected pick is discarded (dashd's
+            //     inBlock assert / project<0> guards). Under the lock a pool
+            //     miss cannot happen, but keep the belt.
+            if (selected.count(txid) || m_pool.find(txid) == m_pool.end()) {
+                if (using_mod) erase_mod(txid);
+                continue;
+            }
+
+            // (e) BUILD PACKAGE. collect_package_locked stays the AUTHORITATIVE
+            //     topology / ancestor-limit gate (design-review consensus_risks:
+            //     over_limit is only a candidate filter, never the sole drop —
+            //     its >25 threshold is off-by-one vs collect's >=25). Returns
+            //     the unselected-ancestor remainder, parents-first == dashd
+            //     CalculateMemPoolAncestors + onlyUnconfirmed + insert(iter).
+            //     false = over-deep chain: drop.
             std::vector<const MempoolEntry*> package;
             {
                 std::set<uint256> seen;
-                if (!collect_package_locked(txid, selected, seen, package, 0))
-                    continue;   // over-deep / over-wide chain: drop candidate
+                if (!collect_package_locked(txid, selected, seen, package, 0)) {
+                    if (using_mod) { erase_mod(txid); failed.insert(txid); }
+                    continue;
+                }
             }
 
             // Package membership for intra-package vin resolution (a parent
@@ -736,9 +824,10 @@ public:
             std::set<uint256> in_package;
             for (const auto* e : package) in_package.insert(e->txid);
 
-            // ── Validate the WHOLE package; any failing member drops the
+            // ── (f) Validate the WHOLE package; any failing member drops the
             // candidate (never a partial package — that is exactly the
-            // childless-parent / parentless-child shape G1 forbids). ──────
+            // childless-parent / parentless-child shape G1 forbids). This block
+            // is LIFTED UNCHANGED from the pre-D2 selector. ──────────────────
             bool     ok         = true;
             uint32_t pkg_bytes  = 0;
             uint64_t pkg_fees   = 0;
@@ -828,22 +917,76 @@ public:
                 pkg_fees   += e->fee;
                 pkg_sigops += tx_sigops;
             }
-            if (!ok) continue;
+            if (!ok) {
+                if (using_mod) { erase_mod(txid); failed.insert(txid); }
+                continue;
+            }
+            (void)pkg_fees;   // accounted below via per-entry e->fee
 
-            // Byte cap: the whole package must fit; a parent that does not
-            // fit drops the child with it (G1's byte-cap clause). `continue`
-            // (not break) — a later, smaller candidate may still fit.
-            if (total_bytes + pkg_bytes > max_bytes) continue;
-            // G2: dashd miner TestPackage bound (>= — reject AT the cap).
-            if (total_sigops + pkg_sigops >= DASH_MAX_BLOCK_SIGOPS) continue;
+            // ── (g) Caps — LIFTED UNCHANGED. Byte cap strict `>`, sigop cap
+            // `>=` (reject AT the cap). `continue` never `break`: a later,
+            // smaller candidate may still fit (superset-safe scan; dashd's
+            // nConsecutiveFailed>1000 cutoff is deliberately NOT ported —
+            // design-review RC5). Only a mapModifiedTx pick is erased+failed
+            // (dashd :590-596); a mapTx pick already had `mi` advanced. ──────
+            if (total_bytes + pkg_bytes > max_bytes) {
+                if (using_mod) { erase_mod(txid); failed.insert(txid); }
+                continue;
+            }
+            if (total_sigops + pkg_sigops >= DASH_MAX_BLOCK_SIGOPS) {
+                if (using_mod) { erase_mod(txid); failed.insert(txid); }
+                continue;
+            }
 
+            // ── (h) Admit. D3 SortForBlock (ancestor-count asc, txid asc)
+            // re-orders the SAME members before emit → within-package
+            // hashMerkleRoot parity. This vector order flows unchanged into
+            // embedded_gbt.hpp's vtx. ────────────────────────────────────────
+            sort_package_for_block(package, anc);
             for (const auto* e : package) {
                 selected.insert(e->txid);
                 total_bytes += e->base_size;
                 total_fees  += e->fee;
                 result.push_back({e->tx, e->fee, e->base_size});
+                erase_mod(e->txid);            // dashd :634
             }
             total_sigops += pkg_sigops;
+
+            // ── (i) UpdatePackagesForAdded (dashd :415-440 / :640). For each
+            // just-admitted tx, re-score its TRANSITIVE descendants (RC1) on
+            // their now-lighter remaining package via mapModifiedTx. Seeded
+            // ONCE from static totals, then each in-block ancestor subtracts
+            // its own fee/size exactly once (RC2) → static-minus-in-block-
+            // ancestors, matching dashd's repeated update_for_parent_inclusion.
+            for (const auto* a : package) {
+                auto dit = anc.descendants.find(a->txid);
+                if (dit == anc.descendants.end()) continue;
+                for (const uint256& desc : dit->second) {
+                    if (selected.count(desc)) continue;
+                    if (anc.over_limit.count(desc)) continue;   // hopeless: collect drops it (RC3)
+                    auto it = mod_by_txid.find(desc);
+                    if (it == mod_by_txid.end()) {
+                        // Seed once from the static ancestor totals. `a` is a
+                        // transitive ancestor of desc (desc ∈ descendants[a]),
+                        // so the static totals include a's fee/size — the
+                        // subtraction below removes it exactly once.
+                        const auto& de = m_pool.at(desc);
+                        ModEntry m;
+                        m.txid          = desc;
+                        m.self_fee      = de.fee;
+                        m.self_size     = de.base_size;
+                        m.mod_modfee_wa = anc.modfee_wa.at(desc);
+                        m.mod_size_wa   = anc.size_wa.at(desc);
+                        it = mod_by_txid.emplace(desc, m).first;
+                        // key inserted once, after the subtraction below
+                    } else {
+                        mod_score.erase(mod_key(it->second));   // stale key out first (R2)
+                    }
+                    it->second.mod_modfee_wa -= a->fee;         // update_for_parent_inclusion
+                    it->second.mod_size_wa   -= a->base_size;   // (miner.h:140-141)
+                    mod_score.insert(mod_key(it->second));
+                }
+            }
         }
         return {std::move(result), total_fees};
     }
@@ -903,6 +1046,140 @@ private:
         if (out.size() >= MAX_PACKAGE_TXS) return false;
         out.push_back(&it->second);
         return true;
+    }
+
+    // ── D1/D2/D3: dashd BlockAssembler::addPackageTxs parity ─────────────────
+    //
+    // The pre-D1 selector walked m_feerate_index by STANDALONE per-tx feerate
+    // and only pulled a candidate's unselected-ancestor package on demand, so
+    // CPFP re-scoring worked only accidentally and the within-package emit order
+    // was a post-order DFS. dashd's BlockAssembler instead:
+    //   D1 sorts by ancestor_score = min(self-feerate, whole-ancestor-package
+    //      feerate)  — CompareTxMemPoolEntryByAncestorFee / GetModFeeAndSize
+    //      (src/txmempool.h:274-312);
+    //   D2 maintains mapModifiedTx, re-scoring a tx's descendants on their
+    //      now-lighter remaining package as ancestors are included
+    //      (src/node/miner.cpp:480,493-640, UpdatePackagesForAdded :415-440);
+    //   D3 emits each accepted package ordered by GetCountWithAncestors() asc,
+    //      txid asc  — SortForBlock (src/node/miner.cpp:442-451,
+    //      src/node/miner.h:104-112).
+    // The three together make the embedded template select the same tx SET in
+    // the same ORDER as dashd for the same tip+mempool → identical
+    // hashMerkleRoot. Reward-safety is unaffected (the #1218 gbt-xcheck guard
+    // fails closed to dashd on ANY divergence); this only lowers swap frequency.
+
+    /// Static ancestor/descendant closure over the fee_known pool, built ONCE
+    /// per template. Pure mempool topology (independent of `selected`), so the
+    /// count/size/modfee totals are the FULL static GetXxxWithAncestors values —
+    /// only the mapModifiedTx entries (ModEntry) carry reduced values.
+    /// Built over fee_known entries ONLY (design-review R1): a fee_known child
+    /// of a fee_unknown parent is unadmittable anyway (collect_package_locked
+    /// still pulls the unpriced parent and the validation loop drops the
+    /// package), and excluding fee_unknown parents keeps the no-package
+    /// pure-feerate path byte-identical to m_feerate_index.
+    struct AncState {
+        std::map<uint256, uint32_t>              count_wa;    // incl self
+        std::map<uint256, uint32_t>              size_wa;     // sum base_size incl self
+        std::map<uint256, uint64_t>              modfee_wa;   // sum fee incl self
+        std::map<uint256, std::set<uint256>>     descendants; // TRANSITIVE, excl self
+        std::set<uint256>                        over_limit;  // closure > MAX_PACKAGE_TXS
+    };
+
+    /// mapModifiedTx entry (dashd CTxMemPoolModifiedEntry, miner.h:60-79). Its
+    /// ancestor-score key is the min-of-two of (self_fee,self_size) vs the
+    /// reduced (mod_modfee_wa,mod_size_wa) — the CPFP re-score.
+    struct ModEntry {
+        uint256  txid;
+        uint64_t self_fee{0};
+        uint32_t self_size{0};
+        uint64_t mod_modfee_wa{0};
+        uint32_t mod_size_wa{0};
+    };
+
+    /// dashd CompareTxMemPoolEntryByAncestorFee::GetModFeeAndSize min-of-two
+    /// (txmempool.h:297-311): return the (fee,size) of the SMALLER feerate of
+    /// {self, whole-ancestor-package}, using the same division-free
+    /// cross-multiply as FeeKey::operator< (no pre-divided double).
+    static FeeKey anc_score_key(uint64_t self_fee, uint32_t self_size,
+                                uint64_t modfee_wa, uint32_t size_wa,
+                                const uint256& txid)
+    {
+        // f1 > f2  ⇔  self feerate > ancestor-package feerate  ⇒ min = ancestor.
+        const double f1 = static_cast<double>(self_fee) * size_wa;
+        const double f2 = static_cast<double>(modfee_wa) * self_size;
+        if (f1 > f2) return FeeKey{modfee_wa, size_wa, txid};   // ancestor pair
+        return FeeKey{self_fee, self_size, txid};               // self pair (also on tie)
+    }
+
+    /// Build the static ancestor/descendant closure. Memoized transitive
+    /// ancestor sets over in-pool fee_known parents; descendants is the reverse
+    /// (transitive, design-review RC1). Caller must hold m_mutex.
+    AncState build_anc_state_locked() const
+    {
+        AncState st;
+        std::map<uint256, std::set<uint256>> anc;   // transitive ancestors, excl self
+
+        // Memoized DFS. std::map nodes are reference-stable across inserts, so
+        // returning a reference into `anc` during recursion is safe. The
+        // mempool is a DAG (a tx cannot spend a descendant's output), so no
+        // cycle guard is needed.
+        std::function<const std::set<uint256>&(const uint256&)> closure =
+            [&](const uint256& txid) -> const std::set<uint256>& {
+                auto memo = anc.find(txid);
+                if (memo != anc.end()) return memo->second;
+                std::set<uint256> acc;
+                auto it = m_pool.find(txid);
+                if (it != m_pool.end() && it->second.fee_known) {
+                    for (const auto& vin : it->second.tx.vin) {
+                        const uint256& p = vin.prevout.hash;
+                        auto pit = m_pool.find(p);
+                        if (pit == m_pool.end() || !pit->second.fee_known)
+                            continue;   // edge leaves the fee_known pool
+                        acc.insert(p);
+                        const auto& panc = closure(p);
+                        acc.insert(panc.begin(), panc.end());
+                    }
+                }
+                return anc.emplace(txid, std::move(acc)).first->second;
+            };
+
+        for (const auto& [txid, e] : m_pool) {
+            if (!e.fee_known) continue;
+            const auto& a = closure(txid);
+            uint32_t cnt = static_cast<uint32_t>(a.size()) + 1;
+            uint64_t szf = e.base_size;
+            uint64_t mff = e.fee;
+            for (const auto& at : a) {
+                const auto& ae = m_pool.at(at);
+                szf += ae.base_size;
+                mff += ae.fee;
+            }
+            st.count_wa[txid]  = cnt;
+            st.size_wa[txid]   = static_cast<uint32_t>(szf);
+            st.modfee_wa[txid] = mff;
+            if (cnt > MAX_PACKAGE_TXS) st.over_limit.insert(txid);
+            for (const auto& at : a) st.descendants[at].insert(txid);  // reverse, transitive
+        }
+        return st;
+    }
+
+    /// dashd SortForBlock (miner.cpp:442-451) + CompareTxIterByAncestorCount
+    /// (miner.h:104-112): order an accepted package by full static
+    /// GetCountWithAncestors ascending, then txid ascending. For A depending on
+    /// B, count(A) > count(B) (A's ancestor set ⊇ B's ∪ {B}) regardless of
+    /// in-block subtraction, so this is always a valid topological emit order.
+    void sort_package_for_block(std::vector<const MempoolEntry*>& pkg,
+                                const AncState& anc) const
+    {
+        std::sort(pkg.begin(), pkg.end(),
+                  [&](const MempoolEntry* a, const MempoolEntry* b) {
+                      auto ia = anc.count_wa.find(a->txid);
+                      auto ib = anc.count_wa.find(b->txid);
+                      uint32_t ca = ia != anc.count_wa.end() ? ia->second : 1;
+                      uint32_t cb = ib != anc.count_wa.end() ? ib->second : 1;
+                      if (ca != cb) return ca < cb;
+                      return a->txid < b->txid;
+                  });
     }
 
     void evict_one_locked(const uint256& txid)
