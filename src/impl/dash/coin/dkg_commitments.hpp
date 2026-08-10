@@ -813,16 +813,117 @@ private:
     MembersReadyFn m_members_ready;   // observability only; unset => n/a
 };
 
+// ── #127 INSTANT-UPGRADE decision (null arm) ───────────────────────────────
+//
+/// When the null arm is armed it serves a consensus-valid NULL commitment for
+/// a required, not-yet-mined DKG slot so miners always have work. The moment
+/// the REAL commitment for that slot arrives on the wire (qfcommit push) it is
+/// admitted to the cache, and the NEXT template build would fold the real
+/// commitment in place of the null — but only IF a template rebuild is
+/// triggered. Nothing in the ingest path bumps work generation, so stratum
+/// keeps handing out the cached NULL job (a ~1 s re-notify) until an unrelated
+/// tip/state-dirty signal happens to fire. "Upgrade the instant it arrives"
+/// was therefore a claim, not a mechanism.
+///
+/// This predicate is that mechanism's DECISION, kept pure so it is KAT-able
+/// away from the main_dash wiring: TRUE iff a freshly-admitted relayed
+/// commitment should trigger a work-generation bump. The wiring
+/// (bump_work_generation + stratum notify_all) at main_dash.cpp calls it on
+/// every qfcommit ingest and bumps exactly when it returns true.
+///
+/// The three conjuncts, each of which must hold:
+///   1. `null_arm_armed`  — the --embedded-null-arm flag. OFF => ALWAYS false,
+///      so an OFF build never bumps here: byte-for-byte the pre-#127 ingest.
+///   2. `adm == Accepted` — a genuinely NEW or strictly-better commitment. A
+///      duplicate (NotBetterThanCached) is already in the cache, so the plan
+///      already had it and no upgrade is owed; a structural reject is not a
+///      commitment at all. (Accepted also implies a REAL commitment — ingest_ex
+///      rejects null-crypto-fields, so a null can never be Accepted.)
+///   3. the arriving (llmq_type, quorum_hash) is a CURRENTLY-REQUIRED
+///      mining-window slot at `next_height`, decided by the SAME
+///      compute_required_qc_slots / phase schedule the null arm itself uses to
+///      choose what to null-serve, read against the SAME has_mined active-set
+///      view. This is the anti-bump-storm gate: an arrival for a closed-window
+///      quorum, an already-mined slot, or a quorum outside the mandatory set
+///      returns FALSE and no bump fires. So the ONLY commitments that bump are
+///      exactly the ones the arm is (or would be) serving null for — the
+///      upgrade case and nothing else.
+///
+/// `has_mined` MUST be the same active-set answer the plan reads (qmgr.find);
+/// pass it via the const QuorumManager accessor so the D2 root-memo epoch is
+/// untouched.
+inline bool qc_ingest_triggers_work_bump(
+    LlmqNetwork net, uint32_t next_height,
+    bool null_arm_armed,
+    MineableCommitmentCache::Admission adm,
+    uint8_t llmq_type, const uint256& quorum_hash,
+    const std::function<std::optional<uint256>(uint32_t)>& hash_at_height,
+    const std::function<bool(uint8_t, const uint256&)>& has_mined)
+{
+    if (!null_arm_armed) return false;
+    if (adm != MineableCommitmentCache::Admission::Accepted) return false;
+    auto slots = compute_required_qc_slots(net, next_height,
+                                           hash_at_height, has_mined);
+    if (!slots) return false;   // set underivable => the plan fails closed too
+    for (const auto& s : *slots)
+        if (s.params.type == llmq_type && s.quorum_hash == quorum_hash)
+            return true;
+    return false;
+}
+
 // ── Daemonless provider (the piece main_dash wires in) ─────────────────────
 
-/// Positive attestation that the DKG for (llmq_type, quorum_hash) genuinely
-/// FAILED — i.e. dashd's own miner mines the NULL commitment for that slot,
-/// so serving null is canonical (reproduces the network root). This must be
-/// EVIDENCE of the failure, never inference from the absence of a relayed
-/// qfcommit (a relay gap looks identical and null-serving through it is the
-/// exact 1520106 divergence). No production source is wired yet: until one
-/// exists (e.g. DKG-phase observation), an unsatisfiable slot fails the
-/// whole height closed. Tests/harness inject attested vectors.
+/// May this required-and-not-yet-mined slot be served the consensus-valid
+/// NULL commitment right now? (#127 null arm — the "upgraded" form: serve
+/// null immediately so miners always have work, and let the normal
+/// work-generation refresh upgrade the template to the REAL commitment the
+/// instant it arrives.)
+///
+/// dashd's ACTUAL rule, ported verbatim from GetMineableCommitments
+/// (dashpay/dash llmq/blockprocessor.cpp:748-762): for each required slot it
+/// computes quorumHash (break if null, :748-750), `continue`s if
+/// HasMinedCommitment(type, quorumHash) (:752), and OTHERWISE emits the null
+/// commitment `CFinalCommitment(llmqParams, quorumHash)` (:757-760). There is
+/// NO failed-DKG predicate anywhere in that path — the ONLY test is
+/// HasMinedCommitment==false on a slot the phase schedule requires. A null is
+/// consensus-VALID at a window height regardless of whether the DKG "could
+/// have" succeeded: ProcessCommitment (blockprocessor.cpp:310-319) for
+/// qc.IsNull() calls ONLY VerifyNull() (commitment.cpp:187-200, structure
+/// only) and returns true; no branch rejects a null because the validator
+/// holds or could derive a real one. And a mined null does NOT set
+/// HasMinedCommitment (the return at :319 precedes the DB write at :362), so
+/// the real commitment can and must still be mined in a later window block —
+/// the null-then-real cadence.
+///
+/// An EARLIER revision of this contract demanded "positive attestation that
+/// the DKG genuinely FAILED", refusing to serve null on the absence of a
+/// relayed qfcommit. That gate was WRONG in both directions: it is
+/// unproducible by any light-client observer (no DKG-phase evidence is on the
+/// wire), and it is STRICTER than dashd, which serves null on a bare
+/// local-pool miss with no failed-DKG evidence at all. This type replaces it
+/// with dashd's negative-and-chain-accurate rule:
+///
+///   return TRUE  iff  !has_mined(type, quorum_hash)          // :752
+///                AND  active-set view is FRESH to pindexPrev // #94 gate
+///
+/// The `!has_mined` conjunct is redundant with compute_required_qc_slots
+/// (:425 already skips has_mined slots, so this fn is only ever CALLED for a
+/// not-yet-mined slot) but is asserted for defence in depth. The freshness
+/// conjunct is the ONLY thing this fn adds over dashd: it answers "may I trust
+/// has_mined==false here, i.e. is my active-set view fresh enough that
+/// has_mined==false is AUTHORITATIVE, not merely un-synced?". It is the SAME
+/// require_sml freshness the embedded arm's viability gate already enforces
+/// for every served block (node_coin_state.hpp: m_sml_current_hash ==
+/// m_prev_hash AND the SML is datable, coin_state_maintainer.hpp
+/// sml_height_paired()). When it is NOT proven fresh the fn returns FALSE and
+/// the whole height fails closed to the dashd fallback — worst case is exactly
+/// today's benign 4.51% gap, never a reject.
+///
+/// The `has_mined` handed to this fn MUST be the same active-set answer the
+/// merkleRootQuorums fold reads (the single-snapshot invariant: qmgr.find in
+/// build_daemonless_qc_plan below). Production wires it at
+/// main_dash.cpp behind --embedded-null-arm; when the flag is OFF the argument
+/// is literally nullptr and the null branch never executes (byte-unchanged).
 using DkgNullEvidenceFn =
     std::function<bool(uint8_t llmq_type, const uint256& quorum_hash)>;
 
@@ -875,9 +976,16 @@ daemonless_qc_commitments(
                 gap_reason = cache->diagnose(s.params.type, s.quorum_hash);
             }
         }
-        // No verified real commitment for this mandatory slot. Null is
-        // canonical ONLY on positive failed-DKG evidence; otherwise the
-        // whole height is unservable (completeness gate — the 1520106 fix).
+        // No verified real commitment for this mandatory slot. Serve the
+        // consensus-valid null iff null_evidence says so (#127: dashd's
+        // negative-and-chain-accurate rule — has_mined==false on a view
+        // proven fresh to pindexPrev; see DkgNullEvidenceFn above). A null
+        // folds NOTHING into merkleRootQuorums (skipped below), so this only
+        // ADDS a block-local null tx on top of the unchanged active-set root.
+        // When null_evidence is nullptr (flag off) or returns false (freshness
+        // unproven) the branch never fires and the whole height fails closed
+        // to the dashd fallback — the completeness gate (the 1520106 fix)
+        // holds unchanged.
         if (null_evidence && null_evidence(s.params.type, s.quorum_hash)) {
             out.push_back(build_null_commitment(s.params, s.quorum_hash,
                                                 s.quorum_index));
@@ -1004,6 +1112,11 @@ enum class QcPlanStage : uint8_t {
                           // THIS is the case that carries a quorum identity.
     RootFoldUnderivable,  // every slot satisfied, but merkleRootQuorums could
                           // not be folded (a leaf's base height is unknown)
+    SnapshotRaced,        // #127 single-snapshot invariant: the QuorumManager
+                          // active set mutated (fold_seq changed) between the
+                          // has_mined sampling and the root fold, so the null
+                          // decision and the root may reference two different
+                          // views — fail closed rather than serve through it
 };
 
 inline const char* qc_plan_stage_name(QcPlanStage s)
@@ -1014,6 +1127,7 @@ inline const char* qc_plan_stage_name(QcPlanStage s)
         case QcPlanStage::SlotSetUnderivable:  return "slot-set-underivable";
         case QcPlanStage::SlotUnsatisfied:     return "slot-unsatisfied";
         case QcPlanStage::RootFoldUnderivable: return "root-fold-underivable";
+        case QcPlanStage::SnapshotRaced:       return "snapshot-raced";
     }
     return "n/a";
 }
@@ -1103,6 +1217,18 @@ inline std::optional<QcBlockPlan> build_daemonless_qc_plan(
     const std::function<bool(uint8_t, const uint256&)>& also_has_mined = nullptr,
     QcPlanGap* plan_gap = nullptr)
 {
+    // #127 SINGLE-SNAPSHOT INVARIANT. The null-evidence decision (via
+    // has_mined below) and the merkleRootQuorums fold (qmgr.active_entries()
+    // in compute_merkle_root_quorums_with_block) MUST read one active-set
+    // snapshot — otherwise a null could be emitted against a view that lacks a
+    // real commitment the root fold then includes (or vice-versa). Under the
+    // single-threaded ioc model they always do: no accepted-diff handler can
+    // preempt this synchronous call. This stamp makes that checkable rather
+    // than merely argued: if the QuorumManager mutates mid-build (a future
+    // off-ioc reader forgetting Phase-L's shared_mutex), fold_seq changes and
+    // the whole height fails closed to the dashd fallback instead of serving a
+    // mismatched (null, root) pair.
+    const uint64_t fold_seq_before = qmgr.fold_seq();
     auto has_mined = [&qmgr, &also_has_mined](uint8_t t, const uint256& qh) {
         if (qmgr.find(t, qh).has_value()) return true;
         return also_has_mined ? also_has_mined(t, qh) : false;
@@ -1125,6 +1251,17 @@ inline std::optional<QcBlockPlan> build_daemonless_qc_plan(
         if (plan_gap != nullptr) {
             *plan_gap = QcPlanGap{};
             plan_gap->stage = QcPlanStage::RootFoldUnderivable;
+        }
+        return std::nullopt;
+    }
+    // #127 single-snapshot assert: the active set must not have moved between
+    // the has_mined sampling and the fold above. Under single-threaded ioc
+    // this can never trip; if it ever does, fail closed rather than emit a
+    // null decided on one snapshot and a root folded from another.
+    if (qmgr.fold_seq() != fold_seq_before) {
+        if (plan_gap != nullptr) {
+            *plan_gap = QcPlanGap{};
+            plan_gap->stage = QcPlanStage::SnapshotRaced;
         }
         return std::nullopt;
     }

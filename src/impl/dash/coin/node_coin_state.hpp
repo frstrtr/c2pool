@@ -197,6 +197,19 @@ public:
     void set_sml_current_hash(const uint256& h) { m_sml_current_hash = h; }
     const uint256& sml_current_hash() const { return m_sml_current_hash; }
 
+    /// #127 null-arm freshness predicate (the require_sml tip-currency half).
+    /// TRUE iff the folded SML is current AT the tip we build on: non-null and
+    /// equal to prev_hash. This is exactly the conjunct the viability gate
+    /// enforces before it refuses (see the `m_require_sml && m_sml_current_hash
+    /// != m_prev_hash` refuse below), exposed so the DkgNullEvidenceFn can
+    /// re-assert the SAME freshness the arm's own viability already proved —
+    /// defence in depth, so a null can never be decided on a view the arm
+    /// would itself reject. The height-DATABLE half (sml_height_paired) lives
+    /// in the maintainer and is AND'd there by the production null-evidence fn.
+    bool sml_current_at_prev() const {
+        return !m_sml_current_hash.IsNull() && m_sml_current_hash == m_prev_hash;
+    }
+
     /// The HEIGHT that same applied SML is current at, authoritative off the
     /// accepted diff's own cbTx.nHeight (CoinStateMaintainer::m_sml_current_height).
     /// -1 = never reported.
