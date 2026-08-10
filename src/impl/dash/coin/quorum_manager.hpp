@@ -23,6 +23,18 @@
 // which posts to ioc; reads from other threads (Phase L's clsig
 // verifier) need a shared_mutex once that lands. For now we assume
 // single-threaded ioc access.
+//
+// SINGLE-SNAPSHOT STAMP (#127 null-arm): m_fold_seq is a monotone counter
+// bumped once on every mutation of the active set (apply / replace_state /
+// clear). build_daemonless_qc_plan (dkg_commitments.hpp) reads it before it
+// samples has_mined and again after it folds merkleRootQuorums, and fails the
+// whole height closed if it changed — so the null-evidence decision and the
+// root fold provably read ONE active-set snapshot. Under the single-threaded
+// ioc model the two reads always match (no diff handler can preempt a
+// synchronous build); the stamp exists so that if the Phase-L shared_mutex
+// ever lands and a reader forgets to hold it across the build, the divergence
+// fails closed to the dashd fallback instead of emitting a null against one
+// snapshot and a root against another.
 
 #include <impl/dash/coin/vendor/llmq_commitment.hpp>
 #include <impl/dash/coin/vendor/quorum_tail.hpp>
@@ -144,6 +156,7 @@ public:
         m_latest_cl_sigs = tail.quorumsCLSigs;
         r.cl_sigs_cached = m_latest_cl_sigs.size();
         r.active_after = m_active.size();
+        ++m_fold_seq;   // #127: one bump per accepted-diff mutation
         return r;
     }
 
@@ -181,6 +194,7 @@ public:
     {
         m_active.clear();
         m_latest_cl_sigs.clear();
+        ++m_fold_seq;   // #127: clear mutates the active set
     }
 
     // Latest cached quorumsCLSigs from the most recent diff. Each entry
@@ -206,7 +220,16 @@ public:
     {
         m_active        = std::move(active);
         m_latest_cl_sigs = std::move(cl_sigs);
+        ++m_fold_seq;   // #127: warm-load mutates the active set
     }
+
+    // #127 single-snapshot stamp. Monotone, bumped once per active-set
+    // mutation (apply / replace_state / clear). See the SINGLE-SNAPSHOT STAMP
+    // note at the top of this file: build_daemonless_qc_plan brackets its
+    // has_mined reads and its root fold with this value and fails closed on a
+    // mismatch, so the null decision and the root can never read two
+    // different snapshots.
+    uint64_t fold_seq() const { return m_fold_seq; }
 
 private:
     std::vector<Entry> m_active;
@@ -216,6 +239,9 @@ private:
     // the entries inserted from THIS diff; on the next diff they go
     // stale and we replace them.
     std::vector<CLSig> m_latest_cl_sigs;
+
+    // #127 single-snapshot stamp — see fold_seq() and the file-header note.
+    uint64_t m_fold_seq{0};
 };
 
 } // namespace coin

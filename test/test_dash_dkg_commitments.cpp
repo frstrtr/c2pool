@@ -2091,3 +2091,265 @@ TEST(DashQcVerifyMemo, ConcurrentServeReadsAlwaysGetTheirCommitmentAndConverge)
         << " reads: the only tolerable duplication is one racing re-verify "
            "per reader thread at the moment of latching, never per read";
 }
+
+// ── #127 NULL ARM (A-upgraded): optimistic null at fresh window-open slots ──
+//
+// dashd emits a NULL final-commitment for a required, not-yet-mined slot
+// whenever HasMinedCommitment==false (GetMineableCommitments,
+// llmq/blockprocessor.cpp:748-762 — NO failed-DKG predicate; the only test is
+// has_mined==false on a phase-required slot). c2pool's DkgNullEvidenceFn ports
+// that rule and ANDs the #94 freshness proof (may I trust has_mined==false,
+// i.e. is my active-set view current to pindexPrev?). These KATs pin all four
+// terminal classes at a WINDOW-OPEN height (the previously-untested class),
+// on the real testnet mnlistdiff wire shape (block 1518412 -> QuorumManager),
+// plus OFF-equivalence and the single-snapshot stamp.
+//
+// The cycle for interval-24 types 1/4/6 is base 1518408; the mining window is
+// phases [10,18] = heights 1518418..1518426. 1518418 is WINDOW-OPEN. The
+// fixture's active set predates this cycle, so its three interval-24 slots are
+// required and not-yet-mined — exactly the null-arm case.
+namespace {
+constexpr uint32_t kNullArmCycleBase   = 1'518'408u;
+constexpr uint32_t kNullArmWindowOpen  = 1'518'418u;   // phase 10
+constexpr uint32_t kNullArmWindowLast  = 1'518'426u;   // phase 18
+
+QuorumManager from_wire_qmgr()
+{
+    auto bytes = read_mnlistdiff_fixture();
+    ::PackStream in(bytes);
+    vendor::CSimplifiedMNListDiff diff;
+    in >> diff;
+    EXPECT_EQ(in.cursor_size(), 0u);
+    vendor::QuorumTail tail;
+    EXPECT_TRUE(vendor::parse_quorum_tail(diff.quorum_tail, tail));
+    QuorumManager qmgr;
+    qmgr.apply(tail);
+    EXPECT_GT(qmgr.active_count(), 0u);
+    return qmgr;
+}
+
+// The production DkgNullEvidenceFn body, shaped exactly as main_dash wires it:
+// null iff the slot is not-yet-mined on the SAME QuorumManager the root fold
+// reads AND the active-set view is proven fresh (the freshness bool models the
+// NodeCoinState require_sml conjunct, unit-covered separately).
+DkgNullEvidenceFn make_null_evidence(const QuorumManager& qmgr, bool fresh)
+{
+    return [&qmgr, fresh](uint8_t t, const uint256& qh) -> bool {
+        const bool not_mined = !qmgr.find(t, qh).has_value();
+        return not_mined && fresh;   // dashd :752 + #94 freshness
+    };
+}
+
+auto null_arm_height_of = [](const uint256&) -> std::optional<uint32_t> {
+    ADD_FAILURE() << "all-null / carried-forward fold needs no eviction order";
+    return std::nullopt;
+};
+} // namespace
+
+// (a) REAL-NOT-YET-MINED at window-open -> null emitted, accepted root ==
+// carried-forward active-set root (a null folds nothing).
+TEST(DashNullArm, WindowOpenRealNotYetMinedServesNullMatchingCarriedRoot)
+{
+    auto qmgr = from_wire_qmgr();
+    ASSERT_TRUE(is_dkg_commitment_window(kNullArmWindowOpen));
+
+    auto plan = build_daemonless_qc_plan(
+        LlmqNetwork::Testnet, kNullArmWindowOpen, qmgr,
+        fake_hash_at, null_arm_height_of,
+        /*cache=*/nullptr, make_null_evidence(qmgr, /*fresh=*/true));
+    ASSERT_TRUE(plan.has_value()) << "a fresh, not-yet-mined window-open slot "
+                                     "must serve the consensus-valid null";
+    ASSERT_EQ(plan->commitments.size(), 3u);
+    for (const auto& c : plan->commitments) {
+        EXPECT_EQ(c.CountSigners(), 0);        // VerifyNull shape
+        EXPECT_EQ(c.CountValidMembers(), 0);
+        EXPECT_EQ(c.quorumHash, *fake_hash_at(kNullArmCycleBase));
+    }
+    // A null block reproduces the carried-forward active-set root exactly
+    // (cbtx.cpp:149-152 skips nulls; our folder mirrors it).
+    EXPECT_EQ(plan->merkle_root_quorums, compute_merkle_root_quorums(qmgr));
+    EXPECT_EQ(plan->merkle_root_quorums.GetHex(), kExpQuorumRoot);
+}
+
+// (b) REAL-ALREADY-MINED <= pindexPrev -> NO null for that slot (the
+// bad-qc-not-allowed door: compute_required_qc_slots :425 skips has_mined
+// slots, so the null_evidence fn is NEVER consulted for one and no null tx is
+// produced). We inject a REAL type-4 commitment at the slot's quorumHash so it
+// reads already-mined; its slot must vanish while types 1/6 still null-serve.
+TEST(DashNullArm, WindowOpenRealAlreadyMinedEmitsNoNullForThatSlot)
+{
+    // Fresh qmgr carrying exactly one already-mined quorum: type 4 at the
+    // cycle-base hash fake_hash_at consults for the type-4 slot (qi 0).
+    QuorumManager qmgr;
+    vendor::QuorumTail tail;
+    tail.newQuorums.push_back(real_commitment(
+        kLlmq100_67, *fake_hash_at(kNullArmCycleBase), /*qi=*/0, /*seed=*/0x11));
+    qmgr.apply(tail);
+    ASSERT_TRUE(qmgr.find(4, *fake_hash_at(kNullArmCycleBase)).has_value());
+
+    // A height_of that CAN resolve the injected leaf's base (the real leaf is
+    // folded into the root; eviction never triggers at 1-of-24 capacity).
+    auto height_of = [](const uint256& qh) -> std::optional<uint32_t> {
+        if (qh == *fake_hash_at(kNullArmCycleBase)) return kNullArmCycleBase;
+        return std::nullopt;
+    };
+
+    auto plan = build_daemonless_qc_plan(
+        LlmqNetwork::Testnet, kNullArmWindowOpen, qmgr,
+        fake_hash_at, height_of,
+        /*cache=*/nullptr, make_null_evidence(qmgr, /*fresh=*/true));
+    ASSERT_TRUE(plan.has_value());
+    // Types 1 and 6 still need nulls; type 4 is suppressed (already mined) so
+    // NO type-4 commitment appears — emitting one would be bad-qc-not-allowed.
+    ASSERT_EQ(plan->commitments.size(), 2u);
+    for (const auto& c : plan->commitments) {
+        EXPECT_NE(c.llmqType, 4) << "a null for an already-mined slot is "
+                                    "bad-qc-not-allowed and must never appear";
+        EXPECT_EQ(c.CountSigners(), 0);
+    }
+    EXPECT_EQ(plan->commitments[0].llmqType, 1);
+    EXPECT_EQ(plan->commitments[1].llmqType, 6);
+}
+
+// (c) STALE FRESHNESS -> fail closed, no null (worst case = today's gap).
+TEST(DashNullArm, WindowOpenStaleFreshnessFailsClosedNoNull)
+{
+    auto qmgr = from_wire_qmgr();
+    RequiredQcSlot gap{};
+    QcPlanGap plan_gap{};
+    auto plan = build_daemonless_qc_plan(
+        LlmqNetwork::Testnet, kNullArmWindowOpen, qmgr,
+        fake_hash_at, null_arm_height_of,
+        /*cache=*/nullptr, make_null_evidence(qmgr, /*fresh=*/false),
+        &gap, /*also_has_mined=*/nullptr, &plan_gap);
+    EXPECT_FALSE(plan.has_value())
+        << "freshness unproven must fail the WHOLE height closed, never null";
+    // Names the first unsatisfiable mandatory slot (a real quorum identity).
+    EXPECT_EQ(gap.params.type, 1);
+    EXPECT_EQ(plan_gap.stage, QcPlanStage::SlotUnsatisfied);
+}
+
+// (d) WINDOW-CLOSED-NULL -> null is canonical at EVERY window height (the DKG
+// failed; dashd mines null the whole way). Every phase 10..18 serves all-null
+// and reproduces the carried-forward root.
+TEST(DashNullArm, WindowClosedNullServesNullAtEveryWindowHeight)
+{
+    auto qmgr = from_wire_qmgr();
+    const uint256 carried = compute_merkle_root_quorums(qmgr);
+    for (uint32_t h = kNullArmWindowOpen; h <= kNullArmWindowLast; ++h) {
+        ASSERT_TRUE(is_dkg_commitment_window(h)) << "h=" << h;
+        auto plan = build_daemonless_qc_plan(
+            LlmqNetwork::Testnet, h, qmgr, fake_hash_at, null_arm_height_of,
+            /*cache=*/nullptr, make_null_evidence(qmgr, /*fresh=*/true));
+        ASSERT_TRUE(plan.has_value()) << "h=" << h;
+        ASSERT_EQ(plan->commitments.size(), 3u) << "h=" << h;
+        for (const auto& c : plan->commitments)
+            EXPECT_EQ(c.CountSigners(), 0) << "h=" << h;
+        EXPECT_EQ(plan->merkle_root_quorums, carried) << "h=" << h;
+    }
+}
+
+// OFF-EQUIVALENCE: with null_evidence == nullptr (flag OFF) the exact
+// window-open height that (a) served must FAIL CLOSED, byte-identical to
+// master's PHASE-1 refusal. This is the neutering control for (a)/(d): flip
+// the arm off and the null disappears.
+TEST(DashNullArm, FlagOffIsByteIdenticalRefusalToMaster)
+{
+    auto qmgr = from_wire_qmgr();
+    RequiredQcSlot gap{};
+    // nullptr null_evidence == the OFF binary's argument token.
+    auto off = build_daemonless_qc_plan(
+        LlmqNetwork::Testnet, kNullArmWindowOpen, qmgr,
+        fake_hash_at, null_arm_height_of,
+        /*cache=*/nullptr, /*null_evidence=*/nullptr, &gap);
+    EXPECT_FALSE(off.has_value())
+        << "flag OFF must refuse exactly as master did (no null branch)";
+    EXPECT_EQ(gap.params.type, 1);   // same first unsatisfiable slot as (c)
+
+    // And an explicit all-false evidence fn is identical to nullptr here.
+    auto off2 = build_daemonless_qc_plan(
+        LlmqNetwork::Testnet, kNullArmWindowOpen, qmgr,
+        fake_hash_at, null_arm_height_of,
+        /*cache=*/nullptr,
+        DkgNullEvidenceFn([](uint8_t, const uint256&) { return false; }));
+    EXPECT_FALSE(off2.has_value());
+}
+
+// UPGRADE CADENCE: at window-open a real commitment is not yet verified -> the
+// slot null-serves; once the SAME slot's real commitment is BLS-verified in
+// the cache, the plan emits the REAL commitment (skipping the null branch) and
+// folds it into the root — the null-then-real template upgrade, no new
+// mechanism. Proven on one type (4); the other two continue to null-serve.
+TEST(DashNullArm, RealArrivalUpgradesTheTemplateFromNullToReal)
+{
+    // Synthetic EMPTY active set so folding the arriving real type-4 leaf needs
+    // no eviction (type 4's capacity is 24; one leaf is far under it), keeping
+    // the root fold self-contained. All three interval-24 slots (types 1/4/6)
+    // are required and not-yet-mined.
+    QuorumManager qmgr;
+    const uint256 q4 = *fake_hash_at(kNullArmCycleBase);
+
+    // BEFORE: null for all three (real not yet verified).
+    auto before = build_daemonless_qc_plan(
+        LlmqNetwork::Testnet, kNullArmWindowOpen, qmgr,
+        fake_hash_at, null_arm_height_of,
+        /*cache=*/nullptr, make_null_evidence(qmgr, /*fresh=*/true));
+    ASSERT_TRUE(before.has_value());
+    ASSERT_EQ(before->commitments.size(), 3u);
+
+    // A real type-4 commitment arrives and BLS-verifies for that slot.
+    MineableCommitmentCache cache;
+    auto real4 = real_commitment(kLlmq100_67, q4, /*qi=*/0, /*seed=*/0x22);
+    ASSERT_TRUE(cache.ingest(LlmqNetwork::Testnet, real4));
+    cache.set_bls_verify_fn([](const CFinalCommitment&) { return true; });
+
+    // AFTER: type 4 serves the REAL commitment; types 1/6 still null. The real
+    // leaf now folds into the root, so it DIFFERS from the all-null root.
+    auto after = build_daemonless_qc_plan(
+        LlmqNetwork::Testnet, kNullArmWindowOpen, qmgr,
+        fake_hash_at, null_arm_height_of,
+        &cache, make_null_evidence(qmgr, /*fresh=*/true));
+    ASSERT_TRUE(after.has_value());
+    ASSERT_EQ(after->commitments.size(), 3u);
+    int real_count = 0, null_count = 0;
+    for (const auto& c : after->commitments) {
+        if (c.CountSigners() > 0) {
+            ++real_count;
+            EXPECT_EQ(c.llmqType, 4);
+            EXPECT_EQ(c.quorumHash, q4);
+        } else {
+            ++null_count;
+        }
+    }
+    EXPECT_EQ(real_count, 1);
+    EXPECT_EQ(null_count, 2);
+    EXPECT_NE(after->merkle_root_quorums, before->merkle_root_quorums)
+        << "a REAL commitment folds into merkleRootQuorums; the upgraded "
+           "template must not carry the all-null root";
+}
+
+// SINGLE-SNAPSHOT STAMP: fold_seq() is monotone across every active-set
+// mutation, and a stable qmgr never trips the SnapshotRaced guard.
+TEST(DashNullArm, FoldSeqIsMonotoneAndStableBuildDoesNotRace)
+{
+    QuorumManager qmgr;
+    const uint64_t s0 = qmgr.fold_seq();
+    vendor::QuorumTail tail;   // empty apply still counts as a mutation point
+    qmgr.apply(tail);
+    const uint64_t s1 = qmgr.fold_seq();
+    EXPECT_GT(s1, s0);
+    qmgr.clear();
+    EXPECT_GT(qmgr.fold_seq(), s1);
+
+    // A synchronous build over a stable snapshot must serve (no race); the
+    // stamp is unchanged across the call.
+    auto qm = from_wire_qmgr();
+    const uint64_t before = qm.fold_seq();
+    auto plan = build_daemonless_qc_plan(
+        LlmqNetwork::Testnet, kNullArmWindowOpen, qm,
+        fake_hash_at, null_arm_height_of,
+        /*cache=*/nullptr, make_null_evidence(qm, /*fresh=*/true));
+    EXPECT_TRUE(plan.has_value());
+    EXPECT_EQ(qm.fold_seq(), before) << "a synchronous build must not mutate "
+                                        "the active set";
+}

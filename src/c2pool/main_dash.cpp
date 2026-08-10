@@ -403,7 +403,7 @@ void print_banner(const char* argv0)
         << "           [--stratum [HOST:]PORT] [--coin-p2p-connect HOST:PORT]... [--coin-p2p-discover]\n"
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
         << "           [--external-ip ADDR]\n"
-        << "           [--embedded-utxo] [--embedded-mainnet] [--embedded-mn-bridge-max N]\n"
+        << "           [--embedded-utxo] [--embedded-mainnet] [--embedded-null-arm] [--embedded-mn-bridge-max N]\n"
         << "           [--embedded-mn-bridge-no-cursor]\n"
         << "           [--embedded-utxo-immature-serve-empty] [--embedded-serve-mempool-txs]\n"
         << "           [--embedded-accrue-asset-locks]\n"
@@ -858,7 +858,23 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // ride the served body (tx-serving, blocked on #125); with a
              // coinbase-only body a submitted block is bad-cbtx-assetlocked-
              // amount. See asset_lock_fold.hpp + set_accrue_pending_asset_locks.
-             bool embedded_accrue_asset_locks = false)
+             bool embedded_accrue_asset_locks = false,
+             // --embedded-null-arm (#127): SUB-arm of the embedded arm. When
+             // a DKG mining-window slot is required and not-yet-mined on a
+             // view PROVEN fresh to the tip, serve the consensus-valid NULL
+             // commitment optimistically (dashd's own GetMineableCommitments
+             // behaviour, llmq/blockprocessor.cpp:748-762) instead of failing
+             // the whole height to the dashd fallback; the normal
+             // work-generation refresh upgrades the template to the REAL
+             // commitment the instant it arrives (null does not set
+             // HasMinedCommitment, so the real can still be mined). DEFAULT
+             // OFF, money/consensus path: when off the null_evidence argument
+             // at the build_daemonless_qc_plan call site is literally nullptr
+             // and every served template + decline decision is byte-identical
+             // to master. Freshness unproven => no null => dashd fallback
+             // (worst case = today's benign gap, never a reject). Only has
+             // effect when the embedded arm is already enabled.
+             bool embedded_null_arm = false)
 {
     namespace io = boost::asio;
 
@@ -4082,24 +4098,27 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // by the VERIFY leg below, and inert unless the build actually
             // links dashbls).
             //
-            // A required slot with no verified commitment is NOT null-served.
-            // dashd's miner does mine the null commitment there
-            // (GetMineableCommitments, "null commitment required" arm); c2pool
-            // deliberately does not copy it, because a null is only CANONICAL
-            // when that DKG genuinely failed: at block 1520106 null-serving a
-            // SUCCEEDED DKG skipped leaves every dashd folds in and diverged
-            // merkleRootQuorums (bad-cbtx). So the slot is unsatisfiable and
-            // the WHOLE height fails closed to the dashd fallback, NAMED
-            // cause=qc-plan-underivable. The refusal is BOUNDED: it ends when
-            // any other miner mines the commitment (the slot then reads
+            // A required slot with no verified commitment is null-served ONLY
+            // when --embedded-null-arm is armed AND the active-set view is
+            // proven fresh to the tip (#127): dashd's own miner mines the null
+            // commitment there (GetMineableCommitments, "null commitment
+            // required" arm, llmq/blockprocessor.cpp:748-762), and a null is
+            // consensus-valid + folds NOTHING into merkleRootQuorums, so it
+            // reproduces the carried-forward active-set root exactly. The
+            // 1520106 divergence was a STALE-active-set fault (null-serving a
+            // view that MISSED a real commitment already mined <= pindexPrev),
+            // which the same freshness obligation the arm already meets closes
+            // — see dkg_commitments.hpp DkgNullEvidenceFn + "two reject doors".
+            // With the flag OFF (default) the null_evidence argument at the
+            // build_daemonless_qc_plan call below is literally nullptr, the
+            // slot stays unsatisfiable, and the WHOLE height fails closed to
+            // the dashd fallback, NAMED cause=qc-plan-underivable — exactly
+            // master's behaviour. The refusal is BOUNDED either way: it ends
+            // when any other miner mines the commitment (the slot then reads
             // already-mined off the mnlistdiff-fed QuorumManager) or when the
-            // DKG mining window closes — both by cycleStart +
-            // dkgMiningWindowEnd. Full reasoning: dkg_commitments.hpp, HEIGHT
-            // COMPLETENESS + COLD-START HOLE. Null is served ONLY on positive
-            // failed-DKG evidence (DkgNullEvidenceFn), and production passes
-            // no such source — see /*null_evidence=*/nullptr at the
-            // build_daemonless_qc_plan call below. [QC-MINEABLE] is the
-            // field-checkable signal that the sourcing leg is live.
+            // DKG mining window closes — both by cycleStart + dkgMiningWindowEnd.
+            // [QC-MINEABLE] is the field-checkable signal that the sourcing leg
+            // is live.
             auto qc_cache =
                 std::make_shared<dash::coin::MineableCommitmentCache>();
 
@@ -4440,8 +4459,60 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // gets its own key so it is never held back by the floor.
             auto qc_recon_log =
                 std::make_shared<dash::coin::diag::LogSuppressor>(300000);
+            // ── #127 NULL ARM: the production DkgNullEvidenceFn ────────────
+            // dashd's negative-and-chain-accurate rule, ported verbatim from
+            // GetMineableCommitments (dashpay/dash llmq/blockprocessor.cpp
+            // :748-762): a required, not-yet-mined slot may be served the
+            // consensus-valid NULL commitment iff HasMinedCommitment==false
+            // (:752). There is NO failed-DKG predicate in that path — the ONLY
+            // test is has_mined==false on a slot the phase schedule requires
+            // (that requirement is enforced upstream by
+            // compute_required_qc_slots, so this fn is only ever CALLED for a
+            // genuinely-required not-yet-mined slot). The one thing we add over
+            // dashd is the freshness proof: may I TRUST has_mined==false, i.e.
+            // is my mnlistdiff-fed active-set view current enough that
+            // has_mined==false is authoritative, not merely un-synced? That is
+            // the SAME require_sml freshness the embedded arm's viability gate
+            // (node_coin_state.hpp) already enforced before build_daemonless_
+            // qc_plan is even reached — re-asserted here for defence in depth,
+            // so the null decision can never ride a view the arm would itself
+            // refuse. The has_mined read goes through the SAME QuorumManager
+            // the merkleRootQuorums fold reads (single-snapshot invariant),
+            // via the CONST accessor so the D2 root-memo epoch is untouched.
+            // Freshness unproven => FALSE => the whole height fails closed to
+            // the dashd fallback (worst case = today's benign gap, never a
+            // reject). Consulted ONLY when --embedded-null-arm is armed; off,
+            // nullptr is passed at the call site and this fn is never invoked.
+            dash::coin::DkgNullEvidenceFn qc_null_evidence =
+                [&node_coin_state, m = maintainer.get()]
+                (uint8_t llmq_type, const uint256& quorum_hash) -> bool {
+                    // (a) !has_mined — redundant with compute_required_qc_slots
+                    //     (:425 already skipped has_mined slots) but asserted.
+                    const bool not_mined =
+                        !std::as_const(node_coin_state).qmgr()
+                             .find(llmq_type, quorum_hash).has_value();
+                    // (b) SML DATABLE (#94 gate, coin_state_maintainer.hpp
+                    //     sml_height_paired): an un-dateable list covers
+                    //     NOTHING, so has_mined==false off it is not trusted.
+                    const bool datable = (m != nullptr) && m->sml_height_paired();
+                    // (c) SML CURRENT AT THE TIP we build on (== pindexPrev):
+                    //     the require_sml freshness (m_sml_current_hash ==
+                    //     m_prev_hash) the viability gate enforces.
+                    const bool current = node_coin_state.sml_current_at_prev();
+                    return not_mined && datable && current;
+                };
+            LOG_INFO << "[QC-NULL-ARM] " << (embedded_null_arm
+                        ? "ARMED (--embedded-null-arm): a required, not-yet-mined"
+                          " DKG slot on a fresh active-set view is served the"
+                          " consensus-valid null commitment (dashd"
+                          " GetMineableCommitments rule); the real commitment"
+                          " upgrades the template via the normal work refresh"
+                        : "OFF (default): unsatisfiable qc slots fail the whole"
+                          " height closed to the dashd fallback, byte-identical"
+                          " to master — pass --embedded-null-arm to enable");
             node_coin_state.set_qc_plan_fn(
                 [&node_coin_state, hc = header_chain.get(), qc_net, qc_cache,
+                 embedded_null_arm, qc_null_evidence,
                  qc_gap_logged_h, qc_first_plan_h, qc_cold_note_done,
                  qc_type_recon, qc_recon_said, qc_recon_log, qc_episode,
                  // PR-2 FORWARD. By REFERENCE: the index is constructed later
@@ -4504,7 +4575,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             return std::nullopt;
                         },
                         qc_cache.get(),
-                        /*null_evidence=*/nullptr,
+                        // #127: null arm. OFF => literally nullptr (the null
+                        // branch never executes; byte-identical to master).
+                        // ON => dashd's negative-and-chain-accurate rule.
+                        (embedded_null_arm
+                            ? qc_null_evidence
+                            : dash::coin::DkgNullEvidenceFn(nullptr)),
                         &gap,
                         // ── PR-2 FORWARD: the SECOND already-mined source ──
                         // dashd answers HasMinedCommitment from the block it
@@ -7389,6 +7465,10 @@ int main(int argc, char** argv)
     // (mempool_validity_gate.hpp). NOT the [SHADOW-TXSET] ours_only number --
     // that is a coverage statistic and gates nothing.
     bool embedded_mempool_ingest = false;
+    // --embedded-null-arm (#127): optimistic null commitment at fresh
+    // window-open slots + template upgrade to the real commitment. DEFAULT
+    // OFF, money/consensus path; byte-unchanged when off (nullptr null_evidence).
+    bool embedded_null_arm = false;
     std::string bestcl_policy = "freshness";   // --bestcl-policy: freshness (default, conservative proxy) | consensus-exact (dashcore's actual CheckCbTxBestChainlock rule)
     bool embedded_oracle_shadow = false;       // --embedded-oracle-shadow: per-block dashd cross-check (OBSERVE-only)
     bool embedded_shadow_compare = false;      // --embedded-shadow-compare: serve-vs-dashd template diff (OBSERVE-only, NOT a gate)
@@ -7488,6 +7568,10 @@ int main(int argc, char** argv)
             embedded_accrue_asset_locks = true;   // #107 PHASE 2
         else if (std::strcmp(argv[i], "--embedded-mempool-ingest") == 0)
             embedded_mempool_ingest = true;
+        else if (std::strcmp(argv[i], "--embedded-null-arm") == 0)
+            embedded_null_arm = true;   // #127
+        else if (std::strcmp(argv[i], "--embedded-null-arm=false") == 0)
+            embedded_null_arm = false;  // #127: explicit OFF (OFF-equivalence)
         else if (std::strcmp(argv[i],
                              "--embedded-creditpool-publish-at-serve-tip") == 0)
             embedded_creditpool_publish_at_serve_tip = true;
@@ -7782,7 +7866,8 @@ int main(int argc, char** argv)
                         embedded_creditpool_publish_at_serve_tip,
                         pin_splice_xcheck_arm,
                         pin_splice_block_budget,
-                        embedded_accrue_asset_locks);   // #107 PHASE 2
+                        embedded_accrue_asset_locks,   // #107 PHASE 2
+                        embedded_null_arm);            // #127
     }
     return run_selftest();
 }
