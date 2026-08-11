@@ -786,6 +786,106 @@ TEST(DashCoinStateMaintainer, MnlistdiffBaseContinuityRejectsMismatchedBase) {
     EXPECT_EQ(st.sml().size(), 3u);
 }
 
+// A1 cursor-derived getmnlistd base: the tip-advance / handshake send paths
+// (main_dash.cpp:5107 / :5226) now derive the getmnlistd request base from
+// CoinStateMaintainer::sml_current_hash() — the block the SML is ACTUALLY
+// current at — instead of the reception-time `sml_base` tracker that advanced
+// on EVERY received diff (accepted or not). This regression-pins the
+// in-flight-overlap latch closed.
+//
+// Scenario (the design's root divergence, no demux leak needed): two tip
+// advances overlap in flight and both request base = cursor0 (ZERO, cold).
+// reply1 (base ZERO -> tip1) is accepted (cursor -> tip1). reply2 (base ZERO
+// -> tip2) BASE-REJECTS at the maintainer because have_at is now tip1 — but a
+// reception-time tracker would still write tip2, stranding the request base
+// AHEAD of the applied cursor. Every later request off that stranded base then
+// re-trips base-continuity and the cursor never moves again (latch).
+//
+// With the base derived from sml_current_hash(): after the rejected reply2 the
+// base source is still tip1 (the applied cursor), so the next advance requests
+// base == tip1 -> a contiguous span that is accepted and advances the cursor.
+TEST(DashCoinStateMaintainer, CursorDerivedBaseSurvivesInFlightOverlapLatch) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+
+    const uint256 TIP1 = raw256(0xA0);
+    const uint256 TIP2 = raw256(0xB0);
+    const uint256 TIP3 = raw256(0xC0);
+
+    // A fake coin_p2p capturing send_getmnlistd(base, target). The captured
+    // base mirrors the FIXED send site exactly: base = m.sml_current_hash().
+    std::vector<std::pair<uint256, uint256>> reqs;
+    auto request = [&](const uint256& target) {
+        const uint256 base = m.sml_current_hash();   // A1 send-site derivation
+        reqs.emplace_back(base, target);
+        return base;
+    };
+    // A model of the RETIRED reception-time tracker: advances on every received
+    // diff regardless of acceptance. Kept only to demonstrate it would strand.
+    uint256 reception_base = uint256::ZERO;
+    auto on_reply = [&](const uint256& base, const uint256& block) {
+        CSimplifiedMNListDiff d;
+        d.baseBlockHash = base;
+        d.blockHash     = block;
+        d.mnList = {sml_entry(0x40)};
+        m.on_mnlistdiff(d);
+        reception_base = block;   // reception-time tracker: writes unconditionally
+    };
+
+    // Two advances overlap in flight: both derive base from the cold cursor
+    // (ZERO) BEFORE either reply lands.
+    ASSERT_EQ(request(TIP1), uint256::ZERO);
+    ASSERT_EQ(request(TIP2), uint256::ZERO);
+
+    // reply1: base ZERO -> tip1, accepted; cursor advances to tip1.
+    on_reply(uint256::ZERO, TIP1);
+    ASSERT_EQ(m.sml_current_hash(), TIP1);
+
+    // reply2: base ZERO -> tip2, BASE-REJECTS (have_at is tip1 now). The cursor
+    // must NOT advance to the stranded reception hash.
+    on_reply(uint256::ZERO, TIP2);
+    EXPECT_EQ(m.sml_current_hash(), TIP1)
+        << "a base-rejected overlapping reply must not advance the applied cursor";
+    // The retired reception-time tracker WOULD have stranded ahead of the
+    // cursor — this is exactly the latch the fix removes.
+    EXPECT_EQ(reception_base, TIP2);
+    EXPECT_NE(reception_base, m.sml_current_hash());
+
+    // Next advance: the FIXED send site derives base from the applied cursor
+    // (tip1), NOT the stranded reception hash (tip2).
+    const uint256 next_base = request(TIP3);
+    EXPECT_EQ(next_base, m.sml_current_hash());
+    EXPECT_EQ(next_base, TIP1) << "base must be the applied cursor, not the stranded reception hash";
+    EXPECT_NE(next_base, reception_base);
+
+    // A diff off that cursor-derived base (tip1 -> tip3) is contiguous and
+    // accepted: the cursor advances, the latch is broken.
+    on_reply(next_base, TIP3);
+    EXPECT_EQ(m.sml_current_hash(), TIP3)
+        << "cursor-derived base yields a contiguous span the maintainer accepts";
+
+    // Counter-model: had the send site used the stranded reception base (tip2),
+    // the same reply would base-reject and the cursor would stay wedged.
+    {
+        NodeCoinState st2;
+        CoinStateMaintainer m2(st2);
+        CSimplifiedMNListDiff cold;
+        cold.baseBlockHash = uint256::ZERO;
+        cold.blockHash     = TIP1;
+        cold.mnList = {sml_entry(0x40)};
+        m2.on_mnlistdiff(cold);
+        ASSERT_EQ(m2.sml_current_hash(), TIP1);
+        CSimplifiedMNListDiff stranded;
+        stranded.baseBlockHash = TIP2;   // the reception-time tracker's stranded base
+        stranded.blockHash     = TIP3;
+        stranded.mnList = {sml_entry(0x41)};
+        m2.on_mnlistdiff(stranded);
+        EXPECT_EQ(m2.sml_current_hash(), TIP1)
+            << "reception-time base (tip2) base-rejects at the maintainer -> the "
+               "cursor stays wedged: this is the latch the A1 fix removes";
+    }
+}
+
 // C-2 chainlock: on_new_chainlock adopts a fresher ChainLock as the CCbTx
 // bestCL* and fires the state-dirty sink; a non-advancing height is ignored.
 TEST(DashCoinStateMaintainer, OnNewChainlockAdoptsForwardOnlyAndFiresDirty) {

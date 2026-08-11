@@ -5104,7 +5104,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // the state needed to build tip+1. Incremental off the last
                 // synced base (ZERO after a reorg = full snapshot); the
                 // new_mnlistdiff subscription advances sml_base on acceptance.
-                if (cp) cp->send_getmnlistd(*sml_base, new_tip);
+                // A1: base = the APPLIED cursor (maintainer->sml_current_hash()),
+                // the block the SML is actually current at — the single source of
+                // truth. A prior overlapping/leaked/base-rejected reply can no
+                // longer strand the request base ahead of the cursor (the
+                // reception-time sml_base tracker's latch); the next advance
+                // re-requests the same contiguous span and is accepted.
+                if (cp && m) cp->send_getmnlistd(m->sml_current_hash(), new_tip);
                 // #739 + stale-payee window close: event-driven stale-work
                 // notify. INVALIDATE the template cache FIRST (mirrors the
                 // #770/#772 fire_refresh trio: invalidate + bump + notify) so the
@@ -5223,7 +5229,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // handshake, target ZERO too — the first tip-change re-requests.
                 auto tip_entry = hc->tip();
                 const uint256 tip = tip_entry ? tip_entry->hash : uint256::ZERO;
-                cp->send_getmnlistd(*sml_base, tip);
+                // A1: base = the APPLIED cursor (single source of truth). At
+                // handshake the maintainer is cold (cursor == ZERO) so this is
+                // the full cold snapshot; a reconnect after some sync re-requests
+                // from exactly what the SML has applied, never a stranded base.
+                cp->send_getmnlistd(maint ? maint->sml_current_hash() : uint256::ZERO, tip);
                 // E-SUPERBLOCK: prime the governance object/vote sync (triggers
                 // + funding votes) so a superblock height can be served
                 // daemonlessly. Zero nProp + empty filter => request all.
