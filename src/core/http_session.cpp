@@ -951,7 +951,14 @@ void HttpSession::process_request()
                         // duplicate buttons on pages that had both mechanisms.
 
                         response.set(http::field::content_type, mime);
-                        response.set(http::field::cache_control, "public, max-age=3600");
+                        // HTML entry points must always revalidate. Caching the shell for an
+                        // hour meant a plain browser refresh kept serving a stale dashboard
+                        // after any update or redeploy. Static assets (js/css/img/map) keep
+                        // the long cache; only the .html/.htm shells get no-cache.
+                        if (ext == ".html" || ext == ".htm")
+                            response.set(http::field::cache_control, "no-cache");
+                        else
+                            response.set(http::field::cache_control, "public, max-age=3600");
                         response.body() = std::move(contents);
                         response.prepare_payload();
                         send_response(std::move(response));
