@@ -684,7 +684,7 @@ jobs:
       # across jobs, so after the first run this is a fast no-op.
       - name: Ensure Inno Setup 6 (for setup.exe installer)
         if: steps.presence.outputs.exists == '1'
-        shell: pwsh
+        shell: powershell -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           if (Test-Path $iscc) { Write-Host "Inno Setup already installed: $iscc"; exit 0 }
