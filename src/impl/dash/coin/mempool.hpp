@@ -65,6 +65,7 @@
 #include <core/coin/utxo_view_cache.hpp>
 
 #include <atomic>
+#include <cmath>                 // block_min_fee_for_size: dashd CFeeRate::GetFee std::ceil
 #include <functional>
 #include <cstdint>
 #include <ctime>
@@ -132,6 +133,19 @@ public:
     static constexpr size_t DEFAULT_MAX_BYTES   = 300ULL * 1024 * 1024;
     static constexpr time_t DEFAULT_EXPIRY_SECS = 14 * 24 * 3600;
 
+    /// dashd DEFAULT_BLOCK_MIN_TX_FEE (src/policy/policy.h:25) — the minimum
+    /// ancestor-package feerate, in duffs per 1000 bytes, below which
+    /// BlockAssembler::addPackageTxs stops adding transactions (miner.cpp:69,
+    /// blockMinFeeRate = CFeeRate(DEFAULT_BLOCK_MIN_TX_FEE)). This is the
+    /// canonical dashd default: keeping it here makes the embedded selection
+    /// terminate at the SAME floor as dashd's own miner out of the box.
+    static constexpr int64_t DEFAULT_BLOCK_MIN_TX_FEE = 1000;
+
+    /// dashd BlockAssembler MAX_CONSECUTIVE_FAILURES (src/node/miner.cpp:490):
+    /// once this many packages in a row fail the byte/sigop caps AND the block
+    /// is within 1000 bytes of full, addPackageTxs gives up scanning.
+    static constexpr int64_t MAX_CONSECUTIVE_FAILURES = 1000;
+
     explicit Mempool(size_t max_bytes  = DEFAULT_MAX_BYTES,
                      time_t expiry_sec = DEFAULT_EXPIRY_SECS)
         : m_max_bytes(max_bytes)
@@ -142,6 +156,23 @@ public:
     Mempool& operator=(const Mempool&) = delete;
 
     void set_utxo(::core::coin::UTXOViewCache* u) { m_utxo.store(u); }
+
+    /// blockmintxfee-equivalent knob (dashd -blockmintxfee / BlockAssembler
+    /// Options::blockMinFeeRate, miner.cpp:100). Sets the min ancestor-package
+    /// feerate in duffs/kB used by the blockMinFeeRate early-return in
+    /// get_sorted_txs_with_fees. DEFAULT_BLOCK_MIN_TX_FEE (1000) matches
+    /// canonical dashd; callers may lower it (e.g. 0 to disable the floor) or
+    /// raise it. Locked because the selector reads it under m_mutex.
+    void set_block_min_tx_fee(int64_t duff_per_k)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_block_min_tx_fee = duff_per_k;
+    }
+    int64_t block_min_tx_fee() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_block_min_tx_fee;
+    }
 
     /// ── PINNED-LOCAL-TX include gate (donation-dust consolidation lane) ────
     /// A pinned tx is an operator-supplied, externally-signed, ZERO-fee
@@ -764,6 +795,11 @@ public:
         // re-scored mapModifiedTx (mod_score) — scored on the SAME min-of-two
         // basis (FeeKey::operator<), so a CPFP descendant re-competes at its
         // lighter remaining-package feerate once an ancestor is included.
+        // PORT 2 (dashd miner.cpp:491): consecutive cap-failure counter — the
+        // give-up heuristic that stops scanning once the block is nearly full
+        // and nothing is fitting. Reset to 0 on each admitted package (:625).
+        int64_t nConsecutiveFailed = 0;
+
         auto mi = anc_index.begin();
         while (mi != anc_index.end() || !mod_by_txid.empty()) {
             // (a) SKIP GUARD (dashd :507-514): a mapTx entry already staged in
@@ -801,6 +837,50 @@ public:
             if (selected.count(txid) || m_pool.find(txid) == m_pool.end()) {
                 if (using_mod) erase_mod(txid);
                 continue;
+            }
+
+            // (d.5) PORT 1: blockMinFeeRate EARLY-RETURN (dashd
+            //     miner.cpp:576-587). Take the winning candidate's
+            //     WHOLE-ancestor-package feerate — dashd's packageFees =
+            //     GetModFeesWithAncestors(), packageSize = GetSizeWithAncestors()
+            //     (the modified totals when the pick came from mapModifiedTx) —
+            //     and stop the WHOLE loop once it drops below the min feerate.
+            //
+            //     SOURCE-OF-FEE/SIZE (money-path, get this exactly right): use
+            //     the SAME ancestor tables that KEYED the ancestor_score index —
+            //       * mapTx pick : anc.modfee_wa/anc.size_wa (full static totals)
+            //       * mod pick   : the ModEntry's mod_modfee_wa/mod_size_wa
+            //         (static-minus-in-block-ancestors, dashd nModFeesWithAncestors)
+            //     NOT collect_package_locked's pkg_fees/pkg_bytes remainder: that
+            //     is only the UNSELECTED-ancestor subset, a higher feerate, and
+            //     gating on it would drop higher-fee txs = revenue loss.
+            //
+            //     WHOLE-package feerate, NOT the min-of-two anc_score key: dashd
+            //     SORTS by min(self, ancestor-package) but GATES on the whole
+            //     ancestor-package feerate. We mirror that split exactly.
+            //
+            //     `return`, NEVER `continue`: both candidate indices are sorted
+            //     by ancestor score descending and `txid` is the best of the two,
+            //     so once this pick is sub-floor everything remaining is too —
+            //     dashd's "Everything else we might consider has a lower fee
+            //     rate". min-fee is POLICY, not consensus: the worst case of
+            //     over-including (floor set too low) is a valid, fee-suboptimal
+            //     block, never an invalid/orphaned one.
+            {
+                uint64_t fee_wa;
+                uint32_t size_wa;
+                if (using_mod) {
+                    const ModEntry& me = mod_by_txid.at(txid);
+                    fee_wa  = me.mod_modfee_wa;
+                    size_wa = me.mod_size_wa;
+                } else {
+                    fee_wa  = anc.modfee_wa.at(txid);
+                    size_wa = anc.size_wa.at(txid);
+                }
+                if (static_cast<int64_t>(fee_wa)
+                        < block_min_fee_for_size(m_block_min_tx_fee, size_wa)) {
+                    return {std::move(result), total_fees};
+                }
             }
 
             // (e) BUILD PACKAGE. collect_package_locked stays the AUTHORITATIVE
@@ -923,18 +1003,39 @@ public:
             }
             (void)pkg_fees;   // accounted below via per-entry e->fee
 
-            // ── (g) Caps — LIFTED UNCHANGED. Byte cap strict `>`, sigop cap
-            // `>=` (reject AT the cap). `continue` never `break`: a later,
-            // smaller candidate may still fit (superset-safe scan; dashd's
-            // nConsecutiveFailed>1000 cutoff is deliberately NOT ported —
-            // design-review RC5). Only a mapModifiedTx pick is erased+failed
-            // (dashd :590-596); a mapTx pick already had `mi` advanced. ──────
+            // ── (g) Caps. Byte cap strict `>`, sigop cap `>=` (reject AT the
+            // cap). Each cap failure is one dashd TestPackage() failure
+            // (miner.cpp:359-368 tests byte AND sigop caps together): only a
+            // mapModifiedTx pick is erased+failed (dashd :590-596); a mapTx pick
+            // already had `mi` advanced.
+            //
+            // PORT 2: nConsecutiveFailed cutoff (dashd miner.cpp:598-603). Each
+            // cap-fail bumps the counter; once >1000 consecutive fails AND the
+            // block is within 1000 bytes of the cap, dashd stops scanning
+            // (`break`) — nothing more will fit. `continue` otherwise (a later,
+            // smaller candidate may still fit — superset-safe). Near-no-op for
+            // DASH's block sizes but ported for exact addPackageTxs parity. The
+            // give-up test uses int64 arithmetic so `max_bytes - 1000` cannot
+            // underflow when max_bytes < 1000 (dashd's nBlockMaxSize is clamped
+            // >=1000, miner.cpp:212; ours is a caller-supplied param).
             if (total_bytes + pkg_bytes > max_bytes) {
                 if (using_mod) { erase_mod(txid); failed.insert(txid); }
+                ++nConsecutiveFailed;
+                if (nConsecutiveFailed > MAX_CONSECUTIVE_FAILURES
+                    && static_cast<int64_t>(total_bytes)
+                           > static_cast<int64_t>(max_bytes) - 1000) {
+                    break;
+                }
                 continue;
             }
             if (total_sigops + pkg_sigops >= DASH_MAX_BLOCK_SIGOPS) {
                 if (using_mod) { erase_mod(txid); failed.insert(txid); }
+                ++nConsecutiveFailed;
+                if (nConsecutiveFailed > MAX_CONSECUTIVE_FAILURES
+                    && static_cast<int64_t>(total_bytes)
+                           > static_cast<int64_t>(max_bytes) - 1000) {
+                    break;
+                }
                 continue;
             }
 
@@ -942,6 +1043,11 @@ public:
             // re-orders the SAME members before emit → within-package
             // hashMerkleRoot parity. This vector order flows unchanged into
             // embedded_gbt.hpp's vtx. ────────────────────────────────────────
+            //
+            // PORT 2: this package makes it in — reset the consecutive-failure
+            // counter ONCE per admitted PACKAGE (dashd miner.cpp:625, before
+            // SortForBlock), not per-tx.
+            nConsecutiveFailed = 0;
             sort_package_for_block(package, anc);
             for (const auto* e : package) {
                 selected.insert(e->txid);
@@ -1010,6 +1116,11 @@ private:
     size_t                                             m_total_bytes{0};
     size_t                                             m_max_bytes;
     time_t                                             m_expiry_sec;
+    // PORT 1: blockmintxfee-equivalent floor (duff/kB) for the blockMinFeeRate
+    // early-return in get_sorted_txs_with_fees. Default = canonical dashd
+    // DEFAULT_BLOCK_MIN_TX_FEE. Read under m_mutex (selector holds it); written
+    // via set_block_min_tx_fee (also under the lock).
+    int64_t                                            m_block_min_tx_fee{DEFAULT_BLOCK_MIN_TX_FEE};
     std::atomic<::core::coin::UTXOViewCache*>          m_utxo{nullptr};
     // Second-source coin lookup for the PINNED-TX gate only (see
     // set_external_coin_lookup). Set once at wiring time, before any template
@@ -1100,6 +1211,25 @@ private:
     /// (txmempool.h:297-311): return the (fee,size) of the SMALLER feerate of
     /// {self, whole-ancestor-package}, using the same division-free
     /// cross-multiply as FeeKey::operator< (no pre-divided double).
+    /// dashd CFeeRate::GetFee (src/policy/feerate.cpp:23-37): the minimum fee,
+    /// in duffs, that `num_bytes` must pay at `sat_per_k` duff/kB. Reproduces
+    /// dashd EXACTLY: ceil of the double quotient (nSatoshisPerK*nSize/1000.0),
+    /// plus the round-up-to-1 floor when a nonzero size would otherwise truncate
+    /// to a zero fee. The int64 product matches dashd's `nSatoshisPerK * nSize`
+    /// (evaluated before the /1000.0 promotes to double); block sizes keep it
+    /// far from int64 overflow.
+    static int64_t block_min_fee_for_size(int64_t sat_per_k, uint64_t num_bytes)
+    {
+        const int64_t n_size = static_cast<int64_t>(num_bytes);
+        int64_t n_fee = static_cast<int64_t>(
+            std::ceil(static_cast<double>(sat_per_k * n_size) / 1000.0));
+        if (n_fee == 0 && n_size != 0) {
+            if (sat_per_k > 0) n_fee = 1;
+            else if (sat_per_k < 0) n_fee = -1;
+        }
+        return n_fee;
+    }
+
     static FeeKey anc_score_key(uint64_t self_fee, uint32_t self_size,
                                 uint64_t modfee_wa, uint32_t size_wa,
                                 const uint256& txid)
