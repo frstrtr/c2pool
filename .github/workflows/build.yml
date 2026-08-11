@@ -1431,7 +1431,13 @@ jobs:
             Remove-Item -Recurse -Force secp256k1-src -ErrorAction SilentlyContinue
             Start-Sleep -Seconds ($i * 5)
           }
-          cmake -B secp256k1-src/build -S secp256k1-src -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="${env:GITHUB_WORKSPACE}/secp256k1" -DSECP256K1_BUILD_TESTS=OFF -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=OFF -DSECP256K1_BUILD_BENCHMARK=OFF -DSECP256K1_BUILD_EXAMPLES=OFF
+          # -DSECP256K1_ENABLE_MODULE_RECOVERY=ON: upstream defaults this module
+          # OFF, and with it off the recovery header (secp256k1_recovery.h) is
+          # NOT installed and the recovery symbols are NOT compiled. Linux/macOS
+          # get it from their distro packages (libsecp256k1-dev / brew secp256k1);
+          # this source build must enable it explicitly so spork.hpp's
+          # <secp256k1_recovery.h> resolves and secp256k1_ecdsa_recover* link.
+          cmake -B secp256k1-src/build -S secp256k1-src -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="${env:GITHUB_WORKSPACE}/secp256k1" -DSECP256K1_ENABLE_MODULE_RECOVERY=ON -DSECP256K1_BUILD_TESTS=OFF -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=OFF -DSECP256K1_BUILD_BENCHMARK=OFF -DSECP256K1_BUILD_EXAMPLES=OFF
           cmake --build secp256k1-src/build --config Release
           cmake --install secp256k1-src/build --config Release
 
