@@ -27,6 +27,7 @@
 #include <core/coin/utxo_view_cache.hpp>
 
 #include <algorithm>
+#include <cmath>       // gate #133 KATs: independent dashd CFeeRate::GetFee ceil reference
 #include <cstdint>
 #include <set>
 #include <vector>
@@ -1399,4 +1400,268 @@ TEST(DashMempoolSelectionFidelity, K8_CapsBoundariesPreserved)
         EXPECT_EQ(sel.size(), 1u)
             << "sigop cap `>=` at 40'000 must stop selection at one such tx";
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Gate #133 — the two remaining dashd BlockAssembler::addPackageTxs residuals
+// ported into get_sorted_txs_with_fees:
+//   PORT 1  blockMinFeeRate early-return   (dashd src/node/miner.cpp:584-587)
+//   PORT 2  nConsecutiveFailed cutoff       (dashd src/node/miner.cpp:490-491,
+//                                            598-603, 625)
+//
+// Expected values are derived ONLY from dashd source constants:
+//   DEFAULT_BLOCK_MIN_TX_FEE = 1000   (src/policy/policy.h:25)
+//   CFeeRate::GetFee(size)   = ceil(sat_per_k * size / 1000.0), rounded up to 1
+//                              for a nonzero size (src/policy/feerate.cpp:23-37)
+//   MAX_CONSECUTIVE_FAILURES = 1000   (src/node/miner.cpp:490)
+// ════════════════════════════════════════════════════════════════════════════
+
+// Independent KAT reference for dashd CFeeRate::GetFee — a SECOND, hand-written
+// implementation (never a call into the header under test) so a regression in
+// mempool.hpp's own copy cannot mask itself.
+static int64_t kat_min_fee(int64_t sat_per_k, uint64_t num_bytes) {
+    const int64_t n = static_cast<int64_t>(num_bytes);
+    int64_t fee = static_cast<int64_t>(
+        std::ceil(static_cast<double>(sat_per_k * n) / 1000.0));
+    if (fee == 0 && n != 0 && sat_per_k > 0) fee = 1;
+    return fee;
+}
+
+// Add a plain 1-in/1-out tx paying EXACTLY `fee` duffs. Seeds a fresh confirmed
+// coin (100'000'000) for the input so the fee is KNOWN. `seed` must be unique
+// within a test. Returns the txid. (The value magnitude never changes the
+// serialized size — TxOut.value is a fixed-width field — so `fee` is free to
+// vary independently of the base size the floor is computed from.)
+static uint256 add_priced(Mempool& mp, UTXOViewCache& utxo, uint32_t seed,
+                          int64_t fee) {
+    uint256 prev = mint_hash(seed);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000'000, {}, 1, false));
+    auto tx = make_spend(prev, 0, 100'000'000 - fee, /*salt=*/seed);
+    EXPECT_TRUE(mp.add_tx(tx));
+    return dash_txid(tx);
+}
+
+// Serialized base size of a plain 1-in/1-out make_spend tx, measured at runtime.
+static uint32_t one_in_one_out_size() {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp; mp.set_utxo(&utxo);
+    uint256 tid = add_priced(mp, utxo, /*seed=*/40'000, /*fee=*/1'000);
+    return mp.get_entry(tid)->base_size;
+}
+
+// ── PORT 1: blockMinFeeRate ──────────────────────────────────────────────────
+
+TEST(DashMempoolBlockMinFeeRate, DefaultFloorIsCanonicalDashd1000)
+{
+    {
+        UTXOViewCache utxo(nullptr); Mempool mp; mp.set_utxo(&utxo);
+        EXPECT_EQ(mp.block_min_tx_fee(), 1000)
+            << "the knob must default to dashd DEFAULT_BLOCK_MIN_TX_FEE";
+    }
+    EXPECT_EQ(Mempool::DEFAULT_BLOCK_MIN_TX_FEE, 1000);
+
+    const uint32_t S = one_in_one_out_size();
+    const int64_t floor = kat_min_fee(1000, S);        // == S at perK 1000
+    ASSERT_EQ(floor, static_cast<int64_t>(S));
+
+    // fee == floor : INCLUDED (the gate is strict `<`, not `<=`).
+    {
+        UTXOViewCache utxo(nullptr); Mempool mp; mp.set_utxo(&utxo);
+        uint256 tid = add_priced(mp, utxo, 41'000, /*fee=*/floor);
+        EXPECT_EQ(sel_set(mp, 1u << 20).count(tid), 1u)
+            << "a package paying EXACTLY the floor must be included";
+    }
+    // fee == floor-1 : EXCLUDED, and selection returns empty.
+    {
+        UTXOViewCache utxo(nullptr); Mempool mp; mp.set_utxo(&utxo);
+        uint256 tid = add_priced(mp, utxo, 41'001, /*fee=*/floor - 1);
+        auto got = sel_set(mp, 1u << 20);
+        EXPECT_EQ(got.count(tid), 0u)
+            << "a sub-floor package must be excluded by blockMinFeeRate";
+        EXPECT_TRUE(got.empty()) << "the sub-floor best candidate must RETURN (empty block)";
+    }
+}
+
+TEST(DashMempoolBlockMinFeeRate, CeilBoundaryMatchesDashdGetFee)
+{
+    const uint32_t S = one_in_one_out_size();
+    ASSERT_NE(S % 1000u, 0u) << "test-size assumption for the ceil probe";
+    const int64_t perK = 1001;                          // forces a fractional GetFee
+    const int64_t floor = kat_min_fee(perK, S);         // ceil(1001*S/1000)
+    const int64_t trunc = (perK * static_cast<int64_t>(S)) / 1000;   // floor division
+    ASSERT_EQ(floor, trunc + 1) << "GetFee must ROUND UP here, not truncate";
+
+    // fee == floor-1 (== the truncated value): EXCLUDED — proves CEIL, not floor.
+    {
+        UTXOViewCache utxo(nullptr); Mempool mp; mp.set_utxo(&utxo);
+        mp.set_block_min_tx_fee(perK);
+        uint256 tid = add_priced(mp, utxo, 42'000, /*fee=*/floor - 1);
+        EXPECT_EQ(sel_set(mp, 1u << 20).count(tid), 0u)
+            << "fee one below ceil(perK*size/1000) must be excluded";
+    }
+    // fee == floor : INCLUDED.
+    {
+        UTXOViewCache utxo(nullptr); Mempool mp; mp.set_utxo(&utxo);
+        mp.set_block_min_tx_fee(perK);
+        uint256 tid = add_priced(mp, utxo, 42'001, /*fee=*/floor);
+        EXPECT_EQ(sel_set(mp, 1u << 20).count(tid), 1u)
+            << "fee exactly at the ceil floor must be included";
+    }
+}
+
+TEST(DashMempoolBlockMinFeeRate, KnobRaisesFloorAndExcludes)
+{
+    const uint32_t S = one_in_one_out_size();
+    const int64_t at_default_floor = kat_min_fee(1000, S);   // == S
+
+    // Included at the default floor...
+    {
+        UTXOViewCache utxo(nullptr); Mempool mp; mp.set_utxo(&utxo);
+        uint256 tid = add_priced(mp, utxo, 43'000, /*fee=*/at_default_floor);
+        EXPECT_EQ(sel_set(mp, 1u << 20).count(tid), 1u);
+    }
+    // ...excluded once the knob raises the floor above its feerate.
+    {
+        UTXOViewCache utxo(nullptr); Mempool mp; mp.set_utxo(&utxo);
+        mp.set_block_min_tx_fee(1'000'000);                  // 1000 duff/byte
+        uint256 tid = add_priced(mp, utxo, 43'001, /*fee=*/at_default_floor);
+        EXPECT_EQ(sel_set(mp, 1u << 20).count(tid), 0u)
+            << "raising blockmintxfee must exclude a now-sub-floor tx";
+    }
+}
+
+TEST(DashMempoolBlockMinFeeRate, GatesOnWholeAncestorPackageFeerateNotSelf)
+{
+    // CPFP: a big cheap PARENT + a small CHILD whose SELF feerate is far above
+    // the floor but whose WHOLE ancestor-package feerate (parent+child) is
+    // BELOW it. dashd gates on GetModFeesWithAncestors/GetSizeWithAncestors —
+    // the whole package — so the child is dropped, and because it is the best
+    // remaining candidate the loop RETURNS with an empty block. Gating on the
+    // child's SELF feerate (or on collect_package_locked's unselected-ancestor
+    // remainder) would instead admit BOTH. Default floor perK=1000 →
+    // floor(size)=size duffs.
+    UTXOViewCache utxo(nullptr); Mempool mp; mp.set_utxo(&utxo);
+    uint256 coinP = mint_hash(44'000);
+    utxo.add_coin(Outpoint(coinP, 0), Coin(100'000'000, {}, 1, false));
+
+    // Parent: padded ~2 KB, fee only 50 → deeply sub-floor on its own.
+    auto parent = make_spend_padded(coinP, 0, 100'000'000 - 50, /*salt=*/44'000, /*pad=*/2000);
+    ASSERT_TRUE(mp.add_tx(parent));
+    const uint32_t Sp = mp.get_entry(dash_txid(parent))->base_size;
+
+    // Child spends parent:0; small 1-in/1-out with a HIGH self fee (500).
+    auto child = make_spend(dash_txid(parent), 0, (100'000'000 - 50) - 500, /*salt=*/44'001);
+    ASSERT_TRUE(mp.add_tx(child));
+    const uint32_t Sc = mp.get_entry(dash_txid(child))->base_size;
+
+    // Pin the intended regime from the MEASURED sizes:
+    ASSERT_GE(int64_t(500), kat_min_fee(1000, Sc))            // child SELF >= its own floor
+        << "child self feerate must be ABOVE the floor";
+    ASSERT_LT(int64_t(50 + 500), kat_min_fee(1000, Sp + Sc))  // package < package floor
+        << "whole (parent+child) package feerate must be BELOW the floor";
+
+    EXPECT_TRUE(sel_set(mp, 1u << 20).empty())
+        << "child gated on WHOLE-package feerate (sub-floor) → dropped; as the "
+           "best candidate its verdict RETURNS an empty selection. A self- or "
+           "remainder-feerate gate would wrongly admit {parent, child}.";
+}
+
+// ── PORT 2: nConsecutiveFailed ───────────────────────────────────────────────
+
+TEST(DashMempoolConsecutiveFailed, BreaksAfter1000FailuresNearCap)
+{
+    // Isolate the cutoff from the fee floor (perK=0 → floor never fires). One
+    // high-fee FILL takes the block within <1000 bytes of the cap; >1000
+    // higher-priority fillers then each overflow the byte cap (continue +
+    // ++nConsecutiveFailed) until the cutoff BREAKS the loop — so a later,
+    // lowest-fee tx that WOULD fit is never reached.
+    UTXOViewCache utxo(nullptr); Mempool mp; mp.set_utxo(&utxo);
+    mp.set_block_min_tx_fee(0);
+
+    uint256 coinF = mint_hash(50'000);
+    utxo.add_coin(Outpoint(coinF, 0), Coin(100'000'000, {}, 1, false));
+    auto FILL = make_spend_padded(coinF, 0, 100'000'000 - 5'000'000, /*salt=*/50'000, /*pad=*/4200);
+    ASSERT_TRUE(mp.add_tx(FILL));
+    const uint32_t Sf = mp.get_entry(dash_txid(FILL))->base_size;
+    const uint32_t max_bytes = Sf + 700;              // 700B room after FILL: <1000 (near cap)
+
+    for (uint32_t i = 0; i < 1002; ++i) {             // >1000 fillers, each ~1KB > 700B room
+        uint256 prev = mint_hash(50'010 + i);
+        utxo.add_coin(Outpoint(prev, 0), Coin(100'000'000, {}, 1, false));
+        auto f = make_spend_padded(prev, 0, 100'000'000 - 100'000, /*salt=*/50'010 + i, /*pad=*/950);
+        ASSERT_TRUE(mp.add_tx(f));
+    }
+    uint256 finalTid = add_priced(mp, utxo, 52'000, /*fee=*/50);   // tiny, LOWEST feerate
+
+    auto got = sel_set(mp, max_bytes);
+    EXPECT_EQ(got.count(dash_txid(FILL)), 1u);
+    EXPECT_EQ(got.count(finalTid), 0u)
+        << "nConsecutiveFailed>1000 within 1000B of the cap must BREAK before "
+           "the later fitting tx is reached";
+    EXPECT_EQ(got.size(), 1u)
+        << "only FILL fits; fillers overflow, FINAL is cut off by the break";
+}
+
+TEST(DashMempoolConsecutiveFailed, NoBreakWhenNotNearCapSigopFailures)
+{
+    // >1000 consecutive failures that are NOT byte-cap failures: each filler
+    // alone exceeds the 40'000 sigop cap. Because total_bytes stays far below
+    // max_bytes-1000, the give-up guard is FALSE and the loop does NOT break —
+    // a later low-sigop tx is still reached and selected.
+    UTXOViewCache utxo(nullptr); Mempool mp; mp.set_utxo(&utxo);
+    mp.set_block_min_tx_fee(0);
+    const uint32_t max_bytes = 8u << 20;              // 8 MB: byte room always ample
+
+    for (uint32_t i = 0; i < 1002; ++i) {
+        uint256 prev = mint_hash(60'000 + i);
+        utxo.add_coin(Outpoint(prev, 0), Coin(100'000'000, {}, 1, false));
+        auto f = make_spend(prev, 0, 100'000'000 - 100'000, /*salt=*/60'000 + i);
+        f.vout[0].scriptPubKey.m_data.assign(2'000, 0xae);   // 2'000×20 = 40'000 legacy sigops
+        ASSERT_TRUE(mp.add_tx(f));
+    }
+    uint256 finalTid = add_priced(mp, utxo, 61'100, /*fee=*/50);   // 0-sigop, LOWEST feerate
+
+    auto got = sel_set(mp, max_bytes);
+    EXPECT_EQ(got.count(finalTid), 1u)
+        << "sigop-cap failures far from the byte cap must NOT trigger the "
+           "near-cap break: the later fitting tx is still selected";
+    EXPECT_EQ(got.size(), 1u)
+        << "every sigop-stuffed filler is rejected AT the cap; only FINAL admits";
+}
+
+TEST(DashMempoolConsecutiveFailed, ResetPerAdmittedPackagePreventsBreak)
+{
+    // The counter resets on every ADMITTED package. Two runs of 600 byte-cap
+    // failures each (1200 > 1000 total) are separated by ONE admitted tx that
+    // resets the counter — so it never reaches 1001 IN A ROW and the loop does
+    // NOT break: a final fitting tx is still selected. Without the reset the
+    // 1200 cumulative failures near the cap would break and cut it off.
+    UTXOViewCache utxo(nullptr); Mempool mp; mp.set_utxo(&utxo);
+    mp.set_block_min_tx_fee(0);
+
+    uint256 coinF = mint_hash(55'000);
+    utxo.add_coin(Outpoint(coinF, 0), Coin(100'000'000, {}, 1, false));
+    auto FILL = make_spend_padded(coinF, 0, 100'000'000 - 9'000'000, /*salt=*/55'000, /*pad=*/4200);
+    ASSERT_TRUE(mp.add_tx(FILL));
+    const uint32_t Sf = mp.get_entry(dash_txid(FILL))->base_size;
+    const uint32_t max_bytes = Sf + 700;              // near cap (room 700B < 1000)
+
+    // Big fillers ~1KB (> room → byte-cap fail). Feerate tiers pick-order the
+    // run as: FILL, [tierA 600], MID(fits→reset), [tierB 600], FINAL(fits).
+    auto add_big = [&](uint32_t seed, int64_t fee) {
+        uint256 prev = mint_hash(seed);
+        utxo.add_coin(Outpoint(prev, 0), Coin(100'000'000, {}, 1, false));
+        auto f = make_spend_padded(prev, 0, 100'000'000 - fee, /*salt=*/seed, /*pad=*/950);
+        ASSERT_TRUE(mp.add_tx(f));
+    };
+    for (uint32_t i = 0; i < 600; ++i) add_big(55'010 + i, /*fee=*/310'000);   // tierA: ~299/B
+    uint256 midTid = add_priced(mp, utxo, 55'700, /*fee=*/17'000);             // MID: 200/B, fits
+    for (uint32_t i = 0; i < 600; ++i) add_big(56'000 + i, /*fee=*/100'000);   // tierB: ~96/B
+    uint256 finalTid = add_priced(mp, utxo, 56'800, /*fee=*/50);               // FINAL: lowest
+
+    auto got = sel_set(mp, max_bytes);
+    EXPECT_EQ(got.count(midTid), 1u)   << "MID admits and resets the failure counter";
+    EXPECT_EQ(got.count(finalTid), 1u)
+        << "with the per-package reset, 600+600 non-consecutive failures never "
+           "reach 1001 in a row → no break → FINAL is still selected";
 }
