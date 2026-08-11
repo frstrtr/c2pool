@@ -684,6 +684,7 @@ jobs:
       # across jobs, so after the first run this is a fast no-op.
       - name: Ensure Inno Setup 6 (for setup.exe installer)
         if: steps.presence.outputs.exists == '1'
+        continue-on-error: true  # Inno is a nice-to-have; never block the .zip release
         shell: powershell -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
