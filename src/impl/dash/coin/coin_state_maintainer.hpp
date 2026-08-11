@@ -127,6 +127,17 @@ public:
     CoinStateMaintainer(const CoinStateMaintainer&) = delete;
     CoinStateMaintainer& operator=(const CoinStateMaintainer&) = delete;
 
+    /// The block hash the applied SML cursor is actually current at — the ONE
+    /// source of truth for the getmnlistd request base. on_mnlistdiff advances
+    /// this (via set_sml_current_hash) only after an accepted, base-contiguous
+    /// apply (:719); on_sml_reorg zeroes it (:865). The tip-advance and
+    /// handshake send paths request base = this hash so base -> target is always
+    /// contiguous with what the SML has actually applied: an overlapping,
+    /// leaked, or base-rejected reply can never strand the request base ahead of
+    /// the cursor (the reception-time tracker's failure mode). Passthrough to
+    /// NodeCoinState::sml_current_hash().
+    const uint256& sml_current_hash() const { return m_state.sml_current_hash(); }
+
     // ── E-SUPERBLOCK: daemonless governance object/vote ingestion ─────────
 
     /// The node-owned governance object/vote store (daemonless superblock payee
