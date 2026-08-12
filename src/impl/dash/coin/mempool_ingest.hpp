@@ -65,4 +65,23 @@ wire_mempool_ingest(::dash::interfaces::Node& node,
         });
 }
 
+// Leg 1b (islock relay): subscribe `maint` to `node.new_islock` — every
+// peer-relayed InstantSend lock (coin-P2P isdlock leg) is folded into the
+// mempool's islock tracking via on_islock -> Mempool::add_islock. This is the
+// feed that makes the ALREADY-MERGED G4 conflict-tx-lock selection guard
+// (#1110) live, and the IsLocked short-circuit of the IS mining-safety hold.
+// Fee-affecting only, never validity: an islock can only EXCLUDE a tx from
+// the embedded template / evict a conflicting pool entry — it can never add
+// one. Same lifetime rules as wire_mempool_ingest above.
+inline std::shared_ptr<EventDisposable>
+wire_islock_ingest(::dash::interfaces::Node& node,
+                   ::dash::coin::CoinStateMaintainer& maint)
+{
+    return node.new_islock.subscribe(
+        [&maint](const ::dash::interfaces::Node::IslockSeen& lk)
+        {
+            maint.on_islock(lk.txid, lk.inputs);
+        });
+}
+
 } // namespace c2pool::dash

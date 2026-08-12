@@ -2124,6 +2124,33 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // never coincide) and blind to a strict SUBSET that contains an invalid
     // transaction, which is exactly the case that costs a whole block.
     node_coin_state.set_serve_mempool_txs(embedded_serve_mempool_txs);
+    // ── IS/CL MINING-SAFETY HOLD arming (dashd TestPackageTransactions) ─────
+    // dashd's miner refuses any not-yet-islocked tx with vins younger than 10
+    // minutes when spork2 (InstantSend) AND spork3 (RejectConflictingBlocks)
+    // are active (node/miner.cpp:374-391; WAIT_FOR_ISLOCK_TIMEOUT,
+    // chainlock/handler.cpp:35) — its defence against mining a tx that then
+    // LOSES to a conflicting islock (conflict-tx-lock block reject). Mirror
+    // the SAME spork gate: derive the arm-bit from the coin-P2P SporkState
+    // (assume-active mainnet seed, refined by verified spork messages),
+    // recomputed on the io thread — the spork map's writer thread — whenever a
+    // verified spork applies, and pushed into the mempool as an atomic. The
+    // hold additionally self-gates on isdlock-feed LIVENESS inside the mempool
+    // (mempool.hpp ISLOCK_FEED_FRESH_SECS), so a dark isdlock leg degrades to
+    // the pre-hold include-immediately behaviour instead of holding every
+    // young tx for 10 minutes. No coin-P2P arm => no isdlock feed => the
+    // arm-bit below is never set and the hold stays OFF.
+    if (coin_p2p) {
+        auto arm_is_hold = [&cp = *coin_p2p, &ncs = node_coin_state]() {
+            const int64_t now = static_cast<int64_t>(std::time(nullptr));
+            const auto& ss = cp.spork_state();
+            ncs.mempool().set_instantsend_mining_hold(
+                ss.is_active(dash::coin::SPORK_2_INSTANTSEND_ENABLED, now)
+                && ss.is_active(dash::coin::SPORK_3_INSTANTSEND_BLOCK_FILTERING,
+                                now));
+        };
+        arm_is_hold();   // seed posture now (mainnet seed: both active)
+        coin_p2p->set_spork_change_callback(arm_is_hold);
+    }
     // #107 PHASE 2 (--embedded-accrue-asset-locks): DEFAULT OFF. When ON the
     // embedded CbTx creditPoolBalance accrues the pending type-8 asset-lock term
     // dashd commits, so the gbt-xcheck-modulo-special-explained swap stops
@@ -3526,6 +3553,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // for viability; enriches the assembled template.
         coin_feed_subs.push_back(
             c2pool::dash::wire_mempool_ingest(coin_state, *maintainer));
+        // Leg 1b (islock relay): new_islock -> maintainer.on_islock ->
+        // Mempool::add_islock. Activates the ALREADY-MERGED G4
+        // conflict-tx-lock selection guard (#1110, feed-less until now) and
+        // the IS mining-safety hold's IsLocked short-circuit. Fee-affecting
+        // only, never validity: an islock can only EXCLUDE a tx from the
+        // embedded template / evict a conflicting pool entry.
+        coin_feed_subs.push_back(
+            c2pool::dash::wire_islock_ingest(coin_state, *maintainer));
         // Leg 2 (tip advance): Node::new_tip -> maintainer.on_new_tip. The
         // new_tip event is FIRED by the tip-changed callback below (off the
         // header chain), NOT the raw wire.

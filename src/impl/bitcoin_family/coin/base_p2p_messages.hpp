@@ -117,6 +117,7 @@ struct inventory_type
         // enum GetDataMsg). Only the ones we actually request are listed.
         quorum_final_commitment = 21,   // MSG_QUORUM_FINAL_COMMITMENT
         clsig           = 29,           // MSG_CLSIG (dashcore protocol.h:522)
+        isdlock         = 31,           // MSG_ISDLOCK (dashcore protocol.h:524)
         witness_tx      = 0x40000001,   // MSG_WITNESS_TX (BIP 144)
         witness_block   = 0x40000002,   // MSG_WITNESS_BLOCK (BIP 144)
     };

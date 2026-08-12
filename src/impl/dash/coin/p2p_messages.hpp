@@ -154,6 +154,45 @@ BEGIN_MESSAGE(clsig)
     }
 END_MESSAGE()
 
+// ── DIP-0010 InstantSend lock (isdlock) ────────────────────────────────────
+// dashcore instantsend/lock.h InstantSendLock wire layout: nVersion(u8) +
+// vector<COutPoint> inputs + txid(32B) + cycleHash(32B) + sig(96B BLS blob).
+// Announced by inv MSG_ISDLOCK=31 and served only on getdata (net_processing
+// relays only VERIFIED islocks), so the inv→getdata leg in inv_type_is_pulled
+// below is what makes this message reachable at all — the same registry rule
+// as clsig/qfcommit.
+//
+// ⚠ TRUST POSTURE (deliberate, documented): the 96-byte recovered threshold
+// signature is CARRIED but NOT BLS-verified in this slice — verifying it needs
+// the DIP-24 rotated SIGNING-quorum selection (GetRequestId + cycleHash →
+// quorum), which is not yet ported. The consumers are therefore restricted to
+// the FEE-ONLY-SAFE directions (Mempool::add_islock): an islock can EXCLUDE a
+// conflicting tx from the embedded template / evict it from the pool (worst
+// case = forgone fees, never an invalid block), and it SHORT-CIRCUITS the
+// 10-minute IS mining-safety hold for the locked txid itself (dashd
+// IsLocked(txid) — strictly no worse than the pre-hold behaviour, which
+// included EVERY young tx immediately). Honest dashd peers relay only islocks
+// they themselves BLS-verified, the same SPV-style trust the tx feed already
+// rides (sole-ingestion-path invariant, mempool.hpp). Full BLS verify is the
+// named follow-up before islock knowledge is treated as authoritative.
+BEGIN_MESSAGE(isdlock)
+    MESSAGE_FIELDS
+    (
+        (uint8_t,                  m_version),
+        (std::vector<TxPrevOut>,   m_inputs),      // COutPoint wire twin (hash+index)
+        (uint256,                  m_txid),
+        (uint256,                  m_cycle_hash),
+        (std::vector<uint8_t>,     m_sig)
+    )
+    {
+        READWRITE(obj.m_version);
+        READWRITE(obj.m_inputs);
+        READWRITE(obj.m_txid);
+        READWRITE(obj.m_cycle_hash);
+        READWRITE(Using<ArrayType<DefaultFormat, 96>>(obj.m_sig));
+    }
+END_MESSAGE()
+
 /// The inv-announcement sourcing policy: which inv types the DASH coin-P2P
 /// client answers with a getdata for the object itself.
 ///
@@ -167,13 +206,17 @@ END_MESSAGE()
 ///   MSG_QUORUM_FINAL_COMMITMENT = 21 — relayed DKG final commitments
 ///                                      (Phase-L MineableCommitmentCache)
 ///   MSG_CLSIG                   = 29 — ChainLocks (dashcore protocol.h:522)
+///   MSG_ISDLOCK                 = 31 — InstantSend locks (protocol.h:524),
+///                                      the G4 conflict-tx-lock guard's feed +
+///                                      the IS mining-safety hold's IsLocked
 ///
 /// Block invs are deliberately NOT here: they take the getheaders-then-block
 /// path in the inv handler, not a bare getdata.
 inline bool inv_type_is_pulled(inventory_type::inv_type t)
 {
     return t == inventory_type::quorum_final_commitment
-        || t == inventory_type::clsig;
+        || t == inventory_type::clsig
+        || t == inventory_type::isdlock;
 }
 
 // ── Phase C-SML step 4: Simplified MN List sync messages ──────────────
@@ -433,6 +476,11 @@ using Handler = MessageHandler<
     message_getblocktxn,
     message_blocktxn,
     message_clsig,
+    // ⚠ ISDLOCK lane — same registry rule as the DIP-24 pair below (#1077): a
+    // handler that exists but whose message type is absent from this list can
+    // never run; the payload dies on the unhandled-command path at DEBUG, and
+    // the G4 islock guard + the IS mining-safety hold silently stay feed-less.
+    message_isdlock,
     message_qfcommit,
     message_getmnlistd,
     message_mnlistdiff,

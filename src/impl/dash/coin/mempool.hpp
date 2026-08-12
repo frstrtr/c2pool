@@ -146,6 +146,31 @@ public:
     /// is within 1000 bytes of full, addPackageTxs gives up scanning.
     static constexpr int64_t MAX_CONSECUTIVE_FAILURES = 1000;
 
+    /// dashd WAIT_FOR_ISLOCK_TIMEOUT (src/chainlock/handler.cpp:35, 10min) —
+    /// the IS/CL MINING-SAFETY HOLD. On mainnet (spork2 InstantSend + spork3
+    /// RejectConflictingBlocks active) dashd's BlockAssembler REFUSES any
+    /// package member with vins that is not islocked AND whose first-seen age
+    /// is under this bound (TestPackageTransactions, miner.cpp:374-391 →
+    /// ChainlockHandler::IsTxSafeForMining, handler.cpp:204-215). It is the
+    /// miner-side defence against the islock-formation race: mine a tx whose
+    /// outpoints then get islocked to a CONFLICTING spend and the won block
+    /// dies conflict-tx-lock (validation.cpp). MempoolEntry::time_added is our
+    /// txFirstSeenTime; a tx with a KNOWN islock (m_islock_txids) is safe
+    /// immediately, exactly dashd's IsLocked(txid) short-circuit.
+    static constexpr time_t WAIT_FOR_ISLOCK_TIMEOUT_SECS = 600;
+
+    /// c2pool-side LIVENESS GATE on the hold (NO dashd equivalent — dashd
+    /// trusts its own islock db to be alive). Our islock knowledge rides the
+    /// coin-P2P isdlock leg; if that leg goes dark (the qrinfo-#1077 silent-
+    /// registry failure class) an armed hold would quietly hold EVERY young tx
+    /// for 10 minutes — far WORSE template parity than no hold at all. So the
+    /// hold is active only while an islock has been seen this recently; a dark
+    /// feed degrades to the pre-hold include-immediately behaviour (reward-
+    /// safe: the #1218 gbt-xcheck fails closed to dashd on any divergence
+    /// while the fallback arm exists). Mainnet forms an islock for most txs,
+    /// so a healthy feed ticks many times per block interval.
+    static constexpr time_t ISLOCK_FEED_FRESH_SECS = 600;
+
     explicit Mempool(size_t max_bytes  = DEFAULT_MAX_BYTES,
                      time_t expiry_sec = DEFAULT_EXPIRY_SECS)
         : m_max_bytes(max_bytes)
@@ -172,6 +197,23 @@ public:
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_block_min_tx_fee;
+    }
+
+    /// Arm/disarm the IS/CL mining-safety hold. The caller (main_dash, off the
+    /// coin-P2P SporkState on its io thread) pushes the spork2+spork3
+    /// conjunction here — dashd's own gate: TestPackageTransactions skips the
+    /// hold entirely when !RejectConflictingBlocks() || !IsInstantSendEnabled()
+    /// (miner.cpp:382). Atomic because the selection path reads it from the
+    /// serve executor. DEFAULT OFF so unit tests and un-wired callers keep the
+    /// pre-hold selection behaviour bit-for-bit; even when armed, the hold
+    /// additionally self-gates on isdlock-feed liveness (ISLOCK_FEED_FRESH_SECS).
+    void set_instantsend_mining_hold(bool armed)
+    {
+        m_is_hold_armed.store(armed, std::memory_order_relaxed);
+    }
+    bool instantsend_mining_hold() const
+    {
+        return m_is_hold_armed.load(std::memory_order_relaxed);
     }
 
     /// ── PINNED-LOCAL-TX include gate (donation-dust consolidation lane) ────
@@ -471,8 +513,13 @@ public:
 
         // G4: an outpoint spent by a CONFIRMED tx is resolved — whatever
         // islock claimed it is now enforced (or moot) by the chain itself, so
-        // the tracking entry has done its job. Prune it.
+        // the tracking entry has done its job. Prune it. Same for the
+        // locked-TXID index: a confirmed tx no longer needs its islock to
+        // bypass the mining-safety hold (it left the pool). Stale txids left
+        // behind in m_islock_txid_order are harmless — the FIFO eviction in
+        // add_islock erases them from the (already-pruned) set as it pops.
         for (const auto& mtx : block.m_txs) {
+            m_islock_txids.erase(dash_txid(mtx));
             for (const auto& vin : mtx.vin) {
                 m_islock_outpoints.erase(
                     std::make_pair(vin.prevout.hash, vin.prevout.index));
@@ -510,13 +557,31 @@ public:
     /// full extent of what any miner can do.
     ///
     /// FEED: dashd-peer relay (the sole-ingestion-path invariant covers
-    /// islocks too — they arrive from the same relay peers as the txs).
-    /// Until the coin-P2P isdlock parse leg lands, this map stays empty and
-    /// selection behaves exactly as before (empty map = no exclusions).
+    /// islocks too — they arrive from the same relay peers as the txs), via
+    /// the coin-P2P isdlock leg: inv(MSG_ISDLOCK=31) → getdata → isdlock →
+    /// Node::new_islock → CoinStateMaintainer::on_islock → here. The BLS sig
+    /// is NOT yet verified (see the trust-posture note on message_isdlock,
+    /// p2p_messages.hpp), which is why every consumer of this map sits in the
+    /// fee-only-safe direction. An un-wired node (no coin-P2P) keeps the map
+    /// empty and selection behaves exactly as before (empty map = no
+    /// exclusions, hold self-disarmed by the liveness gate).
     void add_islock(const uint256& locked_txid,
                     const std::vector<std::pair<uint256, uint32_t>>& inputs)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        // Locked-TXID index — dashd's IsLocked(txid) equivalent for the IS
+        // mining-safety hold: a tx WITH a known islock is safe to mine
+        // immediately (TestPackageTransactions skips the 10-min hold for it).
+        // Bounded FIFO like the outpoint map below (relay is untrusted input).
+        while (m_islock_txid_order.size() >= MAX_ISLOCK_OUTPOINTS
+               && !m_islock_txid_order.empty()) {
+            m_islock_txids.erase(m_islock_txid_order.front());
+            m_islock_txid_order.pop_front();
+        }
+        if (m_islock_txids.insert(locked_txid).second)
+            m_islock_txid_order.push_back(locked_txid);
+        // Feed-liveness tick for the hold's ISLOCK_FEED_FRESH_SECS gate.
+        m_last_islock_seen = std::time(nullptr);
         for (const auto& in : inputs) {
             // Bound the tracking map (relay is untrusted input): evict the
             // oldest registration once over cap. 100k outpoints ≈ a few MB.
@@ -573,6 +638,9 @@ public:
         m_feerate_index.clear();
         m_islock_outpoints.clear();
         m_islock_order.clear();
+        m_islock_txids.clear();
+        m_islock_txid_order.clear();
+        m_last_islock_seen = 0;
         m_total_bytes = 0;
     }
 
@@ -744,9 +812,16 @@ public:
     // true (safe-minimal: the creditPool accrual then reduces to the platform-
     // reward term only). Default false preserves the mempool's general pricing +
     // selection capability (including the asset-unlock fee path) unchanged.
+    // lock_time_cutoff: dashd m_lock_time_cutoff = MTP(pindexPrev)
+    // (miner.cpp:223) for the per-member IsFinalTx re-check
+    // (TestPackageTransactions, miner.cpp:377). 0 (legacy/test callers) skips
+    // the check, preserving the sole-ingestion-path N-A argument unchanged;
+    // the embedded GBT passes the tip MTP, which closes that argument's reorg
+    // edge (height/MTP can REGRESS across a reorg while the tx stays pooled).
     std::pair<std::vector<SelectedTx>, uint64_t>
     get_sorted_txs_with_fees(uint32_t max_bytes, bool exclude_special = false,
-                             uint32_t next_height = 0) const
+                             uint32_t next_height = 0,
+                             int64_t lock_time_cutoff = 0) const
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         std::vector<SelectedTx> result;
@@ -755,6 +830,18 @@ public:
         uint32_t total_bytes  = 0;
         uint32_t total_sigops = DASH_COINBASE_SIGOPS_RESERVE;   // G2
         auto* utxo = m_utxo.load();
+
+        // IS/CL mining-safety hold (dashd TestPackageTransactions): active
+        // only when ARMED (spork2+spork3 via set_instantsend_mining_hold —
+        // dashd's !RejectConflictingBlocks()/!IsInstantSendEnabled() skip)
+        // AND the isdlock feed is demonstrably ALIVE (c2pool-side liveness
+        // gate, see ISLOCK_FEED_FRESH_SECS — a dark feed must degrade to the
+        // pre-hold behaviour, never hold every young tx for 10 minutes).
+        const time_t now_ts = std::time(nullptr);
+        const bool is_hold_active =
+            m_is_hold_armed.load(std::memory_order_relaxed)
+            && m_last_islock_seen != 0
+            && now_ts - m_last_islock_seen <= ISLOCK_FEED_FRESH_SECS;
 
         // ── D1: static ancestor closure + LOCAL ancestor-score index ─────────
         // The persistent m_feerate_index (keyed by standalone feerate) is left
@@ -866,9 +953,9 @@ public:
             //     rate". min-fee is POLICY, not consensus: the worst case of
             //     over-including (floor set too low) is a valid, fee-suboptimal
             //     block, never an invalid/orphaned one.
+            uint64_t fee_wa;
+            uint32_t size_wa;
             {
-                uint64_t fee_wa;
-                uint32_t size_wa;
                 if (using_mod) {
                     const ModEntry& me = mod_by_txid.at(txid);
                     fee_wa  = me.mod_modfee_wa;
@@ -881,6 +968,37 @@ public:
                         < block_min_fee_for_size(m_block_min_tx_fee, size_wa)) {
                     return {std::move(result), total_fees};
                 }
+            }
+
+            // (d.6) dashd TestPackage BYTE leg, IN dashd's position (miner.cpp
+            //     :592-604 calls TestPackage on packageSize — the ancestor-
+            //     score totals, exactly our size_wa — BEFORE the package is
+            //     even collected and BEFORE any member-level check), with
+            //     dashd's boundary: nBlockSize + packageSize >= nBlockMaxSize
+            //     fails AT the cap (miner.cpp:361, `>=`, not the old `>`).
+            //     This is the counter-parity half of the audit's ordering
+            //     divergence: a package failing BOTH the byte cap and a
+            //     member-level check must bump nConsecutiveFailed (dashd bumps
+            //     at TestPackage, before TestPackageTransactions ever runs).
+            //     size_wa == the collected package's byte remainder whenever
+            //     the package is admittable (any mismatch implies a
+            //     fee-unknown member, which block (f) drops regardless).
+            //     The sigop half of TestPackage stays in (g): dashd tests a
+            //     CACHED sigops-with-ancestors we do not maintain (ours is
+            //     computed during member validation); a package failing ONLY
+            //     the sigop cap still bumps there, so the residual counter
+            //     divergence is the dual-fail (sigop-cap AND member-check)
+            //     package — vanishingly rare at DASH's 40k-sigop cap.
+            if (static_cast<uint64_t>(total_bytes) + size_wa
+                    >= static_cast<uint64_t>(max_bytes)) {
+                if (using_mod) { erase_mod(txid); failed.insert(txid); }
+                ++nConsecutiveFailed;
+                if (nConsecutiveFailed > MAX_CONSECUTIVE_FAILURES
+                    && static_cast<int64_t>(total_bytes)
+                           > static_cast<int64_t>(max_bytes) - 1000) {
+                    break;
+                }
+                continue;
             }
 
             // (e) BUILD PACKAGE. collect_package_locked stays the AUTHORITATIVE
@@ -915,6 +1033,40 @@ public:
             for (const auto* e : package) {
                 if (!e->fee_known) { ok = false; break; }
                 if (exclude_special && e->tx.type != 0) { ok = false; break; }
+
+                // ── dashd TestPackageTransactions (node/miner.cpp:374-391),
+                // member-level; either failure drops the WHOLE package and —
+                // like dashd — does NOT bump nConsecutiveFailed. ────────────
+                //
+                // (1) IsFinalTx(tx, nHeight, MTP(prev)): the selection-time
+                //     finality re-check. Steady-state this is a no-op (the
+                //     sole-ingestion-path invariant: relay-admitted txs are
+                //     final at admission and finality is monotonic), but
+                //     across a REORG next-height/MTP can regress while the tx
+                //     stays pooled — this closes that documented edge.
+                //     lock_time_cutoff==0 (legacy/test callers) skips.
+                if (lock_time_cutoff != 0 && next_height != 0
+                    && !is_final_tx(e->tx, next_height, lock_time_cutoff)) {
+                    ok = false;
+                    break;
+                }
+                // (2) IS/CL mining-safety hold (WAIT_FOR_ISLOCK_TIMEOUT): a
+                //     member WITH vins, with NO known islock, first seen less
+                //     than 10 minutes ago is not yet safe to mine — the
+                //     islock that eventually forms may lock a CONFLICTING
+                //     spend, and a won block carrying this tx then dies
+                //     conflict-tx-lock. vin-less members (type-9 asset
+                //     unlocks) are exempt exactly as in dashd
+                //     (!it->GetTx().vin.empty(), miner.cpp:386). An UNKNOWN
+                //     first-seen in dashd yields age 0 => held; time_added is
+                //     always set here, so the same posture holds by
+                //     construction.
+                if (is_hold_active && !e->tx.vin.empty()
+                    && !m_islock_txids.count(e->txid)
+                    && now_ts - e->time_added < WAIT_FOR_ISLOCK_TIMEOUT_SECS) {
+                    ok = false;
+                    break;
+                }
 
                 // G2: legacy sigops (every scriptSig + every scriptPubKey,
                 // multisig = 20), exactly dashd GetLegacySigOpCount.
@@ -1001,13 +1153,17 @@ public:
                 if (using_mod) { erase_mod(txid); failed.insert(txid); }
                 continue;
             }
-            (void)pkg_fees;   // accounted below via per-entry e->fee
+            (void)pkg_fees;    // accounted below via per-entry e->fee
+            (void)pkg_bytes;   // byte cap now tested pre-collect on size_wa,
+                               // dashd TestPackage's position — see (d.6)
 
-            // ── (g) Caps. Byte cap strict `>`, sigop cap `>=` (reject AT the
-            // cap). Each cap failure is one dashd TestPackage() failure
-            // (miner.cpp:359-368 tests byte AND sigop caps together): only a
-            // mapModifiedTx pick is erased+failed (dashd :590-596); a mapTx pick
-            // already had `mi` advanced.
+            // ── (g) Sigop cap, `>=` (reject AT the cap). The byte half of
+            // dashd TestPackage moved to (d.6); this half stays here because
+            // dashd tests a CACHED sigops-with-ancestors and ours is computed
+            // during the member walk above. Each failure is one dashd
+            // TestPackage() failure: only a mapModifiedTx pick is
+            // erased+failed (dashd :590-596); a mapTx pick already had `mi`
+            // advanced.
             //
             // PORT 2: nConsecutiveFailed cutoff (dashd miner.cpp:598-603). Each
             // cap-fail bumps the counter; once >1000 consecutive fails AND the
@@ -1018,16 +1174,6 @@ public:
             // give-up test uses int64 arithmetic so `max_bytes - 1000` cannot
             // underflow when max_bytes < 1000 (dashd's nBlockMaxSize is clamped
             // >=1000, miner.cpp:212; ours is a caller-supplied param).
-            if (total_bytes + pkg_bytes > max_bytes) {
-                if (using_mod) { erase_mod(txid); failed.insert(txid); }
-                ++nConsecutiveFailed;
-                if (nConsecutiveFailed > MAX_CONSECUTIVE_FAILURES
-                    && static_cast<int64_t>(total_bytes)
-                           > static_cast<int64_t>(max_bytes) - 1000) {
-                    break;
-                }
-                continue;
-            }
             if (total_sigops + pkg_sigops >= DASH_MAX_BLOCK_SIGOPS) {
                 if (using_mod) { erase_mod(txid); failed.insert(txid); }
                 ++nConsecutiveFailed;
@@ -1113,6 +1259,17 @@ private:
     // insertion order for bounded eviction.
     std::map<std::pair<uint256, uint32_t>, uint256>    m_islock_outpoints;
     std::deque<std::pair<uint256, uint32_t>>           m_islock_order;
+    // IS mining-safety hold: txids holding a known islock (dashd
+    // IsLocked(txid)) — such a tx bypasses the 10-minute hold. Same bounded-
+    // FIFO posture as the outpoint map (relay is untrusted input).
+    std::set<uint256>                                  m_islock_txids;
+    std::deque<uint256>                                m_islock_txid_order;
+    // Feed-liveness tick (last add_islock wall time; 0 = never) — the hold's
+    // ISLOCK_FEED_FRESH_SECS self-disarm reads this under m_mutex.
+    time_t                                             m_last_islock_seen{0};
+    // Hold arm-bit (spork2+spork3, pushed from the io thread via
+    // set_instantsend_mining_hold; read on the serve executor). DEFAULT OFF.
+    std::atomic<bool>                                  m_is_hold_armed{false};
     size_t                                             m_total_bytes{0};
     size_t                                             m_max_bytes;
     time_t                                             m_expiry_sec;
@@ -1228,6 +1385,29 @@ private:
             else if (sat_per_k < 0) n_fee = -1;
         }
         return n_fee;
+    }
+
+    /// dashd IsFinalTx (src/consensus/tx_verify.cpp), exact port over
+    /// MutableTransaction: locktime==0 => final; locktime below its
+    /// height/time threshold cutoff => final; otherwise final only if EVERY
+    /// vin carries SEQUENCE_FINAL (the nLockTime-disable sentinel). Called at
+    /// selection with (next_height, MTP(prev)) — dashd's exact
+    /// TestPackageTransactions arguments (nHeight, m_lock_time_cutoff).
+    static bool is_final_tx(const MutableTransaction& tx, uint32_t block_height,
+                            int64_t block_time)
+    {
+        constexpr int64_t  LOCKTIME_THRESHOLD = 500000000;   // consensus.h
+        constexpr uint32_t SEQUENCE_FINAL     = 0xffffffff;  // CTxIn
+        if (tx.locktime == 0) return true;
+        const int64_t lt = static_cast<int64_t>(tx.locktime);
+        if (lt < (lt < LOCKTIME_THRESHOLD
+                      ? static_cast<int64_t>(block_height) : block_time)) {
+            return true;
+        }
+        for (const auto& vin : tx.vin) {
+            if (vin.sequence != SEQUENCE_FINAL) return false;
+        }
+        return true;
     }
 
     static FeeKey anc_score_key(uint64_t self_fee, uint32_t self_size,
