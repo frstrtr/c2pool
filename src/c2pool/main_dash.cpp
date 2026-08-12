@@ -6433,8 +6433,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // socket timeout + m_rpc_mutex bound this thread). Declared here (after rpc /
     // work_source / stratum_server) so its explicit stop()+join() after the run
     // loop -- and its destructor -- happen BEFORE those objects unwind: no
-    // background probe is ever mid-flight against freed state. Only created on
-    // the fallback arm; null on the embedded arm (legacy inline path unchanged).
+    // background probe is ever mid-flight against freed state. Created on ANY
+    // arm with a dashd rpc armed (#139: see the executor wiring below); the
+    // rpc-less pure-daemonless arm keeps the legacy inline path, which is
+    // non-blocking there (no dashd RPC exists to block on).
     // The opt-in ZMQ subscriber (declared here for the same teardown ordering)
     // only posts onto ioc; when unconfigured/uncompiled the poll is the whole
     // mechanism -- byte-identical to the poll-only #770/#781 behavior.
@@ -6442,19 +6444,50 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     std::unique_ptr<dash::coin::ZmqHashblockSubscriber> zmq_sub;
 #endif
     std::shared_ptr<boost::asio::thread_pool> rpc_pool;
-    if (!coin_p2p && rpc && stratum_server) {
+    if (rpc && stratum_server) {
         rpc_pool = std::make_shared<boost::asio::thread_pool>(1);
 
         // Non-blocking template re-source: cached_work() hands the blocking
-        // select_work()/GBT to rpc_pool as a single-flight background job
-        // instead of blocking the io thread on every stale/generation miss (the
-        // per-share ~15-30 s GBT block). The io thread serves the cached template
-        // immediately; the pool updates it and the next notify picks it up.
+        // GBT to rpc_pool as a single-flight background job instead of blocking
+        // the io thread on every stale/generation miss (the per-share ~15-30 s
+        // GBT block). The io thread serves the cached template immediately; the
+        // pool updates it and the next notify picks it up.
+        //
+        // #139 SERVE-FREEZE FIX: this wiring used to sit under `!coin_p2p`,
+        // so the coin-p2p arm ran the LEGACY INLINE path -- and with --coin-rpc
+        // kept, EVERY template re-source ran a blocking dashd getblocktemplate
+        // (the gbt-xcheck at work_source.cpp:949 plus the embedded-decline
+        // fallback) on the ONE ioc.run() thread that is simultaneously the
+        // stratum server, the coin-P2P ingest (incl. MSG_TX), the web server,
+        // and every tip-recovery clock (lost-body watchdog, tip-body-overdue
+        // demote). Under tx-serving mempool load the handler queue grew faster
+        // than it drained: the served height fell 4->11->13 blocks behind and
+        // self-cleared only when the mempool wave subsided (canary 9f4a424d,
+        // both episodes, NRestarts=0).
+        //
+        // THREAD CONTRACT (#1134/#1150) -- why this is safe on the coin-p2p arm:
+        // cached_work() resolves EVERY NodeCoinState read on the io thread via
+        // resolve_coin_state_arm() and hands the posted job a self-contained
+        // VALUE; resource_template_now(arm) never names coin_state_ (pinned by
+        // test/test_dash_work_source_ownership.cpp). Only the blocking dashd
+        // RPC moves off ioc. Off-io readers of NodeCoinState stay ZERO -- this
+        // does NOT reintroduce the pre-#1150 arm-exclusivity dependency.
+        //
+        // Gated on `rpc` alone (not the arm): without an rpc there is no
+        // blocking call to decouple -- the inline path is already non-blocking
+        // (dashd_fallback returns the empty set-gap immediately, gbt_xcheck_
+        // is off via set_gbt_xcheck(xcheck_wanted && rpc)).
         work_source->set_refresh_executor(
             [rpc_pool](std::function<void()> job) {
                 boost::asio::post(*rpc_pool, std::move(job));
             });
+    }
 
+    // Fallback-arm-only tip machinery (poll / ZMQ / bestblock announce /
+    // reconnect probe): on the coin-p2p arm the tip edge comes from header
+    // ingest (set_on_tip_changed -> invalidate+bump+notify), so none of this
+    // is wired there. rpc_pool above IS shared with it on the fallback arm.
+    if (!coin_p2p && rpc && stratum_server) {
         // Shared last-seen-tip dedup — the poll AND the ZMQ subscriber consult
         // it, so if both observe the same new block only the first fires the
         // refresh trio (the second is_new_tip() returns false → no-op).
