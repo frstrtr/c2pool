@@ -1358,37 +1358,61 @@ public:
     /// Routed to the peer that ANNOUNCED this block (block_source), which holds
     /// it by definition; falls back to the primary when the announcer is
     /// unknown (bulk/historical legs) or has churned out.
-    void request_block(const uint256& block_hash)
+    ///
+    /// Returns TRUE when the getdata was written to a peer; FALSE when there
+    /// is no route at all (announcer unknown/churned AND no primary) — the
+    /// request then died locally and NO peer will ever answer it. #138: a
+    /// caller that keeps a request ledger (MnCheckpointLane::request_window)
+    /// must not count a false return as requested, or a dropped tip-body
+    /// fetch is never re-asked and the reseed bridge wedges. Callers with
+    /// their own re-request loops may keep ignoring the return value.
+    bool request_block(const uint256& block_hash)
     {
         PeerSession* p = block_source(block_hash);
-        if (!p) return;
+        if (!p) return false;
         auto msg = message_getdata::make_raw(
             {inventory_type(inventory_type::block, block_hash)});
         p->write(msg);
+        return true;
     }
 
     /// Request a full block AND arm the lost-body watchdog for it (tip-follow
     /// path — see the BODY_REREQUEST_* rationale above). Plain
     /// request_block() stays untracked for the bulk/historical legs (UTXO
-    /// window refill, checkpoint-lane windows), whose volume would defeat the
-    /// bound and whose own re-request loops already exist.
-    void request_block_tracked(const uint256& block_hash)
+    /// window refill, checkpoint-lane bulk windows), whose volume would defeat
+    /// the bound and whose own re-request loops already exist.
+    ///
+    /// #138: returns request_block()'s truth — TRUE only when the initial
+    /// getdata reached a peer — so a ledger-keeping caller
+    /// (MnCheckpointLane::request_window) can refuse to count a dead send.
+    /// The watchdog slot is armed EITHER WAY: the locally-dead request (no
+    /// announcer, no primary) is precisely the one that needs the retry most,
+    /// and service_pending_bodies() puts it on the wire against the WHOLE
+    /// pool as soon as a handshaked peer exists. A dead send leaves last_req
+    /// at 0 so that first watchdog attempt is immediate, not 10 s late; a
+    /// dead RE-ask of an existing slot leaves last_req alone so a caller's
+    /// pump cadence can never push the watchdog's own timer out.
+    bool request_block_tracked(const uint256& block_hash)
     {
-        request_block(block_hash);
+        const bool sent = request_block(block_hash);
         const int64_t now = now_sec();
         for (auto& pb : m_pending_bodies)
-            if (pb.hash == block_hash) { pb.last_req = now; return; }
+            if (pb.hash == block_hash) {
+                if (sent) pb.last_req = now;
+                return sent;
+            }
         if (m_pending_bodies.size() >= PENDING_BODY_CAP)
             m_pending_bodies.erase(m_pending_bodies.begin());   // oldest slot
         PendingBody pb;
         pb.hash      = block_hash;
         pb.first_req = now;
-        pb.last_req  = now;
+        pb.last_req  = sent ? now : 0;
         // The announcer just got the initial getdata; record it so the watchdog
         // rotates AWAY from it (to a neighbour) if it does not answer in time.
         PeerSession* src = block_source(block_hash);
         pb.last_peer = src ? src->key : std::string{};
         m_pending_bodies.push_back(std::move(pb));
+        return sent;
     }
 
     /// Watchdog observability (KATs + POOL-STATUS).
