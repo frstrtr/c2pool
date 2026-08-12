@@ -1027,10 +1027,24 @@ jobs:
             echo "puppeteer-core pins Chrome-for-Testing $PIN"
             CHROME_BIN="$(ls -1 "$HOME"/.cache/puppeteer/chrome/*"$PIN"/chrome-linux64/chrome 2>/dev/null | tail -1 || true)"
             if [ ! -x "$CHROME_BIN" ]; then
+              # Partial-cache guard: an interrupted prior download can leave
+              # the versioned dir present with NO chrome-linux64/chrome binary.
+              # @puppeteer/browsers treats "dir exists" as installed and refuses
+              # to re-fetch, so every retry short-circuits to the same broken
+              # path and the gate false-reds (linux-151.0.7922.77 on
+              # actions-runner-8, run 31607961557). Purge any incomplete dir for
+              # this PIN before AND between fetch attempts so the download re-runs.
+              purge_partial() {
+                for d in "$HOME"/.cache/puppeteer/chrome/*"$PIN"; do
+                  [ -d "$d" ] && [ ! -x "$d/chrome-linux64/chrome" ] && rm -rf "$d"
+                done
+              }
+              purge_partial
               for attempt in 1 2 3; do
                 CHROME_BIN="$(npx --yes @puppeteer/browsers install "chrome@$PIN" | tail -1 | awk '{print $NF}')" \
                   && [ -x "$CHROME_BIN" ] && break
                 echo "chrome-for-testing fetch attempt $attempt failed; retrying in $((attempt*10))s"
+                purge_partial
                 sleep $((attempt*10))
               done
             fi
