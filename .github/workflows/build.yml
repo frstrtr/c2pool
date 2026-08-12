@@ -1038,6 +1038,7 @@ jobs:
                 for d in "$HOME"/.cache/puppeteer/chrome/*"$PIN"; do
                   [ -d "$d" ] && [ ! -x "$d/chrome-linux64/chrome" ] && rm -rf "$d"
                 done
+                return 0
               }
               purge_partial
               for attempt in 1 2 3; do
