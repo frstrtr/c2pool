@@ -70,6 +70,7 @@
 #include <impl/dash/coin/qc_episode_classifier.hpp>  // [QC-EPISODE] terminal-event classifier (null-arm design §8)
 #include <impl/dash/coin/vendor/bls_verify.hpp>  // E1 Phase-L: make_commitment_bls_verifier (real qc verify seam)
 #include <impl/dash/coin/chainlock_verify.hpp>   // live-path ChainLock quorum selection + BLS verify gate
+#include <impl/dash/coin/islock_verify.hpp>      // G4 isdlock ROTATED quorum selection + BLS verify gate
 #include <impl/dash/coin/llmq_type_reconciler.hpp>  // negative-capable enabled_llmqs backstop
 #include <impl/dash/coin/quorum_member_source.hpp>  // E1 Phase-L: daemonless member-set sourcing (the provider)
 #include <impl/dash/coin/utxo_lane.hpp>    // dash::coin::UtxoLane — embedded UTXO/fee lane (E2b, #738)
@@ -408,6 +409,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-mn-bridge-no-cursor]\n"
         << "           [--embedded-utxo-immature-serve-empty] [--embedded-serve-mempool-txs]\n"
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
+        << "           [--embedded-ingest-isdlock]\n"
         << "           [--pin-local-tx-hex FILE]  (zero-fee self-mined tx, e.g. donation consolidation)\n"
         << "           [--pin-splice-xcheck-arm]  (let pins ride an xcheck-SWAPPED dashd template; default OFF)\n"
         << "           [--pin-splice-block-budget] (EXCLUDE a pin that pushes the template past the block size cap; default OFF)\n"
@@ -888,7 +890,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // exclude-all. ON without a seeded+proven follower lane (the
              // live 531k-block seed is a follow-up soak) still yields
              // exclude-all — the predicate, not the flag, admits.
-             bool embedded_accrue_asset_unlocks = false)
+             bool embedded_accrue_asset_unlocks = false,
+             // --embedded-ingest-isdlock: arm the BLS-verified isdlock lane
+             // (new_isdlock → maintainer BLS gate → G4 conflict-tx-lock
+             // adoption). DEFAULT OFF: the MSG_ISDLOCK pull itself and the
+             // fee-only-safe new_islock feed (#1230) run unconditionally;
+             // off, the handler never fires new_isdlock, so the VERIFIED
+             // adoption path stays dormant. ON, every isdlock is
+             // individually BLS-gated against the rotated LLMQ_60_75 quorum
+             // dashd's SelectQuorumForSigning designates (islock_verify.hpp;
+             // fail-closed at every hop).
+             bool embedded_ingest_isdlock = false)
 {
     namespace io = boost::asio;
 
@@ -5011,6 +5023,63 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     target->quorum.quorum_public_key, target->sign_hash, sig);
             });
 
+        // isdlock verifier (G4 conflict-tx-lock feed): BLS-verify a relayed
+        // deterministic InstantSend lock against the ROTATED LLMQ_60_75
+        // quorum dashcore's SelectQuorumForSigning designates, before the
+        // maintainer may fold its outpoints into Mempool::add_islock. The one
+        // divergence from the clsig verifier above: llmqTypeDIP0024InstantSend
+        // is a rotated type, so selection is cycleHash + requestId-derived
+        // quorumIndex (islock_verify.hpp), NOT the score-sort arm. Candidate
+        // quorums come from the same qrinfo/mnlistdiff-sourced active set
+        // (#1077 put rotated type-5 entries there); each quorumHash is a block
+        // hash, so the header chain supplies base heights, and the isdlock's
+        // cycleHash resolves the cycle base the same way. Fail-closed at every
+        // step — unknown/over-tip cycleHash, unselectable quorum index,
+        // missing pubkey, BLS fail => drop, no ban, no state change.
+        maintainer->set_islock_verify_fn(
+            [st = &node_coin_state, hc = header_chain.get(),
+             net = (testnet ? dash::coin::LlmqNetwork::Testnet
+                            : dash::coin::LlmqNetwork::Mainnet)](
+                const std::vector<std::pair<uint256, uint32_t>>& inputs,
+                const uint256& txid, const uint256& cycle_hash,
+                const std::array<uint8_t, 96>& sig) -> bool {
+                const auto* p = dash::coin::islock::islock_params(net);
+                if (p == nullptr) return false;
+
+                // The cycle base must be a block WE hold, at or below our own
+                // header tip — a peer replaying junk cycle hashes gets a cheap
+                // refusal before any BLS work (mirrors the clsig over-tip
+                // guard; dashd's LookupBlockIndex(cycleHash) refusal is the
+                // same shape, net_instantsend.cpp:106-110).
+                auto cyc = hc->get_header(cycle_hash);
+                if (!cyc) return false;
+                auto tip = hc->tip();
+                if (!tip || cyc->height > tip->height) return false;
+
+                // Collect the active ROTATED type-5 quorums, each with the
+                // height of its base block (rotated invariant: baseHeight ==
+                // cycleHeight + quorumIndex; islock_verify.hpp filters on it).
+                std::vector<dash::coin::islock::RotatedQuorumCandidate> cands;
+                for (const auto& e : st->qmgr().active_entries()) {
+                    if (e.key.llmqType != p->type) continue;
+                    auto hdr = hc->get_header(e.key.quorumHash);
+                    if (!hdr) continue;          // base header not held => skip
+                    dash::coin::islock::RotatedQuorumCandidate c;
+                    c.quorum_hash       = e.key.quorumHash;
+                    c.base_height       = hdr->height;
+                    c.quorum_index      = static_cast<uint16_t>(
+                        e.commitment.quorumIndex < 0 ? 0xffff
+                                                     : e.commitment.quorumIndex);
+                    c.quorum_public_key = e.commitment.quorumPublicKey;
+                    cands.push_back(c);
+                }
+                auto target = dash::coin::islock::build_islock_sign_target(
+                    *p, cands, cyc->height, inputs, txid);
+                if (!target) return false;       // no quorum selectable => fail closed
+                return dash::coin::vendor::verify_chainlock_sig(
+                    target->quorum.quorum_public_key, target->sign_hash, sig);
+            });
+
         // Leg 6 (ChainLock sig): Node::new_chainlock_sig -> maintainer
         // .on_new_chainlock. The clsig message carries the recovered 96-byte
         // threshold sig (new_chainlock above drops it); the maintainer adopts
@@ -5021,6 +5090,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 [m = maintainer.get()]
                 (const dash::interfaces::Node::ChainLockSigEvent& c) {
                     m->on_new_chainlock(c.height, c.block_hash, c.sig);
+                }));
+
+        // G4 leg (isdlock): Node::new_isdlock -> maintainer.on_new_isdlock.
+        // The event only fires when --embedded-ingest-isdlock armed the pull;
+        // the maintainer gate then BLS-verifies via the verifier above and
+        // ONLY on pass folds the outpoints into Mempool::add_islock (arming
+        // the already-merged G4 conflict-tx-lock selection guard). Both hops
+        // fail closed, so subscribing unconditionally is inert without the
+        // flag.
+        coin_feed_subs.push_back(
+            coin_state.new_isdlock.subscribe(
+                [m = maintainer.get()]
+                (const dash::interfaces::Node::IsdLockEvent& e) {
+                    m->on_new_isdlock(e.inputs, e.txid, e.cycle_hash, e.sig);
                 }));
 
         // Bridge: new_headers -> HeaderChain::add_headers (X11 PoW + DGW
@@ -5269,6 +5352,26 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                          " testmempoolaccept series -- zero INVALID over "
                       << dash::coin::MempoolValidityGate::kCleanHeightsRequired
                       << " consecutive evidence-bearing DISTINCT heights.\n";
+        }
+
+        // ── G4 ISDLOCK INGEST: arm the MSG_ISDLOCK pull ──────────────────
+        // Mempool::add_islock + the G4 conflict-tx-lock selection guard
+        // shipped in #1110 fully inert: nothing acquired islocks, so the
+        // outpoint map stayed empty and selection never excluded anything.
+        // This is the acquire half; the verify half is the BLS gate installed
+        // above (set_islock_verify_fn), and only its PASS ever reaches
+        // add_islock. OFF by default — off, an inv(MSG_ISDLOCK=31) never
+        // earns a getdata and the handler decodes-and-discards, wire and
+        // template behaviour byte-identical to master.
+        if (embedded_ingest_isdlock) {
+            coin_p2p->set_isdlock_pull(true);
+            std::cout << "[run] --embedded-ingest-isdlock: coin-P2P"
+                         " MSG_ISDLOCK pull ARMED. Every isdlock is"
+                         " individually BLS-verified against the rotated"
+                         " LLMQ_60_75 signing quorum before its outpoints"
+                         " reach the mempool's G4 conflict-tx-lock guard;"
+                         " any verification failure is a drop (fail-closed,"
+                         " no state change).\n";
         }
 
         // Kick the initial sync once the version/verack handshake completes:
@@ -7649,6 +7752,12 @@ int main(int argc, char** argv)
     // window-open slots + template upgrade to the real commitment. DEFAULT
     // OFF, money/consensus path; byte-unchanged when off (nullptr null_evidence).
     bool embedded_null_arm = false;
+    // --embedded-ingest-isdlock: arm the coin-P2P MSG_ISDLOCK pull (G4
+    // conflict-tx-lock feed). DEFAULT OFF — off, no getdata for inv type 31
+    // and the handler decodes-and-discards (wire + template behaviour
+    // byte-identical); on, every isdlock is still individually BLS-gated
+    // before Mempool::add_islock (fail-closed at every hop).
+    bool embedded_ingest_isdlock = false;
     std::string bestcl_policy = "freshness";   // --bestcl-policy: freshness (default, conservative proxy) | consensus-exact (dashcore's actual CheckCbTxBestChainlock rule)
     bool embedded_oracle_shadow = false;       // --embedded-oracle-shadow: per-block dashd cross-check (OBSERVE-only)
     bool embedded_shadow_compare = false;      // --embedded-shadow-compare: serve-vs-dashd template diff (OBSERVE-only, NOT a gate)
@@ -7754,6 +7863,8 @@ int main(int argc, char** argv)
             embedded_null_arm = true;   // #127
         else if (std::strcmp(argv[i], "--embedded-null-arm=false") == 0)
             embedded_null_arm = false;  // #127: explicit OFF (OFF-equivalence)
+        else if (std::strcmp(argv[i], "--embedded-ingest-isdlock") == 0)
+            embedded_ingest_isdlock = true;   // G4 conflict-tx-lock feed
         else if (std::strcmp(argv[i],
                              "--embedded-creditpool-publish-at-serve-tip") == 0)
             embedded_creditpool_publish_at_serve_tip = true;
@@ -8050,7 +8161,8 @@ int main(int argc, char** argv)
                         pin_splice_block_budget,
                         embedded_accrue_asset_locks,   // #107 PHASE 2
                         embedded_null_arm,             // #127
-                        embedded_accrue_asset_unlocks); // #143 Variant B
+                        embedded_accrue_asset_unlocks, // #143 Variant B
+                        embedded_ingest_isdlock);      // G4 isdlock feed
     }
     return run_selftest();
 }

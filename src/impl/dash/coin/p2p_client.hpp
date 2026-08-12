@@ -663,6 +663,13 @@ private:
     // answers a getdata with silence cannot wedge the budget.
     static constexpr int64_t TX_PULL_TIMEOUT_SEC = 60;
     bool     m_tx_pull_enabled{false};
+    // BLS-verified isdlock lane (--embedded-ingest-isdlock): OPT-IN. The
+    // getdata itself is NOT gated (the #1230 fee-only-safe new_islock lane
+    // rides every received isdlock); OFF only means the handler does not
+    // forward to the BLS-verified new_isdlock lane. No budget needed: dashd
+    // announces at most one isdlock per locked tx, orders of magnitude rarer
+    // than MSG_TX, and the payload is bounded at decode (MAX_ISDLOCK_INPUTS).
+    bool     m_isdlock_pull_enabled{false};
     size_t   m_tx_pull_inflight_cap{64};
     std::map<uint256, int64_t> m_tx_pull_inflight;   // txid -> requested-at
     uint64_t m_tx_inv_offered{0};    // inv(MSG_TX) SEEN on the wire, pre-dedup
@@ -1350,6 +1357,16 @@ public:
         if (!on) m_tx_pull_inflight.clear();
     }
     bool tx_pull_enabled() const { return m_tx_pull_enabled; }
+
+    /// Arm the BLS-verified isdlock lane (new_isdlock → maintainer BLS gate →
+    /// G4 conflict-tx-lock adoption). OFF by default: an explicit operator
+    /// decision (--embedded-ingest-isdlock), not a side effect of a newer
+    /// build. The MSG_ISDLOCK getdata is NOT gated by this flag — the #1230
+    /// fee-only-safe new_islock feed pulls unconditionally; OFF only means
+    /// the handler never fires new_isdlock, so the verified adoption path
+    /// stays dormant.
+    void set_isdlock_pull(bool on) { m_isdlock_pull_enabled = on; }
+    bool isdlock_pull_enabled() const { return m_isdlock_pull_enabled; }
 
     /// One greppable line: what the ingest lane asked for and what it got.
     /// received < pull_sent is normal (notfound, races, peers that drop);
@@ -2296,6 +2313,12 @@ private:
         // getdata; everything else is ignored.
         for (auto& inv : msg->m_invs)
         {
+            // inv_type_is_pulled is the TYPE predicate. isdlock is pulled
+            // UNCONDITIONALLY (#1230): the fee-only-safe new_islock lane
+            // (G4 guard + IS mining-safety hold) rides every received
+            // isdlock. The runtime opt-in (--embedded-ingest-isdlock) gates
+            // only the BLS-verified new_isdlock lane at the handler, not
+            // the getdata.
             const bool pulled = inv_type_is_pulled(inv.m_type);
             const bool is_block = (inv.base_type() == inventory_type::block);
             const bool is_tx = (inv.base_type() == inventory_type::tx)
@@ -2519,33 +2542,89 @@ private:
 
     ADD_P2P_HANDLER(isdlock)
     {
-        // DIP-0010 InstantSend lock — the G4 conflict-tx-lock guard's feed and
-        // the IS mining-safety hold's IsLocked short-circuit. Reached via the
-        // inv(MSG_ISDLOCK=31)→getdata leg (inv_type_is_pulled). The BLS sig is
-        // NOT verified in this slice; consumers are restricted to the
-        // fee-only-safe directions — see the trust-posture note on
-        // message_isdlock (p2p_messages.hpp). Version-gate defensively: dashd
-        // CURRENT_VERSION==1 (deterministic islock); anything else is a layout
-        // we have not pinned, so drop it rather than mis-map outpoints.
+        // DIP-0010/0022 deterministic InstantSend lock. TWO consumer lanes,
+        // deliberately layered (rebase composite of #1230 + the isdlock-intake
+        // branch):
+        //
+        //   Lane 1 (ALWAYS, #1230): IslockSeen → new_islock — the G4
+        //   conflict-tx-lock guard's feed and the IS mining-safety hold's
+        //   IsLocked short-circuit. The BLS sig is NOT verified on this lane;
+        //   consumers are restricted to the fee-only-safe directions — see the
+        //   trust-posture note on message_isdlock (p2p_messages.hpp).
+        //
+        //   Lane 2 (OPT-IN, --embedded-ingest-isdlock): IsdLockEvent →
+        //   new_isdlock — NO trust decision here; the maintainer-side BLS gate
+        //   (CoinStateMaintainer::on_new_isdlock, fail-closed) decides whether
+        //   the verified adoption path ever runs.
+        //
+        // Version-gate defensively for BOTH lanes: dashd CURRENT_VERSION==1
+        // (deterministic islock); anything else is a layout we have not
+        // pinned, so drop it rather than mis-map outpoints.
         if (msg->m_version != 1) {
             LOG_DEBUG_COIND << "[" << m_chain_label << "] isdlock DROPPED"
                             << " cause=unknown-version v="
                             << static_cast<int>(msg->m_version);
             return;
         }
-        ::dash::interfaces::Node::IslockSeen ev;
-        ev.txid = msg->m_txid;
+        {
+            ::dash::interfaces::Node::IslockSeen ev;
+            ev.txid = msg->m_txid;
+            ev.inputs.reserve(msg->m_inputs.size());
+            for (const auto& in : msg->m_inputs)
+                ev.inputs.emplace_back(in.hash, in.index);
+            // DEBUG, not INFO: mainnet forms an islock for most transactions,
+            // so this is tx-relay-cadence traffic (the mempool's own counters
+            // are the observability surface).
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] isdlock from "
+                            << (m_active ? m_active->key : std::string("?"))
+                            << ": txid=" << msg->m_txid.GetHex().substr(0, 16)
+                            << " inputs=" << msg->m_inputs.size();
+            m_coin->new_islock.happened(ev);
+        }
+        // ── Lane 2: BLS-verified G4 adoption feed (opt-in) ─────────────────
+        if (!m_isdlock_pull_enabled) {
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] isdlock from "
+                            << (m_active ? m_active->key : std::string("?"))
+                            << " not forwarded to the BLS-verified lane"
+                            << " (--embedded-ingest-isdlock off)";
+            return;
+        }
+        // Structural refusals dashd makes in TriviallyValid + version check
+        // (instantsend/lock.cpp): empty inputs, null txid, non-96-byte sig
+        // (version==1 already gated above). Local drop + log; no ban; the
+        // unverified lane above has already fired — this refusal only keeps
+        // a malformed payload out of the verified adoption path.
+        if (msg->m_inputs.empty()
+            || msg->m_txid.IsNull() || msg->m_sig.size() != 96) {
+            LOG_INFO << "[" << m_chain_label << "] isdlock from "
+                     << (m_active ? m_active->key : std::string("?"))
+                     << " REFUSED (version=" << static_cast<int>(msg->m_version)
+                     << " inputs=" << msg->m_inputs.size()
+                     << " sig_bytes=" << msg->m_sig.size() << ")";
+            return;
+        }
+        ::dash::interfaces::Node::IsdLockEvent ev;
+        ev.version    = msg->m_version;
+        ev.txid       = msg->m_txid;
+        ev.cycle_hash = msg->m_cycle_hash;
         ev.inputs.reserve(msg->m_inputs.size());
         for (const auto& in : msg->m_inputs)
             ev.inputs.emplace_back(in.hash, in.index);
-        // DEBUG, not INFO: mainnet forms an islock for most transactions, so
-        // this is tx-relay-cadence traffic (the mempool's own counters are the
-        // observability surface).
-        LOG_DEBUG_COIND << "[" << m_chain_label << "] isdlock from "
-                        << (m_active ? m_active->key : std::string("?"))
-                        << ": txid=" << msg->m_txid.GetHex().substr(0, 16)
-                        << " inputs=" << msg->m_inputs.size();
-        m_coin->new_islock.happened(ev);
+        std::copy(msg->m_sig.begin(), msg->m_sig.end(), ev.sig.begin());
+        // The inv hash is SerializeHash(payload) — SHA256d over the whole
+        // message — same shape as clsig's. Diagnostic only (names the object
+        // in logs); the getdata echoed the announcing peer's hash back.
+        {
+            auto ps = ::pack(*msg);
+            ev.inv_hash = ::Hash(ps.get_span());
+        }
+        LOG_INFO << "[" << m_chain_label << "] isdlock from "
+                 << (m_active ? m_active->key : std::string("?"))
+                 << ": txid=" << msg->m_txid.GetHex().substr(0, 16)
+                 << "... inputs=" << msg->m_inputs.size()
+                 << " cycle=" << msg->m_cycle_hash.GetHex().substr(0, 16)
+                 << "...";
+        m_coin->new_isdlock.happened(ev);
     }
 
     ADD_P2P_HANDLER(qfcommit)

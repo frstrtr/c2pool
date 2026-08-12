@@ -914,6 +914,52 @@ public:
         notify_state_dirty();
     }
 
+    /// Verifier seam for isdlock adoption (G4 conflict-tx-lock feed):
+    /// BLS-verifies a deterministic InstantSend lock's recovered threshold
+    /// signature against the ROTATED LLMQ_60_75 quorum dashcore's
+    /// SelectQuorumForSigning designates (islock_verify.hpp). Installed by
+    /// main_dash; UNSET IS FAIL-CLOSED (see on_new_isdlock).
+    using IslockVerifyFn = std::function<bool(
+        const std::vector<std::pair<uint256, uint32_t>>& inputs,
+        const uint256& txid, const uint256& cycle_hash,
+        const std::array<uint8_t, 96>& sig)>;
+
+    void set_islock_verify_fn(IslockVerifyFn fn) {
+        m_islock_verify = std::move(fn);
+    }
+
+    /// isdlock reception: fold a VERIFIED deterministic InstantSend lock into
+    /// the mempool's islock-conflict tracking (on_islock -> Mempool::
+    /// add_islock), arming the already-merged G4 selection guard.
+    ///
+    /// ⚠ VERIFICATION IS MANDATORY. An isdlock arrives from an arbitrary p2p
+    /// peer, and adopting one decides which mempool txs our served templates
+    /// may NOT contain (add_islock evicts a conflicting entry immediately and
+    /// the G4 guard drops conflicting candidate packages from selection). An
+    /// unverified adoption would let a hostile peer evict arbitrary txs from
+    /// our templates — the same threat model as the ChainLock coinbase fields
+    /// (on_new_chainlock above). When no verifier is installed, or
+    /// verification FAILS, we adopt NOTHING: the map stays exactly as it was
+    /// and selection is unchanged (the pre-existing behaviour). A refusal
+    /// costs only parity with dashd's conflict handling — islock exclusion is
+    /// an optimization, not consensus for us; an erroneous acceptance costs
+    /// template fees on demand.
+    void on_new_isdlock(const std::vector<std::pair<uint256, uint32_t>>& inputs,
+                        const uint256& txid, const uint256& cycle_hash,
+                        const std::array<uint8_t, 96>& sig) {
+        if (!m_islock_verify) return;                     // no verifier => fail closed
+        if (!m_islock_verify(inputs, txid, cycle_hash, sig)) {
+            LOG_WARNING << "[ISLOCK] rejected unverified isdlock txid="
+                        << txid.GetHex().substr(0, 16) << "... cycle="
+                        << cycle_hash.GetHex().substr(0, 16) << "...";
+            return;
+        }
+        LOG_INFO << "[ISLOCK] adopted VERIFIED isdlock txid="
+                 << txid.GetHex().substr(0, 16) << "... inputs="
+                 << inputs.size();
+        on_islock(txid, inputs);
+    }
+
     /// Reorg (SML axis): a chain reorganisation can invalidate the incremental
     /// SML/quorum state (the diffs we applied were relative to an orphaned
     /// branch). Wipe the SML + quorum set and drop have_sml so the embedded arm
@@ -2286,6 +2332,7 @@ private:
     std::function<void(const std::vector<vendor::CFinalCommitment>&)>
         m_on_new_quorum_commitments;
     ChainLockVerifyFn     m_chainlock_verify; // unset => live ChainLocks never adopted (fail closed)
+    IslockVerifyFn        m_islock_verify;    // unset => isdlocks never adopted (fail closed, G4 stays dormant)
     // E2: independent DIP-0027 credit-pool accrual, advanced per ingested block
     // (on_block_connected) and re-anchored per accepted mnlistdiff. Verified
     // against each block's own from-wire cbTx; persisted via the hook below.

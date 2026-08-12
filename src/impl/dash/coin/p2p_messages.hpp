@@ -155,43 +155,9 @@ BEGIN_MESSAGE(clsig)
 END_MESSAGE()
 
 // ── DIP-0010 InstantSend lock (isdlock) ────────────────────────────────────
-// dashcore instantsend/lock.h InstantSendLock wire layout: nVersion(u8) +
-// vector<COutPoint> inputs + txid(32B) + cycleHash(32B) + sig(96B BLS blob).
-// Announced by inv MSG_ISDLOCK=31 and served only on getdata (net_processing
-// relays only VERIFIED islocks), so the inv→getdata leg in inv_type_is_pulled
-// below is what makes this message reachable at all — the same registry rule
-// as clsig/qfcommit.
-//
-// ⚠ TRUST POSTURE (deliberate, documented): the 96-byte recovered threshold
-// signature is CARRIED but NOT BLS-verified in this slice — verifying it needs
-// the DIP-24 rotated SIGNING-quorum selection (GetRequestId + cycleHash →
-// quorum), which is not yet ported. The consumers are therefore restricted to
-// the FEE-ONLY-SAFE directions (Mempool::add_islock): an islock can EXCLUDE a
-// conflicting tx from the embedded template / evict it from the pool (worst
-// case = forgone fees, never an invalid block), and it SHORT-CIRCUITS the
-// 10-minute IS mining-safety hold for the locked txid itself (dashd
-// IsLocked(txid) — strictly no worse than the pre-hold behaviour, which
-// included EVERY young tx immediately). Honest dashd peers relay only islocks
-// they themselves BLS-verified, the same SPV-style trust the tx feed already
-// rides (sole-ingestion-path invariant, mempool.hpp). Full BLS verify is the
-// named follow-up before islock knowledge is treated as authoritative.
-BEGIN_MESSAGE(isdlock)
-    MESSAGE_FIELDS
-    (
-        (uint8_t,                  m_version),
-        (std::vector<TxPrevOut>,   m_inputs),      // COutPoint wire twin (hash+index)
-        (uint256,                  m_txid),
-        (uint256,                  m_cycle_hash),
-        (std::vector<uint8_t>,     m_sig)
-    )
-    {
-        READWRITE(obj.m_version);
-        READWRITE(obj.m_inputs);
-        READWRITE(obj.m_txid);
-        READWRITE(obj.m_cycle_hash);
-        READWRITE(Using<ArrayType<DefaultFormat, 96>>(obj.m_sig));
-    }
-END_MESSAGE()
+// The message codec itself lives further down (BEGIN_MESSAGE(isdlock), G4
+// section) — ONE definition with the MAX_ISDLOCK_INPUTS decode bound. The
+// two consumer lanes' trust postures are documented there.
 
 /// The inv-announcement sourcing policy: which inv types the DASH coin-P2P
 /// client answers with a getdata for the object itself.
@@ -206,9 +172,17 @@ END_MESSAGE()
 ///   MSG_QUORUM_FINAL_COMMITMENT = 21 — relayed DKG final commitments
 ///                                      (Phase-L MineableCommitmentCache)
 ///   MSG_CLSIG                   = 29 — ChainLocks (dashcore protocol.h:522)
-///   MSG_ISDLOCK                 = 31 — InstantSend locks (protocol.h:524),
-///                                      the G4 conflict-tx-lock guard's feed +
+///   MSG_ISDLOCK                 = 31 — deterministic InstantSend locks
+///                                      (protocol.h:524), the G4
+///                                      conflict-tx-lock guard's feed +
 ///                                      the IS mining-safety hold's IsLocked
+///
+/// NOTE: this function is a TYPE predicate only. isdlock is pulled
+/// unconditionally (the fee-only-safe new_islock lane rides every received
+/// one); the runtime opt-in (--embedded-ingest-isdlock,
+/// CoinClient::set_isdlock_pull) gates only the BLS-verified new_isdlock
+/// lane at the handler in p2p_client.hpp — flag OFF means the verified
+/// adoption path (maintainer BLS gate → Mempool::add_islock) stays dormant.
 ///
 /// Block invs are deliberately NOT here: they take the getheaders-then-block
 /// path in the inv handler, not a bare getdata.
@@ -418,6 +392,69 @@ BEGIN_MESSAGE(govsync)
     }
 END_MESSAGE()
 
+// ── G4 feed: deterministic InstantSend lock (DIP-0022) ────────────────────
+// "isdlock" — dashd instantsend/lock.h InstantSendLock, wire order:
+//   nVersion (u8, ISDLOCK_VERSION == 1; anything else is dropped in the
+//             handler, not here — an unknown version is a peer-local refusal,
+//             not a stream error)
+//   inputs   (CompactSize-prefixed vector<COutPoint>: 32B txid + 4B LE index,
+//             the exact GovOutPoint wire)
+//   txid     (uint256 — the tx these outpoints are locked TO)
+//   cycleHash(uint256 — the DKG cycle-start block of the type-5 rotated
+//             quorum that signed; drives the ROTATED SelectQuorumForSigning
+//             arm, see islock_verify.hpp)
+//   sig      (fixed 96B BLS recovered threshold signature, same decode as
+//             clsig m_sig above)
+//
+// ACQUISITION mirrors clsig: dashd ANNOUNCES by inv (MSG_ISDLOCK = 31) and
+// serves the object only on getdata; the inv hash is SerializeHash(payload),
+// echo-back only. The pull is UNCONDITIONAL (inv_type_is_pulled): every
+// received isdlock feeds the #1230 fee-only-safe new_islock lane (an islock
+// can only EXCLUDE a conflicting tx / short-circuit the IS mining-safety
+// hold — worst case forgone fees, never an invalid block; honest dashd
+// peers relay only islocks they themselves BLS-verified, the same SPV-style
+// trust the tx feed rides). --embedded-ingest-isdlock additionally arms the
+// BLS-VERIFIED new_isdlock lane at the handler (default OFF => that lane
+// never fires).
+//
+// ⚠ THE SIGNATURE IS NOT OPAQUE. Receiving an isdlock is NOT evidence the
+// lock is real: adopting one unverified would let an arbitrary peer evict
+// arbitrary mempool txs from our served templates (Mempool::add_islock's
+// conflict eviction + the G4 selection guard). The 96-byte recovered
+// threshold sig MUST be BLS-verified against the rotated LLMQ_60_75 quorum
+// dashd's SelectQuorumForSigning designates (islock_verify.hpp +
+// CoinStateMaintainer::on_new_isdlock, fail-closed without a verifier)
+// before Mempool::add_islock is ever called.
+//
+// Decode bound: dashd InstantSendLock::TriviallyValid rejects
+// inputs.size() > MaxBlockSize()/41 (instantsend/lock.h MAX_INPUTS); we
+// enforce the same ceiling at decode so a hostile peer cannot make us
+// buffer an absurd vector. Empty-inputs / null-txid are handler refusals.
+inline constexpr size_t MAX_ISDLOCK_INPUTS = 2'000'000 / 41;   // dashd MAX_INPUTS
+
+BEGIN_MESSAGE(isdlock)
+    MESSAGE_FIELDS
+    (
+        (uint8_t,                    m_version),
+        (std::vector<GovOutPoint>,   m_inputs),
+        (uint256,                    m_txid),
+        (uint256,                    m_cycle_hash),
+        (std::vector<uint8_t>,       m_sig)
+    )
+    {
+        READWRITE(obj.m_version);
+        READWRITE(obj.m_inputs);
+        if constexpr (std::is_same_v<Formatter, UnserializeFormatter>) {
+            if (obj.m_inputs.size() > MAX_ISDLOCK_INPUTS)
+                throw std::ios_base::failure(
+                    "isdlock inputs over MAX_ISDLOCK_INPUTS");
+        }
+        READWRITE(obj.m_txid);
+        READWRITE(obj.m_cycle_hash);
+        READWRITE(Using<ArrayType<DefaultFormat, 96>>(obj.m_sig));
+    }
+END_MESSAGE()
+
 // ── SPORK listener ────────────────────────────────────────────────────────
 // "spork" — CSporkMessage (dashd src/spork.h SERIALIZE_METHODS): nSporkID(i32)
 // + nValue(i64) + nTimeSigned(i64) + vchSig (LIMITED_VECTOR, 65-byte compact
@@ -480,6 +517,12 @@ using Handler = MessageHandler<
     // handler that exists but whose message type is absent from this list can
     // never run; the payload dies on the unhandled-command path at DEBUG, and
     // the G4 islock guard + the IS mining-safety hold silently stay feed-less.
+    // Membership here is UNCONDITIONAL (compile-time); the
+    // --embedded-ingest-isdlock flag gates BEHAVIOUR (the BLS-verified
+    // new_isdlock lane), never parsing. ONE entry only: a type listed twice
+    // is a duplicate variant alternative = compile error (rebase trap,
+    // #1230 x isdlock-intake). test_dash_isdlock.cpp gates the registry
+    // membership directly.
     message_isdlock,
     message_qfcommit,
     message_getmnlistd,
