@@ -413,6 +413,47 @@ public:
     }
 };
 
+// TEE consumer decoration (Variant B, #143): hand every verified body to TWO
+// consumers so a sister lane (the CreditPool INDEX follower,
+// credit_pool_idx.hpp) shares the SAME 30-40 GB bulk fetch instead of
+// repeating it — and sees the body BEFORE drain_buffer() prunes it, which is
+// the only moment the type-8/9 payloads exist in memory.
+//
+// SEMANTICS (deliberate, both directions fail closed):
+//   * PRIMARY refuses  -> the lane refuses (unchanged W1 contract: a fold
+//     that cannot proceed must never be silently skipped past).
+//   * SIDE refuses     -> the lane ALSO refuses. The side lane's refusal
+//     means ITS provenance broke mid-stream; pressing on would leave the two
+//     lanes' cursors disagreeing about what "delivered" means for this run.
+//     The side consumer is expected to have ALREADY latched its own
+//     fail-closed state (proven_complete=0 + wipe) before returning false,
+//     so the shared lane stopping is a named, restartable condition — never
+//     a silent divergence. Callers that want a purely observational side
+//     lane must wrap it so it never refuses.
+class TeeReplayConsumer : public IReplayBlockConsumer
+{
+    IReplayBlockConsumer* m_primary;   // borrowed, never owned
+    IReplayBlockConsumer* m_side;      // borrowed, never owned
+
+public:
+    TeeReplayConsumer(IReplayBlockConsumer* primary, IReplayBlockConsumer* side)
+        : m_primary(primary), m_side(side) {}
+
+    bool on_replay_block(uint32_t height, const uint256& hash,
+                         const BlockType& block) override
+    {
+        // Side FIRST: it must see the body even if the primary then refuses
+        // (the primary's refusal poisons the lane anyway; the side lane's
+        // ledger stays honest either way because it only advances on its own
+        // clean apply).
+        const bool side_ok =
+            m_side == nullptr || m_side->on_replay_block(height, hash, block);
+        const bool primary_ok =
+            m_primary == nullptr || m_primary->on_replay_block(height, hash, block);
+        return side_ok && primary_ok;
+    }
+};
+
 // ── Genesis→anchor header backfill ─────────────────────────────────────────
 //
 // Forward walker over `headers` batches. Holds ONLY the per-height hash

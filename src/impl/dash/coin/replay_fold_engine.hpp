@@ -693,6 +693,14 @@ public:
             default:
                 // Types 5 (cbTx, coinbase-only), 8/9 (asset lock/unlock —
                 // credit-pool lane, not DML), MNHF: no DML effect.
+                //
+                // Types 8/9 are NOT discarded by the replay pipeline: the
+                // CreditPool INDEX follower (credit_pool_idx.hpp, Variant B
+                // #143) ingests them as a SECOND IReplayBlockConsumer through
+                // the TeeReplayConsumer seam (replay_bulk_fetch.hpp), which
+                // hands it the full body BEFORE drain_buffer() prunes it.
+                // Folding them HERE as well would double-ingest; the DML fold
+                // stays type-8/9-blind on purpose.
                 break;
             }
             if (!err.empty()) {

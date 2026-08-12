@@ -618,7 +618,23 @@ if (BUILD_TESTING AND GTest_FOUND)
     # signature negative — are #ifdef C2POOL_DASH_BLS-gated in the source and
     # exercise only when the backend is linked. dash_bls_verify compiles
     # unconditionally (fail-closed stub without the backend), so this always links.
-    add_executable(test_dash_chainlock_verify test_dash_chainlock_verify.cpp)
+    # Second TU (#143 Variant B): test_dash_credit_pool_idx.cpp — the
+    # CreditPool INDEX follower (credit_pool_idx.hpp): the CRangesSet port,
+    # the dashd "plwdtx" request-id preimage, the era-laddered LimitAmount
+    # arithmetic, the 576-block latelyUnlocked window, the per-block
+    # cbTx-balance cross-check with fail-closed wipe, the CreditPoolIdxDb
+    # R/w/C/S schema + restore adjudication, and the five task KATs
+    # (flag-OFF byte-identity, gap⇒fail-closed, duplicate-index exclusion,
+    # verified-sig inclusion + committed-balance exactness, tampered-sig
+    # rejection). FOLDED into THIS target on purpose: it is the only
+    # build.yml-allowlisted dash target that links dash_bls_verify (the
+    # ARM-3 quorumSig verify needs the same VerifyInsecure port the
+    # ChainLock KATs lock), and a new add_executable would be a NOT_BUILT
+    # sentinel (#143 trap). The BLS-crypto halves (KAT 4/5 real-signature)
+    # are #ifdef C2POOL_DASH_BLS — exercised by the linux-dash-bls leg; the
+    # fold/schema/fail-closed halves run in EVERY build.
+    add_executable(test_dash_chainlock_verify test_dash_chainlock_verify.cpp
+                   test_dash_credit_pool_idx.cpp)
     target_link_libraries(test_dash_chainlock_verify PRIVATE
         GTest::gtest_main GTest::gtest
         dash_bls_verify dash_x11 core
