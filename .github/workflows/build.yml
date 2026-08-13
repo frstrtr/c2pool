@@ -1013,12 +1013,39 @@ jobs:
             # single-attempt download false-reds the whole gate on a transient
             # outbound blip (ENETUNREACH/ETIMEDOUT, run 29675949544), failing
             # PRs that never touch web/.
-            CHROME_BIN="$(ls -1 "$HOME"/.cache/puppeteer/chrome/*/chrome-linux64/chrome 2>/dev/null | tail -1 || true)"
+            # Pin the Chrome-for-Testing build to the EXACT revision that the
+            # installed puppeteer-core is tested against (read from its own
+            # revisions.js), NOT chrome@stable. chrome@stable floats to the
+            # newest major and can outrun the puppeteer-core CDP client ->
+            # TargetCloseError "Protocol error (Page.navigate): Target closed"
+            # (Chrome 151 vs puppeteer-core 23.x, run 31565849067). Keying both
+            # the warm-cache reuse and the cold fetch to $PIN makes the browser
+            # and client move together whenever the puppeteer-core lock is
+            # bumped, so this skew class cannot silently recur.
+            PIN="$(sed -nE "s/.*chrome: *.([0-9.]+).*/\\1/p" node_modules/puppeteer-core/lib/puppeteer/revisions.js | head -1)"
+            test -n "$PIN" || { echo "could not read pinned Chrome revision from puppeteer-core"; exit 1; }
+            echo "puppeteer-core pins Chrome-for-Testing $PIN"
+            CHROME_BIN="$(ls -1 "$HOME"/.cache/puppeteer/chrome/*"$PIN"/chrome-linux64/chrome 2>/dev/null | tail -1 || true)"
             if [ ! -x "$CHROME_BIN" ]; then
+              # Partial-cache guard: an interrupted prior download can leave
+              # the versioned dir present with NO chrome-linux64/chrome binary.
+              # @puppeteer/browsers treats "dir exists" as installed and refuses
+              # to re-fetch, so every retry short-circuits to the same broken
+              # path and the gate false-reds (linux-151.0.7922.77 on
+              # actions-runner-8, run 31607961557). Purge any incomplete dir for
+              # this PIN before AND between fetch attempts so the download re-runs.
+              purge_partial() {
+                for d in "$HOME"/.cache/puppeteer/chrome/*"$PIN"; do
+                  [ -d "$d" ] && [ ! -x "$d/chrome-linux64/chrome" ] && rm -rf "$d"
+                done
+                return 0
+              }
+              purge_partial
               for attempt in 1 2 3; do
-                CHROME_BIN="$(npx --yes @puppeteer/browsers install chrome@stable | tail -1 | awk '{print $NF}')" \
+                CHROME_BIN="$(npx --yes @puppeteer/browsers install "chrome@$PIN" | tail -1 | awk '{print $NF}')" \
                   && [ -x "$CHROME_BIN" ] && break
                 echo "chrome-for-testing fetch attempt $attempt failed; retrying in $((attempt*10))s"
+                purge_partial
                 sleep $((attempt*10))
               done
             fi
