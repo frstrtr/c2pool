@@ -63,6 +63,7 @@
 #include <impl/dash/coin/coin_p2p_magic.hpp>      // dash::coin::select_coin_p2p_magic — E5 --coin-p2p-magic override (regtest ARM A dial)
 #include <impl/dash/coin/node_coin_state.hpp>  // dash::coin::NodeCoinState (embedded work bundle)
 #include <impl/dash/coin/arm_resolution.hpp>   // dash::coin::resolve_embedded_arm (#738 arm decision, one place)
+#include <impl/dash/coin/embedded_startup_invariant.hpp>  // C-startup-invariant: embedded fresh-gate => body-first serve tip
 #include <impl/dash/coin/dkg_window.hpp>       // dash::coin::is_dkg_commitment_window (BLOCKER-1 guard)
 #include <impl/dash/coin/dkg_commitments.hpp>  // E1: build_daemonless_qc_plan (serve DKG windows daemonlessly)
 #include <impl/dash/coin/mined_commitment_index.hpp>  // PR-2 FORWARD: dashd's mined-commitment store, from OUR replay
@@ -4898,7 +4899,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // hash is already at the tip; the accrual then commits a stale
         // creditPoolBalance. Refuse the embedded arm unless the credit-pool seed
         // is current AT the tip, same discipline as the SML axis.
-        node_coin_state.set_require_fresh_credit_pool(run_arm.embedded_arm_enabled);
+        const bool require_fresh_credit_pool = run_arm.embedded_arm_enabled;
+        node_coin_state.set_require_fresh_credit_pool(require_fresh_credit_pool);
 
         // E4 re-soak fix (bad-cb-payee at 1519827): the projected masternode
         // payee is only dashd-exact when the payee queue has folded EVERY
@@ -4914,7 +4916,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // MnStateMachine's forward-contiguity guard + the maintainer's gap
         // fail-closed path (wipe + authoritative protx re-seed) close the
         // gap itself.
-        node_coin_state.set_require_fresh_mn_payee(run_arm.embedded_arm_enabled);
+        const bool require_fresh_mn_payee = run_arm.embedded_arm_enabled;
+        node_coin_state.set_require_fresh_mn_payee(require_fresh_mn_payee);
 
         // H-6: SML/quorum apply and bestCL adoption move ASYNCHRONOUSLY to the
         // header tip. When they advance (catching the SML up to a moved tip, or
@@ -5091,6 +5094,21 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // advance. `creditpool-stale` then ceases to exist as a class in
         // normal operation; the ~1-2 s window is named `tip-body-pending`.
         maintainer->set_body_first_serve_tip(true);
+        // C-startup-invariant (gapless MN-list / daemonless re-seed): couple the
+        // money-path freshness gates to body-first serving. The daemonless arm
+        // sets body-first UNCONDITIONALLY one line up, so this can never
+        // false-trip today; it exists so a FUTURE embedded wiring that adds an
+        // arm with a freshness gate but forgets set_body_first_serve_tip(true)
+        // fails LOUD at startup instead of silently regressing to
+        // publish-at-header-tip (a payee / creditPool projected off a fold not
+        // yet current at the serve tip = bad-cb-payee / bad-cbtx-assetlocked
+        // = lost block). Read body-first back from the maintainer so a dropped
+        // wiring is what actually trips it. Tightens only; relaxes no guard.
+        dash::coin::require_body_first_when_fresh_gated(
+            run_arm.embedded_arm_enabled,
+            require_fresh_credit_pool,
+            require_fresh_mn_payee,
+            maintainer->body_first_serve_tip());
         // PR-5 publication height (default OFF; money path). With body-first
         // on, the credit pool derived for a block ABOVE the serve tip is held
         // and published atomically with the promotion that makes that block
