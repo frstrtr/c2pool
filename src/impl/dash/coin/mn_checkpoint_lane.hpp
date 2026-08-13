@@ -235,7 +235,20 @@ public:
     /// Request the full block body at `height` from the coin-P2P peer. Wired
     /// by main_dash to the same header-chain-hash lookup + request_block seam
     /// UtxoLane uses.
-    using RequestBlockFn = std::function<void(uint32_t height)>;
+    ///
+    /// ── #138 LEDGER HONESTY ──────────────────────────────────────────────
+    /// Returns TRUE only when the getdata actually LEFT for a peer. FALSE
+    /// means the request died locally without any peer hearing it — the two
+    /// wired legs are a header-by-height miss in main_dash's seam (no hash to
+    /// ask by) and CoinP2PClient::request_block()'s block_source()==nullptr
+    /// (announcer FIFO evicted the historical block and the primary is
+    /// null/churned). Both used to be silent voids, and request_window()
+    /// advanced m_requested_through anyway; every later window then computed
+    /// from = ledger+1 — PAST the dead height — and never asked again. On a
+    /// daemonless authoritative reseed that is terminal: the bridge sits one
+    /// body short of publishing while the maintainer's mn-needs-reseed latch
+    /// keeps the embedded arm demoted, forever (the reseed-tail wedge).
+    using RequestBlockFn = std::function<bool(uint32_t height)>;
     /// Publish the bridged, payout-bearing set as an authoritative MN-list
     /// resync. Wired by main_dash to Node::mn_list_update.happened().
     using PublishFn =
@@ -1407,6 +1420,38 @@ public:
 
         if (m_state == State::Waiting) {
             m_state = State::Bridging;
+            // ── #138: THE STATE ARMS ITS OWN PRECONDITION ─────────────────
+            // Every entrance into Bridging — cold arm(), an authoritative-
+            // reseed rearm() (main_dash mn_reseed_fallback), the
+            // FailedClosed self re-arm (poll_rearm) — funnels through this
+            // ONE edge, and the edge runs strictly AFTER try_restore()
+            // settles (the #91 guard above), so m_next is FINAL for this
+            // arm. Force the arm's first request_window() to start at the
+            // cursor no matter what the request ledger claims.
+            //
+            // Today this costs ZERO extra getdata: reset_for_arm() zeroes
+            // m_requested_through, so from == m_next on the first window
+            // with or without the flag. But that safety was EMERGENT — a
+            // reset-list side effect plus the settle-before-request call
+            // ordering — owned by every caller separately. #1162 armed the
+            // fold pause at its call sites and proved where per-caller
+            // arming leads: the cold-start door got fixed while the others
+            // stayed trusted-by-coincidence. Owned here, no entrance can
+            // forget it — including the resume ACCEPT (try_restore rewrites
+            // m_next and touches neither the flag nor the ledger; before
+            // this line it was safe ONLY by sequencing, the documented
+            // from>end zero-getdata wedge if any future path lets a request
+            // precede restore settlement).
+            //
+            // Deliberately mutation-silent at this sha (like the two stated
+            // lines in reset_for_arm()): deleting it produces no red today.
+            // It is an invariant hoist, not a behaviour change — the flag is
+            // consumed by the first request_window() pass (:3050), so it can
+            // never linger past the entry window, and it gates FETCHING
+            // only; publish() keeps every hold (#91 resume HOLD, fold/apply
+            // falsification), so arming here cannot serve a wiped or gapped
+            // set mid-reseed.
+            m_rerequest_from_cursor = true;
             // Size the per-mismatch demotion-walk budget against the replay
             // distance. A PoSe ban is a rare per-masternode event, so the
             // count inside a window scales with the window, not with the set
@@ -3060,7 +3105,34 @@ public:
             // bridge mid-loop. Never keep pulling history for a lane that is no
             // longer bridging.
             if (m_state != State::Bridging) return;
-            m_request(h);
+            // ── #138 LEDGER HONESTY. m_requested_through is a claim that a
+            // peer was ASKED, so it may only advance when the seam says the
+            // getdata reached one. A request that died locally (header not
+            // held / no coin-P2P route — see the RequestBlockFn contract)
+            // leaves the ledger AT the last height a peer really heard, so
+            // the very next drive — the tail-of-apply request_window(), the
+            // next pump tick, or the stall probe — computes from = ledger+1
+            // and re-asks the dead height instead of skipping it forever.
+            // The window STOPS at the first refusal rather than spraying
+            // getdata past a hole the gapless cursor cannot cross yet: that
+            // bounds the extra requests (at most one refused ask per drive,
+            // ZERO extra getdata while every request reaches the wire), and
+            // the heights past the hole are re-covered by the same from=
+            // ledger+1 arithmetic once the hole heals. Fetch-side only:
+            // publish() and its holds are untouched, so an honest ledger can
+            // delay a publish but never license one.
+            if (!m_request(h)) {
+                if (h != m_last_reqfail_logged) {
+                    m_last_reqfail_logged = h;
+                    LOG_WARNING << "[MN-CKPT] block-body request for h=" << h
+                                << " DIED LOCALLY (header not held, or no"
+                                   " coin-P2P route to any peer) — request"
+                                   " ledger stays at h=" << m_requested_through
+                                << "; the next drive re-requests from there"
+                                   " instead of wedging (task #138)";
+                }
+                return;
+            }
             if (h > m_requested_through) m_requested_through = h;
         }
     }
@@ -3426,6 +3498,9 @@ public:
         m_requested_through     = 0;
         m_rerequest_from_cursor = false;
         m_last_wait_log         = 0;
+        m_last_reqfail_logged   = 0;   // #138: same class as m_last_wait_log —
+                                       // a log throttle a fresh bridge must
+                                       // not inherit
         m_position_verified     = false;
         // Diagnostics, reset for the same reason every other counter here is:
         // a re-armed bridge that inherited the previous run's progress baseline
@@ -3574,9 +3649,12 @@ public:
     uint32_t m_max_bridge{kDefaultMaxBridgeBlocks};
     uint32_t m_stalled_pumps{0};
     uint32_t m_last_pump_next{0};        // cursor at the previous pump (stall probe)
-    uint32_t m_requested_through{0};     // highest height already asked for
+    uint32_t m_requested_through{0};     // highest height a peer was ACTUALLY
+                                         // asked for (#138: never advanced on
+                                         // a locally-dead request)
     bool     m_rerequest_from_cursor{false};
     uint32_t m_last_wait_log{0};
+    uint32_t m_last_reqfail_logged{0};   // #138 refusal-log throttle (per height)
     bool     m_position_verified{false};
 
     // ── DIAGNOSTICS (telemetry only; nothing below is read by a gate) ──────

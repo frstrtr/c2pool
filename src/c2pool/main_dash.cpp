@@ -5528,8 +5528,37 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // request_block path the E2b UTXO lane's window refill uses.
             mn_ckpt_lane->set_request_block_fn(
                 [cp = coin_p2p.get(), hc = header_chain.get()](uint32_t h) {
+                    // #138: report the truth of the wire. BOTH local-death
+                    // legs — the header for h not held yet (nothing to ask
+                    // by), and request_block()'s block_source()==nullptr (no
+                    // route to any peer) — must return false, so the lane's
+                    // request ledger never counts a getdata that no peer
+                    // heard. Fire-and-forget here is exactly the reseed-tail
+                    // wedge: the ledger claims the tip body was requested,
+                    // request_window() skips it forever, and the
+                    // mn-needs-reseed latch holds the embedded arm down.
                     auto e = hc->get_header_by_height(h);
-                    if (e) cp->request_block(e->hash);
+                    if (!e) return false;
+                    // #138 TAIL-TRACKED. The last bodies before the header tip
+                    // are the reseed-tail wedge surface: the announcer FIFO
+                    // (ANNOUNCER_CAP) has usually evicted them by the time the
+                    // bridge's cursor arrives, and the lane's own stall probe
+                    // can only re-ask down the SAME block_source() route once
+                    // per pump (~2.5 min) — a connected-but-silent peer eats
+                    // every re-ask identically. Tracking hands those requests
+                    // to the p2p lost-body watchdog (service_pending_bodies),
+                    // which rotates the re-request to a NEIGHBOUR after 10 s,
+                    // bounded at BODY_REREQUEST_MAX; the redelivered body rides
+                    // the ordinary full_block -> on_block_connected ingest the
+                    // lane already consumes. The BULK leg stays UNTRACKED by
+                    // design: kWindow=64 asks per window would defeat
+                    // PENDING_BODY_CAP=8 (see the request_block_tracked doc),
+                    // and bulk already has the lane's windowed re-request loop.
+                    // <=3 tracked heights per window, well under the cap.
+                    const uint32_t tip = hc->height();
+                    if (tip != 0 && h + 2 >= tip)
+                        return cp->request_block_tracked(e->hash);
+                    return cp->request_block(e->hash);
                 });
             mn_ckpt_lane->set_tip_height_fn(
                 [hc = header_chain.get()]() { return hc->height(); });

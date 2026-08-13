@@ -1058,4 +1058,57 @@ TEST(DashCoinP2PPool, tip_body_getdata_targets_the_announcing_peer_not_the_prima
            "on a warm node, may be behind/wedged and never deliver";
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// TASK #138 — a TRACKED request that DIED LOCALLY must (a) say so, and
+// (b) still arm the watchdog, which puts the getdata on the wire the moment
+// a route exists.
+//
+// This is the p2p half of the reseed-tail contract. The mn-ckpt lane's
+// request ledger only advances on TRUE (ledger honesty, its own tests in
+// test_dash_mn_checkpoint.cpp), and the tail of the reseed window is
+// requested TRACKED so the wedge shape — no announcer for a historical tip
+// body, primary churned out — is owned by service_pending_bodies() instead
+// of dying silently. FAILS-ON-MASTER twice over: request_block_tracked
+// returned void, and a dead initial send parked the slot for a full
+// BODY_REREQUEST_SEC before the first retry.
+// ══════════════════════════════════════════════════════════════════════════
+
+TEST(DashCoinP2PPool, tracked_request_that_died_locally_reports_it_and_recovers_via_watchdog)
+{
+    PoolRig rig;
+    rig.use_fake_clock();
+
+    // No handshaked peer at all: block_source() has neither announcer nor
+    // primary — the initial getdata cannot reach anyone.
+    const uint256 h = hash_n(0x138);
+    EXPECT_FALSE(rig.client.request_block_tracked(h))
+        << "#138: a tracked request with no route must SAY so — the caller's"
+           " request ledger must not count a getdata no peer heard";
+    EXPECT_EQ(rig.client.pending_body_count(), 1u)
+        << "the watchdog slot must be armed anyway: the locally-dead request"
+           " is exactly the one that needs the retry";
+    EXPECT_EQ(rig.client.body_rerequests_total(), 0u);
+
+    // The pool heals. The WATCHDOG — not the caller — must put the getdata on
+    // the wire, and immediately: a send that never happened must not have
+    // started the 10 s unanswered-clock.
+    rig.handshake(1);
+    const uint64_t before = rig.session(1)->msgs_sent;
+    rig.run_seconds(1);
+    EXPECT_EQ(rig.client.body_rerequests_total(), 1u)
+        << "the armed slot must be serviced on the first tick after a"
+           " handshaked peer exists — not BODY_REREQUEST_SEC later";
+    EXPECT_EQ(rig.session(1)->msgs_sent, before + 1)
+        << "exactly one getdata, to the peer that now exists";
+
+    // A dead RE-ask (the lane's pump re-driving the same height while the
+    // route is down again) must not push the watchdog's own timer out — the
+    // slot keeps its cadence. Modelled by asking again for the same hash:
+    // peer 1 answers routing now, so this send SUCCEEDS and refreshes.
+    EXPECT_TRUE(rig.client.request_block_tracked(h))
+        << "with a primary up the tracked re-ask reaches the wire";
+    EXPECT_EQ(rig.client.pending_body_count(), 1u)
+        << "re-asking an already-tracked hash must not grow the slots";
+}
+
 } // namespace

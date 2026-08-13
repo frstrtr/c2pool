@@ -227,12 +227,18 @@ struct BridgeHarness {
                 published_as_of = as_of;
                 published_set = std::move(set);
             });
+        // #138: the harness peer always HEARS the getdata (returns true) —
+        // whether it answers is a separate axis (auto_deliver / the async
+        // reseed tests). A seam that returns false models a request that died
+        // LOCALLY before any peer heard it; see
+        // ALocallyDeadRequestSeamMustNotAdvanceTheLedger.
         lane.set_request_block_fn([this](uint32_t h) {
             requested.push_back(h);
-            if (!auto_deliver) return;
+            if (!auto_deliver) return true;
             auto it = blocks.find(h);
-            if (it == blocks.end()) return;
+            if (it == blocks.end()) return true;
             lane.on_block_connected(it->second, h);
+            return true;
         });
     }
 };
@@ -5646,4 +5652,484 @@ TEST(DashMnBridgeCursor, ReArmRefusesACursorFoldedThroughTheDivergence)
     EXPECT_EQ(r.h.requested.front(), kAnchorHeight + 1)
         << "the anchor IS the right answer here; the point is that it was"
            " REACHED by a rule, not inherited from a latch";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TASK #138 — THE RESEED TAIL: a tip body whose getdata died on the wire must
+// be RE-REQUESTED, and the reseed latch must clear when the bridge lands
+//
+// THE SOAK SHAPE THIS PINS (daemonless authoritative reseed). The maintainer
+// wipes a desynced payee queue, latches mn-needs-reseed and asks for an
+// authoritative re-seed; the re-armed bridge replays to the tip and asks for
+// the TIP BODY — and that one getdata dies on the wire (main_dash's request
+// seam drops it silently on a header miss, and the coin-P2P announcer cap can
+// evict it; either way the peer never answers). The lane's request LEDGER
+// (m_requested_through) advanced when the request was ISSUED, not when it was
+// answered, so every later request_window() computes from = ledger + 1 — PAST
+// the reseed cursor — and issues ZERO getdata for the missing height. A tip
+// advance then fetches ONLY the new height, whose body the gapless cursor
+// refuses (height != m_next). The reseed sits one body short of publishing
+// while the latch keeps the embedded arm demoted, with the EMBED-GATE
+// heartbeat printing "cause=mn-needs-reseed value=latched" — the reseed-tail
+// wedge.
+//
+// THE HARNESS IS ASYNCHRONOUS ON PURPOSE. The default BridgeHarness answers
+// getdata INLINE (one ordered stream), and that shape cannot hold this wedge
+// open: #1225's follower re-drives request_window() at the tail of every
+// apply, and the overlapping windows of a synchronous delivery chain re-ask
+// for the pending height before the pump ever returns (measured while writing
+// this test — the inline twin recovers within the reseed pump itself). The
+// wire is not synchronous: requests go out, bodies come back later or never.
+// This test records getdata and lets the "peer" answer explicitly, which is
+// exactly the shape the soak wedged in.
+//
+// WHAT THIS TEST DEMANDS. With the tip body withheld ONCE and the tip then
+// advanced PAST the reseed cursor:
+//   (a) the bridge must issue a SECOND getdata for the withheld height on a
+//       later drive (the fire-and-forget ledger must not be believed forever),
+//   (b) the bridge must complete and publish through the REAL leg-4 event,
+//   (c) the maintainer's mn-needs-reseed latch must CLEAR and the embedded
+//       arm must come back up,
+// and all of it within TWO pump() drives of the tip advance — the wedge must
+// be BOUNDED, never latched. The drive after the withhold is also pinned AS
+// the wedge (ledger believed, cursor stuck, new-height body refused at the
+// gapless cursor), because that mechanism — not an arming gap — is what the
+// soak shows; a change that recovers on that very drive is an improvement and
+// may relax that one EXPECT, but it must keep (a)-(c).
+//
+// HONEST NOTE ON COVERAGE. This test PASSES on the pre-#138 sha: the shape it
+// pins (request reached the wire, peer never answered) was already recovered
+// by the stall probe within two drives, and this test now PINS that recovery
+// against regression. The forever-wedge #138 actually fixes is the OTHER
+// half — a getdata that died LOCALLY (main_dash header-miss /
+// block_source()==nullptr) while the fire-and-forget ledger advanced anyway —
+// and it has its own red/green test below
+// (ALocallyDeadRequestSeamMustNotAdvanceTheLedger). The Waiting->Bridging
+// edge-arm of m_rerequest_from_cursor that rides along is an INVARIANT HOIST
+// and is deliberately mutation-silent at this sha, like the two stated lines
+// in reset_for_arm(): every entrance into Waiting funnels through
+// reset_for_arm(), which zeroes m_requested_through, so the re-armed bridge's
+// first window starts at the cursor with or without the flag. Deleting that
+// one line does NOT red this test. What reds it is a regression of the
+// recovery UNION the reseed tail actually depends on: reset_for_arm()
+// forgetting the request ledger (the documented from>end zero-getdata wedge),
+// the stall probe's re-arm being skipped or starved, or a pause path
+// consuming the flag without re-requesting. Those are the per-caller
+// coincidences the edge-arm exists to stop being load-bearing.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashMnCheckpointReseed, ReseedTailReRequestsAWithheldTipBodyAndClearsTheLatch)
+{
+    ReseedRig r(/*wire_the_reseed_seam=*/true);
+
+    // ── Stage 0: cold start -> bridge -> published -> populated ───────────
+    r.h.lane.arm(r.anchor);
+    r.h.lane.pump();
+    ASSERT_EQ(r.h.lane.state(), MnCheckpointLane::State::Published)
+        << r.h.lane.status();
+    r.fire_tip();
+    ASSERT_TRUE(r.state.populated());
+    ASSERT_FALSE(r.state.mn_needs_reseed());
+
+    // The payment queue as of 1519546 is the anchor set with the three real
+    // payments folded in (blocks 1519544..1519546 are coinbase-only, so
+    // nothing else moved). Rank it with the machine's OWN comparator to name
+    // the payee dashd would pay at 1519547 — computed, not guessed, so this
+    // test cannot drift from the projection it must satisfy.
+    std::vector<std::pair<uint256, MNState>> queue(r.anchor.entries.begin(),
+                                                   r.anchor.entries.end());
+    auto set_paid = [&queue](const char* protx, uint32_t paid_at) {
+        for (auto& e : queue)
+            if (e.first == uint256S(protx)) {
+                e.second.nLastPaidHeight = paid_at;
+                return true;
+            }
+        return false;
+    };
+    ASSERT_TRUE(set_paid("dc2e02ac95ce4ccc9843c38de7bdaf32f2a1d5966c05412"
+                         "7a3f4ca4f4bbd5991", 1519544));
+    ASSERT_TRUE(set_paid("9b653e767b978c10346d938c08dc8c5acd03c495f9d913e"
+                         "6fc652bfcae11a348", 1519545));
+    ASSERT_TRUE(set_paid("91bbce94c34ebde0d099c0a2cb7635c0c31425ebabcec64"
+                         "4f4f1a0854bfa605d", 1519546));
+    const std::pair<uint256, MNState>* head = nullptr;
+    for (const auto& e : queue)
+        if (!head
+            || MnStateMachine::payee_order_before(
+                   MnStateMachine::payee_score(e.second), e.first,
+                   MnStateMachine::payee_score(head->second), head->first))
+            head = &e;
+    ASSERT_NE(head, nullptr);
+    r.h.blocks[1519547] = block_paying(head->second.scriptPayout.m_data);
+
+    // ── Stage 1: go ASYNCHRONOUS — getdata is RECORDED, never answered
+    // inline. From here the test plays the peer and delivers bodies
+    // explicitly, which is what a real wire does and what the inline
+    // harness cannot represent (see the header note).
+    std::vector<uint32_t> getdata;   // every request AFTER the reseed starts
+    // Returns true: this peer HEARS every getdata (the request reached the
+    // wire); whether it ANSWERS is the axis under test. The locally-dead
+    // seam (returns false) has its own test below.
+    r.h.lane.set_request_block_fn(
+        [&getdata](uint32_t hgt) { getdata.push_back(hgt); return true; });
+    auto deliver = [&r](uint32_t hgt) {
+        r.h.lane.on_block_connected(r.h.blocks.at(hgt), hgt);
+    };
+
+    // ── Stage 2: the authoritative reseed; the tip-body getdata dies ──────
+    const auto gap = r.force_apply_gap();
+    ASSERT_TRUE(gap.gap_detected) << "the reseed trigger itself must fire";
+    ASSERT_EQ(r.outcomes.size(), 1u);
+    ASSERT_EQ(r.outcomes[0], MnCheckpointLane::RearmOutcome::Armed)
+        << r.h.lane.last_rearm_reason();
+    // The re-armed bridge asked for the whole window up front...
+    EXPECT_EQ(std::count(getdata.begin(), getdata.end(), 1519544u), 1);
+    EXPECT_EQ(std::count(getdata.begin(), getdata.end(), 1519545u), 1);
+    ASSERT_EQ(std::count(getdata.begin(), getdata.end(), 1519546u), 1);
+    // ...the peer answers 1519544 and 1519545; the 1519546 getdata is the
+    // one the wire ate. The ledger now claims all three were requested.
+    deliver(1519544);
+    deliver(1519545);
+    ASSERT_EQ(r.h.lane.state(), MnCheckpointLane::State::Bridging)
+        << r.h.lane.status();
+    EXPECT_EQ(r.h.lane.cursor_height(), 1519545u);
+    EXPECT_EQ(r.h.lane.requested_through(), 1519546u)
+        << "the fire-and-forget ledger: 1519546 was ISSUED, never ANSWERED";
+    EXPECT_NE(r.h.lane.waiting_for().find("block-bodies@h=1519546"),
+              std::string::npos)
+        << r.h.lane.waiting_for();
+    EXPECT_TRUE(r.state.mn_needs_reseed())
+        << "the latch holds until an authoritative publish clears it";
+
+    // ── Stage 3: the tip advances PAST the reseed cursor ──────────────────
+    // THE WEDGE, pinned. This drive believes the ledger: it fetches only the
+    // NEW height, whose body the gapless cursor refuses (height != m_next),
+    // and it does NOT re-ask for the withheld 1519546. This is the state the
+    // soak sat in while the latch held the embedded arm down.
+    r.h.tip = 1519547;
+    r.h.lane.pump();
+    EXPECT_EQ(std::count(getdata.begin(), getdata.end(), 1519546u), 1)
+        << "current behaviour: the tip-advance drive trusts the ledger and"
+           " does not yet re-request (recovering HERE would be an"
+           " improvement — relax this EXPECT if a change delivers it)";
+    EXPECT_EQ(std::count(getdata.begin(), getdata.end(), 1519547u), 1)
+        << "the tip advance must still fetch the new height";
+    deliver(1519547);   // arrives OUT OF ORDER, ahead of the missing 1519546
+    EXPECT_EQ(r.h.lane.cursor_height(), 1519545u)
+        << "the early 1519547 body must be refused at the gapless cursor,"
+           " never folded over the missing 1519546";
+    EXPECT_EQ(r.h.lane.state(), MnCheckpointLane::State::Bridging)
+        << r.h.lane.status();
+    EXPECT_TRUE(r.state.mn_needs_reseed());
+
+    // ── Stage 4: the NEXT drive must break the wedge — re-request, land,
+    // publish, clear the latch. This is the #138 contract.
+    r.h.lane.pump();
+    ASSERT_GE(std::count(getdata.begin(), getdata.end(), 1519546u), 2)
+        << "the withheld tip body was never re-requested — the reseed tail is"
+           " wedged on a fire-and-forget request ledger (task #138)";
+    deliver(1519546);   // the peer answers the RE-issued getdata
+    if (r.h.lane.state() == MnCheckpointLane::State::Bridging
+        && r.h.lane.cursor_height() == 1519546u)
+        deliver(1519547);   // and the follower's re-pull of the tip body
+    ASSERT_EQ(r.h.lane.state(), MnCheckpointLane::State::Published)
+        << "the reseed bridge must COMPLETE once the bodies land: "
+        << r.h.lane.status();
+    EXPECT_EQ(r.h.lane.cursor_height(), 1519547u);
+    EXPECT_FALSE(r.state.mn_needs_reseed())
+        << "the authoritative publish through the real leg-4 event is the one"
+           " thing that clears the latch, and it must have happened";
+    r.fire_tip();
+    EXPECT_TRUE(r.state.populated())
+        << "the embedded arm must come back up after the reseed lands";
+
+    // Recovery cost is bounded: one duplicate pass from the cursor, never a
+    // re-request storm — ~6 getdata for a 4-block reseed with one drop.
+    EXPECT_LE(getdata.size(), 10u)
+        << "re-requesting must stay a bounded recovery, not a storm";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TASK #138 — LEDGER HONESTY: a getdata that DIED LOCALLY must not advance
+// the request ledger (m_requested_through)
+//
+// THE OTHER HALF OF THE SOAK WEDGE, and the load-bearing one. The
+// asynchronous-withhold test above pins the peer-went-quiet shape (the
+// request reached the wire, no answer came) — recovered by the stall probe,
+// bounded at two drives. This test pins the two wired seams that can kill
+// the request BEFORE any peer hears it, both of which were fire-and-forget
+// voids until #138:
+//   • main_dash's request seam: get_header_by_height(h) miss => NO getdata
+//     was even composed, but the lambda returned normally;
+//   • CoinP2PClient::request_block(): block_source(hash)==nullptr (the
+//     announcer FIFO evicted the historical block / the primary churned out)
+//     => silent return, nothing written to any peer.
+// With a void seam the lane cannot tell either from success, so
+// request_window() advanced m_requested_through anyway; every later window
+// computed from = ledger+1 — PAST the dead height — and never asked for it
+// again. The stall probe's full-window re-request goes through the SAME dead
+// seam, so while the route stays dead the re-asks die identically and
+// SILENTLY: the reseed sits one body short of publishing, forever, with
+// mn-needs-reseed latched and the embedded arm demoted. The seam now returns
+// the truth of the wire and the ledger only advances on TRUE.
+//
+// WHAT THIS TEST DEMANDS:
+//   (a) after the seam refuses the tip-height request, requested_through
+//       stays BELOW it — the honest ledger. Reverting request_window() to
+//       fire-and-forget (deleting the `if (!m_request(h))` guard) reds this
+//       assertion: that is the red/green for the #138 fix;
+//   (b) recovery rides the ORDINARY drives: the tail-of-apply
+//       request_window() re-asks the dead height as soon as the ledger
+//       arithmetic reaches it — no extra pump, no stall-probe wait, no new
+//       mechanism;
+//   (c) the bridge publishes through the real leg-4 event and the
+//       maintainer's mn-needs-reseed latch CLEARS;
+//   (d) the extra getdata is bounded: one refused ask per drive at most, and
+//       zero extra while every request reaches the wire.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashMnCheckpointReseed, ALocallyDeadRequestSeamMustNotAdvanceTheLedger)
+{
+    ReseedRig r(/*wire_the_reseed_seam=*/true);
+
+    // ── Stage 0: cold start -> bridge -> published -> populated ───────────
+    r.h.lane.arm(r.anchor);
+    r.h.lane.pump();
+    ASSERT_EQ(r.h.lane.state(), MnCheckpointLane::State::Published)
+        << r.h.lane.status();
+    r.fire_tip();
+    ASSERT_TRUE(r.state.populated());
+    ASSERT_FALSE(r.state.mn_needs_reseed());
+
+    // ── Stage 1: the seam that tells the truth about the wire. The request
+    // for the TIP body DIES LOCALLY (returns false) on the first ask — the
+    // header-miss / block_source()==nullptr shape; no getdata went out, so
+    // the recorder must NOT see it — and the route heals for every later ask.
+    std::vector<uint32_t> getdata;
+    size_t dead_returns = 0;
+    r.h.lane.set_request_block_fn([&getdata, &dead_returns](uint32_t hgt) {
+        if (hgt == 1519546u && dead_returns == 0) {
+            ++dead_returns;      // the local drop: NO peer heard this ask
+            return false;
+        }
+        getdata.push_back(hgt);
+        return true;
+    });
+    auto deliver = [&r](uint32_t hgt) {
+        r.h.lane.on_block_connected(r.h.blocks.at(hgt), hgt);
+    };
+
+    // ── Stage 2: the authoritative reseed; the tip-body ask dies at the seam
+    ASSERT_TRUE(r.force_apply_gap().gap_detected);
+    ASSERT_EQ(r.outcomes.size(), 1u);
+    ASSERT_EQ(r.outcomes[0], MnCheckpointLane::RearmOutcome::Armed)
+        << r.h.lane.last_rearm_reason();
+    ASSERT_EQ(dead_returns, 1u)
+        << "the dead seam was never exercised — the test lost its subject";
+    EXPECT_EQ(std::count(getdata.begin(), getdata.end(), 1519544u), 1);
+    EXPECT_EQ(std::count(getdata.begin(), getdata.end(), 1519545u), 1);
+    EXPECT_EQ(std::count(getdata.begin(), getdata.end(), 1519546u), 0)
+        << "nothing reached the wire for the dead height yet";
+    // (a) THE HONEST LEDGER — the red line for the fire-and-forget defect.
+    EXPECT_EQ(r.h.lane.requested_through(), 1519545u)
+        << "a request the seam refused was counted as requested: the ledger"
+           " lies, every later request_window() computes from past the dead"
+           " height, and the reseed tail wedges forever (task #138)";
+
+    // ── Stage 3: recovery on the ORDINARY drives. Applying the bodies that
+    // DID go out re-runs request_window() at the tail of each apply; with an
+    // honest ledger its from = ledger+1 lands ON the dead height and re-asks
+    // it — now answerable, because the route healed.
+    deliver(1519544);
+    deliver(1519545);
+    ASSERT_EQ(std::count(getdata.begin(), getdata.end(), 1519546u), 1)
+        << "the tail-of-apply window never re-asked the locally-dead height —"
+           " the ledger was believed over the wire";
+    EXPECT_EQ(r.h.lane.requested_through(), 1519546u)
+        << "once the ask actually reaches a peer the ledger advances again";
+    deliver(1519546);
+
+    // ── Stage 4: (c) published through the real leg-4 event; latch cleared.
+    ASSERT_EQ(r.h.lane.state(), MnCheckpointLane::State::Published)
+        << r.h.lane.status();
+    EXPECT_FALSE(r.state.mn_needs_reseed())
+        << "the authoritative publish is the one thing that clears the latch";
+    r.fire_tip();
+    EXPECT_TRUE(r.state.populated())
+        << "the embedded arm must come back up after the reseed lands";
+
+    // (d) Bounded: 1519544 + 1519545 once each, 1519546 once (the dead ask
+    // never reached the recorder) — 3 getdata on the wire for a 3-block
+    // reseed with one local death. Headroom for a defensive duplicate pass,
+    // never a storm.
+    EXPECT_LE(getdata.size(), 6u)
+        << "ledger honesty must not turn into a re-request storm";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TASK #138 — THE WEDGE END TO END: the tip body is WITHHELD ONCE (the ask
+// dies at the seam — no peer ever hears it), the tip then advances PAST the
+// reseed cursor, and the bridge must ASK AGAIN and clear the latch within a
+// BOUNDED number of pumps.
+//
+// This is #1225's soak shape in one case, and it is RED at 6147ef22 (the
+// pre-fix master this diff applies to). The withhold is the CONFIRMED drop:
+// the request for the reseed tail's tip body dies LOCALLY (main_dash's
+// get_header_by_height miss, or CoinP2PClient::request_block's
+// block_source()==nullptr after the announcer FIFO evicted the historical
+// block and the primary churned) — composed by the lane, heard by NOBODY.
+// The route heals when the next tip arrives (the header/announcer that was
+// missing shows up with it). What master then does with the FIRST pump that
+// sees the new tip is the whole defect:
+//
+//   master: the fire-and-forget ledger claims the withheld height was
+//     requested, so request_window() computes from = ledger+1 — PAST the
+//     hole — and asks ONLY the new height, whose body the gapless cursor
+//     refuses (height != m_next). Not one getdata for the withheld height on
+//     the drive that could finally be answered. (The stall probe cannot save
+//     THIS pump either: the cursor moved since the previous pump — the two
+//     bodies that did arrive applied — so m_next != m_last_pump_next and the
+//     probe stays disarmed. On the real node its later re-asks died down the
+//     same dead route anyway, silently, forever.)
+//
+//   fixed: the seam refused the withheld ask, so the ledger never counted
+//     it; the SAME pump's window starts AT the hole (from = ledger+1 = the
+//     withheld height), the re-ask reaches the healed wire, the body lands,
+//     the follower folds through the tip, publishes through the real leg-4
+//     event, and the maintainer's mn-needs-reseed latch clears.
+//
+// BOUND: ONE pump after the tip advance — the ordinary drive that already
+// runs — plus the deliveries it earns. No stall-probe wait (~2.5 min on
+// mainnet per pump), no new mechanism.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashMnCheckpointReseed,
+     AWithheldTipBodyIsReAskedWithinOnePumpOnceTheTipPassesTheReseedCursor)
+{
+    ReseedRig r(/*wire_the_reseed_seam=*/true);
+
+    // ── Stage 0: cold start -> bridge -> published -> populated ───────────
+    r.h.lane.arm(r.anchor);
+    r.h.lane.pump();
+    ASSERT_EQ(r.h.lane.state(), MnCheckpointLane::State::Published)
+        << r.h.lane.status();
+    r.fire_tip();
+    ASSERT_TRUE(r.state.populated());
+    ASSERT_FALSE(r.state.mn_needs_reseed());
+
+    // The body the ADVANCED tip will need: rank the post-1519546 payment
+    // queue with the machine's OWN comparator and pay its head at 1519547 —
+    // computed, not guessed (same construction as the withheld-tip test
+    // above, for the same reason: this test must not drift from the
+    // projection it has to satisfy).
+    std::vector<std::pair<uint256, MNState>> queue(r.anchor.entries.begin(),
+                                                   r.anchor.entries.end());
+    auto set_paid = [&queue](const char* protx, uint32_t paid_at) {
+        for (auto& e : queue)
+            if (e.first == uint256S(protx)) {
+                e.second.nLastPaidHeight = paid_at;
+                return true;
+            }
+        return false;
+    };
+    ASSERT_TRUE(set_paid("dc2e02ac95ce4ccc9843c38de7bdaf32f2a1d5966c05412"
+                         "7a3f4ca4f4bbd5991", 1519544));
+    ASSERT_TRUE(set_paid("9b653e767b978c10346d938c08dc8c5acd03c495f9d913e"
+                         "6fc652bfcae11a348", 1519545));
+    ASSERT_TRUE(set_paid("91bbce94c34ebde0d099c0a2cb7635c0c31425ebabcec64"
+                         "4f4f1a0854bfa605d", 1519546));
+    const std::pair<uint256, MNState>* head = nullptr;
+    for (const auto& e : queue)
+        if (!head
+            || MnStateMachine::payee_order_before(
+                   MnStateMachine::payee_score(e.second), e.first,
+                   MnStateMachine::payee_score(head->second), head->first))
+            head = &e;
+    ASSERT_NE(head, nullptr);
+    r.h.blocks[1519547] = block_paying(head->second.scriptPayout.m_data);
+
+    // ── Stage 1: the RECORDING seam. `wire` holds every getdata a peer
+    // actually heard; asks for the tip body 1519546 are WITHHELD (die at the
+    // seam, `eaten` counts them) until the route heals. On master the false
+    // return is discarded — void seam — which is exactly the defect.
+    std::vector<uint32_t> wire;
+    size_t eaten = 0;
+    bool   route_dead_for_tip_body = true;
+    r.h.lane.set_request_block_fn(
+        [&wire, &eaten, &route_dead_for_tip_body](uint32_t hgt) {
+            if (hgt == 1519546u && route_dead_for_tip_body) {
+                ++eaten;            // composed, heard by NO peer — the drop
+                return false;
+            }
+            wire.push_back(hgt);
+            return true;
+        });
+    auto deliver = [&r](uint32_t hgt) {
+        r.h.lane.on_block_connected(r.h.blocks.at(hgt), hgt);
+    };
+    auto wire_count = [&wire](uint32_t hgt) {
+        return std::count(wire.begin(), wire.end(), hgt);
+    };
+
+    // ── Stage 2: the authoritative reseed; the tip-body ask is withheld ───
+    const auto gap = r.force_apply_gap();
+    ASSERT_TRUE(gap.gap_detected) << "the reseed trigger itself must fire";
+    ASSERT_EQ(r.outcomes.size(), 1u);
+    ASSERT_EQ(r.outcomes[0], MnCheckpointLane::RearmOutcome::Armed)
+        << r.h.lane.last_rearm_reason();
+    EXPECT_EQ(wire_count(1519544), 1);
+    EXPECT_EQ(wire_count(1519545), 1);
+    ASSERT_GE(eaten, 1u) << "the withhold was never exercised — no subject";
+    ASSERT_EQ(wire_count(1519546), 0)
+        << "nothing may have reached the wire for the withheld height yet";
+    // The peer answers what it was actually asked.
+    deliver(1519544);
+    deliver(1519545);
+    ASSERT_EQ(r.h.lane.state(), MnCheckpointLane::State::Bridging)
+        << r.h.lane.status();
+    ASSERT_EQ(r.h.lane.cursor_height(), 1519545u);
+    // The ledger must tell the truth of the wire: 1519545 is the last height
+    // any peer heard. Master says 1519546 here — the fire-and-forget claim
+    // this whole wedge grows from.
+    EXPECT_EQ(r.h.lane.requested_through(), 1519545u)
+        << "a withheld ask was counted as requested: every later window"
+           " computes from PAST the hole and the reseed tail wedges (#138)";
+    EXPECT_TRUE(r.state.mn_needs_reseed())
+        << "the latch holds until an authoritative publish clears it";
+
+    // ── Stage 3: the tip advances PAST the reseed cursor and the route
+    // heals with it. ONE ordinary pump — the drive that already runs on
+    // every tip change — must put the withheld height back on the wire.
+    r.h.tip                 = 1519547;
+    route_dead_for_tip_body = false;
+    r.h.lane.pump();
+    ASSERT_GE(wire_count(1519546), 1)
+        << "THE WEDGE (task #138 / #1225): the first pump after the tip"
+           " advance believed the request ledger, asked only h=1519547, and"
+           " issued NO getdata for the withheld tip body — the reseed sits"
+           " one body short forever while mn-needs-reseed holds the embedded"
+           " arm down";
+    EXPECT_GE(wire_count(1519547), 1)
+        << "the same window must also fetch the new height";
+
+    // ── Stage 4: the peer answers the re-asks; the bridge must complete and
+    // the latch must clear — no further pumps required beyond this drive's
+    // own deliveries (one defensive pump allowed for a follower re-pull).
+    deliver(1519546);
+    if (r.h.lane.state() == MnCheckpointLane::State::Bridging) {
+        if (wire_count(1519547) == 0) r.h.lane.pump();   // bounded: pump #2
+        deliver(1519547);
+    }
+    ASSERT_EQ(r.h.lane.state(), MnCheckpointLane::State::Published)
+        << "the reseed bridge must COMPLETE once the withheld body lands: "
+        << r.h.lane.status();
+    EXPECT_EQ(r.h.lane.cursor_height(), 1519547u);
+    EXPECT_FALSE(r.state.mn_needs_reseed())
+        << "the authoritative publish through the real leg-4 event must have"
+           " cleared the latch";
+    r.fire_tip();
+    EXPECT_TRUE(r.state.populated())
+        << "the embedded arm must come back up after the reseed lands";
+
+    // Bounded recovery, never a storm: 44+45 once each, 46 re-asked on the
+    // healed wire, 47 once — plus headroom for one defensive duplicate pass.
+    EXPECT_LE(wire.size() + eaten, 12u)
+        << "re-asking a withheld body must stay bounded";
 }

@@ -233,8 +233,12 @@ struct WatchdogRig
         lane.set_publish_fn(
             [](std::vector<std::pair<uint256, MNState>>, uint32_t) {});
         // The peer that goes quiet: getdata is recorded and never answered.
+        // (#138: returns true — the request DID reach the peer; it is the
+        // answer that never comes. A false return would model a request that
+        // died locally, which is a different defect with its own test in
+        // test_dash_mn_checkpoint.cpp.)
         lane.set_request_block_fn(
-            [this](uint32_t h) { requested_blocks.push_back(h); });
+            [this](uint32_t h) { requested_blocks.push_back(h); return true; });
         // The masternode-list request that never draws a reply — this is what
         // parks pump() before its own stall probe.
         lane.set_request_snapshot_fn(
