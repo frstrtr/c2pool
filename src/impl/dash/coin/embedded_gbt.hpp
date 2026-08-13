@@ -32,6 +32,7 @@
 #include <impl/dash/coin/sml_projection.hpp>    // confirmedHash rollover pass + collateral-spend predicate
 #include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/asset_lock_fold.hpp>   // #107 phase 2: DIP-0027 type-8 credit-pool fold
+#include <impl/dash/coin/asset_unlock_admission.hpp>  // #143 Variant B: verified type-9 set (light bridge struct)
 #include <impl/dash/coin/subsidy.hpp>
 #include <impl/dash/coin/governance_object.hpp>   // SuperblockPayment (daemonless superblock outputs)
 #include <impl/dash/coin/utxo_adapter.hpp>
@@ -503,7 +504,28 @@ inline DashWorkData build_embedded_workdata(
     // --embedded-serve-mempool-txs, itself blocked on #125). Committing the
     // accrual with a coinbase-only body would be a bad-cbtx-assetlocked-amount
     // REJECTED block — see the PR body B1.
-    bool accrue_pending_asset_locks = false)
+    bool accrue_pending_asset_locks = false,
+    // ── Variant B (#143) seam: VERIFIED TYPE-9 ASSET UNLOCKS ──────────────
+    // --embedded-accrue-asset-unlocks (default OFF). The SINGLE template-side
+    // call site of the CreditPool INDEX follower: nullptr or empty (the
+    // default, and the ONLY possible value while the flag is OFF or any
+    // fail-closed conjunct fails) means EXCLUDE-ALL — byte-identical to
+    // today's template. When non-empty, every tx here already passed the
+    // follower's full predicate (proven-complete index, fresh at THIS
+    // template's parent, index ∉ CRangesSet, era-correct LimitAmount,
+    // expiry window, quorumSig BLS-verified — credit_pool_idx.hpp
+    // try_admit_unlocks), and three values thread through:
+    //   * txs ride the body right after the pinned local txs (byte-budgeted
+    //     like them, BEFORE mempool selection gets the remainder);
+    //   * total_payload_fees joins total_fees (dashd GetAssetUnlockFee: the
+    //     unlock fee is ordinary miner fee), so block_value stays exact and
+    //     the coinbase-split FORMULA is untouched (reward_path_note);
+    //   * gross_unlocked (Σ vout + fee) is SUBTRACTED from the committed
+    //     creditPoolBalance — exactly dashd's GetTotalLocked sessionUnlocked
+    //     term (creditpool.h:98-100) — so the validator's re-derivation from
+    //     the block's OWN txs matches (specialtxman.cpp bad-cbtx-assetlocked-
+    //     amount otherwise).
+    const AssetUnlockAdmission* admitted_asset_unlocks = nullptr)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
@@ -560,6 +582,13 @@ inline DashWorkData build_embedded_workdata(
     }
     if (pinned_local_txs != nullptr) {
         for (const auto& t : *pinned_local_txs)
+            reserved_bytes += ::pack(t).get_span().size();
+    }
+    // #143: admitted type-9 unlocks are byte-budgeted like the pins —
+    // BEFORE selection gets the remainder (a budget discovered after the
+    // fact is not a budget). nullptr/empty (flag OFF / fail-closed) adds 0.
+    if (admitted_asset_unlocks != nullptr) {
+        for (const auto& t : admitted_asset_unlocks->txs)
             reserved_bytes += ::pack(t).get_span().size();
     }
     // Selection gets what is left. If the required set alone has eaten the
@@ -627,6 +656,13 @@ inline DashWorkData build_embedded_workdata(
         }
         selected.resize(kept);
     }
+    // #143: the admitted unlocks' payload fees are ordinary miner fees (dashd
+    // GetAssetUnlockFee, assetlocktx.cpp:200-212 — the fee reaches the miner
+    // through the coinbase). Folded into total_fees BEFORE block_value below,
+    // so every downstream value (block_value, mn_payment) is exact through
+    // the EXISTING formulas — no new branch in the split math.
+    if (admitted_asset_unlocks != nullptr)
+        total_fees += static_cast<uint64_t>(admitted_asset_unlocks->total_payload_fees);
     // ── CANDIDATE-SET RECORDING (observe-without-arming) ────────────────
     // When the body is deliberately coinbase-only, run the SAME selection the
     // serving path would run and record only its identities and fees. Nothing
@@ -735,6 +771,34 @@ inline DashWorkData build_embedded_workdata(
     // committed merkleRootMNList exactly like a selected one.
     if (pinned_local_txs != nullptr && !pinned_local_txs->empty())
         splice_pinned_txs(w, *pinned_local_txs, mempool, mnstates, "GBT-EMB");
+    // ── #143 VERIFIED TYPE-9 UNLOCKS — after the consensus-required type-6
+    // set and the pins, BEFORE the mempool-sourced range below (they are not
+    // testmempoolaccept-probe material: special txs with no vin). Every tx
+    // here already passed the follower's full fail-closed predicate; this
+    // site only PLACES them. nullptr/empty = today's template, byte-identical.
+    if (admitted_asset_unlocks != nullptr) {
+        for (const auto& utx : admitted_asset_unlocks->txs) {
+            w.m_txs.emplace_back(utx);
+            w.m_tx_hashes.push_back(dash::coin::dash_txid(utx));
+            // The unlock's miner fee is carried in its payload, not derivable
+            // from vin (it has none) — record it so per-tx fee accounting sums
+            // to the total_fees fold above.
+            vendor::CAssetUnlockPayload upl;
+            const uint64_t ufee =
+                vendor::parse_assetunlock_payload(utx.extra_payload, upl)
+                    ? upl.fee : 0;
+            w.m_tx_fees.push_back(ufee);
+            w.m_tx_data_hex.push_back(tx_hex(utx));
+        }
+        if (!admitted_asset_unlocks->txs.empty()) {
+            LOG_INFO << "[GBT-EMB] #143 type-9 unlocks in template h="
+                     << w.m_height << ": " << admitted_asset_unlocks->txs.size()
+                     << " tx, gross_unlocked="
+                     << admitted_asset_unlocks->gross_unlocked
+                     << " payload_fees="
+                     << admitted_asset_unlocks->total_payload_fees;
+        }
+    }
     uint64_t selected_bytes = 0;  // wire bytes packed into this template (underfill guard)
     // ── THE MEMPOOL-SOURCED RANGE (validity-gate probe set) ─────────────
     // Everything appended from here on is mempool-sourced; the type-6
@@ -960,8 +1024,18 @@ inline DashWorkData build_embedded_workdata(
                             " same txs ride the served body -- #125/tx-serving)";
             }
         }
+        // #143: the admitted unlocks' GROSS amount (Σ vout + fee) LEAVES the
+        // pool — dashd's sessionUnlocked term in GetTotalLocked
+        // (creditpool.h:98-100). The validator re-derives this from the
+        // block's OWN type-9 txs (which ride this template's body above), so
+        // committing the deduction is what MAKES the block valid; nullptr /
+        // empty deducts 0 and the accrual is byte-identical to today.
+        const int64_t asset_unlock_deduction =
+            admitted_asset_unlocks != nullptr
+                ? admitted_asset_unlocks->gross_unlocked : 0;
         const int64_t accrued_credit_pool =
-            last_observed_credit_pool + platform_reward + asset_lock_accrual;
+            last_observed_credit_pool + platform_reward + asset_lock_accrual
+            - asset_unlock_deduction;
         // confirmedHash rollover (sml_projection.hpp, FINDING-1): the tip SML
         // is the verifier's PREV list, not the list for the block being
         // templated — dashd's rebuild starts with a purely height-driven
