@@ -1000,8 +1000,11 @@ public:
     /// entry immediately and keeps the outpoints excluded from template
     /// selection (Mempool::add_islock, incl. the documented residual race).
     /// FEED: the coin-P2P isdlock parse leg (dashd-peer relay, same source
-    /// invariant as on_mempool_tx); until that leg lands nothing calls this
-    /// in a live node and selection behaviour is unchanged (empty map).
+    /// invariant as on_mempool_tx): inv(MSG_ISDLOCK) → isdlock handler →
+    /// Node::new_islock → wire_islock_ingest → here. Also drives the IS
+    /// mining-safety hold's IsLocked short-circuit (mempool.hpp). On an
+    /// un-wired node (no coin-P2P) nothing calls this and selection
+    /// behaviour is unchanged (empty map, hold self-disarmed).
     void on_islock(const uint256& locked_txid,
                    const std::vector<std::pair<uint256, uint32_t>>& inputs) {
         m_state.mempool().add_islock(locked_txid, inputs);

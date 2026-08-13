@@ -1014,6 +1014,98 @@ TEST(DashMempoolAuditGaps, G4_IslockConflictEvictedAndNeverSelected)
            "tracking entry must be pruned";
 }
 
+// ── dashd TestPackageTransactions member-level surface (miner.cpp:374-391) ──
+
+TEST(DashMempoolAuditGaps, TPT_FinalityRecheckDropsNonFinalTx)
+{
+    // The reorg edge of the sole-ingestion-path invariant: a tx admitted as
+    // final can become NON-final when next_height regresses across a reorg
+    // while it stays pooled. dashd re-checks IsFinalTx(tx, nHeight, MTP(prev))
+    // at selection (TestPackageTransactions, miner.cpp:377) — so must we.
+    UTXOViewCache utxo(nullptr);
+    uint256 prev = mint_hash(700);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, {}, 1, false));
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    auto tx = make_spend(prev, 0, 90'000, /*salt=*/0);
+    tx.locktime = 5'000;            // height-locked (below LOCKTIME_THRESHOLD)
+    tx.vin[0].sequence = 0;         // nLockTime ENFORCED (not SEQUENCE_FINAL)
+    ASSERT_TRUE(mp.add_tx(tx));
+
+    // next_height == locktime: IsFinalTx needs locktime < nHeight → NOT final.
+    EXPECT_TRUE(mp.get_sorted_txs_with_fees(1u << 20, false,
+                    /*next_height=*/5'000,
+                    /*lock_time_cutoff=*/1'700'000'000).first.empty())
+        << "TPT: a height-locked tx at next_height == locktime is non-final "
+           "and must be dropped at selection (post-reorg template validity)";
+    // One block later it is final again.
+    EXPECT_EQ(mp.get_sorted_txs_with_fees(1u << 20, false,
+                  /*next_height=*/5'001,
+                  /*lock_time_cutoff=*/1'700'000'000).first.size(), 1u);
+    // SEQUENCE_FINAL on every vin disables nLockTime (dashd IsFinalTx tail).
+    auto tx2 = make_spend(prev, 0, 89'000, /*salt=*/1);
+    tx2.locktime = 5'000;           // sequence stays 0xffffffff from the helper
+    Mempool mp2;
+    mp2.set_utxo(&utxo);
+    ASSERT_TRUE(mp2.add_tx(tx2));
+    EXPECT_EQ(mp2.get_sorted_txs_with_fees(1u << 20, false,
+                  /*next_height=*/5'000,
+                  /*lock_time_cutoff=*/1'700'000'000).first.size(), 1u)
+        << "TPT: SEQUENCE_FINAL vins disable nLockTime — final at any height";
+    // Legacy callers (lock_time_cutoff omitted) keep the pre-port shape.
+    EXPECT_EQ(mp.get_sorted_txs_with_fees(1u << 20, false,
+                  /*next_height=*/5'000).first.size(), 1u)
+        << "TPT: cutoff==0 must skip the re-check (sole-ingestion-path N-A)";
+}
+
+TEST(DashMempoolAuditGaps, TPT_InstantSendMiningHold)
+{
+    // dashd IsTxSafeForMining (WAIT_FOR_ISLOCK_TIMEOUT): armed with spork2+
+    // spork3 and a LIVE isdlock feed, a vin-carrying tx with NO known islock,
+    // first seen under 10 minutes, is REFUSED; its own islock lifts the hold
+    // immediately (IsLocked short-circuit).
+    UTXOViewCache utxo(nullptr);
+    uint256 prev = mint_hash(710);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, {}, 1, false));
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    auto tx = make_spend(prev, 0, 90'000, /*salt=*/711);
+    ASSERT_TRUE(mp.add_tx(tx));
+
+    // Unarmed (spork gate off): pre-hold behaviour — included immediately.
+    EXPECT_EQ(mp.get_sorted_txs_with_fees(1u << 20).first.size(), 1u);
+
+    // Armed but feed NEVER seen: the liveness gate keeps the hold DISARMED
+    // (a dark isdlock leg must not hold every young tx for 10 minutes).
+    mp.set_instantsend_mining_hold(true);
+    EXPECT_EQ(mp.get_sorted_txs_with_fees(1u << 20).first.size(), 1u)
+        << "hold must self-disarm while the isdlock feed has never ticked";
+
+    // Armed + LIVE feed (an unrelated islock ticks liveness): the young
+    // un-islocked vin-carrying tx is HELD.
+    mp.add_islock(mint_hash(712), {{mint_hash(713), 0}});
+    EXPECT_TRUE(mp.get_sorted_txs_with_fees(1u << 20).first.empty())
+        << "TPT: young tx with vins and no islock must be held 10 minutes";
+
+    // Its own islock arrives: safe to mine immediately.
+    mp.add_islock(dash_txid(tx), {{prev, 0}});
+    EXPECT_EQ(mp.get_sorted_txs_with_fees(1u << 20).first.size(), 1u)
+        << "TPT: a KNOWN islock lifts the hold (dashd IsLocked short-circuit)";
+
+    // vin-less members (type-9 asset unlocks) are exempt — dashd checks
+    // !GetTx().vin.empty() (miner.cpp:386). A vin-less tx has no UTXO inputs,
+    // so give it an explicit zero fee via the empty shape used elsewhere.
+    auto bare = make_empty(714);
+    Mempool mp3;
+    mp3.set_utxo(&utxo);
+    mp3.set_block_min_tx_fee(0);
+    ASSERT_TRUE(mp3.add_tx(bare));
+    mp3.set_instantsend_mining_hold(true);
+    mp3.add_islock(mint_hash(715), {{mint_hash(716), 0}});   // live feed
+    EXPECT_EQ(mp3.get_sorted_txs_with_fees(1u << 20).first.size(), 1u)
+        << "TPT: vin-less txs are exempt from the mining-safety hold";
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // D1/D2/D3 — dashd BlockAssembler::addPackageTxs SELECTION-FIDELITY parity KATs
 // ════════════════════════════════════════════════════════════════════════════
@@ -1188,7 +1280,9 @@ TEST(DashMempoolSelectionFidelity, K3_D2_MapModifiedRescoreNearCap)
     auto szC1 = mp.get_entry(dash_txid(C1))->base_size;
     auto szC2 = mp.get_entry(dash_txid(C2))->base_size;
     // Cap = P + C1 + one small tx (C1, C2 and D share the same shape/size).
-    uint32_t cap = szP + szC1 + szC2;
+    // +1 because the byte cap now fails AT the cap (dashd TestPackage
+    // miner.cpp:361 `>=`): an exactly-full block needs max_bytes = size + 1.
+    uint32_t cap = szP + szC1 + szC2 + 1;
 
     auto got = sel_set(mp, cap);
     // dashd admits D (ancestor-score 22.2 outranks the {P,Ci} packages at 13.9)

@@ -680,6 +680,10 @@ private:
     // ID from dashd chainparams; overridable only by the test seam below.
     SporkState m_spork_state;
     std::array<uint8_t, 20> m_spork_pubkey_id{MAINNET_SPORK_PUBKEY_ID};
+    // IS/CL mining-safety hold seam (set_spork_change_callback): fired on the
+    // io thread whenever a verified spork applies, so the hold's spork2+spork3
+    // arm-bit is recomputed on the SAME thread that owns m_spork_state.
+    std::function<void()> m_spork_change_cb;
 
     // ── Lost-body watchdog state (see BODY_REREQUEST_* above) ────────────
     // One slot per tracked outstanding getdata(block); disarmed by the block
@@ -842,6 +846,18 @@ public:
         m_max_peers = std::clamp<std::size_t>(n, 1, POOL_PEERS_HARD_CAP);
     }
     std::size_t max_peers() const { return m_max_peers; }
+
+    /// IS/CL mining-safety hold seam: invoked on the io thread after every
+    /// VERIFIED spork APPLIES to SporkState (never for stale/bad-signature
+    /// messages). main_dash uses it to recompute the spork2+spork3 conjunction
+    /// and push the result into the mempool's hold arm-bit (an atomic), so the
+    /// hold tracks live spork flips exactly as dashd's TestPackageTransactions
+    /// does (IsInstantSendEnabled / RejectConflictingBlocks). Set once at
+    /// wiring time, before the io loop runs; optional (unset = no-op).
+    void set_spork_change_callback(std::function<void()> cb)
+    {
+        m_spork_change_cb = std::move(cb);
+    }
 
     /// Dial the given targets with automatic reconnection (30s interval,
     /// round-robin over the target list on each retry).
@@ -2501,6 +2517,37 @@ private:
         }
     }
 
+    ADD_P2P_HANDLER(isdlock)
+    {
+        // DIP-0010 InstantSend lock — the G4 conflict-tx-lock guard's feed and
+        // the IS mining-safety hold's IsLocked short-circuit. Reached via the
+        // inv(MSG_ISDLOCK=31)→getdata leg (inv_type_is_pulled). The BLS sig is
+        // NOT verified in this slice; consumers are restricted to the
+        // fee-only-safe directions — see the trust-posture note on
+        // message_isdlock (p2p_messages.hpp). Version-gate defensively: dashd
+        // CURRENT_VERSION==1 (deterministic islock); anything else is a layout
+        // we have not pinned, so drop it rather than mis-map outpoints.
+        if (msg->m_version != 1) {
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] isdlock DROPPED"
+                            << " cause=unknown-version v="
+                            << static_cast<int>(msg->m_version);
+            return;
+        }
+        ::dash::interfaces::Node::IslockSeen ev;
+        ev.txid = msg->m_txid;
+        ev.inputs.reserve(msg->m_inputs.size());
+        for (const auto& in : msg->m_inputs)
+            ev.inputs.emplace_back(in.hash, in.index);
+        // DEBUG, not INFO: mainnet forms an islock for most transactions, so
+        // this is tx-relay-cadence traffic (the mempool's own counters are the
+        // observability surface).
+        LOG_DEBUG_COIND << "[" << m_chain_label << "] isdlock from "
+                        << (m_active ? m_active->key : std::string("?"))
+                        << ": txid=" << msg->m_txid.GetHex().substr(0, 16)
+                        << " inputs=" << msg->m_inputs.size();
+        m_coin->new_islock.happened(ev);
+    }
+
     ADD_P2P_HANDLER(qfcommit)
     {
         // E1 Phase-L sourcing leg: a peer-relayed DKG final commitment — the
@@ -2677,6 +2724,9 @@ private:
                      << m_spork_state.active_count(now_sec()) << "/"
                      << m_spork_state.known_count() << ", listener-refined "
                      << m_spork_state.listener_refined_count();
+            // A spork actually CHANGED state: let the IS mining-safety hold
+            // re-derive its spork2+spork3 arm-bit (same thread as the map).
+            if (m_spork_change_cb) m_spork_change_cb();
             break;
         case SporkIngest::Stale:
             LOG_DEBUG_COIND << "[SPORK] " << spork_name(id) << " id=" << id

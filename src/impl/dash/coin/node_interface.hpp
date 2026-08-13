@@ -163,6 +163,21 @@ struct Node
     // (dkg_commitments.hpp): structural admission now, BLS verification
     // (Phase L) before any template inclusion.
     Event<coin::vendor::CFinalCommitment> new_qfcommit;
+
+    // G4 feed (conflict-tx-lock + IS mining-safety hold): fires when the
+    // coin-P2P client parses an `isdlock` (DIP-0010 InstantSend lock,
+    // inv MSG_ISDLOCK=31 → getdata). Carries the locked txid plus the locked
+    // outpoints, exactly what Mempool::add_islock consumes (via
+    // CoinStateMaintainer::on_islock — wire_islock_ingest subscribes). The
+    // BLS signature is deliberately NOT carried: it is unverified in this
+    // slice, so consumers are restricted to the fee-only-safe directions —
+    // see the trust-posture note on message_isdlock (p2p_messages.hpp).
+    struct IslockSeen {
+        uint256                                       txid;
+        std::vector<std::pair<uint256, uint32_t>>     inputs;   // locked outpoints
+    };
+    Event<IslockSeen> new_islock;
+
     // ── E-SUPERBLOCK: daemonless governance feed (govsync) ────────────────
     // Reception path: fires when the coin-P2P client parses a `govobj`
     // (MNGOVERNANCEOBJECT) message. Carries the object hash (dashcore

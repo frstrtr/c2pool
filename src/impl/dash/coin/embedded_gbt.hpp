@@ -541,7 +541,17 @@ inline DashWorkData build_embedded_workdata(
     // UPPER BOUND (every configured pin, before the admission gate runs); the
     // gate can only shrink it, so deducting the bound is conservative and can
     // never let the block exceed the cap.
-    constexpr uint32_t MAX_BLOCK_BYTES   = 1'990'000;  // leave headroom for cb
+    // DELIBERATE ~9 KB conservative divergence from dashd (audited, kept):
+    // dashd's effective ceiling is nBlockMaxSize = MaxBlockSize(2,000,000) -
+    // 1000 = 1,999,000 (miner.cpp:212) against a 1000-byte coinbase reserve —
+    // its coinbase pays ONE output. OURS pays the whole PPLNS window (dozens
+    // to hundreds of miner outputs, kilobytes), so the extra headroom is
+    // load-bearing against bad-blk-length on a won block (the block-2517855
+    // loss class). Cost: byte-parity with dashd can break ONLY when the
+    // mempool backlog fills blocks to within ~9 KB of the cap — set/merkle
+    // divergence in the consensus-safe (smaller) direction. Do NOT raise this
+    // to 1,999,000 without sizing the REAL coinbase into reserved_bytes.
+    constexpr uint32_t MAX_BLOCK_BYTES   = 1'990'000;
     constexpr uint32_t kCoinbaseReserve  = 1'000;      // dashd node/miner.cpp:115
     uint64_t reserved_bytes = kCoinbaseReserve;
     if (qc_commitments != nullptr) {
@@ -573,12 +583,19 @@ inline DashWorkData build_embedded_workdata(
     // vin spending a UTXO coinbase younger than 100 confs AT THIS HEIGHT is
     // refused (bad-txns-premature-spend-of-coinbase). Selection is also
     // topological (G1) and sigop-capped (G2) — see mempool.hpp.
+    // lock_time_cutoff=mtp_at_tip threads dashd's TestPackageTransactions
+    // finality re-check (IsFinalTx at nHeight/MTP(prev), miner.cpp:377) into
+    // selection — the reorg-edge closure of the bad-txns-nonfinal
+    // N-A-by-invariant row. The IS mining-safety hold (WAIT_FOR_ISLOCK_
+    // TIMEOUT) also runs inside selection; its arming is pushed separately
+    // (Mempool::set_instantsend_mining_hold + the isdlock feed liveness).
     auto [selected, total_fees] =
         suppress_mempool_txs
             ? std::pair<std::vector<Mempool::SelectedTx>, uint64_t>{{}, 0ull}
             : mempool.get_sorted_txs_with_fees(selection_budget,
                                                /*exclude_special=*/true,
-                                               /*next_height=*/w.m_height);
+                                               /*next_height=*/w.m_height,
+                                               /*lock_time_cutoff=*/mtp_at_tip);
     // MN-collateral spend filter (sml_projection.hpp, FINDING-2). The C-3
     // special-tx cut above is NOT sufficient: dashd's verifier removes a
     // masternode from the list when ANY block tx — special or not — spends
@@ -628,7 +645,8 @@ inline DashWorkData build_embedded_workdata(
             // served more than selection_budget even with serving enabled.
             mempool.get_sorted_txs_with_fees(selection_budget,
                                              /*exclude_special=*/true,
-                                             /*next_height=*/w.m_height);
+                                             /*next_height=*/w.m_height,
+                                             /*lock_time_cutoff=*/mtp_at_tip);
         (void)cand_fees;
         w.m_txset_candidates.reserve(cand.size());
         w.m_txset_candidate_fees.reserve(cand.size());
