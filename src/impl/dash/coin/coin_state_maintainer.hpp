@@ -538,6 +538,62 @@ public:
         // be papered over by a later clean incremental. Reject + keep prior state.
         const uint256 have_at = m_state.sml_current_hash();
         if (!diff.baseBlockHash.IsNull() && diff.baseBlockHash != have_at) {
+            // ── TARGET-ALREADY-HELD CARVE-OUT (reseed-wedge, soak-found) ──
+            // A getmnlistd(base=B, target=T) reply that lands AFTER the SML
+            // already advanced to T (a raced/duplicate reply: another diff
+            // won the advance first) has base != have_at but
+            // diff.blockHash == have_at. It is REDUNDANT, not
+            // out-of-sequence: the state it would produce is the state we
+            // already hold, so continuity is not at risk. Rejecting it as a
+            // base-continuity violation was wrong in exactly one costly way:
+            // the reject swallowed the very advance the payee-desync reseed
+            // latch (m_mn_needs_reseed, set on the wipe below) was waiting
+            // on, and the latch then stayed latched forever — the wedge log
+            // showed have_mn=0 mn_entries=0 with the SML advanced, serving
+            // nothing until a restart.
+            //
+            // DISJOINT from a genuinely out-of-sequence diff by
+            // construction: that one has BOTH base != have_at AND
+            // target != have_at, and still takes the reject below UNCHANGED
+            // (pinned by OutOfSequenceDiffStillRejectedAndKeepsLatch).
+            //
+            // Do NOT apply the diff — we are already at its target; the diff
+            // is evidence of currency, not of change. Clearing the latch
+            // alone cannot restore serving here (the desync wipe emptied the
+            // payee queue, and m_have_mn re-arms only off a NON-EMPTY
+            // authoritative snapshot), so also RE-DRIVE the existing
+            // authoritative re-seed transport (m_on_mn_reseed — the same ask
+            // the wipe itself fired): its daemonless answers gate on the SML
+            // being current, which this very diff has just proven, so an ask
+            // that was refused mid-advance can succeed now. Bounded: fires
+            // only while latched, i.e. once per wedge episode. Reward-safe
+            // either way: main_dash runs require_seeded_mn=true, so with the
+            // queue empty and m_mn_snapshot_height==0 MN-readiness stays
+            // DOWN until the authoritative on_mn_list_update lands — the
+            // carve-out unwedges the latch, it cannot mint a guessed payee.
+            if (diff.blockHash == have_at) {
+                if (m_mn_needs_reseed) {
+                    m_mn_needs_reseed = false;
+                    m_state.set_mn_needs_reseed(false);
+                    LOG_INFO << "[SML] diff target already held ..."
+                             << discriminating_hash_tail(diff.blockHash)
+                             << " (base ..."
+                             << discriminating_hash_tail(diff.baseBlockHash)
+                             << " raced the SML advance) — redundant no-op,"
+                                " NOT out-of-sequence; reseed latch cleared,"
+                                " re-driving the authoritative payee re-seed"
+                                " (the queue is still empty until it lands)";
+                    if (m_on_mn_reseed) m_on_mn_reseed();
+                } else {
+                    LOG_INFO << "[SML] diff target already held ..."
+                             << discriminating_hash_tail(diff.blockHash)
+                             << " (base ..."
+                             << discriminating_hash_tail(diff.baseBlockHash)
+                             << ") — redundant no-op (raced/duplicate reply);"
+                                " state unchanged";
+                }
+                return;
+            }
             // Discriminating TAILs: these two hashes are compared for
             // INEQUALITY, so rendering the difficulty padding they share made
             // the line unable to show the very difference it reports.

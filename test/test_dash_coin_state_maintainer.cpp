@@ -786,6 +786,141 @@ TEST(DashCoinStateMaintainer, MnlistdiffBaseContinuityRejectsMismatchedBase) {
     EXPECT_EQ(st.sml().size(), 3u);
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// RESEED-WEDGE KAT (daemonless soak wedge): a getmnlistd(base=B, target=T)
+// reply that lands AFTER the SML already advanced to T is REDUNDANT (target
+// already held), NOT out-of-sequence — have_at == T == diff.blockHash while
+// baseBlockHash == B != have_at. PRE-FIX the H-7 base-continuity guard
+// rejected it, and the payee-desync reseed latch (m_mn_needs_reseed), which
+// was waiting on exactly that advance, stayed latched forever: the node
+// served nothing (wedge log: have_mn=0 mn_entries=0, sml advanced).
+//
+// The fix must (a) NOT apply the redundant diff (we are already at its
+// target), (b) clear the latch, and (c) RE-DRIVE the existing authoritative
+// payee re-seed ask (m_on_mn_reseed): clearing the flag alone cannot restore
+// serving because the desync wipe emptied the payee queue and m_have_mn only
+// re-arms off a NON-EMPTY authoritative snapshot. Serving is then proven to
+// actually recover once that snapshot lands.
+// ════════════════════════════════════════════════════════════════════════
+TEST(DashCoinStateMaintainer, TargetAlreadyHeldDiffIsNoOpAndClearsReseedLatch) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    int reseed_asks = 0;
+    m.set_on_mn_reseed([&]() { ++reseed_asks; });
+
+    // SML current at A (cold full snapshot, height-paired via the cbTx seed).
+    m.on_mnlistdiff(diff_with_seed(uint256::ZERO, raw256(0xA0), H - 1,
+                                   1'000'000, sml_entry(0x40)));
+    ASSERT_TRUE(st.have_sml());
+    ASSERT_EQ(st.sml_current_hash(), raw256(0xA0));
+    const size_t sml_before = st.sml().size();
+
+    // Payee queue + tip -> the embedded arm serves.
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)), H - 1);
+    m.on_new_tip(H - 1, PREV_HASH, BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER,
+                 CURTIME, VERSION);
+    ASSERT_TRUE(m.live());
+
+    // Payee DESYNC at H: coinbase pays a script that is NOT the projected
+    // MN's — the maintainer wipes the queue, latches, demotes, asks reseed.
+    BlockType blk;
+    blk.m_txs.push_back(make_spend(raw256(0x90), 0, 500000000, 1));
+    blk.m_txs[0].vout[0].scriptPubKey.m_data = p2pkh_script(0x77);
+    bind_block(blk);
+    auto r = m.on_block_connected(blk, H);
+    ASSERT_TRUE(r.payee_desync);
+    ASSERT_TRUE(m.mn_needs_reseed_latched());
+    ASSERT_TRUE(st.mn_needs_reseed());
+    ASSERT_EQ(st.mnstates().size(), 0u) << "the wipe empties the payee queue";
+    ASSERT_EQ(reseed_asks, 1);
+
+    // The raced reply: getmnlistd(base=B, target=A) landing after the SML
+    // already advanced to A. Target already held => redundant no-op.
+    m.on_mnlistdiff(diff_with_seed(raw256(0x90), raw256(0xA0), H - 1,
+                                   1'000'000, sml_entry(0x40)));
+
+    // RED ON MASTER: the base-continuity guard rejected the redundant diff
+    // and the latch stayed latched forever.
+    EXPECT_FALSE(m.mn_needs_reseed_latched())
+        << "a target-already-held diff is redundant, not out-of-sequence — "
+           "it must clear the reseed latch that was waiting on this advance";
+    EXPECT_FALSE(st.mn_needs_reseed());
+    EXPECT_EQ(reseed_asks, 2)
+        << "latch-clear alone cannot restore serving (the queue is EMPTY): "
+           "the redundant diff must re-drive the authoritative re-seed ask";
+
+    // No-op pins: the redundant diff must not have been APPLIED.
+    EXPECT_EQ(st.sml_current_hash(), raw256(0xA0));
+    EXPECT_EQ(st.sml().size(), sml_before);
+    EXPECT_EQ(st.mnstates().size(), 0u)
+        << "the SML diff itself must not repopulate the payee queue";
+
+    // SERVE-RESTORE, not just the flag: answer the re-driven ask with the
+    // authoritative snapshot — the arm must serve again.
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)), H);
+    ASSERT_TRUE(m.live())
+        << "after the authoritative re-seed lands, the embedded arm re-arms";
+    bool fb = false;
+    WorkSelection sel = st.select_work([&]() { fb = true; return DashWorkData{}; });
+    EXPECT_EQ(sel.source, WorkSource::Embedded);
+    EXPECT_FALSE(fb);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// CANNOT-WEAKEN PIN for the carve-out above: a genuinely OUT-OF-SEQUENCE
+// diff — base != have_at AND target != have_at — must still take the H-7
+// base-continuity reject UNCHANGED: no SML mutation, no currency advance,
+// the reseed latch STAYS latched and no re-seed ask is re-driven. The
+// carve-out condition (diff.blockHash == have_at) is disjoint from this
+// case by construction; this test keeps it that way.
+// ════════════════════════════════════════════════════════════════════════
+TEST(DashCoinStateMaintainer, OutOfSequenceDiffStillRejectedAndKeepsLatch) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    int reseed_asks = 0;
+    m.set_on_mn_reseed([&]() { ++reseed_asks; });
+
+    m.on_mnlistdiff(diff_with_seed(uint256::ZERO, raw256(0xA0), H - 1,
+                                   1'000'000, sml_entry(0x40)));
+    ASSERT_EQ(st.sml_current_hash(), raw256(0xA0));
+    const size_t sml_before = st.sml().size();
+
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)), H - 1);
+    m.on_new_tip(H - 1, PREV_HASH, BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER,
+                 CURTIME, VERSION);
+    ASSERT_TRUE(m.live());
+
+    BlockType blk;
+    blk.m_txs.push_back(make_spend(raw256(0x90), 0, 500000000, 1));
+    blk.m_txs[0].vout[0].scriptPubKey.m_data = p2pkh_script(0x77);
+    bind_block(blk);
+    auto r = m.on_block_connected(blk, H);
+    ASSERT_TRUE(r.payee_desync);
+    ASSERT_TRUE(m.mn_needs_reseed_latched());
+    ASSERT_EQ(reseed_asks, 1);
+
+    // Genuinely out-of-sequence: base 0x90 != have_at 0xA0 AND target
+    // 0xC0 != have_at. The reject must fire exactly as before the carve-out.
+    m.on_mnlistdiff(diff_with_seed(raw256(0x90), raw256(0xC0), H,
+                                   1'000'000, sml_entry(0x80)));
+
+    EXPECT_EQ(st.sml().size(), sml_before)
+        << "an out-of-sequence diff must not mutate the SML";
+    EXPECT_EQ(st.sml_current_hash(), raw256(0xA0))
+        << "the currency marker must not advance off an out-of-sequence diff";
+    EXPECT_TRUE(m.mn_needs_reseed_latched())
+        << "an out-of-sequence diff proves NOTHING about the awaited advance "
+           "— the reseed latch must stay latched";
+    EXPECT_TRUE(st.mn_needs_reseed());
+    EXPECT_EQ(reseed_asks, 1)
+        << "no re-seed re-drive off a rejected out-of-sequence diff";
+
+    bool fb = false;
+    WorkSelection sel = st.select_work([&]() { fb = true; return DashWorkData{}; });
+    EXPECT_EQ(sel.source, WorkSource::DashdFallback);
+    EXPECT_TRUE(fb) << "the arm stays demoted until an authoritative re-seed";
+}
+
 // A1 cursor-derived getmnlistd base: the tip-advance / handshake send paths
 // (main_dash.cpp:5107 / :5226) now derive the getmnlistd request base from
 // CoinStateMaintainer::sml_current_hash() — the block the SML is ACTUALLY
