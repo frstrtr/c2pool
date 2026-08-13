@@ -225,7 +225,11 @@ jobs:
         shell: bash          # pipefail: a failing ctest must fail the step
         run: |
           mkdir -p "${GITHUB_WORKSPACE}/ci-logs"
-          ctest --output-on-failure -j8 --exclude-regex "LiveTest\." 2>&1 | tee "${GITHUB_WORKSPACE}/ci-logs/run-tests.log"
+          # --no-tests=error: ctest itself fails a zero-test run (belt).
+          # --output-junit: emit the per-case report the floor guard reads.
+          ctest --output-on-failure --no-tests=error --output-junit "${GITHUB_WORKSPACE}/ci-logs/ctest-linux.xml" -j8 --exclude-regex "LiveTest\." 2>&1 | tee "${GITHUB_WORKSPACE}/ci-logs/run-tests.log"
+          # Suspenders: reject a hollow green where the report has < floor cases.
+          bash "${GITHUB_WORKSPACE}/scripts/ci/test_floor_guard.sh" linux "${GITHUB_WORKSPACE}/ci-logs/ctest-linux.xml"
 
       - name: Package release
         if: startsWith(github.ref, 'refs/tags/v')
