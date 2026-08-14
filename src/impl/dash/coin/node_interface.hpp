@@ -156,6 +156,26 @@ struct Node
     };
     Event<ChainLockSigEvent> new_chainlock_sig;
 
+    // G4 feed: a deterministic InstantSend lock (isdlock, DIP-0022) parsed off
+    // the coin-P2P wire. Carries everything the maintainer-side BLS gate needs:
+    // the locked outpoints, the txid they are locked TO, the DKG cycle-start
+    // block hash of the signing rotated quorum, and the 96-byte recovered
+    // threshold signature. NO trust decision is made in the P2P layer — the
+    // subscriber (CoinStateMaintainer::on_new_isdlock) is fail-closed: no
+    // verifier registered, or BLS verify fails, means the lock is dropped and
+    // Mempool::add_islock is never called. Only fired when
+    // --embedded-ingest-isdlock armed the pull (flag OFF => handler
+    // decode-and-discard => this event never fires).
+    struct IsdLockEvent {
+        uint8_t                                       version{0};
+        std::vector<std::pair<uint256, uint32_t>>     inputs;      // (txid, vout)
+        uint256                                       txid;
+        uint256                                       cycle_hash;
+        std::array<uint8_t, 96>                       sig{};
+        uint256                                       inv_hash;    // SerializeHash(payload), diag only
+    };
+    Event<IsdLockEvent> new_isdlock;
+
     // E1 Phase-L sourcing leg: a peer-relayed DKG final commitment off the
     // coin-P2P `qfcommit` stream (inv MSG_QUORUM_FINAL_COMMITMENT = 21) —
     // the exact stream dashd's own miner sources block-N's mandatory type-6

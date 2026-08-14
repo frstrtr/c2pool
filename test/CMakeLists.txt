@@ -644,6 +644,31 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_chainlock_verify PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_chainlock_verify "" AUTO)
 
+    # G4 isdlock intake (acquire -> BLS-verify -> use, all fail-closed):
+    #   * p2p::Handler REGISTRY membership gate (the DIP-24 qrinfo silent-drop
+    #     failure mode; a de-registered isdlock fails RED here, not at DEBUG
+    #     in production);
+    #   * wire-codec KAT against hand-assembled dashd InstantSendLock bytes;
+    #   * requestId KAT vs an INDEPENDENT digest + the ROTATED
+    #     SelectQuorumForSigning arm (llmq_60_75) incl. upstream's shift quirk;
+    #   * the G4 red/green: a VERIFIED isdlock through the REAL maintainer
+    #     path excludes a conflicting tx from the selected template and keeps
+    #     a non-conflicting one; no verifier / refusing verifier => no change;
+    #   * BLS-gated (C2POOL_DASH_BLS): real threshold sig verifies end-to-end,
+    #     every tampered bit is rejected and never reaches add_islock.
+    add_executable(test_dash_isdlock test_dash_isdlock.cpp)
+    target_link_libraries(test_dash_isdlock PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_block_replay   # full p2p Handler instantiation (registry gate)
+                            # ODR-uses CBlockHeaderAndShortTxIDs::
+                            # FillShortTxIDSelector(), same as test_dash_p2p_node
+        dash_bls_verify dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_isdlock PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_isdlock "" AUTO)
+
     # KNOWN COVERAGE GAP (surfaced by the top-level drift-guard, #883 follow-up):
     # the three targets below are gated behind C2POOL_DASH_BLS, but no workflow
     # in .github/workflows/ enables that flag yet, so they are never built or run
