@@ -1029,17 +1029,22 @@ jobs:
             PIN="$(sed -nE "s/.*chrome: *.([0-9.]+).*/\\1/p" node_modules/puppeteer-core/lib/puppeteer/revisions.js | head -1)"
             test -n "$PIN" || { echo "could not read pinned Chrome revision from puppeteer-core"; exit 1; }
             echo "puppeteer-core pins Chrome-for-Testing $PIN"
-            CHROME_BIN="$(ls -1 "$HOME"/.cache/puppeteer/chrome/*"$PIN"/chrome-linux64/chrome 2>/dev/null | tail -1 || true)"
+            CHROME_BIN="$(ls -1 "$HOME"/.cache/puppeteer/chrome/*"$PIN"/chrome-linux64/chrome ./chrome/*"$PIN"/chrome-linux64/chrome 2>/dev/null | tail -1 || true)"
             if [ ! -x "$CHROME_BIN" ]; then
               # Partial-cache guard: an interrupted prior download can leave
               # the versioned dir present with NO chrome-linux64/chrome binary.
               # @puppeteer/browsers treats "dir exists" as installed and refuses
               # to re-fetch, so every retry short-circuits to the same broken
               # path and the gate false-reds (linux-151.0.7922.77 on
-              # actions-runner-8, run 31607961557). Purge any incomplete dir for
-              # this PIN before AND between fetch attempts so the download re-runs.
+              # actions-runner-8, run 31607961557). The install runs with no
+              # --path from working-directory web-static/sharechain-explorer, so
+              # the versioned dir lands under CWD ./chrome/*"$PIN", NOT only
+              # ~/.cache/puppeteer (the corrupt dir on actions-runner-2, run
+              # 31685136400, was ./chrome/linux-151.0.7922.77). Purge BOTH roots
+              # for this PIN before AND between fetch attempts so the download
+              # re-runs regardless of which layout holds the stale dir.
               purge_partial() {
-                for d in "$HOME"/.cache/puppeteer/chrome/*"$PIN"; do
+                for d in "$HOME"/.cache/puppeteer/chrome/*"$PIN" ./chrome/*"$PIN"; do
                   [ -d "$d" ] && [ ! -x "$d/chrome-linux64/chrome" ] && rm -rf "$d"
                 done
                 return 0
