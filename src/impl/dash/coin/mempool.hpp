@@ -307,6 +307,28 @@ public:
     }
     bool has_external_coin_lookup() const { return static_cast<bool>(m_external_coin_lookup); }
 
+    /// THIRD SOURCE for FEE PRICING + selection vin resolution (W5-A) — the
+    /// graduated full-history UTXO fold (fold_fee_source.hpp). DELIBERATELY a
+    /// separate slot from m_external_coin_lookup above: that slot is the
+    /// dashd-RPC arm feeding ONLY pinned_tx_admissible, and routing the whole
+    /// mempool's fee pricing through it would be an unflagged production
+    /// behaviour change on every node with a pin armed. This slot is
+    /// consulted ONLY when (a) the forward-built UTXOViewCache misses AND
+    /// (b) the in-pool CPFP parent misses — i.e. precisely the "coin older
+    /// than the replay horizon" class — and the installed fn (FoldFeeSource::
+    /// lookup) itself answers nothing until the fold has GRADUATED
+    /// (hash_serialized_2 byte-equal to dashd at the pinned anchor) and is
+    /// live at the tip. Unset (every configuration without
+    /// --embedded-utxo-fold-fees) = byte-identical behaviour.
+    /// Set once at wiring time, before any template build, never mutated
+    /// afterwards (same discipline as m_external_coin_lookup).
+    void set_fee_coin_lookup(
+        std::function<bool(const ::core::coin::Outpoint&, ::core::coin::Coin&)> fn)
+    {
+        m_fee_coin_lookup = std::move(fn);
+    }
+    bool has_fee_coin_lookup() const { return static_cast<bool>(m_fee_coin_lookup); }
+
     PinnedTxGate pinned_tx_admissible(const MutableTransaction& tx,
                                       uint32_t next_height) const {
         // SIZE FIRST. It is the cheapest check and the only one whose failure
@@ -1116,8 +1138,22 @@ public:
                         ::core::coin::Outpoint op(vin.prevout.hash,
                                                   vin.prevout.index);
                         ::core::coin::Coin coin;
-                        if (!utxo->get_coin(op, coin)) {
-                            // Stale input: neither selected-parent nor UTXO.
+                        bool resolved = utxo->get_coin(op, coin);
+                        // FOLD THIRD SOURCE (W5-A): a tx whose fee the fold
+                        // priced spends a coin the forward view CANNOT hold —
+                        // without this arm the stale-input guard would drop
+                        // at selection exactly what pricing just admitted.
+                        // Same precedence as compute_fee_locked (view first);
+                        // the installed fn answers nothing until graduated +
+                        // live, so unset/ungraduated keeps this branch
+                        // byte-identical to the pre-W5 guard.
+                        if (!resolved && m_fee_coin_lookup) {
+                            resolved = m_fee_coin_lookup(op, coin)
+                                    && !coin.is_spent();
+                        }
+                        if (!resolved) {
+                            // Stale input: neither selected-parent, UTXO,
+                            // nor (graduated) fold.
                             ok = false;
                             break;
                         }
@@ -1285,6 +1321,13 @@ private:
     // path where m_utxo is already read lock-free.
     std::function<bool(const ::core::coin::Outpoint&, ::core::coin::Coin&)>
                                                       m_external_coin_lookup;
+    // Third-source coin lookup for fee pricing + selection vin resolution
+    // (W5-A graduated UTXO fold; see set_fee_coin_lookup). Same set-once
+    // discipline. Consulted under m_mutex; the installed fn takes its own
+    // mutex AFTER ours (lock order Mempool::m_mutex → FoldFeeSource::m_mutex,
+    // no cycle — the fold's feed path never calls into Mempool).
+    std::function<bool(const ::core::coin::Outpoint&, ::core::coin::Coin&)>
+                                                      m_fee_coin_lookup;
 
     /// G1: gather `txid` plus every UNSELECTED in-mempool ancestor into
     /// `out`, parents strictly before children (post-order DFS). `seen`
@@ -1583,6 +1626,24 @@ private:
                 in_sum += static_cast<uint64_t>(
                     pit->second.tx.vout[vin.prevout.index].value);
                 continue;
+            }
+            // FOLD THIRD SOURCE (W5-A): full-history UTXO fold, consulted
+            // ONLY on the double miss above — the "coin older than the
+            // replay horizon" class. Order is load-bearing: the forward
+            // UTXOViewCache is the only source that knows RECENT
+            // spends/creates and must win; in-pool parents cover the
+            // unconfirmed; the fold covers deep history. Coin value/height/
+            // coinbase are immutable facts, so a fold answer for a coin it
+            // holds is historically correct regardless of cursor lag; the
+            // installed fn (FoldFeeSource::lookup) additionally answers
+            // NOTHING until graduated + live (fail-toward-exclusion).
+            if (m_fee_coin_lookup) {
+                ::core::coin::Coin fold_coin;
+                if (m_fee_coin_lookup(op, fold_coin)
+                    && !fold_coin.is_spent()) {
+                    in_sum += static_cast<uint64_t>(fold_coin.value);
+                    continue;
+                }
             }
             entry.fee_known = false;
             entry.fee = 0;

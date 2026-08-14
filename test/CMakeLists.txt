@@ -558,7 +558,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     # genesis short-circuit), resumable cursor across reopen, versioned-format
     # fail-loud, 100-block undo window retention, disconnect/reconnect set-
     # hash identity. Same target, no new allowlist entry.
-    add_executable(test_dash_mempool test_dash_mempool.cpp test_dash_replay_utxo_fold.cpp)
+    # Third TU: test_dash_fold_fee_source.cpp — W5-A FoldFeeSource: the
+    # graduated fold as the mempool's THIRD coin source. Red/green pair
+    # (ungraduated-prices-nothing vs graduated-prices-and-selects), spent /
+    # immature-coinbase exclusion, gate-FAIL poison+disarm, tip-lag trust
+    # drop, graduation restore across reopen (operator restatement required),
+    # prev-hash linkage reorg tripwire. Same target, no new allowlist entry.
+    add_executable(test_dash_mempool test_dash_mempool.cpp test_dash_replay_utxo_fold.cpp test_dash_fold_fee_source.cpp)
     target_link_libraries(test_dash_mempool PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

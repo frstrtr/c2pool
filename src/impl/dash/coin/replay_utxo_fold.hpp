@@ -83,14 +83,28 @@
 // feed any serving decision (and nothing constructs this class outside the
 // --replay-utxo-* utility surface — the serve path is byte-identical).
 //
-// ── Persistence layout (format version 1, fail-loud on mismatch) ───────────
+// ── Persistence layout (format version 2, fail-loud on mismatch) ───────────
 //
-//   'V'            → uint32 LE format version (1)
+//   'V'            → uint32 LE format version (2)
 //   'B'            → cursor: best_hash(32) + best_height(4 LE) + undo_floor(4 LE)
 //   'C' + txid(32) + vout(4 LE) → serialized Coin (core::coin::serialize_coin)
 //   'U' + height(4 BE)          → serialized BlockUndo (last `undo_window` blocks)
 //   'H' + height(4 BE)          → block hash(32) (cursor restore on disconnect;
 //                                  same retention window as 'U')
+//   'G'            → GRADUATION record (W5-A): written ONLY by a PASSING
+//                    try_graduate() at the anchor cursor. Absence IS the
+//                    ungraduated state — a store whose cursor is past the
+//                    anchor with no 'G' record can NEVER graduate (re-fold,
+//                    or gate against a fresh operator-supplied anchor).
+//                    Layout: format u32 LE | anchor_height u32 LE |
+//                    anchor_block_hash(32) | expected_hash(32) |
+//                    measured_hash(32) | coins u64 LE | tx_groups u64 LE |
+//                    unix_time i64 LE.
+//
+// Version history: v1 = the pre-graduation layout (no 'G' key class; no
+// production store was ever built at v1 — the fold had no feeder until W5-A).
+// v2 adds 'G'. Any layout change bumps the version so an old binary fails
+// LOUD instead of silently misreading state.
 //
 // All per-block mutations accumulate in a write-back overlay and are
 // committed in ONE WriteBatch per flush (default every 2000 blocks) together
@@ -113,8 +127,10 @@
 #include <core/uint256.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <functional>
 #include <map>
 #include <memory>
@@ -138,8 +154,22 @@ static constexpr uint32_t REPLAY_UTXO_UNDO_WINDOW = 100;
 
 // On-disk format version ('V' key). Bump on ANY layout change so an old
 // binary fails LOUD instead of silently misreading state (standing versioned-
-// format trap, DASH_FULL_HISTORY_REPLAY_MODE.md §4.5).
-static constexpr uint32_t REPLAY_UTXO_FORMAT_VERSION = 1;
+// format trap, DASH_FULL_HISTORY_REPLAY_MODE.md §4.5). v2: 'G' graduation
+// record (W5-A) — see the layout table above.
+static constexpr uint32_t REPLAY_UTXO_FORMAT_VERSION = 2;
+
+// ── THE GRADUATION ANCHOR (W5-A reward-safety gate) ─────────────────────────
+// The live-mainnet anchor the fold must prove byte-equality against before
+// its answers may EVER price a mempool fee (see the module header's GATE
+// section): dashd `gettxoutsetinfo hash_serialized_2` at h=2,516,758.
+// KAT-injectable via ReplayUtxoFoldOptions so synthetic chains can gate at a
+// tiny anchor; production wiring (--embedded-utxo-fold-fees) keeps these
+// defaults and ADDITIONALLY requires the operator to restate the expected
+// hash on the command line (a stale/foreign DB must not graduate on its own
+// say-so).
+static constexpr uint32_t REPLAY_UTXO_GATE_ANCHOR_HEIGHT = 2'516'758;
+inline constexpr const char* REPLAY_UTXO_GATE_ANCHOR_EXPECT =
+    "3d14913768a9d492bfa7a42fe9b111cff625b80e35bb4133e1d60cf3991c2319";
 
 // ── dashd serialize.h primitives (exact transcriptions) ────────────────────
 
@@ -238,6 +268,30 @@ struct ReplayUtxoFoldOptions {
     uint32_t flush_interval = 2000;  // blocks per WriteBatch (≈ W2 work-ahead)
     size_t   write_buffer_size = 32 * 1024 * 1024;
     size_t   block_cache_size = 64 * 1024 * 1024;
+    // ── W5-A graduation gate (KAT-injectable; ships the live anchor) ──────
+    uint32_t    gate_anchor_height = REPLAY_UTXO_GATE_ANCHOR_HEIGHT;
+    std::string gate_anchor_expect = REPLAY_UTXO_GATE_ANCHOR_EXPECT;
+    // Prev-hash linkage check (W5-A live-feed safety): when true, a block at
+    // best+1 whose m_previous_block does not equal the cursor's best_hash is
+    // REFUSED — the structural tripwire that makes silently folding across a
+    // reorg (orphaned tip still in the set) impossible; the adapter disarms
+    // fee-pricing on that refusal. Default OFF so pre-existing synthetic-
+    // chain KATs (which use synthetic hashes, not linked headers) are byte-
+    // identical; FoldFeeSource always arms it.
+    bool check_prev_linkage = false;
+};
+
+/// The 'G' graduation record (see layout table). Only ever written by a
+/// PASSING gate; absence IS the ungraduated state.
+struct ReplayUtxoGraduation {
+    uint32_t format{0};
+    uint32_t anchor_height{0};
+    uint256  anchor_block_hash;   // the cursor's best_hash at the anchor
+    uint256  expected_hash;       // what the gate compared against
+    uint256  measured_hash;       // hash_serialized_2 actually measured (== expected)
+    uint64_t coins{0};
+    uint64_t tx_groups{0};
+    int64_t  unix_time{0};
 };
 
 struct ReplayUtxoSetHash {
@@ -316,6 +370,11 @@ public:
     uint32_t best_height() const { return m_best_height; }
     uint256  best_hash() const { return m_best_hash; }
     uint32_t undo_window() const { return m_opts.undo_window; }
+    uint32_t gate_anchor_height() const { return m_opts.gate_anchor_height; }
+    const std::string& gate_anchor_expect() const
+    {
+        return m_opts.gate_anchor_expect;
+    }
 
     /// Next height the fold expects. Empty store: 0 (genesis pin) — though
     /// delivering height 1 first is equally accepted (dashd never folds
@@ -332,6 +391,11 @@ public:
                          const BlockType& block)
     {
         if (!m_store) return refuse("replay-utxo-not-open");
+        // A failed graduation gate poisons the fold (W1 self-check idiom): a
+        // fold rule that diverged from dashd must not keep extending state.
+        if (m_poisoned)
+            return refuse("replay-utxo-poisoned (gate FAIL latched): " +
+                          m_poison_cause);
 
         // Idempotent redelivery (resume overlap): already folded, ack.
         if (m_have_cursor && height <= m_best_height)
@@ -341,6 +405,19 @@ public:
         if (m_have_cursor && height != m_best_height + 1)
             return refuse("replay-utxo-gap: got h=" + std::to_string(height) +
                           " want h=" + std::to_string(m_best_height + 1));
+
+        // W5-A prev-hash linkage (opt-in; see ReplayUtxoFoldOptions): the
+        // structural reorg tripwire. Folding new-chain h+1 on top of an
+        // ORPHANED h would silently corrupt coin state (a wrong value can
+        // OVERSTATE a fee → overstated coinbasevalue → invalid found block),
+        // so a broken link is refused and the adapter disarms fee-pricing.
+        if (m_opts.check_prev_linkage && m_have_cursor && m_best_height >= 1
+            && !(block.m_previous_block == m_best_hash))
+            return refuse("replay-utxo-prev-mismatch: h=" +
+                          std::to_string(height) + " prev=" +
+                          block.m_previous_block.GetHex().substr(0, 16) +
+                          " cursor=" + m_best_hash.GetHex().substr(0, 16) +
+                          " (reorg or mis-fed lane)");
         // Cold start must begin at the chain's origin — a mid-chain UTXO
         // fold can never reach the gate hash (unlike the DIP3-anchored MN
         // fold). Height 0 or 1 both establish the cursor correctly.
@@ -597,6 +674,105 @@ public:
         return out;
     }
 
+    // ── W5-A GRADUATION GATE ───────────────────────────────────────────────
+    // The single place fold state can ever EARN fee-pricing trust. Callable
+    // ONLY while the cursor stands exactly on the anchor height (hash_
+    // serialized_2 hashes the CURRENT set, so any other cursor is a category
+    // error, refused). PASS → the 'G' record is written (the durable proof a
+    // restart may restore trust from); FAIL → the fold is POISONED (latched:
+    // every further on_replay_block refuses) and NOTHING is written — absence
+    // of 'G' is the fail state. A crash between the pass and the 'G' put
+    // leaves an ungraduated store parked at the anchor; the adapter re-runs
+    // the gate at construction in that case (same verdict, pure re-measure).
+
+    bool poisoned() const { return m_poisoned; }
+
+    /// Read the stored graduation record ('G'). nullopt = never graduated.
+    std::optional<ReplayUtxoGraduation> graduation()
+    {
+        if (!m_store) return std::nullopt;
+        std::vector<uint8_t> v;
+        if (!m_store->get(key_graduation(), v)) return std::nullopt;
+        if (v.size() != 4 + 4 + 32 + 32 + 32 + 8 + 8 + 8) {
+            refuse("replay-utxo-graduation-record-corrupt: " +
+                   std::to_string(v.size()) + " bytes");
+            return std::nullopt;
+        }
+        ReplayUtxoGraduation g;
+        size_t at = 0;
+        g.format        = le32_at(v, at); at += 4;
+        g.anchor_height = le32_at(v, at); at += 4;
+        std::memcpy(g.anchor_block_hash.data(), v.data() + at, 32); at += 32;
+        std::memcpy(g.expected_hash.data(),     v.data() + at, 32); at += 32;
+        std::memcpy(g.measured_hash.data(),     v.data() + at, 32); at += 32;
+        g.coins     = le64_at(v, at); at += 8;
+        g.tx_groups = le64_at(v, at); at += 8;
+        g.unix_time = static_cast<int64_t>(le64_at(v, at));
+        return g;
+    }
+
+    /// Run the gate at the anchor cursor. Returns true ONLY on a byte-equal
+    /// PASS (record written). Any failure is named via refusal(); a HASH
+    /// MISMATCH additionally poisons the fold.
+    bool try_graduate()
+    {
+        if (!m_store) return refuse("replay-utxo-not-open");
+        if (m_poisoned)
+            return refuse("replay-utxo-poisoned: " + m_poison_cause);
+        if (!m_have_cursor || m_best_height != m_opts.gate_anchor_height)
+            return refuse(
+                "replay-utxo-gate-wrong-cursor: h=" +
+                std::to_string(m_have_cursor ? m_best_height : 0) +
+                " anchor=" + std::to_string(m_opts.gate_anchor_height) +
+                " (hash_serialized_2 hashes the CURRENT set — verification"
+                " is only possible standing exactly on the anchor)");
+        std::string want_hex = m_opts.gate_anchor_expect;
+        for (auto& c : want_hex)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (want_hex.size() != 64)
+            return refuse("replay-utxo-gate-bad-expect-hex: '" +
+                          m_opts.gate_anchor_expect + "'");
+        auto measured = hash_serialized_2();   // flushes first
+        if (!measured) return false;           // refusal already named
+        if (measured->hash.GetHex() != want_hex) {
+            m_poisoned = true;
+            m_poison_cause = "gate-fail h=" +
+                std::to_string(m_opts.gate_anchor_height) +
+                " got=" + measured->hash.GetHex() +
+                " want=" + want_hex;
+            LOG_ERROR << "[REPLAY-UTXO] GATE FAIL h="
+                      << m_opts.gate_anchor_height
+                      << " got=" << measured->hash.GetHex()
+                      << " want=" << want_hex
+                      << " coins=" << measured->coins
+                      << " — fold POISONED (no further blocks accepted;"
+                         " nothing written; fee-pricing stays disarmed)";
+            return refuse("replay-utxo-" + m_poison_cause);
+        }
+        // PASS — write the durable record. expected == measured by
+        // definition on this (the only) writing path; both fields are kept
+        // so a reader can distinguish "what was demanded" from "what was
+        // seen" if the layout ever grows an operator-override arm.
+        std::vector<uint8_t> rec;
+        rec.reserve(4 + 4 + 32 + 32 + 32 + 8 + 8 + 8);
+        append_le32(rec, REPLAY_UTXO_FORMAT_VERSION);
+        append_le32(rec, m_opts.gate_anchor_height);
+        rec.insert(rec.end(), m_best_hash.data(), m_best_hash.data() + 32);
+        rec.insert(rec.end(), measured->hash.data(), measured->hash.data() + 32);
+        rec.insert(rec.end(), measured->hash.data(), measured->hash.data() + 32);
+        append_le64(rec, measured->coins);
+        append_le64(rec, measured->tx_groups);
+        append_le64(rec, static_cast<uint64_t>(std::time(nullptr)));
+        if (!m_store->put(key_graduation(), rec))
+            return refuse("replay-utxo-gate-record-write-failed");
+        LOG_INFO << "[REPLAY-UTXO] GATE PASS h=" << m_opts.gate_anchor_height
+                 << " hash=" << measured->hash.GetHex()
+                 << " coins=" << measured->coins
+                 << " tx_groups=" << measured->tx_groups
+                 << " — graduation record written";
+        return true;
+    }
+
 private:
     bool refuse(const std::string& why)
     {
@@ -710,6 +886,7 @@ private:
     }
     static std::string key_undo(uint32_t h) { return key_be32('U', h); }
     static std::string key_hash(uint32_t h) { return key_be32('H', h); }
+    static std::string key_graduation() { return std::string(1, 'G'); }
 
     static uint32_t le32(const std::vector<uint8_t>& v)
     {
@@ -726,6 +903,21 @@ private:
     {
         return uint32_t(v[at]) | (uint32_t(v[at + 1]) << 8) |
                (uint32_t(v[at + 2]) << 16) | (uint32_t(v[at + 3]) << 24);
+    }
+    static uint64_t le64_at(const std::vector<uint8_t>& v, size_t at)
+    {
+        return uint64_t(le32_at(v, at)) |
+               (uint64_t(le32_at(v, at + 4)) << 32);
+    }
+    static void append_le32(std::vector<uint8_t>& v, uint32_t x)
+    {
+        for (int i = 0; i < 4; ++i)
+            v.push_back(static_cast<uint8_t>((x >> (8 * i)) & 0xFF));
+    }
+    static void append_le64(std::vector<uint8_t>& v, uint64_t x)
+    {
+        for (int i = 0; i < 8; ++i)
+            v.push_back(static_cast<uint8_t>((x >> (8 * i)) & 0xFF));
     }
     static void put_le32(std::vector<uint8_t>& v, size_t at, uint32_t x)
     {
@@ -751,6 +943,10 @@ private:
     bool     m_have_cursor{false};
     uint32_t m_since_flush{0};
     std::string m_refusal;
+    // W5-A gate poison latch (in-memory: a restart re-measures; the DURABLE
+    // fail state is the absence of 'G' past the anchor).
+    bool        m_poisoned{false};
+    std::string m_poison_cause;
 };
 
 } // namespace replay
