@@ -686,6 +686,17 @@ private:
     // announces at most one isdlock per locked tx, orders of magnitude rarer
     // than MSG_TX, and the payload is bounded at decode (MAX_ISDLOCK_INPUTS).
     bool     m_isdlock_pull_enabled{false};
+    // DSTX (CoinJoin broadcast tx) lane (--embedded-ingest-dstx): OPT-IN,
+    // and — unlike isdlock — the GETDATA ITSELF is gated: a DSTX has no
+    // fee-only-safe unconditional consumer (its whole effect is putting a
+    // zero-fee tx INTO templates at top priority), so off-flag there is no
+    // reason to spend bandwidth. The pull rides the SAME budget/inflight
+    // machinery as MSG_TX (the DSTX inv hash IS the plain txid,
+    // net_processing.cpp:2567, so the txid-keyed slots are correct).
+    bool     m_dstx_pull_enabled{false};
+    uint64_t m_dstx_inv_seen{0};     // inv(MSG_DSTX) admitted by the dedup
+    uint64_t m_dstx_pull_sent{0};    // getdata(MSG_DSTX) issued
+    uint64_t m_dstx_received{0};     // dstx bodies that arrived
     size_t   m_tx_pull_inflight_cap{64};
     std::map<uint256, int64_t> m_tx_pull_inflight;   // txid -> requested-at
     uint64_t m_tx_inv_offered{0};    // inv(MSG_TX) SEEN on the wire, pre-dedup
@@ -1393,6 +1404,14 @@ public:
     /// stays dormant.
     void set_isdlock_pull(bool on) { m_isdlock_pull_enabled = on; }
     bool isdlock_pull_enabled() const { return m_isdlock_pull_enabled; }
+
+    /// Arm the DSTX (CoinJoin broadcast tx) lane (--embedded-ingest-dstx).
+    /// OFF by default: an explicit operator decision. Unlike isdlock this
+    /// gates the GETDATA itself — no fee-only-safe unconditional consumer
+    /// exists for a DSTX, so off-flag no inv(MSG_DSTX=16) ever earns a
+    /// request and the wire is byte-identical to master.
+    void set_dstx_pull(bool on) { m_dstx_pull_enabled = on; }
+    bool dstx_pull_enabled() const { return m_dstx_pull_enabled; }
 
     /// One greppable line: what the ingest lane asked for and what it got.
     /// received < pull_sent is normal (notfound, races, peers that drop);
@@ -2384,12 +2403,18 @@ private:
             const bool is_block = (inv.base_type() == inventory_type::block);
             const bool is_tx = (inv.base_type() == inventory_type::tx)
                             && m_tx_pull_enabled;
+            // W5-B: MSG_DSTX rides the tx-pull budget path (same strict
+            // tip-body priority, same inflight cap and txid-keyed dedup —
+            // the DSTX inv hash IS the plain txid). Gated on its OWN flag:
+            // no fee-only-safe unconditional consumer exists for a DSTX.
+            const bool is_dstx = (inv.m_type == inventory_type::dstx)
+                              && m_dstx_pull_enabled;
             // Offered-vs-admitted (diagnosis, not policy): counted BEFORE the
             // dedup so "peers are not announcing" can be told apart from "we
             // are filtering". Same announcement from N peers = N offered, 1
             // admitted — that gap is the fan-in the pool exists to produce.
             if (inv.base_type() == inventory_type::tx) ++m_tx_inv_offered;
-            if (!pulled && !is_block && !is_tx)
+            if (!pulled && !is_block && !is_tx && !is_dstx)
                 continue;   // not actionable — do not spend a dedup slot on it
             if (!m_inv_dedup.admit(static_cast<uint32_t>(inv.m_type), inv.m_hash, now))
             {
@@ -2426,9 +2451,9 @@ private:
                 p->write(getdata_msg);
                 continue;
             }
-            if (is_tx)
+            if (is_tx || is_dstx)
             {
-                ++m_tx_inv_seen;
+                if (is_tx) ++m_tx_inv_seen; else ++m_dstx_inv_seen;
                 expire_tx_pulls(now);
                 // STRICT PRIORITY: the tip body always wins. A transaction is
                 // worth a fraction of a block's fees; a late tip body is a
@@ -2441,11 +2466,19 @@ private:
                     ++m_tx_pull_skipped_budget;
                     continue;
                 }
+                // Budget slots are keyed by TXID — correct for BOTH lanes
+                // because the DSTX inv hash IS the plain txid (dashd
+                // net_processing.cpp:2567); a type-1 and a type-16
+                // announcement of the same tx share one slot here even
+                // though InvDedup (keyed on type+hash) admitted both.
                 if (m_tx_pull_inflight.count(inv.m_hash)) continue;
                 m_tx_pull_inflight.emplace(inv.m_hash, now);
-                ++m_tx_pull_sent;
+                if (is_tx) ++m_tx_pull_sent; else ++m_dstx_pull_sent;
+                // Echo the ANNOUNCED type back: a getdata(MSG_TX) for a
+                // DSTX-only tx would get notfound from dashd until it leaves
+                // the DSTX relay window.
                 auto getdata_msg = message_getdata::make_raw(
-                    {inventory_type(inventory_type::tx, inv.m_hash)});
+                    {inventory_type(inv.m_type, inv.m_hash)});
                 p->write(getdata_msg);
                 continue;
             }
@@ -2686,6 +2719,63 @@ private:
                  << " cycle=" << msg->m_cycle_hash.GetHex().substr(0, 16)
                  << "...";
         m_coin->new_isdlock.happened(ev);
+    }
+
+    ADD_P2P_HANDLER(dstx)
+    {
+        // W5-B: CoinJoin broadcast tx (dashd CCoinJoinBroadcastTx). NO trust
+        // decision here — the maintainer-side BLS gate
+        // (CoinStateMaintainer::on_new_dstx, fail-closed without a verifier)
+        // decides whether the zero-fee admission path ever runs. This
+        // handler: (1) releases the shared tx-pull budget slot by the
+        // COMPUTED txid (never the announcement's — an unsolicited or
+        // substituted body cannot free a slot it never occupied, same rule
+        // as the tx handler); (2) applies dashd's STRUCTURAL refusals
+        // (CCoinJoinBroadcastTx::IsValidStructure, coinjoin.cpp:83-102 —
+        // local drop + log, no ban); (3) fires new_dstx when the lane is
+        // armed.
+        ++m_dstx_received;
+        const uint256 txid = dash_txid(msg->m_tx);
+        m_tx_pull_inflight.erase(txid);
+
+        if (!m_dstx_pull_enabled) {
+            // Off-flag no getdata was ever sent; an unsolicited dstx is
+            // decode-and-discard (belt-and-suspenders).
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] dstx from "
+                            << (m_active ? m_active->key : std::string("?"))
+                            << " DISCARDED (--embedded-ingest-dstx off)";
+            return;
+        }
+
+        // dashd IsValidStructure, KAT-pinned free predicate
+        // (p2p_messages.hpp dstx_is_valid_structure).
+        if (!dstx_is_valid_structure(msg->m_tx, msg->m_protx_hash,
+                                     msg->m_sig.size())) {
+            LOG_INFO << "[" << m_chain_label << "] dstx from "
+                     << (m_active ? m_active->key : std::string("?"))
+                     << " REFUSED structure (txid="
+                     << txid.GetHex().substr(0, 16)
+                     << " vin=" << msg->m_tx.vin.size()
+                     << " vout=" << msg->m_tx.vout.size()
+                     << " sig_bytes=" << msg->m_sig.size()
+                     << " protx_null=" << (msg->m_protx_hash.IsNull() ? 1 : 0)
+                     << ")";
+            return;
+        }
+
+        ::dash::interfaces::Node::DstxEvent ev;
+        ev.tx         = msg->m_tx;
+        ev.txid       = txid;
+        ev.protx_hash = msg->m_protx_hash;
+        ev.sig_time   = msg->m_sig_time;
+        std::copy(msg->m_sig.begin(), msg->m_sig.end(), ev.sig.begin());
+        LOG_INFO << "[" << m_chain_label << "] dstx from "
+                 << (m_active ? m_active->key : std::string("?"))
+                 << ": txid=" << txid.GetHex().substr(0, 16)
+                 << "... vin=" << msg->m_tx.vin.size()
+                 << " protx=" << msg->m_protx_hash.GetHex().substr(0, 16)
+                 << "... sig_time=" << msg->m_sig_time;
+        m_coin->new_dstx.happened(ev);
     }
 
     ADD_P2P_HANDLER(qfcommit)

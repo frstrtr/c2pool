@@ -960,6 +960,62 @@ public:
         on_islock(txid, inputs);
     }
 
+    /// Verifier seam for DSTX adoption (W5-B CoinJoin broadcast tx):
+    /// BLS-verifies the mixing masternode's OPERATOR signature over
+    /// SerializeHash(tx‖protxHash‖sigTime) against the SML's
+    /// pubKeyOperator(protxHash) — dashd ValidateDSTX
+    /// (net_processing.cpp:3549-3615) / CCoinJoinBroadcastTx::CheckSignature
+    /// (coinjoin.cpp:73-81). Installed by main_dash; UNSET IS FAIL-CLOSED
+    /// (see on_new_dstx).
+    using DstxVerifyFn = std::function<bool(
+        const dash::coin::MutableTransaction& tx, const uint256& txid,
+        const uint256& protx_hash, const std::array<uint8_t, 96>& sig,
+        int64_t sig_time)>;
+
+    void set_dstx_verify_fn(DstxVerifyFn fn) {
+        m_dstx_verify = std::move(fn);
+    }
+
+    /// DSTX reception: admit a VERIFIED CoinJoin broadcast tx into the
+    /// mempool at fee=0 with dashd's +0.1 COIN prioritisation delta
+    /// (Mempool::add_dstx), so selection ranks it exactly where dashd's
+    /// GetModFeesWithAncestors sort puts it while the coinbase fee term
+    /// stays base (0) — both matching dashd bit-for-bit.
+    ///
+    /// ⚠ VERIFICATION IS MANDATORY. A DSTX is a zero-fee tx that enters the
+    /// served template at TOP modified-fee priority; adopting one unverified
+    /// would let an arbitrary peer stuff zero-fee txs into our templates
+    /// (template pollution ⇒ tx-merkle divergence from dashd ⇒ the #1218
+    /// guard refuses/swaps serving — availability, not validity, but still
+    /// an attack surface). When no verifier is installed, or verification
+    /// FAILS, we adopt NOTHING: the pool stays exactly as it was.
+    ///
+    /// KNOWN PHASE-1 DIVERGENCE (deliberate, documented): dashd additionally
+    /// rate-limits DSTX-es per masternode (IsValidForMixingTxes, MAX=5 since
+    /// the MN's last DSQ, masternode/meta.cpp:124-128). Mirroring that
+    /// counter without ingesting the DSQ queue stream (inv 32) would only
+    /// ever INCREMENT ⇒ permanent false refusals, so phase 1 omits it: an MN
+    /// spamming >5 DSTX between queues makes embedded a SUPERSET of dashd
+    /// for those txs and the tx-merkle guard refuses serving (never an
+    /// invalid block). If soak attributes mismatch events here, phase 2
+    /// adds the DSQ leg for exactness.
+    void on_new_dstx(const dash::coin::MutableTransaction& tx,
+                     const uint256& txid, const uint256& protx_hash,
+                     const std::array<uint8_t, 96>& sig, int64_t sig_time) {
+        if (!m_dstx_verify) return;                      // no verifier => fail closed
+        if (!m_dstx_verify(tx, txid, protx_hash, sig, sig_time)) {
+            LOG_WARNING << "[DSTX] rejected unverified dstx txid="
+                        << txid.GetHex().substr(0, 16) << "... protx="
+                        << protx_hash.GetHex().substr(0, 16) << "...";
+            return;
+        }
+        const bool admitted = m_state.mempool().add_dstx(tx);
+        LOG_INFO << "[DSTX] VERIFIED dstx txid=" << txid.GetHex().substr(0, 16)
+                 << "... protx=" << protx_hash.GetHex().substr(0, 16)
+                 << (admitted ? "... admitted fee=0 delta=+0.1 COIN"
+                              : "... delta applied to already-pooled tx");
+    }
+
     /// Reorg (SML axis): a chain reorganisation can invalidate the incremental
     /// SML/quorum state (the diffs we applied were relative to an orphaned
     /// branch). Wipe the SML + quorum set and drop have_sml so the embedded arm
@@ -2333,6 +2389,7 @@ private:
         m_on_new_quorum_commitments;
     ChainLockVerifyFn     m_chainlock_verify; // unset => live ChainLocks never adopted (fail closed)
     IslockVerifyFn        m_islock_verify;    // unset => isdlocks never adopted (fail closed, G4 stays dormant)
+    DstxVerifyFn          m_dstx_verify;      // unset => DSTX-es never admitted (fail closed, W5-B stays dormant)
     // E2: independent DIP-0027 credit-pool accrual, advanced per ingested block
     // (on_block_connected) and re-anchored per accepted mnlistdiff. Verified
     // against each block's own from-wire cbTx; persisted via the hook below.

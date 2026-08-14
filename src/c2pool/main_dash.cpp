@@ -409,7 +409,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-mn-bridge-no-cursor]\n"
         << "           [--embedded-utxo-immature-serve-empty] [--embedded-serve-mempool-txs]\n"
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
-        << "           [--embedded-ingest-isdlock]\n"
+        << "           [--embedded-ingest-isdlock] [--embedded-ingest-dstx]\n"
         << "           [--pin-local-tx-hex FILE]  (zero-fee self-mined tx, e.g. donation consolidation)\n"
         << "           [--pin-splice-xcheck-arm]  (let pins ride an xcheck-SWAPPED dashd template; default OFF)\n"
         << "           [--pin-splice-block-budget] (EXCLUDE a pin that pushes the template past the block size cap; default OFF)\n"
@@ -900,7 +900,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // individually BLS-gated against the rotated LLMQ_60_75 quorum
              // dashd's SelectQuorumForSigning designates (islock_verify.hpp;
              // fail-closed at every hop).
-             bool embedded_ingest_isdlock = false)
+             bool embedded_ingest_isdlock = false,
+             // --embedded-ingest-dstx (W5-B): arm the CoinJoin DSTX lane —
+             // inv(MSG_DSTX=16) getdata pull (budgeted, shares the MSG_TX
+             // machinery) + the BLS-verified new_dstx adoption path
+             // (maintainer gate → Mempool::add_dstx: fee=0 base + dashd's
+             // +0.1 COIN prioritisation delta). DEFAULT OFF: no getdata
+             // type-16 is ever sent, the handler discards, and templates are
+             // byte-identical to master. Template EFFECT additionally
+             // requires --embedded-serve-mempool-txs; the #1218
+             // gbt-xcheck-txmerkle guard is untouched and stays the referee.
+             bool embedded_ingest_dstx = false)
 {
     namespace io = boost::asio;
 
@@ -5123,6 +5133,62 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     target->quorum.quorum_public_key, target->sign_hash, sig);
             });
 
+        // W5-B DSTX verifier: BLS-verify the mixing masternode's OPERATOR
+        // signature over SerializeHash(tx‖protxHash‖sigTime) against the
+        // SML's pubKeyOperator(protxHash) — dashd ValidateDSTX
+        // (net_processing.cpp:3549-3615). The pre-image is EXACT
+        // (coinjoin.h SERIALIZE_METHODS gates vchSig behind SER_GETHASH):
+        //   SHA256d( ser(tx) ‖ protxHash[32] ‖ sigTime[8 LE] )
+        // — full network tx serialization (pack(tx) IS the dash_txid base),
+        // no CompactSize framing around the trailing fields. The signature
+        // contract is byte-identical to the govvote operator verify
+        // (CBLSSignature::VerifyInsecure with the key's declared wire scheme
+        // vs post-V19 basic signing handled inside), so
+        // verify_govvote_operator_sig is REUSED, not re-implemented.
+        // Fail-closed at every arm: unknown proTxHash in the CURRENT SML =>
+        // refuse (dashd also walks <=24 blocks back for recently-removed
+        // MNs — a KNOWN phase-1 divergence: we refuse those, staying a
+        // SUBSET of dashd for that rare window; the tx-merkle guard covers
+        // it, and a tombstone ring is the phase-2 exactness fix).
+        maintainer->set_dstx_verify_fn(
+            [st = &node_coin_state](
+                const dash::coin::MutableTransaction& tx, const uint256& txid,
+                const uint256& protx_hash, const std::array<uint8_t, 96>& sig,
+                int64_t sig_time) -> bool {
+                (void)txid;
+                // Operator-key lookup in the live SML (mnlistdiff-sourced).
+                const auto& mn_list = st->sml().mnList;
+                const dash::coin::vendor::CSimplifiedMNListEntry* mn = nullptr;
+                for (const auto& e : mn_list) {
+                    if (e.proRegTxHash == protx_hash) { mn = &e; break; }
+                }
+                if (mn == nullptr) return false;   // unknown MN => refuse
+                // GetSignatureHash pre-image — the KAT-pinned helper
+                // (p2p_messages.hpp dstx_signature_hash).
+                const uint256 digest = dash::coin::p2p::dstx_signature_hash(
+                    tx, protx_hash, sig_time);
+                const bool key_legacy =
+                    mn->nVersion ==
+                    dash::coin::vendor::CSimplifiedMNListEntry::VER_LEGACY_BLS;
+                return dash::coin::vendor::verify_govvote_operator_sig(
+                    mn->pubKeyOperator, key_legacy, digest,
+                    std::vector<uint8_t>(sig.begin(), sig.end()));
+            });
+
+        // W5-B leg (dstx): Node::new_dstx -> maintainer.on_new_dstx. The
+        // event only fires when --embedded-ingest-dstx armed the pull; the
+        // maintainer gate then BLS-verifies via the verifier above and ONLY
+        // on pass admits via Mempool::add_dstx (fee=0 base + the +0.1 COIN
+        // prioritisation delta). Both hops fail closed, so subscribing
+        // unconditionally is inert without the flag.
+        coin_feed_subs.push_back(
+            coin_state.new_dstx.subscribe(
+                [m = maintainer.get()]
+                (const dash::interfaces::Node::DstxEvent& e) {
+                    m->on_new_dstx(e.tx, e.txid, e.protx_hash, e.sig,
+                                   e.sig_time);
+                }));
+
         // Leg 6 (ChainLock sig): Node::new_chainlock_sig -> maintainer
         // .on_new_chainlock. The clsig message carries the recovered 96-byte
         // threshold sig (new_chainlock above drops it); the maintainer adopts
@@ -5495,6 +5561,23 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // add_islock. OFF by default — off, an inv(MSG_ISDLOCK=31) never
         // earns a getdata and the handler decodes-and-discards, wire and
         // template behaviour byte-identical to master.
+        // ── W5-B DSTX INGEST: arm the MSG_DSTX pull ──────────────────────
+        // The acquire half; the verify half is the maintainer BLS gate
+        // installed above (set_dstx_verify_fn), and only its PASS ever
+        // reaches Mempool::add_dstx. OFF by default — off, an inv(MSG_DSTX
+        // =16) never earns a getdata and the handler discards, wire and
+        // template behaviour byte-identical to master.
+        if (embedded_ingest_dstx) {
+            coin_p2p->set_dstx_pull(true);
+            std::cout << "[run] --embedded-ingest-dstx: coin-P2P MSG_DSTX"
+                         " pull ARMED (shares the tx-pull budget; yields to"
+                         " the tip body). Every dstx is individually"
+                         " BLS-verified against the SML operator key of its"
+                         " proTxHash before the zero-fee +0.1 COIN"
+                         " prioritised admission; any verification failure"
+                         " is a drop (fail-closed, no state change).\n";
+        }
+
         if (embedded_ingest_isdlock) {
             coin_p2p->set_isdlock_pull(true);
             std::cout << "[run] --embedded-ingest-isdlock: coin-P2P"
@@ -7903,6 +7986,10 @@ int main(int argc, char** argv)
     // byte-identical); on, every isdlock is still individually BLS-gated
     // before Mempool::add_islock (fail-closed at every hop).
     bool embedded_ingest_isdlock = false;
+    // --embedded-ingest-dstx (W5-B): arm the CoinJoin DSTX lane (getdata
+    // pull + BLS-verified zero-fee admission with dashd's +0.1 COIN
+    // prioritisation delta). DEFAULT OFF — wire and templates byte-identical.
+    bool embedded_ingest_dstx = false;
     std::string bestcl_policy = "freshness";   // --bestcl-policy: freshness (default, conservative proxy) | consensus-exact (dashcore's actual CheckCbTxBestChainlock rule)
     bool embedded_oracle_shadow = false;       // --embedded-oracle-shadow: per-block dashd cross-check (OBSERVE-only)
     bool embedded_shadow_compare = false;      // --embedded-shadow-compare: serve-vs-dashd template diff (OBSERVE-only, NOT a gate)
@@ -8010,6 +8097,8 @@ int main(int argc, char** argv)
             embedded_null_arm = false;  // #127: explicit OFF (OFF-equivalence)
         else if (std::strcmp(argv[i], "--embedded-ingest-isdlock") == 0)
             embedded_ingest_isdlock = true;   // G4 conflict-tx-lock feed
+        else if (std::strcmp(argv[i], "--embedded-ingest-dstx") == 0)
+            embedded_ingest_dstx = true;      // W5-B CoinJoin DSTX feed
         else if (std::strcmp(argv[i],
                              "--embedded-creditpool-publish-at-serve-tip") == 0)
             embedded_creditpool_publish_at_serve_tip = true;
@@ -8307,7 +8396,8 @@ int main(int argc, char** argv)
                         embedded_accrue_asset_locks,   // #107 PHASE 2
                         embedded_null_arm,             // #127
                         embedded_accrue_asset_unlocks, // #143 Variant B
-                        embedded_ingest_isdlock);      // G4 isdlock feed
+                        embedded_ingest_isdlock,       // G4 isdlock feed
+                        embedded_ingest_dstx);         // W5-B DSTX feed
     }
     return run_selftest();
 }
