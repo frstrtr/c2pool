@@ -3420,6 +3420,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // Phase-1 mempool-ingest telemetry (30s); constructed only under
     // --embedded-mempool-ingest.
     std::unique_ptr<core::Timer>                               mempool_ingest_timer;
+    // #129 fresh-path header-sync stall watchdog (coin-p2p arm only).
+    // Declared after header_chain/coin_p2p so it unwinds FIRST at return —
+    // its callback reads both.
+    std::unique_ptr<core::Timer>                               header_sync_watchdog_timer;
     // W5 integration: the fold engine the lane drives, and its consumer.
     std::unique_ptr<dash::coin::replay::DmlFoldEngine>         replay_fold_engine;
     std::unique_ptr<dash::coin::replay::FoldReplayConsumer>    replay_fold_consumer;
@@ -5163,6 +5167,95 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     if (batch.empty()) return;
                     cp->send_getheaders(70230, hc->get_locator(), uint256::ZERO);
                 }));
+
+        // ── #129 FRESH-PATH HEADER-SYNC RE-ARM (stall watchdog) ──────────
+        // The self-propel above is a ONE-TOKEN relay: exactly one getheaders
+        // in flight, re-armed ONLY by its own response arriving as a
+        // non-empty headers batch. Two ways the token dies on a FRESH
+        // (empty-data-dir, no --coin-rpc) node:
+        //   (a) the primary is busy computing the cold-start monsters the
+        //       SAME handshake kick queued on it (null-base mnlistdiff for
+        //       ~3200 MNs + qrinfo) — dashd answers a peer's requests
+        //       sequentially, so the next headers reply sits minutes behind
+        //       that computation; single-peer, effectively forever;
+        //   (b) the reply is lost (disconnect, reorg race) — nothing re-asks.
+        // Either way getheaders stops re-arming and the header chain parks
+        // below tip (the h=2406000 fresh-bring-up wedge: anchor + 3 batches,
+        // then silence). The per-block-inv rescue above cannot save a node
+        // whose only/announcing peer is the starved one, and send_getheaders
+        // is a silent no-op with a null primary. An EXISTING data-dir never
+        // sees this: the warm deficit is small and the cold monsters absent.
+        // This is the tip-lane analog of the bulk walker's
+        // maybe_kick_backfill (replay_bulk_fetch.hpp) and the same
+        // armed-once-never-re-armed class as #1151/#1162.
+        //
+        // Every 5 s: if the header chain is BEHIND the best peer-advertised
+        // height AND has not advanced for kStallSec, re-issue getheaders off
+        // the CURRENT locator, round-robining across ALL handshaked peers —
+        // not pinned to the possibly-starved primary. Wire-conservative and
+        // reward-safe by construction: it only re-sends an existing,
+        // well-formed message (no wire/consensus change); a duplicate reply
+        // de-dups as accepted==0; at/above the advertised tip the height
+        // guard makes it inert; and NO serve gate reads it — the freshness /
+        // is_synced gates that keep an incompletely-synced node from serving
+        // are untouched, a re-request grants no serve authority.
+        {
+            struct HeaderSyncWatchdogState {
+                uint32_t last_height{0};
+                int64_t  last_change{0};   // steady seconds of last advance
+                int64_t  last_kick{0};
+                uint64_t rr{0};            // peer round-robin cursor
+                uint64_t kicks{0};
+            };
+            constexpr int64_t kStallSec  = 20;  // no advance for this long
+            constexpr int64_t kRekickSec = 10;  // min spacing between kicks
+            header_sync_watchdog_timer =
+                std::make_unique<core::Timer>(&ioc, /*repeat=*/true);
+            header_sync_watchdog_timer->start(5,
+                [cp = coin_p2p.get(), hc = header_chain.get(),
+                 st = std::make_shared<HeaderSyncWatchdogState>()]() {
+                    const int64_t now =
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::steady_clock::now()
+                                .time_since_epoch()).count();
+                    const uint32_t h = hc->height();
+                    if (st->last_change == 0 || h != st->last_height) {
+                        st->last_height = h;
+                        st->last_change = now;   // progress — watchdog quiet
+                        return;
+                    }
+                    const uint32_t peer_tip = hc->peer_tip_height();
+                    // peer_tip is stamped from version handshakes; once our
+                    // height passes it in steady state the watchdog is inert
+                    // (tip follow is inv-driven there, by design).
+                    if (peer_tip == 0 || h >= peer_tip) return;
+                    if ((now - st->last_change) < kStallSec) return;
+                    if ((now - st->last_kick) < kRekickSec) return;
+                    st->last_kick = now;
+                    ++st->kicks;
+                    const auto locator = hc->get_locator();
+                    auto keys = cp->handshaked_peer_keys();
+                    bool sent = false;
+                    std::string target = "<primary>";
+                    if (!keys.empty()) {
+                        // Rotate so consecutive kicks reach DIFFERENT peers:
+                        // the whole point is escaping a starved primary.
+                        const std::string& key =
+                            keys[st->rr++ % keys.size()];
+                        sent = cp->send_getheaders_to(
+                            key, 70230, locator, uint256::ZERO);
+                        if (sent) target = key;
+                    }
+                    if (!sent)   // no named peer took it — primary fallback
+                        cp->send_getheaders(70230, locator, uint256::ZERO);
+                    LOG_INFO << "[COIN-P2P] header-sync stall watchdog:"
+                                " re-armed getheaders h=" << h
+                             << " peer_tip=" << peer_tip
+                             << " stalled_s=" << (now - st->last_change)
+                             << " peer=" << target
+                             << " kick#" << st->kicks;
+                });
+        }
 
         // ── BODY-FIRST SERVE TIP + bounded full-block buffer (operator
         // direction off soak0804e; the follow-up the #1089 thread scopes).
