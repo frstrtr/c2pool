@@ -651,9 +651,17 @@ if (BUILD_TESTING AND GTest_FOUND)
     # readiness-gate KATs — including the tip-context propagation split — are
     # actually built and run. Header-only over mempool_validity_gate.hpp +
     # nlohmann/json; no new SCC dependency, no new build.yml --target (#769).
+    #
+    # Fifth TU: test_dash_fold_fee_source.cpp — W5-A FoldFeeSource: the
+    # graduated fold as the mempool's THIRD coin source. Red/green pair
+    # (ungraduated-prices-nothing vs graduated-prices-and-selects), spent /
+    # immature-coinbase exclusion, gate-FAIL poison+disarm, tip-lag trust
+    # drop, graduation restore across reopen (operator restatement required),
+    # prev-hash linkage reorg tripwire. Same target, no new allowlist entry.
     add_executable(test_dash_mempool test_dash_mempool.cpp test_dash_replay_utxo_fold.cpp
         test_dash_mempool_validity_gate.cpp
-        test_dash_checkinputscripts.cpp)   # PR-C4: consensus-exact CheckInputScripts KAT
+        test_dash_checkinputscripts.cpp   # PR-C4: consensus-exact CheckInputScripts KAT
+        test_dash_fold_fee_source.cpp)    # W5-A: fold-backed fee pricing source
     target_link_libraries(test_dash_mempool PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

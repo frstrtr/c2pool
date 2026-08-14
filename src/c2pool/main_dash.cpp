@@ -102,6 +102,7 @@
 #include <impl/dash/coin/mn_checkpoint_lane.hpp> // E2d: checkpoint -> forward-replay bridge -> leg-4 publish
 #include <impl/dash/coin/replay_bulk_fetch.hpp>  // W2: full-history replay bulk block-fetch lane (--replay-bulk)
 #include <impl/dash/coin/replay_utxo_fold.hpp>   // W3: full-history replay standalone UTXO fold (--replay-utxo-*)
+#include <impl/dash/coin/fold_fee_source.hpp>    // W5-A: graduated fold → mempool fee pricing (--embedded-utxo-fold-fees)
 #include <impl/dash/coin/replay_prestate.hpp>    // W5: anchor prestate loader (--replay-fold-prestate)
 #include <impl/dash/coin/mnlist_seed.hpp>        // OPTIONAL V20 getmnlistdiff seed (--replay-mnlist-seed-*, #154 escape hatch)
 #include <impl/dash/coin/replay_fold_consumer.hpp> // W5: bulk lane -> W1 DML fold + per-block root check
@@ -467,6 +468,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
         << "           [--embedded-ingest-isdlock] [--embedded-ingest-dstx]\n"
         << "           [--embedded-proactive-rotate]\n"
+        << "           [--embedded-utxo-fold-fees DBPATH --embedded-utxo-fold-expect HEX]\n"
         << "           [--pin-local-tx-hex FILE]  (zero-fee self-mined tx, e.g. donation consolidation)\n"
         << "           [--pin-splice-xcheck-arm]  (let pins ride an xcheck-SWAPPED dashd template; default OFF)\n"
         << "           [--pin-splice-block-budget] (EXCLUDE a pin that pushes the template past the block size cap; default OFF)\n"
@@ -1030,7 +1032,25 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // whose scriptSig does not satisfy it. Requires the fold to be
              // armed (fold_live_db). DEFAULT false => no check, byte-
              // identical to master.
-             bool embedded_fold_checkscripts = false)
+             bool embedded_fold_checkscripts = false,
+             // --embedded-utxo-fold-fees DBPATH (+ REQUIRED
+             // --embedded-utxo-fold-expect HEX): W5-A. Open the W3 full-
+             // history UTXO fold at DBPATH and install FoldFeeSource as the
+             // mempool's THIRD coin source for fee pricing + selection vin
+             // resolution — closing the dominant "coin older than the replay
+             // horizon ⇒ fee-unknown ⇒ excluded" dashd-only tx class behind
+             // the gbt-xcheck tx-merkle mismatches. DEFAULT OFF (empty):
+             // nothing is constructed, Mempool::m_fee_coin_lookup stays
+             // empty, production byte-identical. Even armed, the source
+             // answers NOTHING until the fold GRADUATES (hash_serialized_2
+             // byte-equal to dashd's gettxoutsetinfo at the pinned anchor —
+             // the operator must RESTATE the expected hash in
+             // --embedded-utxo-fold-expect) AND the fold is live at the tip;
+             // every failure path reverts to today's fee-unknown exclusion.
+             // The #1218 gbt-xcheck-txmerkle guard is UNTOUCHED and stays
+             // the referee on any divergence.
+             const std::string& embedded_utxo_fold_fees_db = std::string(),
+             const std::string& embedded_utxo_fold_expect = std::string())
 {
     namespace io = boost::asio;
 
@@ -2479,6 +2499,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     std::function<bool(const ::core::coin::Outpoint&, ::core::coin::Coin&)>
         rpc_pin_lookup;
     dash::coin::UtxoLane utxo_lane;
+    // W5-A fold fee source: SAME outlive-the-mempool rule as utxo_lane above
+    // (the mempool's m_fee_coin_lookup lambda points into fold_fee_source,
+    // which reads fold_fee_fold). Declared before node_coin_state, destroyed
+    // after it. Constructed only under --embedded-utxo-fold-fees (below).
+    std::unique_ptr<dash::coin::replay::ReplayUtxoFold> fold_fee_fold;
+    std::unique_ptr<dash::coin::FoldFeeSource>          fold_fee_source;
     dash::coin::NodeCoinState node_coin_state;
     if (!fold_live_db.empty()) {
         fold_live = std::make_shared<dash::coin::replay::ReplayUtxoFold>();
@@ -2836,6 +2862,76 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         } else {
             std::cout << "[run] embedded UTXO/fee lane FAILED to open " << utxo_path
                       << " -- fees stay unknown; dashd-RPC fallback unaffected\n";
+        }
+    }
+
+    // ── W5-A: graduated-fold fee pricing (--embedded-utxo-fold-fees) ────────
+    // DEFAULT OFF. Constructs the W3 full-history UTXO fold + FoldFeeSource
+    // and installs it as the mempool's THIRD coin source (fee pricing +
+    // selection vin resolution — fold_fee_source.hpp carries the full trust
+    // model). Fail-closed at every step: any construction failure leaves the
+    // mempool exactly as today (fee-unknown exclusion), never a fatal.
+    // (fold_fee_fold / fold_fee_source declared next to utxo_lane above —
+    // the outlive-the-mempool rule.)
+    std::shared_ptr<EventDisposable> fold_fee_tip_sub;
+    if (!embedded_utxo_fold_fees_db.empty()) {
+        if (embedded_utxo_fold_expect.empty()) {
+            std::cout << "[run] --embedded-utxo-fold-fees given WITHOUT"
+                         " --embedded-utxo-fold-expect — the operator must"
+                         " restate the anchor hash; fold fee pricing NOT"
+                         " armed (fee-unknown exclusion unchanged)\n";
+        } else {
+            dash::coin::replay::ReplayUtxoFoldOptions fopts;
+            fopts.check_prev_linkage = true;   // reorg tripwire (ChainLocks
+                                               // make real reorgs ~nonexistent;
+                                               // a trip disarms until restart)
+            fold_fee_fold = std::make_unique<
+                dash::coin::replay::ReplayUtxoFold>(fopts);
+            if (!fold_fee_fold->open(embedded_utxo_fold_fees_db)) {
+                std::cout << "[run] --embedded-utxo-fold-fees: fold store "
+                          << embedded_utxo_fold_fees_db << " FAILED to open"
+                             " (see log) — fold fee pricing NOT armed\n";
+                fold_fee_fold.reset();
+            } else {
+                dash::coin::FoldFeeSource::Options sopts;
+                sopts.operator_expect = embedded_utxo_fold_expect;
+                fold_fee_source = std::make_unique<dash::coin::FoldFeeSource>(
+                    *fold_fee_fold, sopts);
+                node_coin_state.mempool().set_fee_coin_lookup(
+                    [fs = fold_fee_source.get()](
+                        const ::core::coin::Outpoint& op,
+                        ::core::coin::Coin& out) {
+                        return fs->lookup(op, out);
+                    });
+                // Live lane: every connected block both advances the trust
+                // tip AND (when contiguous with the fold cursor — e.g. after
+                // the replay lane bridged to the tip, or across a short
+                // restart covered by the 288-block bootstrap window) feeds
+                // the fold. Idempotent acks + tolerated gaps + the prev-hash
+                // tripwire live inside feed().
+                fold_fee_tip_sub = coin_state.block_connected.subscribe(
+                    [fs = fold_fee_source.get()](
+                        const dash::interfaces::BlockConnected& bc) {
+                        auto packed_hdr = ::pack(
+                            static_cast<const ::dash::coin::BlockHeaderType&>(
+                                bc.block));
+                        const uint256 bh = ::dash::crypto::hash_x11(
+                            packed_hdr.get_span());
+                        fs->note_tip(bc.height);
+                        fs->feed(bc.height, bh, bc.block);
+                    });
+                std::cout << "[run] W5-A FOLD FEE SOURCE armed (DARK until"
+                             " graduated): db=" << embedded_utxo_fold_fees_db
+                          << " fold_h=" << fold_fee_source->fold_height()
+                          << " graduated="
+                          << (fold_fee_source->graduated() ? "YES" : "no")
+                          << " anchor_h="
+                          << fold_fee_fold->gate_anchor_height()
+                          << " — pricing activates ONLY after"
+                             " hash_serialized_2 == the restated anchor AND"
+                             " the fold is live at the tip; every failure"
+                             " path reverts to the fee-unknown exclusion\n";
+            }
         }
     }
 
@@ -4049,6 +4145,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // W5 integration: the fold engine the lane drives, and its consumer.
     std::unique_ptr<dash::coin::replay::DmlFoldEngine>         replay_fold_engine;
     std::unique_ptr<dash::coin::replay::FoldReplayConsumer>    replay_fold_consumer;
+    // W5-A: the UTXO-fold side consumer riding the SAME bulk lane (Tee) when
+    // --embedded-utxo-fold-fees is armed together with --replay-bulk. A fold
+    // refusal (incl. a graduation-gate FAIL) stops the lane with the fold's
+    // own named cause — never a silent skip past divergent state.
+    std::unique_ptr<dash::coin::replay::IReplayBlockConsumer>  replay_utxo_side;
+    std::unique_ptr<dash::coin::replay::TeeReplayConsumer>     replay_utxo_tee;
     // THE SEAM: W4's quorum lane and the bridge that closes the loop.
     std::unique_ptr<dash::coin::replay::QuorumReplayEngine>    replay_quorum_engine;
     std::unique_ptr<dash::coin::replay::ReplayQuorumBridge>    replay_quorum_bridge;
@@ -7803,6 +7905,33 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                              " — mined-commitment index NOT armed\n";
             }
 
+            // ── W5-A: UTXO fold rides the SAME bulk lane (side of a Tee) ──
+            // Catch-up (genesis → anchor → tip) AND steady-state tip-follow:
+            // every verified in-order body is handed to FoldFeeSource::feed
+            // BEFORE drain_buffer() prunes it. The graduation gate fires
+            // inside feed() exactly as the cursor crosses the anchor.
+            if (fold_fee_source) {
+                struct UtxoFoldSide : rp::IReplayBlockConsumer {
+                    dash::coin::FoldFeeSource* fs;
+                    explicit UtxoFoldSide(dash::coin::FoldFeeSource* f)
+                        : fs(f) {}
+                    bool on_replay_block(uint32_t h, const uint256& hash,
+                                         const dash::coin::BlockType& b)
+                        override
+                    {
+                        return fs->feed(h, hash, b);
+                    }
+                };
+                replay_utxo_side = std::make_unique<UtxoFoldSide>(
+                    fold_fee_source.get());
+                replay_utxo_tee = std::make_unique<rp::TeeReplayConsumer>(
+                    replay_consumer, replay_utxo_side.get());
+                replay_consumer = replay_utxo_tee.get();
+                std::cout << "[run] W5-A: UTXO fold FEEDS from the bulk lane"
+                             " (Tee side; fold cursor h="
+                          << fold_fee_source->fold_height() << ")\n";
+            }
+
             if (!g_replay_bulk_capture_dir.empty()) {
                 replay_capture = std::make_unique<rp::CaptureReplayConsumer>(
                     g_replay_bulk_capture_dir, replay_consumer);
@@ -7951,6 +8080,26 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // every race — it simply no longer wins a band it never enters.
             // Unarmed (--replay-bulk alone) the default 12 is untouched.
             if (replay_fold_consumer) rcfg.tip_exclusion = 0;
+            // ── W5-A start-height sentinel (the named trap) ───────────────
+            // A COLD UTXO fold must start at GENESIS: pre-DIP3 coins are
+            // still spendable, so a DIP3-anchored fold can NEVER match the
+            // graduation anchor — and `--replay-bulk-start 0` silently means
+            // "network default = DIP3 1,028,160". Refuse NOW rather than
+            // GATE FAIL fifteen hours of download later. (A fold with a
+            // cursor resumes wherever it stands; the lane's own cursor +
+            // the fold's idempotent acks absorb any overlap.)
+            if (fold_fee_source && fold_fee_fold
+                && !fold_fee_fold->have_cursor() && rcfg.start_height > 1) {
+                std::cerr << "[run] FATAL: --embedded-utxo-fold-fees on an"
+                             " EMPTY fold store requires --replay-bulk-start 1"
+                             " (genesis): configured start h="
+                          << rcfg.start_height
+                          << " can never reach the graduation anchor\n";
+                return 1;
+            }
+            // The fold must BE current to price live-tip fees: close the
+            // 12-block tip-exclusion band exactly as the DML fold does.
+            if (fold_fee_source) rcfg.tip_exclusion = 0;
             replay_lane = std::make_unique<rp::BulkFetchLane>(
                 std::move(seams), rcfg, replay_backfill.get(),
                 replay_consumer, replay_cursor.get());
@@ -9472,6 +9621,12 @@ int main(int argc, char** argv)
     std::string replay_utxo_db;        // --replay-utxo-db PATH (fold store)
     bool replay_utxo_hash = false;     // --replay-utxo-hash: compute hash_serialized_2
     std::string replay_utxo_expect;    // --replay-utxo-expect HEX (gate compare, exit code)
+    // ── W5-A: graduated-fold fee pricing (fold_fee_source.hpp) ────────────
+    // DEFAULT OFF (empty). Both must be given together; --embedded-utxo-fold-
+    // expect is the operator's RESTATEMENT of the anchor hash (a stale or
+    // foreign DB must not graduate on its own say-so).
+    std::string embedded_utxo_fold_fees_db;   // --embedded-utxo-fold-fees PATH
+    std::string embedded_utxo_fold_expect;    // --embedded-utxo-fold-expect HEX
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
             std::cout << "c2pool-dash " << C2POOL_VERSION << "\n";
@@ -9604,6 +9759,10 @@ int main(int argc, char** argv)
             pin_splice_xcheck_arm = true;
         else if (std::strcmp(argv[i], "--pin-splice-block-budget") == 0)
             pin_splice_block_budget = true;
+        else if (std::strcmp(argv[i], "--embedded-utxo-fold-fees") == 0 && i + 1 < argc)
+            embedded_utxo_fold_fees_db = argv[++i];   // W5-A fold fee source
+        else if (std::strcmp(argv[i], "--embedded-utxo-fold-expect") == 0 && i + 1 < argc)
+            embedded_utxo_fold_expect = argv[++i];    // W5-A anchor restatement
         else if (std::strcmp(argv[i], "--replay-utxo-db") == 0 && i + 1 < argc)
             replay_utxo_db = argv[++i];
         else if (std::strcmp(argv[i], "--replay-utxo-hash") == 0)
@@ -9931,7 +10090,9 @@ int main(int argc, char** argv)
                         embedded_asn_diversity,        // PR-4 ASN diversity
                         embedded_fold_live_db,         // PR-C1 embedded-fold-live
                         embedded_fold_live_expect,     // PR-C1 store-verify hash
-                        embedded_fold_checkscripts);   // PR-C4 input-script check
+                        embedded_fold_checkscripts,   // PR-C4 input-script check
+                        embedded_utxo_fold_fees_db,    // W5-A fold fee source
+                        embedded_utxo_fold_expect);    // W5-A anchor restatement
     }
     return run_selftest();
 }
