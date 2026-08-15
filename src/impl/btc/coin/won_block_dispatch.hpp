@@ -69,17 +69,33 @@ using P2pRelaySink = std::function<bool(const std::vector<unsigned char>&)>;
 // true iff the daemon accepted. May be empty (RPC-less).
 using SubmitRpcSink = std::function<bool(const std::string&)>;
 
+// Optional post-broadcast telemetry hook (#995/#1155 BTC found-block arm). Fired
+// AFTER a won block is reconstructed + dispatched down both broadcast arms,
+// carrying the winning share hash, the serialized parent block, and its hex.
+// main_btc binds it to MiningInterface::record_found_block +
+// schedule_block_verification so a pool-won BTC block lands on /recent_blocks and
+// enters the confirm/orphan poller. Empty by default (dashboard off / --http
+// absent): a won block still broadcasts, it is simply not recorded. TELEMETRY
+// ONLY -- it runs strictly after both broadcast arms and never gates, delays, or
+// alters a broadcast.
+using FoundBlockReporter =
+    std::function<void(const uint256& share_hash,
+                       const std::vector<unsigned char>& block_bytes,
+                       const std::string& block_hex)>;
+
 // Build the m_on_block_found handler. The run-loop assigns the returned closure
 // to tracker.m_on_block_found; `relay_p2p` may be empty (no embedded sink yet)
 // and `submit_rpc` may be empty -- broadcast_block_for_connect guards each leg.
 inline std::function<void(const uint256&)>
 make_on_block_found(WonBlockReconstructor reconstruct,
                     P2pRelaySink relay_p2p,
-                    SubmitRpcSink submit_rpc)
+                    SubmitRpcSink submit_rpc,
+                    FoundBlockReporter on_found = {})
 {
     return [reconstruct = std::move(reconstruct),
             relay_p2p   = std::move(relay_p2p),
-            submit_rpc  = std::move(submit_rpc)](const uint256& share_hash)
+            submit_rpc  = std::move(submit_rpc),
+            on_found    = std::move(on_found)](const uint256& share_hash)
     {
         if (!reconstruct) {
             LOG_ERROR << "[EMB-BTC] won-block " << share_hash.GetHex().substr(0, 16)
@@ -108,6 +124,13 @@ make_on_block_found(WonBlockReconstructor reconstruct,
             LOG_ERROR << "[EMB-BTC] won-block " << share_hash.GetHex().substr(0, 16)
                       << " reached NEITHER sink -- SUBSIDY LOST.";
         }
+
+        // #995/#1155 BTC found-block arm: surface the reconstructed win to the
+        // dashboard + confirm/orphan verdict lane (record_found_block +
+        // schedule_block_verification), STRICTLY AFTER both broadcast arms.
+        // Telemetry only -- an empty hook (no dashboard) changes nothing here,
+        // and a throw here can never touch the broadcast that already ran.
+        if (on_found) on_found(share_hash, bytes, hex);
     };
 }
 

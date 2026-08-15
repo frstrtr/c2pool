@@ -2,6 +2,7 @@
 #pragma once
 
 #include <memory>
+#include <limits>       // std::numeric_limits (found-block RPC-fallback sentinel)
 
 #include <boost/asio.hpp>
 
@@ -167,6 +168,23 @@ public:
         if (!m_rpc)
             return false;
         return m_rpc->submit_block_hex(block_hex, /*ignore_failure=*/true);
+    }
+
+    /// Found-block confirmation depth via the external bitcoind submitblock-RPC
+    /// backup (getblockheader "confirmations"). Returns INT_MIN when no external
+    /// RPC is live (embedded-only arm) so the caller falls through to the
+    /// header-chain verdict. TELEMETRY ONLY -- the dashboard found-block
+    /// verifier's fallback arm (#995/#1155 BTC arm); never a consensus or
+    /// broadcast gate. Read-only (a getblockheader query issues no write op).
+    int rpc_block_confirmations(const uint256& block_hash)
+    {
+        if (!m_rpc) return std::numeric_limits<int>::min();
+        try {
+            nlohmann::json j = m_rpc->getblockheader(block_hash, /*verbose=*/true);
+            if (j.contains("confirmations") && j["confirmations"].is_number())
+                return j["confirmations"].get<int>();
+        } catch (...) { /* unreachable / unknown -> pending */ }
+        return std::numeric_limits<int>::min();
     }
 
     /// Broadcast a WON block with FALLBACK semantics: P2P relay is primary,

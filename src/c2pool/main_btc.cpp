@@ -43,6 +43,7 @@
 #include <impl/btc/coin/template_other_txs.hpp>    // make_template_other_txs_fn bridge (#840)
 #include <impl/btc/coin/reconstruct_won_block.hpp> // make_reconstruct_closure — faithful won-block body (#839)
 #include <impl/btc/coin/won_block_dispatch.hpp>    // make_on_block_found — dual-path won-block dispatch (#744)
+#include <impl/btc/coin/block_confirm.hpp>       // #995/#1155 found-block confirm/orphan resolver
 #include <impl/btc/coin/merged_spec.hpp>          // parse --merged SPEC -> AuxChainConfig (NMC PE host-wire slice 3)
 #include <impl/btc/coin/merged_backend.hpp>       // build aux backends + merged_addr payout seam (NMC PE host-wire slice 4)
 
@@ -63,6 +64,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <ctime>            // #1155 found-block record timestamp
+#include <limits>           // #1155 found-block RPC-fallback sentinel
+#include <optional>         // #1155 found-block winner_at oracle
 #include <cstdio>           // [MEM] periodic logger reads /proc/self/status
 #if defined(__GLIBC__)
 #include <malloc.h>         // [MEM] periodic malloc_trim(0) bounds glibc pool fragmentation (glibc-only)
@@ -1481,6 +1485,17 @@ int main(int argc, char* argv[])
     LOG_INFO << "[BTC-STRATUM] sharechain write path wired (mining_submit"
              << " → create_local_share → broadcast_share + notify_local_share)";
 
+    // ── #995/#1155 BTC found-block reporter slot ──────────────────────────
+    // Bound BELOW under --http once the MiningInterface exists; the won-block
+    // dispatch (make_on_block_found, wired just below) forwards every
+    // reconstructed win through this shared slot to record_found_block +
+    // schedule_block_verification. Empty until then (or with the dashboard
+    // off): a won block still broadcasts, it is simply not recorded. TELEMETRY
+    // ONLY -- never on any broadcast/mint/target/payout path.
+    auto found_block_report = std::make_shared<
+        std::function<void(const uint256&, const std::vector<unsigned char>&,
+                           const std::string&)>>();
+
     // ── #744 won-block DISPATCH wire (reconstructor slice 7/7 — FINAL) ─────
     //
     // Un-stub tracker.m_on_block_found. A share that clears the PARENT target
@@ -1564,6 +1579,13 @@ int main(int argc, char* argv[])
                     coin->submit_block_hex_str(hex);
                 });
                 return coin->has_rpc();
+            },
+            /*on_found=*/[found_block_report](const uint256& sh,
+                                              const std::vector<unsigned char>& bytes,
+                                              const std::string& hex) {
+                // Forward to the dashboard/verdict producer once it is bound
+                // (below, under --http). No-op while unbound. Telemetry only.
+                if (*found_block_report) (*found_block_report)(sh, bytes, hex);
             });
     }
     LOG_INFO << "[BTC] won-block dispatch WIRED: m_on_block_found -> faithful"
@@ -1703,6 +1725,102 @@ int main(int argc, char* argv[])
             };
         });
 
+        // ── #995/#1155 BTC found-block record + chain-sourced confirm/orphan ─
+        // Wire the won-block reporter slot (declared above, fired by
+        // make_on_block_found AFTER both broadcast arms) to record_found_block +
+        // schedule_block_verification, and install the verdict fn that resolves a
+        // recorded block against the live chain. Mirrors the DASH/BCH call-site
+        // shape (record sites + set_block_verify_fn) -- SHAPE reference only, no
+        // cross-coin code copied. Isolation: constructs core classes / calls core
+        // MI methods, ZERO src/core edits. Both halves TELEMETRY-ONLY and strictly
+        // downstream of the block submit -- neither gates broadcast, mint, target
+        // or payout.
+        //
+        // PRODUCER. The reconstructed parent block bytes carry the 80-byte header
+        // first; the block IDENTITY hash is SHA256d(header) -- the same key the
+        // embedded HeaderChain and bitcoind getblockheader answer on.
+        *found_block_report =
+            [mi, &header_chain](const uint256& /*share_hash*/,
+                                const std::vector<unsigned char>& block_bytes,
+                                const std::string& /*block_hex*/) {
+                if (block_bytes.size() < 80) return;   // no header -> nothing to key on
+                std::vector<unsigned char> hdr(block_bytes.begin(),
+                                               block_bytes.begin() + 80);
+                uint256 block_hash = Hash(hdr);        // SHA256d(80-byte header)
+                // Height of the block we just won == the pool tip + 1.
+                uint64_t height = static_cast<uint64_t>(header_chain.height()) + 1;
+                mi->record_found_block(
+                    height, block_hash, static_cast<uint64_t>(std::time(nullptr)),
+                    /*chain=*/"BTC", /*miner=*/"", /*share_hash=*/block_hash.GetHex(),
+                    mi->get_network_difficulty(), /*share_difficulty=*/0.0,
+                    mi->get_local_hashrate(), /*subsidy=*/0);
+                mi->schedule_block_verification(block_hash.GetHex());
+                LOG_INFO << "[BTC] recorded found block hash="
+                         << block_hash.GetHex().substr(0, 16)
+                         << " -- confirm/orphan poller armed";
+            };
+
+        // VERDICT. Resolve a recorded found block against the chain: >0 accepted
+        // (best-chain depth), <0 orphaned (off the active chain), 0 pending (not
+        // yet buried, or the chain cannot answer). DAEMONLESS-FIRST off the
+        // embedded HeaderChain (authoritative best branch -- BTC feeds it live,
+        // unlike DGB), with the external bitcoind getblockheader confirmations as
+        // the always-retained fallback when the header chain has not reached the
+        // height. Mirrors the BCH set_block_verify_fn shape (per-coin isolated).
+        mi->set_block_verify_fn(
+            [mi, &header_chain, &coin_node](const std::string& hash_hex) -> int {
+                uint256 h; h.SetHex(hash_hex);
+
+                // found_height: authoritative from our own found-block record
+                // (survives an orphan whose header peers never relayed to us);
+                // else recovered from the embedded header chain.
+                uint32_t found_height = 0;
+                bool     have_height  = false;
+                for (const auto& b : mi->get_found_blocks()) {
+                    if (b.hash == hash_hex) {
+                        found_height = static_cast<uint32_t>(b.height);
+                        have_height  = true;
+                        break;
+                    }
+                }
+                if (!have_height) {
+                    if (auto e = header_chain.get_header(h)) {
+                        found_height = e->height;
+                        have_height  = true;
+                    }
+                }
+
+                if (have_height) {
+                    auto winner_at = [&header_chain](uint32_t hh)
+                        -> std::optional<uint256> {
+                        if (auto e = header_chain.get_header_by_height(hh))
+                            return e->block_hash;
+                        return std::nullopt;
+                    };
+                    int v = btc::coin::block_confirm::resolve_status(
+                        winner_at, header_chain.height(), h, found_height);
+                    // Daemonless-first: trust a definite confirmed/orphaned
+                    // verdict. A 0 (pending) with the header chain ALREADY past
+                    // found_height is a genuine shallow-pending; only fall through
+                    // to RPC when the header chain has not yet reached the height.
+                    if (v != 0) return v;
+                    if (header_chain.height() >= found_height) return 0;
+                }
+
+                // Fallback arm (header chain absent or behind): external bitcoind
+                // getblockheader confirmations. c < 0 => off the best chain.
+                int c = coin_node.rpc_block_confirmations(h);
+                if (c != std::numeric_limits<int>::min()) {
+                    if (c < 0) return -1;
+                    if (c >= static_cast<int>(
+                            btc::coin::block_confirm::kDefaultConfirmDepth))
+                        return c;
+                }
+                return 0;  // still pending
+            });
+        LOG_INFO << "[BTC-POOL] found-block confirm/orphan lane ARMED "
+                 << "(embedded HeaderChain verdict; bitcoind getblockheader fallback)";
+
         // graph_db stats persistence â survives restarts (LTC-parity site 2/3,
         // mirrors main_ltc.cpp:1967-1973). BTC-namespaced sub-dir keeps the per-coin
         // stat log isolated under the shared config path.
@@ -1811,6 +1929,8 @@ int main(int argc, char* argv[])
     //   4. coin_node (bitcoind P2P) + ioc + the rest: regular RAII at end
     //      of scope.
     LOG_INFO << "[BTC] Shutting down...";
+    // #995/#1155: unbind the found-block reporter before mi/web_server die.
+    if (found_block_report) *found_block_report = nullptr;
     stratum_server_for_shutdown.reset();
     work_source_for_shutdown.reset();
     p2p_node.reset();
