@@ -94,10 +94,20 @@ struct BlockBroadcast
 {
     bool        p2p_sent     = false;   // embedded P2P relay issued to a CONNECTED peer
     bool        rpc_ok       = false;   // submitblock returned ok OR duplicate
+    bool        rpc_armed    = false;   // submitblock RPC arm was WIRED (fired), regardless of accept/reject
     const char* landed_first = "none";  // "p2p" | "rpc" | "none"
 
     // The gate predicate: did the won block engage AT LEAST ONE broadcast sink?
     bool any() const { return p2p_sent || rpc_ok; }
+
+    // Neither-sink CAUSE disambiguation (telemetry #987). A submitblock RPC arm
+    // that was WIRED and returned false RESPONDED WITH A REJECTION (bad-chainlock
+    // / bad-cb-payee -- the reason is logged LOUDLY by NodeRPC::submit_block_hex),
+    // which is CATEGORICALLY different from an UNARMED arm (no dashd creds, the
+    // daemonless deployment). The old neither-sink line hardcoded "no dashd RPC
+    // creds", falsely reporting a consensus rejection as an absent daemon and
+    // burying the named cause. rpc_rejected() lets the caller name it correctly.
+    bool rpc_rejected() const { return rpc_armed && !rpc_ok; }
 };
 
 // Fire a won block down BOTH broadcast arms. `block_bytes` is the pre-serialized
@@ -114,6 +124,10 @@ inline BlockBroadcast broadcast_won_block(const P2pRelaySink& p2p_relay,
                                           bool prefer_rpc_first = false)
 {
     BlockBroadcast r;
+    // Record which arms were WIRED up-front so the caller can tell a REJECTION
+    // (arm fired, dashd said no -- reason already logged) apart from an UNARMED
+    // arm (no dashd creds). Independent of accept/reject, path, or ordering.
+    r.rpc_armed = static_cast<bool>(rpc_submit);
 
     // RPC-FIRST validation gate for a stale / height-race won block. The block
     // MIGHT be invalid at its real height, so when the caller asks for it AND a
