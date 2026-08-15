@@ -382,15 +382,37 @@ TEST(CoinPeerManager, DiscoveryEnabled_MaxPeers)
     PeerManagerConfig cfg;
     cfg.max_peers = 2;
     CoinPeerManager pm(ioc, "LTC", "/tmp", cfg);
-    
+    // No start() here, so the bucketed addrman is not loaded from disk and
+    // begins empty regardless of any stale /tmp DB -> its size is exact.
+
     EXPECT_TRUE(pm.discovery_enabled());
-    
+
+    // These three peers sit in THREE DISTINCT /16 network groups (45.33 /
+    // 66.42 / 89.35) so the bucketed addrman keys each into an independent
+    // new-table bucket. Same-group IPs would share one bucket and race for a
+    // single position, so a birthday collision could drop the third add and
+    // make size() flake to 2 -- dashd-correct per-netgroup bucketing, but not
+    // what this test means to measure (that discovery banks a peer past the
+    // working-set cap of 2).
     pm.add_discovered_peer(NetService("45.33.32.1", 9333));
-    pm.add_discovered_peer(NetService("45.33.32.2", 9333));
-    EXPECT_FALSE(pm.discovery_enabled()); // at max
-    
-    pm.add_discovered_peer(NetService("45.33.32.3", 9333)); // rejected
-    EXPECT_EQ(pm.peer_count(), 2);
+    pm.add_discovered_peer(NetService("66.42.10.2", 9333));
+    // max_peers is now ONLY the working-set / outbound-dial cap: the active
+    // dial set stays capped at 2 ...
+    EXPECT_EQ(pm.peer_count(), 2u);
+    // ... but discovery does NOT stop at the cap anymore. The bucketed
+    // addrman is the getaddr sink and keeps banking gossip until it reaches
+    // table capacity (dashd behaviour). The old assertion that discovery
+    // halts at max_peers encoded the pre-port bug that starved daemonless
+    // block download of dial candidates.
+    EXPECT_TRUE(pm.discovery_enabled());
+
+    // A candidate beyond the working-set cap is still banked into the
+    // addrman (up to bucket capacity) even though it does not enter the
+    // active dial set -- exactly the memory the flat working set lacked.
+    pm.add_discovered_peer(NetService("89.35.131.3", 9333));
+    EXPECT_EQ(pm.peer_count(), 2u);        // outbound set stays capped
+    EXPECT_EQ(pm.addrman().size(), 3u);    // addrman banked all three
+    EXPECT_TRUE(pm.discovery_enabled());   // and keeps harvesting
 }
 
 TEST(CoinPeerManager, PruneDead)
