@@ -90,19 +90,32 @@ inline DashChainParams make_dash_chain_params_mainnet() {
     };
     p.block_hash_func = p.pow_func;
 
-    // Fast-start checkpoint: Dash mainnet block 2400000 (2025-01-04).
-    // Cold start skips 2.4M headers of validation, saving ~30s syncing
-    // from genesis. A CLI override (--dash-header-checkpoint) can bump
-    // this forward for even faster first-starts. Matches c2pool-ltc's
-    // --header-checkpoint pattern.
+    // Fast-start checkpoint: PINNED TO COINCIDE WITH THE MN-SET BRIDGE
+    // ANCHOR (dash_mn_checkpoint_mainnet.inc, height 2513000). Cold start
+    // seeds the header tip AT the anchor, skipping ~2.5M headers of
+    // validation from genesis.
     //
-    // chosen to be ~50k blocks behind current tip; old enough that
-    // stale binaries still work without override, recent enough to
-    // skip nearly all historical sync cost.
+    // WHY IT MUST EQUAL THE MN ANCHOR (2026-08-16 cold-cut incident). The
+    // MN-set fold (mn_checkpoint_lane) cannot begin until the header tip
+    // REACHES its anchor height -- until then it reports
+    // waiting_for()=="header-tip-to-reach-anchor@h=2513000". When this
+    // checkpoint sat 113k blocks BELOW the anchor (the old 2400000 pin), a
+    // fresh --coin-rpc-removed data-dir spent ~113000/~60 hdr/s ~= 31 min
+    // crawling headers forward BEFORE the first fold could start, so every
+    // stratum rig timed out before the first embedded template was served
+    // (have_tip=0 / populated=0 for >14 min). Coinciding the two collapses
+    // that gap: hdr_tip >= anchor at t~=0, and only the residual
+    // anchor->tip folds. See test_dash_header_checkpoint_coincide.cpp.
+    //
+    // This mints NO new consensus data: the height/hash below are the SAME
+    // release-pinned trust anchor the MN checkpoint already commits to and
+    // cross-checks the header chain against (mn_checkpoint_lane position
+    // verify). The coincidence is machine-enforced by that KAT, so the two
+    // pins can never silently drift apart again.
     p.fast_start_checkpoint = DashChainParams::Checkpoint{};
-    p.fast_start_checkpoint->height = 2400000;
+    p.fast_start_checkpoint->height = 2513000;
     p.fast_start_checkpoint->hash.SetHex(
-        "000000000000002883c9151a37092287c1773c5a4d175a8f688373daa631f934");
+        "000000000000002114d621d90f28b52c07746414491cbffc7cd373b3a56bc950");
     return p;
 }
 
