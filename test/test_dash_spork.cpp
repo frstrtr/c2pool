@@ -428,15 +428,18 @@ TEST(DashSpork, VerifiedSporkRefinesClientStateAndBadSigDoesNot)
     EXPECT_EQ(j["spork-rejected-sig"].get<uint64_t>(), 1u);
 }
 
-TEST(DashSpork, TruncatedSporkIsContainedBySignatureGateNeverCostsThePeer)
+TEST(DashSpork, TruncatedSporkIsDroppedAtParseNeverCostsThePeer)
 {
     // The counterpart hazard to non-registration: REGISTERED but unparseable.
-    // This codec does NOT reject a truncated payload at parse time —
-    // MessageHandler::add_handlers swallows the unserialize throw and delivers
-    // the partially-read message anyway (the known registered-but-unparseable
-    // seam). For spork that is safe BY CONSTRUCTION: the surviving fields
-    // cannot carry a valid 65-byte signature, so the verification gate rejects
-    // the message before any state is touched — and the peer is kept.
+    // MessageHandler used to swallow the unserialize throw and deliver the
+    // partially-read message (the registered-but-unparseable seam) — spork
+    // survived that only BY CONSTRUCTION, because the surviving fields could
+    // not carry a valid 65-byte signature. Since the 842284 merkle-bind
+    // livelock hardening, types without an m_raw_payload raw-bytes fallback
+    // RETHROW out of the codec instead: the dispatch guard logs and drops the
+    // message before any handler sees it, so it never reaches the signature
+    // gate at all. The invariants that matter are unchanged and asserted
+    // here: the peer is kept, and spork state is untouched.
     SporkRig rig;
     rig.handshake(1);
     const auto rejected_before = rig.client.spork_state().counters().rejected_sig;
@@ -446,8 +449,8 @@ TEST(DashSpork, TruncatedSporkIsContainedBySignatureGateNeverCostsThePeer)
 
     EXPECT_TRUE(rig.client.is_handshake_complete()) << "garbage spork cost the peer";
     EXPECT_EQ(rig.client.connected_peer_count(), 1u);
-    EXPECT_EQ(rig.client.spork_state().counters().rejected_sig, rejected_before + 1)
-        << "a truncated spork was not rejected by the signature gate";
+    EXPECT_EQ(rig.client.spork_state().counters().rejected_sig, rejected_before)
+        << "a truncated spork must be dropped at parse, before the signature gate";
     EXPECT_EQ(rig.client.spork_state().counters().applied, 0u);
     EXPECT_EQ(rig.client.spork_state().listener_refined_count(), 0u)
         << "a truncated spork mutated the state";

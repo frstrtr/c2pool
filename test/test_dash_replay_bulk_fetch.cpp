@@ -680,6 +680,57 @@ TEST(DashReplayHeaderBackfill, AnchorJoinMismatchFailsClosed)
     EXPECT_FALSE(bf.hash_at(5).has_value());
 }
 
+// Restart-resume (vm905 fold, 2026-08-15): persist_full_chunks() writes
+// m_hashes[0] onward, so chunk 0 already carries genesis in slot 0 — while
+// the constructor seeds the walker with genesis BEFORE load_persisted().
+// Appending the store onto that seed shifted every persisted hash up one
+// height, so the JOIN CHECK read height (anchor-1)'s hash at the anchor index
+// and a byte-perfect store failed closed with anchor-join-mismatch on EVERY
+// restart. This walks past one full CHUNK_SPAN, persists, destroys the
+// walker, reloads from the same store, and must resume at the exact chunk
+// boundary and still join the anchor. Red on the shifted reload; green when
+// the reload rebuilds the walker from the store alone.
+TEST(DashReplayHeaderBackfill, RestartResumeRejoinsAnchor)
+{
+    const uint32_t ANCHOR = rp::HeaderBackfill::CHUNK_SPAN + 2000;   // 12000
+    BackfillChain bc(ANCHOR);
+    uint256 pow_limit;
+    pow_limit.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    const std::string db_path = testing::TempDir() + "/backfill_resume_kat";
+    std::filesystem::remove_all(db_path);
+
+    {   // Run 1: walk past the chunk boundary, join, persist, shut down.
+        rp::HeaderBackfill bf(bc.genesis, ANCHOR, bc.hashes[ANCHOR], pow_limit,
+                              db_path, /*check_pow=*/false);
+        for (uint32_t h = 1; h <= ANCHOR && !bf.complete(); h += 2000)
+            bf.add_headers(bc.batch(h, 2000));
+        ASSERT_TRUE(bf.complete());
+        ASSERT_FALSE(bf.failed());
+    }
+
+    // Run 2: a fresh process resumes from the persisted chunks.
+    rp::HeaderBackfill bf2(bc.genesis, ANCHOR, bc.hashes[ANCHOR], pow_limit,
+                           db_path, /*check_pow=*/false);
+    // The resume must NOT fail closed on its own byte-perfect store.
+    ASSERT_FALSE(bf2.failed()) << bf2.fail_cause();
+    // Only full chunks persist: resume lands exactly at the chunk boundary
+    // (height CHUNK_SPAN-1), not one above it (the double-genesis shift).
+    EXPECT_EQ(bf2.tip_height(), rp::HeaderBackfill::CHUNK_SPAN - 1);
+
+    // The partial tail re-fetches and the walk joins the anchor again.
+    auto tail = bc.batch(rp::HeaderBackfill::CHUNK_SPAN, 2001);
+    EXPECT_TRUE(bf2.claims(tail));
+    bf2.add_headers(tail);
+    ASSERT_TRUE(bf2.complete()) << bf2.fail_cause();
+    EXPECT_FALSE(bf2.failed());
+    // And the served index is height-exact against the source chain.
+    ASSERT_TRUE(bf2.hash_at(rp::HeaderBackfill::CHUNK_SPAN - 1).has_value());
+    EXPECT_EQ(*bf2.hash_at(rp::HeaderBackfill::CHUNK_SPAN - 1),
+              bc.hashes[rp::HeaderBackfill::CHUNK_SPAN - 1]);
+    EXPECT_EQ(*bf2.hash_at(ANCHOR), bc.hashes[ANCHOR]);
+    std::filesystem::remove_all(db_path);
+}
+
 // ═══ (H) capture cache ════════════════════════════════════════════════════
 
 TEST(DashReplayBulkCapture, SegmentRoundTripAndTornTail)
