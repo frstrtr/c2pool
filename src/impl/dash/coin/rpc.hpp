@@ -40,6 +40,8 @@
 #include "rpc_data.hpp"
 #include "node_interface.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <ctime>
 #include <functional>
 #include <iostream>
@@ -98,6 +100,27 @@ private:
     std::string m_userpass;
     bool m_connected = false;
     std::unique_ptr<core::Timer> m_reconnect_timer;
+
+    // DASHD-CUT sync-reconnect backoff (hotel-reserve thrash fix). sync_reconnect()
+    // is called synchronously from Send() (under m_rpc_mutex) on every write/read
+    // failure and, unlike the async connect() path, had NO backoff: against a dead
+    // dashd "Connection refused" returns instantly, so Send() re-drove it ~30/s
+    // (17804 attempts in ~10 min at the hotel-reserve reserve). These bound that:
+    // after a FAILED sync reconnect we refuse to re-attempt the socket until the
+    // backoff window elapses (Send() returns empty; the embedded/null arm keeps
+    // serving), doubling the window 1->2->4->...->kSyncBackoffMaxSecs. A SUCCESS
+    // resets it to 0. All accessed only under m_rpc_mutex (sync_reconnect is only
+    // ever entered from inside Send(), which holds it).
+    static constexpr int kSyncBackoffMaxSecs = 30;
+    std::chrono::steady_clock::time_point m_sync_backoff_until{};
+    int      m_sync_backoff_secs = 0;   // 0 = no active backoff
+    // Observability (read-only; test + log). Counts genuine socket attempts (NOT
+    // window-skipped calls): under the fix this stays tiny against a dead dashd
+    // where it used to equal the Send()-retry count. Atomic so a diagnostic
+    // reader off the io thread is race-free; only sync_reconnect() (under the
+    // mutex) writes it.
+    std::atomic<uint64_t> m_sync_reconnect_attempts{0};
+    void bump_sync_backoff();
     // Reconnect-churn observer (stale-payee fix): fired whenever the RPC
     // connection is torn down / re-established (reconnect(), sync_reconnect()).
     // main_dash.cpp wires this to DASHWorkSource::invalidate_template_cache()
@@ -145,6 +168,13 @@ public:
     /// Register the reconnect-churn observer (see m_on_reconnect). Call once
     /// at startup before the io loop runs.
     void set_on_reconnect(std::function<void()> fn) { m_on_reconnect = std::move(fn); }
+    /// DASHD-CUT observability (read-only). Number of genuine sync-reconnect
+    /// SOCKET attempts made (window-skipped calls are NOT counted): a dead-dashd
+    /// hot spin shows up here as a large number; under the backoff fix it stays
+    /// tiny. The current backoff window (seconds; 0 when healthy) is the second
+    /// gauge. Both are the KAT's proof that the ~30/s churn is bounded.
+    uint64_t sync_reconnect_attempts() const { return m_sync_reconnect_attempts.load(); }
+    int      sync_backoff_secs() const { return m_sync_backoff_secs; }
     bool check();
     bool check_blockheader(uint256 header);
 

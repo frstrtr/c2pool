@@ -9,6 +9,8 @@
 
 #include <util/strencodings.h>   // ParseHex / HexStr
 
+#include <algorithm>             // std::min (sync-reconnect backoff)
+
 #ifndef _WIN32
 #include <sys/socket.h>          // setsockopt SO_SND/RCVTIMEO (Send() deadline)
 #include <sys/time.h>            // struct timeval
@@ -133,31 +135,79 @@ void NodeRPC::reconnect()
     m_reconnect_timer->start(15, [this]() { connect(m_address, m_userpass); });
 }
 
+void NodeRPC::bump_sync_backoff()
+{
+    // Exponential 1 -> 2 -> 4 -> ... capped at kSyncBackoffMaxSecs. Called only
+    // on a FAILED sync reconnect, under m_rpc_mutex.
+    m_sync_backoff_secs = (m_sync_backoff_secs <= 0)
+                              ? 1
+                              : std::min(m_sync_backoff_secs * 2, kSyncBackoffMaxSecs);
+    m_sync_backoff_until =
+        std::chrono::steady_clock::now() + std::chrono::seconds(m_sync_backoff_secs);
+}
+
 void NodeRPC::sync_reconnect()
 {
-    // Stale-payee fix: fire the churn observer FIRST — the caller (Send) is
-    // about to retry against a fresh connection; any template cached from the
-    // dead connection's era is suspect and must be invalidated.
-    if (m_on_reconnect)
-        m_on_reconnect();
+    // DASHD-CUT thrash fix (hotel-reserve 2026-08-15). Two changes vs the old
+    // "fire observer FIRST, then blindly re-attempt" body:
+    //
+    //  (1) BACKOFF (no hot spin): a dead dashd returns "Connection refused"
+    //      instantly, so Send() used to re-drive this ~30/s. After a failed
+    //      attempt we refuse to touch the socket again until the backoff window
+    //      elapses -- Send() returns empty, and the embedded/null arm keeps
+    //      serving. The window is bypassed the instant dashd is reachable again
+    //      (the first post-window attempt succeeds and resets it).
+    //
+    //  (2) INVALIDATION DECOUPLED FROM FAILURE: the churn observer
+    //      (m_on_reconnect -> DASHWorkSource::invalidate_template_cache) now
+    //      fires ONLY after a SUCCESSFUL reconnect -- the sole moment dashd's
+    //      tip (and thus the masternode payee) may actually have moved. The old
+    //      body fired it unconditionally at the TOP, so every one of those ~30/s
+    //      failed attempts dropped a VALID cached embedded template and bumped
+    //      the work generation, starving the working embedded arm. A failed
+    //      reconnect changes nothing on-chain, so it must invalidate nothing.
+    //
+    // REWARD-SAFETY: a successful reconnect still invalidates (stale-payee class
+    // preserved); the tip-aware observer on the fallback arm still probes and
+    // fail-safe-invalidates. When dashd is ALIVE, the first attempt succeeds, no
+    // backoff engages, and behaviour is byte-identical to before.
+    const auto now = std::chrono::steady_clock::now();
+    if (m_sync_backoff_secs > 0 && now < m_sync_backoff_until) {
+        // Cooling down after a recent failure: do NOT attempt, do NOT invalidate.
+        return;
+    }
 
     beast::error_code ec;
     m_stream.socket().shutdown(io::ip::tcp::socket::shutdown_both, ec);
     m_stream.close();
 
+    m_sync_reconnect_attempts.fetch_add(1, std::memory_order_relaxed);
+
     // Blocking resolve + connect for immediate retry
     auto results = m_resolver.resolve(m_address.address(), m_address.port_str(), ec);
     if (ec) {
-        LOG_WARNING << "CoindRPC sync_reconnect resolve failed: " << ec.message();
+        bump_sync_backoff();
+        LOG_WARNING << "CoindRPC sync_reconnect resolve failed: " << ec.message()
+                    << " -- backing off " << m_sync_backoff_secs << "s "
+                       "(no cache invalidation on a failed reconnect)";
         return;
     }
     m_stream.connect(*results.begin(), ec);
     if (ec) {
-        LOG_WARNING << "CoindRPC sync_reconnect connect failed: " << ec.message();
+        bump_sync_backoff();
+        LOG_WARNING << "CoindRPC sync_reconnect connect failed: " << ec.message()
+                    << " -- backing off " << m_sync_backoff_secs << "s "
+                       "(no cache invalidation on a failed reconnect)";
         return;
     }
     apply_socket_timeouts();   // re-arm the Send() deadline on the fresh socket
+    // SUCCESS: reset the backoff and NOW fire the churn observer -- a live
+    // reconnect is the only point at which the cached template/payee may be
+    // stale (dashd's tip could have advanced while we were disconnected).
+    m_sync_backoff_secs = 0;
     LOG_INFO << "CoindRPC reconnected (sync)";
+    if (m_on_reconnect)
+        m_on_reconnect();
 }
 
 void NodeRPC::close_stream()

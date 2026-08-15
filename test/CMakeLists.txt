@@ -545,6 +545,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_rpc_conf PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
     gtest_add_tests(test_dash_rpc_conf "" AUTO)
 
+    # DASHD-CUT arm-authority + reconnect-thrash KAT (hotel-reserve 2026-08-15).
+    # SEAM 1 resolve_dashd_arm() (pure, cut-mode disarm), SEAM 2 sync-reconnect
+    # backoff (no ~30/s hot spin against a dead dashd), SEAM 3 cache-invalidation
+    # decoupled from reconnect FAILURE. Links the real dash_rpc lib (coin/rpc.cpp)
+    # to drive NodeRPC::sync_reconnect against dead + live loopback endpoints.
+    add_executable(test_dash_dashd_cut_arm test_dash_dashd_cut_arm.cpp)
+    target_link_libraries(test_dash_dashd_cut_arm PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_rpc dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_dashd_cut_arm PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
+    gtest_add_tests(test_dash_dashd_cut_arm "" AUTO)
+
     # DASH in-memory mempool (S7 leaf): storage + UTXO-fee + LRU eviction +
     # double-spend conflict removal + feerate-sorted selection. Header-only over
     # block/transaction/utxo_adapter + core/coin; no ltc/pool SCC dependency.

@@ -934,16 +934,31 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
     dash::interfaces::Node coin_state;
     std::unique_ptr<dash::coin::NodeRPC> rpc;
-    if (conf.armed()) {
+    // DASHD-CUT arm authority (hotel-reserve thrash fix). The dashd-fallback
+    // CoindRPC is constructed ONLY when the operator EXPLICITLY named a coin RPC
+    // -- via --coin-rpc / --coin-daemon (endpoint), --coin-rpc-auth (creds path),
+    // or a dashd-only one-shot on this path (--submit-block) -- AND creds
+    // resolved. With NONE of those the node is in DAEMONLESS CUT MODE: rpc stays
+    // nullptr, the embedded/null arm is authoritative, and a stray
+    // ~/.dashcore/dash.conf can no longer re-arm a hot-spinning fallback behind
+    // the operator's back (conf.armed() alone used to do exactly that, which is
+    // why removing --coin-rpc was cosmetic). See rpc_conf.hpp::resolve_dashd_arm.
+    const bool coin_rpc_requested =
+        !rpc_endpoint.empty() || !rpc_conf_path.empty() || !submit_hex.empty();
+    const dash::coin::DashdArmDecision arm_decision =
+        dash::coin::resolve_dashd_arm(coin_rpc_requested, conf.armed());
+    if (arm_decision.construct_rpc) {
         rpc = std::make_unique<dash::coin::NodeRPC>(&ioc, &coin_state, testnet);
         rpc->connect(NetService(conf.host, conf.port), conf.userpass());
         std::cout << "[run] external-daemon submit arm ARMED: NodeRPC -> "
-                  << conf.host << ":" << conf.port << " (creds from dash.conf)\n";
+                  << conf.host << ":" << conf.port << " (creds from dash.conf) -- "
+                  << arm_decision.reason << "\n";
     } else {
-        std::cout << "[run] external-daemon submit arm UNARMED "
-                     "(no dash.conf creds / no port); the embedded coin-P2P relay "
-                     "is the primary won-block path (daemonless) when "
-                     "--coin-p2p-connect is set.\n";
+        std::cout << "[run] external-daemon submit arm DISARMED -- "
+                  << arm_decision.reason
+                  << ".\n[run]       the embedded coin-P2P relay is the primary "
+                     "won-block path (daemonless) when --coin-p2p-connect / "
+                     "--coin-p2p-discover is set.\n";
     }
 
     // One-shot submit: the G2 won-block-reaches-network evidence path.
