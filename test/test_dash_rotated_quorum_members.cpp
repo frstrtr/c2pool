@@ -702,6 +702,80 @@ TEST(DashRotatedQuorumMembers, EvictedRetentionReRequestsInsteadOfWedging)
     EXPECT_EQ(m->size(), kQuorumSz);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// #1176 — SLOT-AWARE READINESS. The reorg twin of the qi=11 wedge: not "was
+// too early" but "was right, then the chain moved". A rotated cycle is
+// PREFETCHED with all 32 slot headers held, so every slot serves and the cycle
+// is memoised by (type, cycleBase). A reorg then swaps the TOP-slot header
+// (cycleBase+31). Its member set is UNCHANGED — it derives from the cycle work
+// blocks, which did not move — but its quorumHash, the serve key, is new. On
+// master the memo latches the cycle "done": prefetch never re-walks it, and no
+// qfcommit for the new quorum need arrive before its mining window, so the new
+// header's slot is UNDERIVABLE and strands. The fix records the header each
+// slot was derived under and, on the next tip, re-derives the swapped slot from
+// the RETAINED cycle compute — same bytes, new key.
+//
+// RED on master: lookup(new_hash) is nullopt (the slot stranded).
+// GREEN after:   lookup(new_hash) serves the slot, byte-identical to slot 31.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashRotatedQuorumMembers, ReorgOfATopSlotHeaderReDerivesNotStrands)
+{
+    SourceHarness h;
+    h.load();
+    auto src = h.make();
+
+    // A live tip AT the last slot header, so the whole cycle is prefetchable:
+    // last_slot_h = cycleBase + signingActiveQuorumCount-1 = 1520064 + 31.
+    const uint32_t tip = kCycleBase + (kNQuorums - 1);   // 1520095
+
+    // PREFETCH exactly as the tip callback does, then satisfy the getqrinfo it
+    // emits: now all 32 slots are ready and the cycle is memoised as "done".
+    src.prefetch_cycle(tip);
+    ASSERT_EQ(h.sends, 1) << "prefetch must emit one getqrinfo for the cycle";
+    ASSERT_TRUE(src.on_qrinfo(h.info).has_value());
+    ASSERT_EQ(src.ready_count(), kNQuorums);
+    ASSERT_EQ(src.retained_cycle_count(), 1u);
+
+    const uint32_t qi = kNQuorums - 1;                    // top slot, index 31
+    const uint256 old_hash = h.by_height[kCycleBase + qi];
+    ASSERT_TRUE(src.lookup(kType, old_hash).has_value())
+        << "precondition: the top slot serves under its original header";
+
+    // REORG: the block at cycleBase+31 is replaced by a different one. The
+    // member SET is unchanged; only the quorum HASH (the m_ready key) is new.
+    uint256 new_hash;
+    new_hash.SetHex("dd" + std::string(60, '0') + "1f");
+    ASSERT_NE(new_hash, old_hash);
+    ASSERT_FALSE(src.lookup(kType, new_hash).has_value())
+        << "the new header is not yet a serve key";
+    h.by_height[kCycleBase + qi] = new_hash;
+
+    // The ordinary next tip callback, one block on inside the SAME cycle. On
+    // master this is a no-op for the memoised cycle; the fix re-derives the
+    // swapped slot in reconcile_rotated_slots() at the top of prefetch_cycle.
+    src.prefetch_cycle(tip + 1);
+
+    // The re-derivation reuses the retained compute — no second 600 kB reply.
+    EXPECT_EQ(h.sends, 1)
+        << "re-derivation must reuse the retained cycle, not re-request qrinfo";
+
+    // GREEN: the slot serves under its NEW header. RED on master: nullopt here.
+    auto m = src.lookup(kType, new_hash);
+    ASSERT_TRUE(m.has_value())
+        << "#1176: a reorg that swaps a top-slot header must re-derive the slot "
+           "under the new hash, not strand it for the whole mining window";
+    EXPECT_EQ(m->size(), kQuorumSz);
+
+    // Byte parity: the re-derived slot is EXACTLY the full-cycle compute's slot
+    // 31 — the same ordered key sequence merkleRootQuorums folds over.
+    RealInputs in;
+    ASSERT_TRUE(in.load());
+    RotatedQuorumParams p{kType, kQuorumSz, kNQuorums};
+    auto sets = compute_quorum_members_by_quarter_rotation(p, in.cycles, in.snaps);
+    ASSERT_TRUE(sets.has_value());
+    EXPECT_EQ(key_sequence(*m), key_sequence((*sets)[qi]));
+}
+
 // A tampered operator key breaks the SML root, so the WHOLE cycle fails closed
 // and nothing reaches m_ready — the serve-a-bad-member-set gate, now at the
 // point where a member set actually would have been served.
