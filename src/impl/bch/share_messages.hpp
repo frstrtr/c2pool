@@ -121,7 +121,11 @@ struct ShareMessage
     static std::optional<size_t> unpack(const unsigned char* data, size_t len,
                                         size_t offset, ShareMessage& out)
     {
-        if (len - offset < 8) return std::nullopt;
+        // #1129: self-guard. offset and len are size_t; if a caller passes
+        // offset > len, `len - offset` underflows to a huge value and the
+        // `< 8` check passes, letting the memcpy read out of bounds. Reject
+        // offset past the end BEFORE the subtraction.
+        if (offset > len || len - offset < 8) return std::nullopt;
 
         std::memcpy(&out.msg_type, data + offset, 1);
         std::memcpy(&out.wire_flags, data + offset + 1, 1);
