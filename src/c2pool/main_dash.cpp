@@ -2539,9 +2539,23 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 p2p_relay, rpc_submit, block_bytes, block_hex,
                 /*prefer_rpc_first=*/height_race);
             if (!bcast.any()) {
-                std::cout << "[DASH-STRATUM-BLOCK] reached NEITHER sink "
-                             "(no embedded P2P peer AND no dashd RPC creds) -- "
-                             "won block NOT broadcast\n";
+                // #987: a submitblock RPC arm that FIRED and was REJECTED (e.g.
+                // bad-chainlock / bad-cb-payee) is NOT the no-creds path. The
+                // rejection REASON was already logged LOUDLY by
+                // NodeRPC::submit_block_hex above; name the cause here instead of
+                // the old hardcoded "no dashd RPC creds", which mislabelled a
+                // consensus rejection as an absent daemon.
+                if (bcast.rpc_rejected()) {
+                    std::cout << "[DASH-STRATUM-BLOCK] reached NEITHER sink: dashd "
+                                 "submitblock RPC REJECTED the block (see the "
+                                 "submit_block_hex reason logged above) and no "
+                                 "embedded P2P relay landed it -- won block NOT "
+                                 "broadcast\n";
+                } else {
+                    std::cout << "[DASH-STRATUM-BLOCK] reached NEITHER sink "
+                                 "(no embedded P2P peer AND no dashd RPC creds) -- "
+                                 "won block NOT broadcast\n";
+                }
                 return false;
             }
             std::cout << "[DASH-STRATUM-BLOCK] relayed: p2p="

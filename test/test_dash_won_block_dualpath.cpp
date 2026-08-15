@@ -324,6 +324,92 @@ TEST(DashWonBlockDualPath, HeightRaceDaemonlessStillRelaysPrimary)
     EXPECT_TRUE(r.any());
 }
 
+// ── #987 NEITHER-SINK CAUSE: reject-with-reason vs no-creds ──────────────────
+//
+// The neither-sink telemetry defect. When a won block reaches NO sink, the
+// caller (main_dash.cpp) used to hardcode "no dashd RPC creds" -- but that is
+// FALSE when the submitblock RPC arm actually FIRED and dashd REJECTED the block
+// (bad-chainlock / bad-cb-payee). A rejection is a consensus verdict whose reason
+// is logged by NodeRPC::submit_block_hex; the no-creds path is a daemonless
+// deployment with no arm at all. broadcast_won_block must let the caller tell
+// them apart: rpc_armed records that the arm FIRED, and rpc_rejected() ==
+// (armed && !ok) is the "responded-with-a-rejection" predicate the neither-sink
+// branch keys on. These KATs lock that distinction at the dispatcher seam.
+
+// 11) An ARMED submitblock arm that dashd REJECTED, with no P2P peer, reaches
+//     neither sink -- but it is a REJECTION (reason logged), NOT the no-creds
+//     path: rpc_armed is true and rpc_rejected() is true.
+TEST(DashWonBlockDualPath, RpcRejectedIsNamedRejectionNotNoCreds)
+{
+    const auto block = make_block_bytes();
+    const std::string block_hex = to_hex(block);
+
+    // ARM B fires and dashd REJECTS (e.g. bad-chainlock); no embedded P2P peer.
+    int submit_calls = 0;
+    RpcSubmitSink rpc = [&](const std::string&) -> bool { ++submit_calls; return false; };
+
+    const auto r = broadcast_won_block(/*p2p=*/{}, rpc, block, block_hex);
+
+    ASSERT_EQ(submit_calls, 1);        // the arm DID fire...
+    EXPECT_FALSE(r.any());             // ...and the block reached neither sink
+    EXPECT_TRUE(r.rpc_armed);          // arm was WIRED (fired)
+    EXPECT_FALSE(r.rpc_ok);            // dashd rejected it
+    EXPECT_TRUE(r.rpc_rejected());     // => a rejection with a reason, NOT no-creds
+}
+
+// 12) The genuine no-creds path stays no-creds: a daemonless deployment (no RPC
+//     arm) with no P2P peer reaches neither sink, but rpc_armed is false, so
+//     rpc_rejected() is false -- this really IS "no dashd RPC creds".
+TEST(DashWonBlockDualPath, DaemonlessNeitherSinkIsNotARejection)
+{
+    const auto block = make_block_bytes();
+    const std::string block_hex = to_hex(block);
+
+    const auto r = broadcast_won_block(/*p2p=*/{}, /*rpc=*/{}, block, block_hex);
+
+    EXPECT_FALSE(r.any());
+    EXPECT_FALSE(r.rpc_armed);         // arm never wired -> genuinely no creds
+    EXPECT_FALSE(r.rpc_rejected());    // NOT a rejection
+}
+
+// 13) The height-race reject path is ALSO a named rejection, not no-creds: the
+//     RPC-first gate fires the arm, dashd rejects, the P2P relay is gated off,
+//     and the block reaches neither sink -- rpc_rejected() must still be true.
+TEST(DashWonBlockDualPath, HeightRaceRejectIsNamedRejectionNotNoCreds)
+{
+    const auto block = make_block_bytes();
+    const std::string block_hex = to_hex(block);
+
+    RpcSubmitSink rpc = [&](const std::string&) -> bool { return false; };  // dashd REJECTS
+    P2pRelaySink  p2p = [&](const std::vector<unsigned char>&) -> bool { return true; };
+
+    const auto r = broadcast_won_block(p2p, rpc, block, block_hex,
+                                       /*prefer_rpc_first=*/true);
+
+    EXPECT_FALSE(r.any());
+    EXPECT_TRUE(r.rpc_armed);
+    EXPECT_FALSE(r.rpc_ok);
+    EXPECT_TRUE(r.rpc_rejected());     // named rejection, never "no dashd RPC creds"
+}
+
+// 14) Positive-arm sanity: whenever the RPC arm is wired, rpc_armed is true even
+//     on ACCEPT -- rpc_rejected() is then false (accepted, not rejected). Guards
+//     against rpc_armed collapsing into "rejected".
+TEST(DashWonBlockDualPath, RpcArmedTrueOnAcceptAndNotRejected)
+{
+    const auto block = make_block_bytes();
+    const std::string block_hex = to_hex(block);
+
+    RpcSubmitSink rpc = [&](const std::string&) -> bool { return true; };   // dashd ACCEPTS
+
+    const auto r = broadcast_won_block(/*p2p=*/{}, rpc, block, block_hex);
+
+    EXPECT_TRUE(r.any());
+    EXPECT_TRUE(r.rpc_armed);
+    EXPECT_TRUE(r.rpc_ok);
+    EXPECT_FALSE(r.rpc_rejected());    // accepted -> not a rejection
+}
+
 // 8) E5 --coin-p2p-magic override: the embedded coin-P2P wire magic selector.
 //    No override -> the mainnet/testnet defaults are returned BYTE-FOR-BYTE
 //    unchanged (guards the production ARM A dial from regression). An override
