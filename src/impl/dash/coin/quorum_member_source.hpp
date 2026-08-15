@@ -135,6 +135,7 @@
 #include <set>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace dash {
@@ -278,6 +279,20 @@ public:
     void prefetch_cycle(uint32_t tip_height)
     {
         if (tip_height == 0) return;
+        // #1176 SLOT-AWARE READINESS. Before walking the prefetch memo, honour
+        // reorgs: a rotated cycle is memoised by (type, cycleBase) and never
+        // re-walked, so a reorg that swaps a TOP-slot header (cycleBase+qi for a
+        // high qi) after the cycle was prefetched would strand that slot — its
+        // m_ready entry is keyed by a block hash no longer on the chain, and the
+        // memo suppresses any re-derivation. The serve gate fails CLOSED there
+        // (qc-plan-underivable, never a bad block), but the SLOT is lost for its
+        // whole mining window. reconcile_rotated_slots() detects the swap by the
+        // header each published slot was derived under and re-derives the
+        // changed slot from the retained cycle compute — the SAME republish path
+        // the qi=11 late-slot wedge uses, reached by reorg-detection instead of a
+        // qfcommit kick. It runs on EVERY tip (including catch-up), because a
+        // reorg is exactly the event the catch-up gate below would skip.
+        reconcile_rotated_slots();
         // CATCH-UP GATE. The tip callback fires once per headers MESSAGE, and
         // add_headers coalesces up to 2000 headers into one — so during a cold
         // start or a long resync each call arrives ~2000 blocks above the last.
@@ -438,7 +453,7 @@ public:
             // (request() already returned above when this slot key is ready,
             // so reaching here means the slot is genuinely unsourced.)
             if (try_republish_rotated_slot(key, llmq_type, *cycle_hash,
-                                           quorum_index))
+                                           cycle_h, quorum_index))
                 return;
             request_rotated(llmq_type, *cycle_hash);
             return;
@@ -804,6 +819,10 @@ public:
             if (!qh || qh->IsNull()) continue;
             insert_ready(Key{in.llmq_type, *qh},
                          std::vector<vendor::MemberOperatorKey>((*sets)[qi]));
+            // #1176: remember the header this slot was derived under, so a later
+            // reorg that swaps it is detectable in reconcile_rotated_slots().
+            record_slot_derivation(in.llmq_type, in.cycle_base_height,
+                                   static_cast<uint32_t>(qi), *qh);
             ++published;
         }
         retain_cycle(Key{in.llmq_type, in.quorum_hash}, std::move(*sets));
@@ -982,6 +1001,26 @@ private:
     std::set<uint64_t> m_prefetched_cycles;
     uint32_t           m_last_prefetch_tip{0};
 
+    // #1176 SLOT-AWARE READINESS memo: the block hash each published rotated
+    // slot was derived under, so reconcile_rotated_slots() can detect a reorg
+    // that swaps a top-slot header and re-derive instead of stranding it.
+    // Bounded by wholesale clear past the cap (128 cycles x 32 slots), the same
+    // discipline as m_prefetched_cycles.
+    static constexpr size_t kSlotDeriveMemoMax = 4096;
+    struct SlotDeriveKey {
+        uint8_t  llmqType;
+        uint32_t cycle_base_height;
+        uint32_t quorum_index;
+        bool operator<(const SlotDeriveKey& r) const
+        {
+            if (llmqType != r.llmqType) return llmqType < r.llmqType;
+            if (cycle_base_height != r.cycle_base_height)
+                return cycle_base_height < r.cycle_base_height;
+            return quorum_index < r.quorum_index;
+        }
+    };
+    std::map<SlotDeriveKey, uint256> m_slot_derived_from;
+
     const LlmqParamsView* params_for(uint8_t type) const
     {
         for (const auto& p : enabled_llmqs(m_net))
@@ -1076,6 +1115,7 @@ private:
     /// the publish TIME differs (the slot's base header arrived later).
     bool try_republish_rotated_slot(const Key& slot_key, uint8_t llmq_type,
                                     const uint256& cycle_hash,
+                                    uint32_t cycle_base_height,
                                     uint32_t quorum_index)
     {
         auto it = m_rotated_cycles.find(Key{llmq_type, cycle_hash});
@@ -1086,6 +1126,10 @@ private:
         if (quorum_index >= it->second.size()) return false;
         insert_ready(slot_key, std::vector<vendor::MemberOperatorKey>(
                                    it->second[quorum_index]));
+        // #1176: this slot is now published under slot_key.quorumHash — record
+        // that header so a subsequent reorg of THIS slot is detected too.
+        record_slot_derivation(llmq_type, cycle_base_height, quorum_index,
+                               slot_key.quorumHash);
         m_last_rotated = RotatedOutcome::kSlotRepublished;
         // Same READY token as finalize_rotated so one grep finds both lanes.
         LOG_INFO << "[QC-MEMBERS] READY type="
@@ -1099,6 +1143,86 @@ private:
                  << " (slot header was not held when the cycle finalized; "
                     "published now from the retained cycle compute)";
         return true;
+    }
+
+    /// #1176: record the header a rotated slot was derived under.
+    /// FIFO-unbounded but wholesale-cleared past a generous cap, exactly like
+    /// m_prefetched_cycles — a slot old enough to fall out can never be reorged
+    /// (its cycle is long past any feasible reorg depth), so losing its record
+    /// only forgoes reorg-detection that could never have fired.
+    void record_slot_derivation(uint8_t type, uint32_t cycle_base_h,
+                                uint32_t quorum_index, const uint256& hash)
+    {
+        const SlotDeriveKey sk{type, cycle_base_h, quorum_index};
+        if (m_slot_derived_from.size() >= kSlotDeriveMemoMax
+            && m_slot_derived_from.find(sk) == m_slot_derived_from.end())
+            m_slot_derived_from.clear();
+        m_slot_derived_from[sk] = hash;
+    }
+
+    /// #1176 SLOT-AWARE READINESS — the reorg half of the qi=11 wedge fix.
+    ///
+    /// A rotated slot's MEMBERS are computed from the cycle work blocks
+    /// (cycleBase-8, -C-8, …), not from the header at cycleBase+qi — that header
+    /// only NAMES the quorum (its quorumHash / m_ready key). So a reorg that
+    /// swaps a top-slot header does not change the member set; it changes the
+    /// KEY the set must be served under. finalize_rotated() published the set
+    /// under the OLD header and memoised the cycle, and no qfcommit for the new
+    /// quorum need arrive before its mining window — so the slot strands.
+    ///
+    /// This walks the per-slot derivation record, and for any slot whose header
+    /// on the current chain differs from the one it was published under,
+    /// re-publishes the set under the NEW header from the RETAINED cycle compute
+    /// — the same bytes finalize_rotated produced, re-keyed. When the retained
+    /// compute is gone (FIFO-evicted) it drops the cycle from the prefetch memo
+    /// so the qrinfo is re-requested; meanwhile the slot fails closed (refuses),
+    /// never serving a set under a hash the chain no longer carries.
+    void reconcile_rotated_slots()
+    {
+        if (m_slot_derived_from.empty()) return;
+        // Collect first — the republish mutates m_slot_derived_from.
+        std::vector<std::pair<SlotDeriveKey, uint256>> swapped;
+        for (const auto& [sk, derived_hash] : m_slot_derived_from) {
+            auto cur = m_hash_at_height(sk.cycle_base_height + sk.quorum_index);
+            if (!cur || cur->IsNull()) continue;   // header gap: a "not yet"
+            if (*cur == derived_hash)     continue;   // unchanged
+            swapped.emplace_back(sk, *cur);
+        }
+        for (const auto& [sk, new_hash] : swapped) {
+            const uint64_t cyc_key =
+                (static_cast<uint64_t>(sk.llmqType) << 32) | sk.cycle_base_height;
+            auto cycle_hash = m_hash_at_height(sk.cycle_base_height);
+            if (!cycle_hash || cycle_hash->IsNull()) {
+                // The cycle BASE itself moved (a reorg deeper than a top slot):
+                // the retained compute is keyed by the old base hash and can no
+                // longer be trusted. Re-open the whole cycle for a fresh qrinfo.
+                m_prefetched_cycles.erase(cyc_key);
+                m_slot_derived_from.erase(sk);
+                continue;
+            }
+            const Key new_slot_key{sk.llmqType, new_hash};
+            if (m_ready.count(new_slot_key)) {   // already re-keyed elsewhere
+                m_slot_derived_from[sk] = new_hash;
+                continue;
+            }
+            LOG_INFO << "[QC-PREFETCH] reorg swapped a rotated slot header type="
+                     << static_cast<int>(sk.llmqType)
+                     << " cycle_base_h=" << sk.cycle_base_height
+                     << " slot=" << sk.quorum_index
+                     << " new=" << new_hash.GetHex().substr(0, 8)
+                     << " — re-deriving from the retained cycle compute instead "
+                        "of stranding the slot";
+            if (!try_republish_rotated_slot(new_slot_key, sk.llmqType,
+                                            *cycle_hash, sk.cycle_base_height,
+                                            sk.quorum_index)) {
+                // Retained compute evicted: re-request the qrinfo. The slot
+                // fails closed until the reply lands — never null-served.
+                m_prefetched_cycles.erase(cyc_key);
+                m_slot_derived_from.erase(sk);
+            }
+            // On success try_republish_rotated_slot re-recorded the slot under
+            // new_hash, so the next reorg of the same slot is detected too.
+        }
     }
 
     /// Retain a cycle's computed member sets (FIFO-bounded). For type 5 one
