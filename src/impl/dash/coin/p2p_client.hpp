@@ -573,10 +573,26 @@ private:
     // gap (~1-2 s), far below the 157.5 s block interval, and a false
     // positive costs one duplicate block-sized response — cheap. Re-requests
     // rotate through the pool's OTHER handshaked peers (post-#1082 up to 8),
-    // capped at 4 (~50 s total), after which the headers-driven re-request /
-    // inv-TTL expiry remains the backstop.
-    static constexpr time_t BODY_REREQUEST_SEC = 10;
-    static constexpr int    BODY_REREQUEST_MAX = 4;
+    // capped at BODY_REREQUEST_MAX consecutive stalls per peer-set, after which
+    // the STALLING peer is disconnected so the block is re-requested from a
+    // churned peer set — the slot is NEVER abandoned.
+    //
+    // dashd model (net_processing block download): a needed block stays in
+    // mapBlocksInFlight until it is delivered; a peer that stalls its window
+    // past BLOCK_STALLING_TIMEOUT (starts ~2 s, doubles, caps at 64 s) loses its
+    // in-flight slot and is disconnected, and FindNextBlocksToDownload
+    // re-assigns the block to any peer whose announced tip covers it. We mirror
+    // that: a tracked slot is removed ONLY when the body actually lands (the
+    // block handler), the per-slot stall window doubles per consecutive stall,
+    // and a chronic staller is disconnected so the pool churns to a peer that
+    // will serve the body. This closes the height-967736 wedge where the old
+    // fixed cap erased the slot and left the lane frozen with connected=8/8.
+    static constexpr int64_t BODY_STALL_TIMEOUT_INIT = 2;   // dashd start
+    static constexpr int64_t BODY_STALL_TIMEOUT_MAX  = 64;  // dashd doubling cap
+    // Consecutive stalls against the CURRENT peer set before the blamed peer is
+    // disconnected (releasing its slot; the peer-manager backoff keeps it from
+    // being re-dialed immediately) so recovery churns to a peer that has it.
+    static constexpr int      BODY_REREQUEST_MAX = 4;
     // Tracked slots are bounded by design: the tip body plus a short burst
     // of near-tip blocks; oldest evicted beyond this.
     static constexpr size_t PENDING_BODY_CAP  = 8;
@@ -702,10 +718,20 @@ private:
         int64_t     last_req{0};
         int         rerequests{0};
         std::string last_peer;    // don't re-ask the peer that just failed us
+        // dashd BLOCK_STALLING_TIMEOUT: fast first retry, doubling per stall,
+        // reset to INIT whenever the slot is (re)assigned to a fresh peer.
+        int64_t     stall_timeout{BODY_STALL_TIMEOUT_INIT};
+        // Consecutive stall-driven re-requests since the last staller eviction;
+        // at BODY_REREQUEST_MAX the blamed peer is disconnected to churn the set.
+        int         stalls_since_evict{0};
+        // Stallers disconnected to recover THIS body (per-slot telemetry).
+        int         evictions{0};
     };
     std::vector<PendingBody> m_pending_bodies;
     uint64_t m_body_rerequests_total{0};
-    uint64_t m_body_rerequests_exhausted{0};
+    // Stalling peers disconnected to keep a needed body from wedging the lane
+    // (dashd disconnect-on-stall). Surfaced as body_stall_evictions.
+    uint64_t m_body_stall_evictions{0};
 
     // ── tip-body announcer routing (#1082 pool + #1094 body-first) ───────
     // A block `inv` names a peer that HOLDS the block. The tip-body getdata
@@ -1451,7 +1477,7 @@ public:
     /// Watchdog observability (KATs + POOL-STATUS).
     std::size_t pending_body_count()    const { return m_pending_bodies.size(); }
     uint64_t body_rerequests_total()    const { return m_body_rerequests_total; }
-    uint64_t body_rerequests_exhausted() const { return m_body_rerequests_exhausted; }
+    uint64_t body_stall_evictions()     const { return m_body_stall_evictions; }
 
     /// Send a getmnlistd (SML diff request) — E2/E3 masternode-list sync seam.
     ///
@@ -2067,7 +2093,7 @@ private:
     }
 
     /// Lost-body watchdog service (one pass per pool tick). A tracked
-    /// getdata(block) unanswered for BODY_REREQUEST_SEC is re-issued — from a
+    /// getdata(block) unanswered for its per-slot stall window is re-issued — from a
     /// DIFFERENT handshaked peer when the pool holds one (the announcing peer
     /// may be slow/wedged; its neighbours demonstrably hold the block they
     /// all announced), rotating through the pool on successive attempts —
@@ -2077,26 +2103,23 @@ private:
         for (auto it = m_pending_bodies.begin(); it != m_pending_bodies.end();)
         {
             PendingBody& pb = *it;
-            if (now - pb.last_req < BODY_REREQUEST_SEC) { ++it; continue; }
-            if (pb.rerequests >= BODY_REREQUEST_MAX)
-            {
-                ++m_body_rerequests_exhausted;
-                LOG_WARNING << "[" << m_chain_label
-                            << "] body-rerequest EXHAUSTED hash="
-                            << pb.hash.GetHex().substr(0, 16) << "... after "
-                            << pb.rerequests << " re-request(s) over "
-                            << (now - pb.first_req)
-                            << "s — leaving recovery to the headers-driven"
-                               " re-request / inv-TTL backstop";
-                it = m_pending_bodies.erase(it);
-                continue;
-            }
+            // dashd BLOCK_STALLING_TIMEOUT: the per-slot window doubles on each
+            // consecutive stall (fast first retry; a chronically-missing block
+            // backs off). Not yet due — leave it.
+            if (now - pb.last_req < pb.stall_timeout) { ++it; continue; }
+
+            // The peer we last leaned on did not deliver within the window.
+            // A slot is NEVER erased here: dashd keeps a needed block in
+            // mapBlocksInFlight until the body actually lands (that removal
+            // lives in the block handler). Abandoning it is the wedge this
+            // replaces (height 967736: connected=8/8, slot dropped, lane frozen).
+            const std::string staller = pb.last_peer;
+            ++pb.stalls_since_evict;
+
             // Rotate through the handshaked peers, preferring one we did not
             // just ask; a single-peer pool re-asks the same peer (still
             // strictly better than the 600 s inv-TTL wait). The ANNOUNCER goes
-            // first — it holds the block by definition — so a re-request tries
-            // it before any neighbour that may not have it yet (the fixed-
-            // subset-that-never-has-it rotation was the #1082 warm-node bug).
+            // first — it holds the block by definition.
             std::vector<PeerSession*> cands;
             if (PeerSession* src = block_source(pb.hash))
                 if (src->handshake.complete()) cands.push_back(src);
@@ -2115,12 +2138,50 @@ private:
             target->write(msg);
             ++pb.rerequests;
             ++m_body_rerequests_total;
-            pb.last_req  = now;
+            pb.last_req = now;
+            // A freshly-assigned peer gets the full fast window (dashd resets
+            // the stall clock on (re)assignment); doubling, capped, only when
+            // the pool leaves us re-asking the same staller.
+            if (target->key != staller)
+                pb.stall_timeout = BODY_STALL_TIMEOUT_INIT;
+            else
+                pb.stall_timeout =
+                    std::min<int64_t>(pb.stall_timeout * 2, BODY_STALL_TIMEOUT_MAX);
             pb.last_peer = target->key;
             LOG_INFO << "[" << m_chain_label << "] cause=body-rerequest attempt="
                      << pb.rerequests << " peer=" << target->key << " hash="
                      << pb.hash.GetHex().substr(0, 16) << "... unanswered_for="
-                     << (now - pb.first_req) << "s";
+                     << (now - pb.first_req) << "s next_stall_window="
+                     << pb.stall_timeout << "s";
+
+            // dashd disconnect-on-stall + FindNextBlocksToDownload: with 8/8
+            // connected but none serving THIS body, rotation alone spins. Once
+            // the current peer set has stalled the slot BODY_REREQUEST_MAX times,
+            // DISCONNECT the blamed peer — this fires the peer-manager scorer,
+            // frees the in-flight slot, and arms a refill of a DIFFERENT address
+            // so the pool churns toward a peer that actually holds the body.
+            // Guarded: only when a real staller is still held AND a survivor (or
+            // an armed refill) can replace it, so one missing block can never
+            // drain the pool to zero.
+            if (pb.stalls_since_evict >= BODY_REREQUEST_MAX && !staller.empty())
+            {
+                PeerSession* bad = find_peer(staller);
+                const bool have_alternative =
+                    handshaked_peer_count() > 1 || m_reconnect_enabled;
+                if (bad && owns(bad) && have_alternative)
+                {
+                    ++pb.evictions;
+                    ++m_body_stall_evictions;
+                    pb.stalls_since_evict = 0;
+                    pb.stall_timeout = BODY_STALL_TIMEOUT_INIT;
+                    remove_peer(bad,
+                        "block-stall: body " + pb.hash.GetHex().substr(0, 16)
+                        + "... unanswered over "
+                        + std::to_string(now - pb.first_req)
+                        + "s — disconnecting the staller to re-request from"
+                          " another peer (dashd disconnect-on-stall)");
+                }
+            }
             ++it;
         }
     }
@@ -2167,7 +2228,7 @@ private:
                  << " evicted(cap/ttl)=" << st.evicted_capacity << "/" << st.evicted_ttl
                  << " pending_bodies=" << m_pending_bodies.size()
                  << " body_rerequests=" << m_body_rerequests_total
-                 << "/" << m_body_rerequests_exhausted;
+                 << " body_stall_evictions=" << m_body_stall_evictions;
     }
 
     // ── handshake ────────────────────────────────────────────────────────

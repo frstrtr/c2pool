@@ -928,9 +928,9 @@ TEST(DashCoinP2PPool, a_throwing_subscriber_costs_one_message_not_the_pool)
 // ══════════════════════════════════════════════════════════════════════════
 // LOST-BODY WATCHDOG (#1089 208 s tail; same defect class as the #1077
 // rotated-pending wedge: a request with no timeout). request_block_tracked's
-// getdata unanswered for BODY_REREQUEST_SEC=10 is re-issued from a DIFFERENT
-// handshaked peer, rotating on successive attempts, capped at
-// BODY_REREQUEST_MAX=4, each re-request named (`cause=body-rerequest`) —
+// getdata unanswered for its per-slot stall window is re-issued from a DIFFERENT
+// handshaked peer, rotating on successive attempts; a chronic staller is
+// disconnected after BODY_REREQUEST_MAX stalls, each named (`cause=body-rerequest`) —
 // killing the 208 s / 600 s inv-TTL tail. FAILS-ON-MASTER: request_block has
 // no tracking, no timeout, no re-request at all.
 // ══════════════════════════════════════════════════════════════════════════
@@ -951,15 +951,16 @@ TEST(DashCoinP2PPool, lost_tip_body_is_rerequested_from_a_rotated_peer_at_T)
     // The initial getdata goes to the primary (peer 1), like request_block.
     EXPECT_EQ(rig.session(1)->msgs_sent, p1_before + 1);
 
-    // T-1 seconds of silence: no re-request yet.
-    rig.run_seconds(9);
+    // One second of silence (< the 2 s initial stall window): no re-request.
+    rig.run_seconds(1);
     EXPECT_EQ(rig.client.body_rerequests_total(), 0u)
-        << "re-requested before the 10 s timeout";
+        << "re-requested before the initial stall window elapsed";
 
-    // Crossing T: exactly one re-request, and NOT to the peer that failed us.
+    // Crossing the window: exactly one re-request, and NOT to the failing peer.
     rig.run_seconds(1);
     EXPECT_EQ(rig.client.body_rerequests_total(), 1u)
-        << "an unanswered tracked body request must be re-requested at T=10 s";
+        << "an unanswered tracked body request must be re-requested at the"
+           " dashd stall window (2 s, doubling)";
     EXPECT_EQ(rig.session(1)->msgs_sent, p1_before + 1)
         << "the re-request must rotate OFF the peer that did not answer";
     EXPECT_EQ((rig.session(2)->msgs_sent - p2_before)
@@ -969,22 +970,86 @@ TEST(DashCoinP2PPool, lost_tip_body_is_rerequested_from_a_rotated_peer_at_T)
     EXPECT_EQ(rig.client.pending_body_count(), 1u) << "still unanswered";
 }
 
-TEST(DashCoinP2PPool, body_rerequest_is_capped_then_backstop_owns_it)
+// ANTI-WEDGE (dashd mapBlocksInFlight + disconnect-on-stall). The height-967736
+// wedge: connected=8/8 but none serves THAT body; master ERASED the slot after
+// BODY_REREQUEST_MAX tries and the lane froze forever. dashd never abandons a
+// needed block — the slot stays in flight, the per-slot stall window doubles,
+// and a chronic staller is DISCONNECTED so the pool churns to a peer that has
+// it. FAILS-ON-MASTER: the exhaust branch erased the slot and stopped retrying.
+TEST(DashCoinP2PPool, stalled_body_is_never_abandoned_and_evicts_the_staller)
 {
     PoolRig rig;
     rig.use_fake_clock();
     for (int i = 1; i <= 2; ++i) rig.handshake(i);
 
     rig.client.request_block_tracked(hash_n(0xDEAD));
-    // Nothing ever answers: attempts must stop at the cap and the slot must
-    // be released to the headers-driven / inv-TTL backstop (bounded by
-    // design — not a forever-retry loop).
-    rig.run_seconds(120);
-    EXPECT_EQ(rig.client.body_rerequests_total(), 4u)
-        << "re-requests must be capped at BODY_REREQUEST_MAX";
-    EXPECT_EQ(rig.client.body_rerequests_exhausted(), 1u);
+
+    // Nothing ever answers, for a long time.
+    rig.run_seconds(300);
+
+    EXPECT_EQ(rig.client.pending_body_count(), 1u)
+        << "ANTI-WEDGE: a stalled slot must NEVER be erased (master released it "
+           "after 4 tries and the lane wedged forever)";
+    EXPECT_GT(rig.client.body_rerequests_total(), 4u)
+        << "re-requests must continue past the old BODY_REREQUEST_MAX cap";
+    EXPECT_GE(rig.client.body_stall_evictions(), 1u)
+        << "a chronic staller must be disconnected (dashd disconnect-on-stall)";
+    EXPECT_EQ(rig.client.connected_peer_count(), 1u)
+        << "the staller was churned out; the survivor keeps the slot live — the "
+           "pool is not drained to zero over one missing block";
+}
+
+// THE REQUIRED RECOVERY KAT. A block whose FIRST-tried peer never serves the
+// body is recovered from a SECOND peer, and the tracked cursor advances (the
+// slot disarms) — no permanent wedge. Recovery is by ROTATION, before any
+// staller eviction, so it is deterministic. FAILS-ON-MASTER: after the cap the
+// slot was erased, so a later delivery had nothing to disarm and the reseed
+// cursor never advanced.
+TEST(DashCoinP2PPool, lost_body_first_peer_stalls_recovers_from_the_second_peer)
+{
+    PoolRig rig;
+    rig.use_fake_clock();
+    for (int i = 1; i <= 2; ++i) rig.handshake(i);   // peer 1 is primary
+
+    dash::coin::BlockType blk;
+    blk.m_version = 0x20000000;
+    blk.m_timestamp = 1'700'000'000u;
+    auto packed_hdr =
+        pack(static_cast<const dash::coin::BlockHeaderType&>(blk));
+    const uint256 bh = dash::crypto::hash_x11(packed_hdr.get_span());
+
+    const uint64_t p1_before = rig.session(1)->msgs_sent;
+    const uint64_t p2_before = rig.session(2)->msgs_sent;
+
+    // Initial getdata -> primary (peer 1) = the "first-tried peer".
+    rig.client.request_block_tracked(bh);
+    ASSERT_EQ(rig.client.pending_body_count(), 1u);
+    EXPECT_EQ(rig.session(1)->msgs_sent, p1_before + 1)
+        << "the initial body getdata goes to the primary (peer 1)";
+
+    // Peer 1 never serves it. When its stall window (2 s) elapses the watchdog
+    // rotates OFF the staller and re-requests from the SECOND peer.
+    rig.run_seconds(2);
+    EXPECT_GE(rig.client.body_rerequests_total(), 1u);
+    EXPECT_EQ(rig.session(2)->msgs_sent, p2_before + 1)
+        << "the re-request must rotate to the second peer (peer 1 stalled)";
+    EXPECT_EQ(rig.client.pending_body_count(), 1u)
+        << "still outstanding — and NOT abandoned";
+    ASSERT_EQ(rig.client.connected_peer_count(), 2u)
+        << "recovery is by rotation; no eviction after a single stall";
+
+    // Peer 2 serves the body: RECOVERY. The tracked slot disarms — in
+    // production the reseed-tail cursor advances here — and no wedge remains.
+    rig.deliver(2, p2p::message_block::make_raw(blk));
     EXPECT_EQ(rig.client.pending_body_count(), 0u)
-        << "an exhausted slot must be released, not retried forever";
+        << "delivery from the rotated-to peer recovers the block; the cursor "
+           "advances instead of wedging";
+
+    // And nothing re-requests afterwards.
+    const uint64_t total_after = rig.client.body_rerequests_total();
+    rig.run_seconds(60);
+    EXPECT_EQ(rig.client.body_rerequests_total(), total_after)
+        << "a delivered body stops the watchdog";
 }
 
 TEST(DashCoinP2PPool, body_arrival_disarms_the_watchdog)
@@ -1070,7 +1135,7 @@ TEST(DashCoinP2PPool, tip_body_getdata_targets_the_announcing_peer_not_the_prima
 // body, primary churned out — is owned by service_pending_bodies() instead
 // of dying silently. FAILS-ON-MASTER twice over: request_block_tracked
 // returned void, and a dead initial send parked the slot for a full
-// BODY_REREQUEST_SEC before the first retry.
+// a full per-slot stall window before the first retry.
 // ══════════════════════════════════════════════════════════════════════════
 
 TEST(DashCoinP2PPool, tracked_request_that_died_locally_reports_it_and_recovers_via_watchdog)
@@ -1097,7 +1162,7 @@ TEST(DashCoinP2PPool, tracked_request_that_died_locally_reports_it_and_recovers_
     rig.run_seconds(1);
     EXPECT_EQ(rig.client.body_rerequests_total(), 1u)
         << "the armed slot must be serviced on the first tick after a"
-           " handshaked peer exists — not BODY_REREQUEST_SEC later";
+           " handshaked peer exists — not a full stall window later";
     EXPECT_EQ(rig.session(1)->msgs_sent, before + 1)
         << "exactly one getdata, to the peer that now exists";
 
