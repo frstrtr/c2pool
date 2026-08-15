@@ -505,6 +505,40 @@ public:
         m_chain = &m_tracker.chain;
     }
 
+    // ── Shutdown: drain the compute pools FIRST, before anything they touch ──
+    // (#1133 teardown-order fix.) m_verify_pool (X11 share_init_verify) and
+    // m_think_pool (the run_think/clean election, holding m_tracker_mutex
+    // EXCLUSIVELY) run tasks that lock m_tracker_mutex and read/write the
+    // m_think_running / m_clean_running / m_rethink_pending atomics + the
+    // tracker, snapshot and download/peer state. Every one of those members is
+    // declared AFTER the two pools, so under reverse-order member destruction it
+    // would be torn down while a pool thread still holds/reads it — destroying a
+    // std::shared_mutex another thread may lock is UB. Joining the pools here,
+    // and again from the destructor BODY (which runs before ANY member is
+    // destroyed), makes the hazard unreachable regardless of declaration order.
+    //
+    // Idempotent: stop()+join() on an already-joined pool is a no-op, so the
+    // main_dash explicit call (fault 2: join right after ioc.run() returns, so
+    // ~Node does not run after web_server/oracle_shadow/stratum_server unwind)
+    // and the ~NodeImpl belt-and-suspenders below can both run safely. Mirrors
+    // the main_dash rpc_pool stop()+join() shutdown idiom.
+    void join_compute_pools()
+    {
+        m_verify_pool.stop();
+        m_think_pool.stop();
+        m_verify_pool.join();
+        m_think_pool.join();
+    }
+
+    // Deterministic teardown order (#1133 fault 1): the destructor body runs
+    // before the members are destroyed, so joining the pools here guarantees no
+    // pool task is in flight when m_tracker_mutex / the think atomics / the
+    // tracker are destroyed — independent of where the pools are declared.
+    ~NodeImpl() override
+    {
+        join_compute_pools();
+    }
+
     // INetwork: a pool node does not initiate disconnect; the reception slice
     // overrides connected(). Slice A only needs disconnect() to satisfy the
     // pure-virtual INetwork contract.
