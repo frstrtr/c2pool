@@ -64,8 +64,15 @@ struct MutableTransaction
         s << vin;
         s << vout;
         s << locktime;
-        // Extra payload for special transactions (CBTX type=5)
-        if (type != 0 && !extra_payload.empty()) {
+        // Extra payload for special transactions — dashd parity
+        // (primitives/transaction.h): vExtraPayload exists on the wire ONLY
+        // when nVersion==3 (SPECIAL_VERSION) AND nType!=0. Gating on type
+        // alone mis-serializes pre-DIP2 txs whose raw 32-bit nVersion carries
+        // BIP9-style high bits (e.g. mainnet 842284's coinbase nVersion
+        // 0x20000000 => version16=0, type16=0x2000): those are PLAIN txs and
+        // must round-trip without any payload field. Note dashd writes the
+        // payload compact-size even when the payload is empty.
+        if (version == 3 && type != 0) {
             BaseScript ep;
             ep.m_data = extra_payload;
             s << ep;
@@ -82,9 +89,13 @@ struct MutableTransaction
         s >> vin;
         s >> vout;
         s >> locktime;
-        // Read extra payload for special transactions
+        // Read extra payload for special transactions — same dashd gate as
+        // Serialize above: nVersion==3 && nType!=0. Reading on type alone
+        // consumed a phantom payload out of the NEXT tx's bytes whenever a
+        // pre-DIP2 tx carried BIP9-style high version bits, misaligning the
+        // whole block body (the 842284 merkle-bind livelock).
         extra_payload.clear();
-        if (type != 0) {
+        if (version == 3 && type != 0) {
             BaseScript ep;
             s >> ep;
             extra_payload = std::move(ep.m_data);

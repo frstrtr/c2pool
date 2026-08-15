@@ -51,7 +51,17 @@ private:
             try {
                 rmsg->m_data >> *res;
             } catch (...) {
-                // Parse failure (e.g., DOGE AuxPoW headers) — m_raw_payload has the data
+                if constexpr (requires { res->m_raw_payload; }) {
+                    // Parse failure (e.g., DOGE AuxPoW headers) — m_raw_payload
+                    // has the data; the handler re-parses from the raw bytes.
+                } else {
+                    // No raw-bytes fallback for this type: swallowing here
+                    // would deliver a PARTIALLY-PARSED message (e.g. a block
+                    // whose tx vector stopped mid-stream) with no error ever
+                    // logged. Rethrow — every p2p dispatch site wraps parse()
+                    // in a catch that logs and drops the message.
+                    throw;
+                }
             }
             return res;
         };

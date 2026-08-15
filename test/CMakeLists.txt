@@ -244,7 +244,17 @@ if (BUILD_TESTING AND GTest_FOUND)
     # reassembly over the vendored blockencodings port. Links the additive
     # dash_block_replay static lib (coin/vendor/blockencodings.cpp) on top of
     # the test_dash_header_chain link set; no ltc/pool SCC dependency.
-    add_executable(test_dash_block_replay test_dash_block_replay.cpp)
+    #
+    # test_dash_tx_version_gate.cpp is FOLDED into this target (same CI-fold
+    # rationale as test_dash_mn_state: build.yml allowlists this executable,
+    # a standalone target would be a NOT_BUILT CTest sentinel): the dashd
+    # nVersion==3 extra-payload gate KAT over the real mainnet block 842284
+    # fixture — the [BULK] MERKLE-BIND FAIL livelock the bulk-replay lane
+    # wedged on. DASH_FIXTURE_DIR feeds its fixture loader.
+    add_executable(test_dash_block_replay test_dash_block_replay.cpp
+                   test_dash_tx_version_gate.cpp)
+    target_compile_definitions(test_dash_block_replay PRIVATE
+        DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_block_replay PRIVATE
         GTest::gtest_main GTest::gtest
         dash_block_replay dash_x11 core
