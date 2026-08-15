@@ -36,6 +36,7 @@
 #include <impl/dash/stratum/work_source.hpp>
 
 #include <impl/dash/stratum/submit_payee_guard.hpp>  // check_submit_payee (won-block stale-payee gate)
+#include <impl/dash/coin/serve_gate_rollup_json.hpp>  // serve_gate_rollup_json — #119 follow-up web leg (per-cause TIME)
 #include <impl/dash/coinbase_builder.hpp>     // compute_dash_payouts, build, split_coinb, merkle helpers
 #include <impl/dash/coin/block_producer.hpp>  // compute_merkle_root, append_compact_size, target_from_nbits
 #include <impl/dash/crypto/hash_x11.hpp>      // dash::crypto::hash_x11 (X11 PoW SSOT)
@@ -1567,6 +1568,25 @@ nlohmann::json DASHWorkSource::embedded_arm_status_json() const
         j["no_work_value"]     = "n/a";
         j["no_work_threshold"] = "n/a";
         return j;
+    }
+    // #119 FOLLOW-UP, WEB LEG — per-cause TIME, not just the last cause. The
+    // fields below publish WHICH condition last declined; without seconds
+    // beside them the surface reproduces the count-vs-time trap (109 dmn-stale
+    // episodes vs 3 qc-plan-underivable BY COUNT; 5.6 s vs 351 s BY TIME —
+    // measured 2026-08-06). rollup() is a const accessor over already-banked
+    // totals plus the open segment's partial: it mutates nothing, takes no new
+    // lock (serve_gate_mutex_ is already held via the try_lock above), and the
+    // clock is the SAME steady_clock-seconds the serve path feeds observe()
+    // (note_arm_decision), so the partial can never run backwards. On a busy
+    // gate the field is simply absent (the early return above), matching the
+    // existing degrade-with-a-named-reason pattern. Read-only status path;
+    // serve behavior untouched.
+    {
+        const auto now_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count();
+        j["gate_rollup"] =
+            coin::serve_gate_rollup_json(serve_gate_journal_.rollup(now_sec));
     }
     if (!arm_ever_observed_) {
         j["arm"]               = "unknown";

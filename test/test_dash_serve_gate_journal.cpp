@@ -28,6 +28,7 @@
 #include <gtest/gtest.h>
 
 #include <impl/dash/coin/serve_gate_journal.hpp>
+#include <impl/dash/coin/serve_gate_rollup_json.hpp>
 
 #include <string>
 
@@ -334,6 +335,55 @@ TEST(DashServeGateJournal, SegTerminalNamesCoverClosuresOnly) {
     EXPECT_STREQ(ServeGateJournal::seg_terminal_name(resumed.trigger),
                  "resumed");
     EXPECT_EQ(resumed.prev_cause_sec, 15);
+}
+
+// ── #119 follow-up, WEB LEG: the JSON shape the operator surface publishes ───
+//
+// serve_gate_rollup_json is the ONE serializer shared by
+// DASHWorkSource::embedded_arm_status_json (the `gate_rollup` field, forwarded
+// by /api/node_topology as `serve_gate_rollup`) and this KAT — so this test
+// pins the bytes the web actually serves, not a hand-rebuilt lookalike. Shape:
+// {observed_sec, off_embedded_sec, per_cause:[{cause,sec}...]} with per_cause
+// preserving the roll-up's by-TIME order. The web surface previously published
+// only arm + last cause/value/threshold — count-shaped — which is the exact
+// trap #119 closed in the log (by count dmn-stale looked like 97% of the
+// problem; by time it was 5.6 s vs 351 s).
+TEST(DashServeGateJournal, RollupJsonShapePinsTheWebField) {
+    ServeGateJournal j(1000000);
+    // 20 s of cause-b (closed), then cause-a open for 500 s: a ranks first.
+    j.observe(false, "cause-b", 0);
+    j.observe(false, "cause-a", 20);        // closes b at 20 s, opens a
+    const int64_t now = 520;                 // a has 500 s of open partial
+
+    nlohmann::json json = dash::coin::serve_gate_rollup_json(j.rollup(now));
+
+    // The three fields, exactly — the denominator is never omitted.
+    ASSERT_TRUE(json.contains("observed_sec"));
+    ASSERT_TRUE(json.contains("off_embedded_sec"));
+    ASSERT_TRUE(json.contains("per_cause"));
+    EXPECT_EQ(json.size(), 3u);
+    EXPECT_EQ(json["observed_sec"].get<int64_t>(), 520);
+    EXPECT_EQ(json["off_embedded_sec"].get<int64_t>(), 520);
+
+    // per_cause: array of {cause,sec}, ranked by TIME desc (a=500 before b=20)
+    // — the same order the [EMBED-GATE-ROLLUP] log line prints.
+    const auto& pc = json["per_cause"];
+    ASSERT_TRUE(pc.is_array());
+    ASSERT_EQ(pc.size(), 2u);
+    EXPECT_EQ(pc[0]["cause"].get<std::string>(), "cause-a");
+    EXPECT_EQ(pc[0]["sec"].get<int64_t>(), 500);
+    EXPECT_EQ(pc[1]["cause"].get<std::string>(), "cause-b");
+    EXPECT_EQ(pc[1]["sec"].get<int64_t>(), 20);
+    EXPECT_EQ(pc[0].size(), 2u);  // {cause,sec} only — no extra fields
+
+    // An unobserved journal serializes the honest empty shape, not fabricated
+    // zeros-with-causes: empty array, zero denominator.
+    ServeGateJournal fresh(300);
+    nlohmann::json empty = dash::coin::serve_gate_rollup_json(fresh.rollup(99));
+    EXPECT_EQ(empty["observed_sec"].get<int64_t>(), 0);
+    EXPECT_EQ(empty["off_embedded_sec"].get<int64_t>(), 0);
+    EXPECT_TRUE(empty["per_cause"].is_array());
+    EXPECT_TRUE(empty["per_cause"].empty());
 }
 
 }  // namespace
