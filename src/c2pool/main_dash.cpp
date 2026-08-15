@@ -3551,6 +3551,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         ? std::string()
                         : cause + " (value=" + c["no_work_value"].get<std::string>()
                                 + " threshold=" + c["no_work_threshold"].get<std::string>() + ")";
+                    // #119 follow-up, web leg: cumulative per-cause TIME
+                    // roll-up ({observed_sec, off_embedded_sec, per_cause}),
+                    // seconds beside the cause names above so the page can
+                    // rank by TIME the way [EMBED-GATE-ROLLUP] does — the
+                    // decline COUNT ranks the causes wrongly (the h=2518004
+                    // trap). ABSENT, never zeroed, when the serve-gate lock
+                    // was busy: a missing observation is not a claim of
+                    // health, and the degrade reason already rides `arm`.
+                    if (arm.contains("gate_rollup"))
+                        c["serve_gate_rollup"] = arm["gate_rollup"];
                     // SERVE-STALENESS: the height we actually handed to a miner
                     // versus an independently observed one. header_height and
                     // target_height above are about the HEADER chain and are
