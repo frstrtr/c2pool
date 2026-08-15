@@ -864,6 +864,15 @@ private:
             auto header = static_cast<BlockHeaderType>(result.block);
             m_peer->get_header(blockhash, header);
             m_coin->full_block.happened(result.block);
+        } else if (result.merkle_mismatch) {
+            // #976: every slot filled but the reconstructed txs fail the header
+            // Merkle root -> a short-ID collision substituted a wrong tx. Discard and
+            // pull the authoritative full block; never deliver the mismatched one.
+            LOG_WARNING << "[" << m_chain_label << "] Compact block " << blockhash.GetHex()
+                        << " reconstructed but FAILED header Merkle check — discarding, "
+                        << "requesting full block via getdata";
+            auto getdata_msg = message_getdata::make_raw({inventory_type(inventory_type::block, blockhash)});
+            m_peer->write(getdata_msg);
         } else {
             LOG_INFO << "[" << m_chain_label << "] Compact block incomplete, "
                      << result.missing_indexes.size() << " txs missing — requesting via getblocktxn";

@@ -1226,7 +1226,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # from the BIP 152 spec, asserted against the on-the-wire serialiser output.
     # No call site rewired. MUST also be in BOTH build.yml --target allowlists
     # (#143 NOT_BUILT trap).
-    add_executable(dgb_compact_blocks_bip152_parity_test compact_blocks_bip152_parity_test.cpp)
+    add_executable(dgb_compact_blocks_bip152_parity_test compact_blocks_bip152_parity_test.cpp compact_block_merkle_test.cpp)
     target_link_libraries(dgb_compact_blocks_bip152_parity_test PRIVATE
         GTest::gtest_main GTest::gtest
         core dgb
