@@ -342,6 +342,11 @@ static std::vector<unsigned char> protx_payload(const T& p) {
 static MutableTransaction special_tx(uint16_t type,
                                      const std::vector<unsigned char>& payload) {
     MutableTransaction tx;
+    // DIP2 special txs (ProReg/ProUpReg/ProUpRev/ProUpServ/CbTx) are nVersion==3;
+    // dashd (primitives/transaction.h) only (de)serializes vExtraPayload when
+    // nVersion==3 && nType!=0, so the extra_payload only affects the tx hash for
+    // a nVersion==3 tx. Build the fixture the way the chain actually carries it.
+    tx.version = 3;
     tx.type = type;
     tx.extra_payload = payload;
     // one dummy input (collateral spends test uses real prevouts instead)

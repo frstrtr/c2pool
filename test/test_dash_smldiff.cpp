@@ -86,7 +86,10 @@ static CSimplifiedMNListEntry make_entry(uint8_t proreg_byte0) {
 // exactly like the cbTx embedded in a real mnlistdiff).
 static MutableTransaction make_cbtx() {
     MutableTransaction tx;
-    tx.version = 1;
+    // Real DIP2/DIP4 CBTX are special txs at nVersion==3 (type 5). dashd only
+    // (de)serializes vExtraPayload when nVersion==3 && nType!=0, so the fixture
+    // MUST be nVersion==3 for the payload to ride the wire at all.
+    tx.version = 3;
     tx.type = 5;
     tx.locktime = 0;
     tx.extra_payload = {0xDE, 0xAD, 0xBE, 0xEF};
