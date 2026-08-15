@@ -7604,6 +7604,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         rpc_pool->join();
     }
 
+    // #1133 teardown-order fix (fault 2): drain the sharechain node's OWN compute
+    // pools (m_verify_pool X11 share-verify + m_think_pool run_think/clean
+    // election) HERE — right after ioc.run() returns and BEFORE stratum_server /
+    // oracle_shadow / web_server unwind — for the SAME reason rpc_pool is joined
+    // just above. p2p_node is declared FIRST (:998) so ~Node would otherwise run
+    // LAST, joining these pools only after every object a still-in-flight
+    // verify/think task can reach (the tracker's callback targets, the work
+    // refresh bound off m_on_best_share_changed) is already freed. run() has
+    // returned (ioc stopped) so no NEW task is posted; stop()+join() waits out
+    // the in-flight tail against still-live state. Any post-back to the stopped
+    // ioc simply never executes. Idempotent with the ~NodeImpl belt below.
+    p2p_node.join_compute_pools();
+
     // Tear the acceptor + sessions down while the work source and node_coin_state
     // it references are still alive -- explicit reset keeps destruction order safe
     // (stratum_server was declared before them, so it would otherwise outlive them).

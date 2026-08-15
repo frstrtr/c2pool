@@ -370,7 +370,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # the per-share split on an individual share's page. FOLDED in for the same
     # reason; needs the same link set plus the header-only mint/producer weight
     # walk and coinbase allocator, both already reachable from `dash`.
-    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp)
+    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp test_dash_shutdown_order.cpp)
     target_link_libraries(test_dash_node PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -387,6 +387,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     # transitively; nothing outside src/impl/dash is added.
     target_link_libraries(test_dash_node PRIVATE dash sharechain)
     gtest_add_tests(test_dash_node "" AUTO)
+
+    # #1133 teardown-order guard reads the shipped node.hpp + main_dash.cpp
+    # source (dgb RACE913 DGB_NODE_SRC idiom) so the fix-site assertions are
+    # deterministic red/green on a nondeterministic destruction-order UB.
+    target_compile_definitions(test_dash_node PRIVATE
+        DASH_NODE_HPP_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/impl/dash/node.hpp"
+        DASH_MAIN_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/c2pool/main_dash.cpp")
 
     # DASH S8 per-miner work-target MODULATION KAT (work.py:308-326 oracle pin):
     # pool-share cap (1.67%) + dust-threshold ease + average_attempts_to_target.
