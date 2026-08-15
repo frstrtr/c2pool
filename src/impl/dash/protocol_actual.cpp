@@ -167,6 +167,12 @@ void Actual::HANDLER(sharereq)
         auto reply_msg = message_sharereply::make_raw(msg->m_id, dash::ShareReplyResult::too_long, {});
         peer->write(std::move(reply_msg));
     }
+
+    // #1130: free the OWNED copies handle_get_share cloned for us. Both the
+    // good and too_long paths fall through to here (no early return), and each
+    // variant owns independent heap from clone(), so this destroy() frees our
+    // copies WITHOUT ever touching the pointers the sharechain still owns.
+    for (auto& share : shares) share.destroy();
 }
 
 void Actual::HANDLER(sharereply)

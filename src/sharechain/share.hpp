@@ -120,6 +120,22 @@ public:
         std::visit([](auto* ptr) { delete ptr; }, *this);
     }
 
+    /// Deep-copy the held share into a NEW heap allocation the returned variant
+    /// OWNS. Use when a BORROWED variant — one that aliases a raw pointer the
+    /// sharechain owns and frees under its lock — must outlive that lock. The
+    /// caller destroy()s the returned copy. Same borrow-vs-own discipline as the
+    /// #1131/#1163 verified.remove(owns_data=false) fix: a borrowing view must
+    /// never free, and a value that has to survive the lock must own its memory.
+    ShareVariants clone() const
+    {
+        return std::visit([](auto* ptr) {
+            using share_t = std::remove_const_t<std::remove_pointer_t<decltype(ptr)>>;
+            ShareVariants copy;
+            copy = new share_t(*ptr);
+            return copy;
+        }, *this);
+    }
+
     auto version() const
     {
         return std::visit([&](auto* share){ return share->version; }, *this);

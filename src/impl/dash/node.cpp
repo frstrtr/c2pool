@@ -258,6 +258,13 @@ NodeImpl::handle_get_share(std::vector<uint256> hashes, uint64_t parents,
     if (!shares.empty())
         LOG_INFO << "[Pool] Sending " << shares.size() << " shares to " << peer_addr.to_string();
 
+    // #1130: hand back OWNED copies. Until here `shares` aliased raw
+    // pointers the sharechain owns and frees under m_tracker_mutex; the
+    // sharereq handler (protocol_actual/legacy) serializes them AFTER this
+    // lock is released, so a concurrent think()/prune would free the share
+    // mid-pack — a use-after-free / double-free. clone() gives the caller
+    // independent memory it destroy()s. Same borrow-vs-own rule as #1131/#1163.
+    for (auto& s : shares) s = s.clone();
     return shares;
 }
 
