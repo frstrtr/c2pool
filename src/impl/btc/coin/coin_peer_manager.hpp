@@ -57,6 +57,7 @@
 #include <core/filesystem.hpp>
 #include <core/netaddress.hpp>
 #include <core/dns_seeder.hpp>
+#include <core/coin_addrman.hpp>
 
 namespace btc {
 namespace coin {
@@ -360,10 +361,15 @@ public:
 
     /// Add a peer discovered via P2P addr message.
     /// Validates via PeerEndpoint: rejects empty, unparseable, and non-routable addresses.
-    void add_discovered_peer(const NetService& addr)
+    /// source_host: the peer that gossiped this address (bucket-keys the
+    /// banked entry, bounding how far one source can spray the new table;
+    /// empty = self-announced). Existing call sites need no change.
+    void add_discovered_peer(const NetService& addr,
+                             const std::string& source_host = std::string())
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        try_add_peer_locked(addr, BtcPeerInfo::Source::addr_crawl, /*require_routable=*/true);
+        try_add_peer_locked(addr, BtcPeerInfo::Source::addr_crawl, /*require_routable=*/true,
+                            source_host);
     }
 
     /// Get list of peers that should be connected right now.
@@ -422,6 +428,47 @@ public:
             result.push_back(c.endpoint);
             connected_groups[c.group]++;
         }
+
+        // ── Addrman top-up (dashd CAddrMan port) ──
+        // The score-sorted working set above covers pinned/anchor/known
+        // peers; any remaining budget is drawn from the bucketed DB with
+        // dashd's stochastic quality-biased Select(), so dial plans explore
+        // the whole banked address space instead of re-hammering the same
+        // hand-picked few. One tried-collision incumbent is drawn first
+        // (the feeler leg): re-dialing it gives resolve_collisions() real
+        // evidence to keep or evict it. Group diversity and per-peer
+        // backoff (can_retry) gate the draws exactly like the legacy path.
+        if (static_cast<int>(result.size()) < budget) {
+            std::vector<NetService> draws;
+            if (auto incumbent = m_addrman.select_tried_collision())
+                draws.push_back(*incumbent);
+            const int deficit = budget - static_cast<int>(result.size());
+            for (int i = 0; i < deficit * 4
+                 && static_cast<int>(draws.size()) < deficit + 1; ++i) {
+                auto pick = m_addrman.select();
+                if (!pick) break;
+                draws.push_back(*pick);
+            }
+            for (auto& ns : draws) {
+                if (static_cast<int>(result.size()) >= budget) break;
+                auto ep = PeerEndpoint::from(ns);
+                if (!ep) continue;
+                const auto key = ep->to_string();
+                if (connected_keys.count(key)) continue;
+                bool dup = false;
+                for (auto& r : result)
+                    if (r.to_string() == key) { dup = true; break; }
+                if (dup) continue;
+                auto known = m_peers.find(key);
+                if (known != m_peers.end() && !known->second.can_retry())
+                    continue;
+                auto grp = peer_network_group(ep->host());
+                if (connected_groups[grp] >= MAX_OUTBOUND_PER_GROUP
+                    && !grp.empty()) continue;
+                result.push_back(*ep);
+                connected_groups[grp]++;
+            }
+        }
         return result;
     }
 
@@ -429,11 +476,14 @@ public:
     void notify_connected(const std::string& key)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        auto it = m_peers.find(key);
-        if (it != m_peers.end()) {
-            it->second.record_connected();
+        auto* peer = ensure_working_entry_locked(key);
+        if (peer) {
+            peer->record_connected();
             // Track as anchor candidate (most recent successful connections)
             update_anchors(key);
+            // Promote in the bucketed DB: Good() moves the entry into the
+            // tried table (or parks a tried-collision for the feeler leg).
+            m_addrman.good(peer->address);
             // Live-connection census: this key is now an established outbound
             // link. The maintenance loop's emergency starvation gate keys off
             // m_connected_keys.size() (see on_maintenance_tick).
@@ -450,6 +500,9 @@ public:
         auto it = m_peers.find(key);
         if (it != m_peers.end()) {
             it->second.record_disconnected();
+            // It completed a handshake earlier, so it WAS alive: refresh
+            // the bucketed DB's believed-alive stamp (dashd Connected()).
+            m_addrman.connected(it->second.address);
         }
     }
 
@@ -464,9 +517,13 @@ public:
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_connected_keys.erase(key);   // a failed dial never became a live link
-        auto it = m_peers.find(key);
-        if (it != m_peers.end()) {
-            it->second.record_dial_failed();
+        auto* peer = ensure_working_entry_locked(key);
+        if (peer) {
+            peer->record_dial_failed();
+            // #940 feedback also reaches the bucketed DB: a counted
+            // failed attempt lowers GetChance() so Select() stops
+            // re-drawing the dead target (mirrors dashd Attempt()).
+            m_addrman.attempt(peer->address);
         }
     }
 
@@ -620,8 +677,12 @@ public:
     bool discovery_enabled() const
     {
         if (m_config.disable_discovery) return false;
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return static_cast<int>(m_peers.size()) < m_config.max_peers;
+        // The bucketed DB is the getaddr sink now: keep harvesting until
+        // it is of table order (~82k slots) — in practice always, exactly
+        // like dashd keeps banking addr gossip. The old working-set gate
+        // (m_peers.size() < max_peers) stopped discovery at a handful of
+        // peers and starved daemonless block download of dial candidates.
+        return m_addrman.size() < core::CoinAddrMan::soft_capacity();
     }
 
     /// Remove peers that are exhausted (max attempts reached, not protected).
@@ -688,6 +749,21 @@ public:
             if (!ep || !ep->is_routable()) continue;
             result.push_back(*ep);
         }
+        // Top up from the bucketed DB's tried sample so a node serves
+        // more than its small working set once the DB has grown (dashd
+        // GetAddr; tried-only + routable keeps the unverified out).
+        for (auto& ns : m_addrman.get_addr(
+                 /*max_pct=*/100,
+                 /*max_count=*/static_cast<size_t>(max_count) * 2,
+                 /*tried_only=*/true)) {
+            auto ep = PeerEndpoint::from(ns);
+            if (!ep || !ep->is_routable()) continue;
+            bool dup = false;
+            for (auto& r : result)
+                if (r.to_string() == ep->to_string()) { dup = true; break; }
+            if (dup) continue;
+            result.push_back(*ep);
+        }
         // Shuffle for privacy (don't reveal connection order/topology)
         if (result.size() > 1) {
             thread_local std::mt19937 rng(std::random_device{}());
@@ -697,6 +773,10 @@ public:
             result.erase(result.begin() + max_count, result.end());
         return result;
     }
+
+    /// Bucketed address DB (dashd CAddrMan port) — diagnostics/KATs.
+    core::CoinAddrMan& addrman() { return m_addrman; }
+    const core::CoinAddrMan& addrman() const { return m_addrman; }
 
 private:
     /// Unified peer validation and insertion (caller must hold m_mutex).
@@ -710,7 +790,8 @@ private:
     ///                          peers (getpeerinfo) which may be LAN hosts.
     /// @return true if the peer was added, false if rejected.
     bool try_add_peer_locked(const NetService& addr, BtcPeerInfo::Source source,
-                             bool require_routable)
+                             bool require_routable,
+                             const std::string& source_host = std::string())
     {
         // ── Validate via PeerEndpoint (type-safe, Bitcoin Core classification) ──
         auto ep = PeerEndpoint::from(addr);
@@ -728,6 +809,18 @@ private:
 
         // ── Port filter ──
         if (!is_valid_port(ep->port())) return false;
+
+        // ── Bank in the bucketed address DB (dashd CAddrMan port) ──
+        // Every validated non-daemon candidate is banked BEFORE the
+        // working-set gates below: the capacity/dedup/group caps bound the
+        // small ACTIVE dial set, while the bank is the large archival
+        // history the dial planner draws from (repeat gossip refreshes
+        // freshness there instead of being dropped on the floor).
+        // Daemon-learned peers are deliberately NOT banked — the bank must
+        // stay an INDEPENDENT view of the network.
+        if (source != BtcPeerInfo::Source::coind
+            && !m_coind_peers.count(ep->to_string()))
+            m_addrman.add(ep->to_net_service(), source_host);
 
         // ── Capacity gating ──
         if (static_cast<int>(m_peers.size()) >= m_config.max_peers) return false;
@@ -759,6 +852,37 @@ private:
         peer.last_seen = std::chrono::steady_clock::now();
         peer.max_attempts = m_config.max_connection_attempts;
         return true;
+    }
+
+    /// Materialize a working-set entry for an addrman-drawn dial target
+    /// (or any endpoint the transport reports on) so the notify_*
+    /// feedback — including the #940 dial-failure leg — always lands on
+    /// a scored entry. Returns nullptr for an unparseable key.
+    BtcPeerInfo* ensure_working_entry_locked(const std::string& key)
+    {
+        auto it = m_peers.find(key);
+        if (it != m_peers.end()) return &it->second;
+        const auto colon = key.rfind(':');
+        if (colon == std::string::npos) return nullptr;
+        uint16_t port = 0;
+        try {
+            const unsigned long v = std::stoul(key.substr(colon + 1));
+            if (v == 0 || v > 65535) return nullptr;
+            port = static_cast<uint16_t>(v);
+        } catch (const std::exception&) {
+            return nullptr;
+        }
+        auto ep = PeerEndpoint::from(key.substr(0, colon), port);
+        if (!ep) return nullptr;
+        auto& peer = m_peers[key];
+        peer.address = ep->to_net_service();
+        peer.addr_class = ep->addr_class();
+        peer.source = BtcPeerInfo::Source::addr_crawl;
+        peer.network_group = peer_network_group(ep->host());
+        peer.first_seen = std::chrono::steady_clock::now();
+        peer.last_seen = std::chrono::steady_clock::now();
+        peer.max_attempts = m_config.max_connection_attempts;
+        return &peer;
     }
 
     bool is_valid_port(uint16_t port) const
@@ -873,6 +997,10 @@ private:
         m_maintenance_timer.async_wait([this](const boost::system::error_code& ec) {
             if (ec || !m_running) return;
             schedule_maintenance();
+
+            // Tried-collision resolution for the bucketed DB (dashd
+            // ResolveCollisions cadence rides the maintenance tick).
+            m_addrman.resolve_collisions();
             // Emergency seed re-arm: was a no-op (the fallbacks never re-armed).
             // Drive the spec handler with the live connection count so a node
             // that churns below min_peers after the initial windows recovers.
@@ -915,6 +1043,18 @@ private:
         return (dir / ("peers_" + sym + ".json")).string();
     }
 
+    /// Bucketed-DB file (peers.dat equivalent), beside the working-set
+    /// JSON in the same per-coin directory.
+    std::string addrman_db_path() const
+    {
+        const std::filesystem::path p = db_path();
+        const std::string stem = p.stem().string();   // "peers_<SYM>"
+        const std::string prefix = "peers_";
+        const std::string sym = stem.rfind(prefix, 0) == 0
+            ? stem.substr(prefix.size()) : stem;
+        return (p.parent_path() / ("addrman_" + sym + ".json")).string();
+    }
+
     void save_peers()
     {
         try {
@@ -954,6 +1094,9 @@ private:
                 ofs << j.dump(2);
             }
             std::rename(tmp_path.c_str(), db_path().c_str());
+            // Bucketed DB persists beside the working-set JSON (peers.dat
+            // equivalent; addrman does its own atomic tmp+rename).
+            m_addrman.save(addrman_db_path());
             LOG_DEBUG_COIND << "[" << m_symbol << "] Saved " << m_peers.size() << " peers";
         } catch (const std::exception& e) {
             LOG_WARNING << "[" << m_symbol << "] Failed to save peers: " << e.what();
@@ -962,6 +1105,15 @@ private:
 
     void load_peers()
     {
+        // Bucketed DB (peers.dat equivalent). FAIL-SAFE: a corrupt or
+        // absent file loads EMPTY (load() never throws) and the seed
+        // ladder then bootstraps exactly as on first run.
+        if (m_addrman.load(addrman_db_path())) {
+            LOG_INFO << "[" << m_symbol << "] AddrMan loaded: "
+                     << m_addrman.size() << " known ("
+                     << m_addrman.tried_count() << " tried) from "
+                     << addrman_db_path();
+        }
         try {
             std::ifstream ifs(db_path());
             if (!ifs.is_open()) return;
@@ -1278,6 +1430,11 @@ private:
     boost::asio::steady_timer m_emergency_timer;    // dedicated emergency re-arm (never stomps the one-shots)
 
     mutable std::mutex m_mutex;
+    /// Bucketed new/tried address DB (dashd CAddrMan port). mutable:
+    /// draws and samples only permute internal iteration state, and the
+    /// DB carries its own lock (always taken AFTER m_mutex, never the
+    /// reverse — CoinAddrMan calls nothing back).
+    mutable core::CoinAddrMan m_addrman;
     std::map<std::string, BtcPeerInfo> m_peers;     // key = "host:port"
     std::set<std::string> m_coind_peers;            // daemon's own peers (overlap filter)
     std::string m_local_node_key;

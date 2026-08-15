@@ -215,3 +215,81 @@ TEST(BtcCoinPeerManager, EmergencyRecoveryResetsBackoffToBase)
 
     mgr.stop();
 }
+
+// ---------------------------------------------------------------------------
+// Bucketed addrman integration KATs (dashd CAddrMan port,
+// core/coin_addrman.hpp behind every per-coin manager).
+//
+// Same zero-socket discipline as above: nothing here dials, resolves, or
+// fetches. The corrupt-DB KAT is the manager-level half of the fail-safe
+// contract (core_test carries the CoinAddrMan-level half): a bad DB file
+// must load EMPTY and leave the seed/admission path exactly as on first run.
+// ---------------------------------------------------------------------------
+
+TEST(BtcCoinPeerManager, AddrmanBanksBeyondWorkingSetCapacity)
+{
+    boost::asio::io_context ioc;
+    BtcPeerManagerConfig cfg;
+    cfg.max_peers = 3;
+    auto m = make_mgr(ioc, cfg);
+    for (int i = 0; i < 10; ++i)
+        m->add_discovered_peer(
+            NetService("51." + std::to_string(10 + i) + ".1.1", 8333));
+    // The working set stops at its capacity gate (unchanged behaviour)...
+    EXPECT_EQ(m->peer_stats().total, cfg.max_peers);
+    // ...but the bucketed DB banks EVERY validated candidate — the harvest
+    // that used to be dropped on the floor.
+    EXPECT_EQ(m->addrman().size(), 10u);
+}
+
+TEST(BtcCoinPeerManager, DialPlanDrawsFromAddrmanAndDialFailFeedbackLands)
+{
+    boost::asio::io_context ioc;
+    auto m = make_mgr(ioc, BtcPeerManagerConfig{});
+    // Bank straight into the DB; the working set stays EMPTY. The dial plan
+    // must still produce candidates — the stochastic addrman draw leg.
+    for (int i = 0; i < 8; ++i)
+        m->addrman().add(NetService("51." + std::to_string(30 + i) + ".2.2", 8333));
+    ASSERT_EQ(m->peer_stats().total, 0);
+    auto plan = m->get_peers_to_connect({});
+    ASSERT_FALSE(plan.empty());
+    // #940: a dial failure on a drawn candidate lands in BOTH scorers — the
+    // working-set entry is materialized on the fly.
+    m->notify_dial_failed(plan.front().to_string());
+    EXPECT_EQ(m->peer_stats().total, 1);
+    EXPECT_TRUE(m->addrman().contains(plan.front().to_net_service()));
+}
+
+TEST(BtcCoinPeerManager, ConnectPromotesToTriedInTheDb)
+{
+    boost::asio::io_context ioc;
+    auto m = make_mgr(ioc, BtcPeerManagerConfig{});
+    const NetService peer("51.50.5.5", 8333);
+    m->add_discovered_peer(peer);
+    m->notify_connected(peer.to_string());
+    EXPECT_TRUE(m->addrman().is_tried(peer));
+    EXPECT_EQ(m->addrman().tried_count(), 1u);
+}
+
+TEST(BtcCoinPeerManager, CorruptAddrmanDbIsFailSafe)
+{
+    boost::asio::io_context ioc;
+    const std::string dir =
+        "/tmp/c2pool_btc_addrman_kat_" + std::to_string(::getpid());
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream ofs(dir + "/addrman_BTC.json");
+        ofs << "definitely{not json";
+    }
+    BtcPeerManagerConfig cfg;
+    auto m = std::make_unique<BtcCoinPeerManager>(ioc, "BTC", dir, cfg);
+    // start() loads the corrupt DB: must not throw, must come up EMPTY, and
+    // discovery/admission keeps working exactly as on first run (timers are
+    // armed but the io_context is never run, so nothing fetches).
+    EXPECT_NO_THROW(m->start());
+    EXPECT_EQ(m->addrman().size(), 0u);
+    m->add_discovered_peer(NetService("51.60.6.6", 8333));
+    EXPECT_EQ(m->addrman().size(), 1u);
+    EXPECT_NO_THROW(m->stop());
+    std::filesystem::remove_all(dir);
+}
