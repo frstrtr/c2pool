@@ -572,6 +572,18 @@ private:
                                 (static_cast<uint32_t>(count[1]) << 8) |
                                 (static_cast<uint32_t>(count[2]) << 16) |
                                 (static_cast<uint32_t>(count[3]) << 24);
+        // persist_full_chunks() writes m_hashes[0] onward, so chunk 0 already
+        // carries the genesis hash in slot 0 — while the constructor has
+        // ALREADY seeded the walker with genesis before calling here.
+        // Appending the chunks onto that seed shifts every persisted hash up
+        // one height (m_hashes[h] then holds height h-1's hash) and the JOIN
+        // CHECK fails closed with anchor-join-mismatch on every restart-resume
+        // even though the store is byte-perfect. Rebuild the walker from the
+        // store alone; the genesis pin below still validates slot 0, and the
+        // torn/mismatch paths re-seed the pristine genesis walker.
+        m_hashes.clear();
+        m_recent.clear();
+        m_recent_order.clear();
         m_hashes.reserve(static_cast<size_t>(chunks) * CHUNK_SPAN);
         for (uint32_t c = 0; c < chunks; ++c)
         {
@@ -601,6 +613,8 @@ private:
                                "— discarding persisted walk";
                 m_hashes.clear();
                 m_persisted_chunks = 0;
+                m_hashes.push_back(m_genesis_hash);   // pristine walker
+                note_recent(m_genesis_hash, 0);
                 return;
             }
             for (size_t i = m_hashes.size() > CLAIM_WINDOW
@@ -611,6 +625,14 @@ private:
                      << (m_hashes.size() - 1) << "/" << m_anchor_height
                      << " (" << m_persisted_chunks << " persisted chunk[s])";
             check_join();
+        }
+        else
+        {
+            // rc_count present but chunk 0 missing/torn — same pristine
+            // walker a no-store start gets.
+            m_persisted_chunks = 0;
+            m_hashes.push_back(m_genesis_hash);
+            note_recent(m_genesis_hash, 0);
         }
     }
 
