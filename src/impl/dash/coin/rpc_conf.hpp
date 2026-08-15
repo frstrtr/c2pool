@@ -94,5 +94,77 @@ inline void apply_endpoint_override(const std::string& hostport, RpcConf& out)
     if (!p.empty()) out.port = static_cast<uint16_t>(std::stoi(p));
 }
 
+// ---------------------------------------------------------------------------
+// DASHD-CUT arm authority (daemonless cut mode).
+//
+// THE DEFECT THIS CLOSES (hotel-reserve thrash, 2026-08-15):
+// removing --coin-rpc was COSMETIC. conf.armed() alone (creds resolved from the
+// DEFAULT ~/.dashcore/dash.conf) re-armed the dashd-fallback CoindRPC to
+// 127.0.0.1:9998. When the operator then stopped dashd, the armed-but-dead RPC
+// entered a hot sync_reconnect spin (~30/s) whose every failure invalidated the
+// template cache and starved the working embedded arm -> 0 shares served though
+// the embedded arm was producing valid templates the whole time.
+//
+// The fix DECOUPLES two independent axes that conf.armed() had conflated:
+//   (1) OPERATOR INTENT  -- did the operator EXPLICITLY name a coin RPC?
+//       (--coin-rpc / --coin-daemon endpoint, or --coin-rpc-auth creds path,
+//        or a one-shot that only dashd can service, e.g. --submit-block.)
+//   (2) CREDS RESOLVED   -- conf.armed() (rpcuser+rpcpassword+port present).
+//
+// The dashd-fallback CoindRPC is CONSTRUCTED only when BOTH hold. With NO
+// explicit request the node is in DAEMONLESS CUT MODE: rpc == nullptr, the
+// embedded/null arm is AUTHORITATIVE, and a stray dash.conf can no longer arm a
+// hot-spinning fallback behind the operator's back. This is pure invocation-
+// level policy (no I/O, no allocation), so it is unit-testable in isolation and
+// cannot drift from the launcher.
+//
+// WITH-dashd behaviour is UNCHANGED: any invocation that names --coin-rpc /
+// --coin-rpc-auth still arms exactly as before (ArmedLive). Only the accidental
+// "no flag + stray dash.conf" arming is removed -- which is precisely the cut.
+enum class DashdArm
+{
+    Disarmed,   ///< cut mode: no CoindRPC constructed; embedded/null arm authoritative
+    ArmedLive,  ///< operator named a coin RPC AND creds resolved: construct NodeRPC
+};
+
+struct DashdArmDecision
+{
+    bool        construct_rpc = false;              ///< launcher: `if (d.construct_rpc)` build+connect NodeRPC
+    DashdArm    arm           = DashdArm::Disarmed;
+    const char* reason        = "";                 ///< operator-facing banner text
+};
+
+// Pure resolution. `coin_rpc_requested` = the operator EXPLICITLY asked for a
+// coin RPC (endpoint override, auth-path override, or a dashd-only one-shot).
+// `creds_armed` = conf.armed(). No hidden state; no ordering dependence.
+inline DashdArmDecision resolve_dashd_arm(bool coin_rpc_requested, bool creds_armed)
+{
+    DashdArmDecision d;
+    if (!coin_rpc_requested) {
+        // Cut mode. Even if a stray dash.conf makes creds_armed true, the arm
+        // stays OFF: the operator did not ask for dashd, so we do not spin one
+        // up. This is the line that makes removing --coin-rpc actually cut.
+        d.construct_rpc = false;
+        d.arm           = DashdArm::Disarmed;
+        d.reason        = "daemonless cut mode (no --coin-rpc/--coin-rpc-auth): "
+                          "dashd-fallback arm OFF, embedded/null arm authoritative";
+        return d;
+    }
+    if (!creds_armed) {
+        // Requested but no usable creds/port: cannot arm. Fail CLOSED (unarmed),
+        // loudly -- never silently spin against an endpoint with no auth.
+        d.construct_rpc = false;
+        d.arm           = DashdArm::Disarmed;
+        d.reason        = "coin RPC requested but creds/port unresolved "
+                          "(no rpcuser/rpcpassword in dash.conf) -- arm stays OFF";
+        return d;
+    }
+    d.construct_rpc = true;
+    d.arm           = DashdArm::ArmedLive;
+    d.reason        = "coin RPC requested and creds resolved "
+                      "(dashd-fallback arm ARMED)";
+    return d;
+}
+
 } // namespace coin
 } // namespace dash
