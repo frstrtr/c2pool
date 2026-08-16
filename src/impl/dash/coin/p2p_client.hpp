@@ -668,6 +668,16 @@ private:
     // reconnect to the same non-serving address. Incremented on NOTFOUND for a
     // bulk body and on stall-eviction; cleared when that peer delivers a body.
     std::map<std::string, int> m_bulk_nonserver_strikes;
+    // Round-robin cursor for the STATEFUL request legs (the mn-checkpoint
+    // anchor->tip fold's getmnlistd snapshot). dashd picks a sync peer for a
+    // mnlistdiff and ROTATES to another on stall rather than re-asking one slow
+    // peer forever; a live cold soak froze 26 min pinned to a single slow
+    // primary waiting for the deep base->anchor fold snapshot. This cursor
+    // spreads the fold's getmnlistd (and its re-asks) across the eligible
+    // (CanServeBlocks) pool. m_last_stateful_peer lets a re-ask prefer a
+    // DIFFERENT carrier so it actually fans out.
+    std::size_t  m_stateful_rr{0};
+    std::string  m_last_stateful_peer;
     // The peer select_block_peer() last sent a block getdata to, so
     // request_block_tracked() arms the watchdog against the peer actually
     // asked (not an unrelated primary).
@@ -1246,6 +1256,12 @@ public:
     /// TEST-ONLY: clear a peer's non-server strike (the forgiveness a real
     /// body delivery triggers on the ingest path).
     void forgive_bulk_nonserver_for_test(const std::string& key) { forgive_bulk_nonserver(key); }
+    /// TEST-ONLY: exercise the STATEFUL (getmnlistd fold) carrier selection —
+    /// the seam the rotate-on-timeout KAT asserts fans out on. Returns the
+    /// chosen peer key and records it as the last stateful carrier, exactly as
+    /// send_getmnlistd_rotating() does on the wire, so repeated calls rotate.
+    std::string select_stateful_peer_key_for_test()
+    { PeerSession* p = next_stateful_peer(); if (p) m_last_stateful_peer = p->key; return p ? p->key : std::string{}; }
 
     /// TEST-ONLY: stand a peer session up with a synthetic endpoint and NO
     /// socket, the way Factory does on a live connect. A null socket is legal
@@ -1562,6 +1578,36 @@ public:
                  << " target=" << block_hash.GetHex();
         auto msg = message_getmnlistd::make_raw(base_block_hash, block_hash);
         m_primary->write(msg);
+    }
+
+    /// Fold-snapshot variant of send_getmnlistd that ROTATES its carrier across
+    /// the eligible pool (next_stateful_peer) instead of pinning to m_primary.
+    /// The mn-checkpoint anchor->tip fold's deep base->anchor snapshot is the
+    /// stateful leg that froze a cold soak for 26 min behind a single slow
+    /// primary (LANE-WATCHDOG waiting_for=fold-mnlist-reply, re-asking the SAME
+    /// primary). The reply is matched by block hash and only one getmnlistd is
+    /// ever outstanding, so a reply from ANY carrier satisfies the same await —
+    /// rotating the carrier is safe, and is exactly dashd's rotate-on-stall
+    /// sync-peer behaviour. Reward-safe: this changes WHICH peer is asked, never
+    /// the served MN-payee/quorum-root bytes (those stay DIP-4 client-verified
+    /// against the block's own cbTx commitment before they are believed).
+    void send_getmnlistd_rotating(const uint256& base_block_hash,
+                                  const uint256& block_hash)
+    {
+        PeerSession* p = next_stateful_peer();
+        if (!p) {
+            LOG_WARNING << "[COIN-P2P] getmnlistd(rotating) DROPPED (no peer):"
+                        << " base=" << base_block_hash.GetHex()
+                        << " target=" << block_hash.GetHex()
+                        << " — the fold cannot advance until a peer is up";
+            return;
+        }
+        m_last_stateful_peer = p->key;
+        LOG_INFO << "[COIN-P2P] getmnlistd(rotating) -> peer=" << p->key
+                 << " base=" << base_block_hash.GetHex()
+                 << " target=" << block_hash.GetHex();
+        auto msg = message_getmnlistd::make_raw(base_block_hash, block_hash);
+        p->write(msg);
     }
 
     /// Send a getqrinfo (DIP-24 quorum-rotation-info request) — the ROTATED
@@ -1911,6 +1957,33 @@ private:
                 if (!p->handshake.complete()) continue;
                 if (pass == 0 && !bulk_eligible(p)) continue;
                 m_bulk_rr = (m_bulk_rr + i + 1) % n;
+                return p;
+            }
+        }
+        return m_primary;
+    }
+
+    /// dashd sync-peer selection for the STATEFUL request legs (the
+    /// mn-checkpoint fold's getmnlistd snapshot). Round-robin across the
+    /// eligible (CanServeBlocks + handshaked + non-demoted) pool, PREFERRING a
+    /// peer other than the one the last stateful request went to so a re-ask
+    /// actually fans out instead of re-hammering one slow peer (the 26-min
+    /// single-primary freeze). Falls back — like next_bulk_peer — to any
+    /// eligible peer (first ask / pool of one), then any handshaked peer
+    /// (historical-scarcity), then m_primary.
+    PeerSession* next_stateful_peer()
+    {
+        const std::size_t n = m_pool.size();
+        if (n == 0) return m_primary;
+        for (int pass = 0; pass < 3; ++pass)
+        {
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                PeerSession* p = m_pool[(m_stateful_rr + i) % n].get();
+                if (!p->handshake.complete()) continue;
+                if (pass < 2 && !bulk_eligible(p)) continue;
+                if (pass == 0 && p->key == m_last_stateful_peer) continue;
+                m_stateful_rr = (m_stateful_rr + i + 1) % n;
                 return p;
             }
         }

@@ -1398,3 +1398,108 @@ TEST(DashBulkCanServe, no_eligible_peer_falls_back_never_wedges_the_selection)
     EXPECT_EQ(chosen.size(), 2u);
 }
 
+
+// ══════════════════════════════════════════════════════════════════════════
+// (I) STATEFUL FOLD LEG — getmnlistd rotate-on-stall (dashd sync-peer parity)
+//
+//     The mn-checkpoint anchor->tip fold requests its per-height masternode
+//     snapshot with getmnlistd(ZERO, hash_at(H)). On master (#1253/#1254) that
+//     request is pinned to m_primary and, on no reply, tick_pending_fold()
+//     RE-ASKS THE SAME PRIMARY. A live cold soak froze 26 min behind ONE slow
+//     primary waiting for the deep base->anchor snapshot while 7 other archival
+//     peers sat idle (LANE-WATCHDOG waiting_for=fold-mnlist-reply, warn 1..9).
+//
+//     dashd picks a sync peer for a mnlistdiff and ROTATES to another on stall.
+//     send_getmnlistd_rotating() ports that: the fold's snapshot request (and
+//     every re-ask) fans out across the eligible CanServeBlocks pool, preferring
+//     a carrier OTHER than the last one, so a slow-but-alive primary can no
+//     longer wedge the fold. Reply is matched by block hash and only one
+//     getmnlistd is ever outstanding, so any carrier's reply satisfies the await.
+//
+//     RED (pinned path, still used by the LIVE tip follower): send_getmnlistd
+//     lands every ask on the primary — asserted below as the contrast.
+//     GREEN (fold path): send_getmnlistd_rotating spreads consecutive asks
+//     across the archival peers and skips the pruned one.
+// ══════════════════════════════════════════════════════════════════════════
+
+TEST(DashStatefulFold, fold_getmnlistd_rotates_across_archival_peers_and_skips_pruned)
+{
+    PoolRig rig;
+    rig.handshake_services(1, SVC_FULL);          // primary (first handshaked)
+    rig.handshake_services(2, SVC_FULL);
+    rig.handshake_services(3, SVC_FULL);
+    rig.handshake_services(4, SVC_LIMITED_ONLY);  // pruned — cannot serve deep
+    ASSERT_EQ(rig.client.handshaked_peer_count(), 4u);
+
+    // CONTRAST (the RED behaviour the fix replaces): the PINNED leg — the one
+    // the live tip follower still uses — puts every ask on the primary.
+    const uint64_t p1_before_pinned = rig.session(1)->msgs_sent;
+    for (int i = 0; i < 3; ++i)
+        rig.client.send_getmnlistd(uint256::ZERO, hash_n(500 + i));
+    EXPECT_EQ(rig.session(1)->msgs_sent, p1_before_pinned + 3u)
+        << "the pinned getmnlistd leg must still land on the primary";
+
+    // GREEN: the ROTATING fold leg fans out. Three consecutive asks over three
+    // eligible archival peers hit three DISTINCT carriers (preferring a peer
+    // other than the last), and the pruned peer is never asked.
+    std::vector<uint64_t> before;
+    for (int i = 1; i <= 4; ++i) before.push_back(rig.session(i)->msgs_sent);
+    for (int i = 0; i < 3; ++i)
+        rig.client.send_getmnlistd_rotating(uint256::ZERO, hash_n(9000 + i));
+
+    const uint64_t d1 = rig.session(1)->msgs_sent - before[0];
+    const uint64_t d2 = rig.session(2)->msgs_sent - before[1];
+    const uint64_t d3 = rig.session(3)->msgs_sent - before[2];
+    const uint64_t d4 = rig.session(4)->msgs_sent - before[3];
+
+    EXPECT_EQ(d1 + d2 + d3, 3u) << "all three asks must reach an archival peer";
+    EXPECT_EQ(d4, 0u)
+        << "a pruned (limited-only) peer must never carry the deep fold "
+           "snapshot — it cannot serve ~9.5k-deep history";
+    // True fan-out: no single archival peer absorbed all three (the 26-min
+    // single-primary freeze the fix exists to prevent). With three eligible
+    // peers and last-carrier avoidance, each gets exactly one.
+    EXPECT_EQ(d1, 1u);
+    EXPECT_EQ(d2, 1u);
+    EXPECT_EQ(d3, 1u);
+}
+
+TEST(DashStatefulFold, fold_getmnlistd_reask_leaves_the_slow_primary_for_a_neighbour)
+{
+    PoolRig rig;
+    rig.handshake_services(1, SVC_FULL);   // primary
+    rig.handshake_services(2, SVC_FULL);
+    ASSERT_EQ(rig.client.handshaked_peer_count(), 2u);
+
+    // First ask (fold snapshot) — allowed to pick the primary.
+    const std::string first = rig.client.select_stateful_peer_key_for_test();
+    EXPECT_FALSE(first.empty());
+    // The RE-ask (tick_pending_fold on no reply) must move OFF that carrier so
+    // a slow-but-alive primary cannot wedge the fold. On master the re-ask hit
+    // the same primary every time; here it rotates to the neighbour.
+    const std::string second = rig.client.select_stateful_peer_key_for_test();
+    EXPECT_FALSE(second.empty());
+    EXPECT_NE(second, first)
+        << "the fold re-ask must rotate to a DIFFERENT eligible peer, not "
+           "re-hammer the slow primary (dashd rotate-on-stall)";
+}
+
+TEST(DashStatefulFold, fold_getmnlistd_never_wedges_when_only_pruned_peers_exist)
+{
+    PoolRig rig;
+    // Pathological: every reachable peer is pruned. The rotating leg must still
+    // send (fallback pass), never drop the fold silently — non-regression vs
+    // the pinned path, which would also have used the (pruned) primary.
+    rig.handshake_services(1, SVC_LIMITED_ONLY);
+    rig.handshake_services(2, SVC_LIMITED_ONLY);
+    ASSERT_EQ(rig.client.handshaked_peer_count(), 2u);
+
+    std::vector<uint64_t> before{rig.session(1)->msgs_sent,
+                                 rig.session(2)->msgs_sent};
+    for (int i = 0; i < 4; ++i)
+        rig.client.send_getmnlistd_rotating(uint256::ZERO, hash_n(300 + i));
+    const uint64_t sent = (rig.session(1)->msgs_sent - before[0])
+                        + (rig.session(2)->msgs_sent - before[1]);
+    EXPECT_EQ(sent, 4u) << "the fold request must never be dropped even when no "
+                           "archival peer exists (fallback to the handshaked pool)";
+}
