@@ -1176,4 +1176,97 @@ TEST(DashCoinP2PPool, tracked_request_that_died_locally_reports_it_and_recovers_
         << "re-asking an already-tracked hash must not grow the slots";
 }
 
+// ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+// DASHD-CUT — the anchor->tip mn-checkpoint BULK fold must fan its block-body
+// getdata across the WHOLE handshaked pool and disconnect a stalling peer, the
+// way dashd's FindNextBlocksToDownload / mapBlocksInFlight downloads a deep IBD
+// window in parallel across peers and drops a staller (BLOCK_STALLING_TIMEOUT).
+//
+// The wedge these cover (measured on vm905, wf wt1q31gh2, belt+control both
+// FROZE at cursor=2513065 applied=64): #1250 seeds the mn-ckpt anchor ~9.5k
+// blocks BELOW the header tip, so the ENTIRE fold is the deep-historical
+// (no-announcer) regime. On master every such body was routed to a single
+// m_primary (block_source fallback) and the fixed PENDING_BODY_CAP=8 evicted
+// all but the newest 8 tracked slots — so a slow / churning primary froze the
+// fold at the first 64-block window and only that one peer was ever re-asked.
+//
+// FAILS-ON-MASTER: (1) all getdata funnel at the primary (peers_asked==1),
+// (2) the window is evicted to 8 tracked slots (pending_body_count==8 not 64).
+// ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+
+TEST(DashCoinP2PPool, bulk_fold_getdata_fans_out_across_the_whole_pool)
+{
+    PoolRig rig;
+    rig.client.set_max_peers(8);
+    for (int i = 1; i <= 8; ++i) rig.handshake(i, /*height=*/2513000u + i);
+    ASSERT_EQ(rig.client.handshaked_peer_count(), 8u);
+
+    // Per-peer outbound baseline (the handshake itself sent our version).
+    std::vector<uint64_t> base(9, 0);
+    for (int i = 1; i <= 8; ++i) base[i] = rig.session(i)->msgs_sent;
+
+    // A full fold window of BURIED blocks — none announced (no inv delivered),
+    // exactly the deep anchor->tip regime.
+    const uint32_t W = 64;
+    for (uint32_t k = 0; k < W; ++k)
+        ASSERT_TRUE(rig.client.request_block_tracked(hash_n(500000u + k)))
+            << "with 8 handshaked peers every bulk body must reach the wire";
+
+    int peers_asked = 0;
+    uint64_t max_on_one = 0, total = 0;
+    for (int i = 1; i <= 8; ++i) {
+        const uint64_t got = rig.session(i)->msgs_sent - base[i];
+        if (got > 0) ++peers_asked;
+        if (got > max_on_one) max_on_one = got;
+        total += got;
+    }
+    EXPECT_EQ(total, static_cast<uint64_t>(W))
+        << "every window body must reach exactly one peer";
+    EXPECT_EQ(peers_asked, 8)
+        << "the fold window must fan out across the WHOLE handshaked pool "
+           "(dashd FindNextBlocksToDownload), not funnel at m_primary";
+    EXPECT_LE(max_on_one, static_cast<uint64_t>(W / 8 + 1))
+        << "no peer may carry more than its round-robin share of the window";
+
+    // ...and the full window stays TRACKED by the lost-body watchdog: the
+    // in-flight bound is dashd's MAX_BLOCKS_IN_TRANSIT_PER_PEER(16) x 8 peers
+    // = 128 >= 64, not the fixed cap of 8 that used to strand the bulk fold.
+    EXPECT_EQ(rig.client.pending_body_count(), static_cast<std::size_t>(W))
+        << "the whole fold window must stay in service_pending_bodies so a "
+           "stalled body is re-requested from another peer, not lost";
+}
+
+TEST(DashCoinP2PPool, a_stalling_bulk_peer_is_disconnected_so_the_fold_advances)
+{
+    PoolRig rig;
+    rig.use_fake_clock();
+    rig.client.set_max_peers(8);
+    for (int i = 1; i <= 8; ++i) rig.handshake(i, /*height=*/2513000u + i);
+    ASSERT_EQ(rig.client.handshaked_peer_count(), 8u);
+
+    // A fold window that NOBODY ever delivers — every assigned peer stalls the
+    // body it was handed. The watchdog must re-request each stalled body from a
+    // DIFFERENT peer and, once a peer has chronically stalled, DISCONNECT it
+    // (dashd disconnect-on-stall + reassign), so the fold keeps advancing
+    // instead of freezing behind one silent peer at the first window.
+    const uint32_t W = 64;
+    for (uint32_t k = 0; k < W; ++k)
+        ASSERT_TRUE(rig.client.request_block_tracked(hash_n(600000u + k)));
+    ASSERT_EQ(rig.client.pending_body_count(), static_cast<std::size_t>(W))
+        << "the full bulk window is tracked (this assert also fails on master, "
+           "where the window is evicted to the fixed cap of 8)";
+
+    const uint64_t rr0 = rig.client.body_rerequests_total();
+    rig.run_seconds(600);   // ten minutes of stall service; no peer answers
+
+    EXPECT_GT(rig.client.body_rerequests_total(), rr0)
+        << "a stalled bulk window must be re-requested by the watchdog, not "
+           "left on one peer forever";
+    EXPECT_GE(rig.client.body_stall_evictions(), 1u)
+        << "a chronically stalling peer must be disconnected so the pool churns "
+           "to a peer that serves the body (dashd disconnect-on-stall)";
+    EXPECT_GT(rig.client.handshaked_peer_count(), 0u)
+        << "graceful degradation: a stall must never drain the pool to zero";
+}
+
 } // namespace

@@ -593,9 +593,19 @@ private:
     // disconnected (releasing its slot; the peer-manager backoff keeps it from
     // being re-dialed immediately) so recovery churns to a peer that has it.
     static constexpr int      BODY_REREQUEST_MAX = 4;
-    // Tracked slots are bounded by design: the tip body plus a short burst
-    // of near-tip blocks; oldest evicted beyond this.
+    // Tracked slots floor: the tip body plus a short burst of near-tip
+    // blocks. The tip-follow path never needs more than this.
     static constexpr size_t PENDING_BODY_CAP  = 8;
+    // dashd MAX_BLOCKS_IN_TRANSIT_PER_PEER: the parallel in-flight window it
+    // keeps PER PEER during IBD (net_processing.cpp). The tracked-body watchdog
+    // now also carries the mn-checkpoint anchor->tip BULK fold (a ~9.5k-block
+    // deep replay on a cut cold start), so the in-flight bound is dashd's
+    // per-peer window times the handshaked pool size (effective_pending_cap),
+    // never below PENDING_BODY_CAP. This lets a full fold window
+    // (MnCheckpointLane::kWindow) stay tracked and spread across the pool
+    // instead of being evicted at a fixed 8 — the eviction that used to strand
+    // bulk-fold slots and leave the whole fold funnelled at one primary.
+    static constexpr size_t MAX_BLOCKS_IN_TRANSIT_PER_PEER = 16;
     // Pool-status log cadence (the soak's direct read on peer count + durability).
     static constexpr time_t POOL_STATUS_INTERVAL_SEC = 60;
     // A dial that never calls back (no connected(), no connect_failed()) must not
@@ -633,6 +643,14 @@ private:
     // completes its handshake and re-elected from the surviving handshaked
     // peers when that one is lost. nullptr => no peer is ready to be asked.
     PeerSession* m_primary{nullptr};
+    // Round-robin cursor over m_pool for bulk/historical block-body getdata
+    // (dashd FindNextBlocksToDownload spreads a deep IBD window across peers,
+    // never funnelling it at one peer).
+    std::size_t  m_bulk_rr{0};
+    // The peer select_block_peer() last sent a block getdata to, so
+    // request_block_tracked() arms the watchdog against the peer actually
+    // asked (not an unrelated primary).
+    std::string  m_last_requested_peer;
     // Dispatch cursor: the peer whose message is being handled RIGHT NOW.
     // Valid only inside handle(); this client is single-thread-confined to the
     // io_context (main_dash.cpp:1613), so this is a parameter, not shared state.
@@ -1427,7 +1445,10 @@ public:
     /// their own re-request loops may keep ignoring the return value.
     bool request_block(const uint256& block_hash)
     {
-        PeerSession* p = block_source(block_hash);
+        // Announcer for a tip body; round-robin across the handshaked pool for
+        // a bulk/historical body (dashd IBD spread). select_block_peer records
+        // the chosen peer for the watchdog.
+        PeerSession* p = select_block_peer(block_hash);
         if (!p) return false;
         auto msg = message_getdata::make_raw(
             {inventory_type(inventory_type::block, block_hash)});
@@ -1460,16 +1481,17 @@ public:
                 if (sent) pb.last_req = now;
                 return sent;
             }
-        if (m_pending_bodies.size() >= PENDING_BODY_CAP)
+        if (m_pending_bodies.size() >= effective_pending_cap())
             m_pending_bodies.erase(m_pending_bodies.begin());   // oldest slot
         PendingBody pb;
         pb.hash      = block_hash;
         pb.first_req = now;
         pb.last_req  = sent ? now : 0;
-        // The announcer just got the initial getdata; record it so the watchdog
-        // rotates AWAY from it (to a neighbour) if it does not answer in time.
-        PeerSession* src = block_source(block_hash);
-        pb.last_peer = src ? src->key : std::string{};
+        // The peer request_block() just sent the initial getdata to (announcer
+        // for a tip body, or the round-robin pool peer for a bulk/historical
+        // body). Recorded so the watchdog rotates AWAY from it to a neighbour
+        // if it does not answer in time.
+        pb.last_peer = m_last_requested_peer;
         m_pending_bodies.push_back(std::move(pb));
         return sent;
     }
@@ -1755,11 +1777,12 @@ private:
         m_block_announcers.push_back(BlockAnnouncer{hash, key});
     }
 
-    /// The peer to fetch a block from: the one that ANNOUNCED it (it holds it
-    /// by definition and its reply routes back to its own session), falling
-    /// back to the primary when the announcer is unknown or has since churned
-    /// out of the pool. Never returns a stale pointer — resolved live.
-    PeerSession* block_source(const uint256& hash)
+    /// The peer that ANNOUNCED this block (it holds it by definition and its
+    /// reply routes back to its own session), or nullptr when no live
+    /// handshaked announcer is known — the deep-historical / bulk-fold case,
+    /// where the block was buried long before this node connected and was
+    /// never inv'd to us. Never returns a stale pointer — resolved live.
+    PeerSession* announced_source(const uint256& hash)
     {
         for (auto& a : m_block_announcers)
             if (a.hash == hash)
@@ -1768,7 +1791,65 @@ private:
                 if (p && p->handshake.complete()) return p;
                 break;
             }
+        return nullptr;
+    }
+
+    /// The peer to fetch a block from for the ORDERED, non-bulk legs
+    /// (getheaders-before-connect): the announcer, else the primary. Unchanged
+    /// from the pre-rotation behaviour so the header/tip legs keep their stable
+    /// carrier.
+    PeerSession* block_source(const uint256& hash)
+    {
+        if (PeerSession* a = announced_source(hash)) return a;
         return m_primary;
+    }
+
+    /// Round-robin the next handshaked peer for a bulk/historical block-body
+    /// getdata. dashd's FindNextBlocksToDownload assigns each needed block to a
+    /// peer whose tip covers it and keeps MAX_BLOCKS_IN_TRANSIT_PER_PEER in
+    /// flight PER PEER, in parallel across the whole peer set — it never
+    /// funnels a deep IBD window at a single peer. For a buried block every
+    /// handshaked peer's tip covers it, so we spread the window across them: a
+    /// slow / rate-limiting peer then serialises only its 1/N share instead of
+    /// wedging the entire anchor->tip fold behind one primary. Falls back to
+    /// the primary only when the pool holds no handshaked peer at all.
+    PeerSession* next_bulk_peer()
+    {
+        const std::size_t n = m_pool.size();
+        if (n == 0) return m_primary;
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            PeerSession* p = m_pool[(m_bulk_rr + i) % n].get();
+            if (p->handshake.complete())
+            {
+                m_bulk_rr = (m_bulk_rr + i + 1) % n;
+                return p;
+            }
+        }
+        return m_primary;
+    }
+
+    /// dashd mapBlocksInFlight bound: MAX_BLOCKS_IN_TRANSIT_PER_PEER across
+    /// every handshaked peer, floored at PENDING_BODY_CAP so a momentarily
+    /// empty pool still keeps the tip-follow slots.
+    std::size_t effective_pending_cap() const
+    {
+        const std::size_t hs = handshaked_peer_count();
+        const std::size_t cap = MAX_BLOCKS_IN_TRANSIT_PER_PEER * (hs ? hs : 1);
+        return cap > PENDING_BODY_CAP ? cap : PENDING_BODY_CAP;
+    }
+
+    /// The peer a plain block-body getdata is sent to: the announcer when one
+    /// is live (tip-follow), else round-robin across the pool (bulk/historical
+    /// IBD). Records the chosen peer (m_last_requested_peer) so
+    /// request_block_tracked() arms the watchdog slot against the peer that was
+    /// ACTUALLY asked.
+    PeerSession* select_block_peer(const uint256& hash)
+    {
+        PeerSession* p = announced_source(hash);
+        if (!p) p = next_bulk_peer();
+        m_last_requested_peer = p ? p->key : std::string{};
+        return p;
     }
 
     bool holds_key(const std::string& key) const

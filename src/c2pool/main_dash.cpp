@@ -5857,26 +5857,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     // mn-needs-reseed latch holds the embedded arm down.
                     auto e = hc->get_header_by_height(h);
                     if (!e) return false;
-                    // #138 TAIL-TRACKED. The last bodies before the header tip
-                    // are the reseed-tail wedge surface: the announcer FIFO
-                    // (ANNOUNCER_CAP) has usually evicted them by the time the
-                    // bridge's cursor arrives, and the lane's own stall probe
-                    // can only re-ask down the SAME block_source() route once
-                    // per pump (~2.5 min) — a connected-but-silent peer eats
-                    // every re-ask identically. Tracking hands those requests
-                    // to the p2p lost-body watchdog (service_pending_bodies),
-                    // which rotates the re-request to a NEIGHBOUR after 10 s,
-                    // bounded at BODY_REREQUEST_MAX; the redelivered body rides
-                    // the ordinary full_block -> on_block_connected ingest the
-                    // lane already consumes. The BULK leg stays UNTRACKED by
-                    // design: kWindow=64 asks per window would defeat
-                    // PENDING_BODY_CAP=8 (see the request_block_tracked doc),
-                    // and bulk already has the lane's windowed re-request loop.
-                    // <=3 tracked heights per window, well under the cap.
-                    const uint32_t tip = hc->height();
-                    if (tip != 0 && h + 2 >= tip)
-                        return cp->request_block_tracked(e->hash);
-                    return cp->request_block(e->hash);
+                    // BULK + TAIL both TRACKED. The whole anchor->tip fold now
+                    // rides the dashd-style lost-body watchdog
+                    // (service_pending_bodies): the initial getdata is spread
+                    // round-robin across the handshaked pool
+                    // (request_block -> select_block_peer, dashd
+                    // FindNextBlocksToDownload), a stalled window is re-requested
+                    // from a DIFFERENT peer, and the chronic staller is
+                    // disconnected so the pool churns to one that serves the
+                    // body. The in-flight bound is dashd's per-peer window x pool
+                    // size (effective_pending_cap = MAX_BLOCKS_IN_TRANSIT_PER_PEER
+                    // x handshaked peers), so a full kWindow no longer defeats
+                    // the tracker. This closes the deep (~9.5k-block) cut cold
+                    // fold's single-primary wedge, where every body funnelled at
+                    // m_primary and only that peer was re-asked — freezing at the
+                    // first window when it churned or rate-limited. Reward-safe:
+                    // getdata routing only; the derived MN/quorum/credit-pool
+                    // bytes and every publish() hold are unchanged.
+                    return cp->request_block_tracked(e->hash);
                 });
             mn_ckpt_lane->set_tip_height_fn(
                 [hc = header_chain.get()]() { return hc->height(); });
