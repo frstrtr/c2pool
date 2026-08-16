@@ -45,6 +45,7 @@
 #include <gtest/gtest.h>
 
 #include <impl/dash/coin/header_chain.hpp>   // HeaderChain, make_dash_chain_params_mainnet, x11_hash
+#include <impl/dash/coin/chain_rpc.hpp>     // is_synthetic_anchor (the honesty discriminator)
 
 #include <core/uint256.hpp>
 
@@ -183,5 +184,44 @@ TEST(DashAnchorHeaderMerkleRoot, PinnedHeaderX11EqualsPinnedBlockHash)
 
     EXPECT_EQ(dash::coin::x11_hash(hdr), cp.hash)
         << "pinned anchor header does not X11-hash to the pinned block hash";
+}
+
+// -------------------------------------------------------------------------
+// 5. HONESTY RECONCILIATION (Plan A). Feeding the anchor's merkleRoot to the
+//    DIP-4 auth must NOT turn the lone checkpoint anchor into a "daemon tip".
+//    The seed adopts ONLY the merkleRoot; every other header field stays at
+//    its synthetic default (m_bits==0), so chain_rpc::is_synthetic_anchor
+//    stays TRUE and getbestblockhash / getblockhash / getblockchaininfo keep
+//    WITHHOLDING difficulty / mediantime / bestblockhash until genuinely
+//    synced to the LIVE tip. RED if the seed copies the whole header (#1251's
+//    first cut): is_synthetic_anchor would flip false and the three
+//    DashChainRpc.*SyntheticAnchor* honesty guards would fail. GREEN with
+//    Plan A: auth-fed AND honest at the same seed.
+// -------------------------------------------------------------------------
+TEST(DashAnchorHeaderMerkleRoot, AnchorFedToAuthButStaysSyntheticForHonesty)
+{
+    HeaderChain hc(make_dash_chain_params_mainnet());
+    ASSERT_TRUE(hc.init());
+
+    auto e = hc.get_header_by_height(kAnchorHeight);
+    ASSERT_TRUE(e.has_value());
+
+    // (a) the DIP-4 auth trust anchor IS present ...
+    uint256 expected;
+    expected.SetHex(kAnchorMerkleRoot);
+    EXPECT_EQ(e->header.m_merkle_root, expected);
+
+    // (b) ... while the daemon-tip discriminator is UNTOUCHED: bits/time stay
+    // 0 so is_synthetic_anchor stays true and the honesty guards keep holding.
+    EXPECT_EQ(e->header.m_bits, 0u)
+        << "seeding the real hdr_bits flips is_synthetic_anchor to false and "
+           "publishes difficulty/mediantime/bestblockhash from one "
+           "unvalidated, non-live anchor";
+    EXPECT_EQ(e->header.m_timestamp, 0u)
+        << "a nonzero anchor timestamp makes median_time_past()!=0 -- a "
+           "fabricated daemon-tip mediantime";
+    EXPECT_TRUE(dash::coin::chain_rpc::is_synthetic_anchor(*e))
+        << "the lone checkpoint anchor must remain synthetic for the honesty "
+           "guards even though its merkleRoot is fed to the DIP-4 auth";
 }
 #endif // C2POOL_FAST_START_CHECKPOINT_HAS_HEADER

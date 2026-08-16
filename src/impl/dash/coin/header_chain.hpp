@@ -289,15 +289,26 @@ public:
             entry.prev_hash = uint256::ZERO;
             entry.status = HEADER_VALID_CHAIN;
 
-            // When the checkpoint carries its full header, seed entry.header so
-            // downstream consumers reading the anchor's hashMerkleRoot (DIP-4
-            // historical-snapshot auth in the MN-set bridge) find their trust
-            // anchor at t~=0. SELF-VERIFY first: X11(header) must equal the
-            // release-pinned block hash. A mismatch means the pin is corrupt —
-            // fail closed (leave entry.header default) rather than seed a
-            // header whose merkleRoot could authenticate a forged SML. This
-            // mints no new trust: the merkle root is only adopted once it is
-            // proven to hash to the already-pinned `hash`.
+            // When the checkpoint carries its full header, adopt ONLY its
+            // self-verified hashMerkleRoot into entry.header — the single field
+            // the DIP-4 historical-snapshot auth in the MN-set bridge reads
+            // (main_dash set_merkle_root_at_fn). SELF-VERIFY first: X11 over the
+            // FULL pinned header must equal the release-pinned block hash; a
+            // mismatch means the pin is corrupt, so fail closed (adopt nothing)
+            // rather than feed a merkleRoot that could authenticate a forged SML.
+            //
+            // HONESTY RECONCILIATION (Plan A). We deliberately DO NOT copy the
+            // whole header. m_bits / m_timestamp / m_version / ... stay at their
+            // synthetic-anchor defaults (0), so chain_rpc::is_synthetic_anchor()
+            // (keyed on m_bits==0) stays TRUE and the node keeps WITHHOLDING the
+            // daemon-tip fields difficulty / mediantime / bestblockhash until it
+            // is genuinely synced to the LIVE tip. The pinned header exists for
+            // INTERNAL DIP-4 auth only; a single lone checkpoint anchor must
+            // never masquerade as a daemon tip. Mints no new trust: the merkle
+            // root is adopted only once proven to X11-hash to the pinned block
+            // hash. Machine-checked by test_dash_anchor_header_merkle_root (root
+            // present) and test_dash_header_chain's *SyntheticAnchor* guards
+            // (daemon-tip fields still withheld at the anchor).
             if (cp.has_header) {
                 BlockHeaderType hdr;
                 hdr.m_version        = cp.hdr_version;
@@ -308,13 +319,17 @@ public:
                 hdr.m_nonce          = cp.hdr_nonce;
                 const uint256 computed = x11_hash(hdr);
                 if (computed == cp.hash) {
-                    entry.header = hdr;
-                    LOG_INFO << "[EMB-DASH] Fast-start checkpoint header VERIFIED"
-                             << " (X11==hash) merkleRoot="
-                             << hdr.m_merkle_root.GetHex().substr(0, 16);
+                    // Adopt the merkle root ALONE; leave every other header
+                    // field synthetic (0) so is_synthetic_anchor() stays true
+                    // and the daemon-tip honesty guards keep withholding.
+                    entry.header.m_merkle_root = hdr.m_merkle_root;
+                    LOG_INFO << "[EMB-DASH] Fast-start checkpoint merkleRoot"
+                                " VERIFIED (X11==hash) merkleRoot="
+                             << hdr.m_merkle_root.GetHex().substr(0, 16)
+                             << " (anchor kept synthetic: bits/time withheld)";
                 } else {
                     LOG_ERROR << "[EMB-DASH] Fast-start checkpoint header X11 "
-                                 "MISMATCH — refusing to seed header (fail "
+                                 "MISMATCH — refusing to seed merkleRoot (fail "
                                  "closed); computed="
                               << computed.GetHex().substr(0, 16) << " pinned="
                               << cp.hash.GetHex().substr(0, 16);
@@ -331,7 +346,8 @@ public:
             persist_tip();
             LOG_INFO << "[EMB-DASH] Fast-start checkpoint: height=" << cp.height
                      << " hash=" << cp.hash.GetHex().substr(0, 16)
-                     << " header=" << (entry.header.IsNull() ? "null" : "seeded");
+                     << " merkleRoot="
+                     << (entry.header.m_merkle_root.IsNull() ? "null" : "seeded");
         }
         // Fall back to genesis as stub when no checkpoint is configured
         // (so block 1's prev_hash resolves).
