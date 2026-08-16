@@ -6546,6 +6546,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             seams.tip_busy = [cp = coin_p2p.get()] {
                 return cp->pending_body_count() > 0;
             };
+            // DECONFLICT the shared response demux: while the embedded
+            // MN-checkpoint anchor->tip fold is still building the payee queue,
+            // the bulk genesis->anchor lane yields (body pump AND header
+            // backfill). The fold's block-body getdata rides the same coin-P2P
+            // link as this lane's fetch, and it gates the money arm — it must
+            // finish first. Once the lane publishes, bridging_active() goes
+            // false and the bulk lane resumes at full rate. Reward-safe: this
+            // only reorders WHO fetches WHEN, never what either derives.
+            seams.defer_to_higher_priority = [mnl = mn_ckpt_lane.get()] {
+                return mnl && mnl->bridging_active();
+            };
 
             rp::BulkFetchLane::Config rcfg;
             // A seeded fold pins the lane to anchor+1: the fold is
@@ -7359,6 +7370,38 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         diag_timer->expires_after(std::chrono::seconds(30));
         diag_timer->async_wait(*diag_tick);
     }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // MN-CKPT EVENT-DRIVEN BODY RE-REQUEST — a FAST timer, off the tip clock
+    // ═════════════════════════════════════════════════════════════════════
+    //
+    // The anchor->tip fold self-drives at burst rate as long as bodies arrive
+    // contiguously (on_block_connected tops up the window per applied block).
+    // But once the header chain has caught the tip — which on a cut cold start
+    // it does long before the fold finishes — pump() (HeaderChain::
+    // on_tip_changed) fires only on a NEW block, ~2.5 min apart on mainnet. A
+    // body dropped or starved mid-window then stalls the forward-contiguous
+    // cursor for a whole tip interval before pump()'s stall probe re-asks it,
+    // collapsing the fold onto ~1 block per tip. This 3 s timer re-drives the
+    // request window FROM THE CURSOR the moment it sees no progress — the
+    // cut-cold-path analog of #1162, recovering a starved window in seconds
+    // instead of ~2.5 min. FETCH-timing only (see service_tick's contract): it
+    // issues getdata and nothing else, so the derived MN/quorum/credit bytes
+    // and every reward-safety hold on publish() are untouched. Dormant unless
+    // the lane is armed on the daemonless path; a no-op while Waiting/Published.
+    io::steady_timer mn_service_timer(ioc);
+    auto mn_service_tick =
+        std::make_shared<std::function<void(const boost::system::error_code&)>>();
+    *mn_service_tick =
+        [&mn_service_timer, mn_service_tick, &mn_ckpt_lane](
+            const boost::system::error_code& ec) {
+            if (ec) return;   // cancelled at shutdown
+            if (mn_ckpt_lane) mn_ckpt_lane->service_tick();
+            mn_service_timer.expires_after(std::chrono::seconds(3));
+            mn_service_timer.async_wait(*mn_service_tick);
+        };
+    mn_service_timer.expires_after(std::chrono::seconds(3));
+    mn_service_timer.async_wait(*mn_service_tick);
 
     // ═════════════════════════════════════════════════════════════════════
     // SERVE-STALENESS SENTINEL — REPORT-ONLY (2026-08-07 dead-height incident)

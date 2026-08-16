@@ -118,6 +118,7 @@ struct LaneRig
     rp::CountingReplayConsumer counter;
     std::vector<std::string> peers{"p1:9999", "p2:9999", "p3:9999"};
     bool tip_busy{false};
+    bool defer_higher{false};   // MN-checkpoint fold mid-replay (deconflict seam)
     uint32_t chain_height;
 
     struct SentBatch
@@ -149,6 +150,7 @@ struct LaneRig
             getheaders_sent.emplace_back(peer, loc);
         };
         seams.tip_busy = [this] { return tip_busy; };
+        seams.defer_to_higher_priority = [this] { return defer_higher; };
         lane = std::make_unique<rp::BulkFetchLane>(
             std::move(seams), cfg, backfill,
             consumer_override ? consumer_override
@@ -485,6 +487,26 @@ TEST(DashReplayBulkLane, TipBusyIssuesNoNewRequests)
     EXPECT_FALSE(rig.sent.empty());  // released — bulk resumes
 }
 
+// DECONFLICT: while the higher-priority MN-checkpoint anchor->tip fold is
+// building the payee queue, the bulk lane issues NO body getdata — its fetch
+// shares the coin-P2P response demux with the fold's block-body pull, and the
+// fold gates the money arm. Released the instant the fold publishes.
+TEST(DashReplayBulkLane, DeferHigherPriorityBodyPumpYields)
+{
+    rp::BulkFetchLane::Config cfg;
+    cfg.start_height = 10;
+    LaneRig rig(100, cfg);
+
+    rig.defer_higher = true;         // MN-ckpt fold mid-replay
+    rig.lane->tick(1000);
+    EXPECT_TRUE(rig.sent.empty())    // not one bulk getdata competes with it
+        << "bulk must yield the demux to the MN-checkpoint fold";
+
+    rig.defer_higher = false;        // fold published — bridging_active() false
+    rig.lane->tick(1001);
+    EXPECT_FALSE(rig.sent.empty());  // released — bulk resumes at full rate
+}
+
 // ═══ (F) resumability ═════════════════════════════════════════════════════
 
 TEST(DashReplayCursorStore, RoundTripAndGarbageRejection)
@@ -618,6 +640,35 @@ struct BackfillChain
         return out;
     }
 };
+
+// DECONFLICT, header leg: the genesis->anchor header-backfill getheaders walk
+// ALSO yields while the higher-priority MN-checkpoint fold runs (the cited
+// starver — a headers batch is consumed before the tip lane's new_headers, and
+// it contends for the same coin-P2P link as the fold's body getdata). Released
+// when the fold publishes (defer_higher goes false).
+TEST(DashReplayBulkLane, DeferHigherPriorityBackfillGetheadersYields)
+{
+    const uint32_t ANCHOR = 25;
+    BackfillChain bc(ANCHOR);
+    uint256 pow_limit;
+    pow_limit.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    rp::HeaderBackfill bf(bc.genesis, ANCHOR, bc.hashes[ANCHOR], pow_limit,
+                          /*db_path=*/"", /*check_pow=*/false);
+
+    rp::BulkFetchLane::Config cfg;
+    cfg.start_height = ANCHOR + 1;
+    LaneRig rig(100, cfg, &bf);
+
+    rig.defer_higher = true;         // MN-ckpt fold mid-replay
+    rig.lane->tick(1000);
+    EXPECT_TRUE(rig.getheaders_sent.empty())
+        << "the header backfill must not kick getheaders while the fold runs";
+
+    rig.defer_higher = false;        // fold published
+    rig.lane->tick(1001);
+    EXPECT_FALSE(rig.getheaders_sent.empty())  // released — walk resumes
+        << "backfill resumes the instant the fold's priority is released";
+}
 
 TEST(DashReplayHeaderBackfill, WalksToAnchorAndJoins)
 {

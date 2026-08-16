@@ -510,6 +510,85 @@ TEST(DashMnCheckpointBridge, ReplaysRealBlocksAndPublishesAtTip)
     EXPECT_TRUE(std::is_sorted(h.requested.begin(), h.requested.end()));
 }
 
+// The cut-cold-path stall + its event-driven cure. Once headers have caught
+// the tip, pump() only fires on a NEW block (~2.5 min on mainnet), so a body
+// starved mid-window stalls the forward-contiguous cursor until then.
+// service_tick() — driven off a FAST wall-clock timer, not the tip clock —
+// re-asks the window from the cursor on a stall, recovering in seconds. This
+// is FETCH TIMING only: nothing folds or publishes until a body actually
+// arrives, and the anchor is never touched.
+TEST(DashMnCheckpointBridge, ServiceTickReRequestsAStarvedWindowOffPump)
+{
+    BridgeHarness h;
+    h.auto_deliver = false;                          // model a silent/slow peer
+    h.headers[kAnchorHeight] = uint256S(kAnchorHash);
+    h.blocks[1519544] = block_from_hex(kBlockHex1519544);
+    h.blocks[1519545] = block_from_hex(kBlockHex1519545);
+    h.blocks[1519546] = block_from_hex(kBlockHex1519546);
+    h.tip = 1519546;
+
+    h.lane.arm(good_checkpoint());
+    h.lane.pump();                                   // issues the initial window
+    ASSERT_EQ(h.lane.state(), MnCheckpointLane::State::Bridging);
+    EXPECT_TRUE(h.lane.bridging_active());
+    ASSERT_FALSE(h.requested.empty());               // window asked once
+    EXPECT_EQ(h.lane.cursor_height(), kAnchorHeight); // nothing delivered
+
+    // No tip change happens, so pump() never re-drives the window. The FIRST
+    // service tick only establishes the stall baseline — it must NOT re-request
+    // on a cursor it has not yet seen stand still, or a healthy replay would be
+    // sprayed with redundant getdata.
+    h.requested.clear();
+    h.lane.service_tick();
+    EXPECT_TRUE(h.requested.empty())
+        << "the first service tick must baseline, not re-request";
+    EXPECT_EQ(h.lane.service_rerequests(), 0u);
+
+    // The cursor has now stood still across a whole service interval: starved.
+    // The SECOND tick re-asks FROM THE CURSOR — proving recovery without a pump.
+    h.lane.service_tick();
+    EXPECT_EQ(h.lane.service_rerequests(), 1u);
+    ASSERT_FALSE(h.requested.empty())
+        << "a stalled window must be re-requested off-pump";
+    EXPECT_EQ(h.requested.front(), 1519544u)
+        << "re-request starts AT the cursor (m_rerequest_from_cursor), not past"
+           " the stale request ledger";
+
+    // A pure FETCH nudge: still Bridging, nothing published, no state derived.
+    EXPECT_EQ(h.lane.state(), MnCheckpointLane::State::Bridging);
+    EXPECT_FALSE(h.published);
+
+    // The peer answers the re-ask: the fold completes and publishes, and
+    // bridging_active() flips false — releasing the bulk-lane deconfliction.
+    h.lane.on_block_connected(h.blocks[1519544], 1519544);
+    h.lane.on_block_connected(h.blocks[1519545], 1519545);
+    h.lane.on_block_connected(h.blocks[1519546], 1519546);
+    EXPECT_TRUE(h.published) << h.lane.status();
+    EXPECT_EQ(h.lane.state(), MnCheckpointLane::State::Published);
+    EXPECT_FALSE(h.lane.bridging_active());
+}
+
+// service_tick() is inert off the bridging state: a Waiting lane (headers not
+// yet at the anchor) and a Published lane must never emit a re-request. Proves
+// the tick cannot disturb a lane that is not mid-replay.
+TEST(DashMnCheckpointBridge, ServiceTickIsInertWhenNotBridging)
+{
+    BridgeHarness h;
+    h.auto_deliver = false;
+    h.headers[kAnchorHeight] = uint256S(kAnchorHash);
+    h.tip = 0;                                        // headers have not arrived
+    h.lane.arm(good_checkpoint());
+    ASSERT_EQ(h.lane.state(), MnCheckpointLane::State::Waiting);
+
+    h.requested.clear();
+    h.lane.service_tick();
+    h.lane.service_tick();
+    EXPECT_TRUE(h.requested.empty())
+        << "service_tick must do nothing while Waiting";
+    EXPECT_EQ(h.lane.service_rerequests(), 0u);
+    EXPECT_FALSE(h.lane.bridging_active());
+}
+
 TEST(DashMnCheckpointBridge, IgnoresLiveTipBlocksArrivingMidBridge)
 {
     // The cold-start race: the new_block inv leg delivers a block at the CURRENT

@@ -1028,6 +1028,18 @@ public:
                            const uint256& stop)> send_getheaders;
         // Tip lane busy right now? (pending tracked tip body) — priority inv. 2.
         std::function<bool()> tip_busy;
+        // OPTIONAL. A HIGHER-priority coin-P2P consumer is mid-fetch right now —
+        // specifically the embedded MN-checkpoint anchor->tip fold building the
+        // payee queue (main_dash wires this to MnCheckpointLane::bridging_active).
+        // While it returns true this lane yields BOTH its body pump AND its
+        // header-backfill getheaders, because the fold's block-body getdata and
+        // this backfill's headers share ONE response demux on the coin-P2P link
+        // and the fold gates the money arm — it must build its queue first. This
+        // is the same class of guard as tip_busy (the live-tip body edge), for a
+        // different higher-priority consumer (the one-shot cold-start payee
+        // derivation). Null (KATs, any embedding without the fold) ⇒ this lane
+        // behaves BYTE-IDENTICALLY to before this seam existed.
+        std::function<bool()> defer_to_higher_priority;
     };
 
     struct Config
@@ -1117,6 +1129,13 @@ private:
     void maybe_kick_backfill(int64_t now)
     {
         if (!m_backfill || m_backfill->complete() || m_backfill->failed())
+            return;
+        // Yield the shared response demux to a higher-priority coin-P2P
+        // consumer (the MN-checkpoint anchor->tip fold): its block-body getdata
+        // and this getheaders walk contend for the same link, and the fold's
+        // payee queue gates the money arm. Hold the header walk until the fold
+        // has published. Null seam ⇒ unchanged.
+        if (m_seams.defer_to_higher_priority && m_seams.defer_to_higher_priority())
             return;
         if ((now - m_last_backfill_kick) < m_cfg.backfill_rekick_sec) return;
         auto peers = m_seams.eligible_peers();
@@ -1332,7 +1351,9 @@ public:
         // STRICT PRIORITY: no new bulk requests while a tracked tip body is
         // outstanding (invariant 2). In-flight bulk completes on its own.
         if (!peers.empty() && m_cursor_checked &&
-            !(m_seams.tip_busy && m_seams.tip_busy()))
+            !(m_seams.tip_busy && m_seams.tip_busy()) &&
+            !(m_seams.defer_to_higher_priority &&
+              m_seams.defer_to_higher_priority()))
         {
             auto assignments = m_sched.pump(
                 now, peers, m_seams.hash_at, m_buffer.size());
