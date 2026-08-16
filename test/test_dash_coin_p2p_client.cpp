@@ -61,6 +61,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <algorithm>
 #include <vector>
 
 using dash::coin::p2p::CoinClient;
@@ -734,6 +735,144 @@ TEST(DashCoinP2PClient, pool_tick_timer_is_actually_armed_on_the_io_context)
     EXPECT_GE(rig.client.pings_sent(), 1u)
         << "the pool tick timer was never armed on the io_context — every "
            "clock-driven test above would still pass with the tick deleted";
+}
+
+// ── (f) HEAD-OF-LINE STALLER — dashd nStallingSince port ───────────────────
+//
+// The mn-checkpoint anchor->tip fold is forward-CONTIGUOUS: apply_block cannot
+// cross a hole, so the single body at the fold cursor (the front of the ordered
+// window) gates the WHOLE fold even while up to kWindow-1 later bodies have
+// already arrived and buffered ahead. Before this port that front body was one
+// of ~64 EQUAL tracked slots: its getdata rode a blind round-robin carrier and
+// its slow carrier was disconnected only after BODY_REREQUEST_MAX(4) rotations.
+//
+// dashd (net_processing.cpp) arms nStallingSince against the carrier of the
+// FIRST in-flight block ONLY, and disconnects it after an ADAPTIVE (doubling,
+// 2->64s) timeout once the window is starved. This port mirrors that: the lane
+// tags the cursor block head-of-line; on stall the front RE-HOMES to the
+// fastest-delivering peer (dashd reassignment), and its carrier is disconnected
+// only once it is a CHRONIC staller (the adaptive window has climbed to >=16s),
+// so a willing-but-slow peer is not dropped on the first stall.
+//
+// These KATs are the red/green pair, expressed as untagged-vs-tagged on the
+// SAME service pass with an identical peer set.
+
+// Stand up one handshaked, bulk-eligible (NODE_NETWORK) peer at a synthetic
+// address on the REAL client — attach + version + verack, all above the socket.
+inline void hol_add_handshaked_peer(ClientRig& rig, const std::string& ip,
+                                    uint16_t port, uint64_t services, uint32_t height)
+{
+    NetService addr{ip, port};
+    rig.client.attach_peer_for_test(addr);
+    rig.client.handle(
+        dash::coin::p2p::message_version::make_raw(
+            70230, services, /*timestamp=*/1234567890ull,
+            addr_t{services, addr},
+            addr_t{services, NetService{"0.0.0.0", port}},
+            /*nonce=*/0x1122334455667788ull, "/Dash Core:21.1.0/", height),
+        addr);
+    rig.client.handle(dash::coin::p2p::message_verack::make_raw(), addr);
+}
+
+// GREEN core: a tagged head-of-line front RE-HOMES to the fastest deliverer on
+// its FIRST stall (not a blind round-robin pick) WITHOUT dropping the slow
+// carrier — the pool keeps its parallelism.
+TEST(DashCoinP2PHeadOfLine, tagged_front_rehomes_to_fastest_on_first_stall_pool_intact)
+{
+    ClientRig rig;
+    rig.use_fake_clock();
+
+    // Four archival peers. Attach order fixes the round-robin: A is the initial
+    // carrier; B is the demonstrated FAST deliverer; C, D are spares.
+    hol_add_handshaked_peer(rig, "10.0.0.1", 9999, /*NODE_NETWORK*/1, 3000000);
+    hol_add_handshaked_peer(rig, "10.0.0.2", 9999, 1, 3000000);
+    hol_add_handshaked_peer(rig, "10.0.0.3", 9999, 1, 3000000);
+    hol_add_handshaked_peer(rig, "10.0.0.4", 9999, 1, 3000000);
+    const std::string A = "10.0.0.1:9999", B = "10.0.0.2:9999";
+    ASSERT_EQ(rig.client.handshaked_peer_keys().size(), 4u);
+
+    // dashd PeerTally.blocks: B is the fastest deliverer.
+    rig.client.bump_peer_delivered_for_test(B, 100);
+
+    const uint256 front = uint256(0xF00Dull);
+    ASSERT_TRUE(rig.client.request_head_of_line_for_test(front));
+    EXPECT_TRUE(rig.client.pending_body_is_hol_for_test(front));
+    ASSERT_EQ(rig.client.pending_body_last_peer_for_test(front), A)
+        << "initial HOL getdata should ride the first round-robin carrier";
+
+    rig.fake_now += 3;   // > BODY_STALL_TIMEOUT_INIT (2s): first stall
+    rig.client.service_pending_bodies_for_test(rig.fake_now);
+
+    // The front block re-homes to the FASTEST deliverer (B), not round-robin.
+    EXPECT_EQ(rig.client.hol_rehomes(), 1u);
+    EXPECT_EQ(rig.client.hol_last_rehome_target(), B)
+        << "HOL re-home must pick the highest PeerTally.blocks peer";
+    EXPECT_EQ(rig.client.pending_body_last_peer_for_test(front), B);
+    // A willing-but-slow carrier is NOT dropped on the first stall — the pool
+    // keeps its parallelism (dashd disconnects only a genuinely-starved window).
+    EXPECT_EQ(rig.client.hol_disconnects(), 0u);
+    EXPECT_EQ(rig.client.handshaked_peer_keys().size(), 4u);
+}
+
+// GREEN chronic: a front that stays stuck across the ADAPTIVE (doubling) window
+// eventually has its chronic carrier disconnected (dashd fDisconnect), so the
+// cursor cannot wedge forever on one dead-but-connected peer.
+TEST(DashCoinP2PHeadOfLine, chronic_front_disconnects_its_carrier_after_adaptive_backoff)
+{
+    ClientRig rig;
+    rig.use_fake_clock();
+    hol_add_handshaked_peer(rig, "10.0.0.1", 9999, 1, 3000000);
+    hol_add_handshaked_peer(rig, "10.0.0.2", 9999, 1, 3000000);
+    hol_add_handshaked_peer(rig, "10.0.0.3", 9999, 1, 3000000);
+    hol_add_handshaked_peer(rig, "10.0.0.4", 9999, 1, 3000000);
+    ASSERT_EQ(rig.client.handshaked_peer_keys().size(), 4u);
+
+    const uint256 front = uint256(0xF00Dull);
+    ASSERT_TRUE(rig.client.request_head_of_line_for_test(front));
+
+    // Nobody ever answers. Drive the adaptive window 2->4->8->16 across stalls.
+    // The disconnect fires only once the window reaches the chronic threshold,
+    // so early stalls re-home (race) but keep the pool intact.
+    for (int i = 0; i < 4; ++i) {
+        rig.fake_now += 70;   // always past the (doubling) stall window
+        rig.client.service_pending_bodies_for_test(rig.fake_now);
+    }
+
+    EXPECT_GE(rig.client.hol_rehomes(), 1u) << "the front must have re-homed";
+    EXPECT_GE(rig.client.hol_disconnects(), 1u)
+        << "a chronic front-of-window staller must eventually be disconnected";
+    EXPECT_LT(rig.client.handshaked_peer_keys().size(), 4u)
+        << "the chronic carrier was dropped";
+}
+
+// RED reference: an UNTAGGED front (plain tracked slot) under the identical peer
+// set keeps the pre-port behaviour — blind round-robin re-request, no
+// fastest-peer targeting, and NO HOL disconnect. This is the trickle the tag
+// removes.
+TEST(DashCoinP2PHeadOfLine, untagged_front_keeps_roundrobin_and_no_hol_machinery)
+{
+    ClientRig rig;
+    rig.use_fake_clock();
+    hol_add_handshaked_peer(rig, "10.0.0.1", 9999, 1, 3000000);
+    hol_add_handshaked_peer(rig, "10.0.0.2", 9999, 1, 3000000);
+    hol_add_handshaked_peer(rig, "10.0.0.3", 9999, 1, 3000000);
+    const std::string B = "10.0.0.2:9999";
+    ASSERT_EQ(rig.client.handshaked_peer_keys().size(), 3u);
+    rig.client.bump_peer_delivered_for_test(B, 100);   // fastest — but untagged path ignores rank
+
+    const uint256 front = uint256(0xBEEFull);
+    ASSERT_TRUE(rig.client.request_block_tracked(front));
+    EXPECT_FALSE(rig.client.pending_body_is_hol_for_test(front));
+
+    rig.fake_now += 3;
+    rig.client.service_pending_bodies_for_test(rig.fake_now);
+
+    // No HOL machinery fired: no fastest-peer re-home and no HOL disconnect.
+    EXPECT_EQ(rig.client.hol_disconnects(), 0u);
+    EXPECT_EQ(rig.client.hol_rehomes(), 0u);
+    // It WAS re-requested (round-robin rotation), proving the difference is the
+    // targeting policy — not whether a re-request occurs at all.
+    EXPECT_GE(rig.client.body_rerequests_total(), 1u);
 }
 
 } // namespace

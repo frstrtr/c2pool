@@ -775,12 +775,41 @@ private:
         int         stalls_since_evict{0};
         // Stallers disconnected to recover THIS body (per-slot telemetry).
         int         evictions{0};
+        // dashd nStallingSince (net_processing.cpp FindNextBlocksToDownload):
+        // this slot is the FRONT-OF-DOWNLOAD-WINDOW body — the mn-checkpoint
+        // fold cursor, whose slow carrier gates the whole ordered fold because
+        // apply_block cannot cross the hole it leaves. A HOL slot's carrier is
+        // disconnected on its FIRST stall and the body re-homed to the fastest
+        // deliverer, instead of waiting BODY_REREQUEST_MAX round-robin rotations
+        // like an ordinary buffered-ahead slot.
+        bool        hol{false};
     };
     std::vector<PendingBody> m_pending_bodies;
     uint64_t m_body_rerequests_total{0};
     // Stalling peers disconnected to keep a needed body from wedging the lane
     // (dashd disconnect-on-stall). Surfaced as body_stall_evictions.
     uint64_t m_body_stall_evictions{0};
+
+    // ── dashd nStallingSince: head-of-line (front-of-window) staller state ──
+    // The mn-checkpoint fold is forward-CONTIGUOUS: the body at the cursor
+    // (m_next) gates the WHOLE ordered fold even while up to kWindow-1 later
+    // bodies buffer ahead. dashd arms its stall timer against the carrier of
+    // the FIRST in-flight block ONLY (net_processing.cpp:1482-1494 nodeStaller),
+    // disconnects it on a 2s adaptive timeout, and FindNextBlocksToDownload
+    // reassigns the block to another peer. We mirror that: the lane tags ONE
+    // block as head-of-line (m_hol_hash) via request_head_of_line(); a HOL stall
+    // disconnects that carrier on the FIRST stall and re-homes JUST that block to
+    // the fastest-delivering peer. Exactly one HOL slot at a time.
+    uint256     m_hol_hash;               // current head-of-line block (null = none)
+    uint64_t    m_hol_disconnects{0};     // carriers disconnected for a HOL stall
+    uint64_t    m_hol_rehomes{0};         // HOL bodies re-homed to a faster peer
+    std::string m_hol_last_rehome_target; // key of the last HOL re-home carrier
+    // dashd PeerTally.blocks (the FindNextBlocksToDownload "fastest deliverer"
+    // rank source): count of bodies each ADDRESS has actually delivered, keyed
+    // by addr:port so the rank survives a PeerSession churn / reconnect.
+    // Incremented on body receipt; fastest_bulk_peer() ranks the HOL re-home on
+    // it. A blind analog of replay_bulk_fetch.hpp's PeerTally for the live path.
+    std::map<std::string, uint64_t> m_peer_bodies_delivered;
 
     // ── tip-body announcer routing (#1082 pool + #1094 body-first) ───────
     // A block `inv` names a peer that HOLDS the block. The tip-body getdata
@@ -1262,6 +1291,20 @@ public:
     /// send_getmnlistd_rotating() does on the wire, so repeated calls rotate.
     std::string select_stateful_peer_key_for_test()
     { PeerSession* p = next_stateful_peer(); if (p) m_last_stateful_peer = p->key; return p ? p->key : std::string{}; }
+    /// TEST-ONLY: head-of-line (dashd nStallingSince) seams. Tag a block as the
+    /// front-of-window body, inspect its marker/carrier, bump the fastest-
+    /// deliverer tally the live block handler maintains, and drive the pool-tick
+    /// body service directly (no io_context) — the seams the HOL KAT asserts on.
+    bool request_head_of_line_for_test(const uint256& h) { return request_head_of_line(h); }
+    bool pending_body_is_hol_for_test(const uint256& h) const
+    { for (const auto& pb : m_pending_bodies) if (pb.hash == h) return pb.hol; return false; }
+    std::string pending_body_last_peer_for_test(const uint256& h) const
+    { for (const auto& pb : m_pending_bodies) if (pb.hash == h) return pb.last_peer; return std::string{}; }
+    void bump_peer_delivered_for_test(const std::string& key, uint64_t n)
+    { m_peer_bodies_delivered[key] += n; }
+    uint64_t peer_delivered_for_test(const std::string& key) const
+    { auto it = m_peer_bodies_delivered.find(key); return it == m_peer_bodies_delivered.end() ? 0 : it->second; }
+    void service_pending_bodies_for_test(int64_t now) { service_pending_bodies(now); }
 
     /// TEST-ONLY: stand a peer session up with a synthetic endpoint and NO
     /// socket, the way Factory does on a live connect. A null socket is legal
@@ -1547,10 +1590,44 @@ public:
         return sent;
     }
 
+    /// dashd nStallingSince: tag ONE block as the HEAD-OF-LINE (front-of-
+    /// ordered-window) body and ensure it is tracked. Reuses
+    /// request_block_tracked()'s slot + #138 ledger honesty; the ONLY addition
+    /// is the privileged marker service_pending_bodies() reads to disconnect the
+    /// carrier on the FIRST stall and re-home to the fastest deliverer. Exactly
+    /// one HOL slot exists at a time — marking a new front clears the previous
+    /// (dashd arms the stall timer against a SINGLE carrier). Idempotent: safe to
+    /// call every service tick; when the slot already exists it only re-tags,
+    /// issuing no extra getdata. Reward-safe: fetch routing only.
+    /// Returns request_block_tracked()'s truth (TRUE when a getdata reached a
+    /// peer) so a ledger-keeping caller can refuse to count a dead send.
+    bool request_head_of_line(const uint256& block_hash)
+    {
+        m_hol_hash = block_hash;
+        bool existed = false;
+        for (auto& pb : m_pending_bodies)
+        {
+            if (pb.hash == block_hash) { pb.hol = true; existed = true; }
+            else                       pb.hol = false;
+        }
+        if (existed) return true;   // already tracked — re-tagged, no new getdata
+        // Not tracked yet: create the slot + issue the initial getdata exactly as
+        // request_block_tracked does, then mark the (possibly newly created) slot
+        // HOL and clear the marker on every other slot.
+        const bool sent = request_block_tracked(block_hash);
+        for (auto& pb : m_pending_bodies) pb.hol = (pb.hash == block_hash);
+        return sent;
+    }
+
     /// Watchdog observability (KATs + POOL-STATUS).
     std::size_t pending_body_count()    const { return m_pending_bodies.size(); }
     uint64_t body_rerequests_total()    const { return m_body_rerequests_total; }
     uint64_t body_stall_evictions()     const { return m_body_stall_evictions; }
+    // dashd nStallingSince telemetry: how many front-of-window carriers were
+    // disconnected, how many HOL bodies were re-homed, and to whom last.
+    uint64_t hol_disconnects()          const { return m_hol_disconnects; }
+    uint64_t hol_rehomes()              const { return m_hol_rehomes; }
+    std::string hol_last_rehome_target() const { return m_hol_last_rehome_target; }
 
     /// Send a getmnlistd (SML diff request) — E2/E3 masternode-list sync seam.
     ///
@@ -1963,6 +2040,38 @@ private:
         return m_primary;
     }
 
+    /// dashd FindNextBlocksToDownload reassignment, ranked by the fastest
+    /// DELIVERER (PeerTally.blocks): the handshaked, bulk-eligible (CanServeBlocks
+    /// + non-demoted) peer that has delivered the most bodies, skipping `avoid`
+    /// (the just-blamed head-of-line carrier). Before any delivery history exists
+    /// (cold start) it degrades to next_bulk_peer()'s round-robin spread — still
+    /// skipping the blamed carrier when a neighbour exists — so a HOL re-home
+    /// never wedges on an empty ranking.
+    PeerSession* fastest_bulk_peer(const std::string& avoid)
+    {
+        PeerSession* best = nullptr;
+        uint64_t best_n = 0;
+        for (auto& up : m_pool)
+        {
+            PeerSession* p = up.get();
+            if (!p->handshake.complete()) continue;
+            if (!bulk_eligible(p))         continue;
+            if (p->key == avoid)           continue;
+            auto it = m_peer_bodies_delivered.find(p->key);
+            const uint64_t n = it == m_peer_bodies_delivered.end() ? 0 : it->second;
+            if (!best || n > best_n) { best = p; best_n = n; }
+        }
+        if (best && best_n > 0) return best;   // a demonstrated fast deliverer
+        // No delivery history to rank on — fall back to the round-robin spread.
+        PeerSession* rr = next_bulk_peer();
+        if (rr && rr->key == avoid)
+        {
+            PeerSession* alt = next_bulk_peer();   // one nudge past the staller
+            if (alt && alt->key != avoid) return alt;
+        }
+        return best ? best : rr;
+    }
+
     /// dashd sync-peer selection for the STATEFUL request legs (the
     /// mn-checkpoint fold's getmnlistd snapshot). Round-robin across the
     /// eligible (CanServeBlocks + handshaked + non-demoted) pool, PREFERRING a
@@ -2358,6 +2467,80 @@ private:
             const std::string staller = pb.last_peer;
             ++pb.stalls_since_evict;
 
+            // ── dashd nStallingSince: the FRONT-OF-WINDOW block gates the whole
+            // ordered fold, so it does NOT wait for BODY_REREQUEST_MAX rotations.
+            // On its FIRST stall, re-home JUST this block to the FASTEST-delivering
+            // peer (not a blind round-robin pick) and disconnect the slow carrier
+            // immediately (fDisconnect parity). Guarded so one missing block can
+            // never drain the pool to zero. Reward-safe: getdata routing + a peer
+            // disconnect, no served bytes.
+            if (pb.hol)
+            {
+                PeerSession* target = fastest_bulk_peer(staller);
+                if (!target) { ++it; continue; }   // retry when the pool refills
+                auto hmsg = message_getdata::make_raw(
+                    {inventory_type(inventory_type::block, pb.hash)});
+                target->write(hmsg);
+                ++pb.rerequests;
+                ++m_body_rerequests_total;
+                ++m_hol_rehomes;
+                m_hol_last_rehome_target = target->key;
+                pb.last_req = now;
+                // dashd nStallingSince ADAPTIVE DOUBLING: a front that keeps
+                // stalling backs its window off 2->4->...->64s so a
+                // genuinely-slow-deep front does not spin-disconnect one peer
+                // every 2s and thrash the pool. A NEW front is a FRESH slot
+                // (request_head_of_line -> request_block_tracked) that starts at
+                // BODY_STALL_TIMEOUT_INIT, so only a persistently-stuck cursor
+                // block backs off — exactly dashd's per-node stalling-timeout
+                // doubling, scoped to the one privileged slot.
+                pb.stall_timeout =
+                    std::min<int64_t>(pb.stall_timeout * 2, BODY_STALL_TIMEOUT_MAX);
+                pb.last_peer = target->key;
+                LOG_INFO << "[" << m_chain_label
+                         << "] cause=hol-rehome attempt=" << pb.rerequests
+                         << " target=" << target->key << " hash="
+                         << pb.hash.GetHex().substr(0, 16) << "... unanswered_for="
+                         << (now - pb.first_req) << "s (front-of-window; fastest"
+                            " deliverer, dashd nStallingSince)";
+                // Disconnect the blamed carrier ONLY once it is a CHRONIC
+                // front-of-window staller — the adaptive window has climbed to
+                // >=16s (a front stuck across ~3 stalls), not merely momentarily
+                // behind. On a network where every archival peer serves deep
+                // history at a similar rate (no dramatically-faster peer), the
+                // earlier stalls just RACE the front to the fastest deliverer
+                // WITHOUT dropping a willing-but-slow peer, so the pool keeps its
+                // parallelism (dashd only arms nStallingSince when the window is
+                // genuinely starved, and its stalling-timeout has doubled by the
+                // time it disconnects). Still guarded by a survivor/refill so the
+                // pool can never be drained by one missing block.
+                if (!staller.empty() && staller != target->key
+                    && pb.stall_timeout >= 16)
+                {
+                    PeerSession* bad = find_peer(staller);
+                    const bool have_alternative =
+                        handshaked_peer_count() > 1 || m_reconnect_enabled;
+                    if (bad && owns(bad) && have_alternative)
+                    {
+                        ++pb.evictions;
+                        ++m_body_stall_evictions;
+                        ++m_hol_disconnects;
+                        pb.stalls_since_evict = 0;
+                        note_bulk_nonserver(staller);
+                        remove_peer(bad,
+                            "block-stall(head-of-line): body "
+                            + pb.hash.GetHex().substr(0, 16)
+                            + "... unanswered over "
+                            + std::to_string(now - pb.first_req)
+                            + "s — disconnecting the FRONT-OF-WINDOW staller so the"
+                              " fold cursor re-homes to a fast peer (dashd"
+                              " nStallingSince disconnect-on-stall)");
+                    }
+                }
+                ++it;
+                continue;
+            }
+
             // Rotate through the handshaked peers, preferring one we did not
             // just ask; a single-peer pool re-asks the same peer (still
             // strictly better than the 600 s inv-TTL wait). The ANNOUNCER goes
@@ -2746,11 +2929,22 @@ private:
         // answered first) — disarm its slot.
         for (auto it = m_pending_bodies.begin();
              it != m_pending_bodies.end(); ++it)
-            if (it->hash == blockhash) { m_pending_bodies.erase(it); break; }
+            if (it->hash == blockhash) {
+                // The head-of-line block landed — clear the privileged marker so
+                // the next fold cursor becomes the new front (dashd nStallingSince
+                // re-targets the new first in-flight block).
+                if (!m_hol_hash.IsNull() && m_hol_hash == blockhash)
+                    m_hol_hash.SetNull();
+                m_pending_bodies.erase(it);
+                break;
+            }
         // This peer just DELIVERED a body — it demonstrably serves blocks, so
         // clear any non-server strike so it re-enters bulk selection (dashd
         // forgives a peer the moment it satisfies a download).
         forgive_bulk_nonserver(p->key);
+        // dashd PeerTally.blocks: record the delivery so the head-of-line
+        // re-home can rank this address as a demonstrated fast deliverer.
+        ++m_peer_bodies_delivered[p->key];
         // W2 bulk demux: a body the replay bulk lane has in flight is consumed
         // HERE (verified + folded + pruned by the lane) and never fires
         // full_block — the live ingest legs are tip-rate consumers and must
