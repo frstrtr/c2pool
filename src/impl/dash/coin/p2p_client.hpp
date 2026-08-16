@@ -618,6 +618,22 @@ private:
     // vendor/quorum_tail.hpp) parse the >=70230 layout.
     static constexpr uint32_t PROTOCOL_VERSION = 70230;
     static constexpr uint64_t NODE_NETWORK = 1;   // no segwit/witness on Dash
+    // dashd service-flag classification (net_processing CanServeBlocks /
+    // IsLimitedPeer). A PRUNED node advertises NODE_NETWORK_LIMITED (serves
+    // only the last ~288 blocks) and CLEARS NODE_NETWORK; a full/archival node
+    // sets NODE_NETWORK (usually LIMITED too). The mn-checkpoint anchor->tip
+    // bulk fold reaches ~9.5k blocks deep, so a limited-only peer can never
+    // serve it — CanServeBlocks convergence must exclude it from selection.
+    static constexpr uint64_t NODE_NETWORK_LIMITED = 0x400;
+    // dashd NODE_NETWORK_LIMITED_MIN_BLOCKS(288) - 2: the depth beyond which a
+    // limited peer is not asked (FindNextBlocksToDownload historical gate).
+    static constexpr uint32_t LIMITED_PEER_HISTORY_BLOCKS = 286;
+    // A peer that answers NOTFOUND for a bulk body, or that the stall watchdog
+    // disconnects for a chronic body stall, is demoted after this many strikes:
+    // next_bulk_peer() then skips it so the round-robin CONVERGES onto peers
+    // that actually deliver deep history (dashd per-peer download-failure
+    // demotion). One clean body delivery from a peer forgives it.
+    static constexpr int BULK_NONSERVER_STRIKE_MAX = 2;
     static constexpr uint16_t MAINNET_P2P_PORT = 9999;
 
 public:
@@ -647,6 +663,11 @@ private:
     // (dashd FindNextBlocksToDownload spreads a deep IBD window across peers,
     // never funnelling it at one peer).
     std::size_t  m_bulk_rr{0};
+    // dashd per-peer download-failure demotion (archival convergence). Keyed by
+    // peer addr:port so a strike survives the PeerSession object and even a
+    // reconnect to the same non-serving address. Incremented on NOTFOUND for a
+    // bulk body and on stall-eviction; cleared when that peer delivers a body.
+    std::map<std::string, int> m_bulk_nonserver_strikes;
     // The peer select_block_peer() last sent a block getdata to, so
     // request_block_tracked() arms the watchdog against the peer actually
     // asked (not an unrelated primary).
@@ -1211,6 +1232,20 @@ public:
     /// pool timer would. Paired with set_now_fn this replaces the io_context
     /// entirely for policy tests — no real timer, no real waiting, no race.
     void tick_for_test() { on_pool_tick(); }
+
+    /// TEST-ONLY: exercise the bulk/historical body peer SELECTION directly
+    /// (announcer-less path), returning the chosen peer's key — the seam the
+    /// CanServeBlocks/demotion KATs assert convergence on.
+    std::string select_bulk_peer_key_for_test(const uint256& hash)
+    { PeerSession* p = select_block_peer(hash); return p ? p->key : std::string{}; }
+    /// TEST-ONLY: current non-server strike count for a peer address.
+    int bulk_nonserver_strikes_for_test(const std::string& key) const
+    { auto it = m_bulk_nonserver_strikes.find(key); return it == m_bulk_nonserver_strikes.end() ? 0 : it->second; }
+    /// TEST-ONLY: is this peer currently demoted out of bulk selection?
+    bool bulk_demoted_for_test(const std::string& key) const { return bulk_demoted(key); }
+    /// TEST-ONLY: clear a peer's non-server strike (the forgiveness a real
+    /// body delivery triggers on the ingest path).
+    void forgive_bulk_nonserver_for_test(const std::string& key) { forgive_bulk_nonserver(key); }
 
     /// TEST-ONLY: stand a peer session up with a synthetic endpoint and NO
     /// socket, the way Factory does on a live connect. A null socket is legal
@@ -1813,15 +1848,68 @@ private:
     /// slow / rate-limiting peer then serialises only its 1/N share instead of
     /// wedging the entire anchor->tip fold behind one primary. Falls back to
     /// the primary only when the pool holds no handshaked peer at all.
+    // ── dashd CanServeBlocks service-flag classification ─────────────────
+    /// A peer advertises full-block (archival) service — dashd NODE_NETWORK.
+    static bool advertises_full_blocks(const PeerSession* p)
+    { return p && (p->services & NODE_NETWORK); }
+    /// dashd IsLimitedPeer: pruned — serves only the last ~288 blocks.
+    static bool advertises_limited_only(const PeerSession* p)
+    { return p && !(p->services & NODE_NETWORK) && (p->services & NODE_NETWORK_LIMITED); }
+    /// dashd CanServeBlocks: serves blocks AT ALL (full or limited).
+    static bool can_serve_blocks(const PeerSession* p)
+    { return p && (p->services & (NODE_NETWORK | NODE_NETWORK_LIMITED)); }
+    /// dashd pindexBestKnownBlock coverage: the peer's announced tip is at or
+    /// above the wanted height, so it can be expected to hold that block.
+    static bool peer_covers_height(const PeerSession* p, uint32_t height)
+    { return p && p->start_height >= height; }
+
+    /// Has this peer been demoted as a demonstrated non-server of deep history?
+    bool bulk_demoted(const std::string& key) const
+    {
+        auto it = m_bulk_nonserver_strikes.find(key);
+        return it != m_bulk_nonserver_strikes.end()
+               && it->second >= BULK_NONSERVER_STRIKE_MAX;
+    }
+    void note_bulk_nonserver(const std::string& key)
+    { if (!key.empty()) ++m_bulk_nonserver_strikes[key]; }
+    void forgive_bulk_nonserver(const std::string& key)
+    { if (!key.empty()) m_bulk_nonserver_strikes.erase(key); }
+
+    /// dashd FindNextBlocksToDownload eligibility for a DEEP-historical bulk
+    /// body: the peer must have handshaked, advertise full-block service (a
+    /// limited/pruned peer cannot serve ~9.5k-deep history), and not be a
+    /// demoted non-server. Height coverage is not gated here because the fold
+    /// requests span the whole anchor->tip window and every peer's start_height
+    /// (its own tip) covers every buried block; peer_covers_height() is the
+    /// available lever should a lagging peer ever join.
+    bool bulk_eligible(const PeerSession* p) const
+    {
+        return p && p->handshake.complete()
+               && advertises_full_blocks(p)
+               && !advertises_limited_only(p)
+               && !bulk_demoted(p->key);
+    }
+
     PeerSession* next_bulk_peer()
     {
         const std::size_t n = m_pool.size();
         if (n == 0) return m_primary;
-        for (std::size_t i = 0; i < n; ++i)
+        // Pass 0: dashd CanServeBlocks + per-peer failure demotion — only peers
+        // that advertise full-block service AND have not been demoted for
+        // chronic non-service. This makes the round-robin CONVERGE onto
+        // archival deliverers instead of blindly re-asking pruned/dead peers.
+        // Pass 1: any handshaked peer (non-regression — when the reachable set
+        // holds no eligible peer we still spread across the pool exactly as
+        // #1253 did, rather than wedge on an empty selection; this is the real
+        // historical-body-scarcity case where every reachable peer is
+        // limited/demoted).
+        for (int pass = 0; pass < 2; ++pass)
         {
-            PeerSession* p = m_pool[(m_bulk_rr + i) % n].get();
-            if (p->handshake.complete())
+            for (std::size_t i = 0; i < n; ++i)
             {
+                PeerSession* p = m_pool[(m_bulk_rr + i) % n].get();
+                if (!p->handshake.complete()) continue;
+                if (pass == 0 && !bulk_eligible(p)) continue;
                 m_bulk_rr = (m_bulk_rr + i + 1) % n;
                 return p;
             }
@@ -2254,6 +2342,10 @@ private:
                     ++pb.evictions;
                     ++m_body_stall_evictions;
                     pb.stalls_since_evict = 0;
+                    // The disconnected staller demonstrably did not serve this
+                    // deep body: demote its address so a refill/reconnect to it
+                    // is skipped by next_bulk_peer() (dashd failure demotion).
+                    note_bulk_nonserver(staller);
                     pb.stall_timeout = BODY_STALL_TIMEOUT_INIT;
                     remove_peer(bad,
                         "block-stall: body " + pb.hash.GetHex().substr(0, 16)
@@ -2582,6 +2674,10 @@ private:
         for (auto it = m_pending_bodies.begin();
              it != m_pending_bodies.end(); ++it)
             if (it->hash == blockhash) { m_pending_bodies.erase(it); break; }
+        // This peer just DELIVERED a body — it demonstrably serves blocks, so
+        // clear any non-server strike so it re-enters bulk selection (dashd
+        // forgives a peer the moment it satisfies a download).
+        forgive_bulk_nonserver(p->key);
         // W2 bulk demux: a body the replay bulk lane has in flight is consumed
         // HERE (verified + folded + pruned by the lane) and never fires
         // full_block — the live ingest legs are tip-rate consumers and must
@@ -3001,6 +3097,11 @@ private:
                 // on a DIFFERENT peer immediately instead of waiting out the
                 // scheduler timeout. No-op unless --replay-bulk registered it.
                 if (m_on_block_notfound) m_on_block_notfound(inv.m_hash);
+                // dashd per-peer download-failure demotion: this peer just
+                // declared it does NOT hold a block we asked for. Strike it so
+                // next_bulk_peer() converges away from non-servers of deep
+                // history onto archival peers that actually deliver.
+                note_bulk_nonserver(p->key);
             }
         }
     }
