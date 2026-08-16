@@ -526,6 +526,62 @@ public:
                        " cannot arm until it does";
     }
 
+    /// ── EVENT-DRIVEN BODY RE-REQUEST. Call from a WALL-CLOCK TIMER, never
+    /// from pump() ──────────────────────────────────────────────────────────
+    ///
+    /// WHAT THIS FIXES, measured. While the bridge is mid-replay the only two
+    /// things that top up the block-body request window are on_block_connected
+    /// (one height per APPLIED block — the self-driving burst) and pump()
+    /// (driven by HeaderChain::on_tip_changed). On a cut cold start the header
+    /// chain reaches the tip long before the anchor->tip fold finishes, so
+    /// pump() then fires only on a NEW block — ~2.5 min apart on mainnet. A
+    /// body dropped or starved mid-window (a slow/silent single peer, or the
+    /// W2 bulk lane competing for the shared response demux) stalls the
+    /// forward-CONTIGUOUS cursor — apply_block cannot skip the hole — and the
+    /// ONLY recovery is pump()'s stall probe at the next tip change. The fold
+    /// then falls off its self-driven burst rate onto ~one block per tip.
+    ///
+    /// This tick closes that gap. Driven from a fast timer that tip changes
+    /// cannot influence, it re-drives request_window() FROM THE CURSOR the
+    /// moment it observes the cursor has not advanced since the previous tick —
+    /// recovering a starved window in SECONDS instead of ~2.5 min. It is the
+    /// cut-cold-path analog of #1162's begin_fold, and it reuses the very same
+    /// m_rerequest_from_cursor flag and request_window() re-request path.
+    ///
+    /// REWARD-SAFE BY CONSTRUCTION. It touches FETCH TIMING only. request_window
+    /// issues getdata and mutates nothing else; this tick never applies a block
+    /// (that is on_block_connected, gated on height==m_next), never publishes
+    /// (publish() keeps every #91 resume / fold / apply falsification hold),
+    /// and never selects or moves an anchor (the refuse-newer-anchor guard is
+    /// untouched). A re-requested body already held is skipped by apply_block —
+    /// the sole cost is redundant getdata, exactly as #1162 documented.
+    void service_tick()
+    {
+        // Only a live replay can be starved: Waiting has not started, Published
+        // and FailedClosed are terminal. Match request_window's own guard so a
+        // fold pause (m_snapshot_pending) is left to the fold reply to resume.
+        if (m_state != State::Bridging) return;
+        if (m_snapshot_pending) return;
+        if (!m_tip_height) return;
+        const uint32_t tip = m_tip_height();
+        if (tip == 0 || m_next > tip) return;   // nothing left to fetch
+        // ACT ONLY ON A STALL. A healthy self-driving replay advances the
+        // cursor every service interval (on_block_connected tops up the window
+        // per applied block) and must not be sprayed with redundant getdata, so
+        // the first tick that finds the cursor moved only records the new
+        // baseline. A re-request needs the cursor to have stood still across a
+        // whole interval — i.e. a body that should have arrived did not.
+        if (m_next != m_last_service_next) {
+            m_last_service_next = m_next;
+            return;
+        }
+        // Stalled across a full service interval. Re-ask from the cursor now
+        // (mirror of #1162) rather than waiting for the next tip-change pump.
+        ++m_service_rerequests;
+        m_rerequest_from_cursor = true;
+        request_window(tip);
+    }
+
     /// What the lane is blocked on, as ONE greppable token. This is the field
     /// that was missing: a frozen lane published a cursor but never said what
     /// it was waiting for, so "peer dropped our getdata" and "peer never
@@ -1290,6 +1346,18 @@ public:
     size_t   replay_spent()       const { return m_spent; }
     bool     failed_closed() const { return m_state == State::FailedClosed; }
     bool     published()     const { return m_state == State::Published; }
+    /// True while the lane is actively deriving the payee queue — the
+    /// anchor->tip fold is in progress and has not yet published. Consumed by
+    /// the W2 bulk genesis->anchor replay lane (main_dash wires it into
+    /// BulkFetchLane::Seams::defer_to_higher_priority) so that low-priority
+    /// archival fetch YIELDS the shared coin-P2P response demux to this fold:
+    /// the payee queue gates the money arm and must be built first. Off the
+    /// bulk path (a plain cut cold node, the KATs) nothing reads it, and it is
+    /// pure telemetry-shaped state — reading it changes nothing.
+    bool     bridging_active() const { return m_state == State::Bridging; }
+    /// How many times the event-driven body re-request (service_tick) has
+    /// re-asked a starved window from the cursor. Telemetry / KAT witness only.
+    uint64_t service_rerequests() const { return m_service_rerequests; }
     /// ── The RE-ARM RESET witnesses ────────────────────────────────────────
     /// Exposed so a test can assert that rearm() actually cleared them, not
     /// merely that the lane "looked armed". Each of these was set by a
@@ -3649,6 +3717,9 @@ public:
     uint32_t m_max_bridge{kDefaultMaxBridgeBlocks};
     uint32_t m_stalled_pumps{0};
     uint32_t m_last_pump_next{0};        // cursor at the previous pump (stall probe)
+    uint32_t m_last_service_next{0};     // cursor at the previous service_tick
+                                         // (event-driven re-request stall probe)
+    uint64_t m_service_rerequests{0};    // starved windows re-asked off-pump
     uint32_t m_requested_through{0};     // highest height a peer was ACTUALLY
                                          // asked for (#138: never advanced on
                                          // a locally-dead request)
