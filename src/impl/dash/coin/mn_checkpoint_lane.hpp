@@ -221,6 +221,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -1169,6 +1170,13 @@ public:
     const std::string& status() const { return m_status; }
     uint32_t anchor_height() const { return m_anchor_height; }
     uint32_t cursor_height() const { return m_next == 0 ? 0 : m_next - 1; }
+    /// The fetch reorder buffer's current occupancy and its high-water mark.
+    /// staged_peak() is the measured effective in-flight depth: on the throttled
+    /// path it stays ~1 (bodies dropped, never retained); with the pipeline fix
+    /// it climbs toward kWindow as concurrently-fetched bodies land ahead of the
+    /// cursor and wait to be drained.
+    size_t   staged_size()   const { return m_stage.size(); }
+    size_t   staged_peak()   const { return m_stage_peak; }
     size_t   set_size()      const { return m_machine.size(); }
     /// Masternodes PERMANENTLY excluded during this bridge on SML-attested
     /// PoSe bans. Non-zero is not a failure — it is the repair working — but
@@ -1677,17 +1685,125 @@ public:
         request_window(tip);
     }
 
-    /// Fold the next bridge block. Wired to the SAME block-connect ingest the
-    /// maintainer uses; blocks that are not the exact next height are ignored
-    /// (a live tip block arriving mid-bridge must not be folded onto a stale
-    /// cursor — that is the E4-soak bad-cb-payee shape).
+    /// Ingest a block body off the coin-P2P feed. Wired to the SAME
+    /// block-connect ingest the maintainer uses.
+    ///
+    /// ── DASHD PIPELINE PARITY (the ~1000x throttle fix) ────────────────────
+    /// Before this seam, a body that arrived AHEAD of the strictly-contiguous
+    /// apply cursor was DROPPED on the floor ("if (height != m_next) return")
+    /// and re-fetched only once the cursor crawled up to it — one serving
+    /// round-trip per block. The kWindow-wide getdata burst therefore collapsed
+    /// to an EFFECTIVE in-flight depth of 1: measured 0.31 blk/s over a
+    /// 99%-idle link while dashd pulls the same peers at 150-350 blk/s.
+    ///
+    /// dash-core keeps every out-of-order block it fetched in its block store
+    /// and connects them CONTIGUOUSLY as ActivateBestChain advances the tip
+    /// (net_processing FindNextBlocksToDownload + MAX_BLOCKS_IN_TRANSIT_PER_PEER
+    /// x peers genuinely in flight, connect decoupled from receipt). This ports
+    /// exactly that: a body ahead of the cursor is RETAINED in a bounded
+    /// height-keyed staging map (m_stage, capped at the request window) instead
+    /// of dropped, and drained contiguously into apply the instant the
+    /// head-of-line block fills the gap. The window then slides forward by the
+    /// whole drained run and request_window() tops it straight back up, so
+    /// ~kWindow bodies stay on the wire continuously. Reward-safety is
+    /// untouched: staging changes only WHEN a body is applied, never WHAT
+    /// apply_block derives — every drained block is still forward-contiguous,
+    /// still merkle-bound (live_feed block_body_binds_to_header), still
+    /// per-block payee-falsified in exactly the same order.
     void on_block_connected(const BlockType& block, uint32_t height)
+    {
+        if (m_state != State::Bridging) return;
+        // Already applied (a duplicate / redundant re-request answer). Never
+        // stage a height at or behind the cursor.
+        if (height < m_next) return;
+        // Retain the body — DO NOT drop it — if it sits ahead of the cursor,
+        // within the window we actually requested. This is the reorder buffer:
+        // its whole point is to keep the other kWindow-1 concurrently-fetched
+        // bodies instead of re-fetching them one round-trip at a time. Bound it
+        // to the request window so memory is O(kWindow) blocks; a body outside
+        // the window was never requested, so seeing one is a bug elsewhere —
+        // drop it rather than grow unbounded.
+        if (height > m_next) {
+            if (height <= m_next + kWindow - 1) {
+                auto ins = m_stage.emplace(height, block);
+                if (ins.second && m_stage.size() > m_stage_peak)
+                    m_stage_peak = m_stage.size();
+            }
+            return;
+        }
+        // height == m_next: the head-of-line block just arrived. Apply it, then
+        // drain every contiguous body the staging buffer already holds.
+        drain_from_cursor(block);
+    }
+
+    /// Apply the head-of-line block (height == m_next), then keep applying
+    /// staged bodies as long as they are contiguous with the advancing cursor
+    /// and the replay is not PAUSED (a fold / ban-state probe outstanding) or
+    /// finished. This is dashd's contiguous-connect drain: one head fill can
+    /// release a whole run of already-fetched blocks in a single burst.
+    void drain_from_cursor(const BlockType& head)
+    {
+        // Re-entrancy guard: a synchronous test harness (ordered-stream demux)
+        // can answer a getdata INLINE from inside apply_contiguous_body ->
+        // request_window, re-entering on_block_connected before we return. The
+        // outer drain loop already re-reads m_stage/m_next each turn, so let the
+        // outer loop own the draining and make the inner call a no-op.
+        if (m_draining) {
+            // Stash and let the active drain pick it up on its next turn.
+            if (!m_snapshot_pending)
+                m_stage.emplace(m_next, head);
+            return;
+        }
+        m_draining = true;
+        apply_contiguous_body(head, m_next);
+        drain_loop();
+        m_draining = false;
+    }
+
+    /// Drain whatever the staging buffer ALREADY holds contiguously from the
+    /// cursor, with no fresh network arrival. The resume paths call this after a
+    /// fold lands so the bodies fetched WHILE the fold was outstanding apply
+    /// immediately, instead of waiting for the ~2.5-min next-tip re-fetch.
+    void drain_staged_from_cursor()
+    {
+        if (m_draining) return;
+        m_draining = true;
+        drain_loop();
+        m_draining = false;
+    }
+
+    /// The shared contiguous-connect loop. Precondition: m_draining is held so a
+    /// synchronous (inline) getdata answer cannot re-enter it.
+    void drain_loop()
+    {
+        while (m_state == State::Bridging && !m_snapshot_pending) {
+            auto it = m_stage.find(m_next);
+            if (it == m_stage.end()) break;
+            BlockType next = std::move(it->second);
+            const uint32_t h = it->first;
+            m_stage.erase(it);
+            apply_contiguous_body(next, h);
+        }
+        // Once the cursor has moved past a staged height it can never be applied
+        // (apply_block only folds m_next). Trim anything now behind the cursor
+        // so a stale entry cannot pin memory or shadow a fresh body.
+        while (!m_stage.empty() && m_stage.begin()->first < m_next)
+            m_stage.erase(m_stage.begin());
+    }
+
+    /// Fold ONE bridge block at the contiguous cursor. PRECONDITION:
+    /// height == m_next and the lane is Bridging and not snapshot-paused (the
+    /// public entry + drain loop enforce all three). A live tip block arriving
+    /// mid-bridge must never be folded onto a stale cursor — that is the
+    /// E4-soak bad-cb-payee shape — which is exactly why only height == m_next
+    /// reaches here.
+    void apply_contiguous_body(const BlockType& block, uint32_t height)
     {
         if (m_state != State::Bridging) return;
         // PAUSED: a fold request is outstanding for the current cursor. The
         // cursor must not advance past the height the pending list describes,
-        // or the fold would land EARLY. Blocks arriving now are dropped; they
-        // are re-requested when the fold completes.
+        // or the fold would land EARLY. The drain loop already stops on this
+        // flag; this is the belt-and-braces backstop for a direct caller.
         if (m_snapshot_pending) return;
         if (height != m_next) return;
 
@@ -2722,6 +2838,11 @@ public:
             const uint32_t tip = m_tip_height();
             if (m_next > tip) { publish(tip); return true; }
             request_window(tip);
+            // The bodies fetched WHILE this fold was outstanding are still in
+            // the staging buffer — apply them now rather than waiting for the
+            // request_window() re-fetch round-trip (dashd resumes its connect
+            // straight off the block store the moment the gap fills).
+            drain_staged_from_cursor();
         }
         return true;
     }
@@ -2837,6 +2958,9 @@ private:
         const uint32_t tip = m_tip_height();
         if (m_next > tip) { publish(tip); return; }
         request_window(tip);
+        // Apply the bodies staged while this on-demand fold was outstanding
+        // instead of waiting for the request_window() re-fetch.
+        drain_staged_from_cursor();
     }
 
     /// Apply an AUTHENTICATED list dated exactly at `height`, with the cursor
@@ -3565,6 +3689,11 @@ public:
         m_last_pump_next        = 0;
         m_requested_through     = 0;
         m_rerequest_from_cursor = false;
+        // The fetch reorder buffer holds bodies for a SPECIFIC bridge's height
+        // range; a re-arm replays the same heights from the anchor, so any body
+        // staged by the previous attempt is stale and must not be inherited.
+        m_stage.clear();
+        m_draining              = false;
         m_last_wait_log         = 0;
         m_last_reqfail_logged   = 0;   // #138: same class as m_last_wait_log —
                                        // a log throttle a fresh bridge must
@@ -3724,6 +3853,17 @@ public:
                                          // asked for (#138: never advanced on
                                          // a locally-dead request)
     bool     m_rerequest_from_cursor{false};
+    // ── DASHD PIPELINE PARITY: the fetch reorder / staging buffer ──────────
+    // Height-keyed store of block bodies that arrived AHEAD of the contiguous
+    // apply cursor (dash-core's block store + mapBlocksInFlight analog). Bounded
+    // to the request window (kWindow entries) by on_block_connected. Bodies are
+    // drained contiguously into apply as the cursor advances; this is what turns
+    // the effective in-flight depth from ~1 back into ~kWindow and closes the
+    // measured ~1000x fold throttle. Retained state only — it changes WHEN a
+    // body is applied, never WHAT apply_block derives.
+    std::map<uint32_t, BlockType> m_stage;
+    bool     m_draining{false};          // re-entrancy guard for the drain loop
+    size_t   m_stage_peak{0};            // telemetry: high-water reorder depth
     uint32_t m_last_wait_log{0};
     uint32_t m_last_reqfail_logged{0};   // #138 refusal-log throttle (per height)
     bool     m_position_verified{false};
