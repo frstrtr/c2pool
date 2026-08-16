@@ -5960,7 +5960,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 auto* cp = coin_p2p.get();
                 mn_ckpt_lane->set_request_snapshot_fn(
                     [cp](const uint256& block_hash) {
-                        cp->send_getmnlistd(uint256::ZERO, block_hash);
+                        // Rotate the fold snapshot's getmnlistd across the
+                        // eligible pool so a slow/non-serving primary cannot
+                        // wedge the anchor->tip fold (dashd rotate-on-stall).
+                        cp->send_getmnlistd_rotating(uint256::ZERO, block_hash);
                     });
                 // DEMUX (reward-critical): the reply comes back on the SAME
                 // mnlistdiff message the tip sync uses. Routed here it is
