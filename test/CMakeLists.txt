@@ -1209,7 +1209,8 @@ if (BUILD_TESTING AND GTest_FOUND)
                    test_dash_mn_seed.cpp
                    test_dash_mn_checkpoint.cpp
                    test_dash_lane_diag.cpp
-                   test_dash_header_checkpoint_coincide.cpp)
+                   test_dash_header_checkpoint_coincide.cpp
+                   test_dash_anchor_header_merkle_root.cpp)
     target_link_libraries(test_dash_node_reception_wire PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

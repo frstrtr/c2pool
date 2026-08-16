@@ -116,6 +116,28 @@ inline DashChainParams make_dash_chain_params_mainnet() {
     p.fast_start_checkpoint->height = 2513000;
     p.fast_start_checkpoint->hash.SetHex(
         "000000000000002114d621d90f28b52c07746414491cbffc7cd373b3a56bc950");
+    // The FULL header of the anchor block (mainnet 2513000), so the cold seed
+    // populates entry.header — not just entry.hash. Without it the seeded
+    // IndexEntry carries a default (all-zero) hashMerkleRoot, and the DIP-4
+    // historical-snapshot authentication in the MN-set bridge fails closed at
+    // step (b) ("block header not held"): the base=ZERO anchor snapshot is
+    // consumed but never APPLIED, the payee cursor never leaves the anchor,
+    // have_mn stays 0, and the embedded arm never serves a template on a
+    // --coin-rpc-removed binary (2026-08-16 cold-cut park). Pre-#1250 this
+    // root arrived by crawling headers in from the older 2400000 pin; #1250's
+    // fast-start seed dropped it. These six fields are the consensus header of
+    // the SAME release-pinned block `hash` above; init() REFUSES them unless
+    // X11(header) == hash (self-verifying, fail closed) — so no new trust is
+    // minted. Machine-checked by test_dash_anchor_header_merkle_root.cpp.
+    p.fast_start_checkpoint->has_header = true;
+    p.fast_start_checkpoint->hdr_version = 536870912u;   // 0x20000000
+    p.fast_start_checkpoint->hdr_prev_block.SetHex(
+        "000000000000002affa937f36922946849675632312981c160133b94365408c1");
+    p.fast_start_checkpoint->hdr_merkle_root.SetHex(
+        "01470ce31e4ec9934a229f6eef4c9f561e42898be48d0bd646ab80f4bcc15b9c");
+    p.fast_start_checkpoint->hdr_time  = 1785337727u;
+    p.fast_start_checkpoint->hdr_bits  = 0x192cf712u;
+    p.fast_start_checkpoint->hdr_nonce = 3457493362u;
     return p;
 }
 
@@ -266,6 +288,55 @@ public:
             entry.chain_work = uint256::ONE;
             entry.prev_hash = uint256::ZERO;
             entry.status = HEADER_VALID_CHAIN;
+
+            // When the checkpoint carries its full header, adopt ONLY its
+            // self-verified hashMerkleRoot into entry.header — the single field
+            // the DIP-4 historical-snapshot auth in the MN-set bridge reads
+            // (main_dash set_merkle_root_at_fn). SELF-VERIFY first: X11 over the
+            // FULL pinned header must equal the release-pinned block hash; a
+            // mismatch means the pin is corrupt, so fail closed (adopt nothing)
+            // rather than feed a merkleRoot that could authenticate a forged SML.
+            //
+            // HONESTY RECONCILIATION (Plan A). We deliberately DO NOT copy the
+            // whole header. m_bits / m_timestamp / m_version / ... stay at their
+            // synthetic-anchor defaults (0), so chain_rpc::is_synthetic_anchor()
+            // (keyed on m_bits==0) stays TRUE and the node keeps WITHHOLDING the
+            // daemon-tip fields difficulty / mediantime / bestblockhash until it
+            // is genuinely synced to the LIVE tip. The pinned header exists for
+            // INTERNAL DIP-4 auth only; a single lone checkpoint anchor must
+            // never masquerade as a daemon tip. Mints no new trust: the merkle
+            // root is adopted only once proven to X11-hash to the pinned block
+            // hash. Machine-checked by test_dash_anchor_header_merkle_root (root
+            // present) and test_dash_header_chain's *SyntheticAnchor* guards
+            // (daemon-tip fields still withheld at the anchor).
+            if (cp.has_header) {
+                BlockHeaderType hdr;
+                hdr.m_version        = cp.hdr_version;
+                hdr.m_previous_block = cp.hdr_prev_block;
+                hdr.m_merkle_root    = cp.hdr_merkle_root;
+                hdr.m_timestamp      = cp.hdr_time;
+                hdr.m_bits           = cp.hdr_bits;
+                hdr.m_nonce          = cp.hdr_nonce;
+                const uint256 computed = x11_hash(hdr);
+                if (computed == cp.hash) {
+                    // Adopt the merkle root ALONE; leave every other header
+                    // field synthetic (0) so is_synthetic_anchor() stays true
+                    // and the daemon-tip honesty guards keep withholding.
+                    entry.header.m_merkle_root = hdr.m_merkle_root;
+                    LOG_INFO << "[EMB-DASH] Fast-start checkpoint merkleRoot"
+                                " VERIFIED (X11==hash) merkleRoot="
+                             << hdr.m_merkle_root.GetHex().substr(0, 16)
+                             << " (anchor kept synthetic: bits/time withheld)";
+                } else {
+                    LOG_ERROR << "[EMB-DASH] Fast-start checkpoint header X11 "
+                                 "MISMATCH — refusing to seed merkleRoot (fail "
+                                 "closed); computed="
+                              << computed.GetHex().substr(0, 16) << " pinned="
+                              << cp.hash.GetHex().substr(0, 16);
+                    // entry.header stays default (null merkleRoot) — unproven.
+                }
+            }
+
             m_headers[cp.hash] = entry;
             m_height_index[cp.height] = cp.hash;
             m_tip = cp.hash;
@@ -274,7 +345,9 @@ public:
             persist_header(entry);
             persist_tip();
             LOG_INFO << "[EMB-DASH] Fast-start checkpoint: height=" << cp.height
-                     << " hash=" << cp.hash.GetHex().substr(0, 16);
+                     << " hash=" << cp.hash.GetHex().substr(0, 16)
+                     << " merkleRoot="
+                     << (entry.header.m_merkle_root.IsNull() ? "null" : "seeded");
         }
         // Fall back to genesis as stub when no checkpoint is configured
         // (so block 1's prev_hash resolves).

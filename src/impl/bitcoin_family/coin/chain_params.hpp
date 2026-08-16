@@ -11,6 +11,11 @@
 #include <cstdint>
 #include <string>
 
+// Signals that ChainParams::Checkpoint carries the optional full-header fields
+// (has_header / hdr_*). A KAT can key its fail-closed self-verification case on
+// this so the same test source still compiles on a pre-fix tree.
+#define C2POOL_FAST_START_CHECKPOINT_HAS_HEADER 1
+
 namespace bitcoin_family
 {
 namespace coin
@@ -26,7 +31,29 @@ struct ChainParams
     uint256 genesis_hash;            // genesis block hash (SHA256d for identification)
 
     // Optional: checkpoint for fast-sync (skip syncing from genesis)
-    struct Checkpoint { uint32_t height{0}; uint256 hash; };
+    struct Checkpoint {
+        uint32_t height{0};
+        uint256  hash;
+        // Optional: the FULL 80-byte block header at `hash`, carried as its
+        // consensus fields. When present, HeaderChain seeds entry.header (not
+        // just entry.hash) so downstream consumers that need the block's
+        // hashMerkleRoot — notably DIP-4 historical-snapshot authentication in
+        // the DASH MN-set bridge — have their trust anchor at t~=0, WITHOUT
+        // crawling headers forward from an earlier checkpoint.
+        //
+        // Reward-safety: this mints NO new trust. The seed self-verifies
+        // pow(header) == `hash` (X11 for Dash) before adopting it, so the
+        // merkle root is DERIVED from the already release-pinned `hash`; a
+        // wrong pin fails closed (header left unseeded) instead of admitting a
+        // forged SML. has_header=false keeps every other coin unchanged.
+        bool     has_header{false};
+        uint32_t hdr_version{0};
+        uint256  hdr_prev_block;
+        uint256  hdr_merkle_root;
+        uint32_t hdr_time{0};
+        uint32_t hdr_bits{0};
+        uint32_t hdr_nonce{0};
+    };
     std::optional<Checkpoint> fast_start_checkpoint;
 
     // Halving
