@@ -132,12 +132,13 @@ struct PoolRig
     }
 
     std::unique_ptr<RawMessage> version_msg(uint32_t height,
-                                            const std::string& subver = "/Dash Core:21.1.0/")
+                                            const std::string& subver = "/Dash Core:21.1.0/",
+                                            uint64_t services = 1)
     {
         return p2p::message_version::make_raw(
-            70230, /*services=*/1, /*timestamp=*/1234567890ull,
-            addr_t{1, NetService{"127.0.0.1", 19999}},
-            addr_t{1, NetService{"127.0.0.1", 19999}},
+            70230, services, /*timestamp=*/1234567890ull,
+            addr_t{services, NetService{"127.0.0.1", 19999}},
+            addr_t{services, NetService{"127.0.0.1", 19999}},
             /*nonce=*/0x1122334455667788ull, subver, height);
     }
 
@@ -147,6 +148,22 @@ struct PoolRig
         attach(n);
         deliver(n, version_msg(height));
         deliver(n, p2p::message_verack::make_raw());
+    }
+
+    /// Full attach + version/verack for peer n advertising a SPECIFIC service
+    /// bitfield — the CanServeBlocks convergence KATs stand up mixed
+    /// archival(NODE_NETWORK) / pruned(NODE_NETWORK_LIMITED) pools this way.
+    void handshake_services(int n, uint64_t services, uint32_t height = 1000)
+    {
+        attach(n);
+        deliver(n, version_msg(height, "/Dash Core:21.1.0/", services));
+        deliver(n, p2p::message_verack::make_raw());
+    }
+
+    static std::unique_ptr<RawMessage> block_notfound(const uint256& h)
+    {
+        return p2p::message_notfound::make_raw(std::vector<p2p::inventory_type>{
+            p2p::inventory_type(p2p::inventory_type::block, h)});
     }
 
     const PeerSession* session(int n) const
@@ -1270,3 +1287,114 @@ TEST(DashCoinP2PPool, a_stalling_bulk_peer_is_disconnected_so_the_fold_advances)
 }
 
 } // namespace
+
+// ══════════════════════════════════════════════════════════════════════════
+// (H) CanServeBlocks CONVERGENCE — dashd net_processing service-flag gate +
+//     per-peer download-failure demotion, ported onto the #1253 bulk-fold
+//     round-robin. The mn-checkpoint anchor->tip fold must target ONLY peers
+//     that advertise they can serve the block (NODE_NETWORK, not pruned-only)
+//     and must CONVERGE away from peers that fail to serve (NOTFOUND / stall
+//     eviction) so a deep IBD window re-homes onto archival deliverers.
+//
+//     RED on #1253 (blind round-robin, service-flag-/demotion-blind): a
+//     limited-only peer is selected for a deep body it cannot serve, and a
+//     peer that keeps answering NOTFOUND keeps being re-asked.
+//     GREEN with the port: the pruned peer is never selected, the failing peer
+//     is demoted out, and selection converges onto the full-block peers.
+// ══════════════════════════════════════════════════════════════════════════
+
+// NODE_NETWORK=0x1, NODE_NETWORK_LIMITED=0x400 (dashd protocol.h).
+static constexpr uint64_t SVC_NETWORK        = 0x1;
+static constexpr uint64_t SVC_LIMITED        = 0x400;
+static constexpr uint64_t SVC_FULL           = 0x1 | 0x400;   // archival: both
+static constexpr uint64_t SVC_LIMITED_ONLY   = 0x400;         // pruned
+
+TEST(DashBulkCanServe, limited_only_peer_is_never_selected_for_a_deep_bulk_body)
+{
+    PoolRig rig;
+    // Two archival (full-block) peers and one pruned (limited-only) peer.
+    rig.handshake_services(1, SVC_FULL);
+    rig.handshake_services(2, SVC_FULL);
+    rig.handshake_services(3, SVC_LIMITED_ONLY);
+    ASSERT_EQ(rig.client.handshaked_peer_count(), 3u);
+
+    // Announcer-less (deep-historical) body selection, many rounds so a blind
+    // round-robin would land on peer 3 repeatedly.
+    std::map<std::string, int> hits;
+    for (uint32_t k = 0; k < 60; ++k)
+        hits[rig.client.select_bulk_peer_key_for_test(hash_n(1000 + k))]++;
+
+    // GREEN: the pruned peer is EXCLUDED entirely; both archival peers serve.
+    EXPECT_EQ(hits[PoolRig::peer_key(3)], 0)
+        << "a limited-only (pruned) peer must never be asked for ~9.5k-deep "
+           "history — dashd IsLimitedPeer gate";
+    EXPECT_GT(hits[PoolRig::peer_key(1)], 0);
+    EXPECT_GT(hits[PoolRig::peer_key(2)], 0);
+    EXPECT_EQ(hits[PoolRig::peer_key(1)] + hits[PoolRig::peer_key(2)], 60);
+}
+
+TEST(DashBulkCanServe, notfound_demotes_a_nonserver_and_selection_converges)
+{
+    PoolRig rig;
+    rig.handshake_services(1, SVC_FULL);
+    rig.handshake_services(2, SVC_FULL);
+    rig.handshake_services(3, SVC_FULL);
+    ASSERT_EQ(rig.client.handshaked_peer_count(), 3u);
+
+    // Peer 2 keeps answering NOTFOUND for deep bodies (advertises NODE_NETWORK
+    // but does not actually serve buried history — the live-network symptom).
+    for (int i = 0; i < 2; ++i)   // BULK_NONSERVER_STRIKE_MAX
+        rig.deliver(2, PoolRig::block_notfound(hash_n(7000 + i)));
+
+    EXPECT_TRUE(rig.client.bulk_demoted_for_test(PoolRig::peer_key(2)))
+        << "a peer that repeatedly answers NOTFOUND must be demoted "
+           "(dashd per-peer download-failure demotion)";
+
+    // GREEN: selection now CONVERGES onto the two delivering peers; the demoted
+    // non-server is never chosen again.
+    std::map<std::string, int> hits;
+    for (uint32_t k = 0; k < 60; ++k)
+        hits[rig.client.select_bulk_peer_key_for_test(hash_n(8000 + k))]++;
+    EXPECT_EQ(hits[PoolRig::peer_key(2)], 0);
+    EXPECT_GT(hits[PoolRig::peer_key(1)], 0);
+    EXPECT_GT(hits[PoolRig::peer_key(3)], 0);
+}
+
+TEST(DashBulkCanServe, delivering_a_body_forgives_a_demoted_peer)
+{
+    PoolRig rig;
+    rig.handshake_services(1, SVC_FULL);
+    rig.handshake_services(2, SVC_FULL);
+    for (int i = 0; i < 2; ++i)
+        rig.deliver(2, PoolRig::block_notfound(hash_n(100 + i)));
+    ASSERT_TRUE(rig.client.bulk_demoted_for_test(PoolRig::peer_key(2)));
+
+    // A single clean body delivery from peer 2 clears the strike — it
+    // demonstrably serves blocks now (dashd forgives on a satisfied download).
+    rig.client.forgive_bulk_nonserver_for_test(PoolRig::peer_key(2));
+    EXPECT_FALSE(rig.client.bulk_demoted_for_test(PoolRig::peer_key(2)));
+    EXPECT_EQ(rig.client.bulk_nonserver_strikes_for_test(PoolRig::peer_key(2)), 0);
+}
+
+TEST(DashBulkCanServe, no_eligible_peer_falls_back_never_wedges_the_selection)
+{
+    PoolRig rig;
+    // Pathological scarcity: EVERY reachable peer is pruned (limited-only).
+    // The port must NOT wedge on an empty selection — it falls back to the
+    // handshaked pool exactly as #1253 did (non-regression: never worse than
+    // the blind rotation on a peer set with no archival deliverer).
+    rig.handshake_services(1, SVC_LIMITED_ONLY);
+    rig.handshake_services(2, SVC_LIMITED_ONLY);
+    ASSERT_EQ(rig.client.handshaked_peer_count(), 2u);
+
+    std::set<std::string> chosen;
+    for (uint32_t k = 0; k < 20; ++k)
+    {
+        std::string key = rig.client.select_bulk_peer_key_for_test(hash_n(200 + k));
+        EXPECT_FALSE(key.empty()) << "selection must never return no peer";
+        chosen.insert(key);
+    }
+    // Both limited peers still get used (fallback pass spreads across the pool).
+    EXPECT_EQ(chosen.size(), 2u);
+}
+
