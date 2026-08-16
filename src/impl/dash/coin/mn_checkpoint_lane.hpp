@@ -1353,6 +1353,11 @@ public:
     /// "never evaluated", NOT "evaluated and zero", and the reports say n/a.
     size_t   ondemand_folds()     const { return m_ondemand_folds; }
     size_t   ondemand_excluded()  const { return m_ondemand_excluded; }
+    /// Masternodes whose queue ORDERING (nPoSeRevivedHeight) an on-demand fold
+    /// repaired — a ProUpServTx-revive this bridge applied with the ban
+    /// UNMEASURED, healed forward instead of fail-closing. 0 on a bridge that
+    /// never guessed a revive. See repair_unmeasured_revive_ordering().
+    size_t   ordering_repaired()  const { return m_ordering_repaired; }
     size_t   ondemand_cap()       const { return m_ondemand_cap; }
     bool     ondemand_cap_hit()   const { return m_ondemand_cap_hit; }
     bool     ondemand_evaluated() const { return m_ondemand_evaluated; }
@@ -2934,6 +2939,30 @@ private:
         apply_fold(sml, height);
         if (m_state != State::Bridging) return;   // F5 refused; already closed
 
+        // ── ORDERING REPAIR, before the exclusion walk. A masternode revived
+        // by a ProUpServTx we applied with the ban UNMEASURED keeps
+        // nPoSeRevivedHeight=0 and stays the projected head even though this
+        // height-exact list attests it VALID — the h=2516072 wedge, where the
+        // exclusion-only re-adjudication cannot demote a candidate the list
+        // (correctly) calls valid. This writes the nPoSeRevivedHeight dashd
+        // wrote and re-sorts the pending queue, so the walk below adjudicates
+        // against the queue dashd holds. No-op when there is no unmeasured
+        // revive to repair — the ordinary exclusion path is unchanged.
+        const size_t reordered =
+            m_machine.repair_unmeasured_revive_ordering(sml);
+        if (reordered) {
+            m_ordering_repaired += reordered;
+            LOG_WARNING
+                << "[MN-CKPT] ON-DEMAND ORDERING REPAIR at h=" << height << ": "
+                << reordered << " masternode(s) revived by a ProUpServTx applied"
+                   " with the ban UNMEASURED had their nPoSeRevivedHeight"
+                   " restored to dashd's value from the height-exact list, and"
+                   " the payee queue re-sorted. This repairs a queue-ORDERING"
+                   " desync the exclusion-only re-adjudication cannot — the"
+                   " projected candidate was attested VALID, so it was the"
+                   " ORDER that diverged, not the ban state.";
+        }
+
         const auto rr =
             m_machine.readjudicate_payee(m_ondemand_block, height, sml);
         if (!rr.recovered) {
@@ -3121,6 +3150,14 @@ public:
             + "), " + std::to_string(m_ondemand_excluded)
             + " queue-head exclusion(s) licensed by a list dated EXACTLY at the"
               " height it judged.";
+        if (m_ordering_repaired != 0) {
+            s += " " + std::to_string(m_ordering_repaired)
+                 + " queue-ORDERING repair(s): a ProUpServTx-revive applied with"
+                   " the ban UNMEASURED had nPoSeRevivedHeight restored to"
+                   " dashd's value from the height-exact list and the payee queue"
+                   " re-sorted, healing the mismatch forward instead of failing"
+                   " closed.";
+        }
         if (m_ondemand_cap_hit) {
             s += " THE CAP IS EXHAUSTED: " + std::to_string(m_ondemand_folds)
                  + " of " + std::to_string(m_ondemand_cap)
@@ -3673,6 +3710,7 @@ public:
         m_ondemand_cap_hit   = false;
         m_ondemand_evaluated = false;
         m_ondemand_abandoned = 0;
+        m_ordering_repaired  = 0;
         m_ondemand_block     = BlockType{};
         m_ondemand_r         = MnStateMachine::ApplyResult{};
         // The SIZED cap, which #1033's arm() did not reset. pump() recomputes
@@ -3845,6 +3883,7 @@ public:
     bool      m_ondemand_cap_hit{false};
     bool      m_ondemand_evaluated{false};     // a mismatch ever reached it
     size_t    m_ondemand_abandoned{0};         // on-demand asks never answered
+    size_t    m_ordering_repaired{0};          // nPoSeRevivedHeight healed forward
     // ── BAN-STATE PROBE state. Rides the SAME m_snapshot_pending pause and
     // the SAME reply route as a scheduled fold — it IS a scheduled fold, just
     // scheduled by a ProUpServTx instead of by a counter. m_revive_probe_at is

@@ -4787,6 +4787,120 @@ TEST(DashMnCheckpointReviveProbe, ProbeAnsweringNotBannedIsAMeasurementAndAsksOn
 // because there pump() returns at its state guard and nothing else ever
 // reaches rearm().
 
+// ═══════════════════════════════════════════════════════════════════════════
+// THE UNMEASURED-REVIVE ORDERING WEDGE (mainnet h=2516072, proTx f513574b70…)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// A ProUpServTx revives a masternode from a PoSe ban that began AND ended
+// inside a fold interval. With the ban-state probe unavailable (cap spent, or
+// disabled here to model it), the replay applies the ProUpServTx as a plain
+// service update and leaves nPoSeRevivedHeight=0 — the single dashd write it
+// cannot reproduce (BuildNewListFromBlock -> Revive(h), specialtxman.cpp:
+// 361-370). payee_score() then scores the masternode by its stale
+// nLastPaidHeight instead of its revive height, so it reaches the head of OUR
+// queue ~one queue length before dashd will pay it, and the coinbase pays
+// someone else -> payee_desync.
+//
+// The on-demand fold at the mismatch fetches the list dated EXACTLY there and
+// (correctly) attests the masternode VALID — it IS valid, post-revive. The
+// EXCLUSION-only re-adjudication cannot demote a candidate the list calls
+// valid, so the mismatch SURVIVES the fold and the bridge FAILS CLOSED. That
+// is the wedge measured on vm905 (soak.log:15381): a daemonless money node
+// hitting this stops serving.
+//
+// The repair re-derives ORDERING, not just EXCLUSION: the height-exact list is
+// dashd's own pre-block IsBanned() answer, so when it attests the masternode
+// VALID the recorded ProUpServTx-revive DID happen, and its nPoSeRevivedHeight
+// is set to the height dashd used and the pending queue re-sorted. The
+// mismatch heals forward instead of fail-closing.
+//
+// RED on the pre-fix lane: no ordering repair, so the on-demand fold fails
+// closed at the mismatch and the bridge NEVER PUBLISHES.
+// GREEN after the fix: the revive height is restored, the queue re-sorts, the
+// walk attributes the payment dashd made, and the bridge reaches the tip.
+namespace {
+
+constexpr uint32_t kUrAnchor  = 2513000;   // fold point (all valid here)
+constexpr uint32_t kUrRevive  = 2513002;   // the ProUpServTx block
+constexpr uint32_t kUrDesync  = 2513006;   // the revived MN reaches OUR head
+constexpr uint32_t kUrTip     = 2513008;
+constexpr size_t   kUrRank    = 5;         // banned+revived strictly inside
+constexpr size_t   kUrSetSize = 16;
+
+// The revive and the mismatch both sit strictly inside one fold interval, so
+// no scheduled fold can quietly rescue either — the whole point of the defect.
+static_assert(kUrRevive > kUrAnchor && kUrDesync < kUrTip
+              && kUrDesync - kUrAnchor < MnCheckpointLane::kDefaultFoldInterval,
+              "revive and mismatch must land strictly inside one fold interval");
+
+} // namespace
+
+TEST(DashMnCheckpointReviveProbe, UnmeasuredReviveOrderingIsRepairedNotFailClosed)
+{
+    SnapshotRig rig;
+    const uint256 anchor_hash = uint256S(kAnchorHash);
+    MnCheckpoint cp = synthetic_anchor(kUrSetSize, kUrAnchor, anchor_hash);
+
+    // Every served list — anchor, tip, and the on-demand list at the mismatch —
+    // attests EVERY masternode VALID. The ban that revived kUrRank began and
+    // ended between two folds, so no list this bridge ever fetches records it;
+    // it survives ONLY as the ProUpServTx at kUrRevive. This is exactly why the
+    // exclusion walk cannot repair the mismatch: the list (correctly) calls the
+    // projected head valid.
+    std::vector<std::pair<uint256, bool>> all_valid;
+    for (size_t i = 0; i < cp.entries.size(); ++i)
+        all_valid.emplace_back(cp.entries[i].first, true);
+    rig.attest = all_valid;
+    rig.install(kUrAnchor, kUrTip, anchor_hash);
+
+    // dashd's payment order: ranks 0..4 in turn, then — because kUrRank was
+    // revived at kUrRevive and sorted to the BACK — ranks 6, 7, 8. kUrRank is
+    // NOT paid anywhere in this window; dashd will not pay it until much later.
+    const size_t pays[] = {0, 1, 2, 3, 4, 6, 7, 8};
+    uint32_t bh = kUrAnchor + 1;
+    for (size_t rank : pays) {
+        rig.h.blocks[bh] =
+            block_paying(cp.entries[rank].second.scriptPayout.m_data);
+        ++bh;
+    }
+    // The revive itself, on top of the coinbase the chain produced at kUrRevive.
+    rig.h.blocks[kUrRevive].m_txs.push_back(
+        pro_up_serv_tx_for(cp.entries[kUrRank].first));
+
+    // Model "the ban-state probe budget is spent": with it disabled the revive
+    // is applied UNMEASURED, nPoSeRevivedHeight stays 0, and the ordering desync
+    // is armed — the precondition the repair must heal.
+    rig.h.lane.set_revive_probe_cap(0);
+
+    rig.h.lane.arm(cp);
+    drive_to_publish(rig);
+
+    ASSERT_TRUE(rig.h.published)
+        << "the bridge must reach the tip: the on-demand fold at the mismatch"
+           " re-derives the revive height dashd used and re-sorts the queue,"
+           " instead of fail-closing on a candidate the list calls valid. "
+        << rig.h.lane.status();
+    EXPECT_FALSE(rig.h.lane.failed_closed()) << rig.h.lane.status();
+    EXPECT_EQ(rig.h.published_as_of, kUrTip);
+
+    // The revive was in fact taken UNMEASURED (the probe was disabled), so this
+    // proves the repair path — not the probe — carried the correctness.
+    EXPECT_GE(rig.h.lane.revive_unmeasured(), 1u)
+        << "the revive must have been applied with the ban unmeasured, or the"
+           " fixture is not exercising the ordering wedge: "
+        << rig.h.lane.revive_probe_report();
+
+    // dashd scores this masternode by its revive height from here on. That is
+    // the byte the fix restores; leaving it at the stale last payment is the
+    // ~one-queue-length drift that wedged mainnet h=2516072.
+    const MNState& revived = published_rank(rig.h, cp, kUrRank);
+    EXPECT_EQ(revived.nPoSeRevivedHeight, kUrRevive)
+        << "nPoSeRevivedHeight must be restored to dashd's value";
+    EXPECT_TRUE(revived.isValid);
+    EXPECT_EQ(MnStateMachine::payee_score(revived),
+              static_cast<int>(kUrRevive));
+}
+
 namespace {
 
 // A lane driven exactly the way main_dash drives it: pump() on every tip
