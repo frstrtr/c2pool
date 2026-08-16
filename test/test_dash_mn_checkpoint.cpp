@@ -617,6 +617,65 @@ TEST(DashMnCheckpointBridge, IgnoresLiveTipBlocksArrivingMidBridge)
     EXPECT_EQ(h.published_as_of, 1519546u);
 }
 
+// ── DASHD PIPELINE PARITY (the ~1000x throttle fix) ─────────────────────────
+// Bodies fetched concurrently across rotating peers arrive OUT of order. Before
+// the reorder/staging buffer, every body ahead of the strictly-contiguous apply
+// cursor was DROPPED on the floor and re-fetched one serving round-trip at a
+// time — collapsing a kWindow-wide getdata burst to an effective in-flight
+// depth of 1 (the measured 0.31 blk/s over a 99%-idle link). dash-core keeps
+// out-of-order blocks in its store and connects them contiguously as the tip
+// advances; this ports that. The two arms below are RED on the pre-fix
+// (drop-on-out-of-order) code and GREEN on the pipeline fix.
+TEST(DashMnCheckpointBridge, OutOfOrderBodiesAreStagedAndDrainedNotRefetched)
+{
+    BridgeHarness h;
+    h.auto_deliver = false;                       // WE drive the arrival order
+    h.headers[kAnchorHeight] = uint256S(kAnchorHash);
+    h.blocks[1519544] = block_from_hex(kBlockHex1519544);
+    h.blocks[1519545] = block_from_hex(kBlockHex1519545);
+    h.blocks[1519546] = block_from_hex(kBlockHex1519546);
+    h.tip = 1519546;
+
+    h.lane.arm(good_checkpoint());
+    h.lane.pump();                                // issues the window ONCE
+    ASSERT_EQ(h.lane.state(), MnCheckpointLane::State::Bridging);
+    const size_t reqs_after_window = h.requested.size();
+    ASSERT_GE(reqs_after_window, 3u) << "the initial window covers 44/45/46";
+
+    // The two bodies AHEAD of the head-of-line cursor arrive FIRST. They must be
+    // RETAINED (staged), not dropped: the cursor does not move, nothing
+    // publishes, and — the whole point — NO re-request is emitted for them.
+    h.lane.on_block_connected(h.blocks[1519546], 1519546);
+    h.lane.on_block_connected(h.blocks[1519545], 1519545);
+    EXPECT_EQ(h.lane.cursor_height(), kAnchorHeight)
+        << "staged out-of-order bodies must not advance the contiguous cursor";
+    EXPECT_FALSE(h.published);
+    EXPECT_EQ(h.lane.staged_size(), 2u)
+        << "both out-of-order bodies must sit in the reorder buffer";
+    EXPECT_GE(h.lane.staged_peak(), 2u)
+        << "effective in-flight depth reached 2, not the throttled 1";
+    EXPECT_EQ(h.requested.size(), reqs_after_window)
+        << "a staged body must NOT trigger a re-fetch — that IS the throttle";
+
+    // The head-of-line body arrives LAST. It must drain the whole staged run in
+    // ONE burst and publish at the tip — again with no re-fetch of 45/46.
+    h.lane.on_block_connected(h.blocks[1519544], 1519544);
+    EXPECT_TRUE(h.published) << h.lane.status();
+    EXPECT_EQ(h.published_as_of, 1519546u);
+    EXPECT_EQ(h.requested.size(), reqs_after_window)
+        << "the staged bodies drained from the buffer, not from the wire";
+
+    // Every requested height appears exactly once: the pipeline never spent a
+    // round-trip re-fetching a body it had already received. On the pre-fix code
+    // the dropped 45/46 force exactly such re-fetches (or a wedge) — so this and
+    // the publish assertion are the red/green discriminators.
+    std::map<uint32_t, int> counts;
+    for (auto q : h.requested) counts[q]++;
+    for (auto& kv : counts)
+        EXPECT_EQ(kv.second, 1)
+            << "height " << kv.first << " was re-fetched (throttle present)";
+}
+
 TEST(DashMnCheckpointBridge, ChainPositionMismatchFailsClosed)
 {
     // The anchor names a block our PoW-validated header chain does not hold at
