@@ -5891,6 +5891,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     if (!e) return std::nullopt;
                     return e->hash;
                 });
+            // dashd nStallingSince (net_processing.cpp FindNextBlocksToDownload +
+            // the SendMessages 2s adaptive disconnect-on-stall). Tag the
+            // FRONT-OF-ORDERED-WINDOW block (the fold cursor's next height) as the
+            // head-of-line body so the fetch layer disconnects its slow carrier on
+            // the FIRST stall and re-homes JUST that block to the fastest-
+            // delivering NODE_NETWORK peer — instead of leaving it as one of
+            // kWindow equal round-robin slots that competes with the buffered-ahead
+            // bodies for re-request attention. This lets the ordered fold cursor
+            // track buffer-arrival rate rather than the round-robin's luck.
+            // Reward-safe: getdata routing only — no served MN/quorum/subsidy bytes
+            // and no publish() hold is touched, and the fold still validates every
+            // block. Same header-by-height lookup the block-request seam uses.
+            mn_ckpt_lane->set_hol_request_fn(
+                [cp = coin_p2p.get(), hc = header_chain.get()](uint32_t h) {
+                    auto e = hc->get_header_by_height(h);
+                    if (!e) return false;
+                    return cp->request_head_of_line(e->hash);
+                });
             // SML validity attestation — the ONLY carrier of a post-anchor
             // PoSe ban. dashd applies those from consensus, never as a special
             // tx, so the bridge's block replay is structurally unable to see

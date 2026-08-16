@@ -249,6 +249,13 @@ public:
     /// body short of publishing while the maintainer's mn-needs-reseed latch
     /// keeps the embedded arm demoted, forever (the reseed-tail wedge).
     using RequestBlockFn = std::function<bool(uint32_t height)>;
+    /// dashd nStallingSince seam: (re)tag the block at `height` as the single
+    /// HEAD-OF-LINE (front-of-ordered-window) body in the fetch layer, so its
+    /// slow carrier is disconnected on the first stall and the block re-homed to
+    /// the fastest deliverer. Return value is unused here (marker only); the
+    /// request LEDGER stays owned by RequestBlockFn. FETCH-TIMING ONLY — same
+    /// reward-safety contract as RequestBlockFn.
+    using HolRequestFn = std::function<bool(uint32_t height)>;
     /// Publish the bridged, payout-bearing set as an authoritative MN-list
     /// resync. Wired by main_dash to Node::mn_list_update.happened().
     using PublishFn =
@@ -334,6 +341,10 @@ public:
     MnCheckpointLane& operator=(const MnCheckpointLane&) = delete;
 
     void set_request_block_fn(RequestBlockFn fn) { m_request = std::move(fn); }
+    /// OPTIONAL. Unwired, the bridge behaves exactly as before this seam existed:
+    /// the fold cursor's block is one of kWindow equal round-robin slots. Wired,
+    /// the fetch layer runs dashd's nStallingSince against ITS carrier only.
+    void set_hol_request_fn(HolRequestFn fn) { m_hol_request = std::move(fn); }
     void set_publish_fn(PublishFn fn)            { m_publish = std::move(fn); }
     void set_tip_height_fn(TipHeightFn fn)       { m_tip_height = std::move(fn); }
     void set_header_hash_at_fn(HeaderHashAtFn fn){ m_header_hash_at = std::move(fn); }
@@ -565,6 +576,16 @@ public:
         if (!m_tip_height) return;
         const uint32_t tip = m_tip_height();
         if (tip == 0 || m_next > tip) return;   // nothing left to fetch
+        // ── dashd nStallingSince (net_processing FindNextBlocksToDownload). The
+        // block at the fold cursor (m_next) is the FRONT of the ordered window —
+        // apply_block cannot cross the hole it leaves, so its slow carrier gates
+        // the WHOLE fold even while up to kWindow-1 later bodies buffer ahead.
+        // Tag it as the head-of-line body every tick so the fetch layer runs ONE
+        // stall timer against ITS carrier and, on stall, disconnects that carrier
+        // and re-homes just this block to the fastest deliverer. Idempotent and
+        // marker-only: no extra getdata once the slot exists; the request ledger
+        // and every publish() hold are untouched (fetch-timing, reward-safe).
+        if (m_hol_request) m_hol_request(m_next);
         // ACT ONLY ON A STALL. A healthy self-driving replay advances the
         // cursor every service interval (on_block_connected tops up the window
         // per applied block) and must not be sprayed with redundant getdata, so
@@ -3638,6 +3659,7 @@ public:
     MnStateMachine m_machine;
 
     RequestBlockFn m_request;
+    HolRequestFn   m_hol_request;   // dashd nStallingSince front-of-window tag
     PublishFn      m_publish;
     TipHeightFn    m_tip_height;
     HeaderHashAtFn m_header_hash_at;
