@@ -6180,7 +6180,23 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // matches, the store COVERS heights and the ban-state probe /
             // on-demand fold source 0-RTT/uncapped from it.
             if (mn_ckpt_lane && header_chain && ckpt.ok
-                && !mn_diff_store) {
+                && !mn_diff_store
+                // UAF FIX (yield to the deep replay-fold): the cold MN-CKPT
+                // store-bridge and the W5 replay-fold arm (main_dash.cpp ~7288)
+                // both drive the SINGLE mn_diff_store/mn_diff_writer, but they
+                // are MUTUALLY EXCLUSIVE by design -- this block's own header
+                // comment names it "the COLD MN-CKPT bridge path (no
+                // --replay-bulk / --replay-fold-prestate)". The guard never
+                // actually enforced that: this arm runs FIRST (cold bridge),
+                // creates store/writer A and installs set_on_anchor_snapshot()
+                // whose lambda captures raw w=mn_diff_writer.get(); the later W5
+                // make_unique then FREES writer A behind that lambda's back, and
+                // the historical-snapshot callback dereferences the freed writer
+                // -> MnDiffWriter::arm()->save_snapshot() UAF (SIGSEGV/SIGBUS).
+                // When --replay-fold-prestate is set the deep replay owns the
+                // store; the cold bridge YIELDS. Normal cold start (no prestate)
+                // is UNCHANGED -- this predicate is true there.
+                && g_replay_fold_prestate.empty()) {
                 namespace rp = dash::coin::replay;
                 mn_diff_store = std::make_unique<rp::MnDiffStore>(
                     (core::filesystem::config_path() / net_subdir
@@ -7285,7 +7301,22 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // the store is simply absent and both repair callers keep
                 // their historical wipe/demote fail-closed behavior — the
                 // store is an accelerator, never consensus-required.
-                if (replay_fold_consumer) {
+                if (replay_fold_consumer && mn_diff_store) {
+                    // DEFENSIVE (named fail-closed, not a clobber): the cold
+                    // MN-CKPT store-bridge (main_dash.cpp ~6182) must have YIELDED
+                    // when a prestate is configured. If it did not, a make_unique
+                    // here would FREE the cold bridge's live MnDiffWriter while
+                    // its set_on_anchor_snapshot lambda still holds it raw -> UAF.
+                    // Refuse instead. The deep replay then folds WITHOUT the
+                    // accelerator store (reward-safe: the store is never
+                    // consensus-required, only a gap-repair accelerator).
+                    LOG_ERROR << "[MN-DIFF-DB] INVARIANT VIOLATED: cold-bridge"
+                                 " store present while arming the W5 deep-replay"
+                                 " store -- refusing to clobber a live writer"
+                                 " (would UAF the cold-bridge anchor lambda);"
+                                 " W5 accelerator store DISABLED (reward-safe).";
+                }
+                if (replay_fold_consumer && !mn_diff_store) {
                     mn_diff_store = std::make_unique<rp::MnDiffStore>(
                         (core::filesystem::config_path() / net_subdir
                             / "dash_mn_diff_db").string());
