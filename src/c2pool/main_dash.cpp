@@ -7598,6 +7598,51 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                             " fold_qfcommit past the anchor resolves its"
                                             " member set and the store extends toward"
                                             " tip.";
+                                // ── ASSEMBLE + KEY the straddle cycle NOW ────
+                                // The seed made the cycle DERIVABLE (snapshots +
+                                // work-lists present); this drives dashd's
+                                // ComputeQuorumMembersByQuarterRotation over them
+                                // (the engine's compute_rotation_cycle, verbatim)
+                                // and registers the ordered member set keyed by
+                                // (llmqType, cycle_base+quorumIndex) — the exact
+                                // key fold_qfcommit's m_members_fn(type,quorumHash)
+                                // resolves a commitment quorumHash to. Done BEFORE
+                                // draining the held blocks so the qfcommit at
+                                // cycle_base+mining_window_start (the height the
+                                // store used to cap at) resolves its member set
+                                // and the fold folds THROUGH toward tip.
+                                {
+                                    auto dr = qbr->derive_members_for_cycle(
+                                        sseed->llmq_type, sseed->cycle_base);
+                                    if (dr.ok)
+                                        LOG_INFO << "[MN-DIFF-DB] straddle cycle"
+                                                    " base h=" << sseed->cycle_base
+                                                 << " (type "
+                                                 << int(sseed->llmq_type)
+                                                 << ") rotated member sets"
+                                                    " ASSEMBLED + KEYED: "
+                                                 << dr.member_sets << "/"
+                                                 << dr.expected_sets
+                                                 << " quorumIndex lists (quorum"
+                                                    " size " << dr.quorum_size
+                                                 << ") — fold_qfcommit resolves"
+                                                    " past the anchor.";
+                                    else
+                                        LOG_WARNING << "[MN-DIFF-DB] straddle cycle"
+                                                       " base h="
+                                                    << sseed->cycle_base
+                                                    << " (type "
+                                                    << int(sseed->llmq_type)
+                                                    << ") member assembly"
+                                                       " INCOMPLETE ("
+                                                    << dr.member_sets << "/"
+                                                    << dr.expected_sets << "): "
+                                                    << dr.skip_reason
+                                                    << " — store will cap at the"
+                                                       " cycle's first punishing"
+                                                       " qfcommit; callers fall"
+                                                       " through (reward-safe).";
+                                }
                                 if (!sseed->hold.empty()) {
                                     for (auto& pr : sseed->hold)
                                         (*feed)(pr.second, pr.first);

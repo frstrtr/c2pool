@@ -1045,6 +1045,91 @@ public:
         return mit->second;
     }
 
+    /// Result of an out-of-band single-cycle member derivation.
+    struct DeriveCycleResult {
+        bool        ok{false};
+        uint8_t     llmq_type{0};
+        uint32_t    cycle_base{0};
+        size_t      member_sets{0};   // # of quorumIndex lists now registered
+        size_t      quorum_size{0};   // members per set (for the log)
+        size_t      expected_sets{0}; // signingActiveQuorumCount
+        std::string skip_reason;      // engine's own named miss on !ok
+    };
+
+    /// Out-of-band derivation of ONE rotated cycle's member sets from the
+    /// already-seeded quarter snapshots + work-lists (the getqrinfo straddle
+    /// bootstrap). It drives the SAME compute_rotation_cycle path
+    /// derive_cycles_at() runs at forward-observe — no new consensus code —
+    /// but at the moment the seed LANDS, so the straddle cycle's ordered
+    /// member sets are registered under m_members[{type, cycle_base+index}]
+    /// (exactly the key fold_qfcommit's m_members_fn(type, quorumHash) lookup
+    /// resolves a commitment quorumHash to, via m_height_by_hash) BEFORE any
+    /// held block drains into the fold. Without this the member set is only
+    /// ever attempted lazily during the forward drain, and on the seeded
+    /// straddle cycle that attempt does not populate a result the qfcommit at
+    /// cycle_base+mining_window_start can consume, so the store caps there.
+    ///
+    /// Idempotent (re-storing identical members is a no-op) and reward-safe by
+    /// construction: a WRONG member set later re-hashes to the wrong
+    /// merkleRootMNList and the writer's per-row root self-check refuses the
+    /// row, so callers fall through to the network path — never a bad mint.
+    DeriveCycleResult derive_members_for_cycle(uint8_t llmq_type,
+                                               uint32_t cycle_base)
+    {
+        DeriveCycleResult out;
+        out.llmq_type  = llmq_type;
+        out.cycle_base = cycle_base;
+        const LlmqParamsView* p = replay_llmq_params(m_cfg.network, llmq_type);
+        if (p == nullptr) {
+            out.skip_reason = "llmqType " + std::to_string(int(llmq_type))
+                            + " not in this network's chainparams llmq list";
+            return out;
+        }
+        if (!p->use_rotation) {
+            out.skip_reason = "llmqType " + std::to_string(int(llmq_type))
+                            + " is not a rotated LLMQ — no quarter-rotation "
+                              "member set to assemble";
+            return out;
+        }
+        out.quorum_size   = p->size;
+        out.expected_sets = p->signing_active_quorum_count;
+
+        // Run the engine's own per-cycle derivation verbatim at the cycle
+        // base. derive_cycles_at only acts on types whose dkgInterval divides
+        // the height, so this touches exactly the cycle(s) rooted here.
+        QuorumObserveResult r;
+        r.height = cycle_base;
+        derive_cycles_at(cycle_base, r);
+
+        // Success == the ordered member set for THIS type/cycle is now
+        // registered for every signingActiveQuorumCount index.
+        size_t have = 0;
+        for (uint32_t i = 0; i < p->signing_active_quorum_count; ++i) {
+            if (m_members.count({llmq_type, cycle_base + i})) ++have;
+        }
+        out.member_sets = have;
+        out.ok = (p->signing_active_quorum_count > 0
+                  && have == p->signing_active_quorum_count);
+        if (!out.ok) {
+            const std::string needle =
+                "type " + std::to_string(int(llmq_type)) + " ";
+            for (const auto& s : r.member_skip_reasons) {
+                if (s.find(needle) != std::string::npos) {
+                    out.skip_reason = s;
+                    break;
+                }
+            }
+            if (out.skip_reason.empty())
+                out.skip_reason = "derive produced " + std::to_string(have)
+                    + "/" + std::to_string(p->signing_active_quorum_count)
+                    + " member sets for type " + std::to_string(int(llmq_type))
+                    + " cycle base h=" + std::to_string(cycle_base)
+                    + " with no named skip (inputs present but assembly "
+                      "incomplete)";
+        }
+        return out;
+    }
+
     /// The produced (or seeded) per-cycle snapshot — the qrinfo replacement.
     std::optional<vendor::CQuorumSnapshot> snapshot_for(uint8_t type,
                                                         uint32_t cycle_base) const
