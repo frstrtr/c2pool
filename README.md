@@ -67,6 +67,22 @@ and does not yet exist, so the work can be judged on what it actually is.
   script are immutable consensus history and cannot be retroactively changed; the
   clean script becomes the default at the v37 boundary.
 
+### v36 ratchet complete — the last generation shared with Python p2pool
+- **The LTC line has ratcheted to V36.** As of August 2026 the live Litecoin
+  sharechain signals **100% V36** across the sampling window, and c2pool nodes
+  produce and validate **V36 PPLNS** shares on the shared LTC+DOGE chain alongside
+  the remaining Python `p2pool` v36 nodes. V36 is now the operating generation, not
+  a transition target.
+- **V36 is the end of the line for the Python implementation.** The Python `p2pool`
+  is maintained only for the V36 sharechain it already interoperates with; no
+  further Python protocol development is planned. V36 is the **final share format
+  shared between the Python codebase and c2pool (C++).**
+- **v37 is C++ only.** The next generation — **Work Receipts** and the **MRR
+  Roundabout** settlement/lanes core — is being built exclusively in c2pool. There
+  is no Python v37, and the v37 sharechain does not interoperate with Python
+  `p2pool`. v37 remains design- and prototype-stage per the notes above and must not
+  be run in production.
+
 ### CI / repo state
 - The v37 research line is merged to `master` (PR #809, "V37 dev"). **Current master
   CI is green across the required per-coin gates and the coin matrix** (DASH / LTC /
