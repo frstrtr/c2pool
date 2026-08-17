@@ -970,6 +970,196 @@ TEST(DashReplayHeaderBackfill, RestartResumeRejoinsAnchor)
     std::filesystem::remove_all(db_path);
 }
 
+// ═══ (G.2) header-backfill peer selection: CanServeBlocks + stall-demote ════
+//
+// THE INCIDENT (2026-08-17, vm905, --coin-rpc removed, dashd ABSENT). The
+// genesis→anchor header backfill WEDGED at hdr=0/2513000. The getheaders
+// round-robin at maybe_kick_backfill()/on_headers() picked its target BLINDLY
+// over eligible_peers(), whose liveness fallback re-admits a pruned /
+// NODE_NETWORK_LIMITED peer when the CanServeBlocks-filtered serving set is
+// transiently empty (cold start with one limited peer up). That peer SILENTLY
+// DROPS the from-genesis getheaders, m_backfill->tip_height() never leaves 0,
+// BulkBlockScheduler stays gated on m_backfill->complete(), bodies=0, the fold
+// never starts. PR #1273 (df10298d) fixed exactly this class for the BODY
+// scheduler (peer_can_serve + BLOCK_STALLING_TIMEOUT demote); the header lane
+// was simply not covered.
+//
+// THE PORT (this PR). The header round-robin now (1) reuses the peer_can_serve
+// seam VERBATIM (main_dash → bulk_peer_can_serve: CanServeBlocks + start_height
+// coverage + not-demoted) so a non-serving peer is never targeted for a span it
+// cannot serve, and (2) stall-demotes a peer that RECEIVED getheaders but did
+// not advance the walker within the re-kick window, re-homing the span — with a
+// liveness bypass so no header span is ever skipped.
+//
+// A getheaders-driven rig stands the lane up with no sockets: a "live" server
+// answers a getheaders with the next real header batch (driving the walk); a
+// non-live peer records the target and DROPS it. `serving` models CanServeBlocks
+// (what a peer ADVERTISES); `live` models whether it actually answers — a LIAR
+// advertises service but is not live, the case peer_can_serve alone cannot catch
+// and only the stall-demote re-homes.
+struct HdrLaneRig
+{
+    BackfillChain bc;
+    rp::HeaderBackfill bf;
+    rp::CountingReplayConsumer counter;
+    std::unique_ptr<rp::BulkFetchLane> lane;
+
+    std::vector<std::string> peers;
+    std::set<std::string> serving;      // CanServeBlocks: advertises + covers span
+    std::set<std::string> live;         // actually answers getheaders
+    bool     wire_can_serve;            // false ⇒ peer_can_serve null (blind lane)
+    uint32_t batch_headers;
+    int64_t  now{1000};                 // start past backfill_rekick_sec so the first tick kicks
+
+    std::vector<std::string> getheaders_targets;   // every peer a getheaders went to
+
+    HdrLaneRig(uint32_t anchor, std::vector<std::string> peers_,
+               std::set<std::string> serving_, std::set<std::string> live_,
+               bool can_serve, uint32_t batch, const uint256& pow_limit,
+               int64_t demote_cooldown_sec)
+        : bc(anchor)
+        , bf(bc.genesis, anchor, bc.hashes[anchor], pow_limit,
+             /*db_path=*/"", /*check_pow=*/false)
+        , peers(std::move(peers_)), serving(std::move(serving_))
+        , live(std::move(live_)), wire_can_serve(can_serve), batch_headers(batch)
+    {
+        rp::BulkFetchLane::Config cfg;
+        cfg.start_height = anchor + 1;
+        cfg.backfill_rekick_sec = 15;
+        cfg.backfill_demote_cooldown_sec = demote_cooldown_sec;
+
+        rp::BulkFetchLane::Seams s;
+        s.hash_at = [](uint32_t) -> std::optional<uint256> { return std::nullopt; };
+        s.chain_height = [anchor] { return anchor + 1; };
+        s.eligible_peers = [this] { return peers; };
+        s.send_getdata = [](const std::string&, const std::vector<uint256>&) {};
+        s.now_sec = [this] { return now; };
+        if (can_serve)
+            s.peer_can_serve = [this](const std::string& p, uint32_t) {
+                return serving.count(p) != 0;
+            };
+        s.send_getheaders = [this](const std::string& peer, const uint256&,
+                                   const uint256&) {
+            getheaders_targets.push_back(peer);
+            // A live server answers with the next real header batch (driving the
+            // walk, and — via on_headers — self-propelling). A non-live peer
+            // (pruned/limited or a liar) drops it: only the target is recorded.
+            if (live.count(peer))
+            {
+                auto b = bc.batch(bf.tip_height() + 1, batch_headers);
+                if (!b.empty()) lane->on_headers(peer, b);
+            }
+        };
+        lane = std::make_unique<rp::BulkFetchLane>(
+            std::move(s), cfg, &bf,
+            static_cast<rp::IReplayBlockConsumer*>(&counter), nullptr);
+    }
+
+    // One tick per re-kick window (each tick advances `now` past the re-kick
+    // gate so the backstop fires), until complete/failed or max_kicks.
+    void drive(int max_kicks)
+    {
+        for (int k = 0; k < max_kicks && !bf.complete() && !bf.failed(); ++k)
+        {
+            lane->tick(now);
+            now += 16;
+        }
+    }
+
+    bool targeted(const std::string& p) const
+    {
+        return std::find(getheaders_targets.begin(), getheaders_targets.end(), p)
+               != getheaders_targets.end();
+    }
+};
+
+// (G.2 RED) The PRE-PORT blind lane (peer_can_serve null AND demote disabled,
+// backfill_demote_cooldown_sec=0 — the byte-identical pre-#1273 behaviour)
+// round-robins onto the non-serving peer every other kick and WEDGES: within a
+// tight kick budget it never reaches the anchor, and it DID target the dead
+// peer (the wedge cause).
+TEST(DashReplayHeaderBackfillPeerSelect, RedBlindRoundRobinWedgesOnNonServer)
+{
+    uint256 pow_limit;
+    pow_limit.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    const uint32_t ANCHOR = 40;   // 8 batches of 5 headers to reach the anchor
+    HdrLaneRig rig(ANCHOR, {"limited:1", "full:1"},
+                   /*serving=*/{"full:1"}, /*live=*/{"full:1"},
+                   /*can_serve=*/false, /*batch=*/5, pow_limit,
+                   /*demote_cooldown_sec=*/0);
+    rig.drive(/*max_kicks=*/4);
+    EXPECT_FALSE(rig.bf.complete())
+        << "blind round-robin wastes every other kick on the non-serving peer";
+    EXPECT_LT(rig.bf.tip_height(), ANCHOR) << "walker stalls short of the anchor";
+    EXPECT_TRUE(rig.targeted("limited:1"))
+        << "the blind lane DID target the dead peer — the wedge cause";
+}
+
+// (G.2 GREEN, proactive) With peer_can_serve wired the CanServeBlocks filter
+// NEVER targets the non-serving peer; the walk self-propels off the one serving
+// peer and JOINS the anchor in a single kick.
+TEST(DashReplayHeaderBackfillPeerSelect, GreenCanServeFilterCompletesInOneKick)
+{
+    uint256 pow_limit;
+    pow_limit.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    const uint32_t ANCHOR = 40;
+    HdrLaneRig rig(ANCHOR, {"limited:1", "full:1"},
+                   /*serving=*/{"full:1"}, /*live=*/{"full:1"},
+                   /*can_serve=*/true, /*batch=*/5, pow_limit,
+                   /*demote_cooldown_sec=*/60);
+    rig.drive(/*max_kicks=*/1);
+    EXPECT_TRUE(rig.bf.complete()) << "filtered lane joins the anchor at once";
+    EXPECT_EQ(rig.bf.tip_height(), ANCHOR);
+    EXPECT_FALSE(rig.targeted("limited:1"))
+        << "CanServeBlocks never targets the non-serving peer";
+}
+
+// (G.2 GREEN, reactive) A LIAR advertises full-block service (passes
+// CanServeBlocks) but silently drops every getheaders — the case peer_can_serve
+// alone cannot catch. The BLOCK_STALLING_TIMEOUT demote must fire: the liar is
+// tried once, stalls, is demoted, and the span RE-HOMES to the live server,
+// completing. No span is skipped.
+TEST(DashReplayHeaderBackfillPeerSelect, GreenStallDemoteReHomesOffLyingPeer)
+{
+    uint256 pow_limit;
+    pow_limit.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    const uint32_t ANCHOR = 40;
+    HdrLaneRig rig(ANCHOR, {"liar:1", "full:1"},
+                   /*serving=*/{"liar:1", "full:1"},   // BOTH advertise service
+                   /*live=*/{"full:1"},                // only full actually answers
+                   /*can_serve=*/true, /*batch=*/5, pow_limit,
+                   /*demote_cooldown_sec=*/60);
+    rig.drive(/*max_kicks=*/4);
+    EXPECT_TRUE(rig.bf.complete())
+        << "stall-demote re-homes the span off the lying peer and completes";
+    EXPECT_EQ(rig.bf.tip_height(), ANCHOR);
+    EXPECT_TRUE(rig.targeted("liar:1"))
+        << "the liar WAS tried once (it advertised service) — then demoted";
+}
+
+// (G.2 liveness bypass) BOTH peers advertise service but NEITHER answers. The
+// lane must keep re-homing — Pass 2 clears demotions rather than deadlock — so
+// it never freezes and never permanently skips a span: both peers keep getting
+// retried. It cannot complete (no live server) but it MUST NOT fail/crash.
+TEST(DashReplayHeaderBackfillPeerSelect, LivenessBypassNeverDeadlocks)
+{
+    uint256 pow_limit;
+    pow_limit.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    const uint32_t ANCHOR = 40;
+    HdrLaneRig rig(ANCHOR, {"a:1", "b:1"},
+                   /*serving=*/{"a:1", "b:1"}, /*live=*/{},   // nobody answers
+                   /*can_serve=*/true, /*batch=*/5, pow_limit,
+                   /*demote_cooldown_sec=*/60);
+    rig.drive(/*max_kicks=*/10);
+    EXPECT_FALSE(rig.bf.complete());   // no live server ⇒ cannot join
+    EXPECT_FALSE(rig.bf.failed());     // but never fails/crashes/deadlocks
+    EXPECT_TRUE(rig.targeted("a:1"));
+    EXPECT_TRUE(rig.targeted("b:1"))
+        << "liveness bypass re-homes to BOTH — no span permanently skipped";
+    EXPECT_GE(rig.getheaders_targets.size(), 5u)
+        << "the lane keeps trying every kick — never wedges silently";
+}
+
 // ═══ (H) capture cache ════════════════════════════════════════════════════
 
 TEST(DashReplayBulkCapture, SegmentRoundTripAndTornTail)
