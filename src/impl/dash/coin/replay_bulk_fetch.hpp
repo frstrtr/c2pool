@@ -1162,7 +1162,8 @@ public:
         uint32_t start_height{MAINNET_DIP3_HEIGHT};
         uint32_t tip_exclusion{12};          // live edge belongs to the tip lane
         int64_t  telemetry_interval_sec{30};
-        int64_t  backfill_rekick_sec{15};    // headers stall re-kick
+        int64_t  backfill_rekick_sec{15};    // headers stall re-kick (== dashd BLOCK_STALLING_TIMEOUT window for the header lane)
+        int64_t  backfill_demote_cooldown_sec{60};  // header peer held OFF targeting after a stall (#1273 demote_cooldown parity); 0 ⇒ demote disabled (byte-identical to the pre-port blind lane, like the scheduler's demote_after=0)
         uint32_t cursor_persist_every{512};  // delivered blocks between cursor writes
     };
 
@@ -1193,6 +1194,20 @@ private:
 
     int64_t m_last_backfill_kick{0};
     std::size_t m_backfill_rr{0};
+
+    // dashd net_processing block-download peer policy for the HEADER-backfill
+    // lane — the reactive half of what #1273 (df10298d) ported for the BODY
+    // lane, which the header round-robin at maybe_kick_backfill()/on_headers()
+    // was never covered by. A header peer that RECEIVED a getheaders but did not
+    // advance the walker within the re-kick window is silently dropping it (a
+    // pruned / NODE_NETWORK_LIMITED peer that the eligible_peers liveness
+    // fallback re-admitted, or a full node that lies) — hold it OFF header
+    // targeting until this wall-second (BLOCK_STALLING_TIMEOUT class). Empty ⇒
+    // no header peer demoted, byte-identical to the pre-port blind round-robin.
+    std::map<std::string, int64_t> m_hdr_demoted_until;
+    std::string m_hdr_target_peer;      // peer the last getheaders was sent to
+    uint32_t    m_hdr_target_height{0}; // walker tip when that getheaders left
+    bool        m_hdr_targeted{false};  // a getheaders is outstanding to track
 
     void fail(const std::string& cause)
     {
@@ -1241,6 +1256,93 @@ private:
         }
     }
 
+    /// Pick the header-backfill getheaders target — dashd net_processing's two
+    /// halves of the block-download peer policy applied to the single-target
+    /// header walk (the BODY-lane analog #1273 ported into pump()):
+    ///   * PROACTIVE (CanServeBlocks): reuse the peer_can_serve seam VERBATIM
+    ///     (main_dash → bulk_peer_can_serve: advertises full-block service AND
+    ///     start_height covers `want_height` AND not bulk-demoted). No
+    ///     CanServeBlocks logic is reimplemented here.
+    ///   * REACTIVE (BLOCK_STALLING_TIMEOUT): skip a peer currently held in
+    ///     m_hdr_demoted_until (set by maybe_kick_backfill's stall check).
+    /// Preference DEGRADES to a liveness bypass so no header span is EVER
+    /// skipped — the exact shape of pump()'s any_serves / any_fresh_eligible
+    /// bypasses:
+    ///   1. serving + un-demoted            (the healthy target)
+    ///   2. serving, demotions CLEARED      (every serving peer was demoted —
+    ///                                        never deadlock on demotions)
+    ///   3. any peer                        (NO peer advertises the span)
+    /// Returns "" only when the eligible pool is itself empty.
+    std::string select_backfill_peer(
+        int64_t now, uint32_t want_height,
+        const std::vector<std::string>& peers)
+    {
+        if (peers.empty()) return {};
+        auto serves = [&](const std::string& p) {
+            return !m_seams.peer_can_serve ||
+                   m_seams.peer_can_serve(p, want_height);
+        };
+        auto demoted = [&](const std::string& p) {
+            auto it = m_hdr_demoted_until.find(p);
+            return it != m_hdr_demoted_until.end() && it->second > now;
+        };
+        // Does SOME eligible peer advertise this height? CanServeBlocks is a
+        // preference, never a freeze (pump()'s any_serves): if none do, every
+        // peer is admitted so the span is still fetched (liveness bypass §3).
+        bool any_serves = false;
+        for (const auto& p : peers)
+            if (serves(p)) { any_serves = true; break; }
+
+        const std::size_t n = peers.size();
+        // Pass 1: serving (when some peer serves) AND un-demoted, round-robin.
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const std::string& p = peers[(m_backfill_rr + i) % n];
+            if ((!any_serves || serves(p)) && !demoted(p))
+            {
+                m_backfill_rr = (m_backfill_rr + i + 1) % n;
+                return p;
+            }
+        }
+        // Pass 2 (dashd stall-bypass, liveness §3): every serving peer is
+        // demoted — clear demotions and re-home rather than deadlock the walk.
+        m_hdr_demoted_until.clear();
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const std::string& p = peers[(m_backfill_rr + i) % n];
+            if (!any_serves || serves(p))
+            {
+                m_backfill_rr = (m_backfill_rr + i + 1) % n;
+                return p;
+            }
+        }
+        // Unreachable (!any_serves ⇒ serves() is vacuously true in Pass 2) —
+        // kept as a total function so the walker always has a target.
+        const std::string& p = peers[m_backfill_rr++ % n];
+        return p;
+    }
+
+    /// Issue ONE backfill getheaders to a CanServeBlocks-selected, un-demoted
+    /// peer and RECORD the target (peer + walker tip) so the next kick can tell
+    /// a stall (received-but-did-not-advance) from healthy progress and
+    /// demote+re-home. Height coverage is checked against tip_height()+1 — the
+    /// next header the walk needs — so a limited/pruned peer whose window sits
+    /// above genesis fails CanServeBlocks exactly as it should for a
+    /// from-genesis walk.
+    void issue_backfill_getheaders(
+        int64_t now, const std::vector<std::string>& peers)
+    {
+        const uint32_t want = m_backfill->tip_height() + 1;
+        std::string peer = select_backfill_peer(now, want, peers);
+        if (peer.empty()) return;
+        m_seams.send_getheaders(peer, m_backfill->tip_hash(),
+                                uint256::ZERO /* stop: serve max batches; the
+                                walker itself stops at the anchor */);
+        m_hdr_target_peer   = peer;
+        m_hdr_target_height = m_backfill->tip_height();
+        m_hdr_targeted      = true;
+    }
+
     void maybe_kick_backfill(int64_t now)
     {
         if (!m_backfill || m_backfill->complete() || m_backfill->failed())
@@ -1255,10 +1357,30 @@ private:
         if ((now - m_last_backfill_kick) < m_cfg.backfill_rekick_sec) return;
         auto peers = m_seams.eligible_peers();
         if (peers.empty()) return;
-        const std::string& peer = peers[m_backfill_rr++ % peers.size()];
-        m_seams.send_getheaders(peer, m_backfill->tip_hash(),
-                                uint256::ZERO /* stop: serve max batches; the
-                                walker itself stops at the anchor */);
+        // dashd BLOCK_STALLING_TIMEOUT (reactive half, header lane): this
+        // re-kick backstop only fires because the walker has NOT advanced since
+        // the last kick. If the peer we last targeted still holds the walker at
+        // the height we left it, it received the getheaders and silently
+        // dropped it — DEMOTE it for the cooldown so the re-home below lands on
+        // a different serving peer. Never wedge on one peer. A peer that DID
+        // advance the walker (tip_height moved) is not blamed; on_headers also
+        // clears the demotion the instant a delivery lands.
+        if (m_cfg.backfill_demote_cooldown_sec > 0 &&
+            m_hdr_targeted && !m_hdr_target_peer.empty() &&
+            m_backfill->tip_height() <= m_hdr_target_height)
+        {
+            m_hdr_demoted_until[m_hdr_target_peer] =
+                now + m_cfg.backfill_demote_cooldown_sec;
+            LOG_WARNING << "[BULK] header-backfill peer " << m_hdr_target_peer
+                        << " STALLED at hdr=" << m_backfill->tip_height() << "/"
+                        << m_backfill->anchor_height()
+                        << " (getheaders unanswered ≥"
+                        << m_cfg.backfill_rekick_sec
+                        << "s) — demoted for " << m_cfg.backfill_demote_cooldown_sec
+                        << "s, re-homing the span (dashd BLOCK_STALLING_TIMEOUT "
+                           "parity)";
+        }
+        issue_backfill_getheaders(now, peers);
         m_last_backfill_kick = now;
     }
 
@@ -1408,23 +1530,23 @@ public:
 
     /// Headers demux filter body (registered on the CoinClient): claim and
     /// fold backfill batches; everything else falls through to new_headers.
-    bool on_headers(const std::string& /*peer_key*/,
+    bool on_headers(const std::string& peer_key,
                     const std::vector<BlockType>& batch)
     {
         if (!m_backfill || !m_backfill->claims(batch)) return false;
         const int accepted = m_backfill->add_headers(batch);
         if (accepted > 0 && !m_backfill->complete() && !m_backfill->failed())
         {
-            // Self-propel: immediately ask for the next span. The stall
-            // re-kick in tick() is only the backstop.
+            // The peer that just delivered headers PROVED it serves this span:
+            // clear any stall-demotion (mirror #1273's on_body clearing
+            // demoted_until on a delivered body). Then self-propel — ask a
+            // CanServeBlocks-selected, un-demoted peer for the next span
+            // immediately. The stall re-kick in tick() is only the backstop.
+            if (!peer_key.empty()) m_hdr_demoted_until.erase(peer_key);
             auto peers = m_seams.eligible_peers();
             if (!peers.empty())
-            {
-                const std::string& peer =
-                    peers[m_backfill_rr++ % peers.size()];
-                m_seams.send_getheaders(peer, m_backfill->tip_hash(),
-                                        uint256::ZERO);
-            }
+                issue_backfill_getheaders(
+                    m_seams.now_sec ? m_seams.now_sec() : 0, peers);
         }
         return true;   // claimed — never reaches the tip-lane header ingest
     }
