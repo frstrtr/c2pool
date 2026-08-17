@@ -104,6 +104,7 @@
 #include <impl/dash/coin/replay_utxo_fold.hpp>   // W3: full-history replay standalone UTXO fold (--replay-utxo-*)
 #include <impl/dash/coin/replay_prestate.hpp>    // W5: anchor prestate loader (--replay-fold-prestate)
 #include <impl/dash/coin/mnlist_seed.hpp>        // OPTIONAL V20 getmnlistdiff seed (--replay-mnlist-seed-*, #154 escape hatch)
+#include <impl/dash/coin/mn_checkpoint_dump.hpp> // self-derived MN-set checkpoint dump (--dump-mn-checkpoint)
 #include <impl/dash/coin/replay_fold_consumer.hpp> // W5: bulk lane -> W1 DML fold + per-block root check
 #include <impl/dash/coin/replay_quorum_bridge.hpp> // SEAM: W4 quorum lane <-> W1 MembersFn
 #include <impl/dash/coin/historical_sml.hpp> // authenticate_historical_snapshot (DIP-4 R3, straddle-seed)
@@ -268,6 +269,13 @@ bool g_mn_bridge_no_cursor = false;
 bool        g_replay_bulk = false;            // --replay-bulk: arm the lane
 std::string g_replay_bulk_capture_dir;        // --replay-bulk-capture DIR (implies --replay-bulk)
 uint32_t    g_replay_bulk_start = 0;          // --replay-bulk-start H (0 = network default: mainnet DIP3 1028160)
+// ── DASHD-CUT: self-derived MN-set checkpoint dump (--dump-mn-checkpoint H FILE) ─
+// When the --replay-bulk DML fold's cursor reaches H, serialize its REGISTERED
+// masternode set to the checkpoint .inc at FILE — SELF-DERIVED from the fold's
+// own root-checked ReplayMNState, no dashd RPC, no trusted protx snapshot
+// (operator decision 2026-08-17). One-shot; the fold is unaffected otherwise.
+uint32_t    g_dump_mn_checkpoint_height = 0;  // 0 = off
+std::string g_dump_mn_checkpoint_file;
 
 // ── W5 INTEGRATION: drive the W1 DML fold from the W2 bulk lane ───────────
 // --replay-fold-prestate FILE seeds the W1 fold engine from a full-state
@@ -480,6 +488,7 @@ void print_banner(const char* argv0)
         << "           [--replay-fold-qsnapshot FILE] [--replay-fold-worklists FILE]\n"
         << "           [--replay-mnlist-seed-height H --replay-mnlist-seed-source getmnlistdiff --replay-mnlist-seed-file FILE]\n"
         << "           [--replay-mined-commitment-index] [--embedded-mined-commitment-index]\n"
+        << "           [--dump-mn-checkpoint H FILE]\n"
         << "           [--embedded-no-dashd-mn-seed [--embedded-fold-only-proof]]\n"
         << "           [--oracle-graduation-blocks N] [--oracle-class-coverage K]\n"
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
@@ -647,6 +656,11 @@ void print_banner(const char* argv0)
         << "        caches raw bodies into append-only segment files (fleet re-fold\n"
         << "        cache; implies --replay-bulk). --replay-bulk-start H overrides\n"
         << "        the first fetched height (default: mainnet DIP3 1028160).\n"
+        << "        --dump-mn-checkpoint H FILE serializes the --replay-fold DML\n"
+        << "        set at height H to the checkpoint .inc at FILE, SELF-DERIVED\n"
+        << "        from the fold's own root-checked state (no dashd RPC, no\n"
+        << "        protx snapshot; registered-not-valid; reuses the runtime\n"
+        << "        parser field order + digest, self-verifies before writing).\n"
         << "        --external-ip ADDR (alias --stratum-advertise / --public-host)\n"
         << "        overrides the miner-facing host shown in the dashboard Stratum\n"
         << "        URL -- for NAT / port-mapped nodes whose outbound IP is not the\n"
@@ -8011,6 +8025,52 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // carries a payout script. A fold that diverged, is poisoned,
                 // or is behind the tip can never become the authoritative
                 // snapshot, and the refusal names which condition blocked.
+                // ── DASHD-CUT: self-derived MN-set checkpoint DUMP ────────
+                // One-shot: when the fold cursor reaches H, serialize the
+                // registered set to FILE (mn_checkpoint_dump.hpp). SELF-DERIVED
+                // — every field comes from the fold's own root-checked
+                // ReplayMNState (scriptPayout verbatim from the ProRegTx it
+                // replayed; nLastPaidHeight from the payee bookkeeping it
+                // keeps), never a dashd protx snapshot. Serve-inert: it only
+                // reads the engine and writes one file. The write self-verifies
+                // through parse_mn_checkpoint() so it can never emit a file the
+                // runtime cold-start would refuse.
+                if (g_dump_mn_checkpoint_height != 0 && replay_fold_consumer) {
+                    const uint32_t dump_h = g_dump_mn_checkpoint_height;
+                    const std::string dump_file = g_dump_mn_checkpoint_file;
+                    replay_fold_consumer->set_dump_hook(
+                        dump_h,
+                        [dump_file, dump_h](const rp::DmlFoldEngine& eng,
+                                            uint32_t reached) {
+                            const std::string source =
+                                "self-derived from chain via c2pool"
+                                " --replay-bulk at H=" + std::to_string(reached)
+                                + " (blockhash " + eng.block_hash().GetHex()
+                                + ")";
+                            const std::string generated =
+                                dash::coin::mn_dump_detail::iso8601_utc_now();
+                            std::string err;
+                            if (dash::coin::write_mn_checkpoint_inc(
+                                    eng, dump_file, source, generated, err)) {
+                                std::cout << "[run] --dump-mn-checkpoint: WROTE "
+                                          << eng.size() << " registered"
+                                             " masternodes at h=" << reached
+                                          << " to " << dump_file
+                                          << " (self-derived, no dashd) —"
+                                             " verified through"
+                                             " parse_mn_checkpoint()\n";
+                            } else {
+                                std::cerr << "[run] --dump-mn-checkpoint FAILED"
+                                             " at h=" << reached << ": " << err
+                                          << "\n";
+                            }
+                        });
+                    std::cout << "[run] --dump-mn-checkpoint ARMED: the fold will"
+                                 " serialize its registered MN set at h="
+                              << dump_h << " to " << dump_file
+                              << " (self-derived from chain; no dashd RPC)\n";
+                }
+
                 if (replay_fold_consumer) {
                     replay_payee_pub =
                         std::make_unique<rp::ReplayPayeePublisher>(
@@ -10151,6 +10211,13 @@ int main(int argc, char** argv)
         else if (std::strcmp(argv[i], "--replay-bulk-start") == 0 && i + 1 < argc)
             g_replay_bulk_start = static_cast<uint32_t>(
                 std::strtoul(argv[++i], nullptr, 10));
+        // DASHD-CUT: dump the fold's registered MN set at H to a checkpoint
+        // .inc (self-derived; no dashd). Takes two args: H and FILE.
+        else if (std::strcmp(argv[i], "--dump-mn-checkpoint") == 0 && i + 2 < argc) {
+            g_dump_mn_checkpoint_height = static_cast<uint32_t>(
+                std::strtoul(argv[++i], nullptr, 10));
+            g_dump_mn_checkpoint_file = argv[++i];
+        }
         // W5: anchor-seeded DML fold driven by the bulk lane.
         else if (std::strcmp(argv[i], "--replay-fold-prestate") == 0 && i + 1 < argc) {
             g_replay_fold_prestate = argv[++i];
