@@ -4071,6 +4071,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // root+payee-checked per-block commit it needs. Seeded at the same anchor
     // the bridge stands on; sinks MnDiffWriter::on_folded off ITS OWN commit.
     std::unique_ptr<dash::coin::replay::DmlFoldEngine>         mn_bridge_fold_engine;
+    // DASHD-CUT ARM (resolver wiring): the parallel store engine, like the
+    // main replay-fold path, needs the W4 quorum-member resolver or its fold
+    // FAILS CLOSED at the first punishing qfcommit (llmqType=5 @ h=2513130,
+    // ~130 past the anchor) and the store caps there. Stand up a SECOND
+    // QuorumReplayEngine + ReplayQuorumBridge whose ctor installs
+    // set_members_fn onto mn_bridge_fold_engine, seeded at the SAME anchor.
+    std::unique_ptr<dash::coin::replay::QuorumReplayEngine>    mn_bridge_quorum_engine;
+    std::unique_ptr<dash::coin::replay::ReplayQuorumBridge>    mn_bridge_quorum_bridge;
     // PR-2 FORWARD: dashd's mined-commitment store, fed from the same replayed
     // bodies. shared_ptr because the qc-plan lambda (installed far above, on
     // the serve path) captures it by value and must see it appear later — it
@@ -7045,9 +7053,78 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         std::make_unique<rp::DmlFoldEngine>(fcfg);
                     mn_diff_writer = std::make_unique<rp::MnDiffWriter>(
                         *mn_diff_store, *mn_bridge_fold_engine);
+
+                    // ── RESOLVER WIRING (the fix) ────────────────────────
+                    // The parallel store engine, like the main replay-fold
+                    // path, needs the W4 quorum-member resolver or its fold
+                    // fails closed at the first punishing qfcommit (llmqType=5
+                    // @ h=2513130, only ~130 past the anchor): "no quorum-
+                    // member resolver is installed -- PoSe punishes cannot be
+                    // folded, failing closed". That cap is why the store
+                    // covered only ~130 heights and the bridge fell back to the
+                    // capped network getmnlistd probe (payee-desync).
+                    //
+                    // Mirror the main-path --replay-fold-quorums seam: a SECOND
+                    // QuorumReplayEngine seeded at the SAME full-state anchor and
+                    // a SECOND ReplayQuorumBridge whose ctor installs
+                    // set_members_fn onto mn_bridge_fold_engine. The engine
+                    // self-DERIVES rotated + non-rotated member sets from the
+                    // SAME replayed blocks the store folds (dashd
+                    // CalcQuorumMembers / GetAllQuorumMembers analog),
+                    // self-checked vs each block's committed merkleRootQuorums --
+                    // no qrinfo/P2P dependency. The fold then applies dashd
+                    // HandleQuorumCommitment PoSe-punishes (already ported in
+                    // replay_fold_engine.hpp) so the folded list re-hashes to the
+                    // committed merkleRootMNList PAST the qfcommit and the store
+                    // COVERS heights to tip. A WRONG member set -> root mismatch
+                    // -> the writer's own root self-check REFUSES the row -> store
+                    // stays empty -> callers fall through to the network path
+                    // (reward-safe by construction).
+                    {
+                        namespace rq = dash::coin::replay;
+                        rq::QuorumReplayConfig qcfg;
+                        qcfg.enabled = true;
+                        qcfg.network = testnet
+                            ? dash::coin::LlmqNetwork::Testnet
+                            : dash::coin::LlmqNetwork::Mainnet;
+                        if (testnet) qcfg.v20_floor = 905'100u;
+                        mn_bridge_quorum_engine =
+                            std::make_unique<rq::QuorumReplayEngine>(qcfg);
+                        mn_bridge_quorum_engine->seed_cursor(
+                            ckpt.height, ckpt.blockhash);
+                        rq::QuorumBridgeConfig bcfg;
+                        bcfg.network = qcfg.network;
+                        mn_bridge_quorum_bridge =
+                            std::make_unique<rq::ReplayQuorumBridge>(
+                                *mn_bridge_fold_engine,
+                                *mn_bridge_quorum_engine, bcfg);
+                        // Pre-anchor height->hash from the PoW-verified header
+                        // chain: a commitment mined just after the anchor whose
+                        // quorum BASE predates it still resolves instead of
+                        // failing the lane on an unknown base (mirrors the main
+                        // path's back = 3*576 + 64 window).
+                        size_t qseeded = 0;
+                        const uint32_t qback = 3u * 576u + 64u;
+                        for (uint32_t hh = (ckpt.height > qback
+                                                ? ckpt.height - qback : 1);
+                             hh < ckpt.height; ++hh) {
+                            auto he = header_chain->get_header_by_height(hh);
+                            if (!he) continue;
+                            mn_bridge_quorum_bridge->seed_block_hash(hh, he->hash);
+                            ++qseeded;
+                        }
+                        LOG_INFO << "[MN-DIFF-DB] store-engine quorum resolver"
+                                    " WIRED: second QuorumReplayEngine seeded at"
+                                    " anchor h=" << ckpt.height
+                                 << " (" << qseeded << " pre-anchor header"
+                                    " hashes); set_members_fn installed on the"
+                                    " parallel DML engine -- prime_at_anchor"
+                                    " deferred to the anchor snapshot seed.";
+                    }
                     mn_ckpt_lane->set_on_anchor_snapshot(
                         [eng = mn_bridge_fold_engine.get(),
                          w   = mn_diff_writer.get(),
+                         qbr = mn_bridge_quorum_bridge.get(),
                          anchor = ckpt, net = net_name](
                             const dash::coin::vendor::CSimplifiedMNList& asml,
                             uint32_t /*anchor_h*/) {
@@ -7172,6 +7249,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                        " inert, callers unchanged.";
                                 return;
                             }
+                            // Resolver lane: retain the anchor MN list in the
+                            // quorum bridge's window now that the fold engine is
+                            // seeded (m_dml.height()==anchor), so rotated member
+                            // derivation has its base list. Mirrors the main path.
+                            if (qbr) qbr->prime_at_anchor();
                             LOG_INFO
                                 << "[MN-DIFF-DB] FULL-STATE anchor seed OK: "
                                 << with_facets << " MNs seeded root-fields from the"
@@ -7193,13 +7275,21 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     mn_ckpt_lane->set_on_block_applied(
                         [eng = mn_bridge_fold_engine.get(),
                          w   = mn_diff_writer.get(),
+                         qbr = mn_bridge_quorum_bridge.get(),
                          logged = std::make_shared<bool>(false)](
                             const dash::coin::BlockType& blk, uint32_t h) {
                             if (eng->poisoned()) return;
                             if (eng->size() == 0) return;   // seed deferred to the anchor fold; nothing to fold yet
                             const uint256 bh =
                                 rp::DmlFoldEngine::block_header_hash(blk);
+                            // Feed the parallel quorum lane the SAME block so its
+                            // member derivation stays in lockstep with the fold;
+                            // observe() BEFORE the punish pass consumes
+                            // members_for(), after_fold() AFTER retains work-block
+                            // lists. Mirrors the main path's pre_fold/post_fold.
+                            if (qbr) qbr->observe(h, bh, blk);
                             const auto fr = eng->fold_block(blk, h);
+                            if (qbr) qbr->after_fold(h);
                             if (fr.ok) {
                                 w->on_folded(h, bh, blk, fr);
                                 return;
