@@ -359,6 +359,12 @@ struct ReplayMNState
 struct FoldGates
 {
     int32_t dip0003_height{1028160};   // fold start — no DML below this
+    // DIP3 has TWO distinct heights (dashd deploymentstatus.h:52 comment:
+    // "'active' and 'enforced' are different statuses for DIP0003"). The
+    // deterministic MN list is BUILT from activation (dip0003_height); the
+    // coinbase paying GetMNPayee(list) is only ENFORCED from here on. dashd
+    // mainnet chainparams.cpp:186 DIP0003EnforcementHeight = 1047200.
+    int32_t dip0003_enforcement_height{1047200};
     int32_t v19_height{1899072};       // basic BLS (per-entry nVersion wrapper)
     int32_t mn_rr_height{2128896};     // MN reward reallocation (Evo 4-in-a-row OFF)
     int32_t masternode_min_confirmations{15};
@@ -369,6 +375,13 @@ struct FoldGates
 
     bool v19_active(int32_t h) const   { return h >= v19_height; }
     bool mn_rr_active(int32_t h) const { return h >= mn_rr_height; }
+    // dashd deploymentstatus.h:53 DeploymentDIP0003Enforced(h) == h >= EnfHeight.
+    // Gates the coinbase payee cross-check: below this dashd's own consensus
+    // rule (CMNPaymentsProcessor::IsTransactionValid, payments.cpp:114) returns
+    // valid WITHOUT checking the det payee, so the coinbase pays the legacy
+    // masternode winner, not GetMNPayee(list) — a cross-check here would be
+    // stricter than dashd and false-poison a correct fold.
+    bool dip0003_enforced(int32_t h) const { return h >= dip0003_enforcement_height; }
 };
 
 /// Feature flag for the whole engine. `enabled` MUST be set explicitly —
@@ -414,6 +427,13 @@ struct FoldResult
     // a projection that is NOT paid fails the fold closed, it never leaves
     // this flag quietly clear.
     bool        payee_paid_verified{false};
+    // True when the payee cross-check was SKIPPED because this height is below
+    // DIP3 enforcement (dashd does not commit the det payee to the coinbase
+    // there either). The SET self-check (merkleRootMNList) still ran; only the
+    // payee AXIS is not coinbase-committed yet. Diagnostic only — the fold is
+    // still fully derived and self-consistent (nLastPaidHeight accumulates on
+    // the projected payee exactly as dashd BuildNewListFromBlock does).
+    bool        payee_check_preenforcement_skipped{false};
 };
 
 class DmlFoldEngine
@@ -895,7 +915,30 @@ public:
         // members WITHIN a group. A within-group swap is invisible to the
         // coinbase and therefore invisible to any consumer of it, including
         // dashd's own validation of our block.
-        if (r.payee && !payee_script_pre.empty()) {
+        //
+        // DIP3-ENFORCEMENT GATE (dashd parity, DIP3-genesis regime fix):
+        // dashd builds the deterministic list from DIP3 ACTIVATION (1028160)
+        // but only ENFORCES the coinbase paying GetMNPayee(list) from
+        // DIP0003EnforcementHeight (1047200) — CMNPaymentsProcessor::
+        // IsTransactionValid (payments.cpp:114) returns valid WITHOUT checking
+        // the payee when !DeploymentDIP0003Enforced(h). In the [activation,
+        // enforcement) window the historical coinbase pays the LEGACY
+        // masternode winner, not the det projection, so this cross-check —
+        // which is correct at tip — is STRICTER THAN DASHD there and false-
+        // poisons a byte-correct fold (observed: h=1028163, merkleRootMNList
+        // MATCHED, payee projection sound, coinbase simply pays the legacy
+        // winner). Mirror dashd's gate exactly. The SET self-check above stays
+        // UNCONDITIONAL; the payee projection + nLastPaidHeight bookkeeping
+        // (passes 0/5) also run unconditionally, so the payee axis stays fully
+        // derived and self-consistent across the window and is correct the
+        // instant enforcement begins. Production (tip ~2.5M) is far above
+        // enforcement, so the money-path check is UNCHANGED.
+        if (r.payee && !payee_script_pre.empty()
+            && !m_cfg.gates.dip0003_enforced(H)) {
+            r.payee_check_preenforcement_skipped = true;
+        }
+        if (r.payee && !payee_script_pre.empty()
+            && m_cfg.gates.dip0003_enforced(H)) {
             bool paid = false;
             if (!block.m_txs.empty()) {
                 for (const auto& out : block.m_txs[0].vout) {
