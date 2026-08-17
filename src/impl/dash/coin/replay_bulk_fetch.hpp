@@ -794,6 +794,19 @@ public:
         uint32_t per_peer_inflight{32};   // outstanding bodies per peer (keeps reply queues short — priority inv. 4)
         uint32_t batch{16};               // invs per getdata message
         int64_t  request_timeout_sec{30}; // unanswered this long ⇒ re-request elsewhere
+        // dashd net_processing BLOCK_STALLING_TIMEOUT parity (reactive half of
+        // the block-download peer policy). A peer that leaves `demote_after`
+        // consecutive getdata unanswered — its deep-history bodies never arrive,
+        // and the whole full-history run measured notfound=0, so a non-archival
+        // peer SILENTLY DROPS the request rather than declining it — is held OFF
+        // FRESH contiguous-range assignment for `demote_cooldown_sec`, so the
+        // in-order delivery cursor stops being handed work-ahead behind a peer
+        // that never answers. Purely fetch-side WHO/WHEN: no height is ever
+        // skipped (timed-out heights requeue exactly as before, and retries are
+        // never gated by demotion), and a single delivered body clears it.
+        // demote_after=0 restores byte-identical pre-port behaviour.
+        uint32_t demote_after{3};
+        int64_t  demote_cooldown_sec{60};
     };
 
     struct PeerTally
@@ -801,6 +814,9 @@ public:
         uint64_t blocks{0};
         uint64_t bytes{0};
         uint32_t inflight{0};
+        uint32_t timeouts{0};        // cumulative unanswered-getdata timeouts (telemetry)
+        uint32_t timeout_streak{0};  // consecutive timeouts since this peer last delivered a body
+        int64_t  demoted_until{0};   // held off FRESH range assignment until this wall-second (0 = eligible)
     };
 
     struct Assignment
@@ -881,9 +897,23 @@ public:
         auto& t = m_tallies[it->second.peer];
         ++t.blocks;
         t.bytes += raw_size;
+        // A delivered body proves the peer is serving: clear its stall streak
+        // and any demotion so it is immediately re-eligible for fresh ranges.
+        t.timeout_streak = 0;
+        t.demoted_until = 0;
         if (t.inflight > 0) --t.inflight;
         m_inflight.erase(it);
         return height;
+    }
+
+    /// Peers currently held off fresh-range assignment (stall-demoted). Purely
+    /// observational — for telemetry / the live [BULK] line.
+    std::size_t demoted_count(int64_t now) const
+    {
+        std::size_t n = 0;
+        for (const auto& [key, t] : m_tallies)
+            if (t.demoted_until > now) ++n;
+        return n;
     }
 
     /// The asked peer answered notfound (pruned/archival gap): requeue at the
@@ -922,8 +952,21 @@ public:
             const bool timed_out =
                 (now - it->second.at) >= m_cfg.request_timeout_sec;
             if (!peer_gone && !timed_out) { ++it; continue; }
-            if (timed_out) ++m_timeouts;
             auto& t = m_tallies[it->second.peer];
+            if (timed_out)
+            {
+                ++m_timeouts;
+                ++t.timeouts;
+                ++t.timeout_streak;
+                // dashd BLOCK_STALLING_TIMEOUT parity: after `demote_after`
+                // consecutive unanswered getdata (no delivery in between), hold
+                // this peer off fresh-range assignment for the cooldown. A
+                // departed peer (peer_gone) is a topology event, not a serve
+                // failure — it does not accrue the stall streak.
+                if (m_cfg.demote_after > 0 &&
+                    t.timeout_streak >= m_cfg.demote_after)
+                    t.demoted_until = now + m_cfg.demote_cooldown_sec;
+            }
             if (t.inflight > 0) --t.inflight;
             m_retry.emplace_front(it->second.height, it->second.peer);
             it = m_inflight.erase(it);
@@ -940,7 +983,17 @@ public:
         int64_t now,
         const std::vector<std::string>& peers,
         const std::function<std::optional<uint256>(uint32_t)>& hash_at,
-        std::size_t buffered)
+        std::size_t buffered,
+        // dashd FindNextBlocksToDownload/CanServeBlocks per-(peer,height)
+        // coverage: returns true iff the named peer advertises block service
+        // (NODE_NETWORK / NODE_NETWORK_LIMITED) AND its announced start_height
+        // covers `height`. Null ⇒ every peer serves every height (KATs / any
+        // embedding without the coin-P2P service map) — byte-identical to before
+        // this parameter existed. When non-null it only steers WHO is asked;
+        // a height for which NO eligible peer qualifies still goes out (liveness
+        // bypass below) so no block is ever skipped.
+        const std::function<bool(const std::string&, uint32_t)>& peer_can_serve
+            = {})
     {
         std::vector<Assignment> out;
         if (peers.empty()) return out;
@@ -954,11 +1007,46 @@ public:
         const uint64_t budget_total =
             static_cast<uint64_t>(m_delivered) + m_cfg.window;
 
+        // CanServeBlocks helpers. `serves` is the per-(peer,height) gate;
+        // `any_serves` answers "does SOME eligible peer cover this height?" so
+        // the filter degrades to a preference (never a freeze) when the pool
+        // holds no peer that can serve a given height.
+        auto serves = [&](const std::string& p, uint32_t h) -> bool {
+            return !peer_can_serve || peer_can_serve(p, h);
+        };
+        auto any_serves = [&](uint32_t h) -> bool {
+            if (!peer_can_serve) return true;
+            for (const auto& p : peers)
+                if (peer_can_serve(p, h)) return true;
+            return false;
+        };
+
+        // dashd BLOCK_STALLING_TIMEOUT parity (fresh-range side): is ANY peer
+        // currently un-demoted? If every peer is stalled we must still hand out
+        // fresh ranges (liveness — never freeze the fetch), so the demotion gate
+        // is bypassed in that degenerate case. Retries are never gated by
+        // demotion here: the oldest missing height must be able to land on
+        // whichever peer's slot is free.
+        bool any_fresh_eligible = false;
+        for (const auto& p : peers)
+        {
+            auto ti = m_tallies.find(p);
+            if (ti == m_tallies.end() || ti->second.demoted_until <= now)
+            {
+                any_fresh_eligible = true;
+                break;
+            }
+        }
+
         for (std::size_t pi = 0; pi < peers.size(); ++pi)
         {
             const std::string& peer = peers[(m_rr + pi) % peers.size()];
             auto& tally = m_tallies[peer];
             if (tally.inflight >= m_cfg.per_peer_inflight) continue;
+            // A demoted peer still takes retries below, but is skipped for fresh
+            // contiguous ranges while any healthy peer remains.
+            const bool fresh_ok =
+                !any_fresh_eligible || tally.demoted_until <= now;
             uint32_t capacity = std::min<uint32_t>(
                 m_cfg.batch, m_cfg.per_peer_inflight - tally.inflight);
 
@@ -971,6 +1059,13 @@ public:
                 auto [height, avoid] = m_retry.front();
                 if (avoid == peer && peers.size() > 1)
                     break;   // let another peer's slot take this one
+                // CanServeBlocks: if some eligible peer covers this height,
+                // don't hand it to one that cannot (steer it to an archival
+                // deliverer); if NONE can, fall through so the head-of-line
+                // height never freezes (liveness — same intent as the demote
+                // bypass and the historical-body-scarcity fallback in #1254).
+                if (!serves(peer, height) && any_serves(height))
+                    break;
                 m_retry.pop_front();
                 auto h = hash_at(height);
                 if (!h) continue;   // index shrank (should not happen) — drop
@@ -981,12 +1076,19 @@ public:
                 --capacity;
             }
 
-            // Then a fresh CONTIGUOUS range for this peer.
-            while (capacity > 0 && m_next <= m_target_end &&
+            // Then a fresh CONTIGUOUS range for this peer (unless it is demoted
+            // and healthy peers remain — dashd BLOCK_STALLING_TIMEOUT parity).
+            // The range starts at m_next; a peer whose announced history does
+            // not cover m_next takes no fresh work (its slot stays free for a
+            // range it can serve, or for retries), and the contiguous run stops
+            // at the first height the peer cannot serve.
+            while (fresh_ok && capacity > 0 && m_next <= m_target_end &&
                    static_cast<uint64_t>(m_next) <= budget_total &&
                    (static_cast<uint64_t>(m_inflight.size()) + buffered) <
                        m_cfg.window)
             {
+                if (!serves(peer, m_next) && any_serves(m_next))
+                    break;   // this peer lacks m_next's history — leave it
                 auto h = hash_at(m_next);
                 if (!h) break;   // header index ends here for now
                 m_inflight[*h] = Req{m_next, peer, now, 0};
@@ -1040,6 +1142,19 @@ public:
         // derivation). Null (KATs, any embedding without the fold) ⇒ this lane
         // behaves BYTE-IDENTICALLY to before this seam existed.
         std::function<bool()> defer_to_higher_priority;
+        // OPTIONAL. dashd FindNextBlocksToDownload/CanServeBlocks per-(peer,
+        // height) coverage — main_dash wires it to the coin-P2P service map
+        // (CanServeBlocks + start_height covers the height). Forwarded straight
+        // into BulkBlockScheduler::pump so a deep-history range is assigned only
+        // to a peer that advertises it holds that history. Null (KATs / any
+        // embedding without the map) ⇒ every peer serves every height, exactly
+        // as before this seam existed.
+        std::function<bool(const std::string&, uint32_t)> peer_can_serve;
+        // OPTIONAL. Monotonic wall-second clock. Present ⇒ a delivered body
+        // event-drives an immediate refill pump (removing the ~1/s core::Timer
+        // pump ceiling that capped healthy bands); null ⇒ pumping stays on the
+        // tick() cadence only (byte-identical to before this seam existed).
+        std::function<int64_t()> now_sec;
     };
 
     struct Config
@@ -1165,7 +1280,8 @@ private:
             peers << " " << key << "=" << t.blocks << "blk/"
                   << (t.bytes / (1024 * 1024)) << "MB"
                   << (t.inflight ? ("(+" + std::to_string(t.inflight) + ")")
-                                 : "");
+                                 : "")
+                  << (t.demoted_until > now ? "!D" : "");
         }
         LOG_INFO << "[BULK] delivered=" << m_delivered << "/"
                  << m_sched.target_end()
@@ -1175,6 +1291,7 @@ private:
                  << " inflight=" << m_sched.inflight_count()
                  << " buffer=" << m_buffer.size()
                  << " retry=" << m_sched.retry_count()
+                 << " demoted=" << m_sched.demoted_count(now)
                  << " hdr="
                  << (m_backfill
                          ? (m_backfill->complete()
@@ -1215,6 +1332,32 @@ private:
         LOG_INFO << "[BULK] resume cursor VERIFIED at height "
                  << m_resume->height << " — resuming fetch from "
                  << (m_resume->height + 1);
+    }
+
+    /// Plan and issue bulk getdata under the strict-priority guards. Shared by
+    /// the 1 s tick() and by the event-driven refill in on_block_body(): the
+    /// guards (cursor verified, tip lane idle, no higher-priority consumer) are
+    /// identical in both paths, so a body-triggered refill can never overtake a
+    /// tracked tip body or the MN-checkpoint fold. Assumes the fetch ceiling
+    /// (set_target_end) is current — tick() refreshes it once per second.
+    void issue_bulk_pump(int64_t now)
+    {
+        if (m_failed || !m_cursor_checked) return;
+        if (m_seams.tip_busy && m_seams.tip_busy()) return;
+        if (m_seams.defer_to_higher_priority &&
+            m_seams.defer_to_higher_priority()) return;
+        const auto peers = m_seams.eligible_peers();
+        if (peers.empty()) return;
+        auto assignments = m_sched.pump(
+            now, peers, m_seams.hash_at, m_buffer.size(),
+            m_seams.peer_can_serve);
+        for (const auto& a : assignments)
+        {
+            std::vector<uint256> hashes;
+            hashes.reserve(a.blocks.size());
+            for (const auto& [h, hash] : a.blocks) hashes.push_back(hash);
+            m_seams.send_getdata(a.peer, hashes);
+        }
     }
 
 public:
@@ -1322,6 +1465,15 @@ public:
             return true;   // duplicate (double-answered re-request) — pruned
         m_buffer[*height] = block;
         drain_buffer();
+        // EVENT-DRIVEN REFILL: the serving peer just freed a slot. Hand it (and
+        // any other peer with capacity) fresh work NOW instead of waiting up to
+        // one full core::Timer tick — the ~1/s tick cadence is what capped the
+        // healthy bands (issue rate ≈ batch × peers per second). Guarded on the
+        // clock seam: null ⇒ pumping stays tick-only, byte-identical to before.
+        // issue_bulk_pump re-applies the strict-priority guards, so this can
+        // never overtake a tracked tip body or the MN-checkpoint fold.
+        if (m_seams.now_sec)
+            issue_bulk_pump(m_seams.now_sec());
         return true;
     }
 
@@ -1349,22 +1501,10 @@ public:
                                    ? tip - m_cfg.tip_exclusion : 0);
 
         // STRICT PRIORITY: no new bulk requests while a tracked tip body is
-        // outstanding (invariant 2). In-flight bulk completes on its own.
-        if (!peers.empty() && m_cursor_checked &&
-            !(m_seams.tip_busy && m_seams.tip_busy()) &&
-            !(m_seams.defer_to_higher_priority &&
-              m_seams.defer_to_higher_priority()))
-        {
-            auto assignments = m_sched.pump(
-                now, peers, m_seams.hash_at, m_buffer.size());
-            for (const auto& a : assignments)
-            {
-                std::vector<uint256> hashes;
-                hashes.reserve(a.blocks.size());
-                for (const auto& [h, hash] : a.blocks) hashes.push_back(hash);
-                m_seams.send_getdata(a.peer, hashes);
-            }
-        }
+        // outstanding (invariant 2). In-flight bulk completes on its own. The
+        // guards live in issue_bulk_pump so the event-driven refill honours the
+        // exact same priority.
+        issue_bulk_pump(now);
         maybe_log_telemetry(now);
     }
 

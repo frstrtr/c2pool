@@ -7547,13 +7547,31 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // Priority invariant 1: the PRIMARY carries every stateful
             // request/response leg — bulk loads it only when it is the sole
             // handshaked peer.
+            // Priority invariant 1 + dashd CanServeBlocks (#1254): the bulk
+            // lane's peer universe is the handshaked pool FILTERED to archival
+            // deliverers (advertises full-block service, not stall-demoted),
+            // primary excluded unless it is the sole survivor. A non-serving
+            // peer silently drops deep-history getdata (the full run measured
+            // notfound=0, timeout=45%); this is the proactive half of dashd's
+            // block-download peer policy, the scheduler's reactive stall-demote
+            // is the other half. Liveness fallback lives inside the helper.
             seams.eligible_peers = [cp = coin_p2p.get()] {
-                auto keys = cp->handshaked_peer_keys();
-                const auto prim = cp->primary_peer_key();
-                if (keys.size() > 1 && !prim.empty())
-                    keys.erase(std::remove(keys.begin(), keys.end(), prim),
-                               keys.end());
-                return keys;
+                return cp->eligible_bulk_peer_keys();
+            };
+            // dashd FindNextBlocksToDownload per-(peer,height) coverage: a
+            // contiguous range is assigned to a peer only if it can serve
+            // blocks AND its announced start_height covers the height.
+            seams.peer_can_serve = [cp = coin_p2p.get()](
+                const std::string& peer, uint32_t height) {
+                return cp->bulk_peer_can_serve(peer, height);
+            };
+            // Monotonic clock for the event-driven refill (same steady_clock
+            // seconds the 1 s tick uses — keeps the stall-demote timebase
+            // consistent across tick and body-triggered pumps).
+            seams.now_sec = [] {
+                return std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                    .count();
             };
             seams.send_getdata = [cp = coin_p2p.get()](
                 const std::string& peer, const std::vector<uint256>& hashes) {
