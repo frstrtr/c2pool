@@ -6445,6 +6445,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         uint32_t last_send_h{0};
                         uint256  cycle_base_hash;
                         std::vector<std::pair<uint32_t, dash::coin::BlockType>> hold;
+                        // Pre-anchor header backfill (cold fast-start): leg (b)
+                        // of the getqrinfo snapshot auth needs the FULL headers
+                        // of the three rotated work blocks, all BELOW the anchor
+                        // and absent from the lone-anchor cold chain. One-shot
+                        // backward getheaders installs the span DOWN from the
+                        // trusted anchor before the seed can authenticate.
+                        bool     backfill_sent{false};
+                        uint256  anchor_hash;      // trusted downward-link root
+                        uint32_t anchor_height{0};
                     };
                     auto sseed = std::make_shared<StoreStraddleSeed>();
                     {
@@ -6464,6 +6473,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             // correct for both and costs at most a few dozen buffered
                             // blocks in the rare case the reply is slow.
                             sseed->first_need_h = sseed->cycle_base;
+                            sseed->anchor_hash  = ckpt.blockhash;
+                            sseed->anchor_height= anchor_h;
                             sseed->armed        = true;
                             break;   // one rotated type on mainnet (type 5)
                         }
@@ -6478,6 +6489,42 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                      << " (its H-C/2C/3C predecessors are all below"
                                         " the anchor; the store engine cannot"
                                         " self-derive them).";
+                    }
+
+                    // ── PRE-ANCHOR HEADER BACKFILL INSTALLER ─────────────────
+                    // The one-shot backward getheaders issued by the qrinfo
+                    // consumer below (when the work-block headers leg (b) needs
+                    // are absent at cold fast-start) returns a `headers` batch
+                    // spanning [h-4C .. anchor]. It arrives on the new_headers
+                    // event, where the forward add_headers path orphan-rejects
+                    // every pre-anchor header (parent not held). This installer
+                    // instead links them DOWN from the trusted anchor via
+                    // HeaderChain::install_preanchor_span (X11 prev-hash chain +
+                    // PoW, reward-safe), then re-drives getqrinfo so leg (b)
+                    // authenticates promptly. Self-guarding: it no-ops unless the
+                    // backfill was issued and not yet landed, and a batch that
+                    // does not reach the anchor installs nothing.
+                    if (sseed->armed) {
+                        coin_feed_subs.push_back(
+                            coin_state.new_headers.subscribe(
+                                [sseed, hc = header_chain.get(),
+                                 cp = coin_p2p.get()](
+                                    const std::vector<dash::coin::BlockHeaderType>&
+                                        batch) {
+                                    if (!sseed->armed || sseed->landed) return;
+                                    if (!sseed->backfill_sent) return;
+                                    if (batch.empty()) return;
+                                    const size_t n = hc->install_preanchor_span(
+                                        sseed->anchor_hash, batch);
+                                    if (n == 0) return;
+                                    // Re-drive getqrinfo now that the pre-anchor
+                                    // work-block headers are held → leg (b)
+                                    // authenticates on the next reply.
+                                    if (cp && !sseed->cycle_base_hash.IsNull())
+                                        cp->send_getqrinfo(
+                                            {}, sseed->cycle_base_hash,
+                                            /*extra=*/true);
+                                }));
                     }
 
                     // The shared per-block fold drive. Both the live feed and the
@@ -6520,6 +6567,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             [sseed, feed,
                              qbr = mn_bridge_quorum_bridge.get(),
                              hc  = header_chain.get(),
+                             cp  = coin_p2p.get(),
                              anchor_h = ckpt.height, net = net_name](
                                 const dash::coin::vendor::CQuorumRotationInfo& info) {
                                 if (!sseed->armed || sseed->landed) return;
@@ -6533,6 +6581,69 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                     || hcb.nHeight < 0) return;
                                 if (static_cast<uint32_t>(hcb.nHeight)
                                     != sseed->cycle_base - 8u) return;   // not ours
+
+                                // ── PRE-ANCHOR HEADER BACKFILL GATE ──────────
+                                // leg (b) below needs the FULL headers of the
+                                // three rotated work blocks (h-C/2C/3C), all
+                                // BELOW the fast-start anchor. At cold start the
+                                // header chain holds only the anchor, so the auth
+                                // fails closed 'block header not held'. Fetch the
+                                // pre-anchor span (once) and install it DOWN from
+                                // the trusted anchor BEFORE authenticating.
+                                {
+                                    const uint256 wh_c  =
+                                        info.mnListDiffAtHMinusC.blockHash;
+                                    const uint256 wh_2c =
+                                        info.mnListDiffAtHMinus2C.blockHash;
+                                    const uint256 wh_3c =
+                                        info.mnListDiffAtHMinus3C.blockHash;
+                                    if (!hc->has_header(wh_c)
+                                        || !hc->has_header(wh_2c)
+                                        || !hc->has_header(wh_3c)) {
+                                        // getheaders replies START at locator+1,
+                                        // so to INCLUDE the deepest work block
+                                        // (h-3C) the locator is seeded one rotated
+                                        // cycle DEEPER — the h-4C block from the
+                                        // extraShare leg. That hash is used ONLY
+                                        // as a locator; it is never trusted (a bad
+                                        // one yields no downward linkage from the
+                                        // anchor → zero installs → fail closed).
+                                        if (!sseed->backfill_sent && cp
+                                            && info.extraShare
+                                            && info.mnListDiffAtHMinus4C) {
+                                            const uint256 loc =
+                                                info.mnListDiffAtHMinus4C->blockHash;
+                                            const std::string peer =
+                                                cp->primary_peer_key();
+                                            if (!peer.empty()
+                                                && cp->send_getheaders_to(
+                                                       peer, 70230, {loc},
+                                                       sseed->anchor_hash)) {
+                                                sseed->backfill_sent = true;
+                                                LOG_INFO << "[MN-DIFF-DB] pre-anchor"
+                                                    " header BACKFILL issued:"
+                                                    " getheaders locator=h-4C "
+                                                    << loc.GetHex().substr(0, 16)
+                                                    << " stop=anchor "
+                                                    << sseed->anchor_hash.GetHex()
+                                                           .substr(0, 16)
+                                                    << " — installs the h-C/2C/3C"
+                                                       " work-block headers leg (b)"
+                                                       " needs; getqrinfo retries"
+                                                       " once the span lands.";
+                                            }
+                                        } else if (!info.extraShare
+                                                   || !info.mnListDiffAtHMinus4C) {
+                                            LOG_WARNING << "[MN-DIFF-DB] getqrinfo"
+                                                " reply lacks the h-4C extraShare"
+                                                " leg — cannot seed a locator below"
+                                                " the deepest work block; rotated"
+                                                " bootstrap fails closed"
+                                                " (reward-safe), retry.";
+                                        }
+                                        return;   // headers absent → fail closed
+                                    }
+                                }
                                 dash::coin::MerkleRootOfHashFn mroot =
                                     [hc](const uint256& b)
                                         -> std::optional<uint256> {
@@ -6659,8 +6770,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                 if (auto he = hc->get_header_by_height(
                                         sseed->cycle_base)) {
                                     sseed->cycle_base_hash = he->hash;
+                                    // extra=true: the reply must carry the h-4C
+                                    // leg, whose blockHash seeds a getheaders
+                                    // locator BELOW the deepest work block so the
+                                    // pre-anchor backfill span includes h-3C.
                                     if (cp) cp->send_getqrinfo(
-                                        {}, he->hash, /*extra=*/false);
+                                        {}, he->hash, /*extra=*/true);
                                     sseed->sent        = true;
                                     sseed->last_send_h = h;
                                     LOG_INFO << "[MN-DIFF-DB] getqrinfo issued for"
@@ -6690,7 +6805,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                         if (auto he = hc->get_header_by_height(
                                                 sseed->cycle_base)) {
                                             if (cp) cp->send_getqrinfo(
-                                                {}, he->hash, false);
+                                                {}, he->hash, /*extra=*/true);
                                             sseed->last_send_h = h;
                                         }
                                     }

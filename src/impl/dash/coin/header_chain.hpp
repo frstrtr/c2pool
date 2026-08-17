@@ -563,6 +563,110 @@ public:
         return accepted;
     }
 
+    // Feature macro: the cold-start pre-anchor header backfill primitive
+    // below exists. Guards the KAT so it still compiles on a pre-fix tree.
+#ifndef C2POOL_PREANCHOR_SPAN_BACKFILL
+#define C2POOL_PREANCHOR_SPAN_BACKFILL 1
+#endif
+    /// Install a PRE-ANCHOR header span that links DOWNWARD from a trusted,
+    /// already-held block (the fast-start anchor). The forward add_header path
+    /// cannot do this: a pre-anchor header's parent is not held, so it
+    /// orphan-rejects (add_header_internal :660-661). At cold fast-start the
+    /// chain holds a LONE anchor and none of the work-block headers BELOW it
+    /// that the DIP-4 historical-snapshot auth (leg (b), historical_sml.hpp)
+    /// must consult — so getqrinfo rotated-quarter snapshots fail closed with
+    /// "block header not held". This walks DOWN from `anchor_hash` (which MUST
+    /// be held) through the supplied getheaders batch, authenticating each
+    /// parent by (1) X11(header) == the prev-hash its already-trusted child
+    /// commits to, and (2) check_pow against pow_limit — exactly the two legs
+    /// dashd requires of any header it stores. Headers that do not chain
+    /// downward from the trusted anchor are IGNORED (fail closed). Does NOT
+    /// move the tip / best-work: pre-anchor headers never compete for the tip,
+    /// and the synthetic-anchor daemon-tip honesty guards stay intact.
+    ///
+    /// REWARD-SAFETY: every installed header is bound to the release-pinned
+    /// anchor by an unbroken X11 prev-hash chain AND is independently
+    /// PoW-verified, so a wrong/forged header can never enter the view leg (b)
+    /// consults. A lying peer that returns garbage produces no linkage → zero
+    /// installs → leg (b) still fails closed.
+    ///
+    /// Returns the number of headers newly installed.
+    size_t install_preanchor_span(const uint256& anchor_hash,
+                                  const std::vector<BlockHeaderType>& batch)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        // The anchor is the trust root of the downward walk; it must be held.
+        auto anchor_it = m_headers.find(anchor_hash);
+        if (anchor_it == m_headers.end()) return 0;
+        const uint32_t anchor_height = anchor_it->second.height;
+
+        // Index the batch by X11 identity so prev-hash pointers can be
+        // followed. A header's presence here means it hashes to a specific
+        // block id; whether that id is TRUSTED is decided only by the walk.
+        std::map<uint256, const BlockHeaderType*> by_hash;
+        for (const auto& h : batch)
+            by_hash[x11_hash(h)] = &h;
+
+        // Bootstrap: the stored anchor entry keeps a SYNTHETIC prev (ZERO) so
+        // it never masquerades as a daemon tip, so read the anchor's REAL
+        // previous-block hash from the batch's own copy of the anchor header
+        // (getheaders with hash_stop=anchor returns it as the terminal entry).
+        // That copy is trusted the instant X11(copy) == the release-pinned
+        // anchor hash — which is exactly its key in by_hash.
+        auto anchor_hdr = by_hash.find(anchor_hash);
+        if (anchor_hdr == by_hash.end()) return 0;   // span never reached the anchor
+
+        uint32_t child_height = anchor_height;
+        uint256  parent_hash  = anchor_hdr->second->m_previous_block;
+
+        size_t installed = 0;
+        while (!parent_hash.IsNull() && child_height > 0) {
+            auto pit = by_hash.find(parent_hash);
+            if (pit == by_hash.end()) break;   // bottom of the supplied span
+            const BlockHeaderType& ph = *pit->second;
+            const uint32_t parent_height = child_height - 1;
+            // (1) X11 identity: pit was keyed by X11==parent_hash, and
+            //     parent_hash is the value the trusted child commits to — the
+            //     link is cryptographic. (2) PoW must be real.
+            if (!check_pow(parent_hash, ph.m_bits, m_params.pow_limit)) {
+                LOG_WARNING << "[EMB-DASH] pre-anchor backfill PoW FAIL at h="
+                            << parent_height << " hash="
+                            << parent_hash.GetHex().substr(0, 24)
+                            << " — stop (fail closed)";
+                break;
+            }
+            if (!m_headers.count(parent_hash)) {
+                IndexEntry e;
+                e.header     = ph;
+                e.hash       = parent_hash;
+                e.height     = parent_height;
+                // Pre-anchor cumulative work is unknown (genesis..anchor not
+                // held) and never consulted: these entries never enter tip
+                // selection. Zero keeps them strictly below m_best_work.
+                e.chain_work = uint256::ZERO;
+                e.prev_hash  = ph.m_previous_block;
+                e.status     = HEADER_VALID_CHAIN;
+                m_headers[parent_hash] = e;
+                // Bonus: back-fill the height index so get_header_by_height
+                // resolves pre-anchor heights too (harmless — forward entries
+                // at >= anchor are untouched; a later reorg rebuild walks from
+                // the synthetic anchor and simply drops these again, which
+                // leg (b)'s by-HASH lookup does not depend on).
+                m_height_index[parent_height] = parent_hash;
+                persist_header(e);
+                ++installed;
+            }
+            child_height = parent_height;
+            parent_hash  = ph.m_previous_block;
+        }
+        if (installed)
+            LOG_INFO << "[EMB-DASH] pre-anchor backfill INSTALLED " << installed
+                     << " header(s) down to h=" << child_height
+                     << " (X11-linked + PoW-verified from trusted anchor h="
+                     << anchor_height << "); DIP-4 leg (b) can now consult them.";
+        return installed;
+    }
+
     std::vector<uint256> get_locator() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return get_locator_internal();
