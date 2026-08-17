@@ -3536,6 +3536,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // queue gap-repair seam. Constructed only alongside the fold engine.
     std::unique_ptr<dash::coin::replay::MnDiffStore>           mn_diff_store;
     std::unique_ptr<dash::coin::replay::MnDiffWriter>          mn_diff_writer;
+    // DASHD-CUT ARM: the PARALLEL DML fold engine that feeds the diff store on
+    // the COLD MN-CKPT bridge path (no --replay-bulk / --replay-fold-prestate).
+    // The cold bridge folds an MnStateMachine (payee projection); this engine
+    // folds the full ReplayMNState alongside it so the store writer has the
+    // root+payee-checked per-block commit it needs. Seeded at the same anchor
+    // the bridge stands on; sinks MnDiffWriter::on_folded off ITS OWN commit.
+    std::unique_ptr<dash::coin::replay::DmlFoldEngine>         mn_bridge_fold_engine;
     // PR-2 FORWARD: dashd's mined-commitment store, fed from the same replayed
     // bodies. shared_ptr because the qc-plan lambda (installed far above, on
     // the serve path) captures it by value and must see it appear later — it
@@ -6250,6 +6257,197 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     mnl->pump();
                 };
             maintainer->set_on_mn_reseed(mn_reseed_fallback);
+
+            // ── DASHD-CUT ARM: the MN DIFF/SNAPSHOT STORE on the COLD bridge ──
+            // The store block below (dashd evodb dmn_D4/dmn_S3 port) was DORMANT
+            // on the daemonless cold flags: its only construction site was gated
+            // under --replay-bulk → --replay-fold-prestate. LIFT it onto the
+            // cold MN-CKPT bridge arm so the ban-state probe / on-demand fold can
+            // repair from a 0-RTT root+payee-verified store instead of a capped
+            // network round trip (see begin_revive_probe / the payee-desync
+            // store re-apply in mn_checkpoint_lane.hpp).
+            //
+            // The cold bridge folds an MnStateMachine (payee projection); the
+            // store WRITER is bound to a DmlFoldEngine (full ReplayMNState). So
+            // we stand up a PARALLEL DmlFoldEngine seeded at the SAME anchor the
+            // bridge stands on, feed it every block the bridge folds CLEANLY
+            // (set_on_block_applied), and sink MnDiffWriter::on_folded off THAT
+            // engine's own root-checked commit.
+            //
+            // REWARD-SAFETY IS BY CONSTRUCTION and does NOT depend on the seed
+            // being complete: MnDiffStore::reconstruct() REFUSES any row that
+            // does not re-hash to the block's committed merkleRootMNList
+            // (mn_diff_store.hpp:849-857). The trusted-anchor checkpoint carries
+            // the DIP-3 PAYEE fields but NOT the SML fields the root commits
+            // (confirmedHash, netInfo) — so the parallel engine cannot reproduce
+            // the anchor+1 root and POISONS at the first fold. A poisoned engine
+            // writes no diffs, the store holds only the anchor, every height
+            // above it REPAIR-REFUSES, and the SOURCE callers fall through to
+            // their unchanged network path: today's behaviour EXACTLY, never a
+            // wrong row, never a bad mint. The wiring is in place so that the
+            // day a FULL-STATE (v3) anchor is pinned, the store serves the cold
+            // bridge with zero further change. Until then it is an accelerator
+            // that is present and inert, precisely as an accelerator should be.
+            if (mn_ckpt_lane && header_chain && ckpt.ok
+                && !mn_diff_store) {
+                namespace rp = dash::coin::replay;
+                mn_diff_store = std::make_unique<rp::MnDiffStore>(
+                    (core::filesystem::config_path() / net_subdir
+                        / "dash_mn_diff_db").string());
+                if (!mn_diff_store->open()) {
+                    LOG_WARNING << "[MN-DIFF-DB] cold-bridge open failed — diff"
+                                   " store DISABLED (gap repair unavailable;"
+                                   " probe/fold caps unchanged)";
+                    mn_diff_store.reset();
+                } else {
+                    auto diff_hlookup =
+                        [hc = header_chain.get()](const uint256& h)
+                            -> std::optional<std::pair<uint32_t, uint256>> {
+                        if (!hc) return std::nullopt;
+                        auto e = hc->get_header(h);
+                        if (!e) return std::nullopt;
+                        return std::make_pair(e->height, e->prev_hash);
+                    };
+                    std::string vnote;
+                    mn_diff_store->startup_verify(diff_hlookup, vnote);
+                    if (!vnote.empty())
+                        LOG_INFO << "[MN-DIFF-DB] cold-bridge startup verify: "
+                                 << vnote;
+
+                    // PARALLEL engine seeded at the bridge anchor. The checkpoint
+                    // MNState carries the payee facets; the SML-root facets it
+                    // omits are left at their ReplayMNState defaults (the engine
+                    // then self-checks and poisons at anchor+1 unless a genuine
+                    // full-state anchor was supplied — see the safety note above).
+                    dash::coin::replay::FoldConfig fcfg;
+                    fcfg.enabled = true;
+                    mn_bridge_fold_engine =
+                        std::make_unique<rp::DmlFoldEngine>(fcfg);
+                    std::vector<std::pair<uint256, rp::ReplayMNState>> seed;
+                    seed.reserve(ckpt.entries.size());
+                    uint64_t trc = 0;
+                    for (const auto& [protx, mn] : ckpt.entries) {
+                        rp::ReplayMNState st;
+                        st.nType             = mn.nType;
+                        st.internalId        = trc++;   // ordering only; not root
+                        st.collateralOutpoint = mn.collateralOutpoint;
+                        st.nOperatorReward   = mn.nOperatorReward;
+                        st.nVersion          = mn.nVersion;
+                        st.nRegisteredHeight  = static_cast<int32_t>(mn.nRegisteredHeight);
+                        st.nLastPaidHeight    = static_cast<int32_t>(mn.nLastPaidHeight);
+                        st.nConsecutivePayments = static_cast<int32_t>(mn.nConsecutivePayments);
+                        st.nPoSeRevivedHeight = mn.nPoSeRevivedHeight == 0
+                            ? rp::ReplayMNState::NEVER
+                            : static_cast<int32_t>(mn.nPoSeRevivedHeight);
+                        st.nPoSeBanHeight     = mn.nPoSeBanHeight == 0
+                            ? rp::ReplayMNState::NEVER
+                            : static_cast<int32_t>(mn.nPoSeBanHeight);
+                        st.nRevocationReason = mn.nRevocationReason;
+                        st.keyIDOwner        = mn.keyIDOwner;
+                        st.pubKeyOperator    = mn.pubKeyOperator;
+                        st.keyIDVoting       = mn.keyIDVoting;
+                        st.netInfo           = mn.netInfo;
+                        st.scriptPayout      = mn.scriptPayout;
+                        st.scriptOperatorPayout = mn.scriptOperatorPayout;
+                        st.platformNodeID    = mn.platformNodeID;
+                        st.platformP2PPort   = mn.platformP2PPort;
+                        st.platformHTTPPort  = mn.platformHTTPPort;
+                        seed.emplace_back(protx, std::move(st));
+                    }
+                    mn_bridge_fold_engine->seed(std::move(seed), trc,
+                                                ckpt.height, ckpt.blockhash,
+                                                net_name);
+                    mn_diff_writer = std::make_unique<rp::MnDiffWriter>(
+                        *mn_diff_store, *mn_bridge_fold_engine);
+                    mn_diff_writer->arm();
+
+                    // THE WRITE FEED: every block the bridge folds CLEANLY is
+                    // handed to the parallel engine; only its OWN root-checked
+                    // commit sinks the writer. A once-latched poison log names
+                    // the reality when a partial anchor cannot reproduce roots.
+                    mn_ckpt_lane->set_on_block_applied(
+                        [eng = mn_bridge_fold_engine.get(),
+                         w   = mn_diff_writer.get(),
+                         logged = std::make_shared<bool>(false)](
+                            const dash::coin::BlockType& blk, uint32_t h) {
+                            if (eng->poisoned()) return;
+                            const uint256 bh =
+                                rp::DmlFoldEngine::block_header_hash(blk);
+                            const auto fr = eng->fold_block(blk, h);
+                            if (fr.ok) {
+                                w->on_folded(h, bh, blk, fr);
+                                return;
+                            }
+                            if (!*logged) {
+                                *logged = true;
+                                LOG_WARNING
+                                    << "[MN-DIFF-DB] cold-bridge parallel fold"
+                                       " could not extend the store at h=" << h
+                                    << " (" << fr.error << "). The store keeps"
+                                       " only its anchor row; every height above"
+                                       " REPAIR-REFUSES and the probe/on-demand"
+                                       " paths fall through to the network"
+                                       " unchanged. This is the expected,"
+                                       " reward-safe state when the anchor is a"
+                                       " payee-only checkpoint (no committed-root"
+                                       " SML fields) rather than a full-state"
+                                       " snapshot.";
+                            }
+                        });
+
+                    // THE READ SEAM: the 0-RTT gap-repair the SOURCE callers
+                    // use, reconstructed from the store and cross-checked at
+                    // every hop against OUR PoW-validated header chain.
+                    dash::coin::MnGapRepairFn repair_fn =
+                        [store = mn_diff_store.get(),
+                         hc = header_chain.get()](uint32_t want)
+                            -> dash::coin::MnGapRepairResult {
+                        dash::coin::MnGapRepairResult out;
+                        out.as_of = want;
+                        if (store == nullptr || hc == nullptr) {
+                            out.error = "diff store / header chain absent";
+                            return out;
+                        }
+                        auto e = hc->get_header_by_height(want);
+                        if (!e) {
+                            out.error = "h=" + std::to_string(want)
+                                      + " is not on our PoW-validated header"
+                                        " chain";
+                            return out;
+                        }
+                        auto hlookup = [hc](const uint256& h)
+                            -> std::optional<std::pair<uint32_t, uint256>> {
+                            auto ie = hc->get_header(h);
+                            if (!ie) return std::nullopt;
+                            return std::make_pair(ie->height, ie->prev_hash);
+                        };
+                        rp::DmlFoldEngine::Entries list;
+                        uint64_t trc2 = 0;
+                        std::string err;
+                        if (!store->reconstruct(e->hash, hlookup, list, trc2,
+                                                err)) {
+                            out.error = err;
+                            return out;
+                        }
+                        out.entries.reserve(list.size());
+                        for (const auto& [protx, st] : list)
+                            out.entries.emplace_back(protx,
+                                                     rp::to_payee_state(st));
+                        out.ok = true;
+                        return out;
+                    };
+                    mn_ckpt_lane->set_gap_repair(repair_fn);
+
+                    std::cout << "[run] MN DIFF STORE ARMED (cold bridge): the"
+                                 " MN-CKPT bridge's clean folds feed a parallel"
+                                 " root-checked DML engine; the ban-state probe"
+                                 " and on-demand fold repair from it 0-RTT when"
+                                 " it covers the height, else fall through to"
+                                 " the network unchanged (reward-safe: a row"
+                                 " that does not re-hash to the committed"
+                                 " merkleRootMNList is REFUSED)\n";
+                }
+            }
 
             // Kick the lane once now in case the header chain is already past
             // the anchor from a previous run's persisted header DB.
