@@ -354,6 +354,71 @@ TEST(DashMempool, SortedSelectionHighestFeerateFirst)
 //
 // This KAT pins that: identical equal-feerate sets added in OPPOSITE
 // orders must yield the SAME selection, ordered by txid ascending.
+// dashcore CTxMemPool::CompareIteratorByHash orders txiters by
+// uint256::operator< == base_blob::Compare == memcmp over the RAW hash bytes.
+// Those raw (wire/internal) bytes are the REVERSE of the human-readable
+// (block-explorer) txid hex, so we build the oracle order INDEPENDENTLY of the
+// production helper: reverse GetHex() into wire byte order and compare
+// lexicographically (each pair is a hex byte, so string-order == byte-order).
+static std::string oracle_wire_key(const uint256& h)
+{
+    const std::string hex = h.GetHex();   // 64 chars, big-endian display
+    std::string wire;
+    wire.reserve(64);
+    for (int i = 31; i >= 0; --i) wire += hex.substr(2 * i, 2);
+    return wire;
+}
+static bool oracle_wire_less(const uint256& a, const uint256& b)
+{
+    return oracle_wire_key(a) < oracle_wire_key(b);
+}
+
+// RED-then-GREEN KAT for the tx-serving ORDERING residual (busy-mempool
+// tx-merkle divergence). Equal-feerate txs must be emitted in dashcore's
+// GetHash() memcmp order, NOT base_uint's arithmetic operator<. The two orders
+// differ for effectively all real txid sets; this KAT proves (a) the selection
+// matches the wire-hash oracle, and (b) that oracle DISAGREES with the
+// arithmetic order for these inputs -- so the test genuinely discriminates the
+// fix (the pre-fix arithmetic tie-break FAILS assertion (a)).
+TEST(DashMempool, EqualFeerateTieBreakMatchesDashdWireHashOrderNotArithmetic)
+{
+    UTXOViewCache utxo(nullptr);
+    constexpr int N = 8;
+    std::vector<MutableTransaction> txs;
+    for (int i = 0; i < N; ++i) {
+        uint256 prev = mint_hash(900 + i);
+        utxo.add_coin(Outpoint(prev, 0), Coin(100'000, {}, 1, false));
+        txs.push_back(make_spend(prev, 0, /*out=*/95'000, /*salt=*/700 + i)); // fee 5000
+    }
+
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    for (auto& t : txs) ASSERT_TRUE(mp.add_tx(t));
+
+    auto [selected, total_fees] = mp.get_sorted_txs_with_fees(/*max_bytes=*/1u << 20);
+    ASSERT_EQ(selected.size(), static_cast<size_t>(N));
+
+    std::vector<uint256> got;
+    for (auto& s : selected) got.push_back(dash_txid(s.tx));
+
+    std::vector<uint256> expect_wire = got;
+    std::sort(expect_wire.begin(), expect_wire.end(), oracle_wire_less);
+
+    std::vector<uint256> arithmetic = got;
+    std::sort(arithmetic.begin(), arithmetic.end());   // base_uint::operator<
+
+    // (b) Discriminating guard: the two orders must DIFFER for these inputs,
+    //     otherwise this KAT could not distinguish the fix from the bug.
+    ASSERT_NE(expect_wire, arithmetic)
+        << "chosen txids do not separate wire-hash vs arithmetic order; "
+           "pick different salts so the KAT stays discriminating";
+
+    // (a) The emitted order must be dashcore's wire-hash (GetHash memcmp) order.
+    EXPECT_EQ(got, expect_wire)
+        << "equal-feerate emit order must match dashcore GetHash() memcmp, "
+           "not base_uint arithmetic operator< (the tx-merkle ordering residual)";
+}
+
 static std::vector<uint256> equal_feerate_selection(bool reverse_insertion)
 {
     UTXOViewCache utxo(nullptr);
@@ -393,11 +458,16 @@ TEST(DashMempool, EqualFeerateSelectionIsTxidAscendingAndInsertionOrderIndepende
     EXPECT_EQ(forward, reverse)
         << "equal-feerate tx order must be independent of mempool arrival order";
 
-    // And that stable order is txid ascending (dashcore GetHash() tiebreak).
+    // And that stable order matches dashcore's GetHash() tie-break, which is
+    // uint256::operator< == memcmp over the RAW (wire-serialized) hash bytes --
+    // the REVERSE of the human-readable txid hex. NOTE: base_uint::operator<
+    // (what a plain std::sort uses) is an ARITHMETIC limb comparison, a
+    // DIFFERENT order; asserting against that is exactly the bug this KAT now
+    // guards against.
     auto sorted = forward;
-    std::sort(sorted.begin(), sorted.end());
+    std::sort(sorted.begin(), sorted.end(), oracle_wire_less);
     EXPECT_EQ(forward, sorted)
-        << "equal-feerate ties must resolve to txid-ascending, oracle-conformant order";
+        << "equal-feerate ties must resolve to dashcore wire-hash (GetHash memcmp) order";
 }
 
 
@@ -434,17 +504,18 @@ TEST(DashMempool, FeerateCompareIsDivisionFreeCrossMultiplyNotPreDividedDouble)
         const double f1 = static_cast<double>(fa) * sb;
         const double f2 = static_cast<double>(fb) * sa;
         if (f1 != f2) return f1 > f2;   // higher feerate first
-        return ta < tb;                 // txid ascending
+        return oracle_wire_less(ta, tb); // dashd GetHash() memcmp tie-break
     };
 
-    // Two distinct txids; assign the SMALLER to A so a correct
-    // (cross-multiply => tie => txid-asc) key orders A before B, whereas
-    // the old pre-divide code would have put B first ("B higher feerate").
+    // Two distinct txids; assign the wire-hash-SMALLER (dashd GetHash order,
+    // NOT base_uint arithmetic) to A so a correct (cross-multiply => tie =>
+    // wire-hash-asc) key orders A before B, whereas the old pre-divide code
+    // would have put B first ("B higher feerate").
     const uint256 t0 = mint_hash(9001);
     const uint256 t1 = mint_hash(9002);
-    const uint256 ta = std::min(t0, t1);
-    const uint256 tb = std::max(t0, t1);
-    ASSERT_TRUE(ta < tb);
+    const uint256 ta = oracle_wire_less(t0, t1) ? t0 : t1;
+    const uint256 tb = oracle_wire_less(t0, t1) ? t1 : t0;
+    ASSERT_TRUE(oracle_wire_less(ta, tb));
 
     const uint64_t fa = 182912374030878ULL;
     const uint32_t sa = 3535u;
@@ -1370,10 +1441,12 @@ TEST(DashMempoolSelectionFidelity, K5_D3_WithinPackageEmitOrder)
     auto P  = make_spend_2out(coinP, 0, 499'900, 499'900, /*salt=*/1052); // fee 200
     auto ca = make_spend(dash_txid(P), 0, 499'800, /*salt=*/1053);        // fee 100
     auto cb = make_spend(dash_txid(P), 1, 499'800, /*salt=*/1054);        // fee 100
-    // Identify the low- and high-txid child.
+    // Identify the low- and high-txid child in dashd GetHash() (wire-hash)
+    // order — the order SortForBlock's CompareIteratorByHash tie-break uses,
+    // NOT base_uint arithmetic std::min/std::max.
     uint256 tca = dash_txid(ca), tcb = dash_txid(cb);
-    const uint256& lo = std::min(tca, tcb);
-    const uint256& hi = std::max(tca, tcb);
+    const uint256& lo = oracle_wire_less(tca, tcb) ? tca : tcb;
+    const uint256& hi = oracle_wire_less(tca, tcb) ? tcb : tca;
     // G spends HIGH-txid child as vin[0], LOW-txid child as vin[1] → DFS post-
     // order emits [P, hi, lo, G]; SortForBlock emits [P, lo, hi, G].
     auto G = make_spend_2in(hi, 0, lo, 0, /*out=*/899'700, /*salt=*/1055);  // fee 100'000
