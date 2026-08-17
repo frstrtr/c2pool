@@ -596,6 +596,162 @@ TEST(DashReplayQuorumEngine, KatC_OwnSnapshotFeedsTheNextCycleIdentically)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// KAT-D — the STORE-ENGINE straddle bootstrap: derive_members_for_cycle()
+// ASSEMBLES the rotated cycle's 32 ordered member sets from the SEEDED
+// quarters (getqrinfo straddle seed) and KEYS them by (llmqType,
+// cycle_base+quorumIndex), so fold_qfcommit's m_members_fn(type, quorumHash)
+// lookup resolves — the fix for the store capping at cycle_base +
+// mining_window_start. KAT-B proved compute_rotation_cycle's math is
+// dashd-exact; this proves the ENGINE WRAPPER that drives it from the seed
+// and the members_for KEYING the fold consumes.
+//
+//  RED (drop a seeded quarter, or revert the wiring): derive returns ok=false
+//      with a NAMED skip, members_for() is nullopt, the fold fails closed.
+//  GREEN: 32/32 sets registered, each == dashd's golden order (KAT-B
+//      goldens), resolvable through members_for by the per-index quorum base
+//      hash exactly as fold_qfcommit resolves a commitment quorumHash.
+//  REWARD-SAFE: a TAMPERED quarter still runs the math but the assembled set
+//      DIFFERS from dashd's — the divergence the writer's per-row
+//      merkleRootMNList self-check catches, so the store fails closed and
+//      callers fall through to the network path (never a bad mint).
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashReplayQuorumEngine, KatD_DeriveMembersForCycleAssemblesAndKeysStraddleCycle)
+{
+    QrinfoCycles q;
+    ASSERT_TRUE(q.load()) << "mainnet qrinfo must decode + authenticate";
+    auto kat = load_member_kat();
+    ASSERT_EQ(kat.size(), 32u);
+
+    // The cycle-H work block's own hash + CL — chain data the store OBSERVES
+    // forward before the hold; derive recomputes the H modifier from these
+    // (it does NOT read a seeded H modifier), so it must reproduce
+    // q.modifiers[0] for the members to match the goldens.
+    const uint32_t workH = kCycleBase - kWorkDiffDepth;
+    const uint256  workH_hash = q.info.mnListDiffH.blockHash;
+    std::optional<std::array<uint8_t, CFinalCommitment::BLS_SIG_SIZE>> workH_cl;
+    {
+        dash::coin::vendor::CCbTx cb;
+        ASSERT_TRUE(dash::coin::vendor::parse_cbtx(
+            q.info.mnListDiffH.cbTx.extra_payload, cb));
+        if (cb.nVersion >= dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE
+            && cb.has_best_cl_signature())
+            workH_cl = cb.bestCLSignature;
+    }
+
+    // Seed an engine to the same state the store-engine bridge holds when the
+    // getqrinfo straddle seed lands: the three previous-quarter snapshots +
+    // modifiers + work-lists, and the cycle-H work block chain fields.
+    auto seed_engine = [&](QuorumReplayEngine& eng, bool seed_hminusC) {
+        std::map<uint32_t, std::vector<QuorumMnEntry>> lists_by_h;
+        lists_by_h[kCycleBase - kWorkDiffDepth]              = q.lists[0];
+        lists_by_h[kCycleBase - 1u * kC - kWorkDiffDepth]    = q.lists[1];
+        lists_by_h[kCycleBase - 2u * kC - kWorkDiffDepth]    = q.lists[2];
+        lists_by_h[kCycleBase - 3u * kC - kWorkDiffDepth]    = q.lists[3];
+        eng.set_mn_list_at_fn(
+            [lists_by_h](uint32_t h)
+                -> std::optional<std::vector<QuorumMnEntry>> {
+                auto it = lists_by_h.find(h);
+                if (it == lists_by_h.end()) return std::nullopt;
+                return it->second;
+            });
+        eng.seed_block_hash(workH, workH_hash);
+        eng.seed_work_block_cl(workH, workH_cl);
+        for (size_t i = 1; i <= 3; ++i) {
+            if (i == 1 && !seed_hminusC) continue;   // RED: drop the H-C quarter
+            const uint32_t base = kCycleBase - static_cast<uint32_t>(i) * kC;
+            eng.seed_snapshot(kType6075, base, *q.snaps[i - 1]);
+            eng.seed_modifier(kType6075, base, q.modifiers[i]);
+        }
+    };
+
+    // Per-index quorum base hashes, so members_for() resolves the way
+    // fold_qfcommit does: quorumHash -> height (cycle_base+index) -> members.
+    auto seed_index_hashes = [&](QuorumReplayEngine& eng, char tag,
+                                 std::array<uint256, 32>& qhash) {
+        for (uint32_t idx = 0; idx < 32; ++idx) {
+            std::string h(64, '0');
+            h[0]  = tag;
+            h[58] = "0123456789abcdef"[(idx >> 8) & 0xf];
+            h[59] = "0123456789abcdef"[(idx >> 4) & 0xf];
+            h[60] = "0123456789abcdef"[idx & 0xf];
+            qhash[idx].SetHex(h);
+            eng.seed_block_hash(kCycleBase + idx, qhash[idx]);
+        }
+    };
+
+    // ── GREEN: assembled + keyed, dashd-exact, resolvable ─────────────────
+    {
+        QuorumReplayEngine eng(mainnet_cfg());
+        seed_engine(eng, /*seed_hminusC=*/true);
+        std::array<uint256, 32> qhash;
+        seed_index_hashes(eng, 'e', qhash);
+
+        auto dr = eng.derive_members_for_cycle(kType6075, kCycleBase);
+        ASSERT_TRUE(dr.ok) << dr.skip_reason;
+        EXPECT_EQ(dr.member_sets, 32u);
+        EXPECT_EQ(dr.expected_sets, 32u);
+        EXPECT_EQ(dr.quorum_size, 60u);
+
+        for (const auto& row : kat) {
+            ASSERT_LT(row.index, 32u);
+            auto m = eng.members_for(kType6075, qhash[row.index]);
+            ASSERT_TRUE(m.has_value())
+                << "quorumIndex " << row.index << " must resolve after derive";
+            auto got = protx_hex(*m);
+            ASSERT_EQ(got.size(), row.protx.size())
+                << "quorumIndex " << row.index;
+            for (size_t i = 0; i < got.size(); ++i)
+                EXPECT_EQ(got[i], row.protx[i])
+                    << "quorumIndex " << row.index << " member INDEX " << i
+                    << " diverges from dashd (this is the validMembers slot — "
+                       "consensus)";
+        }
+    }
+
+    // ── RED: a missing quarter → named skip, no member set, fail-closed ────
+    {
+        QuorumReplayEngine eng(mainnet_cfg());
+        seed_engine(eng, /*seed_hminusC=*/false);
+        uint256 qh0;
+        qh0.SetHex(
+            "0000000000000000000000000000000000000000000000000000000000000e00");
+        eng.seed_block_hash(kCycleBase, qh0);
+
+        auto dr = eng.derive_members_for_cycle(kType6075, kCycleBase);
+        EXPECT_FALSE(dr.ok);
+        EXPECT_LT(dr.member_sets, 32u);
+        EXPECT_FALSE(dr.skip_reason.empty()) << "the miss must be NAMED";
+        EXPECT_FALSE(eng.members_for(kType6075, qh0).has_value())
+            << "a missing quarter must leave the fold with NO member set "
+               "(fail-closed), never a guessed one";
+    }
+
+    // ── REWARD-SAFE: a tampered quarter assembles a DETECTABLY WRONG set ───
+    {
+        QuorumReplayEngine eng(mainnet_cfg());
+        seed_engine(eng, /*seed_hminusC=*/true);
+        CQuorumSnapshot bad = *q.snaps[0];   // H-C quarter
+        ASSERT_FALSE(bad.activeQuorumMembers.empty());
+        bad.activeQuorumMembers[0] = !bad.activeQuorumMembers[0];
+        eng.seed_snapshot(kType6075, kCycleBase - kC, bad);
+        std::array<uint256, 32> qhash;
+        seed_index_hashes(eng, 'f', qhash);
+
+        (void)eng.derive_members_for_cycle(kType6075, kCycleBase);
+        bool any_diff = false;
+        for (const auto& row : kat) {
+            auto m = eng.members_for(kType6075, qhash[row.index]);
+            if (!m) { any_diff = true; break; }
+            if (protx_hex(*m) != row.protx) { any_diff = true; break; }
+        }
+        EXPECT_TRUE(any_diff)
+            << "a tampered quarter must NOT reproduce dashd's members — that "
+               "divergence is exactly what the writer's per-row "
+               "merkleRootMNList self-check catches (reward-safe fail-closed)";
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Engine discipline (synthetic)
 // ═══════════════════════════════════════════════════════════════════════════
 

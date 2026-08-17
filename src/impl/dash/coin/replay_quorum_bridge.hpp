@@ -738,6 +738,25 @@ public:
         return std::nullopt;
     }
 
+    /// Drive the straddle-cycle member assembly the moment the getqrinfo
+    /// seed lands (store-engine bootstrap, main_dash.cpp). Pass-through to the
+    /// engine; folds the outcome into the report counters so a run states
+    /// whether the seeded cycle became derivable. See
+    /// QuorumReplayEngine::derive_members_for_cycle for the reward-safety
+    /// argument (a wrong set fails the writer's root self-check closed).
+    QuorumReplayEngine::DeriveCycleResult
+    derive_members_for_cycle(uint8_t llmq_type, uint32_t cycle_base)
+    {
+        auto r = m_quorum.derive_members_for_cycle(llmq_type, cycle_base);
+        if (r.ok) {
+            ++m_stats.member_cycles_derived;
+        } else {
+            ++m_stats.member_cycles_skipped;
+            if (!r.skip_reason.empty()) m_stats.last_skip_reason = r.skip_reason;
+        }
+        return r;
+    }
+
     size_t retained_lists() const { return m_lists.size(); }
 
     /// dashd CDeterministicMN → the member-computation view. Carries the
