@@ -838,7 +838,8 @@ if (BUILD_TESTING AND GTest_FOUND)
                    test_dash_replay_fold.cpp
                    test_dash_replay_run.cpp
                    test_dash_replay_quorum_seam.cpp
-                   test_dash_replay_payee_publish.cpp)
+                   test_dash_replay_payee_publish.cpp
+                   test_dash_replay_prestate_empty_dip3.cpp)
     target_link_libraries(test_dash_mn_state PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

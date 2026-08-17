@@ -31,6 +31,9 @@
 //   * every per-mn hash field is WIRE hex (raw internal bytes, memcpy'd).
 
 #include <impl/dash/coin/replay_fold_engine.hpp>
+#include <impl/dash/coin/replay_bulk_fetch.hpp>   // MAINNET_DIP3_HEIGHT — the
+                                                  // SAME constant --replay-bulk-start
+                                                  // defaults to (do NOT re-literal it)
 
 #include <cstdint>
 #include <cstring>
@@ -322,8 +325,31 @@ inline Prestate parse_prestate_text(const std::string& text)
         return fail("prestate declares count=" + std::to_string(declared)
                     + " but carries " + std::to_string(ps.entries.size())
                     + " mn records");
-    if (ps.entries.empty())
-        return fail("prestate carries no masternodes");
+    // ── SCOPED empty-set relaxation (reward-safe, DIP3-activation ONLY) ──────
+    //
+    // An empty entries set is CHAIN-TRUE at exactly one height: the DIP3
+    // activation height. DASH's deterministic masternode list is empty until
+    // the first ProRegTx at/after DIP3 enforcement, so the W1 fold must be
+    // seedable from an EMPTY set at h=MAINNET_DIP3_HEIGHT to derive the whole
+    // set FROM CHAIN (dashd BuildNewListFromBlock parity) instead of capturing
+    // it from dashd RPC. We reuse the SAME constant --replay-bulk-start
+    // defaults to (rp::MAINNET_DIP3_HEIGHT == 1028160); no fresh literal.
+    //
+    // At EVERY other height an empty set stays a HARD reject: there it can only
+    // mean a half-parsed / records-dropped seed, which would seed a replay that
+    // diverges SILENTLY (the very failure this loader exists to refuse).
+    //
+    // This relaxation is FAIL-CLOSED and can never mint: the empty seed is not
+    // trusted on faith. The fold's per-block merkleRootMNList self-check
+    // (replay_fold_engine.hpp poison() ~:815) HARD-STOPS at the first post-DIP3
+    // ProRegTx block if the empty-at-DIP3 seed (or its anchor hash/height) is
+    // wrong — a wrong seed folds to the wrong root and poisons the engine
+    // instead of serving wrong bytes. DIP-4 / root self-checks stay strict.
+    if (ps.entries.empty() && ps.height != MAINNET_DIP3_HEIGHT)
+        return fail("prestate carries no masternodes (an empty set is chain-true"
+                    " ONLY at the DIP3 activation height "
+                    + std::to_string(MAINNET_DIP3_HEIGHT) + ", not at h="
+                    + std::to_string(ps.height) + ")");
 
     ps.ok = true;
     return ps;
