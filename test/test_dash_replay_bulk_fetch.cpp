@@ -1044,4 +1044,279 @@ TEST(DashReplayBulkLane, CaptureConsumerDecoratesWithoutChangingDelivery)
     std::filesystem::remove_all(dir);
 }
 
+// ═══ (I) dashd CanServeBlocks / BLOCK_STALLING_TIMEOUT throughput port ══════
+//
+// The full-history --replay-bulk run measured timeout=753956 / 1.68M delivered
+// (45% re-request) with notfound=0: non-archival peers SILENTLY DROP deep-
+// history getdata, and nothing demoted a near-dead peer that kept its 32 slots
+// the whole run, so the in-order delivery cursor head-of-line-blocked behind
+// each hole for the flat 30 s timeout. This ports dashd net_processing's two
+// halves — the proactive CanServeBlocks service-bit/coverage filter (WHO may
+// be handed a range) and the reactive BLOCK_STALLING_TIMEOUT demote (WHEN a
+// non-server is re-eligible) — plus the event-driven refill that lifts the
+// ~1/s tick pump ceiling. All THROUGHPUT-ONLY: no height is ever skipped.
+
+// (I.1) CanServeBlocks: a fresh contiguous range is handed ONLY to a peer that
+// advertises it can serve the height; a height no eligible peer covers still
+// goes out (liveness — never freeze the head-of-line block).
+TEST(DashReplayBulkScheduler, CanServeBlocksSteersRangesToArchivalPeers)
+{
+    SyntheticChain chain(200);
+    rp::BulkBlockScheduler::Config cfg;
+    cfg.window = 1000; cfg.per_peer_inflight = 32; cfg.batch = 8;
+
+    rp::BulkBlockScheduler s;
+    s.configure(cfg); s.reset(10); s.set_target_end(199);
+    const std::vector<std::string> peers{"full", "pruned"};
+    // "pruned" advertises no history for this deep band; "full" covers all.
+    auto only_full = [](const std::string& p, uint32_t) { return p == "full"; };
+    auto plan = s.pump(1000, peers,
+                       [&](uint32_t h) { return chain.hash_at(h); }, 0,
+                       only_full);
+    ASSERT_EQ(plan.size(), 1u);                 // pruned got nothing
+    EXPECT_EQ(plan[0].peer, "full");
+    EXPECT_EQ(plan[0].blocks.size(), cfg.batch);
+    for (const auto& [h, hash] : plan[0].blocks) EXPECT_EQ(hash, chain.hashes[h]);
+
+    // Liveness: when NO peer can serve a height, the filter degrades to a
+    // preference and the assignment still issues (no block is ever orphaned).
+    rp::BulkBlockScheduler s2;
+    s2.configure(cfg); s2.reset(10); s2.set_target_end(199);
+    auto none = [](const std::string&, uint32_t) { return false; };
+    auto plan2 = s2.pump(1000, peers,
+                         [&](uint32_t h) { return chain.hash_at(h); }, 0, none);
+    std::size_t total = 0;
+    for (const auto& a : plan2) total += a.blocks.size();
+    EXPECT_GT(total, 0u) << "bypass: a height no peer covers must still go out";
+}
+
+// (I.2a) Stall-demote: `demote_after` consecutive timeouts hold a dead peer OFF
+// fresh ranges while a healthy peer remains; its retries steer to the healthy
+// peer. (I.2b) A delivered body clears the streak and the demotion at once.
+TEST(DashReplayBulkScheduler, StallDemoteHoldsDeadPeerOffFreshRanges)
+{
+    SyntheticChain chain(500);
+    rp::BulkBlockScheduler::Config cfg;
+    cfg.window = 1000; cfg.per_peer_inflight = 8; cfg.batch = 8;
+    cfg.request_timeout_sec = 30; cfg.demote_after = 3; cfg.demote_cooldown_sec = 60;
+
+    rp::BulkBlockScheduler s;
+    s.configure(cfg); s.reset(0); s.set_target_end(499);
+    auto hs = [&](uint32_t h) { return chain.hash_at(h); };
+    const std::vector<std::string> peers{"good", "dead"};
+
+    // rr order: good←[0..7], dead←[8..15].
+    s.pump(1000, peers, hs, 0);
+    for (uint32_t h = 0; h < 8; ++h) s.on_body(chain.hashes[h], 100);  // good serves
+
+    EXPECT_EQ(s.demoted_count(1040), 0u);
+    s.service(1040, peers);              // dead's 8..15 time out (streak 8 ≥ 3)
+    EXPECT_GE(s.demoted_count(1040), 1u) << "dead demoted after the stall wave";
+
+    auto plan = s.pump(1041, peers, hs, 0);
+    for (const auto& a : plan)
+        EXPECT_NE(a.peer, "dead")
+            << "a demoted peer gets neither fresh ranges nor its own retries";
+
+    // (I.2b) sole-peer bypass keeps the fetch live AND a delivered body clears
+    // the demotion the instant the peer proves it is serving again.
+    rp::BulkBlockScheduler s2;
+    s2.configure(cfg); s2.reset(0); s2.set_target_end(99);
+    const std::vector<std::string> solo{"dead"};
+    s2.pump(1000, solo, hs, 0);          // dead←[0..7]
+    s2.service(1040, solo);              // all 8 time out → demoted
+    EXPECT_EQ(s2.demoted_count(1040), 1u);
+    s2.pump(1041, solo, hs, 0);          // liveness bypass re-feeds sole peer
+    s2.on_body(chain.hashes[0], 100);    // a body arrives at last
+    EXPECT_EQ(s2.demoted_count(1041), 0u) << "delivered body clears the demotion";
+}
+
+// ── stall-band throughput sim ──────────────────────────────────────────────
+// One archival "good" peer answers instantly; one "dead" peer silently drops
+// every getdata (the measured notfound=0 condition). The lane runs on a 1 s
+// tick; run() returns the virtual seconds to deliver the whole span in order.
+struct StallSim
+{
+    SyntheticChain chain;
+    rp::CountingReplayConsumer counter;
+    std::unique_ptr<rp::BulkFetchLane> lane;
+    std::vector<std::string> peers{"good:1", "dead:1"};
+    struct Out { std::string peer; uint256 hash; int64_t at; };
+    std::vector<Out> outstanding;
+    int64_t timeout;
+    int64_t now{0};
+
+    StallSim(uint32_t heights, uint32_t demote_after, int64_t req_timeout)
+        : chain(heights), timeout(req_timeout)
+    {
+        rp::BulkFetchLane::Config cfg;
+        cfg.start_height = 0; cfg.tip_exclusion = 0;
+        rp::BulkFetchLane::Seams s;
+        s.hash_at = [this](uint32_t h) { return chain.hash_at(h); };
+        s.chain_height = [this] {
+            return static_cast<uint32_t>(chain.hashes.size() - 1);
+        };
+        s.eligible_peers = [this] { return peers; };
+        s.send_getdata = [this](const std::string& p,
+                                const std::vector<uint256>& hh) {
+            for (const auto& h : hh) outstanding.push_back({p, h, now});
+        };
+        s.send_getheaders = [](const std::string&, const uint256&,
+                               const uint256&) {};
+        s.tip_busy = [] { return false; };
+        s.defer_to_higher_priority = [] { return false; };
+        lane = std::make_unique<rp::BulkFetchLane>(
+            std::move(s), cfg, nullptr, &counter, nullptr);
+        rp::BulkBlockScheduler::Config sc;
+        sc.window = 512; sc.per_peer_inflight = 32; sc.batch = 8;
+        sc.request_timeout_sec = req_timeout;
+        sc.demote_after = demote_after; sc.demote_cooldown_sec = 60;
+        lane->scheduler().configure(sc);
+    }
+
+    const BlockType* body_for(const uint256& h)
+    {
+        auto it = std::find(chain.hashes.begin(), chain.hashes.end(), h);
+        return it == chain.hashes.end()
+                   ? nullptr
+                   : &chain.blocks[std::distance(chain.hashes.begin(), it)];
+    }
+
+    // Deliver in order; return {seconds, timeouts}. seconds=-1 ⇒ never finished.
+    std::pair<int64_t, uint64_t> run(uint32_t target)
+    {
+        const int64_t cap = 200000;
+        for (now = 1; now <= cap; ++now)
+        {
+            lane->tick(now);
+            auto batch = outstanding; outstanding.clear();
+            for (auto& e : batch)
+            {
+                if (e.peer == "good:1")
+                {
+                    if (const BlockType* b = body_for(e.hash))
+                        lane->on_block_body(e.hash, *b);   // instant serve
+                }
+                else if (now - e.at >= timeout)
+                {
+                    /* dead request timed out — scheduler already requeued it */
+                }
+                else outstanding.push_back(e);             // still waiting
+            }
+            if (lane->delivered() >= target)
+                return {now, lane->scheduler().timeout_count()};
+        }
+        return {-1, lane->scheduler().timeout_count()};
+    }
+};
+
+// (I.3) THE THROUGHPUT PROOF. Same dead-peer topology, in-order full span:
+// demote_after=0 (pre-port) vs demote_after=3 (ported). The port must deliver
+// every block in order in BOTH cases (never skips a height) while cutting the
+// timeout wall — the stall-band rate rises.
+TEST(DashReplayBulkScheduler, StallBandThroughputRisesWithDemotePort)
+{
+    const uint32_t H = 600;
+    StallSim baseline(H, /*demote_after=*/0, /*timeout=*/30);   // pre-port
+    StallSim ported  (H, /*demote_after=*/3, /*timeout=*/30);   // dashd parity
+
+    auto [b_secs, b_to] = baseline.run(H - 1);
+    auto [p_secs, p_to] = ported.run(H - 1);
+
+    // Correctness FIRST: both deliver the whole span, strictly in order.
+    EXPECT_EQ(baseline.lane->delivered(), H - 1);
+    EXPECT_EQ(ported.lane->delivered(),   H - 1);
+    EXPECT_FALSE(baseline.counter.order_violated());
+    EXPECT_FALSE(ported.counter.order_violated());
+    ASSERT_GT(b_secs, 0);
+    ASSERT_GT(p_secs, 0);
+
+    const double b_rate = double(H) / double(b_secs);
+    const double p_rate = double(H) / double(p_secs);
+    std::printf("[STALL-BAND] pre-port: %lld s, %llu timeouts, %.2f blk/s | "
+                "ported: %lld s, %llu timeouts, %.2f blk/s | rate x%.2f\n",
+                (long long)b_secs, (unsigned long long)b_to, b_rate,
+                (long long)p_secs, (unsigned long long)p_to, p_rate,
+                p_rate / b_rate);
+
+    // The port cuts re-requests and raises the delivered-in-order rate.
+    EXPECT_LT(p_to, b_to)   << "ported issues strictly fewer re-requests";
+    EXPECT_LT(p_secs, b_secs) << "ported clears the span sooner (rate rises)";
+}
+
+// (I.4) Event-driven refill: with the clock seam armed, a delivered body hands
+// its freed slot fresh work IMMEDIATELY (no wait for the next tick); without
+// it, the lane issues nothing new until the tick — the ~1/s pump ceiling.
+struct RefillRig
+{
+    SyntheticChain chain;
+    rp::CountingReplayConsumer counter;
+    std::vector<std::pair<std::string, std::vector<uint256>>> sent;
+    std::unique_ptr<rp::BulkFetchLane> lane;
+    int64_t clock{1000};
+
+    RefillRig(uint32_t heights, bool arm_event) : chain(heights)
+    {
+        rp::BulkFetchLane::Config cfg;
+        cfg.start_height = 0; cfg.tip_exclusion = 0;
+        rp::BulkFetchLane::Seams s;
+        s.hash_at = [this](uint32_t h) { return chain.hash_at(h); };
+        s.chain_height = [this] {
+            return static_cast<uint32_t>(chain.hashes.size() - 1);
+        };
+        s.eligible_peers = [] { return std::vector<std::string>{"p:1"}; };
+        s.send_getdata = [this](const std::string& p,
+                                const std::vector<uint256>& h) {
+            sent.emplace_back(p, h);
+        };
+        s.send_getheaders = [](const std::string&, const uint256&,
+                               const uint256&) {};
+        s.tip_busy = [] { return false; };
+        s.defer_to_higher_priority = [] { return false; };
+        if (arm_event) s.now_sec = [this] { return clock; };
+        lane = std::make_unique<rp::BulkFetchLane>(
+            std::move(s), cfg, nullptr, &counter, nullptr);
+        rp::BulkBlockScheduler::Config sc;
+        sc.window = 1000; sc.per_peer_inflight = 32; sc.batch = 8;
+        sc.request_timeout_sec = 30;
+        lane->scheduler().configure(sc);
+    }
+
+    void deliver_sent()
+    {
+        auto batch = sent; sent.clear();
+        for (auto& [p, hs] : batch)
+            for (auto& h : hs)
+            {
+                auto it = std::find(chain.hashes.begin(), chain.hashes.end(), h);
+                if (it != chain.hashes.end())
+                    lane->on_block_body(
+                        h, chain.blocks[std::distance(chain.hashes.begin(), it)]);
+            }
+    }
+};
+
+TEST(DashReplayBulkLane, EventDrivenRefillLiftsPerTickCeiling)
+{
+    RefillRig armed(500, /*arm_event=*/true);
+    RefillRig tickonly(500, /*arm_event=*/false);
+
+    armed.lane->tick(1000);
+    tickonly.lane->tick(1000);
+    const std::size_t primed = armed.sent.size();
+    ASSERT_GT(primed, 0u);
+    ASSERT_EQ(primed, tickonly.sent.size());   // identical priming
+
+    // Answer the primed bodies WITHOUT a second tick.
+    armed.deliver_sent();
+    tickonly.deliver_sent();
+
+    EXPECT_GT(armed.sent.size(), 0u)
+        << "armed lane refills on each delivered body (no tick needed)";
+    EXPECT_EQ(tickonly.sent.size(), 0u)
+        << "tick-only lane issues nothing until the next tick (the ceiling)";
+    // Both still deliver in order — throughput-only, nothing skipped.
+    EXPECT_FALSE(armed.counter.order_violated());
+}
+
 } // namespace
