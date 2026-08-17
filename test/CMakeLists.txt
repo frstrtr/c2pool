@@ -688,6 +688,32 @@ if (BUILD_TESTING AND GTest_FOUND)
     #     a non-conflicting one; no verifier / refusing verifier => no change;
     #   * BLS-gated (C2POOL_DASH_BLS): real threshold sig verifies end-to-end,
     #     every tampered bit is rejected and never reaches add_islock.
+    # W5-B DSTX intake (acquire -> BLS-verify -> zero-fee prioritised
+    # admission, all fail-closed):
+    #   * p2p::Handler REGISTRY membership gate (the DIP-24 qrinfo
+    #     silent-drop failure mode; a de-registered dstx fails RED here);
+    #   * wire-codec KAT against hand-assembled dashd CCoinJoinBroadcastTx
+    #     bytes + byte-exact re-encode;
+    #   * GetSignatureHash pre-image KAT vs an INDEPENDENTLY hand-assembled
+    #     byte stream (also pins pack(tx) network serialization);
+    #   * IsValidStructure refusal matrix;
+    #   * the USE red/green: plain zero-fee admission stays OUT (min-feerate
+    #     floor, master's behaviour) vs the REAL verified maintainer path
+    #     ranking it FIRST on the +0.1 COIN modified fee while total_fees
+    #     stays BASE (coinbasevalue parity);
+    #   * fail-closed: no verifier / bad BLS sig through the real
+    #     verify_govvote_operator_sig entry point admits nothing.
+    add_executable(test_dash_dstx test_dash_dstx.cpp)
+    target_link_libraries(test_dash_dstx PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_block_replay   # full p2p Handler instantiation (registry gate)
+        dash_bls_verify dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_dstx PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_dstx "" AUTO)
+
     add_executable(test_dash_isdlock test_dash_isdlock.cpp)
     target_link_libraries(test_dash_isdlock PRIVATE
         GTest::gtest_main GTest::gtest

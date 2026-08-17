@@ -176,6 +176,27 @@ struct Node
     };
     Event<IsdLockEvent> new_isdlock;
 
+    // W5-B: a CoinJoin broadcast tx (dstx, MSG_DSTX=16) parsed off the
+    // coin-P2P wire — dashd CCoinJoinBroadcastTx {tx, protxHash, vchSig,
+    // sigTime}. Carries everything the maintainer-side BLS gate needs: the
+    // full tx (a protocol-forced zero-fee denominated mixing tx), the mixing
+    // masternode's proTxHash (operator-key lookup in the SML), the 96-byte
+    // BLS operator signature over SerializeHash(tx‖protxHash‖sigTime), and
+    // sigTime. NO trust decision is made in the P2P layer — the subscriber
+    // (CoinStateMaintainer::on_new_dstx) is fail-closed: no verifier
+    // registered, or BLS verify fails, means the tx is dropped and
+    // Mempool::add_dstx is never called. Only fired when
+    // --embedded-ingest-dstx armed the pull (flag OFF => no getdata is ever
+    // sent AND the handler discards => this event never fires).
+    struct DstxEvent {
+        coin::MutableTransaction tx;
+        uint256                  txid;         // dash_txid(tx), self-computed
+        uint256                  protx_hash;
+        std::array<uint8_t, 96>  sig{};
+        int64_t                  sig_time{0};
+    };
+    Event<DstxEvent> new_dstx;
+
     // E1 Phase-L sourcing leg: a peer-relayed DKG final commitment off the
     // coin-P2P `qfcommit` stream (inv MSG_QUORUM_FINAL_COMMITMENT = 21) —
     // the exact stream dashd's own miner sources block-N's mandatory type-6

@@ -115,6 +115,13 @@ struct inventory_type
         wtx             = 5,            // MSG_WTX (BIP 339)
         // Dash-specific getdata/inv types (dashcore src/protocol.h:495-524,
         // enum GetDataMsg). Only the ones we actually request are listed.
+        dstx            = 16,           // MSG_DSTX (dashcore protocol.h:507,
+                                        // CoinJoin broadcast tx; the inv hash
+                                        // is the PLAIN TXID, not a payload
+                                        // hash — net_processing.cpp:2567.
+                                        // NOTE: 16, NOT the retired legacy
+                                        // MSG_ISLOCK=30 — protocol.h keeps
+                                        // this enum backwards compatible)
         quorum_final_commitment = 21,   // MSG_QUORUM_FINAL_COMMITMENT
         clsig           = 29,           // MSG_CLSIG (dashcore protocol.h:522)
         isdlock         = 31,           // MSG_ISDLOCK (dashcore protocol.h:524,
