@@ -6143,15 +6143,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // does not re-hash to the block's committed merkleRootMNList
             // (mn_diff_store.hpp:849-857). The trusted-anchor checkpoint carries
             // the DIP-3 PAYEE fields but NOT the SML fields the root commits
-            // (confirmedHash, netInfo) — so the parallel engine cannot reproduce
-            // the anchor+1 root and POISONS at the first fold. A poisoned engine
-            // writes no diffs, the store holds only the anchor, every height
-            // above it REPAIR-REFUSES, and the SOURCE callers fall through to
-            // their unchanged network path: today's behaviour EXACTLY, never a
-            // wrong row, never a bad mint. The wiring is in place so that the
-            // day a FULL-STATE (v3) anchor is pinned, the store serves the cold
-            // bridge with zero further change. Until then it is an accelerator
-            // that is present and inert, precisely as an accelerator should be.
+            // (confirmedHash, netInfo) — which a checkpoint-only seed cannot
+            // supply. So rather than seed from the checkpoint alone (which would
+            // poison at anchor+1), the seed is DEFERRED to the lane's own anchor
+            // fold: it fetches getmnlistd(base=ZERO, target=anchor_hash) and
+            // DIP-4-authenticates the FULL Simplified MN List against the anchor
+            // block's committed merkleRootMNList, and set_on_anchor_snapshot()
+            // merges those root-committing fields onto the checkpoint's forward
+            // facets. The merged seed is SELF-CHECKED against the committed root
+            // before forward folds arm; a seed that fails leaves the engine
+            // UNSEEDED, the store empty, and the SOURCE callers on their unchanged
+            // network path — never a wrong row, never a bad mint. When the seed
+            // matches, the store COVERS heights and the ban-state probe /
+            // on-demand fold source 0-RTT/uncapped from it.
             if (mn_ckpt_lane && header_chain && ckpt.ok
                 && !mn_diff_store) {
                 namespace rp = dash::coin::replay;
@@ -6178,52 +6182,151 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         LOG_INFO << "[MN-DIFF-DB] cold-bridge startup verify: "
                                  << vnote;
 
-                    // PARALLEL engine seeded at the bridge anchor. The checkpoint
-                    // MNState carries the payee facets; the SML-root facets it
-                    // omits are left at their ReplayMNState defaults (the engine
-                    // then self-checks and poisons at anchor+1 unless a genuine
-                    // full-state anchor was supplied — see the safety note above).
+                    // ── FULL-STATE ANCHOR SEED (dashd-parity, option A) ──────
+                    // Stand up the parallel DmlFoldEngine here but DEFER its seed
+                    // to the lane's own anchor fold. The payee-only compiled
+                    // checkpoint omits the two fields the anchor merkleRootMNList
+                    // commits to (confirmedHash, netInfo); a checkpoint-only seed
+                    // therefore cannot reproduce the anchor+1 root and poisons at
+                    // the first fold. set_on_anchor_snapshot() below receives the
+                    // DIP-4-authenticated FULL SML the lane already fetches for its
+                    // anchor fold, MERGES its root-committing fields onto the
+                    // checkpoint's forward-fold facets, seeds, and SELF-CHECKS the
+                    // merged state against the anchor's committed root BEFORE arming
+                    // forward folds. A seed that fails the self-check leaves the
+                    // engine UNSEEDED -> store never populates -> callers fall
+                    // through unchanged (reward-safe: a wrong seed can never mint).
                     dash::coin::replay::FoldConfig fcfg;
                     fcfg.enabled = true;
                     mn_bridge_fold_engine =
                         std::make_unique<rp::DmlFoldEngine>(fcfg);
-                    std::vector<std::pair<uint256, rp::ReplayMNState>> seed;
-                    seed.reserve(ckpt.entries.size());
-                    uint64_t trc = 0;
-                    for (const auto& [protx, mn] : ckpt.entries) {
-                        rp::ReplayMNState st;
-                        st.nType             = mn.nType;
-                        st.internalId        = trc++;   // ordering only; not root
-                        st.collateralOutpoint = mn.collateralOutpoint;
-                        st.nOperatorReward   = mn.nOperatorReward;
-                        st.nVersion          = mn.nVersion;
-                        st.nRegisteredHeight  = static_cast<int32_t>(mn.nRegisteredHeight);
-                        st.nLastPaidHeight    = static_cast<int32_t>(mn.nLastPaidHeight);
-                        st.nConsecutivePayments = static_cast<int32_t>(mn.nConsecutivePayments);
-                        st.nPoSeRevivedHeight = mn.nPoSeRevivedHeight == 0
-                            ? rp::ReplayMNState::NEVER
-                            : static_cast<int32_t>(mn.nPoSeRevivedHeight);
-                        st.nPoSeBanHeight     = mn.nPoSeBanHeight == 0
-                            ? rp::ReplayMNState::NEVER
-                            : static_cast<int32_t>(mn.nPoSeBanHeight);
-                        st.nRevocationReason = mn.nRevocationReason;
-                        st.keyIDOwner        = mn.keyIDOwner;
-                        st.pubKeyOperator    = mn.pubKeyOperator;
-                        st.keyIDVoting       = mn.keyIDVoting;
-                        st.netInfo           = mn.netInfo;
-                        st.scriptPayout      = mn.scriptPayout;
-                        st.scriptOperatorPayout = mn.scriptOperatorPayout;
-                        st.platformNodeID    = mn.platformNodeID;
-                        st.platformP2PPort   = mn.platformP2PPort;
-                        st.platformHTTPPort  = mn.platformHTTPPort;
-                        seed.emplace_back(protx, std::move(st));
-                    }
-                    mn_bridge_fold_engine->seed(std::move(seed), trc,
-                                                ckpt.height, ckpt.blockhash,
-                                                net_name);
                     mn_diff_writer = std::make_unique<rp::MnDiffWriter>(
                         *mn_diff_store, *mn_bridge_fold_engine);
-                    mn_diff_writer->arm();
+                    mn_ckpt_lane->set_on_anchor_snapshot(
+                        [eng = mn_bridge_fold_engine.get(),
+                         w   = mn_diff_writer.get(),
+                         anchor = ckpt, net = net_name](
+                            const dash::coin::vendor::CSimplifiedMNList& asml,
+                            uint32_t /*anchor_h*/) {
+                            if (eng->size() != 0) return;   // already seeded
+                            // The DIP-4-authenticated anchor SML is the AUTHORITATIVE
+                            // source for EVERY field the committed merkleRootMNList
+                            // commits to (nVersion, confirmedHash, netInfo,
+                            // pubKeyOperator, keyIDVoting, isValid, nType, platform
+                            // HTTP port + node id). The payee-only checkpoint diverges
+                            // from the committed list in MORE than confirmedHash+
+                            // netInfo (proven live: a confirmedHash+netInfo-only merge
+                            // still missed the anchor root), so iterate the SML and
+                            // take those root fields from it -- the seeded set then IS
+                            // the anchor set and the root reproduces BY CONSTRUCTION.
+                            // The FORWARD-FOLD facets the SML does not carry
+                            // (collateralOutpoint, nRegisteredHeight, nLastPaidHeight,
+                            // nConsecutivePayments, nPoSeRevivedHeight, nOperatorReward,
+                            // keyIDOwner, scriptPayout/scriptOperatorPayout,
+                            // platformP2PPort, the ban HEIGHT magnitude) come from the
+                            // compiled checkpoint when it holds the MN.
+                            std::map<uint256, const dash::coin::MNState*> cp;
+                            for (const auto& [protx, mn] : anchor.entries)
+                                cp[protx] = &mn;
+                            std::vector<std::pair<uint256, rp::ReplayMNState>> seed;
+                            seed.reserve(asml.mnList.size());
+                            uint64_t trc = 0;
+                            size_t with_facets = 0, without_facets = 0;
+                            for (const auto& e : asml.mnList) {
+                                rp::ReplayMNState st;
+                                // ROOT-COMMITTING fields -- SML authoritative.
+                                st.nVersion         = e.nVersion;
+                                st.nType            = e.nType;
+                                st.pubKeyOperator   = e.pubKeyOperator;
+                                st.keyIDVoting      = e.keyIDVoting;
+                                st.netInfo.ip       = e.netAddress;
+                                st.netInfo.port_be  = e.netPort;
+                                st.platformHTTPPort = e.platformHTTPPort;
+                                st.platformNodeID   = e.platformNodeID;
+                                if (!e.confirmedHash.IsNull())
+                                    st.UpdateConfirmedHash(e.proRegTxHash,
+                                                           e.confirmedHash);
+                                st.internalId       = trc++;   // ordering only; not root
+                                // FORWARD-FOLD facets -- checkpoint when present.
+                                auto cit = cp.find(e.proRegTxHash);
+                                if (cit != cp.end()) {
+                                    const auto& mn = *cit->second;
+                                    st.collateralOutpoint   = mn.collateralOutpoint;
+                                    st.nOperatorReward      = mn.nOperatorReward;
+                                    st.nRegisteredHeight    = static_cast<int32_t>(mn.nRegisteredHeight);
+                                    st.nLastPaidHeight      = static_cast<int32_t>(mn.nLastPaidHeight);
+                                    st.nConsecutivePayments = static_cast<int32_t>(mn.nConsecutivePayments);
+                                    st.nPoSeRevivedHeight   = mn.nPoSeRevivedHeight == 0
+                                        ? rp::ReplayMNState::NEVER
+                                        : static_cast<int32_t>(mn.nPoSeRevivedHeight);
+                                    st.nRevocationReason    = mn.nRevocationReason;
+                                    st.keyIDOwner           = mn.keyIDOwner;
+                                    st.scriptPayout         = mn.scriptPayout;
+                                    st.scriptOperatorPayout = mn.scriptOperatorPayout;
+                                    st.platformP2PPort      = mn.platformP2PPort;
+                                    ++with_facets;
+                                } else {
+                                    ++without_facets;
+                                }
+                                // BAN STATE: the SML isValid boolean is the root truth
+                                // (isValid == !IsBanned()); reconcile the ban HEIGHT so
+                                // IsBanned() matches it -- the checkpoint height when it
+                                // agrees, else a sentinel at the anchor.
+                                if (e.isValid) {
+                                    st.nPoSeBanHeight = rp::ReplayMNState::NEVER;
+                                } else {
+                                    int32_t cpban = rp::ReplayMNState::NEVER;
+                                    if (cit != cp.end() && cit->second->nPoSeBanHeight != 0)
+                                        cpban = static_cast<int32_t>(cit->second->nPoSeBanHeight);
+                                    st.nPoSeBanHeight = (cpban != rp::ReplayMNState::NEVER)
+                                        ? cpban
+                                        : static_cast<int32_t>(anchor.height);
+                                }
+                                seed.emplace_back(e.proRegTxHash, std::move(st));
+                            }
+                            eng->seed(std::move(seed), trc, anchor.height,
+                                      anchor.blockhash, net);
+                            // SEED SELF-CHECK: the merged state MUST reproduce the
+                            // anchor's own committed merkleRootMNList (== the DIP-4
+                            // authenticated SML's root). If not, UNSEED so the store
+                            // never populates and every caller falls through.
+                            const uint256 got  = eng->compute_sml_root();
+                            const uint256 want = asml.CalcMerkleRoot();
+                            if (got != want) {
+                                LOG_ERROR
+                                    << "[MN-DIFF-DB] FULL-STATE anchor seed SELF-CHECK"
+                                       " FAILED at h=" << anchor.height
+                                    << " (with_facets=" << with_facets
+                                    << " without_facets=" << without_facets
+                                    << "): computed root "
+                                    << got.GetHex().substr(0, 16) << " != committed "
+                                    << want.GetHex().substr(0, 16)
+                                    << " -- engine left UNSEEDED, store stays empty,"
+                                       " callers fall through to the network path"
+                                       " unchanged (reward-safe).";
+                                eng->seed({}, 0, 0, uint256::ZERO, net);   // UNSEED
+                                return;
+                            }
+                            if (!w->arm()) {
+                                LOG_WARNING
+                                    << "[MN-DIFF-DB] writer arm FAILED after a"
+                                       " root-matched full-state seed -- store"
+                                       " inert, callers unchanged.";
+                                return;
+                            }
+                            LOG_INFO
+                                << "[MN-DIFF-DB] FULL-STATE anchor seed OK: "
+                                << with_facets << " MNs seeded root-fields from the"
+                                   " DIP-4 anchor SML (" << without_facets
+                                << " without a checkpoint facet); reproduces the"
+                                   " anchor's committed"
+                                   " merkleRootMNList "
+                                << want.GetHex().substr(0, 16)
+                                << " -- the parallel DML engine now folds forward"
+                                   " WITHOUT poisoning at anchor+1; the store will"
+                                   " COVER heights and the ban-state probe /"
+                                   " on-demand fold source 0-RTT/uncapped from it.";
+                        });
 
                     // THE WRITE FEED: every block the bridge folds CLEANLY is
                     // handed to the parallel engine; only its OWN root-checked
@@ -6235,6 +6338,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                          logged = std::make_shared<bool>(false)](
                             const dash::coin::BlockType& blk, uint32_t h) {
                             if (eng->poisoned()) return;
+                            if (eng->size() == 0) return;   // seed deferred to the anchor fold; nothing to fold yet
                             const uint256 bh =
                                 rp::DmlFoldEngine::block_header_hash(blk);
                             const auto fr = eng->fold_block(blk, h);
@@ -6251,11 +6355,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                        " only its anchor row; every height above"
                                        " REPAIR-REFUSES and the probe/on-demand"
                                        " paths fall through to the network"
-                                       " unchanged. This is the expected,"
-                                       " reward-safe state when the anchor is a"
-                                       " payee-only checkpoint (no committed-root"
-                                       " SML fields) rather than a full-state"
-                                       " snapshot.";
+                                       " unchanged (reward-safe). With the"
+                                       " full-state anchor seed this is NOT the"
+                                       " expected cold-bridge state: it means the"
+                                       " parallel fold diverged from a committed"
+                                       " cbTx root at this height.";
                             }
                         });
 
