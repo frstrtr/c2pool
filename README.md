@@ -184,6 +184,15 @@ cmake --build . --target c2pool -j$(nproc)
 ./src/c2pool/c2pool
 ```
 
+**Linux (Ubuntu 26.04 LTS)** — *theoretical: CI builds on 24.04, so the 26.04 path below is documented from known toolchain deltas, not yet exercised in the CI matrix. Report any gotcha via an issue.*
+
+The 24.04 steps above apply unchanged; the build is Conan-managed, so it is largely toolchain-version agnostic. Expect only these deltas on 26.04:
+- **Newer default compiler.** 26.04 LTS ships a newer default GCC (15.x) / libstdc++. No action needed — `conan profile detect --force` picks up the system toolchain, and `conan install --build=missing` builds the C++ dependencies (Boost 1.90, etc.) against it. If the newer compiler turns a dependency warning into an error, `--build=missing` already rebuilds that dependency from source with your toolchain.
+- **Externally-managed pip (PEP 668).** As on 24.04, install Conan with `pip install "conan>=2.0,<3.0" --break-system-packages`, or prefer an isolated `pipx install "conan>=2.0,<3.0"` (`sudo apt-get install -y pipx`) so the tool does not touch the system Python. (Conan is c2pool's **C++** dependency manager — a pip-distributed tool — and is unrelated to any Python component of a pool.)
+- **apt package names are unchanged**: `g++ cmake make libleveldb-dev libsecp256k1-dev python3-pip`.
+
+Everything else — `conan install` → `cmake --preset conan-debug` → `cmake --build` — is identical to 24.04.
+
 **macOS (Intel & Apple Silicon)**
 ```bash
 xcode-select --install
