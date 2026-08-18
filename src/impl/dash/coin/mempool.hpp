@@ -126,6 +126,29 @@ struct MempoolEntry {
 /// is precisely how dashd shares CompareTxMemPoolEntryByAncestorFee between
 /// mapTx and mapModifiedTx (D1/D2). The struct and its operator< are
 /// identical either way; only the (fee, size) fed in differ.
+// dashcore CompareIteratorByHash / CTransaction::GetHash() tie-break order.
+//
+// The embedded uint256 is base_uint<256>, whose operator< delegates to
+// CompareTo(): an ARITHMETIC limb comparison, most-significant 32-bit limb
+// first. dashcore breaks every equal-feerate / equal-ancestor-count mining tie
+// with CTxMemPool::CompareIteratorByHash, i.e. uint256::operator< ==
+// base_blob::Compare == std::memcmp over the RAW (wire-serialized, little-
+// endian) hash bytes, byte 0 first. Those two orders differ, so using the
+// arithmetic operator< for the tie-break transposes adjacent equal-key txs vs
+// dashd and diverges the block tx-merkle root (the tx-serving ordering
+// residual). Reproduce dashd's memcmp exactly: compare the serialized bytes,
+// byte 0 (limb 0 LSB) first. Extraction is by shift, so it is identical on any
+// host endianness and matches the wire bytes dashd hashes.
+inline bool txid_oracle_less(const uint256& a, const uint256& b)
+{
+    for (int i = 0; i < 32; ++i) {
+        const uint8_t ba = static_cast<uint8_t>(a.pn[i >> 2] >> (8 * (i & 3)));
+        const uint8_t bb = static_cast<uint8_t>(b.pn[i >> 2] >> (8 * (i & 3)));
+        if (ba != bb) return ba < bb;
+    }
+    return false;
+}
+
 struct FeeKey {
     uint64_t fee;        // satoshi
     uint32_t base_size;  // serialized bytes (>0 for every indexed entry)
@@ -135,7 +158,7 @@ struct FeeKey {
         const double f1 = static_cast<double>(fee)   * o.base_size;
         const double f2 = static_cast<double>(o.fee) * base_size;
         if (f1 != f2) return f1 > f2;   // higher feerate first
-        return txid < o.txid;           // txid asc tiebreak (oracle-conformant)
+        return txid_oracle_less(txid, o.txid);   // dashd GetHash() memcmp tie-break
     }
 };
 
@@ -1609,7 +1632,7 @@ private:
                       uint32_t ca = ia != anc.count_wa.end() ? ia->second : 1;
                       uint32_t cb = ib != anc.count_wa.end() ? ib->second : 1;
                       if (ca != cb) return ca < cb;
-                      return a->txid < b->txid;
+                      return txid_oracle_less(a->txid, b->txid);
                   });
     }
 
