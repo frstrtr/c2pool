@@ -59,6 +59,7 @@
 #include <impl/dash/coin/coin_peer_manager.hpp> // dash::coin::DashCoinPeerManager — DASH-ISOLATED scored/diverse peer discovery (--coin-p2p-discover; network-standalone gate)
 #include <impl/dash/coin/chain_seeds.hpp>  // dash::coin::dash_dns_seeds / dash_fixed_seeds — DASH mainnet/testnet seed bootstrap
 #include <impl/dash/coin/won_block_dispatch.hpp> // dash::coin::broadcast_won_block — S8 dual-path won-block dispatcher (embedded P2P primary + submitblock RPC backup)
+#include <impl/dash/coin/reconstruct_won_block.hpp> // dash::coin::reconstruct_won_block — distributed won-block: rebuild full block from a won share for re-broadcast
 #include <impl/dash/coin/zmq_tip_notify.hpp> // dash::coin::TipHashDedup / ZmqHashblockSubscriber — dashd ZMQ hashblock INSTANT tip-notify (opt-in, hardening on the #770 poll)
 #include <impl/dash/coin/coin_p2p_magic.hpp>      // dash::coin::select_coin_p2p_magic — E5 --coin-p2p-magic override (regtest ARM A dial)
 #include <impl/dash/coin/node_coin_state.hpp>  // dash::coin::NodeCoinState (embedded work bundle)
@@ -1801,46 +1802,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // block hash (on DASH the share hash IS X11(block header)) and the same
         // "DASH" label, and record_found_block dedups on exactly that pair.
         //
-        // Display only: no submit, mint, target or payout path is reachable.
-        {
-            core::WebServer* ws = web_server.get();
-            dash::Node* node = &p2p_node;
-            p2p_node.tracker().m_on_block_found =
-                dash::dashboard::make_on_block_found(
-                    node, testnet,
-                    [&ioc](std::function<void()> work) {
-                        boost::asio::post(ioc, std::move(work));
-                    },
-                    [ws](const dash::dashboard::FoundBlockRow& row) {
-                        auto* mi = ws->get_mining_interface();
-                        LOG_INFO << "[DASH] GOT BLOCK FROM POOL! height=" << row.height
-                                 << " hash=" << row.block_hash.GetHex().substr(0, 16)
-                                 << " miner=" << row.miner;
-                        mi->record_found_block(
-                            row.height, row.block_hash, row.timestamp,
-                            row.chain, row.miner, row.share_hash,
-                            mi->get_network_difficulty(),
-                            row.share_difficulty,
-                            // pool_hashrate_at_find: 0 routes the core to the
-                            // real POOL estimator (m_pool_hashrate_fn); this
-                            // site passed get_local_hashrate(), which is only
-                            // the pool rate when every rig sits on this node.
-                            /*pool_hashrate=*/0.0,
-                            row.subsidy,
-                            // Sharechain peer path: another node built the
-                            // template that won. Our pins and our tx selection
-                            // are not in it, and our address may still be in
-                            // the coinbase as our share of the pool payout.
-                            // row.miner is that peer's own payout address,
-                            // derived from the winning share's pubkey hash.
-                            core::MiningInterface::BlockAuthorship
-                                ::sharechain_peer);
-                        // Arm the post-broadcast confirm/orphan poller so this
-                        // peer-found block flips off "pending" (main_ltc.cpp:6315
-                        // parity). Telemetry only; never gates a broadcast.
-                        mi->schedule_block_verification(row.block_hash.GetHex());
-                    });
-        }
+        // WON-BLOCK RE-BROADCAST (distributed close, p2pool node.py:268-282):
+        // this dashboard row is now the POST-BROADCAST TELEMETRY LEG of the
+        // dash::coin::make_on_block_found dispatcher. The tracker binding moved
+        // DOWN to after the p2p_relay + rpc_submit sinks are constructed (search
+        // "DISTRIBUTED WON-BLOCK RE-BROADCAST (tracker arm)"), so both the stratum
+        // submit fn and this tracker dispatcher share the IDENTICAL two sinks, and
+        // the dashboard record_found_block row is composed there as the
+        // post-broadcast telemetry leg (unchanged display behavior; now preceded
+        // by the actual re-broadcast). Nothing to install here anymore.
 
         // ── REAL node-owner fee (already parsed from argv above) ──────────
         if (node_owner_fee > 0.0 && !node_owner_address.empty())
@@ -2530,6 +2500,89 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         rpc_submit = [&rpc](const std::string& block_hex) -> bool {
             return rpc->submit_block_hex(block_hex, /*ignore_failure=*/false);
         };
+    }
+
+    // ── DISTRIBUTED WON-BLOCK RE-BROADCAST (tracker arm) ──────────────────────
+    // Bind ShareTracker::m_on_block_found to the dash::coin dispatcher so a block
+    // found by ANY pool participant (a gossiped share whose X11 header clears the
+    // coin BLOCK target) is RECONSTRUCTED and RE-BROADCAST to the DASH network,
+    // not merely recorded. This is the p2pool node.py:268-282 fan-out DASH lacked
+    // (it previously bound the DISPLAY-ONLY dashboard handler). It reuses the
+    // IDENTICAL p2p_relay + rpc_submit sinks the stratum finder uses (constructed
+    // just above), so both arms broadcast the same way.
+    //
+    // The reconstruct closure runs SYNCHRONOUSLY inside the hook (on the compute
+    // thread, m_tracker_mutex held) because it reads the on-chain PPLNS window +
+    // walks tracker.chain -- the SAME reads verify_payout_commitment already did
+    // one call earlier under this same lock (no new lock, no inversion). The
+    // actual broadcast is POSTed onto ioc so the submitblock RPC round-trip never
+    // runs under the tracker lock. The dashboard row (captured above) is the
+    // post-broadcast telemetry leg. known_txs is empty for now: the daemonless
+    // norm is coinbase-only (transactions==[]), so a share that references other
+    // txs fails loud (broadcast NOTHING, telemetry still recorded) rather than
+    // emit an incomplete block -- reward-safe, and it fills in with mempool
+    // tx-selection later with no change here.
+    {
+        auto& won_tracker = p2p_node.tracker();
+        const core::CoinParams won_params = mint_params;
+        core::MiningInterface* won_mi =
+            web_server ? web_server->get_mining_interface() : nullptr;
+
+        dash::coin::WonBlockReconstructor won_reconstruct =
+            [&won_tracker, won_params](const uint256& sh)
+                -> std::optional<dash::coin::ReconstructedWonBlock> {
+                if (!won_tracker.chain.contains(sh)) return std::nullopt;
+                std::optional<dash::coin::ReconstructedWonBlock> result;
+                won_tracker.chain.get_share(sh).invoke([&](auto* obj) {
+                    if (!obj) return;
+                    using ShareT = std::decay_t<decltype(*obj)>;
+                    if constexpr (std::is_same_v<ShareT, dash::DashShare>) {
+                        result = dash::coin::reconstruct_won_block(
+                            sh, *obj, won_tracker, won_params, /*known_txs=*/{});
+                    }
+                });
+                return result;
+            };
+
+        dash::coin::AlreadyBroadcastPredicate won_already;
+        dash::coin::MarkBroadcastFn           won_mark;
+        if (won_mi) {
+            won_already = [won_mi](const uint256& h) { return won_mi->already_submitted_block(h); };
+            won_mark    = [won_mi](const uint256& h) { won_mi->mark_block_submitted(h); };
+        }
+
+        // Post-broadcast telemetry leg: the EXISTING dashboard found-block handler
+        // (unchanged display behavior; ANY-participant /recent_blocks feed). Now it
+        // fires AFTER the re-broadcast rather than instead of it -- composed, not
+        // replaced. Reads the share via read_tracker() (reentrancy-aware) and posts
+        // record_found_block onto ioc, exactly as the old dashboard-only binding.
+        core::WebServer* won_ws = web_server.get();
+        dash::Node*      won_node = &p2p_node;
+        std::function<void(const uint256&)> won_telemetry =
+            dash::dashboard::make_on_block_found(
+                won_node, testnet,
+                [&ioc](std::function<void()> work) { boost::asio::post(ioc, std::move(work)); },
+                [won_ws](const dash::dashboard::FoundBlockRow& row) {
+                    auto* mi = won_ws->get_mining_interface();
+                    LOG_INFO << "[DASH] GOT BLOCK FROM POOL! height=" << row.height
+                             << " hash=" << row.block_hash.GetHex().substr(0, 16)
+                             << " miner=" << row.miner;
+                    mi->record_found_block(
+                        row.height, row.block_hash, row.timestamp,
+                        row.chain, row.miner, row.share_hash,
+                        mi->get_network_difficulty(),
+                        row.share_difficulty,
+                        /*pool_hashrate=*/0.0,
+                        row.subsidy,
+                        core::MiningInterface::BlockAuthorship::sharechain_peer);
+                    mi->schedule_block_verification(row.block_hash.GetHex());
+                });
+
+        p2p_node.tracker().m_on_block_found = dash::coin::make_on_block_found(
+            std::move(won_reconstruct), p2p_relay, rpc_submit,
+            [&ioc](std::function<void()> work) { boost::asio::post(ioc, std::move(work)); },
+            std::move(won_already), std::move(won_mark),
+            std::move(won_telemetry));
     }
 
     dash::stratum::DASHWorkSource::SubmitBlockFn stratum_submit_fn =
