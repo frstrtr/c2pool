@@ -362,6 +362,25 @@ public:
         m_on_block_applied = std::move(fn);
     }
 
+    /// FULL-STATE ANCHOR SEED seam (dashd-cut MN diff store). The lane's OWN
+    /// first fold is the anchor fold: begin_fold(m_anchor_height) requests
+    /// getmnlistd(base=ZERO, target=anchor_hash) and on_historical_snapshot()
+    /// DIP-4-authenticates the reply against the anchor block's committed
+    /// merkleRootMNList (never a partial acceptance). That authenticated list
+    /// is the FULL Simplified MN List AS OF the anchor -- precisely the
+    /// root-committing fields (confirmedHash, netInfo) the payee-only compiled
+    /// checkpoint OMITS. This callback hands that verified list to the parallel
+    /// DmlFoldEngine seed so it reproduces the anchor's committed root and no
+    /// longer poisons at anchor+1. Fired EXACTLY ONCE, from apply_fold() at
+    /// height == m_anchor_height, BEFORE any forward block is folded. A resumed
+    /// bridge never runs the anchor fold, so it never fires. Optional -- unset
+    /// is a no-op (the checkpoint-only seed stands, which self-checks/poisons).
+    void set_on_anchor_snapshot(
+        std::function<void(const vendor::CSimplifiedMNList&, uint32_t)> fn)
+    {
+        m_on_anchor_snapshot = std::move(fn);
+    }
+
     /// OPTIONAL. Unwired, the bridge behaves exactly as it did before this
     /// seam existed: any payee mismatch during replay is terminal.
     void set_sml_validity_fn(SmlValidityFn fn)
@@ -3139,6 +3158,16 @@ private:
     /// at `height`. Every caller must have established that equality.
     void apply_fold(const vendor::CSimplifiedMNList& sml, uint32_t height)
     {
+        // FULL-STATE ANCHOR SEED HOOK. The lane's own anchor fold has just
+        // DIP-4-authenticated the FULL SML as of the anchor -- deliver it once,
+        // before any forward block is folded, so the parallel MN diff-store
+        // engine seeds full-state instead of poisoning at anchor+1 on the
+        // payee-only checkpoint. height == m_anchor_height is reached only by
+        // the anchor fold (fold points and on-demand folds are all > cursor,
+        // and a resumed bridge never runs the anchor fold).
+        if (height == m_anchor_height && m_on_anchor_snapshot)
+            m_on_anchor_snapshot(sml, height);
+
         const size_t before = m_machine.eligible_size();
 
         // F5 SANITY BOUND, now defence-in-depth. The list is DIP-4 verified
@@ -3959,6 +3988,12 @@ public:
     // MnDiffWriter). Unset is a no-op, so a bridge with no store wired behaves
     // exactly as before.
     std::function<void(const BlockType&, uint32_t)> m_on_block_applied;
+    // FULL-STATE ANCHOR SEED seam (dashd-cut): fired once from apply_fold at
+    // the anchor height with the DIP-4-authenticated full SML, so main_dash
+    // can seed the parallel DmlFoldEngine with the root-committing fields the
+    // payee-only checkpoint omits. Unset = no-op.
+    std::function<void(const vendor::CSimplifiedMNList&, uint32_t)>
+        m_on_anchor_snapshot;
     // dashd-cut SOURCE observability: pre-block ban state resolved from the
     // diff store (0-RTT) instead of a capped network probe/fold. These are the
     // counts that prove the store SERVED — a green run has probe/fold caps
