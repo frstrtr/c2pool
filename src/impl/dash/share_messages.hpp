@@ -85,6 +85,7 @@ constexpr uint8_t MSG_MINER_MESSAGE     = 0x02;
 constexpr uint8_t MSG_POOL_ANNOUNCE     = 0x03;
 constexpr uint8_t MSG_VERSION_SIGNAL    = 0x04;
 constexpr uint8_t MSG_MERGED_STATUS     = 0x05;
+constexpr uint8_t MSG_FEATURED_NODE     = 0x06;  // service/presentation: featured dev-node dashboard banner (consensus-neutral, verify-before-render)
 constexpr uint8_t MSG_EMERGENCY         = 0x10;
 constexpr uint8_t MSG_TRANSITION_SIGNAL = 0x20;
 

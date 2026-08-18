@@ -1855,6 +1855,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         //     live v16 DashShare wire format has no message_data field, so at
         //     v16 this blob feeds ONLY the dashboard display/verify path
         //     (rest_version_signaling fallback). See the mint-path note below.
+        // ── Featured developer-node banner: persistence restore ────────────
+        // Load the highest-seq verified banner BEFORE any blob/share
+        // processing so a restart can never resurrect an older message.
+        mi->set_featured_node_state_path(
+            (core::filesystem::config_path() / "featured_node_state.json").string());
+        mi->load_featured_node_state();
+
         if (!operator_message_blob_hex.empty()) {
             if (operator_message_blob_hex.size() % 2 != 0) {
                 LOG_ERROR << "--message-blob-hex must have even length";
@@ -1873,6 +1880,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 return 1;
             }
             mi->set_operator_message_blob(blob);
+            mi->scan_blob_for_featured_node(blob);  // featured-node banner (freshest-wins)
             LOG_INFO << "Operator message blob configured (" << blob.size() << " bytes)";
         }
 
