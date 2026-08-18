@@ -7596,7 +7596,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // false and the bulk lane resumes at full rate. Reward-safe: this
             // only reorders WHO fetches WHEN, never what either derives.
             seams.defer_to_higher_priority = [mnl = mn_ckpt_lane.get()] {
-                return mnl && mnl->bridging_active();
+                // PROGRESS-CONDITIONED (dashd BLOCK_STALLING_TIMEOUT parity):
+                // yield the shared link to the bridge only while its apply
+                // cursor is actually advancing. A bridge frozen on a pending
+                // getmnlistd reply is idle-waiting, not using the link -- so it
+                // must NOT starve the genesis->anchor backfill + body pump. See
+                // MnCheckpointLane::bulk_should_yield().
+                return mnl && mnl->bulk_should_yield();
             };
 
             rp::BulkFetchLane::Config rcfg;

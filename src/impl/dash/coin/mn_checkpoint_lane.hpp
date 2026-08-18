@@ -1417,6 +1417,53 @@ public:
     /// bulk path (a plain cut cold node, the KATs) nothing reads it, and it is
     /// pure telemetry-shaped state — reading it changes nothing.
     bool     bridging_active() const { return m_state == State::Bridging; }
+
+    /// Silence (no cursor advance) after which the bulk-lane defer treats the
+    /// bridge as FROZEN and stops yielding the shared coin-P2P link to it.
+    /// dashd BLOCK_STALLING_TIMEOUT is 2s and adapts up to 64s; the bridge
+    /// legitimately pauses a few seconds per on-demand getmnlistd fold, so this
+    /// sits well above a healthy fold pause (seconds) and well below a real
+    /// freeze (minutes) -- 20s cleanly separates the two, matching the
+    /// 2026-08-18 measurement's 15-30s parity band.
+    static constexpr int64_t kBulkDeferStallMs = 20000;
+
+    /// dashd BLOCK_STALLING_TIMEOUT parity, applied to the shared-demux defer.
+    ///
+    /// bridging_active() is TRUE for the WHOLE Bridging state, including the
+    /// multi-minute freezes the LANE-WATCHDOG measured when the cold bridge
+    /// parks on a single-outstanding getmnlistd reply (217s / 337s / 98s,
+    /// mainnet 2026-08-18). Wiring the bulk-lane defer straight to it turns one
+    /// frozen fold into a TOTAL priority inversion: while the bridge sits
+    /// Bridging-but-idle the genesis->anchor header backfill AND the body pump
+    /// issue NOTHING, so the whole self-derive holds 0 blk/s -- measured 48+ min
+    /// across a restart. dashd has no such coupling: block download
+    /// (FindNextBlocksToDownload) never waits on masternode-state sync;
+    /// CMasternodeSync waits for blocks, never the reverse.
+    ///
+    /// This predicate is what the defer should read instead. It yields the link
+    /// to the bridge ONLY while the bridge is actually progressing -- its apply
+    /// cursor advanced within kBulkDeferStallMs. Once the cursor stands still
+    /// past that window the bridge is, by construction, NOT using the shared
+    /// link (it is idle-waiting on a reply), so the contention the defer guards
+    /// against does not exist and the bulk lane runs. The instant a reply lands
+    /// and the cursor advances, progress() re-stamps the watchdog and this
+    /// returns true again -- priority snaps straight back to the bridge. It
+    /// reorders only WHO fetches WHEN on an idle link, never WHAT either lane
+    /// folds: the bridge's forward-contiguous cursor, its per-block
+    /// merkleRootMNList/merkleRootQuorums self-check and its poison fail-closed
+    /// are all untouched -- reward-safe by exactly the argument #1257 made for
+    /// the reorder buffer.
+    ///
+    /// m_watchdog is armed at the Waiting->Bridging edge and progress()-stamped
+    /// on every cursor advance, so elapsed_ms is precisely "time since the
+    /// bridge last moved". A not-yet-armed or just-armed lane reads elapsed 0
+    /// and holds priority -- correct, a bridge that just started cannot have
+    /// stalled yet.
+    bool bulk_should_yield() const
+    {
+        if (m_state != State::Bridging) return false;
+        return m_watchdog.elapsed_ms(m_now()) < kBulkDeferStallMs;
+    }
     /// How many times the event-driven body re-request (service_tick) has
     /// re-asked a starved window from the cursor. Telemetry / KAT witness only.
     uint64_t service_rerequests() const { return m_service_rerequests; }

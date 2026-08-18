@@ -797,6 +797,83 @@ TEST(DashMnCheckpointBridge, ServiceTickReRequestsAStarvedWindowOffPump)
     EXPECT_FALSE(h.lane.bridging_active());
 }
 
+// ── THE DOMINANT-THROTTLE PORT (2026-08-18 self-derive measurement) ─────────
+// The bulk genesis->anchor lane defers to the MN-checkpoint bridge on the
+// shared coin-P2P link. Before this port that defer read bridging_active(),
+// which is TRUE for the entire Bridging state -- including the multi-minute
+// freezes when the cold bridge parks on a single-outstanding getmnlistd reply.
+// One frozen fold therefore inverted priority TOTALLY: the header backfill and
+// the body pump issued NOTHING and the whole self-derive held 0 blk/s for 48+
+// min across a restart. dashd never gates block download on masternode-sync
+// state (CMasternodeSync waits for blocks, never the reverse).
+//
+// The port makes the defer PROGRESS-CONDITIONED (dashd BLOCK_STALLING_TIMEOUT
+// parity): bulk_should_yield() holds priority only while the bridge's apply
+// cursor is advancing, and releases it the moment the cursor has stood still
+// past kBulkDeferStallMs -- i.e. while the bridge is idle-waiting on a reply
+// and NOT using the link. It reclaims priority instantly on the next advance.
+// FETCH TIMING only: nothing folds, publishes, or moves an anchor here.
+//
+// RED on the pre-port logic (bulk_should_yield()==bridging_active(), true for
+// the whole freeze); GREEN once it is progress-conditioned.
+TEST(DashMnCheckpointBridge, BulkDeferReleasesWhenBridgeFreezesAndReclaimsOnProgress)
+{
+    BridgeHarness h;
+    int64_t clk = 100000;                       // injected wall clock (ms)
+    h.lane.set_clock_fn([&clk] { return clk; });
+    h.auto_deliver = false;                     // WE drive body arrival + the clock
+    h.headers[kAnchorHeight] = uint256S(kAnchorHash);
+    h.blocks[1519544] = block_from_hex(kBlockHex1519544);
+    h.blocks[1519545] = block_from_hex(kBlockHex1519545);
+    h.blocks[1519546] = block_from_hex(kBlockHex1519546);
+    h.tip = 1519546;
+
+    h.lane.arm(good_checkpoint());
+    h.lane.pump();                              // Waiting -> Bridging; watchdog armed @100000
+    ASSERT_EQ(h.lane.state(), MnCheckpointLane::State::Bridging);
+
+    // t0: bridge just armed -> it owns the shared link (bulk yields).
+    EXPECT_TRUE(h.lane.bulk_should_yield())
+        << "a just-armed / actively-progressing bridge keeps link priority";
+
+    // Deliver one body: the cursor advances -> progress() re-stamps the watchdog.
+    h.lane.on_block_connected(h.blocks[1519544], 1519544);
+    ASSERT_EQ(h.lane.cursor_height(), 1519544u);
+    EXPECT_TRUE(h.lane.bulk_should_yield())
+        << "immediately after a cursor advance the bridge still owns the link";
+
+    // Now the bridge FREEZES on the wire (a single-outstanding getmnlistd reply
+    // that never comes). Wall clock crosses the stall window with NO cursor
+    // advance: the bridge is not using the link, so the bulk lane must run.
+    clk += MnCheckpointLane::kBulkDeferStallMs + 1;
+    EXPECT_FALSE(h.lane.bulk_should_yield())
+        << "a bridge frozen past kBulkDeferStallMs must NOT starve the bulk lane"
+           " -- dashd never gates block download on an idle masternode-sync lane";
+
+    // Just below the window the defer would still hold (proves it is the elapsed
+    // time, not merely 'ever advanced', that flips it).
+    clk -= 2;                                    // now exactly kBulkDeferStallMs - 1 since last advance
+    EXPECT_TRUE(h.lane.bulk_should_yield())
+        << "inside the stall window the bridge retains priority";
+    clk += 2;                                    // back past the window
+    EXPECT_FALSE(h.lane.bulk_should_yield());
+
+    // A reply finally lands: the cursor advances, progress() resets the timer,
+    // and the bridge reclaims priority in the same instant.
+    h.lane.on_block_connected(h.blocks[1519545], 1519545);
+    ASSERT_EQ(h.lane.cursor_height(), 1519545u);
+    EXPECT_TRUE(h.lane.bulk_should_yield())
+        << "the instant the bridge advances again it reclaims the shared link";
+
+    // Terminal: once the bridge publishes, the defer is off entirely -- the bulk
+    // lane runs unconditionally (bridging_active() and bulk_should_yield() agree
+    // here: both false when not Bridging).
+    h.lane.on_block_connected(h.blocks[1519546], 1519546);
+    EXPECT_EQ(h.lane.state(), MnCheckpointLane::State::Published);
+    EXPECT_FALSE(h.lane.bulk_should_yield());
+    EXPECT_FALSE(h.lane.bridging_active());
+}
+
 // service_tick() is inert off the bridging state: a Waiting lane (headers not
 // yet at the anchor) and a Published lane must never emit a re-request. Proves
 // the tick cannot disturb a lane that is not mid-replay.
