@@ -520,3 +520,185 @@ TEST(DashDstxFailClosed, BadBlsSignatureIsRejected)
     EXPECT_EQ(st.mempool().size(), 0u)
         << "an unverifiable DSTX must never reach add_dstx";
 }
+
+// ═══ 7. EXCLUSION DISCIPLINE (tx-serving reward-safety, flag default-OFF) ═════
+//
+// The template selector now gates every included member on fee_fold_proven —
+// the bit set ONLY by a genuine W5 UTXO fold (inputs present in our view AND
+// in_sum >= out_sum) — never on fee_known, which a forced-fee DSTX admission
+// (add_tx_locked is_dstx branch) can flip true on inputs the fold could not
+// vouch for. These KATs pin the include/exclude matrix the design requires:
+//   INCLUDE  — a fee-proven valid tx rides at its EXACT base fee; coinbase
+//              total_fees == sum of included proven base fees (never more).
+//   EXCLUDE  — a forced-fee tx whose fold FAILED (unpriceable input, or
+//              in_sum < out_sum money-creation) is admitted to the RELAY pool
+//              (fee_known) but is NEVER a template member (fee_fold_proven
+//              stays false). On master (pre-fix) the money-creating tx clears
+//              the vin-present guard and is PACKED at fee 0 — a lost block.
+//   CONFIRMED— an already-confirmed tx is rejected at admission (#125) and
+//              conflict/confirm-evicted at connect (remove_for_block); the
+//              selector's fold-belt is the third, independent layer.
+
+namespace {
+
+// A minimal fee-lane fixture: connect a coinbase whose outputs seed the view,
+// so the mempool fold can price (or fail to price) spends of those outputs.
+struct FeeLane {
+    NodeCoinState st;
+    UtxoLane      lane;
+    Mempool&      mp;
+    uint256       cb_txid;
+
+    FeeLane() : mp(st.mempool())
+    {
+        EXPECT_TRUE(lane.open(""));
+        lane.attach(mp);
+    }
+    // Seed a coinbase at height 1 with the given (value, tag) outputs.
+    void seed(std::vector<std::pair<int64_t, uint8_t>> outs)
+    {
+        auto cb = make_coinbase(std::move(outs), /*salt=*/11);
+        lane.on_block_connected(make_block({cb}, /*salt=*/11), /*height=*/1);
+        cb_txid = dash_txid(cb);
+    }
+};
+
+} // namespace
+
+// INCLUDE: a normal tx spending a seeded output at a real positive fee is
+// fold-proven, selected, and its EXACT base fee flows into total_fees.
+TEST(DashExclusionDiscipline, FeeProvenValidTxIncludedWithExactFee)
+{
+    FeeLane f;
+    f.seed({{200'000, 0x04}});
+
+    MutableTransaction tx;
+    tx.version = 1; tx.type = 0; tx.locktime = 3;
+    tx.vin.push_back(make_input(f.cb_txid, 0));
+    tx.vout.push_back(make_output(150'000, p2pkh_script(0x50)));  // fee 50'000
+    const uint256 txid = dash_txid(tx);
+    ASSERT_TRUE(f.mp.add_tx(tx));
+
+    auto e = f.mp.get_entry(txid);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_TRUE(e->fee_known);
+    EXPECT_TRUE(e->fee_fold_proven);          // the selection predicate
+    EXPECT_EQ(e->fee, 50'000u);
+
+    auto [sel, fees] = f.mp.get_sorted_txs_with_fees(1u << 20);
+    ASSERT_EQ(sel.size(), 1u) << "a fold-proven positive-fee tx must be included";
+    EXPECT_EQ(dash_txid(sel[0].tx), txid);
+    EXPECT_EQ(sel[0].fee, 50'000u);
+    EXPECT_EQ(fees, 50'000u)                   // coinbase fee-sum is EXACT
+        << "total_fees must equal the sum of included proven base fees";
+}
+
+// EXCLUDE (the red/green core): a MONEY-CREATING tx (inputs present in the
+// view but out_sum > in_sum) force-admitted like a DSTX gets fee_known=true /
+// fee=0, so it rides the relay pool — but fee_fold_proven stays FALSE, so it is
+// NEVER a template member. On master the vin-present guard passes and it is
+// packed at fee 0, invalidating the block (bad-txns-in-belowout). This is the
+// hole the exclusion discipline closes.
+TEST(DashExclusionDiscipline, MoneyCreatingForcedFeeTxExcluded)
+{
+    FeeLane f;
+    f.seed({{100'000, 0x04}});   // the only input value available
+
+    MutableTransaction tx;
+    tx.version = 1; tx.type = 0; tx.locktime = 4;
+    tx.vin.push_back(make_input(f.cb_txid, 0));           // 100'000 in
+    tx.vout.push_back(make_output(200'000, p2pkh_script(0x51)));  // 200'000 out
+    const uint256 txid = dash_txid(tx);
+
+    // Force-admit exactly as the DSTX intake does when the fold can't vouch.
+    ASSERT_TRUE(f.mp.add_dstx(tx));
+
+    auto e = f.mp.get_entry(txid);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_TRUE(e->fee_known)  << "forced admission keeps it in the relay pool";
+    EXPECT_EQ(e->fee, 0u)      << "understate-only: forced fee is 0";
+    EXPECT_FALSE(e->fee_fold_proven)
+        << "the fold FAILED (in_sum < out_sum) — must never be fold-proven";
+
+    auto [sel, fees] = f.mp.get_sorted_txs_with_fees(1u << 20);
+    EXPECT_EQ(sel.size(), 0u)
+        << "a money-creating forced-fee tx must NEVER be a template member";
+    EXPECT_EQ(fees, 0u);
+    // Belt: it is also absent from the selected txids.
+    for (const auto& s : sel) EXPECT_NE(dash_txid(s.tx), txid);
+}
+
+// EXCLUDE: a forced-fee DSTX whose inputs the view cannot price at all
+// (unknown prevouts) is admitted (fee_known) yet excluded (fee_fold_proven
+// false). Distinct from the money-creating case: here the fold fails on
+// missing-input, not on negative balance.
+TEST(DashExclusionDiscipline, UnpriceableForcedFeeTxExcluded)
+{
+    FeeLane f;   // nothing seeded → the DSTX prevouts are unknown
+
+    auto dstx_tx = make_dstx_tx(raw256(0x77), /*salt=*/9);
+    const uint256 txid = dash_txid(dstx_tx);
+    ASSERT_TRUE(f.mp.add_dstx(dstx_tx));
+
+    auto e = f.mp.get_entry(txid);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_TRUE(e->fee_known);
+    EXPECT_FALSE(e->fee_fold_proven);
+
+    auto [sel, fees] = f.mp.get_sorted_txs_with_fees(1u << 20);
+    EXPECT_EQ(sel.size(), 0u)
+        << "an unpriceable forced-fee tx must never be a template member";
+    EXPECT_EQ(fees, 0u);
+}
+
+// EXCLUDE: a fold-PRICEABLE DSTX (inputs present, balanced) rides at its true
+// base fee — the discipline excludes only what the fold could not prove, not
+// every DSTX. (Companion to VerifiedDstxRanksFirstAndFeesStayBase, asserting
+// the new bit directly.)
+TEST(DashExclusionDiscipline, PriceableDstxKeepsFoldProvenAndRides)
+{
+    FeeLane f;
+    // Three denomination coins the balanced 3-in/3-out DSTX spends.
+    f.seed({{kDenom, 0x01}, {kDenom, 0x02}, {kDenom, 0x03}});
+    auto dstx_tx = make_dstx_tx(f.cb_txid, /*salt=*/7);
+    const uint256 txid = dash_txid(dstx_tx);
+    ASSERT_TRUE(f.mp.add_dstx(dstx_tx));
+
+    auto e = f.mp.get_entry(txid);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_TRUE(e->fee_known);
+    EXPECT_TRUE(e->fee_fold_proven)
+        << "a balanced, priceable DSTX is fold-proven and template-eligible";
+    EXPECT_EQ(e->fee, 0u);   // in_sum == out_sum → base fee 0
+}
+
+// CONFIRMED (#125 + selector belt): an already-confirmed tx is refused at
+// re-admission (its inputs are now spent, its own outputs are coins) and is
+// never in the pool, so it can never be a template member.
+TEST(DashExclusionDiscipline, AlreadyConfirmedTxRejectedAndUnselectable)
+{
+    FeeLane f;
+    f.seed({{200'000, 0x04}});
+
+    MutableTransaction tx;
+    tx.version = 1; tx.type = 0; tx.locktime = 5;
+    tx.vin.push_back(make_input(f.cb_txid, 0));
+    tx.vout.push_back(make_output(150'000, p2pkh_script(0x52)));
+    const uint256 txid = dash_txid(tx);
+
+    // Confirm tx in a block (a coinbase MUST lead so `tx` is treated as a
+    // regular tx whose input is actually spent): input spent, own output
+    // becomes a coin, pool evicts it via remove_for_block.
+    auto cb2 = make_coinbase({{500'000, 0x09}}, /*salt=*/13);
+    f.lane.on_block_connected(make_block({cb2, tx}, /*salt=*/12), /*height=*/2);
+    EXPECT_FALSE(f.mp.contains(txid));
+
+    // #125: re-relaying the confirmed tx is rejected at admission.
+    EXPECT_FALSE(f.mp.add_tx(tx))
+        << "an already-confirmed tx must be refused (txn-already-known)";
+    EXPECT_FALSE(f.mp.contains(txid));
+
+    auto [sel, fees] = f.mp.get_sorted_txs_with_fees(1u << 20);
+    for (const auto& s : sel) EXPECT_NE(dash_txid(s.tx), txid);
+    EXPECT_EQ(fees, 0u);
+}

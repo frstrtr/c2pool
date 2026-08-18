@@ -95,6 +95,19 @@ struct MempoolEntry {
     // 0 everywhere else = byte-identical ordering (modified == base).
     uint64_t fee_delta{0};
     bool     fee_known{false};
+    // EXCLUSION-DISCIPLINE selection predicate (tx-serving reward-safety).
+    // fee_known is TWO things: "priceable via the W5 UTXO fold" OR "a DSTX
+    // whose fee was FORCED to 0 because the fold could not price it"
+    // (add_tx_locked is_dstx branch). The forced case sets fee_known=true on
+    // inputs the fold could NOT vouch for, so fee_known ⇏ inputs-proven-present
+    // — unsafe to SELECT a template member on. fee_fold_proven is set ONLY by
+    // compute_fee_locked success (every vin priced from our own UTXO view /
+    // in-pool parent, in_sum >= out_sum, or an input-free type-9 with a
+    // well-formed explicit-fee payload). It is the ONE bit that proves BOTH
+    // invariant-1 "inputs available in our UTXO view" AND invariant-2 "fee is
+    // fold-exact, never overstated". The template selector gates on THIS, never
+    // on fee_known; fee_known stays the RELAY/index/stats predicate unchanged.
+    bool     fee_fold_proven{false};
     time_t   time_added{0};
 
     uint64_t modified_fee() const { return fee + fee_delta; }
@@ -528,9 +541,19 @@ private:
         // W5-B: a BLS-verified DSTX whose inputs the view cannot price is
         // admitted at fee=0 (see add_dstx — understate-only, reward-safe);
         // a priceable one keeps its computed base fee.
+        //
+        // EXCLUSION-DISCIPLINE: this FORCES fee_known=true so the DSTX rides
+        // the relay pool / feerate index, but it does NOT set fee_fold_proven
+        // — the fold could not vouch for these inputs (or priced in_sum <
+        // out_sum). So the template selector, which gates on fee_fold_proven,
+        // EXCLUDES this entry: an unpriceable DSTX collects no fee and never
+        // risks a lost block, while a fold-priceable DSTX (fee_known already
+        // true above) keeps fee_fold_proven=true and rides at its true base
+        // fee. This is the ONE in-tree hole the discipline closes.
         if (is_dstx && !entry.fee_known) {
             entry.fee = 0;
             entry.fee_known = true;
+            // entry.fee_fold_proven deliberately stays false → template-excluded.
         }
 
         // LRU eviction if over size cap.
@@ -987,7 +1010,13 @@ public:
         const AncState anc = build_anc_state_locked();
         std::set<FeeKey> anc_index;
         for (const auto& [txid, e] : m_pool) {
-            if (!e.fee_known) continue;
+            // EXCLUSION-DISCIPLINE: candidate ONLY if the fold proved the fee
+            // (inputs present in our view, in_sum >= out_sum). fee_known alone
+            // admits a DSTX force-priced at 0 on inputs the fold could not
+            // vouch for — a template MUST NOT select on that. delta==0 for
+            // every fee_fold_proven non-DSTX entry, so with no forced entries
+            // in the pool this loop is byte-identical to the fee_known form.
+            if (!e.fee_fold_proven) continue;
             if (anc.over_limit.count(txid)) continue;
             // W5-B: SCORE on the MODIFIED fee (dashd sorts on
             // GetModFeesWithAncestors); delta==0 ⇒ byte-identical to base.
@@ -1166,7 +1195,11 @@ public:
             uint64_t pkg_fees   = 0;
             uint32_t pkg_sigops = 0;
             for (const auto* e : package) {
-                if (!e->fee_known) { ok = false; break; }
+                // EXCLUSION-DISCIPLINE: a member is includable ONLY if its fee
+                // was fold-proven (inputs present + in_sum >= out_sum). A
+                // force-priced DSTX (fee_known, fee_fold_proven==false) drops
+                // its WHOLE package here — never packed, never a lost block.
+                if (!e->fee_fold_proven) { ok = false; break; }
                 if (exclude_special && e->tx.type != 0) { ok = false; break; }
 
                 // ── dashd TestPackageTransactions (node/miner.cpp:374-391),
@@ -1580,12 +1613,12 @@ private:
                 if (memo != anc.end()) return memo->second;
                 std::set<uint256> acc;
                 auto it = m_pool.find(txid);
-                if (it != m_pool.end() && it->second.fee_known) {
+                if (it != m_pool.end() && it->second.fee_fold_proven) {
                     for (const auto& vin : it->second.tx.vin) {
                         const uint256& p = vin.prevout.hash;
                         auto pit = m_pool.find(p);
-                        if (pit == m_pool.end() || !pit->second.fee_known)
-                            continue;   // edge leaves the fee_known pool
+                        if (pit == m_pool.end() || !pit->second.fee_fold_proven)
+                            continue;   // edge leaves the fold-proven pool
                         acc.insert(p);
                         const auto& panc = closure(p);
                         acc.insert(panc.begin(), panc.end());
@@ -1595,7 +1628,11 @@ private:
             };
 
         for (const auto& [txid, e] : m_pool) {
-            if (!e.fee_known) continue;
+            // EXCLUSION-DISCIPLINE: ancestor aggregates + over_limit are built
+            // over fold-proven entries only, so a force-priced DSTX is invisible
+            // to scoring/ordering exactly as it is to selection. With no forced
+            // entries this is byte-identical to the fee_known form.
+            if (!e.fee_fold_proven) continue;
             const auto& a = closure(txid);
             uint32_t cnt = static_cast<uint32_t>(a.size()) + 1;
             uint64_t szf = e.base_size;
@@ -1703,15 +1740,20 @@ private:
                                                   payload)) {
                 entry.fee = payload.fee;
                 entry.fee_known = true;
+                // Explicit, exact miner fee from the DIP-0027 payload (no UTXO
+                // fold needed, never overstated) → fold-proven for selection.
+                entry.fee_fold_proven = true;
                 return true;
             }
             entry.fee_known = false;
+            entry.fee_fold_proven = false;
             entry.fee = 0;
             return false;
         }
 
         if (!utxo) {
             entry.fee_known = false;
+            entry.fee_fold_proven = false;
             return false;
         }
         uint64_t in_sum = 0, out_sum = 0;
@@ -1731,6 +1773,7 @@ private:
                 continue;
             }
             entry.fee_known = false;
+            entry.fee_fold_proven = false;
             entry.fee = 0;
             return false;
         }
@@ -1738,14 +1781,21 @@ private:
             out_sum += static_cast<uint64_t>(vout.value);
         }
         if (in_sum < out_sum) {
-            // Negative fee — invalid tx; mark unknown so we don't
-            // poison block templates with garbage values.
+            // Negative fee — invalid tx (spends more than its inputs hold);
+            // mark unknown so we don't poison block templates with garbage
+            // values. fee_fold_proven stays false → template-excluded even if
+            // a DSTX force later flips fee_known (the money-creating hole).
             entry.fee_known = false;
+            entry.fee_fold_proven = false;
             entry.fee = 0;
             return false;
         }
         entry.fee = in_sum - out_sum;
         entry.fee_known = true;
+        // Every vin priced from our own UTXO view / in-pool parent and
+        // in_sum >= out_sum → the fee is fold-exact and inputs are proven
+        // present. This is the ONE bit the template selector trusts.
+        entry.fee_fold_proven = true;
         return true;
     }
 };
