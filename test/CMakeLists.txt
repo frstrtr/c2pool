@@ -440,6 +440,20 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_share_messages PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_share_messages "" AUTO)
 
+    # Featured developer-node banner (signed authority subtype 0x06): freshest-
+    # wins / replay-protection / persistence (core::FeaturedNodeStore) + the
+    # ECDSA sign-then-verify render gate (dash share-message crypto). Consensus-
+    # neutral presentation feature; no share/target/payout link needed.
+    add_executable(test_dash_featured_node test_featured_node.cpp)
+    target_link_libraries(test_dash_featured_node PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_featured_node PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_featured_node "" AUTO)
+
     add_executable(test_dash_stratum_binding test_dash_stratum_binding.cpp)
     target_link_libraries(test_dash_stratum_binding PRIVATE
         GTest::gtest_main GTest::gtest
