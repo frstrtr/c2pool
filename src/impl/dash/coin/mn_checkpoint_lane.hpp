@@ -343,6 +343,25 @@ public:
     /// level APPLY GAP before fail_closed. Optional — unset keeps the
     /// terminal fail_closed behavior byte-identical.
     void set_gap_repair(MnGapRepairFn fn)        { m_gap_repair = std::move(fn); }
+
+    /// ── THE MN-DIFF-STORE WRITE FEED (dashd-cut ARM) ──────────────────────
+    /// Called with (block, height) the instant AFTER m_machine.apply_block()
+    /// has folded a bridge block CLEANLY at the contiguous cursor — no gap, no
+    /// surviving payee desync, non-empty set. main_dash wires this to a
+    /// PARALLEL DmlFoldEngine (seeded at the same bridge anchor) so the store
+    /// writer's root+payee-checked per-block diffs are produced off the very
+    /// blocks this lane replays. The parallel engine self-checks each fold
+    /// against the block's committed merkleRootMNList and only its OWN commit
+    /// sinks MnDiffWriter::on_folded, so a seed the engine cannot reproduce
+    /// (e.g. an SML-incomplete anchor) simply poisons the engine and the store
+    /// never populates — never a wrong row. Forward-contiguous by construction:
+    /// this fires once per height, in ascending order, exactly as the engine's
+    /// own forward-only cursor demands. Optional — unset is a no-op.
+    void set_on_block_applied(std::function<void(const BlockType&, uint32_t)> fn)
+    {
+        m_on_block_applied = std::move(fn);
+    }
+
     /// OPTIONAL. Unwired, the bridge behaves exactly as it did before this
     /// seam existed: any payee mismatch during replay is terminal.
     void set_sml_validity_fn(SmlValidityFn fn)
@@ -1337,6 +1356,17 @@ public:
     /// "never evaluated", NOT "evaluated and zero", and the reports say n/a.
     size_t   ondemand_folds()     const { return m_ondemand_folds; }
     size_t   ondemand_excluded()  const { return m_ondemand_excluded; }
+    /// Masternodes whose queue ORDERING (nPoSeRevivedHeight) an on-demand fold
+    /// repaired — a ProUpServTx-revive this bridge applied with the ban
+    /// UNMEASURED, healed forward instead of fail-closing. 0 on a bridge that
+    /// never guessed a revive. See repair_unmeasured_revive_ordering().
+    size_t   ordering_repaired()  const { return m_ordering_repaired; }
+    /// dashd-cut SOURCE: pre-block ban states resolved 0-RTT from the diff
+    /// store instead of a capped network round trip. > 0 means the ARM's store
+    /// SERVED the bridge; a probe/fold cap was not reached because it did not
+    /// need to be. See begin_revive_probe() / the payee-desync store re-apply.
+    size_t   revive_measured_from_store()   const { return m_revive_measured_from_store; }
+    size_t   ondemand_resolved_from_store() const { return m_ondemand_resolved_from_store; }
     size_t   ondemand_cap()       const { return m_ondemand_cap; }
     bool     ondemand_cap_hit()   const { return m_ondemand_cap_hit; }
     bool     ondemand_evaluated() const { return m_ondemand_evaluated; }
@@ -1863,6 +1893,45 @@ public:
         // ask for an RPC re-seed — daemonless has nothing to re-seed from, and
         // guessing is exactly what must never happen).
         if (r.payee_desync && !r.gap_detected) {
+            // ── STORE-FIRST (0-RTT), the on-demand analogue of the ban-state
+            // probe's store-first path in begin_revive_probe(). Before spending
+            // a CAPPED network on-demand fold, ask the diff store for the
+            // AUTHORITATIVE pre-block list AS OF height-1 and RE-APPLY this
+            // block off it — the exact load+re-apply idiom the apply-gap repair
+            // above (r.gap_detected) already uses. The store reconstruct()
+            // returns only a list that re-hashes to the block's committed
+            // merkleRootMNList AND carries payee_verified on every constituent
+            // diff (mn_diff_store.hpp:788,849-857), so re-projecting block
+            // `height`'s payee off it derives EXACTLY the payee dashd's own
+            // list at height-1 projects — the h=2516072 unmeasured-revive
+            // ordering desync heals because the store already recorded
+            // nPoSeRevivedHeight. mark_ban_state_measured(height-1) so the
+            // re-apply's revive gate is decided, not guessed. A refusal (store
+            // absent / row missing / unverified) leaves r untouched and the
+            // network on-demand fold below runs byte-for-byte as before — the
+            // cap is NOT widened, it is simply not reached for the store-covered
+            // case.
+            if (m_gap_repair && height >= 1) {
+                auto rep = m_gap_repair(height - 1);
+                if (rep.ok && !rep.entries.empty() && rep.as_of == height - 1) {
+                    m_machine.load(std::move(rep.entries), height - 1);
+                    m_machine.mark_ban_state_measured(height - 1);
+                    ++m_ondemand_resolved_from_store;
+                    LOG_INFO
+                        << "[MN-CKPT] PAYEE DESYNC at h=" << height
+                        << " RESOLVED FROM STORE (source="
+                        << kPayeeSourceMnDiffRepair << "): re-applied the block "
+                           "off the diff store's authoritative pre-block list AS "
+                           "OF h=" << (height - 1)
+                        << " (0-RTT, root+payee verified) — NO on-demand network "
+                           "fold spent, the "
+                        << m_ondemand_folds << "/" << m_ondemand_cap
+                        << " on-demand budget is untouched.";
+                    r = m_machine.apply_block(block, height);
+                }
+            }
+        }
+        if (r.payee_desync && !r.gap_detected) {
             // ── ON-DEMAND FOLD. The mismatch IS the trigger: ask for the
             // masternode list dated exactly at this height and re-adjudicate.
             // Returns true when the request was issued (the replay is now
@@ -1887,6 +1956,11 @@ public:
         m_next = height + 1;
         ++m_applied;
         note_replay_advance(block);
+        // ── MN-DIFF-STORE WRITE FEED (dashd-cut ARM). The block folded
+        // CLEANLY at the contiguous cursor; hand it to the parallel fold
+        // engine so the store writer emits this height's root+payee-checked
+        // diff. Forward-contiguous, once per height, in order.
+        if (m_on_block_applied) m_on_block_applied(block, height);
         // #91: DELIVERED, and only now. Every guard above had to pass — no
         // gap, no payee desync, a non-empty set — before this height is a
         // height a restart may resume from.
@@ -2555,6 +2629,41 @@ public:
         const auto cands = m_machine.unmeasured_revive_candidates(block, height);
         if (cands.empty()) return false;
 
+        // ── STORE-FIRST (0-RTT, dashd GetListForBlockInternal). Before
+        // spending a CAPPED network probe, ask the diff store for the list AS
+        // OF height-1 — the exact pre-block list dashcore consults to decide
+        // whether a ProUpServTx revives (specialtxman.cpp:361-370). The store
+        // reconstruct() REFUSES any list that does not re-hash to the block's
+        // committed merkleRootMNList (mn_diff_store.hpp:849-857) and the SML
+        // entry commits isValid, so a list it returns AT height-1 carries
+        // dashd's own ban state there — every bit as authoritative as the
+        // fetched height-exact snapshot, at zero round trips. load() it and
+        // mark the ban state measured, which makes ban_state_measured_for(
+        // height) true, so unmeasured_revive_candidates(height) is now empty
+        // and apply_block decides the revive gate correctly WITHOUT a probe.
+        // Only fall through to the network probe when the store is absent or
+        // refuses (a missing/unverified row) — the cap is NEVER widened, it is
+        // simply not reached for the store-covered case.
+        if (m_gap_repair && height >= 1) {
+            auto rep = m_gap_repair(height - 1);
+            if (rep.ok && !rep.entries.empty() && rep.as_of == height - 1) {
+                m_machine.load(std::move(rep.entries), height - 1);
+                m_machine.mark_ban_state_measured(height - 1);
+                ++m_revive_measured_from_store;
+                LOG_INFO
+                    << "[MN-CKPT] BAN-STATE MEASURED FROM STORE at h=" << height
+                    << " (source=" << kPayeeSourceMnDiffRepair << "): the "
+                    << cands.size() << " ProUpServTx here had their pre-block "
+                       "ban state resolved from the diff store's height-exact "
+                       "list AS OF h=" << (height - 1)
+                    << " (0-RTT, root+payee verified) — NO network probe spent, "
+                       "the "
+                    << m_revive_probes << "/" << m_revive_probe_cap
+                    << " probe budget is untouched.";
+                return false;   // measured; apply proceeds, replay NOT paused
+            }
+        }
+
         if (m_revive_probes >= m_revive_probe_cap) {
             m_revive_probe_cap_hit = true;
             LOG_WARNING
@@ -2947,6 +3056,30 @@ private:
         apply_fold(sml, height);
         if (m_state != State::Bridging) return;   // F5 refused; already closed
 
+        // ── ORDERING REPAIR, before the exclusion walk. A masternode revived
+        // by a ProUpServTx we applied with the ban UNMEASURED keeps
+        // nPoSeRevivedHeight=0 and stays the projected head even though this
+        // height-exact list attests it VALID — the h=2516072 wedge, where the
+        // exclusion-only re-adjudication cannot demote a candidate the list
+        // (correctly) calls valid. This writes the nPoSeRevivedHeight dashd
+        // wrote and re-sorts the pending queue, so the walk below adjudicates
+        // against the queue dashd holds. No-op when there is no unmeasured
+        // revive to repair — the ordinary exclusion path is unchanged.
+        const size_t reordered =
+            m_machine.repair_unmeasured_revive_ordering(sml);
+        if (reordered) {
+            m_ordering_repaired += reordered;
+            LOG_WARNING
+                << "[MN-CKPT] ON-DEMAND ORDERING REPAIR at h=" << height << ": "
+                << reordered << " masternode(s) revived by a ProUpServTx applied"
+                   " with the ban UNMEASURED had their nPoSeRevivedHeight"
+                   " restored to dashd's value from the height-exact list, and"
+                   " the payee queue re-sorted. This repairs a queue-ORDERING"
+                   " desync the exclusion-only re-adjudication cannot — the"
+                   " projected candidate was attested VALID, so it was the"
+                   " ORDER that diverged, not the ban state.";
+        }
+
         const auto rr =
             m_machine.readjudicate_payee(m_ondemand_block, height, sml);
         if (!rr.recovered) {
@@ -2978,6 +3111,11 @@ private:
         // after this line. Recording progress here is what gives the watchdog a
         // truthful last-progress timestamp to measure that freeze from.
         note_replay_advance(m_ondemand_block);
+        // MN-DIFF-STORE WRITE FEED (dashd-cut ARM): the on-demand fold resolved
+        // the mismatch and the block is now applied at the contiguous cursor —
+        // feed it to the parallel engine exactly as the ordinary post-apply
+        // path does, so the store's per-height diff chain has no hole here.
+        if (m_on_block_applied) m_on_block_applied(m_ondemand_block, height);
         m_sml_recovered += m_ondemand_r.sml_recovered;
         m_registered    += m_ondemand_r.registered;
         m_spent         += m_ondemand_r.spent;
@@ -3134,6 +3272,14 @@ public:
             + "), " + std::to_string(m_ondemand_excluded)
             + " queue-head exclusion(s) licensed by a list dated EXACTLY at the"
               " height it judged.";
+        if (m_ordering_repaired != 0) {
+            s += " " + std::to_string(m_ordering_repaired)
+                 + " queue-ORDERING repair(s): a ProUpServTx-revive applied with"
+                   " the ban UNMEASURED had nPoSeRevivedHeight restored to"
+                   " dashd's value from the height-exact list and the payee queue"
+                   " re-sorted, healing the mismatch forward instead of failing"
+                   " closed.";
+        }
         if (m_ondemand_cap_hit) {
             s += " THE CAP IS EXHAUSTED: " + std::to_string(m_ondemand_folds)
                  + " of " + std::to_string(m_ondemand_cap)
@@ -3686,6 +3832,9 @@ public:
         m_ondemand_cap_hit   = false;
         m_ondemand_evaluated = false;
         m_ondemand_abandoned = 0;
+        m_ordering_repaired  = 0;
+        m_revive_measured_from_store   = 0;
+        m_ondemand_resolved_from_store = 0;
         m_ondemand_block     = BlockType{};
         m_ondemand_r         = MnStateMachine::ApplyResult{};
         // The SIZED cap, which #1033's arm() did not reset. pump() recomputes
@@ -3806,6 +3955,16 @@ public:
     HeaderHashAtFn m_header_hash_at;
     SmlSnapshotFn  m_sml_snapshot;
     MnGapRepairFn  m_gap_repair;     // diff-store gap repair; unset = terminal fail_closed as before
+    // dashd-cut ARM: parallel-fold write feed (main_dash → DmlFoldEngine +
+    // MnDiffWriter). Unset is a no-op, so a bridge with no store wired behaves
+    // exactly as before.
+    std::function<void(const BlockType&, uint32_t)> m_on_block_applied;
+    // dashd-cut SOURCE observability: pre-block ban state resolved from the
+    // diff store (0-RTT) instead of a capped network probe/fold. These are the
+    // counts that prove the store SERVED — a green run has probe/fold caps
+    // untouched and these > 0.
+    size_t m_revive_measured_from_store{0};   // begin_revive_probe store hits
+    size_t m_ondemand_resolved_from_store{0}; // payee-desync store re-applies
 
     State       m_state{State::Unarmed};
     std::string m_status{"unarmed"};
@@ -3858,6 +4017,7 @@ public:
     bool      m_ondemand_cap_hit{false};
     bool      m_ondemand_evaluated{false};     // a mismatch ever reached it
     size_t    m_ondemand_abandoned{0};         // on-demand asks never answered
+    size_t    m_ordering_repaired{0};          // nPoSeRevivedHeight healed forward
     // ── BAN-STATE PROBE state. Rides the SAME m_snapshot_pending pause and
     // the SAME reply route as a scheduled fold — it IS a scheduled fold, just
     // scheduled by a ProUpServTx instead of by a counter. m_revive_probe_at is

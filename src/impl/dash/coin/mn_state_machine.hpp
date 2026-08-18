@@ -446,6 +446,10 @@ public:
         // set is reloaded. Leaving it would let a re-armed lane re-adjudicate
         // an old height against a new set.
         m_pending = PendingPayeeAdjudication{};
+        // The unmeasured-revive ordering ledger describes THESE entries; a
+        // reload retires it for the same reason the ban-state measurement is
+        // retired above.
+        m_unmeasured_revive_at.clear();
         for (auto& [h, st] : entries) {
             m_collateral_index[st.collateralOutpoint] = h;
             m_entries.emplace(h, std::move(st));
@@ -471,6 +475,25 @@ public:
     {
         return m_ban_state_measured_at != 0
             && m_ban_state_measured_at + 1 == height;
+    }
+
+    /// Declare the PoSe ban state of THIS set measured as-of `height` — the
+    /// same fact sync_validity_from_sml() records, but for a set loaded from
+    /// the diff store instead of folded from a fetched SML.
+    ///
+    /// The diff store's reconstruct() only ever returns a list that RE-HASHES
+    /// to the block's committed merkleRootMNList (mn_diff_store.hpp:849-857),
+    /// and the SML entry commits isValid — so a store-reconstructed list AT
+    /// `height` carries dashd's own pre-block ban state at `height`, exactly
+    /// what a fetched height-exact snapshot would. load() clears
+    /// m_ban_state_measured_at (the measurement described the OLD entries), so
+    /// a store-sourced load must re-assert it or ban_state_measured_for()
+    /// stays false and the caller wastes a network probe on a set it already
+    /// measured. Reward-safe by construction: a wrong store row cannot reach
+    /// here — it is REFUSED at reconstruct() before load() is ever called.
+    void mark_ban_state_measured(uint32_t height)
+    {
+        m_ban_state_measured_at = height;
     }
 
     /// The proTxHashes in `block` whose revive outcome this machine cannot
@@ -1034,6 +1057,42 @@ public:
             return false;
         };
 
+        // ── ORDERING-REPAIR fast path. The exclusion walk only ever
+        // attributes to a RUNNER-UP, after demoting a banned head — it cannot
+        // accept a head that is itself the correct paid payee. But when the
+        // mismatch was a queue-ORDERING artifact (a ProUpServTx-revive applied
+        // with the ban unmeasured, since repaired and re-sorted by
+        // repair_unmeasured_revive_ordering()), the projected head is now the
+        // masternode dashd actually paid — there is nothing to exclude. If the
+        // (re-sorted) head's scriptPayout IS paid by this coinbase and the
+        // height-exact list does not attest it INVALID, attribute the payment
+        // to it directly, exactly as a clean apply_block pass-3 would. On a
+        // genuine PoSe-ban desync the head is NOT paid (that is why it
+        // mismatched), so this is skipped and the exclusion walk runs
+        // unchanged.
+        if (!m_pending.ranked.empty()) {
+            auto hit = m_entries.find(m_pending.ranked.front());
+            if (hit != m_entries.end()
+                && paid_in_cb(hit->second.scriptPayout.m_data)) {
+                const std::optional<bool> ha = attest(m_pending.ranked.front());
+                if (!ha.has_value() || *ha) {
+                    mark_paid_entry(hit, height);
+                    out.recovered = true;
+                    out.accepted  = m_pending.ranked.front();
+                    LOG_WARNING
+                        << "[MNS-SM] ON-DEMAND RE-ADJUDICATION h=" << height
+                        << ": the projected payee "
+                        << out.accepted->GetHex().substr(0, 16)
+                        << " is itself paid by this coinbase after the"
+                           " revive-height ORDERING repair re-sorted the queue"
+                           " — the mismatch was a queue-position artifact, not a"
+                           " ban. Payment attributed to it; no exclusion needed.";
+                    m_pending = PendingPayeeAdjudication{};
+                    return out;
+                }
+            }
+        }
+
         const WalkOutcome w =
             walk_to_paid_candidate(m_pending.ranked, attest, paid_in_cb);
         if (!w.accepted) {
@@ -1067,6 +1126,101 @@ public:
                        " height.";
         m_pending = PendingPayeeAdjudication{};
         return out;
+    }
+
+    /// ─────────────────────────────────────────────────────────────────────
+    /// repair_unmeasured_revive_ordering — the ORDERING arm of the on-demand
+    /// PoSe repair (mainnet h=2516072, proTx f513574b70a029ef)
+    /// ─────────────────────────────────────────────────────────────────────
+    ///
+    /// readjudicate_payee re-decides EXCLUSION (ban/valid) and NEVER ORDERING.
+    /// A masternode revived by a ProUpServTx this machine applied while the
+    /// pre-block ban state was UNMEASURED keeps nPoSeRevivedHeight=0, so
+    /// payee_score() sorts it by its stale nLastPaidHeight — ~one queue length
+    /// too early — and it stays the projected head even after the height-exact
+    /// masternode list (correctly) attests it VALID. That is the fail-closed
+    /// WEDGE the exclusion-only re-adjudication cannot repair: the projected
+    /// candidate is attested valid, so nothing is demoted, and the mismatch
+    /// SURVIVES the fold.
+    ///
+    /// dashd's BuildNewListFromBlock applies CDeterministicMNState::Revive(h)
+    /// on a ProUpServTx whenever the masternode IsBanned() pre-block
+    /// (specialtxman.cpp:361-370), setting nPoSeRevivedHeight = the ProUpServTx
+    /// height. The masternode list dated EXACTLY at the mismatch height (the
+    /// one begin_ondemand_fold fetched and DIP-4 client-verified) IS dashd's
+    /// own answer to "was it banned when the revive landed": if it attests the
+    /// masternode VALID here, the revive DID happen, so we write the SAME
+    /// nPoSeRevivedHeight dashd wrote — the height we OBSERVED the ProUpServTx
+    /// at — and re-sort the pending queue. Nothing is guessed: the height is
+    /// recorded from the block, and it is applied only under height-exact
+    /// confirmation. A list that attests INVALID or is silent licenses nothing
+    /// (the exclusion walk owns that case). Returns the number of masternodes
+    /// whose ordering was repaired.
+    ///
+    /// Call BETWEEN apply_fold() and readjudicate_payee() on the on-demand
+    /// path: the fold reconciles ban/valid, this repairs the queue position,
+    /// and the walk then adjudicates against the queue dashd actually holds.
+    size_t repair_unmeasured_revive_ordering(
+        const vendor::CSimplifiedMNList& sml)
+    {
+        if (m_unmeasured_revive_at.empty()) return 0;
+        std::map<uint256, bool> attested;
+        for (const auto& e : sml.mnList) attested[e.proRegTxHash] = e.isValid;
+
+        size_t repaired = 0;
+        for (auto pit = m_unmeasured_revive_at.begin();
+             pit != m_unmeasured_revive_at.end(); ) {
+            const uint256& protx    = pit->first;
+            const uint32_t revive_h = pit->second;
+            auto ait = attested.find(protx);
+            auto eit = m_entries.find(protx);
+            // Repair ONLY when the height-exact list ATTESTS VALID (the revive
+            // really happened) AND we still hold the entry. Absent, invalid, or
+            // spent: leave the ledger entry and let the exclusion walk decide.
+            if (ait == attested.end() || !ait->second
+                || eit == m_entries.end()) { ++pit; continue; }
+            if (revive_h > eit->second.nPoSeRevivedHeight) {
+                eit->second.nPoSeRevivedHeight = revive_h;
+                eit->second.nPoSeBanHeight     = 0;
+                eit->second.isValid            = true;
+                ++repaired;
+                LOG_WARNING
+                    << "[MNS-SM] ORDERING REPAIR: proTx "
+                    << protx.GetHex().substr(0, 16)
+                    << " revived by a ProUpServTx at h=" << revive_h
+                    << " that this set applied with the ban UNMEASURED"
+                       " (nPoSeRevivedHeight stayed 0). The masternode list"
+                       " dated EXACTLY at the mismatch height attests it VALID,"
+                       " so the revive is confirmed: writing"
+                       " nPoSeRevivedHeight=" << revive_h
+                    << " (dashd's own value) and re-sorting the payee queue.";
+            }
+            pit = m_unmeasured_revive_at.erase(pit);
+        }
+
+        // Re-sort the PENDING queue by the corrected scores so the on-demand
+        // re-adjudication walks the queue dashd holds, not the mis-ordered one
+        // captured before the repair. The revived masternode drops to its true
+        // slot; the candidate dashd actually pays rises to the head.
+        if (repaired && m_pending.present) {
+            std::stable_sort(
+                m_pending.ranked.begin(), m_pending.ranked.end(),
+                [this](const uint256& a, const uint256& b) {
+                    auto ia = m_entries.find(a);
+                    auto ib = m_entries.find(b);
+                    const int sa = (ia == m_entries.end())
+                        ? std::numeric_limits<int>::max()
+                        : payee_score(ia->second);
+                    const int sb = (ib == m_entries.end())
+                        ? std::numeric_limits<int>::max()
+                        : payee_score(ib->second);
+                    return payee_order_before(sa, a, sb, b);
+                });
+            m_pending.projected = m_pending.ranked.empty()
+                ? std::optional<uint256>{}
+                : std::optional<uint256>{m_pending.ranked.front()};
+        }
+        return repaired;
     }
 
     // Process a single block. Mutates state per dashcore's
@@ -1284,6 +1438,16 @@ public:
                     // missed one, and both have been measured on mainnet.
                     ++r.revive_unmeasured;
                     r.revive_unmeasured_protx.push_back(ptx.proTxHash);
+                    // Remember WHERE dashd would have written nPoSeRevivedHeight
+                    // so the on-demand fold can reproduce it forward. dashd's
+                    // BuildNewListFromBlock sets it to THIS ProUpServTx height
+                    // (specialtxman.cpp:361-370); we cannot decide the gate now
+                    // (ban state unmeasured), but if a height-exact list later
+                    // attests this masternode VALID the revive DID happen, and
+                    // this is the height it happened at. This is the single
+                    // dashd write the unmeasured path drops — recorded, not
+                    // guessed, and applied only under height-exact confirmation.
+                    m_unmeasured_revive_at[ptx.proTxHash] = height;
                     LOG_WARNING
                         << "[MNS-SM] ProUpServTx h=" << height << " for proTx "
                         << ptx.proTxHash.GetHex().substr(0, 16)
@@ -1851,6 +2015,16 @@ private:
     // 0 = the ban state in this set has NEVER been measured against a dated
     // list; it is whatever the seed carried plus whatever transactions moved.
     uint32_t m_ban_state_measured_at{0};
+
+    // proTxHash -> ProUpServTx height for every revive this machine applied
+    // with the pre-block ban state UNMEASURED (apply_block case-2 else branch).
+    // dashd wrote nPoSeRevivedHeight = that height; we could not decide the
+    // gate, so nPoSeRevivedHeight stayed 0 and the projection drifted ~one
+    // queue length ahead. repair_unmeasured_revive_ordering() consumes this
+    // under height-exact confirmation. Transient (never persisted): a resume
+    // re-measures via the fold ladder, and a stale ledger must not license a
+    // revive-height write. Cleared by load().
+    std::map<uint256, uint32_t> m_unmeasured_revive_at;
 
     /// Walk every ProUpServTx in a block, in tx order, handing the caller the
     /// proTxHash it names. The pre-scan and the apply BOTH go through here so
