@@ -1396,7 +1396,7 @@ struct PayeeGateFixture {
 TEST(DashReplayFoldPreEnforcement, BelowEnforcementPayeeMismatchFoldsThrough)
 {
     PayeeGateFixture fx(/*enforcement_height=*/103);  // 102 < 103 ⇒ pre-enforcement
-    ASSERT_TRUE(fx.eng.project_payee(102).has_value())
+    ASSERT_TRUE(fx.eng.project_payee(101).has_value())
         << "a payee must be projected (else the test proves nothing)";
     auto pay_blk = make_block(102, raw256(9), fx.payment_root,
                               /*special_txs=*/{}, /*pay_from=*/nullptr);
@@ -1419,7 +1419,7 @@ TEST(DashReplayFoldPreEnforcement, BelowEnforcementPayeeMismatchFoldsThrough)
 TEST(DashReplayFoldPreEnforcement, AtEnforcementPayeeMismatchStillPoisons)
 {
     PayeeGateFixture fx(/*enforcement_height=*/102);  // 102 >= 102 ⇒ enforced
-    ASSERT_TRUE(fx.eng.project_payee(102).has_value());
+    ASSERT_TRUE(fx.eng.project_payee(101).has_value());
     auto pay_blk = make_block(102, raw256(9), fx.payment_root,
                               /*special_txs=*/{}, /*pay_from=*/nullptr);
     auto r = fx.eng.fold_block(pay_blk, 102);
@@ -1441,4 +1441,157 @@ TEST(DashReplayFoldPreEnforcement, BelowEnforcementPayeePaidIsNotFlaggedSkipped)
     // Below enforcement the check is skipped regardless of whether the coinbase
     // happens to pay the projection; the flag reflects the GATE, not the match.
     EXPECT_TRUE(r.payee_check_preenforcement_skipped);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// OPERATOR-REWARD SPLIT payee cross-check — h=1439234 sub-class
+// ════════════════════════════════════════════════════════════════════════
+//
+// dashd masternode/payments.cpp GetBlockTxOuts:64-77 does NOT unconditionally
+// emit scriptPayout. When nOperatorReward==10000 and scriptOperatorPayout is
+// set, the operator reward eats the WHOLE MN share, masternodeReward folds to
+// exactly 0, and the ONLY MN output dashd emits (and its IsTransactionValid
+// :109-139 requires) is scriptOperatorPayout. A payee cross-check that always
+// demands scriptPayout is STRICTER THAN DASHD there and false-poisons a
+// byte-correct fold — the live self-derive incident at h=1439234 (proTxHash
+// 71ed3bf5…, bps=10000, owner==operator self-host, coinbase paid the operator
+// script for the full 1.51818084 share, no owner remainder; roots matched
+// 411073/411073). These KATs pin the faithful branch.
+//
+// Build the fixture by SEEDING the pre-block state directly (scriptOperatorPayout
+// is set by a ProUpServTx in history; seeding it is the same pre-block tuple
+// dashd built the coinbase from). Confirmations are pushed out so pass 1 never
+// mutates confirmedHash and the SML root stays byte-stable across the payment
+// fold — the SET self-check binds in every arm.
+namespace {
+static FoldConfig op_split_cfg()
+{
+    FoldConfig cfg;
+    cfg.enabled = true;
+    cfg.gates.dip0003_height               = 1;
+    cfg.gates.dip0003_enforcement_height   = 1;   // ENFORCED: payee check ON
+    cfg.gates.v19_height                   = 1;
+    cfg.gates.mn_rr_height                 = 1;
+    cfg.gates.masternode_min_confirmations = 100000000;  // no confirmedHash churn
+    return cfg;
+}
+
+// Seed one non-banned MN carrying (scriptPayout=owner, scriptOperatorPayout=op,
+// nOperatorReward=bps). Returns the engine + the committed SML root of that
+// single-entry list (unchanged by a payment fold).
+struct OpSplitFixture {
+    DmlFoldEngine eng;
+    uint256       committed_root;
+    uint256       mn;
+    std::vector<unsigned char> owner_script;
+    std::vector<unsigned char> op_script;
+    OpSplitFixture(uint16_t bps,
+                   const std::vector<unsigned char>& owner,
+                   const std::vector<unsigned char>& op)
+        : eng(op_split_cfg())
+        , mn(raw256(0xE7))
+        , owner_script(owner)
+        , op_script(op)
+    {
+        ReplayMNState st;
+        st.nVersion   = ProTxVersion::BASIC_BLS;
+        st.nType      = MnType::REGULAR;
+        st.keyIDOwner  = raw160(0x27);
+        st.keyIDVoting = raw160(0x57);
+        st.pubKeyOperator = seq_array<48>(0x37);
+        st.collateralOutpoint.hash  = raw256(0x47);
+        st.collateralOutpoint.index = 1;
+        st.netInfo.ip      = seq_array<16>(0x17);
+        st.netInfo.port_be = 9999;
+        st.nOperatorReward = bps;
+        st.scriptPayout.m_data         = owner;
+        st.scriptOperatorPayout.m_data = op;
+        st.nRegisteredHeight = 50;
+        st.nLastPaidHeight   = 0;            // never paid — first payment here
+        st.confirmedHash     = raw256(0x99); // pre-set: pass 1 leaves it alone
+        eng.seed({{mn, st}}, /*total_registered=*/1, /*height=*/100, raw256(9));
+        committed_root = eng.compute_sml_root();
+    }
+    // A payment block at h whose coinbase pays EXACTLY `scripts` (one vout each).
+    BlockType payment_block(uint32_t h,
+                            std::vector<std::vector<unsigned char>> scripts) const
+    {
+        auto blk = make_block(h, raw256(9), committed_root);  // coinbase, no payee vout
+        for (auto& s : scripts) {
+            TxOut out;
+            out.value = 100000000;
+            out.scriptPubKey.m_data = std::move(s);
+            blk.m_txs[0].vout.push_back(std::move(out));
+        }
+        return blk;
+    }
+};
+} // namespace
+
+// GREEN (RED on master): bps==10000 with a set operator script. dashd zeroes
+// masternodeReward and pays ONLY the operator script — so a coinbase paying the
+// operator script (and NOT scriptPayout) is exactly what dashd produced. The
+// fold must accept it. On master this REDS: the check demands scriptPayout,
+// which is legitimately absent, and false-poisons.
+TEST(DashReplayFoldOperatorSplit, FullOperatorRewardPaysOperatorScriptFoldsThrough)
+{
+    OpSplitFixture fx(/*bps=*/10000, script_bytes(0x6A), script_bytes(0x6B));
+    ASSERT_TRUE(fx.eng.project_payee(101).has_value());
+    // Coinbase pays ONLY the operator script (the h=1439234 shape).
+    auto blk = fx.payment_block(101, {fx.op_script});
+    auto r = fx.eng.fold_block(blk, 101);
+    ASSERT_TRUE(r.ok) << "a full-operator-reward payment (dashd emits ONLY the "
+                         "operator output) must fold through, not poison: "
+                      << r.error;
+    EXPECT_EQ(r.computed_root, r.committed_root);      // SET self-check bound
+    EXPECT_TRUE(r.payee_paid_verified);                // payee AXIS verified
+    EXPECT_TRUE(r.payee_operator_full_reward);         // via the operator branch
+    EXPECT_TRUE(r.payee_marked);                       // nLastPaidHeight bumped
+}
+
+// STRICTNESS / reward-safety: same 100%-operator MN, but the coinbase pays the
+// OWNER scriptPayout instead of the operator script. dashd would REJECT that
+// coinbase (it requires the operator output, masternodeReward==0 so no owner
+// output is valid) — our check must also POISON. The fix makes the requirement
+// EQUAL to dashd's, never weaker: it does not accept "pays either script".
+TEST(DashReplayFoldOperatorSplit, FullOperatorRewardPayingOwnerScriptStillPoisons)
+{
+    OpSplitFixture fx(/*bps=*/10000, script_bytes(0x6A), script_bytes(0x6B));
+    auto blk = fx.payment_block(101, {fx.owner_script});  // pays owner, NOT operator
+    auto r = fx.eng.fold_block(blk, 101);
+    ASSERT_FALSE(r.ok) << "at bps=10000 dashd emits only the operator output; a "
+                          "coinbase paying scriptPayout instead is invalid and "
+                          "MUST poison";
+    EXPECT_NE(r.error.find("PAYEE MISMATCH"), std::string::npos) << r.error;
+    EXPECT_NE(r.error.find("scriptOperatorPayout"), std::string::npos)
+        << "the poison message must name the required operator script: " << r.error;
+    EXPECT_TRUE(fx.eng.poisoned());                    // fail-closed, engine poisoned
+}
+
+// UNCHANGED for partial splits: 0<bps<10000 keeps masternodeReward>0, so dashd
+// still emits scriptPayout and the check still requires it. A coinbase paying
+// the owner script folds through (the operator output is fee-priced, which the
+// fold cannot compute, so it is NEVER poisoned on for absence).
+TEST(DashReplayFoldOperatorSplit, PartialOperatorRewardRequiresOwnerScript)
+{
+    OpSplitFixture fx(/*bps=*/800, script_bytes(0x6A), script_bytes(0x6B));
+    // Pays owner only (operator output amount is fee-unknown; not required).
+    auto blk = fx.payment_block(101, {fx.owner_script});
+    auto r = fx.eng.fold_block(blk, 101);
+    ASSERT_TRUE(r.ok) << "a partial-split payment paying scriptPayout must fold "
+                         "through: " << r.error;
+    EXPECT_TRUE(r.payee_paid_verified);
+    EXPECT_FALSE(r.payee_operator_full_reward);         // partial ⇒ owner-required branch
+}
+
+// STRICTNESS for partial splits: masternodeReward>0 so scriptPayout is required;
+// a coinbase paying ONLY the operator script (no owner output) is invalid and
+// MUST poison — the owner axis is always priceable and always enforced.
+TEST(DashReplayFoldOperatorSplit, PartialOperatorRewardMissingOwnerScriptPoisons)
+{
+    OpSplitFixture fx(/*bps=*/800, script_bytes(0x6A), script_bytes(0x6B));
+    auto blk = fx.payment_block(101, {fx.op_script});  // operator only, no owner
+    auto r = fx.eng.fold_block(blk, 101);
+    ASSERT_FALSE(r.ok) << "partial split with no owner output MUST poison";
+    EXPECT_NE(r.error.find("PAYEE MISMATCH"), std::string::npos) << r.error;
 }

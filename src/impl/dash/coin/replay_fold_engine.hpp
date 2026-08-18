@@ -427,6 +427,13 @@ struct FoldResult
     // still fully derived and self-consistent (nLastPaidHeight accumulates on
     // the projected payee exactly as dashd BuildNewListFromBlock does).
     bool        payee_check_preenforcement_skipped{false};
+    // True when the projected payee carried nOperatorReward==10000 with a
+    // non-empty scriptOperatorPayout, so dashd (payments.cpp GetBlockTxOuts)
+    // zeroed masternodeReward and emitted ONLY the operator output — the
+    // payee cross-check therefore required scriptOperatorPayout, NOT
+    // scriptPayout. Diagnostic: distinguishes a full-operator-reward payment
+    // from the ordinary owner-paid case at h=1439234 and its sub-class.
+    bool        payee_operator_full_reward{false};
 };
 
 class DmlFoldEngine
@@ -641,15 +648,26 @@ public:
         // ── Pass 0: payee, from the PRE-block list ──────────────────────
         r.payee = project_payee(H);
 
-        // ── Pass 0b: capture the payee's PRE-BLOCK payout script ────────
+        // ── Pass 0b: capture the payee's PRE-BLOCK payment tuple ────────
         // dashd built this block's coinbase from the list at H-1, which is
         // exactly the list being held right now. A ProUpRegTx later in this
         // same block may rewrite scriptPayout, and a collateral spend may
-        // remove the masternode outright, so the script is captured HERE and
+        // remove the masternode outright, so the tuple is captured HERE and
         // adjudicated in pass 6 — after the special-tx folds, so that a block
         // with a genuinely broken payload still reports ITS OWN blocking
         // condition rather than this one.
+        //
+        // The full tuple is (scriptPayout, scriptOperatorPayout, bps): dashd
+        // GetBlockTxOuts (masternode/payments.cpp:64-77) does NOT always emit
+        // scriptPayout. When nOperatorReward==10000 and scriptOperatorPayout
+        // is set, the operator reward eats the entire MN share, masternodeReward
+        // becomes exactly 0, and the ONLY MN vout dashd emits is the operator
+        // script. Capturing all three lets pass 6 mirror that branch exactly
+        // instead of unconditionally demanding scriptPayout (which false-poisons
+        // a byte-correct fold at every 100%-operator-reward payment — h=1439234).
         std::vector<unsigned char> payee_script_pre;
+        std::vector<unsigned char> payee_op_script_pre;
+        uint16_t                   payee_bps_pre = 0;
         if (r.payee) {
             const ReplayMNState* pst = find(*r.payee);
             if (pst == nullptr) {
@@ -661,7 +679,9 @@ public:
                 LOG_ERROR << "[DML-FOLD] " << r.error;
                 return r;
             }
-            payee_script_pre = pst->scriptPayout.m_data;
+            payee_script_pre    = pst->scriptPayout.m_data;
+            payee_op_script_pre = pst->scriptOperatorPayout.m_data;
+            payee_bps_pre       = pst->nOperatorReward;
         }
 
         // ── Pass 1: confirmedHash (specialtxman.cpp:205-218) ────────────
@@ -832,26 +852,80 @@ public:
         // derived and self-consistent across the window and is correct the
         // instant enforcement begins. Production (tip ~2.5M) is far above
         // enforcement, so the money-path check is UNCHANGED.
-        if (r.payee && !payee_script_pre.empty()
+        //
+        // WHICH SCRIPT dashd requires (masternode/payments.cpp GetBlockTxOuts
+        // :64-77, IsTransactionValid :109-139): the coinbase's REQUIRED MN
+        // output set is NOT unconditionally {scriptPayout}. dashd computes
+        //     if (nOperatorReward != 0 && scriptOperatorPayout != CScript()) {
+        //         operatorReward = (masternodeReward * nOperatorReward) / 10000;
+        //         masternodeReward -= operatorReward;
+        //     }
+        //     if (masternodeReward > 0) emplace(masternodeReward, scriptPayout);
+        //     if (operatorReward  > 0) emplace(operatorReward,  scriptOperatorPayout);
+        // and its validator requires PRECISELY the vouts it emitted — never
+        // scriptPayout when masternodeReward folded to 0.
+        //
+        // At nOperatorReward==10000 with a set scriptOperatorPayout, the
+        // operator reward eats the WHOLE MN share: masternodeReward becomes
+        // exactly 0, so dashd emits NO scriptPayout output and the only
+        // required MN vout is scriptOperatorPayout. A check that demands
+        // scriptPayout there is STRICTER THAN DASHD and false-poisons a
+        // byte-correct fold (observed h=1439234: proTxHash 71ed3bf5…, bps=10000,
+        // owner==operator self-host; roots matched 411073/411073, coinbase paid
+        // the operator script for the full share, no owner remainder).
+        //
+        // For 0 < bps < 10000, masternodeReward = mnShare − floor(mnShare·bps/
+        // 10000) is provably > 0 (floor of a strict-fraction of mnShare is
+        // strictly below mnShare), so scriptPayout IS emitted and required —
+        // today's behaviour. The operator output's exact amount needs the fee
+        // reward, which the fold's fee-unknown (W5) gap cannot price, so we
+        // NEVER poison on the operator axis for a partial split — only the
+        // owner axis, which is always required and always priceable.
+        //
+        // The required script is therefore the SINGLE owner-or-operator script
+        // dashd guarantees to emit; we fail closed on its absence exactly as a
+        // root mismatch, and stay STRICTLY equal to dashd's requirement, never
+        // weaker.
+        const bool full_operator_reward =
+            payee_bps_pre == 10000 && !payee_op_script_pre.empty();
+        const std::vector<unsigned char>& required_script =
+            full_operator_reward ? payee_op_script_pre : payee_script_pre;
+        if (r.payee) r.payee_operator_full_reward = full_operator_reward;
+
+        if (r.payee && !required_script.empty()
             && !m_cfg.gates.dip0003_enforced(H)) {
             r.payee_check_preenforcement_skipped = true;
         }
-        if (r.payee && !payee_script_pre.empty()
+        if (r.payee && !required_script.empty()
             && m_cfg.gates.dip0003_enforced(H)) {
             bool paid = false;
             if (!block.m_txs.empty()) {
                 for (const auto& out : block.m_txs[0].vout) {
-                    if (out.scriptPubKey.m_data == payee_script_pre) {
+                    if (out.scriptPubKey.m_data == required_script) {
                         paid = true;
                         break;
                     }
                 }
             }
             if (!paid) {
+                const auto hx = [](const std::vector<unsigned char>& v) {
+                    static const char* d = "0123456789abcdef";
+                    std::string s; s.reserve(v.size() * 2);
+                    for (unsigned char b : v) { s += d[b >> 4]; s += d[b & 0xf]; }
+                    return s;
+                };
                 r.error = "DML FOLD PAYEE MISMATCH at h=" + std::to_string(height)
                         + ": this block's coinbase does not pay the projected "
                           "masternode " + r.payee->GetHex()
-                        + " — the merkleRootMNList self-check PASSED at this "
+                        + " — required " + (full_operator_reward
+                              ? "scriptOperatorPayout (nOperatorReward=10000, "
+                                "masternodeReward folds to 0 so dashd emits only "
+                                "the operator output)"
+                              : "scriptPayout")
+                        + " {scriptPayout=" + hx(payee_script_pre)
+                        + ", scriptOperatorPayout=" + hx(payee_op_script_pre)
+                        + ", bps=" + std::to_string(payee_bps_pre)
+                        + "} — the merkleRootMNList self-check PASSED at this "
                           "height, which is exactly why this check exists: "
                           "nLastPaidHeight is not committed by any block, so "
                           "a wrong payment order folds to the right root — "
