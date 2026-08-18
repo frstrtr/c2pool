@@ -5098,7 +5098,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // maintainer's SmlResyncWatchdog; this closure only forwards.
         maintainer->set_on_sml_rerequest(
             [cp = coin_p2p.get()](const uint256& base, const uint256& target) {
-                if (cp) cp->send_getmnlistd(base, target);
+                // TIMEOUT re-ask (SmlResyncWatchdog): rotate to a DIFFERENT
+                // archival carrier and strike the stalled one as a non-server,
+                // so a slow/limited primary can neither wedge the tip SML nor
+                // stay invisible to the outbound-acquisition pump. dashd
+                // rotate-on-stall + prefer-CanServeBlocks for the getmnlistd
+                // leg. Reward-safe: peer selection + dial count only.
+                if (cp) cp->send_getmnlistd_reask(base, target);
             });
 
         // ChainLock verifier: BLS-verify a relayed clsig against the quorum
@@ -6123,6 +6129,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         // eligible pool so a slow/non-serving primary cannot
                         // wedge the anchor->tip fold (dashd rotate-on-stall).
                         cp->send_getmnlistd_rotating(uint256::ZERO, block_hash);
+                    });
+                // TIMEOUT RE-ASK of that same fold snapshot: besides rotating,
+                // strike the stalled carrier as a demonstrated non-server so
+                // the acquisition pump expands the outbound set
+                // (GetExtraFullOutboundCount) toward a peer that actually
+                // serves the deep base->anchor snapshot, instead of re-asking
+                // one slow peer forever. Reward-safe: peer selection + dial
+                // count only.
+                mn_ckpt_lane->set_reask_snapshot_fn(
+                    [cp](const uint256& block_hash) {
+                        cp->send_getmnlistd_reask(uint256::ZERO, block_hash);
                     });
                 // DEMUX (reward-critical): the reply comes back on the SAME
                 // mnlistdiff message the tip sync uses. Routed here it is
