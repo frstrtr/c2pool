@@ -1337,6 +1337,53 @@ public:
         return m_primary ? m_primary->key : std::string{};
     }
 
+    /// The bulk lane's peer universe FILTERED through dashd CanServeBlocks
+    /// (#1254 bulk_eligible: handshaked + advertises full-block service + not
+    /// demoted). The replay BulkFetchLane wires this as its eligible_peers seam
+    /// so a deep-history getdata is only ever handed to an archival deliverer —
+    /// the reactive stall-demote + this proactive service-bit filter are dashd
+    /// net_processing's two halves of the block-download peer policy. Liveness
+    /// fallback: if the CanServeBlocks filter empties the set (a transient
+    /// all-pruned/all-demoted pool), fall back to the raw handshaked set so the
+    /// lane never freezes — the same Pass-0/Pass-1 shape as next_bulk_peer().
+    /// Primary excluded unless it is the only survivor (priority invariant 1).
+    std::vector<std::string> eligible_bulk_peer_keys() const
+    {
+        std::vector<std::string> serving, handshaked;
+        for (const auto& up : m_pool)
+        {
+            const PeerSession* p = up.get();
+            if (!p->handshake.complete()) continue;
+            handshaked.push_back(p->key);
+            if (bulk_eligible(p)) serving.push_back(p->key);
+        }
+        std::vector<std::string> keys =
+            serving.empty() ? std::move(handshaked) : std::move(serving);
+        const std::string prim = primary_peer_key();
+        if (keys.size() > 1 && !prim.empty())
+            keys.erase(std::remove(keys.begin(), keys.end(), prim), keys.end());
+        return keys;
+    }
+
+    /// dashd FindNextBlocksToDownload per-(peer,height) coverage for the replay
+    /// bulk lane's pump() assignment: the named peer serves blocks at all
+    /// (CanServeBlocks), is not demoted, and its announced start_height covers
+    /// `height` (peer_covers_height — the lever for a lagging peer that joined
+    /// below the wanted band). Unknown/incomplete peer ⇒ false.
+    bool bulk_peer_can_serve(const std::string& key, uint32_t height) const
+    {
+        for (const auto& up : m_pool)
+        {
+            const PeerSession* p = up.get();
+            if (p->key != key) continue;
+            return p->handshake.complete()
+                   && can_serve_blocks(p)
+                   && !bulk_demoted(key)
+                   && peer_covers_height(p, height);
+        }
+        return false;
+    }
+
     /// getheaders to a NAMED peer (bulk header backfill: the walker rotates
     /// its own peer cursor and must not disturb the primary-bound tip legs).
     /// Returns false when the peer is unknown/not handshaked.
@@ -1371,6 +1418,27 @@ public:
         p->write(msg);
         return true;
     }
+
+    /// dashd net_processing BLOCK_STALLING_TIMEOUT: force-drop a single named
+    /// peer session and redial a replacement NOW. The pre-anchor header-backfill
+    /// lane calls this on a peer that received a getheaders but never answered
+    /// within the stalling window — dashd disconnects such a peer ('Peer is
+    /// stalling block download, disconnecting') instead of leaving the zombie
+    /// session occupying a pool slot at max RTO backoff. remove_peer() fires the
+    /// disconnect seam + re-elects the primary if needed; refill_pool() redials
+    /// from the scored dial plan immediately rather than waiting the 30 s
+    /// reconnect tick (which is only the backstop). Returns true iff a session
+    /// was actually dropped. A no-op (peer already gone) when the key is stale.
+    bool stall_disconnect_and_redial(const std::string& peer_key,
+                                     const std::string& reason)
+    {
+        PeerSession* p = find_peer(peer_key);
+        if (!p) return false;
+        remove_peer(p, reason);
+        refill_pool();   // immediate redial; the 30 s loop is only the backstop
+        return true;
+    }
+
     /// Fired on socket connect (before handshake) with the peer endpoint — the
     /// DashCoinPeerManager scores the connect + tracks anchors off this.
     void set_on_peer_connected(PeerLifecycleCallback cb) { m_on_peer_connected = std::move(cb); }
