@@ -200,6 +200,12 @@ public:
     bool empty() const { return m_targets.empty(); }
     std::size_t size() const { return m_targets.size(); }
 
+    // Read-only view of the scored targets — the archival outbound-rotation
+    // pump peeks it to decide whether a FRESH (not-already-held, not-in-flight,
+    // not-in-cooldown) candidate exists before it evicts a demoted slot-holder.
+    // Never mutates the round-robin cursor (a bare check must not consume it).
+    const std::vector<NetService>& targets() const { return m_targets; }
+
     const NetService& current() const { return m_targets.at(m_index); }
 
     // Rotate to the next target (single-target plans stay put) and return it.
@@ -645,6 +651,37 @@ public:
     static constexpr std::size_t DEFAULT_POOL_PEERS = 8;
     static constexpr std::size_t POOL_PEERS_HARD_CAP = 16;
 
+    // ── dashd outbound-acquisition parity (archival rotation pump) ─────────
+    // dashd never stays starved on a full-but-shallow peer set: while it is
+    // behind it opens EXTRA full-relay outbound (GetExtraFullOutboundCount) and
+    // it DISCONNECTS a peer that holds a download slot without serving
+    // (BLOCK_STALLING_TIMEOUT) so ThreadOpenConnections refills the freed slot
+    // with a FRESH addrman candidate — cycling until every download slot holds
+    // an archival (NODE_NETWORK) peer and the block-download window fills. Our
+    // pool, in contrast, latched: a full pool early-returns from refill_pool()
+    // (a frozen full pool) and the bulk lane only DEMOTES a demonstrated
+    // non-server (holds it off fresh ranges) without ever freeing its slot, so
+    // the large addrman bank behind the working set was never drawn again and
+    // "only 7 peers serve deep bodies" was the frozen first-come set, not the
+    // network's ceiling. This pump is the missing acquisition half, and it is
+    // connection-management ONLY: the per-block merkleRoot fold self-check +
+    // payee cross-check + poison fail-closed are untouched, no block is skipped
+    // — it only changes WHICH / HOW-MANY peers the fold fetches from.
+    //
+    // GetExtraFullOutboundCount analog: while a demonstrated deep-body
+    // non-server occupies a slot we are "behind" on archival coverage, so raise
+    // the effective dial target by this many (clamped to the hard cap) — dial
+    // MORE fresh candidates to reach archival servers beyond the frozen set.
+    static constexpr std::size_t OUTBOUND_BEHIND_EXTRA = 2;
+    // BLOCK_STALLING_TIMEOUT cadence: minimum seconds between two evict+refill
+    // rotations so a transiently-quiet peer is never churned (dashd's stall
+    // timeout is seconds, doubling; this is the steady rotation floor).
+    static constexpr int64_t OUTBOUND_ROTATE_INTERVAL_SEC = 20;
+    // A just-rotated-out address is held OFF redial this long (addrman-backoff
+    // analog) so refill_pool() draws a genuinely fresh candidate instead of
+    // immediately re-dialing the non-server we just dropped.
+    static constexpr int64_t OUTBOUND_ROTATE_COOLDOWN_SEC = 120;
+
 private:
     dash::interfaces::Node* m_coin;
     io::io_context* m_context;
@@ -668,6 +705,19 @@ private:
     // reconnect to the same non-serving address. Incremented on NOTFOUND for a
     // bulk body and on stall-eviction; cleared when that peer delivers a body.
     std::map<std::string, int> m_bulk_nonserver_strikes;
+    // ── archival outbound-rotation pump state (dashd acquisition parity) ───
+    // Master switch. Default ON (this is an always-on port like the bulk demote
+    // #1272 / header stall-disconnect #1283 that precede it); flipping it OFF
+    // restores BYTE-IDENTICAL pre-port behaviour (a frozen full pool), which is
+    // both the safety escape hatch and the RED arm of the acquisition KATs.
+    bool m_outbound_rotate_enabled{true};
+    // Rate limit: wall-second of the last evict+refill rotation.
+    int64_t m_last_outbound_rotate{0};
+    // Just-evicted addresses held OFF redial: addr -> skip-until wall-second.
+    std::map<std::string, int64_t> m_rotation_cooldown;
+    // Telemetry: how many demoted slot-holders we have rotated out for a fresh
+    // archival dial (asserted by the KATs, surfaced in the pool-status log).
+    uint64_t m_outbound_rotations{0};
     // Round-robin cursor for the STATEFUL request legs (the mn-checkpoint
     // anchor->tip fold's getmnlistd snapshot). dashd picks a sync peer for a
     // mnlistdiff and ROTATES to another on stall rather than re-asking one slow
@@ -1267,6 +1317,20 @@ public:
     /// TEST-ONLY: clear a peer's non-server strike (the forgiveness a real
     /// body delivery triggers on the ingest path).
     void forgive_bulk_nonserver_for_test(const std::string& key) { forgive_bulk_nonserver(key); }
+    /// TEST-ONLY: record a non-server strike directly (stands in for the live
+    /// NOTFOUND/stall path the archival-rotation KATs demote a peer through).
+    void note_bulk_nonserver_for_test(const std::string& key) { note_bulk_nonserver(key); }
+    // ── archival outbound-rotation pump — test seams ──────────────────────
+    /// TEST-ONLY: master switch. Default ON; OFF restores the byte-identical
+    /// pre-port frozen-full-pool behaviour (the RED arm of the acquisition KATs).
+    void set_outbound_rotate_enabled_for_test(bool on) { m_outbound_rotate_enabled = on; }
+    /// TEST-ONLY: the dashd GetExtraFullOutboundCount-raised effective target.
+    std::size_t effective_max_peers_for_test() const { return effective_max_peers(); }
+    /// TEST-ONLY: behind on archival coverage (a demoted non-server holds a slot)?
+    bool outbound_behind_for_test() const { return outbound_behind(); }
+    /// TEST-ONLY: how many demoted slot-holders have been rotated out for a
+    /// fresh archival dial.
+    uint64_t outbound_rotations_for_test() const { return m_outbound_rotations; }
     /// TEST-ONLY: exercise the STATEFUL (getmnlistd fold) carrier selection —
     /// the seam the rotate-on-timeout KAT asserts fans out on. Returns the
     /// chosen peer key and records it as the last stateful carrier, exactly as
@@ -2266,10 +2330,15 @@ private:
         if (!m_reconnect_enabled || m_dial_plan.empty()) return;
         const int64_t now = now_sec();
         prune_stale_dials(now);
+        prune_rotation_cooldown(now);
 
+        // dashd GetExtraFullOutboundCount: while we are behind on archival
+        // coverage the effective target is raised, so a full-at-base pool still
+        // dials MORE fresh candidates to reach archival servers.
+        const std::size_t target = effective_max_peers();
         const std::size_t held = m_pool.size() + m_dialing.size();
-        if (held >= m_max_peers) return;
-        std::size_t slots = m_max_peers - held;
+        if (held >= target) return;
+        std::size_t slots = target - held;
 
         // One pass over the plan at most: every target is considered exactly
         // once per refill, so a plan shorter than the slot count simply fills
@@ -2284,25 +2353,160 @@ private:
         std::size_t dialed = 0;
         for (std::size_t i = 0; i < n && slots > 0; ++i)
         {
-            const NetService target = m_dial_plan.current();
+            const NetService target_addr = m_dial_plan.current();
             m_dial_plan.advance();
-            const std::string key = target.to_string();
+            const std::string key = target_addr.to_string();
             if (holds_key(key) || m_dialing.count(key)) continue;
+            // Skip an address we just rotated OUT — the addrman-backoff analog
+            // that forces refill onto a genuinely fresh candidate.
+            if (is_rotation_cooled(key, now)) continue;
             m_dialing[key] = now;
             LOG_INFO << "[" << m_chain_label << "] dialing " << key
                      << " (pool " << m_pool.size() << "/" << m_max_peers
                      << ", " << m_dialing.size() << " in flight)";
-            core::Factory<core::Client>::connect(target);
+            core::Factory<core::Client>::connect(target_addr);
             --slots;
             ++dialed;
         }
-        if (dialed == 0 && m_pool.size() < m_max_peers)
+        if (dialed == 0 && m_pool.size() < target)
         {
             LOG_DEBUG_COIND << "[" << m_chain_label << "] pool below target ("
-                            << m_pool.size() << "/" << m_max_peers
+                            << m_pool.size() << "/" << target
                             << ") but no fresh dial target in a "
                             << n << "-entry plan";
         }
+    }
+
+    // ── archival outbound-rotation pump (dashd acquisition parity) ─────────
+    /// Live strike count for an address (0 when unknown). The demotion state
+    /// the notfound/stall handlers already feed (note_bulk_nonserver).
+    int bulk_strikes(const std::string& key) const
+    {
+        auto it = m_bulk_nonserver_strikes.find(key);
+        return it == m_bulk_nonserver_strikes.end() ? 0 : it->second;
+    }
+
+    /// Pool peers that are demonstrated deep-body NON-servers (bulk-demoted for
+    /// chronic NOTFOUND / stall). Each holds a download slot dashd would have
+    /// freed; while any exist we are "behind" on archival coverage.
+    std::size_t pool_demoted_count() const
+    {
+        std::size_t n = 0;
+        for (const auto& up : m_pool)
+            if (up->handshake.complete() && bulk_demoted(up->key)) ++n;
+        return n;
+    }
+
+    /// Behind on archival coverage ⇒ a demonstrated non-server occupies a slot.
+    bool outbound_behind() const
+    { return m_outbound_rotate_enabled && pool_demoted_count() > 0; }
+
+    /// dashd GetExtraFullOutboundCount analog: the dial target, RAISED while we
+    /// are behind so refill dials MORE fresh candidates to reach archival
+    /// servers (clamped to the hard cap). Base target when not behind, so a
+    /// healthy pool is byte-identical to before this port.
+    std::size_t effective_max_peers() const
+    {
+        if (!outbound_behind()) return m_max_peers;
+        return std::min<std::size_t>(m_max_peers + OUTBOUND_BEHIND_EXTRA,
+                                     POOL_PEERS_HARD_CAP);
+    }
+
+    bool is_rotation_cooled(const std::string& key, int64_t now) const
+    {
+        auto it = m_rotation_cooldown.find(key);
+        return it != m_rotation_cooldown.end() && it->second > now;
+    }
+    void prune_rotation_cooldown(int64_t now)
+    {
+        for (auto it = m_rotation_cooldown.begin(); it != m_rotation_cooldown.end(); )
+            if (it->second <= now) it = m_rotation_cooldown.erase(it);
+            else ++it;
+    }
+
+    /// Is there a plan entry we could dial RIGHT NOW that we do not already
+    /// hold, have in flight, or just rotated out? Without a fresh candidate an
+    /// eviction would only re-dial the same non-server, so the pump holds.
+    bool has_fresh_dial_candidate(int64_t now) const
+    {
+        for (const auto& t : m_dial_plan.targets())
+        {
+            const std::string key = t.to_string();
+            if (holds_key(key) || m_dialing.count(key)) continue;
+            if (is_rotation_cooled(key, now)) continue;
+            return true;
+        }
+        return false;
+    }
+
+    /// The worst demoted slot-holder to rotate out: most strikes first, then
+    /// the oldest (longest-latched) session. Skips one still in its own
+    /// post-rotation cooldown. nullptr ⇒ nothing eligible to evict.
+    PeerSession* worst_demoted_pool_peer(int64_t now) const
+    {
+        PeerSession* worst = nullptr;
+        int worst_strikes = 0;
+        for (const auto& up : m_pool)
+        {
+            PeerSession* p = up.get();
+            if (!p->handshake.complete()) continue;
+            if (!bulk_demoted(p->key)) continue;
+            if (is_rotation_cooled(p->key, now)) continue;
+            const int s = bulk_strikes(p->key);
+            if (!worst || s > worst_strikes ||
+                (s == worst_strikes && p->age_sec() > worst->age_sec()))
+            { worst = p; worst_strikes = s; }
+        }
+        return worst;
+    }
+
+    /// dashd's acquisition loop, once per pool tick: keep cycling fresh peers
+    /// until the block-download window can fill.
+    ///   (1) EXTRA OUTBOUND while behind — refill_pool() already honours the
+    ///       raised effective target, so a call here dials more the moment a
+    ///       slot is notionally open (GetExtraFullOutboundCount).
+    ///   (2) EVICT-THEN-REFILL when the (expanded) pool is FULL yet still holds
+    ///       a demoted non-server AND a fresh candidate exists: drop the worst
+    ///       non-server (BLOCK_STALLING_TIMEOUT disconnect) and refill from the
+    ///       addrman-fed plan (ThreadOpenConnections). Rate-limited so a
+    ///       transiently-quiet peer is never churned.
+    /// Reward-safe: this changes only WHICH / HOW-MANY peers we fetch from — the
+    /// per-block merkleRoot fold self-check, payee cross-check, and poison
+    /// fail-closed are all untouched, and no block is ever skipped.
+    void maybe_rotate_outbound(int64_t now)
+    {
+        if (!m_outbound_rotate_enabled) return;
+        prune_rotation_cooldown(now);
+        if (!outbound_behind()) return;
+
+        // (1) Room under the raised target ⇒ dial more fresh candidates.
+        if (m_pool.size() + m_dialing.size() < effective_max_peers())
+        {
+            refill_pool();
+            return;
+        }
+
+        // (2) Saturated even at the expanded target: rotate the worst
+        // non-server out for a fresh dial — but only when it buys a genuinely
+        // new candidate, and no more often than the stall cadence.
+        if (now - m_last_outbound_rotate < OUTBOUND_ROTATE_INTERVAL_SEC) return;
+        if (!has_fresh_dial_candidate(now)) return;
+        PeerSession* victim = worst_demoted_pool_peer(now);
+        if (!victim) return;
+
+        const std::string vkey = victim->key;
+        LOG_INFO << "[" << m_chain_label << "] archival rotation: evicting "
+                    "demonstrated deep-body non-server " << vkey
+                 << " (strikes=" << bulk_strikes(vkey)
+                 << ") for a fresh archival dial (dashd BLOCK_STALLING_TIMEOUT "
+                    "+ ThreadOpenConnections refill)";
+        m_rotation_cooldown[vkey] = now + OUTBOUND_ROTATE_COOLDOWN_SEC;
+        forgive_bulk_nonserver(vkey);   // a reconnect starts with a clean slate
+        m_last_outbound_rotate = now;
+        ++m_outbound_rotations;
+        remove_peer(victim, "archival rotation: deep-body non-server rotated out "
+                            "for a fresh addrman candidate");
+        refill_pool();                  // immediate redial; 30s loop is backstop
     }
 
     /// Reclaim dial slots whose callback never came. Without this a Factory
@@ -2418,6 +2622,10 @@ private:
 
         service_pending_bodies(now);
         prune_stale_dials(now);
+        // dashd acquisition parity: while behind on archival coverage, dial
+        // more and rotate the frozen full pool's worst non-server out for a
+        // fresh archival candidate (connection-management only, reward-safe).
+        maybe_rotate_outbound(now);
         maybe_log_pool_status(now);
     }
 
