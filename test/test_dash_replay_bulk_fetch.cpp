@@ -1016,7 +1016,8 @@ struct HdrLaneRig
     HdrLaneRig(uint32_t anchor, std::vector<std::string> peers_,
                std::set<std::string> serving_, std::set<std::string> live_,
                bool can_serve, uint32_t batch, const uint256& pow_limit,
-               int64_t demote_cooldown_sec)
+               int64_t demote_cooldown_sec,
+               uint32_t getheaders_window = 4)
         : bc(anchor)
         , bf(bc.genesis, anchor, bc.hashes[anchor], pow_limit,
              /*db_path=*/"", /*check_pow=*/false)
@@ -1027,6 +1028,7 @@ struct HdrLaneRig
         cfg.start_height = anchor + 1;
         cfg.backfill_rekick_sec = 15;
         cfg.backfill_demote_cooldown_sec = demote_cooldown_sec;
+        cfg.backfill_getheaders_window = getheaders_window;
 
         rp::BulkFetchLane::Seams s;
         s.hash_at = [](uint32_t) -> std::optional<uint256> { return std::nullopt; };
@@ -1086,7 +1088,7 @@ TEST(DashReplayHeaderBackfillPeerSelect, RedBlindRoundRobinWedgesOnNonServer)
     HdrLaneRig rig(ANCHOR, {"limited:1", "full:1"},
                    /*serving=*/{"full:1"}, /*live=*/{"full:1"},
                    /*can_serve=*/false, /*batch=*/5, pow_limit,
-                   /*demote_cooldown_sec=*/0);
+                   /*demote_cooldown_sec=*/0, /*getheaders_window=*/1);
     rig.drive(/*max_kicks=*/4);
     EXPECT_FALSE(rig.bf.complete())
         << "blind round-robin wastes every other kick on the non-serving peer";
