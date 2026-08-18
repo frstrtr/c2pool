@@ -1504,6 +1504,121 @@ TEST(DashStatefulFold, fold_getmnlistd_never_wedges_when_only_pruned_peers_exist
                            "archival peer exists (fallback to the handshaked pool)";
 }
 
+// (STATEFUL-STALL A) THE EXPANSION HALF, DRIVEN BY A STATEFUL STALL.
+// The live A/B (wf w8cr3yepg) proved the acquisition ROTATION fired but the
+// effective_max_peers EXPANSION never engaged: the near-tip window was
+// dominated by the STATEFUL getmnlistd leg, and "behind" was fed ONLY by the
+// block-body demotion tally — blind to a getmnlistd stall. send_getmnlistd_
+// reask() closes it: a timeout re-ask strikes the stalled carrier through the
+// SAME tally, so outbound_behind() sees the demoted slot-holder, the dial
+// target rises (GetExtraFullOutboundCount) and refill dials fresh archival
+// peers. RED contrast: the pre-port rotating send never strikes, so the
+// identical stall stays invisible and the pool stays frozen at its base size.
+TEST(DashStatefulFold, stateful_getmnlistd_stall_expands_outbound_like_a_body_stall)
+{
+    PoolRig rig;
+    rig.use_fake_clock();
+    rig.client.set_max_peers(8);
+
+    // Come up full: 8 handshaked peers, exactly ONE archival (peer 1); the
+    // rest pruned, so the stateful leg can only ride peer 1 — the single-
+    // carrier topology the live 26-min freeze happened on.
+    std::vector<NetService> plan;
+    for (int i = 1; i <= 8; ++i) plan.push_back(PoolRig::peer_addr(i));
+    rig.client.connect(plan);
+    rig.handshake_services(1, SVC_FULL);
+    for (int i = 2; i <= 8; ++i) rig.handshake_services(i, SVC_LIMITED_ONLY);
+    ASSERT_EQ(rig.client.connected_peer_count(), 8u);
+
+    // Fresh archival candidates the frozen set never reached.
+    rig.client.update_dial_targets({PoolRig::peer_addr(9), PoolRig::peer_addr(10),
+                                    PoolRig::peer_addr(11), PoolRig::peer_addr(12)});
+
+    // Healthy to begin with: not behind, base target.
+    EXPECT_FALSE(rig.client.outbound_behind_for_test());
+    EXPECT_EQ(rig.client.effective_max_peers_for_test(), 8u);
+
+    // The fold asks peer 1 (records it as the stateful carrier), then two
+    // timeout re-asks go unanswered — each strikes the carrier. Two strikes =
+    // BULK_NONSERVER_STRIKE_MAX => demoted.
+    rig.client.send_getmnlistd_rotating(uint256::ZERO, hash_n(700));   // first ask
+    ASSERT_EQ(rig.client.bulk_nonserver_strikes_for_test(PoolRig::peer_key(1)), 0);
+    rig.client.send_getmnlistd_reask(uint256::ZERO, hash_n(700));      // re-ask #1
+    rig.client.send_getmnlistd_reask(uint256::ZERO, hash_n(700));      // re-ask #2
+    EXPECT_GE(rig.client.bulk_nonserver_strikes_for_test(PoolRig::peer_key(1)), 2);
+    ASSERT_TRUE(rig.client.bulk_demoted_for_test(PoolRig::peer_key(1)))
+        << "a chronically-unanswered stateful carrier must demote, exactly like "
+           "a chronically-unanswered block-body peer";
+
+    // EXPANSION now engages — the half that never fired in the live run.
+    EXPECT_TRUE(rig.client.outbound_behind_for_test());
+    EXPECT_EQ(rig.client.effective_max_peers_for_test(), 10u)
+        << "a stateful-leg stall must raise the dial target, not only a body stall";
+
+    // One pool tick dials the extra fresh archival outbound.
+    rig.run_seconds(1);
+    EXPECT_EQ(rig.client.dialing_count(), 2u)
+        << "behind on the stateful leg, the pool must acquire MORE archival peers";
+    for (const auto& k : rig.client.dialing_keys())
+    {
+        bool fresh = k == PoolRig::peer_key(9)  || k == PoolRig::peer_key(10) ||
+                     k == PoolRig::peer_key(11) || k == PoolRig::peer_key(12);
+        EXPECT_TRUE(fresh) << "extra outbound dialed a non-fresh target: " << k;
+    }
+
+    // RED CONTRAST: the pre-port rotating send (no strike) leaves the identical
+    // stall invisible — no demotion, no expansion, the frozen pool of the run.
+    PoolRig red;
+    red.use_fake_clock();
+    red.client.set_max_peers(8);
+    red.client.connect(plan);
+    red.handshake_services(1, SVC_FULL);
+    for (int i = 2; i <= 8; ++i) red.handshake_services(i, SVC_LIMITED_ONLY);
+    red.client.update_dial_targets({PoolRig::peer_addr(9), PoolRig::peer_addr(10),
+                                    PoolRig::peer_addr(11), PoolRig::peer_addr(12)});
+    red.client.send_getmnlistd_rotating(uint256::ZERO, hash_n(700));
+    red.client.send_getmnlistd_rotating(uint256::ZERO, hash_n(700));
+    red.client.send_getmnlistd_rotating(uint256::ZERO, hash_n(700));
+    red.run_seconds(5);
+    EXPECT_EQ(red.client.bulk_nonserver_strikes_for_test(PoolRig::peer_key(1)), 0)
+        << "the plain rotating send must never strike — that is why EXPANSION "
+           "never engaged in the live A/B";
+    EXPECT_FALSE(red.client.outbound_behind_for_test());
+    EXPECT_EQ(red.client.effective_max_peers_for_test(), 8u);
+    EXPECT_EQ(red.client.dialing_count(), 0u);
+}
+
+// (STATEFUL-STALL B) The re-ask STRIKES the stalled carrier; the plain first-
+// ask rotating send never does. This is the reward-safe demote-on-stall the
+// tip-follow SmlResyncWatchdog re-request now feeds so a slow/limited primary
+// can neither wedge the SML nor stay invisible to the acquisition pump.
+TEST(DashStatefulFold, getmnlistd_reask_strikes_the_stalled_carrier)
+{
+    PoolRig rig;
+    rig.handshake_services(1, SVC_FULL);
+    rig.handshake_services(2, SVC_FULL);
+    rig.handshake_services(3, SVC_FULL);
+
+    const std::string c1 = rig.client.select_stateful_peer_key_for_test();
+    ASSERT_FALSE(c1.empty());
+    ASSERT_EQ(rig.client.bulk_nonserver_strikes_for_test(c1), 0);
+
+    // A timeout re-ask strikes THAT carrier (it did not answer in time).
+    rig.client.send_getmnlistd_reask(uint256::ZERO, hash_n(11));
+    EXPECT_EQ(rig.client.bulk_nonserver_strikes_for_test(c1), 1)
+        << "the stalled stateful carrier must be struck (dashd disconnect-on-stall)";
+
+    // RED: the first-ask rotating send is not a stall signal and never demotes.
+    PoolRig red;
+    red.handshake_services(1, SVC_FULL);
+    red.handshake_services(2, SVC_FULL);
+    const std::string rc = red.client.select_stateful_peer_key_for_test();
+    ASSERT_FALSE(rc.empty());
+    red.client.send_getmnlistd_rotating(uint256::ZERO, hash_n(12));
+    EXPECT_EQ(red.client.bulk_nonserver_strikes_for_test(rc), 0)
+        << "a first-ask rotating send must not demote its carrier";
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // (H) OUTBOUND ACQUISITION — dashd never stays starved on a full-but-shallow
 //     peer set. While it is behind it opens EXTRA full-relay outbound

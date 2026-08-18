@@ -1761,6 +1761,48 @@ public:
         p->write(msg);
     }
 
+    /// TIMEOUT RE-ASK of the STATEFUL getmnlistd leg — the recovery half of
+    /// dashd's rotate-on-stall sync-peer behaviour, fired when the carrier we
+    /// last asked did not answer in time (the tip-follow SmlResyncWatchdog
+    /// re-request, or the mn-checkpoint fold's tick_pending_fold re-ask). Two
+    /// things happen, and the live A/B (wf w8cr3yepg) proved BOTH were missing
+    /// on this leg — it pinned every ask AND every re-ask to one primary:
+    ///
+    ///   (B) ROTATE — send_getmnlistd_rotating() picks a DIFFERENT eligible
+    ///       archival carrier (next_stateful_peer avoids m_last_stateful_peer
+    ///       and prefers CanServeBlocks/NODE_NETWORK), so a slow/limited peer
+    ///       cannot wedge the fold by being re-asked forever.
+    ///
+    ///   (A) DEMOTE — strike the carrier that just stalled us as a demonstrated
+    ///       non-server, in the SAME bulk-demotion tally the block-body lane
+    ///       feeds. This is what makes the acquisition pump SEE a getmnlistd
+    ///       stall: outbound_behind() then reads a demoted slot-holder, the
+    ///       effective dial target expands (GetExtraFullOutboundCount) and
+    ///       refill/rotate pulls in MORE fresh archival peers to reach one that
+    ///       actually serves. Without it "behind" was blind to everything but
+    ///       block bodies, so a getmnlistd-dominated near-tip window kept the
+    ///       pool frozen at its base size even while a slow primary starved the
+    ///       SML — exactly the EXPANSION-never-engaged half of the finding.
+    ///
+    /// Reward-safe: this changes only WHICH peer is asked and HOW MANY we dial.
+    /// Exactly one getmnlistd is outstanding, so a reply from ANY carrier
+    /// satisfies the same await; the served MN-payee/quorum-root bytes are
+    /// still DIP-4 client-verified against the block's own cbTx commitment
+    /// before they are believed; and a peer that later delivers a body clears
+    /// its strike (forgive_bulk_nonserver on the ingest path).
+    void send_getmnlistd_reask(const uint256& base_block_hash,
+                               const uint256& block_hash)
+    {
+        // (A) the carrier we last asked demonstrably did not answer in time —
+        // strike it so the acquisition pump treats it as a slot-holding non-
+        // server and expands/rotates the outbound set toward a real server.
+        if (!m_last_stateful_peer.empty() && holds_key(m_last_stateful_peer))
+            note_bulk_nonserver(m_last_stateful_peer);
+        // (B) rotate to a fresh archival carrier and send (never drops: the
+        // rotating send falls back to any handshaked peer, then m_primary).
+        send_getmnlistd_rotating(base_block_hash, block_hash);
+    }
+
     /// Send a getqrinfo (DIP-24 quorum-rotation-info request) — the ROTATED
     /// counterpart of send_getmnlistd above. An EMPTY baseBlockHashes asks for
     /// FULL (base=ZERO) mnlistdiffs at every cycle height, which is what the

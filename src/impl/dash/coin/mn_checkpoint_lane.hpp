@@ -399,6 +399,16 @@ public:
     {
         m_request_snapshot = std::move(fn);
     }
+    /// Optional TIMEOUT RE-ASK seam. When set, tick_pending_fold() re-asks the
+    /// unanswered fold snapshot through THIS callback instead of the first-ask
+    /// one, so the re-ask can rotate to a fresh archival carrier AND strike the
+    /// stalled one as a non-server (feeding the outbound-acquisition pump). It
+    /// is a pure connection-management upgrade: unwired, the lane re-asks the
+    /// same way it always did.
+    void set_reask_snapshot_fn(RequestSnapshotFn fn)
+    {
+        m_reask_snapshot = std::move(fn);
+    }
     void set_merkle_root_at_fn(MerkleRootAtFn fn)
     {
         m_merkle_root_at = std::move(fn);
@@ -2897,7 +2907,10 @@ public:
                         << " drives — re-asking (same block, so still ONE"
                            " outstanding request: a reply to either ask is"
                            " indistinguishable and both are ours)";
-            m_request_snapshot(m_snapshot_hash);
+            // Route the re-ask through the rotate+demote seam when wired, so a
+            // stalled carrier is struck and a fresh archival peer is tried;
+            // falls back to the plain first-ask send when it is not.
+            (m_reask_snapshot ? m_reask_snapshot : m_request_snapshot)(m_snapshot_hash);
             return false;
         }
         if (m_snapshot_waits < kFoldGiveUpPumps) return false;
@@ -4067,6 +4080,7 @@ public:
     bool      m_revive_probe_cap_forced{false};
     bool      m_revive_probe_cap_hit{false};
     RequestSnapshotFn m_request_snapshot;
+    RequestSnapshotFn m_reask_snapshot;   // optional rotate+demote re-ask seam
     MerkleRootAtFn    m_merkle_root_at;
     size_t   m_sml_recovery_cap{0}; // budget handed to the machine, mirrored
     size_t   m_registered{0};       // ADDS observed across the replay
