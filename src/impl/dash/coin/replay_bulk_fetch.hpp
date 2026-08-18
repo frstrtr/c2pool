@@ -103,6 +103,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -1155,6 +1156,18 @@ public:
         // pump ceiling that capped healthy bands); null ⇒ pumping stays on the
         // tick() cadence only (byte-identical to before this seam existed).
         std::function<int64_t()> now_sec;
+        // OPTIONAL. dashd net_processing BLOCK_STALLING_TIMEOUT (proactive half,
+        // header lane): a peer that received a header-backfill getheaders but
+        // never answered within the stalling window is DROPPED and a replacement
+        // is redialed — not demote-only. dashd disconnects a stalling block peer
+        // ('Peer is stalling block download, disconnecting') rather than leaving
+        // the zombie session occupying a pool slot at max RTO backoff; this seam
+        // is the header-lane analog. main_dash wires it to
+        // CoinClient::stall_disconnect_and_redial (remove_peer + immediate
+        // refill_pool). Null (KATs without a live pool / any embedding that
+        // cannot redial) ⇒ the lane falls back to demote-only, byte-identical to
+        // the pre-port behaviour of this lane.
+        std::function<void(const std::string& peer_key)> disconnect_and_redial;
     };
 
     struct Config
@@ -1164,6 +1177,21 @@ public:
         int64_t  telemetry_interval_sec{30};
         int64_t  backfill_rekick_sec{15};    // headers stall re-kick (== dashd BLOCK_STALLING_TIMEOUT window for the header lane)
         int64_t  backfill_demote_cooldown_sec{60};  // header peer held OFF targeting after a stall (#1273 demote_cooldown parity); 0 ⇒ demote disabled (byte-identical to the pre-port blind lane, like the scheduler's demote_after=0)
+        // dashd HEADERS-DOWNLOAD WINDOW parity (parallel half). The pre-anchor
+        // header walk was SINGLE-INFLIGHT: one getheaders outstanding, and a
+        // peer that silently dropped it stalled the whole walk until the re-kick
+        // timer fired. dashd never serializes header/block fetch on one peer —
+        // it keeps a window open across peers and refills it on each message
+        // arrival. This bounds how many getheaders spans race concurrently
+        // across CanServeBlocks-eligible peers; the fastest answer drives the
+        // walk forward and a slow/dead peer never blocks it. 1 ⇒ legacy
+        // single-inflight (the pre-port behaviour, used by the KAT's RED arm).
+        uint32_t backfill_getheaders_window{4};
+        // dashd BLOCK_STALLING_TIMEOUT: a targeted peer that has not advanced the
+        // walk this many seconds is disconnected+redialed (disconnect_and_redial
+        // seam) instead of demote-only. 0 ⇒ disconnect disabled (demote-only,
+        // the pre-port behaviour / KAT RED arm).
+        int64_t  backfill_stall_disconnect_sec{15};
         uint32_t cursor_persist_every{512};  // delivered blocks between cursor writes
     };
 
@@ -1205,9 +1233,22 @@ private:
     // targeting until this wall-second (BLOCK_STALLING_TIMEOUT class). Empty ⇒
     // no header peer demoted, byte-identical to the pre-port blind round-robin.
     std::map<std::string, int64_t> m_hdr_demoted_until;
-    std::string m_hdr_target_peer;      // peer the last getheaders was sent to
-    uint32_t    m_hdr_target_height{0}; // walker tip when that getheaders left
-    bool        m_hdr_targeted{false};  // a getheaders is outstanding to track
+
+    // dashd HEADERS-DOWNLOAD WINDOW (parallel half): the set of peers with a
+    // getheaders currently OUTSTANDING for the pre-anchor walk. Each entry
+    // records the walker tip height at send time (to tell "answered / walk
+    // advanced" from "still silent") and the wall-second it left (to time the
+    // BLOCK_STALLING_TIMEOUT disconnect). Replaces the single m_hdr_target_*
+    // trio the pre-port lane tracked — up to Config::backfill_getheaders_window
+    // spans race concurrently across CanServeBlocks-eligible peers.
+    struct HdrSpan { uint32_t height_sent{0}; int64_t wall_sent{0}; };
+    std::map<std::string, HdrSpan> m_hdr_inflight;
+
+    // Telemetry: header spans that raced, peers disconnected for stalling, and
+    // header peers demoted (the demote-only fallback when disconnect is off).
+    uint64_t m_hdr_spans_issued{0};
+    uint64_t m_hdr_stall_disconnects{0};
+    uint64_t m_hdr_stall_demotes{0};
 
     void fail(const std::string& cause)
     {
@@ -1322,25 +1363,140 @@ private:
         return p;
     }
 
-    /// Issue ONE backfill getheaders to a CanServeBlocks-selected, un-demoted
-    /// peer and RECORD the target (peer + walker tip) so the next kick can tell
-    /// a stall (received-but-did-not-advance) from healthy progress and
-    /// demote+re-home. Height coverage is checked against tip_height()+1 — the
-    /// next header the walk needs — so a limited/pruned peer whose window sits
-    /// above genesis fails CanServeBlocks exactly as it should for a
-    /// from-genesis walk.
-    void issue_backfill_getheaders(
-        int64_t now, const std::vector<std::string>& peers)
+    /// Issue ONE backfill getheaders to a named peer and RECORD it in the
+    /// download window (peer + walker tip at send time + wall-second) so a stall
+    /// (received-but-did-not-advance) is told apart from healthy progress. The
+    /// stop hash is ZERO — the walker itself stops at the anchor.
+    void issue_one_getheaders(int64_t now, const std::string& peer)
     {
+        m_seams.send_getheaders(peer, m_backfill->tip_hash(), uint256::ZERO);
+        m_hdr_inflight[peer] = HdrSpan{ m_backfill->tip_height(), now };
+        ++m_hdr_spans_issued;
+    }
+
+    /// dashd HEADERS-DOWNLOAD WINDOW: top the outstanding-getheaders window up to
+    /// Config::backfill_getheaders_window by racing the CURRENT walker tip across
+    /// DISTINCT CanServeBlocks-eligible, un-demoted, not-already-inflight peers.
+    /// Height coverage is checked against tip_height()+1 (the next header the
+    /// walk needs) via the SAME peer_can_serve seam #1273 ported for the body
+    /// lane. Racing is SAFE by construction: a duplicate/stale batch whose
+    /// prev-hash is still in HeaderBackfill's recent window is claimed and then
+    /// cleanly rejected (prev != tip) — the walk only ever extends its tip. The
+    /// liveness bypass (select_backfill_peer) guarantees the window is never
+    /// left empty while any eligible peer exists — no span is ever skipped.
+    void fan_backfill_getheaders(int64_t now,
+                                 const std::vector<std::string>& peers)
+    {
+        if (peers.empty() || !m_backfill) return;
+        const std::size_t window = m_cfg.backfill_getheaders_window
+                                       ? m_cfg.backfill_getheaders_window : 1;
+        if (m_hdr_inflight.size() >= window) return;   // window already full
         const uint32_t want = m_backfill->tip_height() + 1;
-        std::string peer = select_backfill_peer(now, want, peers);
-        if (peer.empty()) return;
-        m_seams.send_getheaders(peer, m_backfill->tip_hash(),
-                                uint256::ZERO /* stop: serve max batches; the
-                                walker itself stops at the anchor */);
-        m_hdr_target_peer   = peer;
-        m_hdr_target_height = m_backfill->tip_height();
-        m_hdr_targeted      = true;
+        auto serves = [&](const std::string& p) {
+            return !m_seams.peer_can_serve || m_seams.peer_can_serve(p, want);
+        };
+        auto demoted = [&](const std::string& p) {
+            auto it = m_hdr_demoted_until.find(p);
+            return it != m_hdr_demoted_until.end() && it->second > now;
+        };
+        bool any_serves = false;
+        for (const auto& p : peers) if (serves(p)) { any_serves = true; break; }
+
+        const std::size_t n = peers.size();
+        // Round-robin fill with distinct serving, un-demoted, not-already-
+        // inflight peers — same CanServeBlocks preference the body lane uses.
+        for (std::size_t i = 0; i < n && m_hdr_inflight.size() < window; ++i)
+        {
+            const std::string& p = peers[(m_backfill_rr + i) % n];
+            if (m_hdr_inflight.count(p)) continue;   // already racing this window
+            if (any_serves && !serves(p)) continue;  // CanServeBlocks preference
+            if (demoted(p)) continue;                // BLOCK_STALLING_TIMEOUT cooldown
+            issue_one_getheaders(now, p);
+        }
+        m_backfill_rr = (m_backfill_rr + 1) % n;   // rotate start for next fan
+        // Liveness bypass (dashd never deadlocks the walk): if the window is
+        // STILL empty — every serving peer demoted, or the pool could not fill
+        // even one slot — fall back to the total-function selector, which clears
+        // demotions rather than sit idle. Never wedge with peers present.
+        if (m_hdr_inflight.empty())
+        {
+            std::string p = select_backfill_peer(now, want, peers);
+            if (!p.empty()) issue_one_getheaders(now, p);
+        }
+    }
+
+    /// Drop window entries for peers that vanished from the eligible set
+    /// (disconnected / reaped), so the window refills onto live peers.
+    void prune_departed_inflight(const std::vector<std::string>& peers)
+    {
+        if (m_hdr_inflight.empty()) return;
+        std::set<std::string> live(peers.begin(), peers.end());
+        for (auto it = m_hdr_inflight.begin(); it != m_hdr_inflight.end(); )
+        {
+            if (!live.count(it->first)) it = m_hdr_inflight.erase(it);
+            else ++it;
+        }
+    }
+
+    /// dashd BLOCK_STALLING_TIMEOUT: sweep the download window. A peer that
+    /// ANSWERED has already been erased by on_headers (on any claimed batch,
+    /// fresh or stale), so anything still outstanding here has sent NOTHING back
+    /// since we asked it — the walk advancing via OTHER racing peers is not
+    /// credit to a silent one (that is exactly the trap the single-inflight lane
+    /// could not see, because there the walk could not advance without the one
+    /// peer). A peer silent past the stalling window is DISCONNECTED+REDIALED
+    /// (dashd disconnects a stalling block peer rather than leaving a zombie
+    /// session at max RTO backoff); if that seam is absent it is demote-only (the
+    /// pre-port fallback). Either clears the slot so the next fan re-homes the
+    /// span onto a fresh peer. height_sent is retained for the log line only.
+    void check_hdr_stalls(int64_t now, const std::vector<std::string>& /*peers*/)
+    {
+        if (m_hdr_inflight.empty()) return;
+        const bool disc_enabled = m_cfg.backfill_stall_disconnect_sec > 0 &&
+                                  static_cast<bool>(m_seams.disconnect_and_redial);
+        std::vector<std::string> disconnect, demote;
+        for (const auto& [peer, span] : m_hdr_inflight)
+        {
+            const int64_t waited = now - span.wall_sent;
+            if (disc_enabled && waited >= m_cfg.backfill_stall_disconnect_sec)
+                disconnect.push_back(peer);
+            else if (!disc_enabled && m_cfg.backfill_demote_cooldown_sec > 0 &&
+                     waited >= m_cfg.backfill_rekick_sec)
+                demote.push_back(peer);
+        }
+        for (const auto& peer : demote)
+        {
+            m_hdr_demoted_until[peer] =
+                now + m_cfg.backfill_demote_cooldown_sec;
+            m_hdr_inflight.erase(peer);
+            ++m_hdr_stall_demotes;
+            LOG_WARNING << "[BULK] header-backfill peer " << peer
+                        << " STALLED at hdr=" << m_backfill->tip_height() << "/"
+                        << m_backfill->anchor_height()
+                        << " (getheaders unanswered ≥" << m_cfg.backfill_rekick_sec
+                        << "s) — demoted for " << m_cfg.backfill_demote_cooldown_sec
+                        << "s, re-homing the span (dashd BLOCK_STALLING_TIMEOUT "
+                           "parity, demote-only)";
+        }
+        for (const auto& peer : disconnect)
+        {
+            // Hold it off re-targeting until a fresh session redials, so the very
+            // next fan does not re-home the span straight back onto the dropped
+            // peer's key before the redial completes.
+            if (m_cfg.backfill_demote_cooldown_sec > 0)
+                m_hdr_demoted_until[peer] =
+                    now + m_cfg.backfill_demote_cooldown_sec;
+            m_hdr_inflight.erase(peer);
+            ++m_hdr_stall_disconnects;
+            LOG_WARNING << "[BULK] header-backfill peer " << peer
+                        << " STALLED at hdr=" << m_backfill->tip_height() << "/"
+                        << m_backfill->anchor_height()
+                        << " (getheaders unanswered ≥"
+                        << m_cfg.backfill_stall_disconnect_sec
+                        << "s) — DISCONNECT+REDIAL (dashd BLOCK_STALLING_TIMEOUT "
+                           "'Peer is stalling block download, disconnecting')";
+            m_seams.disconnect_and_redial(peer);
+        }
     }
 
     void maybe_kick_backfill(int64_t now)
@@ -1354,34 +1510,25 @@ private:
         // has published. Null seam ⇒ unchanged.
         if (m_seams.defer_to_higher_priority && m_seams.defer_to_higher_priority())
             return;
-        if ((now - m_last_backfill_kick) < m_cfg.backfill_rekick_sec) return;
         auto peers = m_seams.eligible_peers();
         if (peers.empty()) return;
-        // dashd BLOCK_STALLING_TIMEOUT (reactive half, header lane): this
-        // re-kick backstop only fires because the walker has NOT advanced since
-        // the last kick. If the peer we last targeted still holds the walker at
-        // the height we left it, it received the getheaders and silently
-        // dropped it — DEMOTE it for the cooldown so the re-home below lands on
-        // a different serving peer. Never wedge on one peer. A peer that DID
-        // advance the walker (tip_height moved) is not blamed; on_headers also
-        // clears the demotion the instant a delivery lands.
-        if (m_cfg.backfill_demote_cooldown_sec > 0 &&
-            m_hdr_targeted && !m_hdr_target_peer.empty() &&
-            m_backfill->tip_height() <= m_hdr_target_height)
-        {
-            m_hdr_demoted_until[m_hdr_target_peer] =
-                now + m_cfg.backfill_demote_cooldown_sec;
-            LOG_WARNING << "[BULK] header-backfill peer " << m_hdr_target_peer
-                        << " STALLED at hdr=" << m_backfill->tip_height() << "/"
-                        << m_backfill->anchor_height()
-                        << " (getheaders unanswered ≥"
-                        << m_cfg.backfill_rekick_sec
-                        << "s) — demoted for " << m_cfg.backfill_demote_cooldown_sec
-                        << "s, re-homing the span (dashd BLOCK_STALLING_TIMEOUT "
-                           "parity)";
-        }
-        issue_backfill_getheaders(now, peers);
-        m_last_backfill_kick = now;
+        prune_departed_inflight(peers);
+        // dashd BLOCK_STALLING_TIMEOUT: disconnect+redial (or demote) any span
+        // gone silent past the stalling window — always time-based, every tick.
+        check_hdr_stalls(now, peers);
+        // Tick-driven window TOP-UP is the backstop only: the healthy driver is
+        // the event-driven refill in on_headers (fires on every arrival, no
+        // cadence gate). This backstop is cadence-gated so a window that never
+        // received an arrival (an all-dead cold start) is re-kicked on the
+        // re-kick cadence rather than every tick — which is exactly what makes
+        // window==1 reproduce the pre-port single-inflight stall. An EMPTY
+        // window bypasses the gate so a fully-drained window never idles.
+        if (!m_hdr_inflight.empty() &&
+            (now - m_last_backfill_kick) < m_cfg.backfill_rekick_sec)
+            return;
+        const std::size_t before = m_hdr_inflight.size();
+        fan_backfill_getheaders(now, peers);
+        if (m_hdr_inflight.size() != before) m_last_backfill_kick = now;
     }
 
     void maybe_log_telemetry(int64_t now)
@@ -1425,6 +1572,12 @@ private:
                                          + std::to_string(
                                                m_backfill->anchor_height())))
                          : std::string("n/a"))
+                 << " hdrwin=" << m_hdr_inflight.size() << "/"
+                 << (m_cfg.backfill_getheaders_window
+                         ? m_cfg.backfill_getheaders_window : 1)
+                 << " hdrspans=" << m_hdr_spans_issued
+                 << " hdrdisc=" << m_hdr_stall_disconnects
+                 << " hdrdemote=" << m_hdr_stall_demotes
                  << " rereq=" << m_sched.rerequests()
                  << " timeout=" << m_sched.timeout_count()
                  << " notfound=" << m_sched.notfound_count()
@@ -1535,18 +1688,32 @@ public:
     {
         if (!m_backfill || !m_backfill->claims(batch)) return false;
         const int accepted = m_backfill->add_headers(batch);
+        // The peer answered — free its download-window slot and clear any
+        // stall-demotion (mirror #1273's on_body clearing demoted_until on a
+        // delivered body). This also retires a STALE racing response (accepted==0
+        // because another peer advanced the walk first): the slot is freed either
+        // way so the next fan can re-use it.
+        if (!peer_key.empty())
+        {
+            m_hdr_inflight.erase(peer_key);
+            m_hdr_demoted_until.erase(peer_key);
+        }
         if (accepted > 0 && !m_backfill->complete() && !m_backfill->failed())
         {
-            // The peer that just delivered headers PROVED it serves this span:
-            // clear any stall-demotion (mirror #1273's on_body clearing
-            // demoted_until on a delivered body). Then self-propel — ask a
-            // CanServeBlocks-selected, un-demoted peer for the next span
-            // immediately. The stall re-kick in tick() is only the backstop.
-            if (!peer_key.empty()) m_hdr_demoted_until.erase(peer_key);
-            auto peers = m_seams.eligible_peers();
-            if (!peers.empty())
-                issue_backfill_getheaders(
-                    m_seams.now_sec ? m_seams.now_sec() : 0, peers);
+            // EVENT-DRIVEN REFILL (dashd refills the download window on each
+            // message arrival, not on a timer): the walk advanced, so immediately
+            // top the window back up across serving peers at the NEW tip instead
+            // of waiting the tick re-kick cadence. Yields to a higher-priority
+            // coin-P2P consumer (the MN-checkpoint fold) exactly as the tick path
+            // does, so a body-triggered fan can never contend with the fold.
+            if (!(m_seams.defer_to_higher_priority &&
+                  m_seams.defer_to_higher_priority()))
+            {
+                auto peers = m_seams.eligible_peers();
+                if (!peers.empty())
+                    fan_backfill_getheaders(
+                        m_seams.now_sec ? m_seams.now_sec() : 0, peers);
+            }
         }
         return true;   // claimed — never reaches the tip-lane header ingest
     }
