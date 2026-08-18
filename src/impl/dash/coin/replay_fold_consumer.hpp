@@ -153,6 +153,18 @@ public:
         m_post_fold = std::move(h);
     }
 
+    /// ── The diff-store seam (mn_diff_store.hpp) ──────────────────────────
+    /// Invoked for every block whose fold COMPLETED — i.e. after the root
+    /// self-check passed and the counters above were credited. This is the
+    /// c2pool analogue of dashd writing DB_LIST_DIFF inside ProcessBlock
+    /// (evo/deterministicmns.cpp:689): the write rides the same per-block
+    /// commit that proved the state, so a record can never exist for a block
+    /// the fold did not verify. A refused/diverged fold never reaches this
+    /// sink (the divergence latch above returns first).
+    using DiffSink = std::function<void(uint32_t, const uint256&,
+                                        const BlockType&, const FoldResult&)>;
+    void set_diff_sink(DiffSink s) { m_diff_sink = std::move(s); }
+
     bool on_replay_block(uint32_t height, const uint256& hash,
                          const BlockType& block) override
     {
@@ -236,6 +248,7 @@ public:
         m_stats.collateral_spent += r.collateral_spent;
 
         if (m_post_fold) m_post_fold(height);
+        if (m_diff_sink) m_diff_sink(height, hash, block, r);
 
         if (m_utxo_sink && !m_utxo_sink(height, hash, block)) {
             // Tier-B is a DECORATION: its failure is reported but must never
@@ -311,6 +324,7 @@ private:
     UtxoSink          m_utxo_sink;
     BlockHook         m_pre_fold;
     std::function<void(uint32_t)> m_post_fold;
+    DiffSink          m_diff_sink;
     uint32_t          m_progress_every;
     FoldConsumerStats m_stats;
     std::chrono::steady_clock::time_point m_started;

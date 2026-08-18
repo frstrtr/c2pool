@@ -208,6 +208,7 @@
 #include <impl/dash/coin/block.hpp>
 #include <impl/dash/coin/mn_bridge_cursor.hpp>   // #91: the resumable replay cursor
 #include <impl/dash/coin/mn_checkpoint.hpp>
+#include <impl/dash/coin/mn_gap_repair.hpp>    // MnGapRepairFn (diff-store gap repair seam)
 #include <impl/dash/coin/mn_state_machine.hpp>
 #include <impl/dash/coin/historical_sml.hpp>   // authenticate_historical_snapshot
 #include <impl/dash/coin/lane_diag.hpp>        // ProgressReporter / StallWatchdog / MnSource
@@ -338,6 +339,10 @@ public:
     void set_publish_fn(PublishFn fn)            { m_publish = std::move(fn); }
     void set_tip_height_fn(TipHeightFn fn)       { m_tip_height = std::move(fn); }
     void set_header_hash_at_fn(HeaderHashAtFn fn){ m_header_hash_at = std::move(fn); }
+    /// Diff-store gap repair (mn_gap_repair.hpp): consulted on a machine-
+    /// level APPLY GAP before fail_closed. Optional — unset keeps the
+    /// terminal fail_closed behavior byte-identical.
+    void set_gap_repair(MnGapRepairFn fn)        { m_gap_repair = std::move(fn); }
     /// OPTIONAL. Unwired, the bridge behaves exactly as it did before this
     /// seam existed: any payee mismatch during replay is terminal.
     void set_sml_validity_fn(SmlValidityFn fn)
@@ -1806,6 +1811,9 @@ public:
         // flag; this is the belt-and-braces backstop for a direct caller.
         if (m_snapshot_pending) return;
         if (height != m_next) return;
+        // (The diff-store gap-repair seam below fires only on a machine-level
+        // APPLY GAP — a bridge whose own cursor discipline slipped; the
+        // height!=m_next drop above remains the ordinary filter.)
 
         // Publish the SML's own height into the machine BEFORE it adjudicates
         // anything, so the reactive demotion walk's attestations are gated on
@@ -1822,7 +1830,33 @@ public:
         // resumes it and re-delivers this very block).
         if (begin_revive_probe(block, height)) return;
 
-        const auto r = m_machine.apply_block(block, height);
+        auto r = m_machine.apply_block(block, height);
+
+        // ── DIFF-STORE GAP REPAIR (dashd GetListForBlockInternal analogue,
+        // evo/deterministicmns.cpp:778-870). A machine-level APPLY GAP was
+        // TERMINAL on this lane (fail_closed below — daemonless has no RPC
+        // to re-seed from). When the ported diff store (mn_diff_store.hpp)
+        // can reconstruct the verified list AT height-1, load it and retry
+        // the same block; any refusal leaves `r` as it was and the
+        // pre-existing fail_closed path below runs byte-for-byte unchanged.
+        if (r.gap_detected && m_gap_repair) {
+            auto rep = m_gap_repair(height - 1);
+            if (rep.ok && !rep.entries.empty() && rep.as_of == height - 1) {
+                LOG_INFO << "[MN-CKPT] bridge APPLY GAP at h=" << height
+                         << " REPAIRED from the diff store (source="
+                         << kPayeeSourceMnDiffRepair << ", "
+                         << rep.entries.size()
+                         << " MNs as-of h=" << rep.as_of
+                         << ") — retrying the held block";
+                m_machine.load(std::move(rep.entries), rep.as_of);
+                r = m_machine.apply_block(block, height);
+            } else {
+                LOG_WARNING << "[MN-CKPT] bridge APPLY GAP at h=" << height
+                            << " NOT repairable from the diff store ("
+                            << (rep.error.empty() ? "refused" : rep.error)
+                            << ") — fail_closed path unchanged";
+            }
+        }
 
         // The anchor's own falsification test. apply_block already logs the
         // detail; here it is TERMINAL (unlike the maintainer's path, which can
@@ -3771,6 +3805,7 @@ public:
     TipHeightFn    m_tip_height;
     HeaderHashAtFn m_header_hash_at;
     SmlSnapshotFn  m_sml_snapshot;
+    MnGapRepairFn  m_gap_repair;     // diff-store gap repair; unset = terminal fail_closed as before
 
     State       m_state{State::Unarmed};
     std::string m_status{"unarmed"};

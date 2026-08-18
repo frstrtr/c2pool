@@ -901,11 +901,37 @@ TEST(DashMnCheckpointE2e, NegativeControlAntiMintLatchBlocksUnseededArming)
     EXPECT_FALSE(state.populated())
         << "an unheighted masternode set must never arm the embedded arm";
 
-    // Positive control on the same object: the SAME set WITH its height arms it.
-    maint.on_mn_list_update(cp.entries, kAnchorHeight);
+    // Positive control on the same object: the SAME set WITH a height stamp
+    // arms it. Stamped AT the serve tip: the consumer currency gate (the G7
+    // split, coin_state_maintainer.hpp on_mn_list_update) refuses to arm
+    // SERVING off a seed whose as_of is below an already-known serve tip
+    // unless the diff-store catch-up (not wired in this rig) brings the
+    // cursor to the tip — a below-tip queue front must never back a template.
+    maint.on_mn_list_update(cp.entries, /*as_of_height=*/1519546);
     fire_tip();
     EXPECT_TRUE(state.populated())
-        << "a height-stamped authoritative snapshot must still arm normally";
+        << "a height-stamped authoritative snapshot at the serve tip must"
+           " still arm normally";
+
+    // The currency gate's own negative control: with the serve tip already
+    // known, a stale (below-tip) stamp must NOT arm serving — but the seed
+    // itself is STORED (refusal to arm is not a wipe, no reseed latch).
+    {
+        dash::coin::NodeCoinState st2;
+        dash::coin::CoinStateMaintainer m2{st2};
+        m2.set_require_seeded_mn_set(true);
+        m2.on_new_tip(/*prev_height=*/1519546, uint256S(kAnchorHash),
+                      /*bits_for_next=*/0x1d00ffff,
+                      /*mtp_at_tip=*/1751000000,
+                      TESTNET_PUBKEY_VER, TESTNET_P2SH_VER);
+        m2.on_mn_list_update(cp.entries, kAnchorHeight);   // 3 below the tip
+        EXPECT_FALSE(st2.populated())
+            << "a below-tip seed with no diff-store catch-up must not arm"
+               " serving";
+        EXPECT_EQ(st2.mnstates().size(), cp.entries.size())
+            << "the seed itself is STORED — refusal to arm is not a wipe";
+        EXPECT_FALSE(m2.mn_needs_reseed_latched());
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
