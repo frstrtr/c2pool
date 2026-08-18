@@ -22,6 +22,7 @@
 #include "share.hpp"
 #include "share_types.hpp"
 #include "version_negotiation.hpp"   // dash::version_negotiation:: accept-path version gate
+#include "coin/gentx_coinbase.hpp"   // dash::coin::GentxCoinbase (won-block reconstruct SSOT hand-off)
 
 #include <core/coin_params.hpp>
 #include <core/donation.hpp>          // cross-coin COMBINED_DONATION_SCRIPT SSOT (Bucket-2)
@@ -520,9 +521,19 @@ inline std::vector<unsigned char> get_share_script(const auto* obj)
 //
 // Reference: ref/p2pool-dash/p2pool/data.py generate_transaction() lines 131-269
 // ─────────────────────────────────────────────────────────────────────────────
+//
+// out_gentx (optional, default null): when non-null it is filled with the
+// regenerated coinbase's non-witness BYTES + its txid (== the returned hash),
+// so the won-block reconstructor (reconstruct_won_block.hpp) reuses this ONE
+// KAT-proven coinbase byte path instead of re-implementing the DIP3/DIP4 CbTx
+// assembly. PURELY ADDITIVE: every existing caller passes nothing (nullptr),
+// the coinbase bytes are already built here regardless, and the returned txid
+// is byte-identical with or without the out-param -- no accept-path behavior,
+// PPLNS math, or committed-txid comparison changes. Mirrors dgb's out_gentx.
 template <typename TrackerT>
 uint256 generate_share_transaction(const DashShare& share, TrackerT& tracker,
-                                   const core::CoinParams& params)
+                                   const core::CoinParams& params,
+                                   dash::coin::GentxCoinbase* out_gentx = nullptr)
 {
     const uint64_t subsidy = share.m_subsidy;
 
@@ -793,7 +804,16 @@ uint256 generate_share_transaction(const DashShare& share, TrackerT& tracker,
     // ── 6. Compute txid ──
     auto tx_span = std::span<const unsigned char>(
         reinterpret_cast<const unsigned char*>(tx.data()), tx.size());
-    return Hash(tx_span);
+    uint256 gentx_txid = Hash(tx_span);
+
+    // Additive: expose the coinbase BYTES + txid for the won-block reconstructor.
+    // Existing callers pass nullptr and are byte-for-byte unaffected.
+    if (out_gentx) {
+        out_gentx->bytes.assign(tx_span.begin(), tx_span.end());
+        out_gentx->txid = gentx_txid;
+    }
+
+    return gentx_txid;
 }
 
 // === verify_payout_commitment (Dash accept-path step 3: trustless PPLNS payout) ===

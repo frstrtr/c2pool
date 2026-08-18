@@ -28,6 +28,9 @@
 #include <impl/dash/params.hpp>
 #include <impl/dash/coinbase_builder.hpp>   // coinbase::merkle_branches_raw (drift fence)
 #include <impl/dash/stratum/work_target.hpp> // stratum::cap_pool_share (1.67% pool-share cap)
+#include <impl/dash/coin/reconstruct_won_block.hpp> // dash::coin::reconstruct_won_block / frame_won_block (distributed won-block)
+
+#include <optional>
 
 #include <core/coin_params.hpp>
 #include <core/hash.hpp>
@@ -1049,4 +1052,133 @@ TEST(DashPayoutCommitment, FinderTamperRejected) {
     // tampered share's recomputed coinbase no longer matches -> REJECTED.
     EXPECT_THROW(dash::verify_payout_commitment(
         tampered, tv, params, built.gentx_hash), std::invalid_argument);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DISTRIBUTED WON-BLOCK RECONSTRUCT (dash::coin::reconstruct_won_block /
+// frame_won_block) -- byte-correctness of rebuilding the full parent block from
+// a won share so ANY node can re-broadcast it (p2pool node.py:268-282 fan-out).
+// ═════════════════════════════════════════════════════════════════════════════
+namespace {
+
+// mint_scene's coinbase-ONLY sibling: same g<-s1<-s2<-C(win) window, but NO
+// masternode payments and NO GBT txs -> empty transaction_hash_refs + empty
+// merkle_link. This is the DAEMONLESS norm (transactions==[]): the reconstructed
+// block is [gentx] alone and merkle_root == gentx_txid.
+static dash::producer::BuiltShare mint_scene_coinbase_only(
+    SyntheticChain& sc, const core::CoinParams& params) {
+    const uint160 A = h160_uniform(0xaa), B = h160_uniform(0xbb), C = h160_uniform(0xcc);
+    uint256 g  = sc.add(0x01, uint256(), BITS_DIFF1, BITS_DIFF1, 1699999900, A, 0,
+                        1, u128_hex(ATA_DIFF1_HEX));
+    uint256 s1 = sc.add(0x02, g,  BITS_DIFF1, BITS_DIFF1, 1699999920, B, 0,
+                        2, u128_hex(ATA_DIFF1_HEX) * 2u);
+    uint256 s2 = sc.add(0x03, s1, BITS_DIFF1, BITS_DIFF1, 1699999940, C, 0,
+                        3, u128_hex(ATA_DIFF1_HEX) * 3u);
+    ProducerJobInputs in;
+    in.prev_share_hash = s2; in.coinbase_scriptSig = {0x03,0x01,0x02,0x03};
+    in.share_nonce = 7; in.pubkey_hash = C; in.subsidy = 500000000;
+    in.donation = 0; in.desired_version = 16; in.desired_timestamp = 1700000000;
+    in.desired_target = params.max_target;
+    in.packed_payments = {}; in.payment_amount = 0;    // coinbase-only
+    in.desired_tx_hashes = {};                          // transactions == []
+    auto info = dash::producer::generate_prospective_share_info(sc.chain, params, in);
+    return dash::producer::build_share(
+        sc.chain, params, info, fixture_min_header(), F1_NONCE64, /*check_pow=*/false);
+}
+
+} // namespace
+
+// GREEN: a coinbase-only won share reconstructs to the EXACT block it solved --
+// header(80) + varint(1) + gentx, whose X11(header) == the share hash (on DASH
+// the share hash IS the block hash). This is the block any node re-broadcasts.
+TEST(DashWonBlockReconstruct, CoinbaseOnlyShareRebuildsToWonBlock) {
+    const auto params = dash::make_coin_params(false);
+    SyntheticChain sc;
+    auto built = mint_scene_coinbase_only(sc, params);
+    PayoutTrackerView tv{sc.chain};
+
+    // The out_gentx param exposes the SAME coinbase bytes/txid the accept path
+    // commits to (additive; the returned txid is unchanged).
+    dash::coin::GentxCoinbase gc;
+    uint256 txid = dash::generate_share_transaction(built.share, tv, params, &gc);
+    EXPECT_EQ(hex_of(txid), hex_of(built.gentx_hash));
+    EXPECT_EQ(hex_of(gc.txid), hex_of(built.gentx_hash));
+    EXPECT_FALSE(gc.bytes.empty());
+
+    auto blk = dash::coin::reconstruct_won_block(
+        built.share.m_hash, built.share, tv, params, /*known_txs=*/{});
+    ASSERT_TRUE(blk.has_value());
+
+    // 80-byte header + CompactSize(1) + the gentx bytes, nothing else.
+    ASSERT_GT(blk->bytes.size(), 81u);
+    EXPECT_EQ(blk->bytes[80], 0x01);   // exactly one tx (the coinbase)
+    std::vector<unsigned char> body(blk->bytes.begin() + 81, blk->bytes.end());
+    EXPECT_EQ(body, gc.bytes);
+
+    // X11(header) of the reconstructed block == the share hash the tracker fired
+    // on: the reconstructed block IS the block the winning share solved.
+    std::span<const unsigned char> hdr(blk->bytes.data(), 80);
+    EXPECT_EQ(hex_of(params.pow_func(hdr)), hex_of(built.share.m_hash));
+
+    // hex mirror is exactly HexStr(bytes) for the RPC submitblock arm.
+    EXPECT_EQ(blk->hex, HexStr(blk->bytes));
+}
+
+// FAIL-LOUD: a share that references other (non-coinbase) txs whose bodies are
+// not in the known-tx set reconstructs to NOTHING (nullopt) -- never a partial
+// block. mint_scene carries non-empty transaction_hash_refs; with an empty
+// known-tx lookup the referenced bodies are unavailable.
+TEST(DashWonBlockReconstruct, ShareReferencingUnknownTxFailsLoud) {
+    const auto params = dash::make_coin_params(false);
+    SyntheticChain sc;
+    auto built = mint_scene(sc, params);            // has transaction_hash_refs
+    PayoutTrackerView tv{sc.chain};
+
+    ASSERT_FALSE(built.share.m_transaction_hash_refs.empty());
+    auto blk = dash::coin::reconstruct_won_block(
+        built.share.m_hash, built.share, tv, params, /*known_txs=*/{});
+    EXPECT_FALSE(blk.has_value());                  // INCOMPLETE -> broadcast NOTHING
+}
+
+// FAIL-LOUD: a share whose parent is not in-chain has no PPLNS window to rebuild
+// the coinbase from -> nullopt.
+TEST(DashWonBlockReconstruct, ParentNotInChainFailsLoud) {
+    const auto params = dash::make_coin_params(false);
+    SyntheticChain sc;                              // empty chain
+    PayoutTrackerView tv{sc.chain};
+
+    dash::DashShare orphan;
+    orphan.m_hash = h256_tag(0x55);
+    orphan.m_prev_hash = h256_tag(0x54);            // not added to the chain
+    auto blk = dash::coin::reconstruct_won_block(
+        orphan.m_hash, orphan, tv, params, /*known_txs=*/{});
+    EXPECT_FALSE(blk.has_value());
+}
+
+// resolve_other_tx_hashes: ordered ref-walk + loud out-of-range failure (pure).
+TEST(DashWonBlockReconstruct, ResolveOtherTxHashesOrdersAndFailsLoud) {
+    const uint256 won = h256_tag(0x90);
+    const uint256 anc = h256_tag(0x80);
+    const uint256 t0 = h256_tag(0x01), t1 = h256_tag(0x02);
+
+    auto nth_parent = [&](const uint256& s, uint64_t n) -> uint256 {
+        if (s == won && n == 1) return anc;         // parent
+        return uint256();                            // off-chain
+    };
+    auto new_txs = [&](const uint256& s) -> std::vector<uint256> {
+        if (s == anc) return {t0, t1};
+        return {};
+    };
+
+    // refs = [share_count=1, tx_count=1] -> ancestor's new_tx_hashes[1] == t1.
+    auto hashes = dash::coin::resolve_other_tx_hashes(won, {1, 1}, nth_parent, new_txs);
+    ASSERT_EQ(hashes.size(), 1u);
+    EXPECT_EQ(hex_of(hashes[0]), hex_of(t1));
+
+    // tx_count out of range -> throws (turned into fail-loud nullopt by caller).
+    EXPECT_THROW(dash::coin::resolve_other_tx_hashes(won, {1, 9}, nth_parent, new_txs),
+                 std::out_of_range);
+    // share_count walks off-chain -> throws.
+    EXPECT_THROW(dash::coin::resolve_other_tx_hashes(won, {5, 0}, nth_parent, new_txs),
+                 std::out_of_range);
 }

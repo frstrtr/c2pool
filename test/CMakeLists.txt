@@ -1471,7 +1471,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # build.yml --target allowlist never built -> NOT_BUILT/CTest "Could not find
     # executable" red). Separate TU, own anon namespace + distinct
     # DashWonBlockDualPath suite, gtest_main-provided main() -> no symbol clash.
-    add_executable(test_dash_broadcaster_full test_dash_broadcaster_full.cpp test_dash_won_block_dualpath.cpp)
+    add_executable(test_dash_broadcaster_full test_dash_broadcaster_full.cpp test_dash_won_block_dualpath.cpp test_dash_won_block_dispatch.cpp)
     target_link_libraries(test_dash_broadcaster_full PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
