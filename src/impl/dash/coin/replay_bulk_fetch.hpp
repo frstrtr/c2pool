@@ -794,6 +794,17 @@ public:
         uint32_t per_peer_inflight{32};   // outstanding bodies per peer (keeps reply queues short — priority inv. 4)
         uint32_t batch{16};               // invs per getdata message
         int64_t  request_timeout_sec{30}; // unanswered this long ⇒ re-request elsewhere
+        // dashd net_processing BLOCK_STALLING_TIMEOUT parity. A peer that leaves
+        // `demote_after` consecutive getdata unanswered (its deep-history bodies
+        // never arrive — the whole run measured notfound=0: non-archival peers
+        // silently drop the request rather than decline it) is held OFF fresh
+        // contiguous-range assignment for `demote_cooldown_sec`, so the in-order
+        // delivery cursor stops being handed work-ahead behind a peer that never
+        // answers. Purely fetch-side WHO/WHEN: no height is ever skipped (timed-
+        // out heights are requeued exactly as before), and a single delivered
+        // body clears the demotion. demote_after=0 restores pre-port behaviour.
+        uint32_t demote_after{3};
+        int64_t  demote_cooldown_sec{60};
     };
 
     struct PeerTally
@@ -801,6 +812,9 @@ public:
         uint64_t blocks{0};
         uint64_t bytes{0};
         uint32_t inflight{0};
+        uint32_t timeouts{0};        // cumulative unanswered-getdata timeouts (telemetry)
+        uint32_t timeout_streak{0};  // consecutive timeouts since this peer last delivered a body
+        int64_t  demoted_until{0};   // held off FRESH range assignment until this wall-second (0 = eligible)
     };
 
     struct Assignment
@@ -864,6 +878,16 @@ public:
     uint64_t timeout_count() const { return m_timeouts; }
     const std::map<std::string, PeerTally>& tallies() const { return m_tallies; }
 
+    /// Peers currently held off fresh-range assignment (stall-demoted). Purely
+    /// observational — for telemetry / the live [BULK] line.
+    std::size_t demoted_count(int64_t now) const
+    {
+        std::size_t n = 0;
+        for (const auto& [key, t] : m_tallies)
+            if (t.demoted_until > now) ++n;
+        return n;
+    }
+
     bool is_inflight(const uint256& hash) const
     {
         return m_inflight.find(hash) != m_inflight.end();
@@ -881,6 +905,10 @@ public:
         auto& t = m_tallies[it->second.peer];
         ++t.blocks;
         t.bytes += raw_size;
+        // A delivered body proves the peer is serving: clear its stall streak
+        // and any demotion so it is immediately re-eligible for fresh ranges.
+        t.timeout_streak = 0;
+        t.demoted_until = 0;
         if (t.inflight > 0) --t.inflight;
         m_inflight.erase(it);
         return height;
@@ -922,8 +950,21 @@ public:
             const bool timed_out =
                 (now - it->second.at) >= m_cfg.request_timeout_sec;
             if (!peer_gone && !timed_out) { ++it; continue; }
-            if (timed_out) ++m_timeouts;
             auto& t = m_tallies[it->second.peer];
+            if (timed_out)
+            {
+                ++m_timeouts;
+                ++t.timeouts;
+                ++t.timeout_streak;
+                // dashd BLOCK_STALLING_TIMEOUT parity: after `demote_after`
+                // consecutive unanswered getdata (no delivery in between), hold
+                // this peer off fresh-range assignment for the cooldown. A
+                // departed peer (peer_gone) is a topology event, not a serve
+                // failure — it does not accrue the stall streak.
+                if (m_cfg.demote_after > 0 &&
+                    t.timeout_streak >= m_cfg.demote_after)
+                    t.demoted_until = now + m_cfg.demote_cooldown_sec;
+            }
             if (t.inflight > 0) --t.inflight;
             m_retry.emplace_front(it->second.height, it->second.peer);
             it = m_inflight.erase(it);
@@ -954,11 +995,32 @@ public:
         const uint64_t budget_total =
             static_cast<uint64_t>(m_delivered) + m_cfg.window;
 
+        // dashd BLOCK_STALLING_TIMEOUT parity (fresh-range side): is ANY peer
+        // currently un-demoted? If every peer is stalled we must still hand out
+        // fresh ranges (liveness — never freeze the fetch), so the demotion gate
+        // is bypassed in that degenerate case. Retries are never gated here: the
+        // oldest missing height must be able to land on whichever peer's slot is
+        // free (the per-height avoid-peer already steers it off the last failer).
+        bool any_fresh_eligible = false;
+        for (const auto& p : peers)
+        {
+            auto ti = m_tallies.find(p);
+            if (ti == m_tallies.end() || ti->second.demoted_until <= now)
+            {
+                any_fresh_eligible = true;
+                break;
+            }
+        }
+
         for (std::size_t pi = 0; pi < peers.size(); ++pi)
         {
             const std::string& peer = peers[(m_rr + pi) % peers.size()];
             auto& tally = m_tallies[peer];
             if (tally.inflight >= m_cfg.per_peer_inflight) continue;
+            // A demoted peer still takes retries below, but is skipped for fresh
+            // contiguous ranges while any healthy peer remains.
+            const bool fresh_ok =
+                !any_fresh_eligible || tally.demoted_until <= now;
             uint32_t capacity = std::min<uint32_t>(
                 m_cfg.batch, m_cfg.per_peer_inflight - tally.inflight);
 
@@ -981,8 +1043,9 @@ public:
                 --capacity;
             }
 
-            // Then a fresh CONTIGUOUS range for this peer.
-            while (capacity > 0 && m_next <= m_target_end &&
+            // Then a fresh CONTIGUOUS range for this peer (unless it is demoted
+            // and healthy peers remain — dashd BLOCK_STALLING_TIMEOUT parity).
+            while (fresh_ok && capacity > 0 && m_next <= m_target_end &&
                    static_cast<uint64_t>(m_next) <= budget_total &&
                    (static_cast<uint64_t>(m_inflight.size()) + buffered) <
                        m_cfg.window)
@@ -1165,7 +1228,8 @@ private:
             peers << " " << key << "=" << t.blocks << "blk/"
                   << (t.bytes / (1024 * 1024)) << "MB"
                   << (t.inflight ? ("(+" + std::to_string(t.inflight) + ")")
-                                 : "");
+                                 : "")
+                  << (t.demoted_until > now ? "!D" : "");
         }
         LOG_INFO << "[BULK] delivered=" << m_delivered << "/"
                  << m_sched.target_end()
@@ -1175,6 +1239,7 @@ private:
                  << " inflight=" << m_sched.inflight_count()
                  << " buffer=" << m_buffer.size()
                  << " retry=" << m_sched.retry_count()
+                 << " demoted=" << m_sched.demoted_count(now)
                  << " hdr="
                  << (m_backfill
                          ? (m_backfill->complete()

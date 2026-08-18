@@ -351,6 +351,194 @@ TEST(DashReplayBulkScheduler, DepartedPeerRequestsRequeueImmediately)
     EXPECT_EQ(s.inflight_count(), 4u);   // b's requests untouched
 }
 
+// ═══ (B2) stall-demotion — dashd BLOCK_STALLING_TIMEOUT parity ═════════════
+//
+// The live full-history replay measured timeout=753956 against total=1681142
+// delivered (a 45% re-request rate) with notfound=0: non-archival peers do not
+// DECLINE deep-history getdata, they silently drop it, and one near-dead peer
+// (553 blk of 2.52M) kept its slot the whole run because nothing ever demoted
+// it. dashd disconnects a peer that stalls the download window; the reward-safe
+// analogue here holds a peer that leaves `demote_after` consecutive getdata
+// unanswered off FRESH contiguous-range assignment for a cooldown — never
+// dropping a height (timed-out heights requeue exactly as before), and clearing
+// the moment the peer delivers again.
+
+TEST(DashReplayBulkScheduler, StallDemotionHoldsDeadPeerOffFreshRanges)
+{
+    SyntheticChain chain(500);
+    rp::BulkBlockScheduler s;
+    rp::BulkBlockScheduler::Config cfg;
+    cfg.window = 400;
+    cfg.per_peer_inflight = 8;
+    cfg.batch = 8;
+    cfg.request_timeout_sec = 30;
+    cfg.demote_after = 3;
+    cfg.demote_cooldown_sec = 60;
+    s.configure(cfg);
+    s.reset(0);
+    s.set_target_end(499);
+    auto hashfn = [&](uint32_t h) { return chain.hash_at(h); };
+
+    // One dead peer, two healthy — so a healthy peer has spare capacity for
+    // fresh work even while the other absorbs the dead peer's requeued heights.
+    const std::vector<std::string> peers{"dead", "live1", "live2"};
+    int64_t now = 1000;
+
+    // Round 1: all three peers get a fresh contiguous batch.
+    auto plan = s.pump(now, peers, hashfn, 0);
+    ASSERT_EQ(plan.size(), 3u);
+    EXPECT_EQ(s.demoted_count(now), 0u);
+    // The live peers answer every body; "dead" answers none.
+    for (const auto& a : plan)
+        if (a.peer != "dead")
+            for (const auto& [h, hash] : a.blocks) s.on_body(hash, 100);
+
+    // 30 s later dead's whole batch times out in one service pass — enough
+    // consecutive unanswered getdata to cross demote_after.
+    now += 30;
+    s.service(now, peers);
+    EXPECT_GE(s.timeout_count(), static_cast<uint64_t>(cfg.demote_after));
+    EXPECT_EQ(s.demoted_count(now), 1u);            // exactly "dead"
+
+    // Next pump: "dead" is handed NOTHING — its timed-out heights requeue with
+    // avoid="dead" (steered onto a live peer) and it is barred from fresh
+    // ranges. All work flows through the live peers, which keep advancing.
+    const uint32_t fresh_floor = s.next_height();
+    auto plan2 = s.pump(now, peers, hashfn, 0);
+    ASSERT_FALSE(plan2.empty());
+    for (const auto& a : plan2)
+        EXPECT_NE(a.peer, "dead") << "demoted peer must receive no assignment";
+    EXPECT_GT(s.next_height(), fresh_floor);        // live kept advancing
+}
+
+TEST(DashReplayBulkScheduler, DeliveredBodyClearsDemotionImmediately)
+{
+    SyntheticChain chain(200);
+    rp::BulkBlockScheduler s;
+    rp::BulkBlockScheduler::Config cfg;
+    cfg.per_peer_inflight = 4;
+    cfg.batch = 4;
+    cfg.request_timeout_sec = 30;
+    cfg.demote_after = 3;
+    cfg.demote_cooldown_sec = 600;   // long cooldown — only a delivery can clear
+    s.configure(cfg);
+    s.reset(0);
+    s.set_target_end(199);
+    auto hashfn = [&](uint32_t h) { return chain.hash_at(h); };
+
+    const std::vector<std::string> solo{"x"};
+    int64_t now = 5000;
+    auto plan = s.pump(now, solo, hashfn, 0);        // "x" gets a batch
+    ASSERT_EQ(plan.size(), 1u);
+    const auto batch = plan[0].blocks;
+
+    now += 30;
+    s.service(now, solo);                            // all time out → demoted
+    EXPECT_EQ(s.demoted_count(now), 1u);
+
+    // A single delivered body proves the peer is serving again — clears the
+    // streak and demotion even though the 600 s cooldown has not elapsed.
+    // (Deliver a requeued height by re-pumping first so it is in-flight again;
+    // liveness fallback lets the sole demoted peer take fresh work.)
+    auto plan2 = s.pump(now, solo, hashfn, 0);
+    ASSERT_FALSE(plan2.empty());                     // sole peer ⇒ liveness bypass
+    s.on_body(plan2[0].blocks[0].second, 100);
+    EXPECT_EQ(s.demoted_count(now), 0u);             // demotion cleared
+}
+
+TEST(DashReplayBulkScheduler, StallDemotionCutsTimeoutWallTimeVsBaseline)
+{
+    // Deterministic before/after "measurement" of the exact throttle the live
+    // run measured. One dead peer among four; live peers answer instantly, the
+    // dead peer's requests only clear by 30 s timeout. The lane's in-order
+    // delivery cursor + bounded work-ahead window are modelled faithfully: the
+    // dead peer's contiguous chunk sits at the cursor HEAD, blocks it, the
+    // window fills with buffered work-ahead, and the whole fetch waits out a
+    // 30 s timeout wave before the cursor can advance. The metric is virtual
+    // SECONDS to deliver the entire span in order. Baseline (demote_after=0 ==
+    // pre-port behaviour) re-hands the dead peer a fresh contiguous chunk on
+    // every rotation, so it re-blocks the cursor and pays a 30 s wave again and
+    // again; the port demotes it after one wave and the remainder flows at live
+    // speed. Both MUST deliver every height in order (reward-safety: no skip).
+    auto run = [](uint32_t demote_after) -> std::pair<int64_t, bool> {
+        const uint32_t END = 2999;
+        SyntheticChain chain(END + 1);
+        rp::BulkBlockScheduler s;
+        rp::BulkBlockScheduler::Config cfg;
+        cfg.window = 512;             // bounded work-ahead (the §4.3 buffer)
+        cfg.per_peer_inflight = 16;
+        cfg.batch = 16;
+        cfg.request_timeout_sec = 30;
+        cfg.demote_after = demote_after;
+        cfg.demote_cooldown_sec = 60;
+        s.configure(cfg);
+        s.reset(0);
+        s.set_target_end(END);
+        auto hashfn = [&](uint32_t h) { return chain.hash_at(h); };
+        const std::vector<std::string> peers{"dead", "l1", "l2", "l3"};
+
+        std::set<uint32_t> received;   // bodies in hand, above the cursor
+        int64_t cursor = 0;            // next height the in-order lane needs
+        int64_t now = 0;
+        int guard = 0;
+        while (cursor <= END && guard++ < 2000000)
+        {
+            // Pump to a fixed point at this instant: a delivered body frees
+            // window/inflight, so keep pumping+delivering+draining until the
+            // in-order cursor can no longer advance (blocked behind the dead
+            // peer's held chunk).
+            bool progressed = true;
+            while (progressed)
+            {
+                progressed = false;
+                auto plan = s.pump(now, peers, hashfn, received.size());
+                for (const auto& a : plan)
+                {
+                    if (a.peer == "dead") continue;       // never answers
+                    for (const auto& [h, hash] : a.blocks)
+                    {
+                        auto got = s.on_body(hash, 100);
+                        if (got) received.insert(*got);
+                    }
+                }
+                // Drain in order, advancing the cursor + the scheduler high-water.
+                while (!received.empty() &&
+                       *received.begin() == static_cast<uint32_t>(cursor))
+                {
+                    s.note_delivered(static_cast<uint32_t>(cursor));
+                    received.erase(received.begin());
+                    ++cursor;
+                    progressed = true;
+                }
+            }
+            if (cursor > END) break;
+            // Cursor blocked: advance to the next timeout boundary and service
+            // (times out the dead peer's held chunk + requeues it to a live one).
+            now += cfg.request_timeout_sec;
+            s.service(now, peers);
+        }
+        return {now, cursor == static_cast<int64_t>(END) + 1};
+    };
+
+    auto [baseline_secs, baseline_ok] = run(/*demote_after=*/0);
+    auto [ported_secs,   ported_ok]   = run(/*demote_after=*/3);
+
+    EXPECT_TRUE(baseline_ok) << "baseline must still deliver every block in order";
+    EXPECT_TRUE(ported_ok)   << "port must still deliver every block in order";
+    // The port must slash the timeout wall time.
+    EXPECT_LT(ported_secs, baseline_secs);
+    EXPECT_LT(ported_secs * 3, baseline_secs)
+        << "ported=" << ported_secs << "s baseline=" << baseline_secs << "s";
+    // Surface the numbers in the test log for the before/after record.
+    std::fprintf(stderr,
+        "[stall-demote KAT] in-order full-span fetch virtual wall: "
+        "baseline=%llds ported=%llds (%.1fx less timeout wall)\n",
+        static_cast<long long>(baseline_secs),
+        static_cast<long long>(ported_secs),
+        baseline_secs > 0 && ported_secs > 0
+            ? double(baseline_secs) / double(ported_secs) : 0.0);
+}
+
 // ═══ (C) in-order delivery + prune ════════════════════════════════════════
 
 TEST(DashReplayBulkLane, DeliversInOrderAndPrunes)
