@@ -1418,6 +1418,27 @@ public:
         p->write(msg);
         return true;
     }
+
+    /// dashd net_processing BLOCK_STALLING_TIMEOUT: force-drop a single named
+    /// peer session and redial a replacement NOW. The pre-anchor header-backfill
+    /// lane calls this on a peer that received a getheaders but never answered
+    /// within the stalling window — dashd disconnects such a peer ('Peer is
+    /// stalling block download, disconnecting') instead of leaving the zombie
+    /// session occupying a pool slot at max RTO backoff. remove_peer() fires the
+    /// disconnect seam + re-elects the primary if needed; refill_pool() redials
+    /// from the scored dial plan immediately rather than waiting the 30 s
+    /// reconnect tick (which is only the backstop). Returns true iff a session
+    /// was actually dropped. A no-op (peer already gone) when the key is stale.
+    bool stall_disconnect_and_redial(const std::string& peer_key,
+                                     const std::string& reason)
+    {
+        PeerSession* p = find_peer(peer_key);
+        if (!p) return false;
+        remove_peer(p, reason);
+        refill_pool();   // immediate redial; the 30 s loop is only the backstop
+        return true;
+    }
+
     /// Fired on socket connect (before handshake) with the peer endpoint — the
     /// DashCoinPeerManager scores the connect + tracks anchors off this.
     void set_on_peer_connected(PeerLifecycleCallback cb) { m_on_peer_connected = std::move(cb); }

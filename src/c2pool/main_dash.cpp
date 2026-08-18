@@ -6827,6 +6827,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 const uint256& stop) {
                 cp->send_getheaders_to(peer, 70230, {locator_hash}, stop);
             };
+            // dashd BLOCK_STALLING_TIMEOUT (proactive half, header lane): a peer
+            // that received a header-backfill getheaders but never answered
+            // within the stalling window is dropped + a replacement redialed,
+            // instead of demote-only (which left the zombie session pinned to a
+            // pool slot at max RTO backoff — the POOL-STATUS started/lost=8/0
+            // pileup the cold-start diagnosis named). refill_pool() redials NOW.
+            seams.disconnect_and_redial = [cp = coin_p2p.get()](
+                const std::string& peer) {
+                cp->stall_disconnect_and_redial(
+                    peer, "header-backfill getheaders stalling (BLOCK_STALLING_TIMEOUT)");
+            };
             // Priority invariant 2: no new bulk getdata while a tracked tip
             // body is outstanding.
             seams.tip_busy = [cp = coin_p2p.get()] {
