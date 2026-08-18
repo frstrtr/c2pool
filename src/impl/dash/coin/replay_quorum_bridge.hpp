@@ -637,6 +637,7 @@ public:
     std::string observe(uint32_t height, const uint256& hash,
                         const BlockType& block)
     {
+        m_observed = std::make_pair(height, hash);
         std::string err;
         auto in = QuorumReplayEngine::input_from_block(block, height, hash,
                                                        &err);
@@ -709,6 +710,7 @@ public:
         if ((height + kWorkDiffDepth) % m_cfg.work_stride == 0)
             retain_list_at(height);
         prune(height);
+        maybe_produce_early_members(height);
     }
 
     /// Exposed for tests and for callers that want the seam without the
@@ -779,6 +781,37 @@ public:
     }
 
 private:
+    /// Early-era (pre-V20) non-rotated member production, wired into the
+    /// POST-fold step. observe_block() refuses below the V20 floor, so the
+    /// forward member lane never produced a set for a REAL early LLMQ_50_60
+    /// commitment and the W1 fold failed closed on its PoSe punishes
+    /// (h=1081595). Once the DML fold of a DKG base block H has completed
+    /// (so the DML is GetListForBlock(H) by construction), derive that base's
+    /// non-rotated member sets from the SAME replayed list and register them
+    /// for members_for(). Above the floor this is a no-op — the engine's
+    /// observe_block() path owns that era.
+    void maybe_produce_early_members(uint32_t height)
+    {
+        if (height >= m_quorum.v20_floor()) return;
+        if (!m_observed || m_observed->first != height) return;
+        bool is_base = false;
+        for (const auto& p : replay_chainparams_llmqs(m_cfg.network)) {
+            if (!p.use_rotation && p.dkg_interval
+                    && height % p.dkg_interval == 0) { is_base = true; break; }
+        }
+        if (!is_base) return;
+        std::vector<QuorumMnEntry> list_at_base;
+        list_at_base.reserve(m_dml.entries().size());
+        for (const auto& [protx, st] : m_dml.entries())
+            list_at_base.push_back(to_quorum_entry(protx, st));
+        auto r = m_quorum.produce_early_nonrotated_members(
+            height, m_observed->second, list_at_base);
+        m_stats.member_cycles_derived += r.cycles_produced;
+        m_stats.member_cycles_skipped += r.cycles_skipped;
+        if (!r.skip_reasons.empty())
+            m_stats.last_skip_reason = r.skip_reasons.back();
+    }
+
     void retain_list_at(uint32_t height)
     {
         std::vector<QuorumMnEntry> list;
@@ -808,6 +841,9 @@ private:
     QuorumReplayEngine& m_quorum;
     QuorumBridgeConfig  m_cfg;
     std::map<uint32_t, std::vector<QuorumMnEntry>> m_lists;
+    /// The (height, hash) of the block currently being folded, cached by
+    /// observe() so the post-fold early-member producer has the base hash.
+    std::optional<std::pair<uint32_t, uint256>> m_observed;
     std::vector<uint32_t> m_seeded_work_heights;
     Stats  m_stats;
     size_t m_seeded_snapshots{0};

@@ -1000,6 +1000,106 @@ public:
         return it->second;
     }
 
+    /// The DEPLOYMENT_V20 activation height this engine gates its modifier /
+    /// merkleRootQuorums era on (diagnostics + the early-era producer below,
+    /// which runs STRICTLY below this line).
+    uint32_t v20_floor() const { return m_cfg.v20_floor; }
+
+    /// Outcome of an early-era non-rotated member production pass.
+    struct EarlyMemberProdResult {
+        uint32_t                 base_height{0};
+        uint32_t                 cycles_produced{0};
+        uint32_t                 cycles_skipped{0};
+        std::vector<std::string> skip_reasons;
+    };
+
+    /// EARLY-ERA (pre-V20) NON-ROTATED member PRODUCER.
+    ///
+    /// dashd llmq/utils.cpp verbatim for a non-rotated quorum whose work block
+    /// is PRE-V20 (DeploymentActiveAfter(pWorkBlockIndex, ..., DEPLOYMENT_V20)
+    /// is FALSE):
+    ///   * member list = GetListForBlock(pQuorumBaseBlockIndex) — the list AS
+    ///     OF the DKG base block itself, NO -8 work-block offset. The offset
+    ///     lives ONLY in GetHashModifier's ChainLock lookup;
+    ///     ComputeQuorumMembers feeds the BASE-block list (verified against
+    ///     dashpay/dash develop). `list_at_base` is exactly that: the W1
+    ///     fold's just-proven DML at this base (post_fold), which IS
+    ///     GetListForBlock(base) by construction.
+    ///   * modifier    = ::SerializeHash(std::make_pair(llmqType, baseHash)) —
+    ///     GetHashModifier's pre-V20 branch (no ChainLock term). That is
+    ///     compute_quorum_modifier's CL-absent branch fed the BASE hash.
+    ///   * selection   = CalculateQuorum(size, modifier) over confirmed+valid
+    ///     MNs — compute_nonrotated_members (eligible() drops PoSe-banned and
+    ///     null-confirmedHash exactly as CalculateScores does).
+    ///
+    /// This is the piece observe_block() cannot supply below the V20 floor:
+    /// it refuses every such block (the rotated / CL-modifier eras and the
+    /// merkleRootQuorums self-check are Phase-2), so a REAL early LLMQ_50_60
+    /// commitment — mainnet's first mined DKG era, May 2019 — had NO member
+    /// set and the W1 fold failed closed on its PoSe punishes (the h=1081595
+    /// poison). merkleRootQuorums does not exist pre-DIP8; ONLY member
+    /// production is enabled here. Above the floor this is a no-op —
+    /// observe_block owns that era and must never be shadowed.
+    ///
+    /// Iterates the CHAINPARAMS llmq list (which still carries LLMQ_50_60,
+    /// mined in this era), not the runtime-enabled set (which correctly drops
+    /// it on modern mainnet). Keyed by (llmqType, baseHash) via the same
+    /// m_height_by_hash the forward path uses, so members_for(type,
+    /// quorumHash) resolves a commitment whose quorumHash == its DKG base
+    /// block hash. commitment_is_null() is unchanged (already dashd-IsNull-
+    /// faithful): a genuinely null early commitment still skips before any
+    /// member set is consulted.
+    EarlyMemberProdResult produce_early_nonrotated_members(
+        uint32_t base_height, const uint256& base_hash,
+        const std::vector<QuorumMnEntry>& list_at_base)
+    {
+        EarlyMemberProdResult out;
+        out.base_height = base_height;
+        if (!m_cfg.enabled) return out;
+        // STRICTLY below the V20 floor. At/above it observe_block() is the
+        // authoritative producer (work-block list + CL modifier + rotation).
+        if (base_height >= m_cfg.v20_floor) return out;
+
+        // Register the base block in the height/hash window so members_for()
+        // maps a commitment's quorumHash (== base block hash) back to the base
+        // height. Below the floor observe_block() refuses before it would.
+        m_hash_by_height[base_height] = base_hash;
+        m_height_by_hash[base_hash]   = base_height;
+
+        for (const auto& p : replay_chainparams_llmqs(m_cfg.network)) {
+            if (p.use_rotation) continue;              // rotated => Phase-2
+            if (p.dkg_interval == 0) continue;
+            if (base_height % p.dkg_interval != 0) continue;
+
+            const uint256 modifier = vendor::compute_quorum_modifier(
+                p.type, base_height, /*best_cl_sig=*/std::nullopt, base_hash);
+            const bool evo_only =
+                (m_cfg.network == LlmqNetwork::Mainnet
+                     ? p.type == vendor::kLlmqTypePlatformMainnet
+                     : p.type == vendor::kLlmqTypePlatformTestnet);
+            std::string err;
+            auto members = compute_nonrotated_members(
+                p, evo_only, list_at_base, modifier, &err);
+            if (!members) {
+                ++out.cycles_skipped;
+                out.skip_reasons.push_back(
+                    "early non-rotated type " + std::to_string(int(p.type))
+                    + " base h=" + std::to_string(base_height) + ": " + err);
+                continue;
+            }
+            m_modifiers[{p.type, base_height}] = modifier;
+            m_members[{p.type, base_height}]   = std::move(*members);
+            ++out.cycles_produced;
+        }
+
+        // Bound memory across a genesis-length early era. A base's member set
+        // is consumed only inside its own mining window (base+mining_window),
+        // so keep_depth (>> that window) can never evict a set a later
+        // commitment still needs.
+        prune(base_height);
+        return out;
+    }
+
     // ── observe_block — the per-block quorum fold + THE self-check ───────
     QuorumObserveResult observe_block(const QuorumBlockInput& in)
     {

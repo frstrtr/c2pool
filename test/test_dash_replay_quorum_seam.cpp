@@ -776,3 +776,159 @@ TEST(DashReplayQuorumSeam, BridgeNeverArmsTheRootSelfCheckByItself)
     EXPECT_TRUE(bridge.self_check_armed())
         << "arm_self_check() is the ONLY door, and it must still work";
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KAT-E — EARLY-ERA (pre-V20) NON-ROTATED member production (the h=1081595
+//         poison)
+//
+//   A REAL LLMQ_50_60 (type 1) final commitment — mainnet's FIRST mined DKG
+//   era, May 2019 — marks members invalid, so the W1 fold needs its ORDERED
+//   member set to attribute dashd's HandleQuorumCommitment PoSe punishes by
+//   bitset index. But the W4 QuorumReplayEngine refuses every block below the
+//   V20 floor (1'987'776), so members_for() answered nullopt and the fold
+//   FAILED CLOSED: "quorum-member resolver has no member set for llmqType=1
+//   ... failing closed". That is the live-proven poison (DIVERGED_AT=1081595).
+//
+//   commitment_is_null() was NEVER the bug — it is already dashd
+//   CFinalCommitment::IsNull-faithful and the 1081595 commitment is non-null
+//   (41/50 signers, real pubkey/sigs). The fix PRODUCES the early non-rotated
+//   member set, dashd llmq/utils.cpp ComputeQuorumMembers verbatim for a
+//   pre-V20 work block: member list = GetListForBlock(base) (NO -8 offset),
+//   modifier = ::SerializeHash(make_pair(type, baseHash)) (no ChainLock term
+//   — GetHashModifier's pre-V20 branch, verified against dashpay/dash develop).
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Deterministic distinct 32-byte value (display-hex from two 64-bit words).
+uint256 u256_from(uint64_t hi, uint64_t lo)
+{
+    static const char* H = "0123456789abcdef";
+    std::string s(64, '0');
+    const uint64_t v[2] = {lo, hi};
+    for (int k = 0; k < 2; ++k)
+        for (int i = 0; i < 16; ++i)
+            s[63 - k * 16 - i] = H[(v[k] >> (4 * i)) & 0xf];
+    return from_display(s.c_str());
+}
+
+std::vector<QuorumMnEntry> synth_mn_list(size_t n, size_t n_invalid)
+{
+    std::vector<QuorumMnEntry> list;
+    list.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        QuorumMnEntry e;
+        e.proTxHash      = u256_from(0x1000u + i, i * 2654435761ull);
+        e.confirmedHash  = u256_from(0xc0ffeeu, i * 40503ull + 7);  // non-null
+        e.is_valid       = (i >= n_invalid);   // first n_invalid are PoSe-banned
+        e.n_type         = 0;
+        e.has_collateral = true;
+        e.collateral_hash  = u256_from(0xabcdu, i * 7919ull);
+        e.collateral_index = static_cast<uint32_t>(i);
+        list.push_back(e);
+    }
+    return list;
+}
+
+// The real quorumHash the live poison names at h=1081595 (== its DKG base
+// block hash; the fold resolves members_for(type, quorumHash) through it).
+const uint256 kEarlyBaseHash = from_display(
+    "00000000000000019b39d2d042f4da5d2edcb3f5c73b3517d6bdf9ae2568c52c");
+constexpr uint32_t kEarlyBase = 1'081'584;   // % 24 == 0, below the V20 floor
+constexpr uint8_t  kType5060  = 1;
+
+}  // namespace
+
+// RED WITNESS: the era gate that caused the poison. Below the V20 floor the
+// forward observe_block() path refuses, so a fresh engine has NO member set
+// for the early quorum — the fold fails closed exactly as the live run did.
+TEST(DashReplayQuorumSeam, EarlyNonRotatedGateRefusesWithoutTheProducer)
+{
+    QuorumReplayConfig qcfg;
+    qcfg.enabled = true;
+    qcfg.network = LlmqNetwork::Mainnet;      // v20_floor = 1'987'776
+    QuorumReplayEngine eng(qcfg);
+    eng.seed_cursor(kEarlyBase - 24, u256_from(0x1u, 0x105ab0u));
+
+    dash::coin::replay::QuorumBlockInput in;
+    in.height     = kEarlyBase;
+    in.block_hash = kEarlyBaseHash;
+    auto r = eng.observe_block(in);
+    EXPECT_FALSE(r.ok);
+    EXPECT_NE(r.error.find("below the V20 floor"), std::string::npos) << r.error;
+
+    // ... so members_for stays nullopt: the W1 fold would fail closed here.
+    EXPECT_FALSE(eng.members_for(kType5060, kEarlyBaseHash).has_value());
+}
+
+// GREEN: the early producer registers the base's non-rotated member sets and
+// members_for() now resolves the LLMQ_50_60 quorum — byte-identical to dashd's
+// pre-V20 ComputeQuorumMembers.
+TEST(DashReplayQuorumSeam, EarlyNonRotatedProducerResolvesMembersFaithfully)
+{
+    QuorumReplayConfig qcfg;
+    qcfg.enabled = true;
+    qcfg.network = LlmqNetwork::Mainnet;
+    QuorumReplayEngine eng(qcfg);
+    eng.seed_cursor(kEarlyBase - 24, u256_from(0x1u, 0x105ab0u));
+
+    auto list = synth_mn_list(/*n=*/80, /*n_invalid=*/9);
+
+    auto prod = eng.produce_early_nonrotated_members(kEarlyBase, kEarlyBaseHash,
+                                                     list);
+    EXPECT_GE(prod.cycles_produced, 1u)
+        << (prod.skip_reasons.empty() ? std::string{} : prod.skip_reasons.back());
+
+    auto got = eng.members_for(kType5060, kEarlyBaseHash);
+    ASSERT_TRUE(got.has_value())
+        << "members_for must now resolve the early LLMQ_50_60 quorum";
+
+    const auto* p =
+        dash::coin::replay::replay_llmq_params(LlmqNetwork::Mainnet, kType5060);
+    ASSERT_NE(p, nullptr);
+    EXPECT_EQ(got->size(), std::min<size_t>(p->size, 80u));   // top 50 of 80
+
+    // FAITHFULNESS: byte-identical to dashd ComputeQuorumMembers for a pre-V20
+    // work block — base-block list + SerializeHash(pair(type, baseHash)), NO
+    // -8 work-block offset, NO ChainLock term.
+    const uint256 pre_v20_modifier =
+        dash::coin::vendor::compute_quorum_modifier(
+            kType5060, kEarlyBase, /*best_cl_sig=*/std::nullopt, kEarlyBaseHash);
+    auto want = dash::coin::replay::compute_nonrotated_members(
+        *p, /*evo_only=*/false, list, pre_v20_modifier, nullptr);
+    ASSERT_TRUE(want.has_value());
+    EXPECT_EQ(*got, *want);
+
+    // The pre-V20 formula is NOT the post-V20 (work-block hash) one: a modifier
+    // built over a different hash reorders the top-50, so the choice is load-
+    // bearing, not cosmetic.
+    const uint256 wrong_modifier =
+        dash::coin::vendor::compute_quorum_modifier(
+            kType5060, kEarlyBase, std::nullopt, u256_from(0xdead, 0xbeef));
+    auto wrong = dash::coin::replay::compute_nonrotated_members(
+        *p, false, list, wrong_modifier, nullptr);
+    ASSERT_TRUE(wrong.has_value());
+    EXPECT_NE(*got, *wrong);
+
+    // Every PoSe-banned synthetic MN is excluded (eligible() == dashd
+    // CalculateScores onlyValid + confirmedHash skip).
+    for (const auto& m : *got)
+        for (size_t i = 0; i < 9; ++i)
+            EXPECT_NE(m.GetHex(), list[i].proTxHash.GetHex());
+}
+
+// The producer is STRICTLY a below-floor lane: at/above the V20 floor the
+// forward observe_block() path is authoritative and must never be shadowed.
+TEST(DashReplayQuorumSeam, EarlyProducerIsANoOpAtOrAboveTheV20Floor)
+{
+    QuorumReplayConfig qcfg;
+    qcfg.enabled = true;
+    qcfg.network = LlmqNetwork::Mainnet;
+    QuorumReplayEngine eng(qcfg);
+    const uint256 base_hash = u256_from(0x1e5u, 0x0u);
+    auto list = synth_mn_list(80, 9);
+    auto prod = eng.produce_early_nonrotated_members(
+        /*base=*/2'000'000u, base_hash, list);          // >= 1'987'776
+    EXPECT_EQ(prod.cycles_produced, 0u);
+    EXPECT_FALSE(eng.members_for(kType5060, base_hash).has_value());
+}
