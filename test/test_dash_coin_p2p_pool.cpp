@@ -1503,3 +1503,216 @@ TEST(DashStatefulFold, fold_getmnlistd_never_wedges_when_only_pruned_peers_exist
     EXPECT_EQ(sent, 4u) << "the fold request must never be dropped even when no "
                            "archival peer exists (fallback to the handshaked pool)";
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// (H) OUTBOUND ACQUISITION — dashd never stays starved on a full-but-shallow
+//     peer set. While it is behind it opens EXTRA full-relay outbound
+//     (GetExtraFullOutboundCount) and it DISCONNECTS a peer that holds a
+//     download slot without serving (BLOCK_STALLING_TIMEOUT) so the freed slot
+//     refills with a FRESH addrman candidate (ThreadOpenConnections) —
+//     rotating until every download slot holds an archival peer and the
+//     block-download window fills. Our pool used to LATCH: a full pool
+//     early-returned from refill_pool() and the bulk lane only DEMOTED a
+//     demonstrated non-server (held it off fresh ranges) without ever freeing
+//     its slot, so the large addrman bank behind the working set was never
+//     re-drawn. These KATs are RED with the pump disabled (byte-identical
+//     pre-port frozen full pool) and GREEN with it on (default).
+// ══════════════════════════════════════════════════════════════════════════
+
+// (H1) dashd GetExtraFullOutboundCount: a demonstrated deep-body non-server
+// occupying a slot means we are BEHIND on archival coverage — the effective
+// dial target expands and a full-at-base pool dials MORE fresh candidates to
+// reach archival servers beyond the frozen set.
+TEST(DashCoinP2PPool, behind_on_archival_coverage_expands_outbound_and_dials_more)
+{
+    PoolRig rig;
+    rig.use_fake_clock();
+    rig.client.set_max_peers(8);
+
+    // Come up full: 8 handshaked peers dialed from the plan.
+    std::vector<NetService> plan;
+    for (int i = 1; i <= 8; ++i) plan.push_back(PoolRig::peer_addr(i));
+    rig.client.connect(plan);
+    for (int i = 1; i <= 8; ++i) rig.handshake(i);
+    ASSERT_EQ(rig.client.connected_peer_count(), 8u);
+
+    // Healthy full pool: base target, NOT behind, and (the pre-#1272 rule that
+    // still holds) a full pool does not dial.
+    EXPECT_FALSE(rig.client.outbound_behind_for_test());
+    EXPECT_EQ(rig.client.effective_max_peers_for_test(), 8u);
+
+    // Supply FRESH archival candidates the frozen set never reached.
+    rig.client.update_dial_targets({PoolRig::peer_addr(9), PoolRig::peer_addr(10),
+                                    PoolRig::peer_addr(11), PoolRig::peer_addr(12)});
+    ASSERT_EQ(rig.client.dialing_count(), 0u) << "a healthy full pool must not dial";
+
+    // Peer 1 demonstrates it does not serve deep bodies (two NOTFOUND/stall
+    // strikes = BULK_NONSERVER_STRIKE_MAX) — it is now demoted, holding a slot.
+    rig.client.note_bulk_nonserver_for_test(PoolRig::peer_key(1));
+    rig.client.note_bulk_nonserver_for_test(PoolRig::peer_key(1));
+    ASSERT_TRUE(rig.client.bulk_demoted_for_test(PoolRig::peer_key(1)));
+
+    // GetExtraFullOutboundCount: behind ⇒ target raised by OUTBOUND_BEHIND_EXTRA.
+    EXPECT_TRUE(rig.client.outbound_behind_for_test());
+    EXPECT_EQ(rig.client.effective_max_peers_for_test(), 10u)
+        << "the dial target must expand while behind so we reach MORE peers";
+
+    // One pool tick runs the acquisition pump: 8 held < 10 effective ⇒ dial 2
+    // FRESH candidates (no eviction needed — pure extra outbound).
+    rig.run_seconds(1);
+    EXPECT_EQ(rig.client.dialing_count(), 2u)
+        << "behind, a full-at-base pool must dial the extra outbound slots";
+    for (const auto& k : rig.client.dialing_keys())
+    {
+        bool fresh = k == PoolRig::peer_key(9)  || k == PoolRig::peer_key(10) ||
+                     k == PoolRig::peer_key(11) || k == PoolRig::peer_key(12);
+        EXPECT_TRUE(fresh) << "extra outbound dialed a non-fresh target: " << k;
+    }
+    EXPECT_EQ(rig.client.outbound_rotations_for_test(), 0u)
+        << "the extra-outbound path must NOT evict anyone (no peer disconnected)";
+
+    // RED proof (pump disabled = byte-identical pre-port): frozen full pool.
+    PoolRig red;
+    red.use_fake_clock();
+    red.client.set_outbound_rotate_enabled_for_test(false);
+    red.client.set_max_peers(8);
+    red.client.connect(plan);
+    for (int i = 1; i <= 8; ++i) red.handshake(i);
+    red.client.update_dial_targets({PoolRig::peer_addr(9), PoolRig::peer_addr(10),
+                                    PoolRig::peer_addr(11), PoolRig::peer_addr(12)});
+    red.client.note_bulk_nonserver_for_test(PoolRig::peer_key(1));
+    red.client.note_bulk_nonserver_for_test(PoolRig::peer_key(1));
+    red.run_seconds(5);
+    EXPECT_EQ(red.client.effective_max_peers_for_test(), 8u);
+    EXPECT_EQ(red.client.dialing_count(), 0u)
+        << "PRE-PORT: a full pool of non-servers never dials more (the frozen pool)";
+}
+
+// (H2) dashd BLOCK_STALLING_TIMEOUT + ThreadOpenConnections: when even the
+// EXPANDED pool is saturated and still holds demoted non-servers, the worst one
+// (most strikes) is disconnected and the freed slot refills from the addrman-fed
+// plan with a FRESH candidate. Non-demoted peers are never evicted.
+TEST(DashCoinP2PPool, saturated_pool_rotates_worst_nonserver_out_for_a_fresh_dial)
+{
+    PoolRig rig;
+    rig.use_fake_clock();
+    // At the hard cap the effective target cannot expand (min(16+2,16)==16), so
+    // a full+behind pool takes the EVICT-then-refill branch deterministically.
+    rig.client.set_max_peers(16);
+
+    std::vector<NetService> plan;
+    for (int i = 1; i <= 16; ++i) plan.push_back(PoolRig::peer_addr(i));
+    rig.client.connect(plan);
+    for (int i = 1; i <= 16; ++i) rig.handshake(i);
+    ASSERT_EQ(rig.client.connected_peer_count(), 16u);
+
+    // A fresh archival candidate the frozen 16-set never reached.
+    rig.client.update_dial_targets({PoolRig::peer_addr(17)});
+
+    // Two demoted non-servers; peer 6 is the WORST (3 strikes vs peer 9's 2).
+    for (int s = 0; s < 2; ++s) rig.client.note_bulk_nonserver_for_test(PoolRig::peer_key(9));
+    for (int s = 0; s < 3; ++s) rig.client.note_bulk_nonserver_for_test(PoolRig::peer_key(6));
+    ASSERT_TRUE(rig.client.bulk_demoted_for_test(PoolRig::peer_key(6)));
+    ASSERT_TRUE(rig.client.bulk_demoted_for_test(PoolRig::peer_key(9)));
+    EXPECT_TRUE(rig.client.outbound_behind_for_test());
+    EXPECT_EQ(rig.client.effective_max_peers_for_test(), 16u)
+        << "at the hard cap there is no room to expand — rotation is the lever";
+
+    // One tick: evict the worst non-server (peer 6) and redial a fresh archival.
+    rig.run_seconds(1);
+    EXPECT_EQ(rig.client.outbound_rotations_for_test(), 1u);
+    EXPECT_EQ(rig.client.connected_peer_count(), 15u)
+        << "the demoted slot-holder must be freed";
+    EXPECT_EQ(rig.client.peer_session(PoolRig::peer_key(6)), nullptr)
+        << "peer 6 (most strikes) must be the one rotated out";
+    EXPECT_NE(rig.client.peer_session(PoolRig::peer_key(9)), nullptr)
+        << "the LESS-struck non-server must survive this rotation (one at a time)";
+    // Non-demoted peers are untouched.
+    EXPECT_NE(rig.client.peer_session(PoolRig::peer_key(1)), nullptr);
+    // The freed slot refills with the FRESH candidate, not the just-evicted peer.
+    ASSERT_EQ(rig.client.dialing_count(), 1u) << "the freed slot must redial";
+    EXPECT_EQ(rig.client.dialing_keys().front(), PoolRig::peer_key(17))
+        << "refill must draw a fresh candidate, never re-dial the rotated-out peer";
+
+    // RED proof: pump off ⇒ the frozen full pool never rotates.
+    PoolRig red;
+    red.use_fake_clock();
+    red.client.set_outbound_rotate_enabled_for_test(false);
+    red.client.set_max_peers(16);
+    red.client.connect(plan);
+    for (int i = 1; i <= 16; ++i) red.handshake(i);
+    red.client.update_dial_targets({PoolRig::peer_addr(17)});
+    for (int s = 0; s < 3; ++s) red.client.note_bulk_nonserver_for_test(PoolRig::peer_key(6));
+    red.run_seconds(10);
+    EXPECT_EQ(red.client.outbound_rotations_for_test(), 0u);
+    EXPECT_EQ(red.client.connected_peer_count(), 16u)
+        << "PRE-PORT: a full pool of demoted non-servers stays frozen at 16/16";
+    EXPECT_EQ(red.client.dialing_count(), 0u);
+}
+
+// (H3) GUARDRAILS — the pump is reward-safe connection management: it never
+// churns a healthy pool, never disconnects when it cannot replace, and rate-
+// limits rotations so a transiently-quiet peer is not thrashed.
+TEST(DashCoinP2PPool, archival_rotation_is_bounded_and_never_churns_a_healthy_pool)
+{
+    // (a) A healthy full pool (no demoted peer) is byte-identical to before:
+    // not behind, base target, zero dials, zero rotations across many ticks.
+    {
+        PoolRig rig;
+        rig.use_fake_clock();
+        rig.client.set_max_peers(16);
+        std::vector<NetService> plan;
+        for (int i = 1; i <= 16; ++i) plan.push_back(PoolRig::peer_addr(i));
+        rig.client.connect(plan);
+        for (int i = 1; i <= 16; ++i) rig.handshake(i);
+        rig.client.update_dial_targets({PoolRig::peer_addr(17)});
+        rig.run_seconds(30);
+        EXPECT_FALSE(rig.client.outbound_behind_for_test());
+        EXPECT_EQ(rig.client.effective_max_peers_for_test(), 16u);
+        EXPECT_EQ(rig.client.outbound_rotations_for_test(), 0u);
+        EXPECT_EQ(rig.client.connected_peer_count(), 16u);
+        EXPECT_EQ(rig.client.dialing_count(), 0u)
+            << "a healthy full pool must never dial or churn";
+    }
+
+    // (b) Full+behind but NO fresh candidate ⇒ HOLD: never disconnect a peer we
+    // cannot replace (would only re-dial the same non-server).
+    {
+        PoolRig rig;
+        rig.use_fake_clock();
+        rig.client.set_max_peers(16);
+        std::vector<NetService> plan;
+        for (int i = 1; i <= 16; ++i) plan.push_back(PoolRig::peer_addr(i));
+        rig.client.connect(plan);
+        for (int i = 1; i <= 16; ++i) rig.handshake(i);
+        // Plan holds ONLY addresses we already hold ⇒ no fresh candidate.
+        for (int s = 0; s < 3; ++s) rig.client.note_bulk_nonserver_for_test(PoolRig::peer_key(6));
+        rig.run_seconds(30);
+        EXPECT_EQ(rig.client.outbound_rotations_for_test(), 0u)
+            << "no fresh candidate ⇒ the pump must NOT disconnect (no thrash)";
+        EXPECT_EQ(rig.client.connected_peer_count(), 16u);
+    }
+
+    // (c) Rate limit: two demoted non-servers, one fresh candidate. The pump
+    // rotates ONE per OUTBOUND_ROTATE_INTERVAL_SEC, not both at once.
+    {
+        PoolRig rig;
+        rig.use_fake_clock();
+        rig.client.set_max_peers(16);
+        std::vector<NetService> plan;
+        for (int i = 1; i <= 16; ++i) plan.push_back(PoolRig::peer_addr(i));
+        rig.client.connect(plan);
+        for (int i = 1; i <= 16; ++i) rig.handshake(i);
+        rig.client.update_dial_targets({PoolRig::peer_addr(17), PoolRig::peer_addr(18)});
+        for (int s = 0; s < 3; ++s) rig.client.note_bulk_nonserver_for_test(PoolRig::peer_key(6));
+        for (int s = 0; s < 3; ++s) rig.client.note_bulk_nonserver_for_test(PoolRig::peer_key(9));
+        rig.run_seconds(1);
+        EXPECT_EQ(rig.client.outbound_rotations_for_test(), 1u)
+            << "only ONE rotation may fire per stall interval";
+        // Within the interval, no further rotation even though a 2nd demoted
+        // non-server and a 2nd fresh candidate both exist.
+        rig.run_seconds(5);
+        EXPECT_EQ(rig.client.outbound_rotations_for_test(), 1u)
+            << "a second rotation must wait out OUTBOUND_ROTATE_INTERVAL_SEC";
+    }
+}
