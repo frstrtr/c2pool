@@ -153,6 +153,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <utility>
@@ -479,6 +480,7 @@ public:
         m_network                = std::move(network);
         m_poisoned               = false;
         m_poison_reason.clear();
+        reset_sml_cache();
     }
 
     // ── Accessors ────────────────────────────────────────────────────────
@@ -530,7 +532,53 @@ public:
 
     /// DIP-4 merkleRootMNList of the CURRENT state — the value the
     /// self-check compares against each block's committed cbTx root.
+    ///
+    /// INCREMENTAL (dashd CDeterministicMNListDiff parity). The profiled
+    /// dominant fold cost was rebuilding ALL ~4900 CSimplifiedMNListEntry,
+    /// serializing+SHA256d'ing each leaf, sorting and merkling the whole tree
+    /// EVERY block. dashd instead caches each CDeterministicMN's SML entry
+    /// hash and re-hashes only the entries a diff actually changed. This
+    /// mirrors that:
+    ///   • m_leaf_hash_cache — per-proTxHash CalcHash, invalidated ONLY for
+    ///     entries whose SML-serialized fields changed this block. The
+    ///     mutation sites that touch an SML field call mark_sml_dirty; the
+    ///     ones that do NOT (nLastPaidHeight/nConsecutivePayments in pass 5,
+    ///     the nPoSePenalty decrement in pass 2, a punish that does not cross
+    ///     into a ban) never dirty — those fields are not under CalcHash.
+    ///   • m_sml_tree — a cached merkle tree over the memcmp-sorted leaf
+    ///     hashes. On a FIELD-ONLY block (leaf set unchanged, positions
+    ///     stable) each changed leaf updates the O(log N) nodes on its path.
+    /// A STRUCTURAL block (ProRegTx add, collateral remove) shifts every
+    /// sorted position after the mutation, which reshuffles all pairings in
+    /// the positional duplicate-last-on-odd Bitcoin/Dash merkle — O(log N) is
+    /// UNSAFE there, so the tree is rebuilt from the (still-valid) leaf-hash
+    /// cache. HYBRID: incremental path on field-only blocks, recompute from
+    /// cached leaves on structural blocks. The result is byte-identical to
+    /// compute_sml_root_full() at every block (KAT-proven across add / remove
+    /// / isValid-flip / confirmedHash / operator-key change), so the
+    /// self-check against the committed cbTx root is UNCHANGED and still
+    /// poisons on mismatch.
     uint256 compute_sml_root() const
+    {
+        if (m_entries.empty()) {
+            m_sml_tree.clear();
+            m_sml_sorted_protx.clear();
+            m_sml_tree_valid      = true;
+            m_sml_structure_dirty = false;
+            m_sml_dirty_leaves.clear();
+            return uint256::ZERO;
+        }
+        if (!m_sml_tree_valid || m_sml_structure_dirty)
+            rebuild_sml_tree();
+        else if (!m_sml_dirty_leaves.empty())
+            apply_sml_field_updates();
+        return m_sml_tree.back().front();
+    }
+
+    /// Reference FULL recompute — the pre-incremental path, kept as the KAT
+    /// oracle (the incremental root MUST equal this at every block) and as a
+    /// cache-independent belt any caller can reach.
+    uint256 compute_sml_root_full() const
     {
         std::vector<vendor::CSimplifiedMNListEntry> ents;
         ents.reserve(m_entries.size());
@@ -538,6 +586,26 @@ public:
             ents.push_back(st.to_sml_entry(protx));
         vendor::CSimplifiedMNList sml(std::move(ents));
         return sml.CalcMerkleRoot();
+    }
+
+    /// TEST-ONLY. Simulate a MISSED SML invalidation: a mutation that changed
+    /// an entry's SML-serialized fields but failed to mark its proTxHash
+    /// dirty. Corrupts the cached leaf so the next compute_sml_root() returns
+    /// a STALE root — the fold self-check then mismatches the committed cbTx
+    /// root and poisons. Proves the incremental path cannot silently serve a
+    /// wrong list. Never called in production.
+    void test_only_corrupt_incremental_cache(const uint256& protx)
+    {
+        (void)compute_sml_root();               // materialise the tree
+        uint256 bogus;
+        auto it = m_leaf_hash_cache.find(protx);
+        if (it != m_leaf_hash_cache.end()) bogus = it->second;
+        bogus.data()[0] ^= 0xff;                // cannot equal a real CalcHash
+        m_leaf_hash_cache[protx] = bogus;
+        // Force a rebuild that REUSES the corrupted cached leaf (present, not
+        // dirty) — models a leaf whose recompute was skipped.
+        m_sml_structure_dirty = true;
+        m_sml_dirty_leaves.clear();
     }
 
     /// dashd CDeterministicMNList::GetMNPayee (deterministicmns.cpp:183-215)
@@ -693,6 +761,7 @@ public:
             const int32_t confs = (H - 1) - st.nRegisteredHeight;
             if (confs >= m_cfg.gates.masternode_min_confirmations) {
                 st.UpdateConfirmedHash(protx, prev_hash);
+                mark_sml_dirty(protx);  // confirmedHash is an SML field
                 ++r.confirmed;
             }
         }
@@ -1053,6 +1122,7 @@ public:
             m_total_registered_count = total_registered;
             m_poisoned               = false;
             m_poison_reason.clear();
+            reset_sml_cache();
             return true;
         } catch (const std::exception& ex) {
             error = std::string("snapshot deserialize failed: ") + ex.what();
@@ -1099,6 +1169,149 @@ private:
     bool        m_poisoned{false};
     std::string m_poison_reason;
 
+    // ─────────────────────────────────────────────────────────────────────
+    // Incremental SML merkle-root cache (see compute_sml_root doc). mutable:
+    // compute_sml_root() is const (external callers hold const refs) but
+    // memoizes; single-io-thread discipline like the rest of the engine — no
+    // locks.
+    // ─────────────────────────────────────────────────────────────────────
+    mutable std::map<uint256, uint256>        m_leaf_hash_cache;   // protx→CalcHash
+    mutable std::vector<uint256>              m_sml_sorted_protx;  // memcmp-sorted keys
+    mutable std::vector<std::vector<uint256>> m_sml_tree;          // [0]=leaves … root
+    mutable bool                              m_sml_tree_valid{false};
+    mutable bool                              m_sml_structure_dirty{true};
+    mutable std::set<uint256>                 m_sml_dirty_leaves;  // field-changed protx
+
+    // dashcore sorts SML entries by proRegTxHash.Compare (memcmp of the raw
+    // 32 bytes) — see vendor/simplifiedmns.hpp CSimplifiedMNList::sort. The
+    // incremental tree MUST use the SAME order or the leaves interleave wrong.
+    static bool protx_memcmp_less(const uint256& a, const uint256& b)
+    {
+        return std::memcmp(a.data(), b.data(), 32) < 0;
+    }
+
+    static uint256 sml_merkle_pair(const uint256& a, const uint256& b)
+    {
+        uint256 out;
+        CHash256()
+            .Write(std::span<const unsigned char>(a.data(), 32))
+            .Write(std::span<const unsigned char>(b.data(), 32))
+            .Finalize(std::span<unsigned char>(out.data(), 32));
+        return out;
+    }
+
+    // Called ONLY at mutation sites that touch an SML-serialized field
+    // (nVersion, confirmedHash, netInfo ip/port, pubKeyOperator, keyIDVoting,
+    // isValid via ban/revive, platformHTTPPort/NodeID). Position unchanged.
+    void mark_sml_dirty(const uint256& protx) { m_sml_dirty_leaves.insert(protx); }
+
+    // The leaf SET changed (add/remove): positions shift → rebuild next compute.
+    void mark_sml_structural() { m_sml_structure_dirty = true; }
+
+    // Fresh list (seed / snapshot load): a proTxHash could even carry
+    // different fields than a prior life, so drop the whole cache.
+    void reset_sml_cache() const
+    {
+        m_leaf_hash_cache.clear();
+        m_sml_sorted_protx.clear();
+        m_sml_tree.clear();
+        m_sml_dirty_leaves.clear();
+        m_sml_tree_valid      = false;
+        m_sml_structure_dirty = true;
+    }
+
+    // Leaf hash for protx, memoized. Recomputes when forced (field changed).
+    const uint256& sml_leaf_hash(const uint256& protx, bool force) const
+    {
+        auto it = m_leaf_hash_cache.find(protx);
+        if (!force && it != m_leaf_hash_cache.end()) return it->second;
+        const uint256 h = m_entries.at(protx).to_sml_entry(protx).CalcHash();
+        return m_leaf_hash_cache[protx] = h;
+    }
+
+    // Standard Bitcoin/Dash SHA256d-pairwise levels, duplicate-last-on-odd —
+    // byte-identical to vendor compute_merkle_root_local, but every level is
+    // KEPT so a field-only update can walk the path.
+    void build_sml_levels(std::vector<uint256> leaves) const
+    {
+        m_sml_tree.clear();
+        m_sml_tree.push_back(std::move(leaves));
+        while (m_sml_tree.back().size() > 1) {
+            const std::vector<uint256>& cur = m_sml_tree.back();
+            const size_t sz = cur.size();
+            std::vector<uint256> next;
+            next.reserve((sz + 1) / 2);
+            for (size_t i = 0; i < sz; i += 2) {
+                const uint256& a = cur[i];
+                const uint256& b = (i + 1 < sz) ? cur[i + 1] : cur[i];
+                next.push_back(sml_merkle_pair(a, b));
+            }
+            m_sml_tree.push_back(std::move(next));
+        }
+    }
+
+    // Full rebuild from m_entries: re-sort keys (memcmp), recompute dirty /
+    // absent leaves (reuse the rest from cache), rebuild every tree level.
+    void rebuild_sml_tree() const
+    {
+        m_sml_sorted_protx.clear();
+        m_sml_sorted_protx.reserve(m_entries.size());
+        for (const auto& [protx, st] : m_entries)
+            m_sml_sorted_protx.push_back(protx);
+        std::sort(m_sml_sorted_protx.begin(), m_sml_sorted_protx.end(),
+                  protx_memcmp_less);
+
+        std::vector<uint256> leaves;
+        leaves.reserve(m_sml_sorted_protx.size());
+        for (const uint256& protx : m_sml_sorted_protx) {
+            const bool force = m_sml_dirty_leaves.count(protx) != 0;
+            leaves.push_back(sml_leaf_hash(protx, force));
+        }
+        build_sml_levels(std::move(leaves));
+        m_sml_tree_valid      = true;
+        m_sml_structure_dirty = false;
+        m_sml_dirty_leaves.clear();
+    }
+
+    // Field-only update: same leaf set / positions, some leaf hashes changed.
+    // Recompute each dirty leaf, then propagate ONLY the affected O(log N)
+    // path nodes up the cached tree (dedup shared ancestors). If a dirty
+    // proTxHash is somehow absent (should be impossible on the field-only
+    // path) fall back to a full rebuild — never serve a stale root.
+    void apply_sml_field_updates() const
+    {
+        std::set<size_t> dirty_idx;
+        for (const uint256& protx : m_sml_dirty_leaves) {
+            auto lo = std::lower_bound(m_sml_sorted_protx.begin(),
+                                       m_sml_sorted_protx.end(), protx,
+                                       protx_memcmp_less);
+            if (lo == m_sml_sorted_protx.end() || *lo != protx) {
+                m_sml_structure_dirty = true;
+                rebuild_sml_tree();
+                return;
+            }
+            const size_t idx =
+                static_cast<size_t>(lo - m_sml_sorted_protx.begin());
+            m_sml_tree[0][idx] = sml_leaf_hash(protx, /*force=*/true);
+            dirty_idx.insert(idx);
+        }
+        for (size_t level = 0; level + 1 < m_sml_tree.size(); ++level) {
+            const std::vector<uint256>& cur = m_sml_tree[level];
+            const size_t sz = cur.size();
+            std::set<size_t> next_dirty;
+            for (size_t idx : dirty_idx) {
+                const size_t pidx  = idx / 2;
+                const size_t left  = pidx * 2;
+                const size_t right = (left + 1 < sz) ? left + 1 : left;
+                m_sml_tree[level + 1][pidx] =
+                    sml_merkle_pair(cur[left], cur[right]);
+                next_dirty.insert(pidx);
+            }
+            dirty_idx = std::move(next_dirty);
+        }
+        m_sml_dirty_leaves.clear();
+    }
+
     void poison(const std::string& why)
     {
         m_poisoned      = true;
@@ -1111,6 +1324,9 @@ private:
         if (it == m_entries.end()) return;
         m_collateral_index.erase(it->second.collateralOutpoint);
         m_entries.erase(it);
+        m_leaf_hash_cache.erase(protx);   // proTxHash is never reused
+        m_sml_dirty_leaves.erase(protx);  // leaf no longer exists
+        mark_sml_structural();            // a leaf left the sorted set
     }
 
     /// dashd CompareByLastPaid_GetHeight (deterministicmns.cpp:157-166),
@@ -1214,6 +1430,7 @@ private:
 
         m_collateral_index[st.collateralOutpoint] = proTxHash;
         m_entries[proTxHash] = std::move(st);
+        mark_sml_structural();  // a new leaf enters the sorted set
         ++m_total_registered_count;
         ++r.registered;
         if (m_cfg.debug_logs) {
@@ -1268,6 +1485,7 @@ private:
                 }
             }
         }
+        mark_sml_dirty(p.proTxHash);  // netInfo/platform, and Revive flips isValid
         ++r.updated;
         return {};
     }
@@ -1307,6 +1525,7 @@ private:
         }
         st.keyIDVoting  = p.keyIDVoting;
         st.scriptPayout = p.scriptPayout;
+        mark_sml_dirty(p.proTxHash);  // keyIDVoting (SML); key-change reset+ban too
         ++r.updated;
         return {};
     }
@@ -1329,6 +1548,7 @@ private:
         st.BanIfNotBanned(H);
         st.nRevocationReason = p.nReason;
         if (!was_banned) ++r.banned;
+        mark_sml_dirty(p.proTxHash);  // operator fields reset + isValid flip
         ++r.revoked;
         return {};
     }
@@ -1439,6 +1659,7 @@ private:
         ++r.punished;
         if (!st.IsBanned() && st.nPoSePenalty >= max_penalty) {
             st.BanIfNotBanned(H);
+            mark_sml_dirty(protx);  // isValid flips false; penalty alone is NOT SML
             ++r.banned;
             if (m_cfg.debug_logs) {
                 LOG_INFO << "[DML-FOLD] h=" << H << " MN "

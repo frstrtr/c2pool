@@ -44,6 +44,7 @@
 #include <impl/dash/crypto/hash_x11.hpp>
 #include <impl/dash/coin/utxo_adapter.hpp>   // must precede subsidy.hpp (dash_txid in scope)
 #include <impl/dash/coin/subsidy.hpp>
+#include <btclibs/crypto/sha256.h>   // SHA256AutoDetect (CPU-dispatched SIMD/SHA-NI transform)
 
 #include <core/coin_params.hpp>
 #include <core/coinbase_builder.hpp>       // c2pool::MAX_OPERATOR_TEXT_SOLO (--coinbase-text budget SSOT)
@@ -9081,6 +9082,52 @@ int main(int argc, char** argv)
         else
             std::cout << "[init] RLIMIT_NOFILE soft limit: " << nofile
                       << (nofile < 65536 ? " (< 65536; hard limit too low)" : "") << "\n";
+    }
+
+    // Light the CPUID-dispatched SIMD SHA256 backend (sse4 single-block, and
+    // SHA-NI where the CPU has it) before any hashing runs. The DASH daemonless
+    // replay fold recomputes the full merkleRootMNList / merkleRootQuorums every
+    // block as its reward-safety self-check, and that recompute was ~70% scalar
+    // SHA256 (single-thread CPU bound). SHA256AutoDetect() probes CPUID and
+    // installs the fastest transform the running CPU proves correct; the fold's
+    // committed-root byte-compare stays the authority, so a wrong primitive can
+    // only fail closed, never mis-fold. Byte-identical output by construction.
+    {
+        const std::string sha_backend = SHA256AutoDetect();
+        std::cout << "[init] SHA256 backend: " << sha_backend << "\n";
+        // Release defines NDEBUG, which turns AutoDetect's internal
+        // assert(SelfTest()) into a no-op -- so run an explicit KAT here that
+        // survives NDEBUG. SHA256("abc") exercises the single-block transform
+        // (the fold's leaf + pairwise-merkle hot path); a double-SHA256 of a
+        // 64-byte block exercises the CHash256 merkle-node form. A miscompiled
+        // transform aborts startup rather than folding a wrong root.
+        {
+            static const unsigned char kAbc[3] = {'a','b','c'};
+            static const unsigned char kAbcSha[32] = {
+                0xba,0x78,0x16,0xbf,0x8f,0x01,0xcf,0xea,0x41,0x41,0x40,0xde,
+                0x5d,0xae,0x22,0x23,0xb0,0x03,0x61,0xa3,0x96,0x17,0x7a,0x9c,
+                0xb4,0x10,0xff,0x61,0xf2,0x00,0x15,0xad};
+            unsigned char out[32];
+            CSHA256().Write(kAbc, 3).Finalize(out);
+            if (std::memcmp(out, kAbcSha, 32) != 0) {
+                std::cout << "[init] FATAL: SHA256 SIMD KAT failed (single-block); aborting\n";
+                return 2;
+            }
+            // double-SHA256 of 64 zero bytes == the CHash256 merkle-node form.
+            static const unsigned char kZero64[64] = {0};
+            static const unsigned char kZero64d[32] = {
+                0xe2,0xf6,0x1c,0x3f,0x71,0xd1,0xde,0xfd,0x3f,0xa9,0x99,0xdf,
+                0xa3,0x69,0x53,0x75,0x5c,0x69,0x06,0x89,0x79,0x99,0x62,0xb4,
+                0x8b,0xeb,0xd8,0x36,0x97,0x4e,0x8c,0xf9};
+            unsigned char d1[32], d2[32];
+            CSHA256().Write(kZero64, 64).Finalize(d1);
+            CSHA256().Write(d1, 32).Finalize(d2);
+            if (std::memcmp(d2, kZero64d, 32) != 0) {
+                std::cout << "[init] FATAL: SHA256 SIMD KAT failed (double/merkle); aborting\n";
+                return 2;
+            }
+            std::cout << "[init] SHA256 SIMD KAT: OK (byte-exact vs scalar goldens)\n";
+        }
     }
 
     // Name the BLS backend unconditionally at startup: a stub (BLS-dark) node

@@ -628,6 +628,22 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_simplifiedmns PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_simplifiedmns "" AUTO)
 
+    # DASH daemonless-fold SIMD-SHA256 reward-safety KAT (dashd-cut replay
+    # speedup): proves SHA256AutoDetect()-dispatched SIMD/SHA-NI reproduces the
+    # merkleRootMNList byte-for-byte vs the scalar transform (self-check input
+    # unchanged), that a one-entry mutation still changes the root (poison
+    # intact), and reports the scalar->SIMD speedup. Mirrors the
+    # test_dash_simplifiedmns link set.
+    add_executable(test_dash_sml_simd_sha256 test_dash_sml_simd_sha256.cpp)
+    target_link_libraries(test_dash_sml_simd_sha256 PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_sml_simd_sha256 PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_sml_simd_sha256 "" AUTO)
+
     # Header-only LLMQ quorum-tail verification leaf over core/uint256 +
     # core/pack; no ltc/pool SCC dependency. Sits between the
     # SimplifiedMNList leaf (#309) and embedded_gbt main (S7).
