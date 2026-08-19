@@ -25,6 +25,7 @@
 // non-broadcaster shape suitable for B2-net smoke testing.
 
 #include <impl/btc/coin/header_chain.hpp>
+#include <impl/btc/coin/tip_reconcile_gate.hpp> // B5b: TipReconcileGate SSOT (10s re-poll cadence + fire predicate) shared with tip_reconcile_test.cpp
 #include <impl/btc/coin/mempool.hpp>
 #include <impl/btc/coin/node.hpp>
 #include <impl/btc/coin/coin_peer_manager.hpp> // btc::coin::BtcCoinPeerManager -- BTC-ISOLATED scored/diverse coin-network peer discovery (--coin-p2p-discover)
@@ -817,6 +818,58 @@ int main(int argc, char* argv[])
         });
     };
     (*schedule_warn)();
+
+    // B5b: tip-reconcile poll. When a submitted block is still pending
+    // roundtrip confirmation, bitcoind may have connected it (or a
+    // competing block at the same height) as its active tip WITHOUT
+    // re-announcing an inv/sendheaders over our P2P leg -- Core does not
+    // reliably re-announce a block to the path it was learned from. The
+    // initial getheaders sync then never re-fires, so HeaderChain stalls
+    // one block behind bitcoind's real tip, every new template re-mines
+    // the SAME height, and each won block returns submitblock
+    // "inconclusive" -> STALE (self-collision livelock; observed on the
+    // vm130 G3b regtest rig 2026-08-16, tip pinned at 604 while bitcoind
+    // was at 605). Fix: while ANY submit is pending, actively re-issue
+    // getheaders(locator = current tip) every 10s so HeaderChain pulls
+    // the connected tip and either CONFIRMS the roundtrip or advances
+    // past it, unwedging template production. Gated on pending_submits so
+    // there is zero getheaders churn on an idle, caught-up node.
+    auto reconcile_timer    = std::make_shared<boost::asio::steady_timer>(ioc);
+    auto schedule_reconcile = std::make_shared<std::function<void()>>();
+    std::weak_ptr<std::function<void()>> weak_reconcile = schedule_reconcile;
+    *schedule_reconcile = [reconcile_timer, &coin_node, &header_chain,
+                           &chain_params, pending_mu, pending_submits,
+                           weak_reconcile, BTC_PROTOCOL_VERSION]() {
+        reconcile_timer->expires_after(btc::coin::TipReconcileGate::kPollInterval);
+        reconcile_timer->async_wait(
+            [reconcile_timer, &coin_node, &header_chain, &chain_params,
+             pending_mu, pending_submits, weak_reconcile, BTC_PROTOCOL_VERSION]
+            (const boost::system::error_code& ec) {
+                if (ec) return;
+                bool have_pending;
+                {
+                    std::lock_guard<std::mutex> lk(*pending_mu);
+                    have_pending = !pending_submits->empty();
+                }
+                if (btc::coin::TipReconcileGate::evaluate(
+                        have_pending, coin_node.has_p2p(),
+                        coin_node.is_handshake_complete())
+                    == btc::coin::TipReconcileGate::Action::Poll) {
+                    uint256 locator;
+                    if (auto tip = header_chain.tip(); tip)
+                        locator = tip->block_hash;
+                    else
+                        locator = chain_params.genesis_hash;
+                    LOG_INFO << "[BTC-SUBMIT] tip-reconcile getheaders locator="
+                             << locator.GetHex().substr(0, 16)
+                             << " chain_height=" << header_chain.height();
+                    coin_node.send_getheaders(
+                        BTC_PROTOCOL_VERSION, {locator}, uint256::ZERO);
+                }
+                if (auto self = weak_reconcile.lock()) (*self)();
+            });
+    };
+    (*schedule_reconcile)();
 
     // [MEM] periodic memory logger: every 60s, log VmRSS / VmSize from
     // /proc/self/status. Catches slow leaks invisible from in-process
