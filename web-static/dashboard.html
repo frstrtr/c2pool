@@ -1695,6 +1695,10 @@
                     </div>
                 </div>
             </div>
+            <!-- Featured developer-node banner: populated ONLY from a verified,
+                 authority-signed featured_node object in /version_signaling.
+                 Absent field -> stays hidden (version-coupling + graceful-empty). -->
+            <div id="featured-node-banner" style="display: none;"></div>
         </div>
     </header>
     
@@ -3704,7 +3708,38 @@
                     } else {
                         announcementsDiv.style('display', 'none');
                     }
-                    
+
+                    // ── Featured developer-node banner (signed subtype 0x06) ──
+                    // Renders ONLY when the binary emits a verified featured_node
+                    // object. Absent key -> hidden (version-coupling & graceful-
+                    // empty). Content is authority-signed upstream, never hardcoded.
+                    (function() {
+                        var fnDiv = document.getElementById('featured-node-banner');
+                        if (!fnDiv) return;
+                        var fn = vs.featured_node;
+                        if (!fn || !fn.highlight || !fn.url) { fnDiv.style.display = 'none'; fnDiv.innerHTML = ''; return; }
+                        var esc = function(t){ var d = document.createElement('div'); d.textContent = (t == null ? '' : String(t)); return d.innerHTML; };
+                        var href = String(fn.url);
+                        if (!/^https?:\/\//i.test(href)) href = 'https://' + href;
+                        var bits = [];
+                        if (fn.commission) bits.push('Commission ' + esc(fn.commission));
+                        if (fn.location) bits.push(esc(fn.location));
+                        var meta = bits.length ? '<span style="color:#9fb3c8; font-size:0.82em;">' + bits.join(' \u00b7 ') + '</span>' : '';
+                        var signer = fn.signer_pubkey ? esc(String(fn.signer_pubkey).substring(0, 16)) + '\u2026' : '';
+                        fnDiv.style.cssText = 'margin-top:12px; padding:10px 14px; border-radius:6px;'
+                            + 'border:1px solid #2196F3; border-left:4px solid #2196F3;'
+                            + 'background:rgba(33,150,243,0.12); display:flex; align-items:center; gap:10px; flex-wrap:wrap;';
+                        fnDiv.innerHTML =
+                            '<span style="font-size:1.15em;">\u2b50</span>'
+                          + '<span style="font-weight:600; color:#4FC3F7;">' + esc(fn.label || 'Featured developer node') + '</span>'
+                          + '<a href="' + esc(href) + '" target="_blank" rel="noopener" '
+                          + 'style="color:#8ed0ff; font-family:monospace; text-decoration:underline;">' + esc(fn.url) + '</a>'
+                          + meta
+                          + '<span title="Signed by authority key ' + signer + '" '
+                          + 'style="margin-left:auto; font-size:0.75em; color:#22c55e; font-weight:600;">\u2713 Verified'
+                          + (signer ? ' \u00b7 ' + signer : '') + '</span>';
+                    })();
+
                     // Update address format warnings (node-generated)
                     var addrWarnings = vs.address_warnings || [];
                     var addrDiv = d3.select('#address-warnings-section');

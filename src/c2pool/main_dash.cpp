@@ -59,6 +59,7 @@
 #include <impl/dash/coin/coin_peer_manager.hpp> // dash::coin::DashCoinPeerManager — DASH-ISOLATED scored/diverse peer discovery (--coin-p2p-discover; network-standalone gate)
 #include <impl/dash/coin/chain_seeds.hpp>  // dash::coin::dash_dns_seeds / dash_fixed_seeds — DASH mainnet/testnet seed bootstrap
 #include <impl/dash/coin/won_block_dispatch.hpp> // dash::coin::broadcast_won_block — S8 dual-path won-block dispatcher (embedded P2P primary + submitblock RPC backup)
+#include <impl/dash/coin/reconstruct_won_block.hpp> // dash::coin::reconstruct_won_block — distributed won-block: rebuild full block from a won share for re-broadcast
 #include <impl/dash/coin/zmq_tip_notify.hpp> // dash::coin::TipHashDedup / ZmqHashblockSubscriber — dashd ZMQ hashblock INSTANT tip-notify (opt-in, hardening on the #770 poll)
 #include <impl/dash/coin/coin_p2p_magic.hpp>      // dash::coin::select_coin_p2p_magic — E5 --coin-p2p-magic override (regtest ARM A dial)
 #include <impl/dash/coin/node_coin_state.hpp>  // dash::coin::NodeCoinState (embedded work bundle)
@@ -420,7 +421,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-mn-bridge-no-cursor]\n"
         << "           [--embedded-utxo-immature-serve-empty] [--embedded-serve-mempool-txs]\n"
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
-        << "           [--embedded-ingest-isdlock]\n"
+        << "           [--embedded-ingest-isdlock] [--embedded-ingest-dstx]\n"
         << "           [--pin-local-tx-hex FILE]  (zero-fee self-mined tx, e.g. donation consolidation)\n"
         << "           [--pin-splice-xcheck-arm]  (let pins ride an xcheck-SWAPPED dashd template; default OFF)\n"
         << "           [--pin-splice-block-budget] (EXCLUDE a pin that pushes the template past the block size cap; default OFF)\n"
@@ -917,7 +918,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // individually BLS-gated against the rotated LLMQ_60_75 quorum
              // dashd's SelectQuorumForSigning designates (islock_verify.hpp;
              // fail-closed at every hop).
-             bool embedded_ingest_isdlock = false)
+             bool embedded_ingest_isdlock = false,
+             // --embedded-ingest-dstx (W5-B): arm the CoinJoin DSTX lane —
+             // inv(MSG_DSTX=16) getdata pull (budgeted, shares the MSG_TX
+             // machinery) + the BLS-verified new_dstx adoption path
+             // (maintainer gate → Mempool::add_dstx: fee=0 base + dashd's
+             // +0.1 COIN prioritisation delta). DEFAULT OFF: no getdata
+             // type-16 is ever sent, the handler discards, and templates are
+             // byte-identical to master. Template EFFECT additionally
+             // requires --embedded-serve-mempool-txs; the #1218
+             // gbt-xcheck-txmerkle guard is untouched and stays the referee.
+             bool embedded_ingest_dstx = false)
 {
     namespace io = boost::asio;
 
@@ -1808,46 +1819,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // block hash (on DASH the share hash IS X11(block header)) and the same
         // "DASH" label, and record_found_block dedups on exactly that pair.
         //
-        // Display only: no submit, mint, target or payout path is reachable.
-        {
-            core::WebServer* ws = web_server.get();
-            dash::Node* node = &p2p_node;
-            p2p_node.tracker().m_on_block_found =
-                dash::dashboard::make_on_block_found(
-                    node, testnet,
-                    [&ioc](std::function<void()> work) {
-                        boost::asio::post(ioc, std::move(work));
-                    },
-                    [ws](const dash::dashboard::FoundBlockRow& row) {
-                        auto* mi = ws->get_mining_interface();
-                        LOG_INFO << "[DASH] GOT BLOCK FROM POOL! height=" << row.height
-                                 << " hash=" << row.block_hash.GetHex().substr(0, 16)
-                                 << " miner=" << row.miner;
-                        mi->record_found_block(
-                            row.height, row.block_hash, row.timestamp,
-                            row.chain, row.miner, row.share_hash,
-                            mi->get_network_difficulty(),
-                            row.share_difficulty,
-                            // pool_hashrate_at_find: 0 routes the core to the
-                            // real POOL estimator (m_pool_hashrate_fn); this
-                            // site passed get_local_hashrate(), which is only
-                            // the pool rate when every rig sits on this node.
-                            /*pool_hashrate=*/0.0,
-                            row.subsidy,
-                            // Sharechain peer path: another node built the
-                            // template that won. Our pins and our tx selection
-                            // are not in it, and our address may still be in
-                            // the coinbase as our share of the pool payout.
-                            // row.miner is that peer's own payout address,
-                            // derived from the winning share's pubkey hash.
-                            core::MiningInterface::BlockAuthorship
-                                ::sharechain_peer);
-                        // Arm the post-broadcast confirm/orphan poller so this
-                        // peer-found block flips off "pending" (main_ltc.cpp:6315
-                        // parity). Telemetry only; never gates a broadcast.
-                        mi->schedule_block_verification(row.block_hash.GetHex());
-                    });
-        }
+        // WON-BLOCK RE-BROADCAST (distributed close, p2pool node.py:268-282):
+        // this dashboard row is now the POST-BROADCAST TELEMETRY LEG of the
+        // dash::coin::make_on_block_found dispatcher. The tracker binding moved
+        // DOWN to after the p2p_relay + rpc_submit sinks are constructed (search
+        // "DISTRIBUTED WON-BLOCK RE-BROADCAST (tracker arm)"), so both the stratum
+        // submit fn and this tracker dispatcher share the IDENTICAL two sinks, and
+        // the dashboard record_found_block row is composed there as the
+        // post-broadcast telemetry leg (unchanged display behavior; now preceded
+        // by the actual re-broadcast). Nothing to install here anymore.
 
         // ── REAL node-owner fee (already parsed from argv above) ──────────
         if (node_owner_fee > 0.0 && !node_owner_address.empty())
@@ -1862,6 +1842,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         //     live v16 DashShare wire format has no message_data field, so at
         //     v16 this blob feeds ONLY the dashboard display/verify path
         //     (rest_version_signaling fallback). See the mint-path note below.
+        // ── Featured developer-node banner: persistence restore ────────────
+        // Load the highest-seq verified banner BEFORE any blob/share
+        // processing so a restart can never resurrect an older message.
+        mi->set_featured_node_state_path(
+            (core::filesystem::config_path() / "featured_node_state.json").string());
+        mi->load_featured_node_state();
+
         if (!operator_message_blob_hex.empty()) {
             if (operator_message_blob_hex.size() % 2 != 0) {
                 LOG_ERROR << "--message-blob-hex must have even length";
@@ -1880,6 +1867,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 return 1;
             }
             mi->set_operator_message_blob(blob);
+            mi->scan_blob_for_featured_node(blob);  // featured-node banner (freshest-wins)
             LOG_INFO << "Operator message blob configured (" << blob.size() << " bytes)";
         }
 
@@ -2537,6 +2525,89 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         rpc_submit = [&rpc](const std::string& block_hex) -> bool {
             return rpc->submit_block_hex(block_hex, /*ignore_failure=*/false);
         };
+    }
+
+    // ── DISTRIBUTED WON-BLOCK RE-BROADCAST (tracker arm) ──────────────────────
+    // Bind ShareTracker::m_on_block_found to the dash::coin dispatcher so a block
+    // found by ANY pool participant (a gossiped share whose X11 header clears the
+    // coin BLOCK target) is RECONSTRUCTED and RE-BROADCAST to the DASH network,
+    // not merely recorded. This is the p2pool node.py:268-282 fan-out DASH lacked
+    // (it previously bound the DISPLAY-ONLY dashboard handler). It reuses the
+    // IDENTICAL p2p_relay + rpc_submit sinks the stratum finder uses (constructed
+    // just above), so both arms broadcast the same way.
+    //
+    // The reconstruct closure runs SYNCHRONOUSLY inside the hook (on the compute
+    // thread, m_tracker_mutex held) because it reads the on-chain PPLNS window +
+    // walks tracker.chain -- the SAME reads verify_payout_commitment already did
+    // one call earlier under this same lock (no new lock, no inversion). The
+    // actual broadcast is POSTed onto ioc so the submitblock RPC round-trip never
+    // runs under the tracker lock. The dashboard row (captured above) is the
+    // post-broadcast telemetry leg. known_txs is empty for now: the daemonless
+    // norm is coinbase-only (transactions==[]), so a share that references other
+    // txs fails loud (broadcast NOTHING, telemetry still recorded) rather than
+    // emit an incomplete block -- reward-safe, and it fills in with mempool
+    // tx-selection later with no change here.
+    {
+        auto& won_tracker = p2p_node.tracker();
+        const core::CoinParams won_params = mint_params;
+        core::MiningInterface* won_mi =
+            web_server ? web_server->get_mining_interface() : nullptr;
+
+        dash::coin::WonBlockReconstructor won_reconstruct =
+            [&won_tracker, won_params](const uint256& sh)
+                -> std::optional<dash::coin::ReconstructedWonBlock> {
+                if (!won_tracker.chain.contains(sh)) return std::nullopt;
+                std::optional<dash::coin::ReconstructedWonBlock> result;
+                won_tracker.chain.get_share(sh).invoke([&](auto* obj) {
+                    if (!obj) return;
+                    using ShareT = std::decay_t<decltype(*obj)>;
+                    if constexpr (std::is_same_v<ShareT, dash::DashShare>) {
+                        result = dash::coin::reconstruct_won_block(
+                            sh, *obj, won_tracker, won_params, /*known_txs=*/{});
+                    }
+                });
+                return result;
+            };
+
+        dash::coin::AlreadyBroadcastPredicate won_already;
+        dash::coin::MarkBroadcastFn           won_mark;
+        if (won_mi) {
+            won_already = [won_mi](const uint256& h) { return won_mi->already_submitted_block(h); };
+            won_mark    = [won_mi](const uint256& h) { won_mi->mark_block_submitted(h); };
+        }
+
+        // Post-broadcast telemetry leg: the EXISTING dashboard found-block handler
+        // (unchanged display behavior; ANY-participant /recent_blocks feed). Now it
+        // fires AFTER the re-broadcast rather than instead of it -- composed, not
+        // replaced. Reads the share via read_tracker() (reentrancy-aware) and posts
+        // record_found_block onto ioc, exactly as the old dashboard-only binding.
+        core::WebServer* won_ws = web_server.get();
+        dash::Node*      won_node = &p2p_node;
+        std::function<void(const uint256&)> won_telemetry =
+            dash::dashboard::make_on_block_found(
+                won_node, testnet,
+                [&ioc](std::function<void()> work) { boost::asio::post(ioc, std::move(work)); },
+                [won_ws](const dash::dashboard::FoundBlockRow& row) {
+                    auto* mi = won_ws->get_mining_interface();
+                    LOG_INFO << "[DASH] GOT BLOCK FROM POOL! height=" << row.height
+                             << " hash=" << row.block_hash.GetHex().substr(0, 16)
+                             << " miner=" << row.miner;
+                    mi->record_found_block(
+                        row.height, row.block_hash, row.timestamp,
+                        row.chain, row.miner, row.share_hash,
+                        mi->get_network_difficulty(),
+                        row.share_difficulty,
+                        /*pool_hashrate=*/0.0,
+                        row.subsidy,
+                        core::MiningInterface::BlockAuthorship::sharechain_peer);
+                    mi->schedule_block_verification(row.block_hash.GetHex());
+                });
+
+        p2p_node.tracker().m_on_block_found = dash::coin::make_on_block_found(
+            std::move(won_reconstruct), p2p_relay, rpc_submit,
+            [&ioc](std::function<void()> work) { boost::asio::post(ioc, std::move(work)); },
+            std::move(won_already), std::move(won_mark),
+            std::move(won_telemetry));
     }
 
     dash::stratum::DASHWorkSource::SubmitBlockFn stratum_submit_fn =
@@ -5050,7 +5121,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // maintainer's SmlResyncWatchdog; this closure only forwards.
         maintainer->set_on_sml_rerequest(
             [cp = coin_p2p.get()](const uint256& base, const uint256& target) {
-                if (cp) cp->send_getmnlistd(base, target);
+                // TIMEOUT re-ask (SmlResyncWatchdog): rotate to a DIFFERENT
+                // archival carrier and strike the stalled one as a non-server,
+                // so a slow/limited primary can neither wedge the tip SML nor
+                // stay invisible to the outbound-acquisition pump. dashd
+                // rotate-on-stall + prefer-CanServeBlocks for the getmnlistd
+                // leg. Reward-safe: peer selection + dial count only.
+                if (cp) cp->send_getmnlistd_reask(base, target);
             });
 
         // ChainLock verifier: BLS-verify a relayed clsig against the quorum
@@ -5160,6 +5237,62 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 return dash::coin::vendor::verify_chainlock_sig(
                     target->quorum.quorum_public_key, target->sign_hash, sig);
             });
+
+        // W5-B DSTX verifier: BLS-verify the mixing masternode's OPERATOR
+        // signature over SerializeHash(tx‖protxHash‖sigTime) against the
+        // SML's pubKeyOperator(protxHash) — dashd ValidateDSTX
+        // (net_processing.cpp:3549-3615). The pre-image is EXACT
+        // (coinjoin.h SERIALIZE_METHODS gates vchSig behind SER_GETHASH):
+        //   SHA256d( ser(tx) ‖ protxHash[32] ‖ sigTime[8 LE] )
+        // — full network tx serialization (pack(tx) IS the dash_txid base),
+        // no CompactSize framing around the trailing fields. The signature
+        // contract is byte-identical to the govvote operator verify
+        // (CBLSSignature::VerifyInsecure with the key's declared wire scheme
+        // vs post-V19 basic signing handled inside), so
+        // verify_govvote_operator_sig is REUSED, not re-implemented.
+        // Fail-closed at every arm: unknown proTxHash in the CURRENT SML =>
+        // refuse (dashd also walks <=24 blocks back for recently-removed
+        // MNs — a KNOWN phase-1 divergence: we refuse those, staying a
+        // SUBSET of dashd for that rare window; the tx-merkle guard covers
+        // it, and a tombstone ring is the phase-2 exactness fix).
+        maintainer->set_dstx_verify_fn(
+            [st = &node_coin_state](
+                const dash::coin::MutableTransaction& tx, const uint256& txid,
+                const uint256& protx_hash, const std::array<uint8_t, 96>& sig,
+                int64_t sig_time) -> bool {
+                (void)txid;
+                // Operator-key lookup in the live SML (mnlistdiff-sourced).
+                const auto& mn_list = st->sml().mnList;
+                const dash::coin::vendor::CSimplifiedMNListEntry* mn = nullptr;
+                for (const auto& e : mn_list) {
+                    if (e.proRegTxHash == protx_hash) { mn = &e; break; }
+                }
+                if (mn == nullptr) return false;   // unknown MN => refuse
+                // GetSignatureHash pre-image — the KAT-pinned helper
+                // (p2p_messages.hpp dstx_signature_hash).
+                const uint256 digest = dash::coin::p2p::dstx_signature_hash(
+                    tx, protx_hash, sig_time);
+                const bool key_legacy =
+                    mn->nVersion ==
+                    dash::coin::vendor::CSimplifiedMNListEntry::VER_LEGACY_BLS;
+                return dash::coin::vendor::verify_govvote_operator_sig(
+                    mn->pubKeyOperator, key_legacy, digest,
+                    std::vector<uint8_t>(sig.begin(), sig.end()));
+            });
+
+        // W5-B leg (dstx): Node::new_dstx -> maintainer.on_new_dstx. The
+        // event only fires when --embedded-ingest-dstx armed the pull; the
+        // maintainer gate then BLS-verifies via the verifier above and ONLY
+        // on pass admits via Mempool::add_dstx (fee=0 base + the +0.1 COIN
+        // prioritisation delta). Both hops fail closed, so subscribing
+        // unconditionally is inert without the flag.
+        coin_feed_subs.push_back(
+            coin_state.new_dstx.subscribe(
+                [m = maintainer.get()]
+                (const dash::interfaces::Node::DstxEvent& e) {
+                    m->on_new_dstx(e.tx, e.txid, e.protx_hash, e.sig,
+                                   e.sig_time);
+                }));
 
         // Leg 6 (ChainLock sig): Node::new_chainlock_sig -> maintainer
         // .on_new_chainlock. The clsig message carries the recovered 96-byte
@@ -5533,6 +5666,23 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // add_islock. OFF by default — off, an inv(MSG_ISDLOCK=31) never
         // earns a getdata and the handler decodes-and-discards, wire and
         // template behaviour byte-identical to master.
+        // ── W5-B DSTX INGEST: arm the MSG_DSTX pull ──────────────────────
+        // The acquire half; the verify half is the maintainer BLS gate
+        // installed above (set_dstx_verify_fn), and only its PASS ever
+        // reaches Mempool::add_dstx. OFF by default — off, an inv(MSG_DSTX
+        // =16) never earns a getdata and the handler discards, wire and
+        // template behaviour byte-identical to master.
+        if (embedded_ingest_dstx) {
+            coin_p2p->set_dstx_pull(true);
+            std::cout << "[run] --embedded-ingest-dstx: coin-P2P MSG_DSTX"
+                         " pull ARMED (shares the tx-pull budget; yields to"
+                         " the tip body). Every dstx is individually"
+                         " BLS-verified against the SML operator key of its"
+                         " proTxHash before the zero-fee +0.1 COIN"
+                         " prioritised admission; any verification failure"
+                         " is a drop (fail-closed, no state change).\n";
+        }
+
         if (embedded_ingest_isdlock) {
             coin_p2p->set_isdlock_pull(true);
             std::cout << "[run] --embedded-ingest-isdlock: coin-P2P"
@@ -6002,6 +6152,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         // eligible pool so a slow/non-serving primary cannot
                         // wedge the anchor->tip fold (dashd rotate-on-stall).
                         cp->send_getmnlistd_rotating(uint256::ZERO, block_hash);
+                    });
+                // TIMEOUT RE-ASK of that same fold snapshot: besides rotating,
+                // strike the stalled carrier as a demonstrated non-server so
+                // the acquisition pump expands the outbound set
+                // (GetExtraFullOutboundCount) toward a peer that actually
+                // serves the deep base->anchor snapshot, instead of re-asking
+                // one slow peer forever. Reward-safe: peer selection + dial
+                // count only.
+                mn_ckpt_lane->set_reask_snapshot_fn(
+                    [cp](const uint256& block_hash) {
+                        cp->send_getmnlistd_reask(uint256::ZERO, block_hash);
                     });
                 // DEMUX (reward-critical): the reply comes back on the SAME
                 // mnlistdiff message the tip sync uses. Routed here it is
@@ -7584,6 +7745,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 const uint256& stop) {
                 cp->send_getheaders_to(peer, 70230, {locator_hash}, stop);
             };
+            // dashd BLOCK_STALLING_TIMEOUT (proactive half, header lane): a peer
+            // that received a header-backfill getheaders but never answered
+            // within the stalling window is dropped + a replacement redialed,
+            // instead of demote-only (which left the zombie session pinned to a
+            // pool slot at max RTO backoff — the POOL-STATUS started/lost=8/0
+            // pileup the cold-start diagnosis named). refill_pool() redials NOW.
+            seams.disconnect_and_redial = [cp = coin_p2p.get()](
+                const std::string& peer) {
+                cp->stall_disconnect_and_redial(
+                    peer, "header-backfill getheaders stalling (BLOCK_STALLING_TIMEOUT)");
+            };
             // Priority invariant 2: no new bulk getdata while a tracked tip
             // body is outstanding.
             seams.tip_busy = [cp = coin_p2p.get()] {
@@ -8987,6 +9159,10 @@ int main(int argc, char** argv)
     // byte-identical); on, every isdlock is still individually BLS-gated
     // before Mempool::add_islock (fail-closed at every hop).
     bool embedded_ingest_isdlock = false;
+    // --embedded-ingest-dstx (W5-B): arm the CoinJoin DSTX lane (getdata
+    // pull + BLS-verified zero-fee admission with dashd's +0.1 COIN
+    // prioritisation delta). DEFAULT OFF — wire and templates byte-identical.
+    bool embedded_ingest_dstx = false;
     std::string bestcl_policy = "freshness";   // --bestcl-policy: freshness (default, conservative proxy) | consensus-exact (dashcore's actual CheckCbTxBestChainlock rule)
     bool embedded_oracle_shadow = false;       // --embedded-oracle-shadow: per-block dashd cross-check (OBSERVE-only)
     bool embedded_shadow_compare = false;      // --embedded-shadow-compare: serve-vs-dashd template diff (OBSERVE-only, NOT a gate)
@@ -9094,6 +9270,8 @@ int main(int argc, char** argv)
             embedded_null_arm = false;  // #127: explicit OFF (OFF-equivalence)
         else if (std::strcmp(argv[i], "--embedded-ingest-isdlock") == 0)
             embedded_ingest_isdlock = true;   // G4 conflict-tx-lock feed
+        else if (std::strcmp(argv[i], "--embedded-ingest-dstx") == 0)
+            embedded_ingest_dstx = true;      // W5-B CoinJoin DSTX feed
         else if (std::strcmp(argv[i],
                              "--embedded-creditpool-publish-at-serve-tip") == 0)
             embedded_creditpool_publish_at_serve_tip = true;
@@ -9398,7 +9576,8 @@ int main(int argc, char** argv)
                         embedded_accrue_asset_locks,   // #107 PHASE 2
                         embedded_null_arm,             // #127
                         embedded_accrue_asset_unlocks, // #143 Variant B
-                        embedded_ingest_isdlock);      // G4 isdlock feed
+                        embedded_ingest_isdlock,       // G4 isdlock feed
+                        embedded_ingest_dstx);         // W5-B DSTX feed
     }
     return run_selftest();
 }

@@ -14,8 +14,11 @@
 
 #include <impl/bitcoin_family/coin/base_p2p_messages.hpp>
 
+#include <span>
 #include <vector>
 
+#include <core/hash.hpp>      // CHash256 — dstx_signature_hash (W5-B)
+#include <core/pack.hpp>      // PackStream — dstx_signature_hash (W5-B)
 #include <core/uint256.hpp>
 #include <core/netaddress.hpp>
 #include <core/message.hpp>
@@ -455,6 +458,122 @@ BEGIN_MESSAGE(isdlock)
     }
 END_MESSAGE()
 
+// ── W5-B: CoinJoin broadcast tx (DSTX) ────────────────────────────────────
+// "dstx" — dashd coinjoin/coinjoin.h CCoinJoinBroadcastTx, v23 wire form
+// (SERIALIZE_METHODS, coinjoin.h:255-263; the legacy masternodeOutpoint arm
+// is gone at proto 70230 — protxHash only):
+//   tx        (full network tx serialization — Dash has no witness)
+//   protxHash (uint256 — the mixing masternode's registration txid)
+//   vchSig    (CompactSize-prefixed byte vector; 96-byte BLS operator sig.
+//              The 96B check is a HANDLER refusal, not a codec bound —
+//              mirrors isdlock's "structural refusal is peer-local" posture)
+//   sigTime   (int64 LE)
+//
+// ACQUISITION: dashd relays a mixing tx as inv(MSG_DSTX=16) where the inv
+// hash is the PLAIN TXID (net_processing.cpp:2567 — unlike isdlock/clsig,
+// whose inv hash is SerializeHash(payload)), and serves the object from
+// CDSTXManager::GetDSTX(txid) on getdata (:2868-2873). The pull is OPT-IN
+// (--embedded-ingest-dstx, CoinClient::set_dstx_pull) and rides the SAME
+// budgeted tx-pull machinery as MSG_TX (slot keyed by txid — correct here
+// precisely because the DSTX inv hash IS the txid); flag OFF ⇒ no getdata
+// type-16 is ever sent ⇒ zero wire and zero template change.
+//
+// ⚠ THE SIGNATURE IS NOT OPAQUE. A DSTX is a ZERO-FEE tx dashd admits and
+// then PRIORITISES (+0.1 COIN modified fee, net_processing.cpp:3609) ONLY
+// after BLS-verifying vchSig against the mixing MN's operator key
+// (ValidateDSTX, :3549-3615). Adopting one unverified would let an arbitrary
+// peer stuff zero-fee txs into our served templates at top priority. The
+// maintainer-side gate (CoinStateMaintainer::on_new_dstx, fail-closed
+// without a verifier) must BLS-verify
+//     SerializeHash(tx ‖ protxHash ‖ sigTime)      (SER_GETHASH drops vchSig;
+//                                                   coinjoin.cpp:68-80)
+// against SML pubKeyOperator(protxHash) before Mempool::add_dstx runs.
+BEGIN_MESSAGE(dstx)
+    MESSAGE_FIELDS
+    (
+        (MutableTransaction,   m_tx),
+        (uint256,              m_protx_hash),
+        (std::vector<uint8_t>, m_sig),
+        (int64_t,              m_sig_time)
+    )
+    {
+        READWRITE(obj.m_tx);
+        READWRITE(obj.m_protx_hash);
+        READWRITE(obj.m_sig);
+        READWRITE(obj.m_sig_time);
+    }
+END_MESSAGE()
+
+/// dashd CCoinJoinBroadcastTx::IsValidStructure (coinjoin.cpp:83-102) — the
+/// STRUCTURAL refusals a DSTX must clear before the BLS gate ever runs.
+/// Mainnet constants: nPoolMinParticipants=3 / nPoolMaxParticipants=20
+/// (chainparams.cpp:287-288), COINJOIN_ENTRY_MAX_SIZE=9 (coinjoin.h:47) ⇒
+/// vin ∈ [3, 180]; every vout must be a standard CoinJoin denomination
+/// (coinjoin/common.h:38-44) paid to P2PKH. No sigTime bound — dashd's
+/// ValidateDSTX has none (the time bound is queue-only). A refusal is a
+/// peer-local drop, never a ban. Free function so it is unit-testable
+/// without a live socket peer (same reason as inv_type_is_pulled).
+inline bool dstx_is_valid_structure(const MutableTransaction& tx,
+                                    const uint256& protx_hash,
+                                    size_t sig_size)
+{
+    static constexpr size_t kMinVin = 3;        // nPoolMinParticipants
+    static constexpr size_t kMaxVin = 20 * 9;   // nPoolMaxParticipants * ENTRY_MAX
+    auto is_denomination = [](int64_t v) {
+        return v == 1000010000LL   // 10.00010000 DASH
+            || v == 100001000LL    //  1.00001000
+            || v == 10000100LL     //  0.10000100
+            || v == 1000010LL      //  0.01000010
+            || v == 100001LL;      //  0.00100001
+    };
+    auto is_p2pkh = [](const std::vector<uint8_t>& s) {
+        return s.size() == 25 && s[0] == 0x76 && s[1] == 0xa9 && s[2] == 0x14
+            && s[23] == 0x88 && s[24] == 0xac;
+    };
+    if (protx_hash.IsNull()) return false;
+    if (tx.vin.size() != tx.vout.size()) return false;
+    if (tx.vin.size() < kMinVin || tx.vin.size() > kMaxVin) return false;
+    if (sig_size != 96) return false;
+    for (const auto& out : tx.vout) {
+        if (!is_denomination(out.value)) return false;
+        if (!is_p2pkh(out.scriptPubKey.m_data)) return false;
+    }
+    return true;
+}
+
+/// dashd CCoinJoinBroadcastTx::GetSignatureHash() — SerializeHash(*this,
+/// SER_GETHASH, PROTOCOL_VERSION) with vchSig EXCLUDED by the SER_GETHASH
+/// guard in SERIALIZE_METHODS (coinjoin.h:257-262, coinjoin.cpp:68-71):
+///
+///     digest = SHA256d( ser(tx) ‖ protxHash[32] ‖ sigTime[8 LE] )
+///
+/// Full network tx serialization (Dash txs have no witness, so SER_GETHASH
+/// does not alter the tx bytes; ::pack(MutableTransaction) IS the dash_txid
+/// byte source), raw 32-byte protxHash, plain 8-byte LE sigTime — NO
+/// CompactSize framing around the trailing fields. This is the pre-image the
+/// mixing MN's BLS operator key signs; pinned by test_dash_dstx.cpp against
+/// an independently hand-assembled byte stream.
+inline uint256 dstx_signature_hash(const MutableTransaction& tx,
+                                   const uint256& protx_hash,
+                                   int64_t sig_time)
+{
+    ::PackStream ps;
+    ps << tx;
+    auto sp = ps.get_span();
+    std::vector<uint8_t> pre(
+        reinterpret_cast<const uint8_t*>(sp.data()),
+        reinterpret_cast<const uint8_t*>(sp.data()) + sp.size());
+    pre.insert(pre.end(), protx_hash.data(), protx_hash.data() + 32);
+    for (int i = 0; i < 8; ++i)
+        pre.push_back(static_cast<uint8_t>(
+            (static_cast<uint64_t>(sig_time) >> (8 * i)) & 0xFF));
+    uint256 digest;
+    CHash256()
+        .Write(std::span<const unsigned char>(pre.data(), pre.size()))
+        .Finalize(std::span<unsigned char>(digest.data(), 32));
+    return digest;
+}
+
 // ── SPORK listener ────────────────────────────────────────────────────────
 // "spork" — CSporkMessage (dashd src/spork.h SERIALIZE_METHODS): nSporkID(i32)
 // + nValue(i64) + nTimeSigned(i64) + vchSig (LIMITED_VECTOR, 65-byte compact
@@ -524,6 +643,16 @@ using Handler = MessageHandler<
     // #1230 x isdlock-intake). test_dash_isdlock.cpp gates the registry
     // membership directly.
     message_isdlock,
+    // ⚠ DSTX lane — same registry rule as isdlock above (#1077): a handler
+    // that exists but whose message type is absent from this list can never
+    // run; the payload dies on the unhandled-command path at DEBUG, and the
+    // CoinJoin leg silently stays feed-less. Membership here is
+    // UNCONDITIONAL (compile-time); the --embedded-ingest-dstx flag gates
+    // BEHAVIOUR (the getdata pull + the BLS-verified new_dstx lane), never
+    // parsing. ONE entry only: a type listed twice is a duplicate variant
+    // alternative = compile error (rebase trap). test_dash_dstx.cpp gates
+    // the registry membership directly.
+    message_dstx,
     message_qfcommit,
     message_getmnlistd,
     message_mnlistdiff,

@@ -245,6 +245,9 @@ void MiningInterface::load_transition_blobs(const std::string& dir_path)
         auto blob = ParseHex(hex_str);
         if (blob.empty()) continue;
 
+        // Featured-node banner: ECDSA-verified ingestion (freshest-wins).
+        scan_blob_for_featured_node(blob);
+
         auto unpacked = ltc::unpack_share_messages(blob.data(), blob.size());
         if (!unpacked.decrypted) continue;
 
@@ -307,6 +310,33 @@ std::vector<unsigned char> MiningInterface::get_operator_message_blob() const
 {
     std::lock_guard<std::mutex> lock(m_message_blob_mutex);
     return m_operator_message_blob;
+}
+
+// ── Featured developer-node banner: authority-verified ingestion ────────────
+// The freshest-wins comparator, persistence and render logic live in the
+// consensus-neutral core::FeaturedNodeStore (featured_node.hpp). This is the
+// RENDER GATE: only blobs that pass FULL authority verification — MAC decrypt
+// + per-message ECDSA + pinned COMBINED_DONATION_SCRIPT pubkey — are ingested.
+// validate_message_data() returns empty ONLY on that success; a forged,
+// unsigned, wrong-key or tampered blob is rejected before any seq comparison,
+// so an attacker can neither render a banner nor burn the monotonic counter.
+void MiningInterface::scan_blob_for_featured_node(const std::vector<unsigned char>& blob)
+{
+    if (blob.empty()) return;
+    if (!ltc::validate_message_data(blob).empty()) return;  // not authority-signed → ignore
+    auto unpacked = ltc::unpack_share_messages(blob.data(), blob.size());
+    if (!unpacked.decrypted || unpacked.authority_pubkey == nullptr) return;
+    std::string signer_hex = to_hex(std::vector<unsigned char>(
+        unpacked.authority_pubkey->begin(), unpacked.authority_pubkey->end()));
+    for (const auto& msg : unpacked.messages) {
+        if (msg.msg_type != ltc::MSG_FEATURED_NODE) continue;  // unknown subtypes ignored gracefully
+        std::string payload_text(msg.payload.begin(), msg.payload.end());
+        nlohmann::json pj;
+        try { pj = nlohmann::json::parse(payload_text); } catch (...) { continue; }
+        if (!pj.is_object()) continue;
+        uint64_t seq = pj.value("seq", uint64_t(0));
+        apply_featured_node_message(seq, msg.timestamp, payload_text, signer_hex);
+    }
 }
 
 // ─── Live coin-daemon integration ────────────────────────────────────────────
@@ -2266,6 +2296,7 @@ nlohmann::json MiningInterface::setmessageblob(const std::string& message_blob_h
     }
 
     set_operator_message_blob(blob);
+    scan_blob_for_featured_node(blob);  // freshest-wins featured-node banner at runtime
     return {
         {"ok", true},
         {"enabled", true},
@@ -5507,6 +5538,22 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
 
     nlohmann::json result = nlohmann::json::object();
 
+    // ── Featured developer-node banner (signed subtype 0x06, freshest-wins) ──
+    // Emitted BEFORE the version-signaling early returns so the banner is shown
+    // independent of any transition state (a fresh/empty chain returns {} for
+    // the signaling fields, but a verified banner must still render). Fold in
+    // the operator message blob so a runtime /msg/load_blob (the DASH delivery
+    // seam until share-embedding Phase B lands) updates the banner without a
+    // restart. featured_node_json() applies expiry/retract and returns null
+    // when there is nothing to show → the field is OMITTED, so an old dashboard
+    // sees no key and a new dashboard hides the div (version-coupling safe).
+    {
+        auto op_blob = get_operator_message_blob();
+        if (!op_blob.empty()) scan_blob_for_featured_node(op_blob);
+        auto fn = featured_node_json();
+        if (!fn.is_null()) result["featured_node"] = fn;
+    }
+
     // Use pre-computed sharechain stats if provided
     nlohmann::json sc;
     if (cached_sc && !cached_sc->is_null())
@@ -5817,6 +5864,15 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
                             tmsg["to_ver"] = payload_json.value("to", "");
                         } else { tmsg["msg"] = payload_text; tmsg["urgency"] = "info"; }
                         result["transition_message"] = tmsg;
+                    } else if (msg_type == 0x06 && is_authority) {
+                        // Featured dev-node banner via share-embedded gossip
+                        // (delivery inherits automatically when DASH Phase B
+                        // share-embedding lands). The best share was already
+                        // ECDSA-validated upstream, so this is authority-proven.
+                        if (payload_json.is_object()) {
+                            uint64_t fseq = payload_json.value("seq", uint64_t(0));
+                            apply_featured_node_message(fseq, ts, payload_text, signer);
+                        }
                     } else if (msg_type == 0x03 || msg_type == 0x10) {
                         nlohmann::json ann = {
                             {"type", (msg_type == 0x10) ? "EMERGENCY" : "POOL_ANNOUNCE"},

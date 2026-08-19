@@ -200,6 +200,12 @@ public:
     bool empty() const { return m_targets.empty(); }
     std::size_t size() const { return m_targets.size(); }
 
+    // Read-only view of the scored targets — the archival outbound-rotation
+    // pump peeks it to decide whether a FRESH (not-already-held, not-in-flight,
+    // not-in-cooldown) candidate exists before it evicts a demoted slot-holder.
+    // Never mutates the round-robin cursor (a bare check must not consume it).
+    const std::vector<NetService>& targets() const { return m_targets; }
+
     const NetService& current() const { return m_targets.at(m_index); }
 
     // Rotate to the next target (single-target plans stay put) and return it.
@@ -645,6 +651,37 @@ public:
     static constexpr std::size_t DEFAULT_POOL_PEERS = 8;
     static constexpr std::size_t POOL_PEERS_HARD_CAP = 16;
 
+    // ── dashd outbound-acquisition parity (archival rotation pump) ─────────
+    // dashd never stays starved on a full-but-shallow peer set: while it is
+    // behind it opens EXTRA full-relay outbound (GetExtraFullOutboundCount) and
+    // it DISCONNECTS a peer that holds a download slot without serving
+    // (BLOCK_STALLING_TIMEOUT) so ThreadOpenConnections refills the freed slot
+    // with a FRESH addrman candidate — cycling until every download slot holds
+    // an archival (NODE_NETWORK) peer and the block-download window fills. Our
+    // pool, in contrast, latched: a full pool early-returns from refill_pool()
+    // (a frozen full pool) and the bulk lane only DEMOTES a demonstrated
+    // non-server (holds it off fresh ranges) without ever freeing its slot, so
+    // the large addrman bank behind the working set was never drawn again and
+    // "only 7 peers serve deep bodies" was the frozen first-come set, not the
+    // network's ceiling. This pump is the missing acquisition half, and it is
+    // connection-management ONLY: the per-block merkleRoot fold self-check +
+    // payee cross-check + poison fail-closed are untouched, no block is skipped
+    // — it only changes WHICH / HOW-MANY peers the fold fetches from.
+    //
+    // GetExtraFullOutboundCount analog: while a demonstrated deep-body
+    // non-server occupies a slot we are "behind" on archival coverage, so raise
+    // the effective dial target by this many (clamped to the hard cap) — dial
+    // MORE fresh candidates to reach archival servers beyond the frozen set.
+    static constexpr std::size_t OUTBOUND_BEHIND_EXTRA = 2;
+    // BLOCK_STALLING_TIMEOUT cadence: minimum seconds between two evict+refill
+    // rotations so a transiently-quiet peer is never churned (dashd's stall
+    // timeout is seconds, doubling; this is the steady rotation floor).
+    static constexpr int64_t OUTBOUND_ROTATE_INTERVAL_SEC = 20;
+    // A just-rotated-out address is held OFF redial this long (addrman-backoff
+    // analog) so refill_pool() draws a genuinely fresh candidate instead of
+    // immediately re-dialing the non-server we just dropped.
+    static constexpr int64_t OUTBOUND_ROTATE_COOLDOWN_SEC = 120;
+
 private:
     dash::interfaces::Node* m_coin;
     io::io_context* m_context;
@@ -668,6 +705,19 @@ private:
     // reconnect to the same non-serving address. Incremented on NOTFOUND for a
     // bulk body and on stall-eviction; cleared when that peer delivers a body.
     std::map<std::string, int> m_bulk_nonserver_strikes;
+    // ── archival outbound-rotation pump state (dashd acquisition parity) ───
+    // Master switch. Default ON (this is an always-on port like the bulk demote
+    // #1272 / header stall-disconnect #1283 that precede it); flipping it OFF
+    // restores BYTE-IDENTICAL pre-port behaviour (a frozen full pool), which is
+    // both the safety escape hatch and the RED arm of the acquisition KATs.
+    bool m_outbound_rotate_enabled{true};
+    // Rate limit: wall-second of the last evict+refill rotation.
+    int64_t m_last_outbound_rotate{0};
+    // Just-evicted addresses held OFF redial: addr -> skip-until wall-second.
+    std::map<std::string, int64_t> m_rotation_cooldown;
+    // Telemetry: how many demoted slot-holders we have rotated out for a fresh
+    // archival dial (asserted by the KATs, surfaced in the pool-status log).
+    uint64_t m_outbound_rotations{0};
     // Round-robin cursor for the STATEFUL request legs (the mn-checkpoint
     // anchor->tip fold's getmnlistd snapshot). dashd picks a sync peer for a
     // mnlistdiff and ROTATES to another on stall rather than re-asking one slow
@@ -735,6 +785,17 @@ private:
     // announces at most one isdlock per locked tx, orders of magnitude rarer
     // than MSG_TX, and the payload is bounded at decode (MAX_ISDLOCK_INPUTS).
     bool     m_isdlock_pull_enabled{false};
+    // DSTX (CoinJoin broadcast tx) lane (--embedded-ingest-dstx): OPT-IN,
+    // and — unlike isdlock — the GETDATA ITSELF is gated: a DSTX has no
+    // fee-only-safe unconditional consumer (its whole effect is putting a
+    // zero-fee tx INTO templates at top priority), so off-flag there is no
+    // reason to spend bandwidth. The pull rides the SAME budget/inflight
+    // machinery as MSG_TX (the DSTX inv hash IS the plain txid,
+    // net_processing.cpp:2567, so the txid-keyed slots are correct).
+    bool     m_dstx_pull_enabled{false};
+    uint64_t m_dstx_inv_seen{0};     // inv(MSG_DSTX) admitted by the dedup
+    uint64_t m_dstx_pull_sent{0};    // getdata(MSG_DSTX) issued
+    uint64_t m_dstx_received{0};     // dstx bodies that arrived
     size_t   m_tx_pull_inflight_cap{64};
     std::map<uint256, int64_t> m_tx_pull_inflight;   // txid -> requested-at
     uint64_t m_tx_inv_offered{0};    // inv(MSG_TX) SEEN on the wire, pre-dedup
@@ -1256,6 +1317,20 @@ public:
     /// TEST-ONLY: clear a peer's non-server strike (the forgiveness a real
     /// body delivery triggers on the ingest path).
     void forgive_bulk_nonserver_for_test(const std::string& key) { forgive_bulk_nonserver(key); }
+    /// TEST-ONLY: record a non-server strike directly (stands in for the live
+    /// NOTFOUND/stall path the archival-rotation KATs demote a peer through).
+    void note_bulk_nonserver_for_test(const std::string& key) { note_bulk_nonserver(key); }
+    // ── archival outbound-rotation pump — test seams ──────────────────────
+    /// TEST-ONLY: master switch. Default ON; OFF restores the byte-identical
+    /// pre-port frozen-full-pool behaviour (the RED arm of the acquisition KATs).
+    void set_outbound_rotate_enabled_for_test(bool on) { m_outbound_rotate_enabled = on; }
+    /// TEST-ONLY: the dashd GetExtraFullOutboundCount-raised effective target.
+    std::size_t effective_max_peers_for_test() const { return effective_max_peers(); }
+    /// TEST-ONLY: behind on archival coverage (a demoted non-server holds a slot)?
+    bool outbound_behind_for_test() const { return outbound_behind(); }
+    /// TEST-ONLY: how many demoted slot-holders have been rotated out for a
+    /// fresh archival dial.
+    uint64_t outbound_rotations_for_test() const { return m_outbound_rotations; }
     /// TEST-ONLY: exercise the STATEFUL (getmnlistd fold) carrier selection —
     /// the seam the rotate-on-timeout KAT asserts fans out on. Returns the
     /// chosen peer key and records it as the last stateful carrier, exactly as
@@ -1407,6 +1482,27 @@ public:
         p->write(msg);
         return true;
     }
+
+    /// dashd net_processing BLOCK_STALLING_TIMEOUT: force-drop a single named
+    /// peer session and redial a replacement NOW. The pre-anchor header-backfill
+    /// lane calls this on a peer that received a getheaders but never answered
+    /// within the stalling window — dashd disconnects such a peer ('Peer is
+    /// stalling block download, disconnecting') instead of leaving the zombie
+    /// session occupying a pool slot at max RTO backoff. remove_peer() fires the
+    /// disconnect seam + re-elects the primary if needed; refill_pool() redials
+    /// from the scored dial plan immediately rather than waiting the 30 s
+    /// reconnect tick (which is only the backstop). Returns true iff a session
+    /// was actually dropped. A no-op (peer already gone) when the key is stale.
+    bool stall_disconnect_and_redial(const std::string& peer_key,
+                                     const std::string& reason)
+    {
+        PeerSession* p = find_peer(peer_key);
+        if (!p) return false;
+        remove_peer(p, reason);
+        refill_pool();   // immediate redial; the 30 s loop is only the backstop
+        return true;
+    }
+
     /// Fired on socket connect (before handshake) with the peer endpoint — the
     /// DashCoinPeerManager scores the connect + tracks anchors off this.
     void set_on_peer_connected(PeerLifecycleCallback cb) { m_on_peer_connected = std::move(cb); }
@@ -1509,6 +1605,14 @@ public:
     /// stays dormant.
     void set_isdlock_pull(bool on) { m_isdlock_pull_enabled = on; }
     bool isdlock_pull_enabled() const { return m_isdlock_pull_enabled; }
+
+    /// Arm the DSTX (CoinJoin broadcast tx) lane (--embedded-ingest-dstx).
+    /// OFF by default: an explicit operator decision. Unlike isdlock this
+    /// gates the GETDATA itself — no fee-only-safe unconditional consumer
+    /// exists for a DSTX, so off-flag no inv(MSG_DSTX=16) ever earns a
+    /// request and the wire is byte-identical to master.
+    void set_dstx_pull(bool on) { m_dstx_pull_enabled = on; }
+    bool dstx_pull_enabled() const { return m_dstx_pull_enabled; }
 
     /// One greppable line: what the ingest lane asked for and what it got.
     /// received < pull_sent is normal (notfound, races, peers that drop);
@@ -1655,6 +1759,48 @@ public:
                  << " target=" << block_hash.GetHex();
         auto msg = message_getmnlistd::make_raw(base_block_hash, block_hash);
         p->write(msg);
+    }
+
+    /// TIMEOUT RE-ASK of the STATEFUL getmnlistd leg — the recovery half of
+    /// dashd's rotate-on-stall sync-peer behaviour, fired when the carrier we
+    /// last asked did not answer in time (the tip-follow SmlResyncWatchdog
+    /// re-request, or the mn-checkpoint fold's tick_pending_fold re-ask). Two
+    /// things happen, and the live A/B (wf w8cr3yepg) proved BOTH were missing
+    /// on this leg — it pinned every ask AND every re-ask to one primary:
+    ///
+    ///   (B) ROTATE — send_getmnlistd_rotating() picks a DIFFERENT eligible
+    ///       archival carrier (next_stateful_peer avoids m_last_stateful_peer
+    ///       and prefers CanServeBlocks/NODE_NETWORK), so a slow/limited peer
+    ///       cannot wedge the fold by being re-asked forever.
+    ///
+    ///   (A) DEMOTE — strike the carrier that just stalled us as a demonstrated
+    ///       non-server, in the SAME bulk-demotion tally the block-body lane
+    ///       feeds. This is what makes the acquisition pump SEE a getmnlistd
+    ///       stall: outbound_behind() then reads a demoted slot-holder, the
+    ///       effective dial target expands (GetExtraFullOutboundCount) and
+    ///       refill/rotate pulls in MORE fresh archival peers to reach one that
+    ///       actually serves. Without it "behind" was blind to everything but
+    ///       block bodies, so a getmnlistd-dominated near-tip window kept the
+    ///       pool frozen at its base size even while a slow primary starved the
+    ///       SML — exactly the EXPANSION-never-engaged half of the finding.
+    ///
+    /// Reward-safe: this changes only WHICH peer is asked and HOW MANY we dial.
+    /// Exactly one getmnlistd is outstanding, so a reply from ANY carrier
+    /// satisfies the same await; the served MN-payee/quorum-root bytes are
+    /// still DIP-4 client-verified against the block's own cbTx commitment
+    /// before they are believed; and a peer that later delivers a body clears
+    /// its strike (forgive_bulk_nonserver on the ingest path).
+    void send_getmnlistd_reask(const uint256& base_block_hash,
+                               const uint256& block_hash)
+    {
+        // (A) the carrier we last asked demonstrably did not answer in time —
+        // strike it so the acquisition pump treats it as a slot-holding non-
+        // server and expands/rotates the outbound set toward a real server.
+        if (!m_last_stateful_peer.empty() && holds_key(m_last_stateful_peer))
+            note_bulk_nonserver(m_last_stateful_peer);
+        // (B) rotate to a fresh archival carrier and send (never drops: the
+        // rotating send falls back to any handshaked peer, then m_primary).
+        send_getmnlistd_rotating(base_block_hash, block_hash);
     }
 
     /// Send a getqrinfo (DIP-24 quorum-rotation-info request) — the ROTATED
@@ -2226,10 +2372,15 @@ private:
         if (!m_reconnect_enabled || m_dial_plan.empty()) return;
         const int64_t now = now_sec();
         prune_stale_dials(now);
+        prune_rotation_cooldown(now);
 
+        // dashd GetExtraFullOutboundCount: while we are behind on archival
+        // coverage the effective target is raised, so a full-at-base pool still
+        // dials MORE fresh candidates to reach archival servers.
+        const std::size_t target = effective_max_peers();
         const std::size_t held = m_pool.size() + m_dialing.size();
-        if (held >= m_max_peers) return;
-        std::size_t slots = m_max_peers - held;
+        if (held >= target) return;
+        std::size_t slots = target - held;
 
         // One pass over the plan at most: every target is considered exactly
         // once per refill, so a plan shorter than the slot count simply fills
@@ -2244,25 +2395,160 @@ private:
         std::size_t dialed = 0;
         for (std::size_t i = 0; i < n && slots > 0; ++i)
         {
-            const NetService target = m_dial_plan.current();
+            const NetService target_addr = m_dial_plan.current();
             m_dial_plan.advance();
-            const std::string key = target.to_string();
+            const std::string key = target_addr.to_string();
             if (holds_key(key) || m_dialing.count(key)) continue;
+            // Skip an address we just rotated OUT — the addrman-backoff analog
+            // that forces refill onto a genuinely fresh candidate.
+            if (is_rotation_cooled(key, now)) continue;
             m_dialing[key] = now;
             LOG_INFO << "[" << m_chain_label << "] dialing " << key
                      << " (pool " << m_pool.size() << "/" << m_max_peers
                      << ", " << m_dialing.size() << " in flight)";
-            core::Factory<core::Client>::connect(target);
+            core::Factory<core::Client>::connect(target_addr);
             --slots;
             ++dialed;
         }
-        if (dialed == 0 && m_pool.size() < m_max_peers)
+        if (dialed == 0 && m_pool.size() < target)
         {
             LOG_DEBUG_COIND << "[" << m_chain_label << "] pool below target ("
-                            << m_pool.size() << "/" << m_max_peers
+                            << m_pool.size() << "/" << target
                             << ") but no fresh dial target in a "
                             << n << "-entry plan";
         }
+    }
+
+    // ── archival outbound-rotation pump (dashd acquisition parity) ─────────
+    /// Live strike count for an address (0 when unknown). The demotion state
+    /// the notfound/stall handlers already feed (note_bulk_nonserver).
+    int bulk_strikes(const std::string& key) const
+    {
+        auto it = m_bulk_nonserver_strikes.find(key);
+        return it == m_bulk_nonserver_strikes.end() ? 0 : it->second;
+    }
+
+    /// Pool peers that are demonstrated deep-body NON-servers (bulk-demoted for
+    /// chronic NOTFOUND / stall). Each holds a download slot dashd would have
+    /// freed; while any exist we are "behind" on archival coverage.
+    std::size_t pool_demoted_count() const
+    {
+        std::size_t n = 0;
+        for (const auto& up : m_pool)
+            if (up->handshake.complete() && bulk_demoted(up->key)) ++n;
+        return n;
+    }
+
+    /// Behind on archival coverage ⇒ a demonstrated non-server occupies a slot.
+    bool outbound_behind() const
+    { return m_outbound_rotate_enabled && pool_demoted_count() > 0; }
+
+    /// dashd GetExtraFullOutboundCount analog: the dial target, RAISED while we
+    /// are behind so refill dials MORE fresh candidates to reach archival
+    /// servers (clamped to the hard cap). Base target when not behind, so a
+    /// healthy pool is byte-identical to before this port.
+    std::size_t effective_max_peers() const
+    {
+        if (!outbound_behind()) return m_max_peers;
+        return std::min<std::size_t>(m_max_peers + OUTBOUND_BEHIND_EXTRA,
+                                     POOL_PEERS_HARD_CAP);
+    }
+
+    bool is_rotation_cooled(const std::string& key, int64_t now) const
+    {
+        auto it = m_rotation_cooldown.find(key);
+        return it != m_rotation_cooldown.end() && it->second > now;
+    }
+    void prune_rotation_cooldown(int64_t now)
+    {
+        for (auto it = m_rotation_cooldown.begin(); it != m_rotation_cooldown.end(); )
+            if (it->second <= now) it = m_rotation_cooldown.erase(it);
+            else ++it;
+    }
+
+    /// Is there a plan entry we could dial RIGHT NOW that we do not already
+    /// hold, have in flight, or just rotated out? Without a fresh candidate an
+    /// eviction would only re-dial the same non-server, so the pump holds.
+    bool has_fresh_dial_candidate(int64_t now) const
+    {
+        for (const auto& t : m_dial_plan.targets())
+        {
+            const std::string key = t.to_string();
+            if (holds_key(key) || m_dialing.count(key)) continue;
+            if (is_rotation_cooled(key, now)) continue;
+            return true;
+        }
+        return false;
+    }
+
+    /// The worst demoted slot-holder to rotate out: most strikes first, then
+    /// the oldest (longest-latched) session. Skips one still in its own
+    /// post-rotation cooldown. nullptr ⇒ nothing eligible to evict.
+    PeerSession* worst_demoted_pool_peer(int64_t now) const
+    {
+        PeerSession* worst = nullptr;
+        int worst_strikes = 0;
+        for (const auto& up : m_pool)
+        {
+            PeerSession* p = up.get();
+            if (!p->handshake.complete()) continue;
+            if (!bulk_demoted(p->key)) continue;
+            if (is_rotation_cooled(p->key, now)) continue;
+            const int s = bulk_strikes(p->key);
+            if (!worst || s > worst_strikes ||
+                (s == worst_strikes && p->age_sec() > worst->age_sec()))
+            { worst = p; worst_strikes = s; }
+        }
+        return worst;
+    }
+
+    /// dashd's acquisition loop, once per pool tick: keep cycling fresh peers
+    /// until the block-download window can fill.
+    ///   (1) EXTRA OUTBOUND while behind — refill_pool() already honours the
+    ///       raised effective target, so a call here dials more the moment a
+    ///       slot is notionally open (GetExtraFullOutboundCount).
+    ///   (2) EVICT-THEN-REFILL when the (expanded) pool is FULL yet still holds
+    ///       a demoted non-server AND a fresh candidate exists: drop the worst
+    ///       non-server (BLOCK_STALLING_TIMEOUT disconnect) and refill from the
+    ///       addrman-fed plan (ThreadOpenConnections). Rate-limited so a
+    ///       transiently-quiet peer is never churned.
+    /// Reward-safe: this changes only WHICH / HOW-MANY peers we fetch from — the
+    /// per-block merkleRoot fold self-check, payee cross-check, and poison
+    /// fail-closed are all untouched, and no block is ever skipped.
+    void maybe_rotate_outbound(int64_t now)
+    {
+        if (!m_outbound_rotate_enabled) return;
+        prune_rotation_cooldown(now);
+        if (!outbound_behind()) return;
+
+        // (1) Room under the raised target ⇒ dial more fresh candidates.
+        if (m_pool.size() + m_dialing.size() < effective_max_peers())
+        {
+            refill_pool();
+            return;
+        }
+
+        // (2) Saturated even at the expanded target: rotate the worst
+        // non-server out for a fresh dial — but only when it buys a genuinely
+        // new candidate, and no more often than the stall cadence.
+        if (now - m_last_outbound_rotate < OUTBOUND_ROTATE_INTERVAL_SEC) return;
+        if (!has_fresh_dial_candidate(now)) return;
+        PeerSession* victim = worst_demoted_pool_peer(now);
+        if (!victim) return;
+
+        const std::string vkey = victim->key;
+        LOG_INFO << "[" << m_chain_label << "] archival rotation: evicting "
+                    "demonstrated deep-body non-server " << vkey
+                 << " (strikes=" << bulk_strikes(vkey)
+                 << ") for a fresh archival dial (dashd BLOCK_STALLING_TIMEOUT "
+                    "+ ThreadOpenConnections refill)";
+        m_rotation_cooldown[vkey] = now + OUTBOUND_ROTATE_COOLDOWN_SEC;
+        forgive_bulk_nonserver(vkey);   // a reconnect starts with a clean slate
+        m_last_outbound_rotate = now;
+        ++m_outbound_rotations;
+        remove_peer(victim, "archival rotation: deep-body non-server rotated out "
+                            "for a fresh addrman candidate");
+        refill_pool();                  // immediate redial; 30s loop is backstop
     }
 
     /// Reclaim dial slots whose callback never came. Without this a Factory
@@ -2378,6 +2664,10 @@ private:
 
         service_pending_bodies(now);
         prune_stale_dials(now);
+        // dashd acquisition parity: while behind on archival coverage, dial
+        // more and rotate the frozen full pool's worst non-server out for a
+        // fresh archival candidate (connection-management only, reward-safe).
+        maybe_rotate_outbound(now);
         maybe_log_pool_status(now);
     }
 
@@ -2677,12 +2967,18 @@ private:
             const bool is_block = (inv.base_type() == inventory_type::block);
             const bool is_tx = (inv.base_type() == inventory_type::tx)
                             && m_tx_pull_enabled;
+            // W5-B: MSG_DSTX rides the tx-pull budget path (same strict
+            // tip-body priority, same inflight cap and txid-keyed dedup —
+            // the DSTX inv hash IS the plain txid). Gated on its OWN flag:
+            // no fee-only-safe unconditional consumer exists for a DSTX.
+            const bool is_dstx = (inv.m_type == inventory_type::dstx)
+                              && m_dstx_pull_enabled;
             // Offered-vs-admitted (diagnosis, not policy): counted BEFORE the
             // dedup so "peers are not announcing" can be told apart from "we
             // are filtering". Same announcement from N peers = N offered, 1
             // admitted — that gap is the fan-in the pool exists to produce.
             if (inv.base_type() == inventory_type::tx) ++m_tx_inv_offered;
-            if (!pulled && !is_block && !is_tx)
+            if (!pulled && !is_block && !is_tx && !is_dstx)
                 continue;   // not actionable — do not spend a dedup slot on it
             if (!m_inv_dedup.admit(static_cast<uint32_t>(inv.m_type), inv.m_hash, now))
             {
@@ -2719,9 +3015,9 @@ private:
                 p->write(getdata_msg);
                 continue;
             }
-            if (is_tx)
+            if (is_tx || is_dstx)
             {
-                ++m_tx_inv_seen;
+                if (is_tx) ++m_tx_inv_seen; else ++m_dstx_inv_seen;
                 expire_tx_pulls(now);
                 // STRICT PRIORITY: the tip body always wins. A transaction is
                 // worth a fraction of a block's fees; a late tip body is a
@@ -2734,11 +3030,19 @@ private:
                     ++m_tx_pull_skipped_budget;
                     continue;
                 }
+                // Budget slots are keyed by TXID — correct for BOTH lanes
+                // because the DSTX inv hash IS the plain txid (dashd
+                // net_processing.cpp:2567); a type-1 and a type-16
+                // announcement of the same tx share one slot here even
+                // though InvDedup (keyed on type+hash) admitted both.
                 if (m_tx_pull_inflight.count(inv.m_hash)) continue;
                 m_tx_pull_inflight.emplace(inv.m_hash, now);
-                ++m_tx_pull_sent;
+                if (is_tx) ++m_tx_pull_sent; else ++m_dstx_pull_sent;
+                // Echo the ANNOUNCED type back: a getdata(MSG_TX) for a
+                // DSTX-only tx would get notfound from dashd until it leaves
+                // the DSTX relay window.
                 auto getdata_msg = message_getdata::make_raw(
-                    {inventory_type(inventory_type::tx, inv.m_hash)});
+                    {inventory_type(inv.m_type, inv.m_hash)});
                 p->write(getdata_msg);
                 continue;
             }
@@ -2983,6 +3287,63 @@ private:
                  << " cycle=" << msg->m_cycle_hash.GetHex().substr(0, 16)
                  << "...";
         m_coin->new_isdlock.happened(ev);
+    }
+
+    ADD_P2P_HANDLER(dstx)
+    {
+        // W5-B: CoinJoin broadcast tx (dashd CCoinJoinBroadcastTx). NO trust
+        // decision here — the maintainer-side BLS gate
+        // (CoinStateMaintainer::on_new_dstx, fail-closed without a verifier)
+        // decides whether the zero-fee admission path ever runs. This
+        // handler: (1) releases the shared tx-pull budget slot by the
+        // COMPUTED txid (never the announcement's — an unsolicited or
+        // substituted body cannot free a slot it never occupied, same rule
+        // as the tx handler); (2) applies dashd's STRUCTURAL refusals
+        // (CCoinJoinBroadcastTx::IsValidStructure, coinjoin.cpp:83-102 —
+        // local drop + log, no ban); (3) fires new_dstx when the lane is
+        // armed.
+        ++m_dstx_received;
+        const uint256 txid = dash_txid(msg->m_tx);
+        m_tx_pull_inflight.erase(txid);
+
+        if (!m_dstx_pull_enabled) {
+            // Off-flag no getdata was ever sent; an unsolicited dstx is
+            // decode-and-discard (belt-and-suspenders).
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] dstx from "
+                            << (m_active ? m_active->key : std::string("?"))
+                            << " DISCARDED (--embedded-ingest-dstx off)";
+            return;
+        }
+
+        // dashd IsValidStructure, KAT-pinned free predicate
+        // (p2p_messages.hpp dstx_is_valid_structure).
+        if (!dstx_is_valid_structure(msg->m_tx, msg->m_protx_hash,
+                                     msg->m_sig.size())) {
+            LOG_INFO << "[" << m_chain_label << "] dstx from "
+                     << (m_active ? m_active->key : std::string("?"))
+                     << " REFUSED structure (txid="
+                     << txid.GetHex().substr(0, 16)
+                     << " vin=" << msg->m_tx.vin.size()
+                     << " vout=" << msg->m_tx.vout.size()
+                     << " sig_bytes=" << msg->m_sig.size()
+                     << " protx_null=" << (msg->m_protx_hash.IsNull() ? 1 : 0)
+                     << ")";
+            return;
+        }
+
+        ::dash::interfaces::Node::DstxEvent ev;
+        ev.tx         = msg->m_tx;
+        ev.txid       = txid;
+        ev.protx_hash = msg->m_protx_hash;
+        ev.sig_time   = msg->m_sig_time;
+        std::copy(msg->m_sig.begin(), msg->m_sig.end(), ev.sig.begin());
+        LOG_INFO << "[" << m_chain_label << "] dstx from "
+                 << (m_active ? m_active->key : std::string("?"))
+                 << ": txid=" << txid.GetHex().substr(0, 16)
+                 << "... vin=" << msg->m_tx.vin.size()
+                 << " protx=" << msg->m_protx_hash.GetHex().substr(0, 16)
+                 << "... sig_time=" << msg->m_sig_time;
+        m_coin->new_dstx.happened(ev);
     }
 
     ADD_P2P_HANDLER(qfcommit)

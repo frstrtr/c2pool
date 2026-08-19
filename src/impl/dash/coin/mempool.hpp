@@ -85,8 +85,32 @@ struct MempoolEntry {
     uint256  txid;
     uint32_t base_size{0};
     uint64_t fee{0};            // satoshi (computed from UTXO when available)
+    // W5-B: PrioritiseTransaction-style fee delta (dashd mapDeltas /
+    // CTxMemPoolEntry::GetModifiedFee). SCORING uses fee + fee_delta
+    // (feerate index, ancestor aggregates, blockMinFeeRate gate — dashd's
+    // nModFeesWithAncestors basis); ACCOUNTING (total_fees → coinbasevalue,
+    // SelectedTx.fee) stays BASE fee, exactly dashd's split (miner.cpp
+    // AddToBlock nFees += iter->GetFee()). Today's only writer is the
+    // BLS-verified DSTX admission (+0.1 COIN, net_processing.cpp:3609);
+    // 0 everywhere else = byte-identical ordering (modified == base).
+    uint64_t fee_delta{0};
     bool     fee_known{false};
+    // EXCLUSION-DISCIPLINE selection predicate (tx-serving reward-safety).
+    // fee_known is TWO things: "priceable via the W5 UTXO fold" OR "a DSTX
+    // whose fee was FORCED to 0 because the fold could not price it"
+    // (add_tx_locked is_dstx branch). The forced case sets fee_known=true on
+    // inputs the fold could NOT vouch for, so fee_known ⇏ inputs-proven-present
+    // — unsafe to SELECT a template member on. fee_fold_proven is set ONLY by
+    // compute_fee_locked success (every vin priced from our own UTXO view /
+    // in-pool parent, in_sum >= out_sum, or an input-free type-9 with a
+    // well-formed explicit-fee payload). It is the ONE bit that proves BOTH
+    // invariant-1 "inputs available in our UTXO view" AND invariant-2 "fee is
+    // fold-exact, never overstated". The template selector gates on THIS, never
+    // on fee_known; fee_known stays the RELAY/index/stats predicate unchanged.
+    bool     fee_fold_proven{false};
     time_t   time_added{0};
+
+    uint64_t modified_fee() const { return fee + fee_delta; }
 
     double feerate_satvb() const {
         return (fee_known && base_size > 0)
@@ -115,6 +139,29 @@ struct MempoolEntry {
 /// is precisely how dashd shares CompareTxMemPoolEntryByAncestorFee between
 /// mapTx and mapModifiedTx (D1/D2). The struct and its operator< are
 /// identical either way; only the (fee, size) fed in differ.
+// dashcore CompareIteratorByHash / CTransaction::GetHash() tie-break order.
+//
+// The embedded uint256 is base_uint<256>, whose operator< delegates to
+// CompareTo(): an ARITHMETIC limb comparison, most-significant 32-bit limb
+// first. dashcore breaks every equal-feerate / equal-ancestor-count mining tie
+// with CTxMemPool::CompareIteratorByHash, i.e. uint256::operator< ==
+// base_blob::Compare == std::memcmp over the RAW (wire-serialized, little-
+// endian) hash bytes, byte 0 first. Those two orders differ, so using the
+// arithmetic operator< for the tie-break transposes adjacent equal-key txs vs
+// dashd and diverges the block tx-merkle root (the tx-serving ordering
+// residual). Reproduce dashd's memcmp exactly: compare the serialized bytes,
+// byte 0 (limb 0 LSB) first. Extraction is by shift, so it is identical on any
+// host endianness and matches the wire bytes dashd hashes.
+inline bool txid_oracle_less(const uint256& a, const uint256& b)
+{
+    for (int i = 0; i < 32; ++i) {
+        const uint8_t ba = static_cast<uint8_t>(a.pn[i >> 2] >> (8 * (i & 3)));
+        const uint8_t bb = static_cast<uint8_t>(b.pn[i >> 2] >> (8 * (i & 3)));
+        if (ba != bb) return ba < bb;
+    }
+    return false;
+}
+
 struct FeeKey {
     uint64_t fee;        // satoshi
     uint32_t base_size;  // serialized bytes (>0 for every indexed entry)
@@ -124,7 +171,7 @@ struct FeeKey {
         const double f1 = static_cast<double>(fee)   * o.base_size;
         const double f2 = static_cast<double>(o.fee) * base_size;
         if (f1 != f2) return f1 > f2;   // higher feerate first
-        return txid < o.txid;           // txid asc tiebreak (oracle-conformant)
+        return txid_oracle_less(txid, o.txid);   // dashd GetHash() memcmp tie-break
     }
 };
 
@@ -353,9 +400,66 @@ public:
     bool add_tx(const MutableTransaction& tx,
                 ::core::coin::UTXOViewCache* utxo)
     {
-        uint256 txid = dash_txid(tx);
-
         std::lock_guard<std::mutex> lock(m_mutex);
+        return add_tx_locked(tx, utxo, /*is_dstx=*/false);
+    }
+
+    /// W5-B: dashd's DSTX prioritisation delta — PrioritiseTransaction(hash,
+    /// COIN/10) fired by ValidateDSTX on every BLS-verified CoinJoin
+    /// broadcast tx BEFORE mempool acceptance (net_processing.cpp:3609).
+    static constexpr uint64_t DSTX_FEE_DELTA = 10'000'000;   // 0.1 COIN, duffs
+
+    /// W5-B: admit a BLS-VERIFIED CoinJoin broadcast tx. ONLY caller is
+    /// CoinStateMaintainer::on_new_dstx AFTER the operator-signature BLS gate
+    /// passed (fail-closed; see the sole-ingestion-path invariant above —
+    /// this is a second, explicitly-audited seam: structural validity was
+    /// checked at the P2P handler, the tx is a protocol-forced denominated
+    /// mixing tx, and finality/script arguments carry over from the same
+    /// dashd-relay source).
+    ///
+    /// Mirrors dashd's ORDER exactly: the delta is recorded BEFORE admission
+    /// (mapDeltas pre-dates and survives acceptance), then the tx is admitted
+    /// with fee=0 when inputs are unpriceable — reward-SAFE because a DSTX's
+    /// protocol shape (vin.size()==vout.size(), all-denominated outputs)
+    /// forces fee≈0, and even a hostile signed nonzero-fee DSTX only makes
+    /// total_fees UNDERSTATE ⇒ coinbase pays ≤ allowed ⇒ never an invalid
+    /// block. If compute_fee_locked CAN price it, the computed base fee is
+    /// kept. If the plain MSG_TX body arrived first (already pooled), the
+    /// delta is applied RETROACTIVELY — we converge on dashd's STATE (the
+    /// prioritised pool), not its message-order accident.
+    bool add_dstx(const MutableTransaction& tx,
+                  uint64_t fee_delta = DSTX_FEE_DELTA)
+    {
+        const uint256 txid = dash_txid(tx);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        record_fee_delta_locked(txid, fee_delta);
+        auto it = m_pool.find(txid);
+        if (it != m_pool.end()) {
+            // Retro-apply: re-key the feerate index under the new modified
+            // fee (every index site keys FeeKey{modified_fee(), size, txid}).
+            if (it->second.fee_delta != fee_delta) {
+                if (it->second.fee_known)
+                    m_feerate_index.erase(FeeKey{it->second.modified_fee(),
+                                                 it->second.base_size, txid});
+                it->second.fee_delta = fee_delta;
+                if (it->second.fee_known)
+                    m_feerate_index.insert(FeeKey{it->second.modified_fee(),
+                                                  it->second.base_size, txid});
+                LOG_INFO << "[MEMPOOL] dstx delta retro-applied txid="
+                         << txid.GetHex().substr(0, 16)
+                         << " delta=" << fee_delta;
+            }
+            return false;   // already known (same contract as add_tx)
+        }
+        return add_tx_locked(tx, m_utxo.load(), /*is_dstx=*/true);
+    }
+
+private:
+    bool add_tx_locked(const MutableTransaction& tx,
+                       ::core::coin::UTXOViewCache* utxo,
+                       bool is_dstx)
+    {
+        uint256 txid = dash_txid(tx);
         if (m_pool.count(txid)) return false;
 
         // #125 — REJECT ALREADY-CONFIRMED TRANSACTIONS AT ADMISSION.
@@ -427,8 +531,30 @@ public:
         auto packed      = ::pack(tx);
         entry.base_size  = static_cast<uint32_t>(packed.size());
         entry.time_added = std::time(nullptr);
+        // W5-B: a recorded prioritisation delta applies WHENEVER the tx is
+        // admitted, on either path (dashd mapDeltas semantics — the delta
+        // pre-dates and survives acceptance).
+        if (auto dit = m_fee_deltas.find(txid); dit != m_fee_deltas.end())
+            entry.fee_delta = dit->second;
 
         compute_fee_locked(entry, utxo);
+        // W5-B: a BLS-verified DSTX whose inputs the view cannot price is
+        // admitted at fee=0 (see add_dstx — understate-only, reward-safe);
+        // a priceable one keeps its computed base fee.
+        //
+        // EXCLUSION-DISCIPLINE: this FORCES fee_known=true so the DSTX rides
+        // the relay pool / feerate index, but it does NOT set fee_fold_proven
+        // — the fold could not vouch for these inputs (or priced in_sum <
+        // out_sum). So the template selector, which gates on fee_fold_proven,
+        // EXCLUDES this entry: an unpriceable DSTX collects no fee and never
+        // risks a lost block, while a fold-priceable DSTX (fee_known already
+        // true above) keeps fee_fold_proven=true and rides at its true base
+        // fee. This is the ONE in-tree hole the discipline closes.
+        if (is_dstx && !entry.fee_known) {
+            entry.fee = 0;
+            entry.fee_known = true;
+            // entry.fee_fold_proven deliberately stays false → template-excluded.
+        }
 
         // LRU eviction if over size cap.
         int evicted = 0;
@@ -452,9 +578,12 @@ public:
         // Feerate-sorted index (step 2) — only if fee was known.
         // Unknown-fee txs sit out of the sorted view until
         // recompute_unknown_fees() resolves them after a UTXO update.
-        // Uses negative feerate as the multimap key so begin() = best.
+        // Keyed by MODIFIED fee (W5-B) — every insert/erase site keys
+        // FeeKey{modified_fee(), size, txid}, one invariant; delta==0 for
+        // every non-DSTX entry keeps this byte-identical to the base key.
         if (stored.fee_known) {
-            m_feerate_index.insert(FeeKey{stored.fee, stored.base_size, txid});
+            m_feerate_index.insert(
+                FeeKey{stored.modified_fee(), stored.base_size, txid});
         }
 
         // Periodic stats — every 100 entries + first 5 + every eviction.
@@ -470,6 +599,22 @@ public:
         return true;
     }
 
+    /// W5-B: bounded mapDeltas (dashd CTxMemPool::mapDeltas). FIFO-evicted
+    /// beyond the cap (relay is untrusted input, same posture as the islock
+    /// maps); confirmed txids are pruned by remove_for_block.
+    void record_fee_delta_locked(const uint256& txid, uint64_t delta)
+    {
+        while (m_fee_delta_order.size() >= MAX_FEE_DELTAS
+               && !m_fee_delta_order.empty()) {
+            m_fee_deltas.erase(m_fee_delta_order.front());
+            m_fee_delta_order.pop_front();
+        }
+        auto [it, inserted] = m_fee_deltas.insert_or_assign(txid, delta);
+        (void)it;
+        if (inserted) m_fee_delta_order.push_back(txid);
+    }
+
+public:
     void remove_tx(const uint256& txid)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -525,6 +670,14 @@ public:
                     std::make_pair(vin.prevout.hash, vin.prevout.index));
             }
         }
+
+        // W5-B: a confirmed tx no longer needs its prioritisation delta
+        // (dashd also clears mapDeltas on block connect). Stale txids left
+        // in m_fee_delta_order are harmless — the FIFO eviction in
+        // record_fee_delta_locked erases them from the (already-pruned)
+        // map as it pops.
+        for (const auto& mtx : block.m_txs)
+            m_fee_deltas.erase(dash_txid(mtx));
 
         if (removed > 0 || conflicts > 0) {
             LOG_INFO << "[MEMPOOL] block cleanup removed=" << removed
@@ -641,6 +794,8 @@ public:
         m_islock_txids.clear();
         m_islock_txid_order.clear();
         m_last_islock_seen = 0;
+        m_fee_deltas.clear();
+        m_fee_delta_order.clear();
         m_total_bytes = 0;
     }
 
@@ -657,7 +812,8 @@ public:
         for (auto& [txid, entry] : m_pool) {
             if (entry.fee_known) continue;
             if (compute_fee_locked(entry, utxo)) {
-                m_feerate_index.insert(FeeKey{entry.fee, entry.base_size, txid});
+                m_feerate_index.insert(
+                    FeeKey{entry.modified_fee(), entry.base_size, txid});
                 resolved_fees += entry.fee;
                 ++resolved;
             } else {
@@ -854,9 +1010,17 @@ public:
         const AncState anc = build_anc_state_locked();
         std::set<FeeKey> anc_index;
         for (const auto& [txid, e] : m_pool) {
-            if (!e.fee_known) continue;
+            // EXCLUSION-DISCIPLINE: candidate ONLY if the fold proved the fee
+            // (inputs present in our view, in_sum >= out_sum). fee_known alone
+            // admits a DSTX force-priced at 0 on inputs the fold could not
+            // vouch for — a template MUST NOT select on that. delta==0 for
+            // every fee_fold_proven non-DSTX entry, so with no forced entries
+            // in the pool this loop is byte-identical to the fee_known form.
+            if (!e.fee_fold_proven) continue;
             if (anc.over_limit.count(txid)) continue;
-            anc_index.insert(anc_score_key(e.fee, e.base_size,
+            // W5-B: SCORE on the MODIFIED fee (dashd sorts on
+            // GetModFeesWithAncestors); delta==0 ⇒ byte-identical to base.
+            anc_index.insert(anc_score_key(e.modified_fee(), e.base_size,
                                            anc.modfee_wa.at(txid),
                                            anc.size_wa.at(txid), txid));
         }
@@ -1031,7 +1195,11 @@ public:
             uint64_t pkg_fees   = 0;
             uint32_t pkg_sigops = 0;
             for (const auto* e : package) {
-                if (!e->fee_known) { ok = false; break; }
+                // EXCLUSION-DISCIPLINE: a member is includable ONLY if its fee
+                // was fold-proven (inputs present + in_sum >= out_sum). A
+                // force-priced DSTX (fee_known, fee_fold_proven==false) drops
+                // its WHOLE package here — never packed, never a lost block.
+                if (!e->fee_fold_proven) { ok = false; break; }
                 if (exclude_special && e->tx.type != 0) { ok = false; break; }
 
                 // ── dashd TestPackageTransactions (node/miner.cpp:374-391),
@@ -1225,7 +1393,7 @@ public:
                         const auto& de = m_pool.at(desc);
                         ModEntry m;
                         m.txid          = desc;
-                        m.self_fee      = de.fee;
+                        m.self_fee      = de.modified_fee();   // scoring basis (W5-B)
                         m.self_size     = de.base_size;
                         m.mod_modfee_wa = anc.modfee_wa.at(desc);
                         m.mod_size_wa   = anc.size_wa.at(desc);
@@ -1234,8 +1402,8 @@ public:
                     } else {
                         mod_score.erase(mod_key(it->second));   // stale key out first (R2)
                     }
-                    it->second.mod_modfee_wa -= a->fee;         // update_for_parent_inclusion
-                    it->second.mod_size_wa   -= a->base_size;   // (miner.h:140-141)
+                    it->second.mod_modfee_wa -= a->modified_fee();  // update_for_parent_inclusion
+                    it->second.mod_size_wa   -= a->base_size;       // (miner.h:140-141; modified basis, W5-B)
                     mod_score.insert(mod_key(it->second));
                 }
             }
@@ -1264,6 +1432,12 @@ private:
     // FIFO posture as the outpoint map (relay is untrusted input).
     std::set<uint256>                                  m_islock_txids;
     std::deque<uint256>                                m_islock_txid_order;
+    // W5-B: dashd mapDeltas — txid → prioritisation delta (duffs), recorded
+    // pre-admission and applied on ANY later admission; bounded FIFO (relay
+    // is untrusted input), pruned on block confirm.
+    static constexpr size_t MAX_FEE_DELTAS = 10'000;
+    std::map<uint256, uint64_t>                        m_fee_deltas;
+    std::deque<uint256>                                m_fee_delta_order;
     // Feed-liveness tick (last add_islock wall time; 0 = never) — the hold's
     // ISLOCK_FEED_FRESH_SECS self-disarm reads this under m_mutex.
     time_t                                             m_last_islock_seen{0};
@@ -1439,12 +1613,12 @@ private:
                 if (memo != anc.end()) return memo->second;
                 std::set<uint256> acc;
                 auto it = m_pool.find(txid);
-                if (it != m_pool.end() && it->second.fee_known) {
+                if (it != m_pool.end() && it->second.fee_fold_proven) {
                     for (const auto& vin : it->second.tx.vin) {
                         const uint256& p = vin.prevout.hash;
                         auto pit = m_pool.find(p);
-                        if (pit == m_pool.end() || !pit->second.fee_known)
-                            continue;   // edge leaves the fee_known pool
+                        if (pit == m_pool.end() || !pit->second.fee_fold_proven)
+                            continue;   // edge leaves the fold-proven pool
                         acc.insert(p);
                         const auto& panc = closure(p);
                         acc.insert(panc.begin(), panc.end());
@@ -1454,15 +1628,22 @@ private:
             };
 
         for (const auto& [txid, e] : m_pool) {
-            if (!e.fee_known) continue;
+            // EXCLUSION-DISCIPLINE: ancestor aggregates + over_limit are built
+            // over fold-proven entries only, so a force-priced DSTX is invisible
+            // to scoring/ordering exactly as it is to selection. With no forced
+            // entries this is byte-identical to the fee_known form.
+            if (!e.fee_fold_proven) continue;
             const auto& a = closure(txid);
             uint32_t cnt = static_cast<uint32_t>(a.size()) + 1;
             uint64_t szf = e.base_size;
-            uint64_t mff = e.fee;
+            // W5-B: modfee_wa IS dashd's nModFeesWithAncestors — MODIFIED
+            // fees (base + delta). Base-fee accounting (total_fees /
+            // SelectedTx.fee) never reads these aggregates.
+            uint64_t mff = e.modified_fee();
             for (const auto& at : a) {
                 const auto& ae = m_pool.at(at);
                 szf += ae.base_size;
-                mff += ae.fee;
+                mff += ae.modified_fee();
             }
             st.count_wa[txid]  = cnt;
             st.size_wa[txid]   = static_cast<uint32_t>(szf);
@@ -1488,7 +1669,7 @@ private:
                       uint32_t ca = ia != anc.count_wa.end() ? ia->second : 1;
                       uint32_t cb = ib != anc.count_wa.end() ? ib->second : 1;
                       if (ca != cb) return ca < cb;
-                      return a->txid < b->txid;
+                      return txid_oracle_less(a->txid, b->txid);
                   });
     }
 
@@ -1511,9 +1692,11 @@ private:
             }
         }
 
-        // Drop from feerate index (only present if fee was known).
+        // Drop from feerate index (only present if fee was known). Same
+        // modified-fee key every insert site used (single invariant, W5-B).
         if (it->second.fee_known) {
-            m_feerate_index.erase(FeeKey{it->second.fee, it->second.base_size, txid});
+            m_feerate_index.erase(FeeKey{it->second.modified_fee(),
+                                         it->second.base_size, txid});
         }
 
         // Drop from spent-outputs index.
@@ -1557,15 +1740,20 @@ private:
                                                   payload)) {
                 entry.fee = payload.fee;
                 entry.fee_known = true;
+                // Explicit, exact miner fee from the DIP-0027 payload (no UTXO
+                // fold needed, never overstated) → fold-proven for selection.
+                entry.fee_fold_proven = true;
                 return true;
             }
             entry.fee_known = false;
+            entry.fee_fold_proven = false;
             entry.fee = 0;
             return false;
         }
 
         if (!utxo) {
             entry.fee_known = false;
+            entry.fee_fold_proven = false;
             return false;
         }
         uint64_t in_sum = 0, out_sum = 0;
@@ -1585,6 +1773,7 @@ private:
                 continue;
             }
             entry.fee_known = false;
+            entry.fee_fold_proven = false;
             entry.fee = 0;
             return false;
         }
@@ -1592,14 +1781,21 @@ private:
             out_sum += static_cast<uint64_t>(vout.value);
         }
         if (in_sum < out_sum) {
-            // Negative fee — invalid tx; mark unknown so we don't
-            // poison block templates with garbage values.
+            // Negative fee — invalid tx (spends more than its inputs hold);
+            // mark unknown so we don't poison block templates with garbage
+            // values. fee_fold_proven stays false → template-excluded even if
+            // a DSTX force later flips fee_known (the money-creating hole).
             entry.fee_known = false;
+            entry.fee_fold_proven = false;
             entry.fee = 0;
             return false;
         }
         entry.fee = in_sum - out_sum;
         entry.fee_known = true;
+        // Every vin priced from our own UTXO view / in-pool parent and
+        // in_sum >= out_sum → the fee is fold-exact and inputs are proven
+        // present. This is the ONE bit the template selector trusts.
+        entry.fee_fold_proven = true;
         return true;
     }
 };

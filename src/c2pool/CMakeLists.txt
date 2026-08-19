@@ -337,6 +337,30 @@ target_link_libraries(c2pool-dash
     ${Boost_LIBRARIES}
 )
 
+# KAT: pre-anchor header-backfill PARALLEL GETHEADERS WINDOW (extends #1263 /
+# task #151; base PR #1278). Drives the real BulkFetchLane header lane against a
+# scripted peer set: RED (window=1, no disconnect) serializes/wedges on a silent
+# peer; GREEN (window=N + event refill + disconnect-and-redial) completes. Links
+# the same DASH library set as c2pool-dash (header lane pulls block_producer /
+# header_chain / x11 / block-replay; BLS carried for the shared object graph).
+add_executable(dash_hdr_backfill_window_kat dash_hdr_backfill_window_kat.cpp)
+target_link_libraries(dash_hdr_backfill_window_kat
+    core pool sharechain
+    c2pool_node_enhanced
+    dash
+    c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
+    dash_x11
+    dash_rpc
+    dash_stratum
+    dash_block_replay
+    dash_bls_verify
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+)
+add_test(NAME dash_hdr_backfill_window_kat COMMAND dash_hdr_backfill_window_kat)
+
 # Windows: Boost.Asio requires Winsock libraries; /bigobj for large translation units
 if(WIN32)
     target_link_libraries(c2pool ws2_32 mswsock bcrypt dbghelp)

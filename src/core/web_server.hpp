@@ -28,6 +28,7 @@
 #include <core/mining_node_interface.hpp>
 #include <core/address_validator.hpp>
 #include <core/hashrate_ring.hpp>
+#include <core/featured_node.hpp>
 #include <core/stratum_types.hpp>
 #include <core/stratum_work_source.hpp>
 #include <c2pool/payout/payout_manager.hpp>
@@ -484,6 +485,24 @@ public:
     // Load transition message blobs from a directory (*.hex files).
     // Decrypts and caches messages for display in the transition banner.
     void load_transition_blobs(const std::string& dir_path);
+
+    // ── Featured developer-node banner (signed authority subtype 0x06) ──
+    // Consensus-neutral service/presentation feature: freshest-wins over a
+    // monotonic signed seq, replay-protected, persisted across restarts.
+    // All ingestion is downstream of authority verification; deleting this
+    // block cannot affect a single share, target, or payout.
+    void set_featured_node_state_path(const std::string& path) { m_featured_node.set_path(path); }
+    void load_featured_node_state() { m_featured_node.load(); }
+    bool apply_featured_node_message(uint64_t seq, uint32_t timestamp,
+                                     const std::string& payload_json,
+                                     const std::string& signer_pubkey_hex) {
+        return m_featured_node.apply(seq, timestamp, payload_json, signer_pubkey_hex);
+    }
+    // Verify (MAC+ECDSA+pinned-pubkey) an authority blob, then apply any
+    // MSG_FEATURED_NODE messages it carries. Forged/unsigned/wrong-key/
+    // tampered blobs are rejected here and never reach the seq comparator.
+    void scan_blob_for_featured_node(const std::vector<unsigned char>& blob);
+    nlohmann::json featured_node_json() const { return m_featured_node.emit(); }
 
     // Hook: expose decoded protocol messages (e.g. from current best share)
     // through API methods for dashboard/monitoring clients.
@@ -1228,6 +1247,11 @@ private:
     // Cached transition messages loaded from blob files at startup.
     nlohmann::json m_cached_transition_message;        // null or {msg,url,urgency,...}
     nlohmann::json m_cached_authority_announcements;   // array of announcements
+
+    // Featured developer-node banner store (signed subtype 0x06, freshest-wins).
+    // Pure presentation state — see featured_node.hpp for the consensus-neutral
+    // contract. Read/written only by web_server featured-node code.
+    core::FeaturedNodeStore m_featured_node;
 
     // Coinbase scriptSig customization
     std::string m_coinbase_text;  // empty = "/c2pool/" default tag
