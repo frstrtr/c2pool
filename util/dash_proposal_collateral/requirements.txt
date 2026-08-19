@@ -1,0 +1,5 @@
+bip_utils>=2.9
+coincurve>=19
+# fallback if coincurve is unavailable:
+# ecdsa>=0.19
+pytest>=8
