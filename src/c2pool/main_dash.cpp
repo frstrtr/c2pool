@@ -6164,6 +6164,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     [cp](const uint256& block_hash) {
                         cp->send_getmnlistd_reask(uint256::ZERO, block_hash);
                     });
+                // WALL-CLOCK STALL SIGNAL (dashd TipMayBeStale ->
+                // SetTryNewOutboundPeer). The lane's watchdog tick raises this
+                // while a bridging getmnlistd is frozen unanswered so the pool
+                // expands its dial target past 8 and rotates the silent carrier
+                // — even when the header tip is itself stalled and the
+                // tip-driven re-ask never fires. Reward-safe: dial-count only.
+                mn_ckpt_lane->set_stateful_stall_fn(
+                    [cp](bool stalled) {
+                        cp->note_stateful_stall(stalled);
+                    });
                 // DEMUX (reward-critical): the reply comes back on the SAME
                 // mnlistdiff message the tip sync uses. Routed here it is
                 // consumed as historical and the LIVE tip SML is never

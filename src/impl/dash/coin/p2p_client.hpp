@@ -728,6 +728,15 @@ private:
     // DIFFERENT carrier so it actually fans out.
     std::size_t  m_stateful_rr{0};
     std::string  m_last_stateful_peer;
+    // dashd TipMayBeStale/SetTryNewOutboundPeer analog for the STATEFUL leg: a
+    // bridging getmnlistd (fold / ondemand-mnlist) that the mn-ckpt lane has
+    // found outstanding past its wall-clock re-ask grace. While set,
+    // outbound_behind() is true so effective_max_peers() expands and refill/
+    // rotation dials past the base pool to reach a peer that will answer —
+    // exactly as dashd opens an extra OUTBOUND_FULL_RELAY when it falls behind.
+    // Set/cleared every lane watchdog tick via note_stateful_stall(), so it
+    // self-clears the moment the leg is served. Dial-count only.
+    bool         m_stateful_stall{false};
     // The peer select_block_peer() last sent a block getdata to, so
     // request_block_tracked() arms the watchdog against the peer actually
     // asked (not an unrelated primary).
@@ -1803,6 +1812,14 @@ public:
         send_getmnlistd_rotating(base_block_hash, block_hash);
     }
 
+    /// dashd SetTryNewOutboundPeer for the STATEFUL leg. The mn-ckpt lane's
+    /// wall-clock watchdog calls this TRUE while a bridging getmnlistd has been
+    /// unanswered past its grace and FALSE once it is served, raising/clearing
+    /// the outbound-behind expansion signal so the pool acquires a peer that
+    /// will answer instead of pinning at its base target on a silent carrier.
+    /// Reward-safe: dial-count only, the applied list is untouched.
+    void note_stateful_stall(bool stalled) { m_stateful_stall = stalled; }
+
     /// Send a getqrinfo (DIP-24 quorum-rotation-info request) — the ROTATED
     /// counterpart of send_getmnlistd above. An EMPTY baseBlockHashes asks for
     /// FULL (base=ZERO) mnlistdiffs at every cycle height, which is what the
@@ -2439,9 +2456,14 @@ private:
         return n;
     }
 
-    /// Behind on archival coverage ⇒ a demonstrated non-server occupies a slot.
+    /// Behind on archival coverage ⇒ a demonstrated non-server occupies a slot,
+    /// OR a bridging getmnlistd (fold / ondemand-mnlist) is stalled unanswered
+    /// (dashd opens an extra outbound in BOTH cases). The stall arm is what
+    /// makes a frozen ondemand-mnlist expand the pool without waiting for the
+    /// carrier to accumulate block-body strikes.
     bool outbound_behind() const
-    { return m_outbound_rotate_enabled && pool_demoted_count() > 0; }
+    { return m_outbound_rotate_enabled
+             && (pool_demoted_count() > 0 || m_stateful_stall); }
 
     /// dashd GetExtraFullOutboundCount analog: the dial target, RAISED while we
     /// are behind so refill dials MORE fresh candidates to reach archival
