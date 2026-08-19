@@ -1595,3 +1595,256 @@ TEST(DashReplayFoldOperatorSplit, PartialOperatorRewardMissingOwnerScriptPoisons
     ASSERT_FALSE(r.ok) << "partial split with no owner output MUST poison";
     EXPECT_NE(r.error.find("PAYEE MISMATCH"), std::string::npos) << r.error;
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// INCREMENTAL SML MERKLE-ROOT KATs
+//
+// The incremental root (per-proTxHash CalcHash cache + cached merkle tree,
+// hybrid path/rebuild — replay_fold_engine.hpp compute_sml_root) MUST equal
+// the cache-independent full recompute (compute_sml_root_full) at EVERY
+// block, and the fold self-check MUST still poison when the incremental path
+// is wrong. The whole existing synthetic + real suite above already folds
+// through the incremental path (every self-check passes only if incremental
+// == committed); these add the EXPLICIT incremental == full equality and the
+// missed-invalidation poison property.
+// ════════════════════════════════════════════════════════════════════════
+
+// Root-axis-isolating config: folds enabled from h=1, payee cross-check OFF
+// (enforcement height pushed above every test height) so the UNCONDITIONAL
+// merkleRootMNList self-check is the only thing under test — no coinbase
+// payout scaffolding needed. v19/mn_rr on from h=1 like synth_cfg.
+static FoldConfig inc_cfg()
+{
+    FoldConfig cfg;
+    cfg.enabled = true;
+    cfg.gates.dip0003_height             = 1;
+    cfg.gates.dip0003_enforcement_height = 100000000; // payee axis dormant
+    cfg.gates.v19_height                 = 1;
+    cfg.gates.mn_rr_height               = 1;
+    return cfg;
+}
+
+static MutableTransaction spend_collateral_tx(const TxPrevOut& outpoint)
+{
+    MutableTransaction spend;
+    spend.version = 1;
+    TxIn in;
+    in.prevout  = outpoint;
+    in.sequence = 0xffffffff;
+    spend.vin.push_back(in);
+    return spend;
+}
+
+// A multi-block window that exercises, with the incremental root proven equal
+// to the full recompute AND to an independently hand-built root at each step:
+//   • ProRegTx add (h=101, h=102) — new leaves shift sorted positions
+//   • ProUpRevTx revoke (h=103)   — ResetOperatorFields + ban → isValid false
+//   • ProUpRegTx operator-key change (h=104) — reset + ban + new keys
+//   • collateral spend remove (h=105, h=106) — leaves shift again
+TEST(DashReplayFoldIncremental, WindowIncrementalEqualsFullEqualsHandBuilt)
+{
+    DmlFoldEngine eng(inc_cfg());
+    eng.seed({}, 0, 100, raw256(9));
+    EXPECT_EQ(eng.compute_sml_root(), eng.compute_sml_root_full());
+    EXPECT_EQ(eng.compute_sml_root(), uint256::ZERO); // empty list
+
+    // ── h=101: register a, b, c ─────────────────────────────────────────
+    auto pa = make_proreg(1), pb = make_proreg(2), pc = make_proreg(3);
+    auto txa = make_special_tx(1, pa, 1);
+    auto txb = make_special_tx(1, pb, 2);
+    auto txc = make_special_tx(1, pc, 3);
+    const uint256 ha = tx_hash_of(txa), hb = tx_hash_of(txb), hc = tx_hash_of(txc);
+    CSimplifiedMNListEntry ea = expected_entry_of(pa, ha);
+    CSimplifiedMNListEntry eb = expected_entry_of(pb, hb);
+    CSimplifiedMNListEntry ec = expected_entry_of(pc, hc);
+    uint256 root1 = root_of({ea, eb, ec});
+    {
+        auto r = eng.fold_block(make_block(101, raw256(9), root1, {txa, txb, txc}),
+                                101);
+        ASSERT_TRUE(r.ok) << r.error;
+        EXPECT_EQ(r.computed_root, root1);
+        EXPECT_EQ(eng.compute_sml_root(), eng.compute_sml_root_full());
+        EXPECT_EQ(eng.compute_sml_root(), root1);
+    }
+
+    // ── h=102: register d, e (positions shift) ──────────────────────────
+    auto pd = make_proreg(4), pe = make_proreg(5);
+    auto txd = make_special_tx(1, pd, 4);
+    auto txe = make_special_tx(1, pe, 5);
+    const uint256 hd = tx_hash_of(txd), he = tx_hash_of(txe);
+    CSimplifiedMNListEntry ed = expected_entry_of(pd, hd);
+    CSimplifiedMNListEntry ee = expected_entry_of(pe, he);
+    uint256 root2 = root_of({ea, eb, ec, ed, ee});
+    {
+        auto r = eng.fold_block(make_block(102, raw256(10), root2, {txd, txe}), 102);
+        ASSERT_TRUE(r.ok) << r.error;
+        EXPECT_EQ(r.computed_root, root2);
+        EXPECT_EQ(eng.compute_sml_root(), eng.compute_sml_root_full());
+        EXPECT_EQ(eng.compute_sml_root(), root2);
+    }
+
+    // ── h=103: ProUpRevTx revoke c → reset + ban (isValid flips false) ──
+    CProUpRevTx rev;
+    rev.nVersion  = ProTxVersion::BASIC_BLS;
+    rev.proTxHash = hc;
+    rev.nReason   = CProUpRevTx::REASON_COMPROMISED_KEYS;
+    auto revtx = make_special_tx(4, rev, 6);
+    CSimplifiedMNListEntry ec2;                 // hand-built revoked entry
+    ec2.nVersion     = ProTxVersion::LEGACY_BLS; // ResetOperatorFields floor
+    ec2.proRegTxHash = hc;
+    ec2.keyIDVoting  = pc.keyIDVoting;
+    ec2.isValid      = false;
+    uint256 root3 = root_of({ea, eb, ec2, ed, ee});
+    {
+        auto r = eng.fold_block(make_block(103, raw256(11), root3, {revtx}), 103);
+        ASSERT_TRUE(r.ok) << r.error;
+        EXPECT_EQ(r.revoked, 1u);
+        EXPECT_EQ(r.computed_root, root3);
+        EXPECT_EQ(eng.compute_sml_root(), eng.compute_sml_root_full());
+        EXPECT_EQ(eng.compute_sml_root(), root3);
+    }
+
+    // ── h=104: ProUpRegTx operator-key change on a → reset + ban + keys ─
+    CProUpRegTx upr;
+    upr.nVersion       = ProTxVersion::BASIC_BLS;
+    upr.proTxHash      = ha;
+    upr.pubKeyOperator = seq_array<48>(0xB0);
+    upr.keyIDVoting    = raw160(0xB4);
+    upr.scriptPayout.m_data = script_bytes(0xB8);
+    upr.vchSig.assign(8, 0xB);
+    auto uprtx = make_special_tx(3, upr, 7);
+    CSimplifiedMNListEntry ea2;                  // hand-built key-changed entry
+    ea2.nVersion       = ProTxVersion::BASIC_BLS; // never downgraded below basic
+    ea2.proRegTxHash   = ha;
+    ea2.netAddress     = {};                      // reset empties netInfo
+    ea2.netPort        = 0;
+    ea2.pubKeyOperator = upr.pubKeyOperator;
+    ea2.keyIDVoting    = upr.keyIDVoting;
+    ea2.isValid        = false;                   // banned until a ProUpServTx
+    ea2.nType          = MnType::REGULAR;
+    uint256 root4 = root_of({ea2, eb, ec2, ed, ee});
+    {
+        auto r = eng.fold_block(make_block(104, raw256(12), root4, {uprtx}), 104);
+        ASSERT_TRUE(r.ok) << r.error;
+        EXPECT_EQ(r.banned, 1u);
+        EXPECT_EQ(r.computed_root, root4);
+        EXPECT_EQ(eng.compute_sml_root(), eng.compute_sml_root_full());
+        EXPECT_EQ(eng.compute_sml_root(), root4);
+    }
+
+    // ── h=105: collateral-spend e (remove; positions shift) ─────────────
+    {
+        auto spend = spend_collateral_tx(pe.collateralOutpoint);
+        uint256 root5 = root_of({ea2, eb, ec2, ed});
+        auto r = eng.fold_block(make_block(105, raw256(13), root5, {spend}), 105);
+        ASSERT_TRUE(r.ok) << r.error;
+        EXPECT_EQ(r.collateral_spent, 1u);
+        EXPECT_EQ(eng.find(he), nullptr);
+        EXPECT_EQ(r.computed_root, root5);
+        EXPECT_EQ(eng.compute_sml_root(), eng.compute_sml_root_full());
+        EXPECT_EQ(eng.compute_sml_root(), root5);
+    }
+
+    // ── h=106: collateral-spend a (remove the banned, key-changed leaf) ─
+    {
+        auto spend = spend_collateral_tx(pa.collateralOutpoint);
+        uint256 root6 = root_of({eb, ec2, ed});
+        auto r = eng.fold_block(make_block(106, raw256(14), root6, {spend}), 106);
+        ASSERT_TRUE(r.ok) << r.error;
+        EXPECT_EQ(r.collateral_spent, 1u);
+        EXPECT_EQ(eng.find(ha), nullptr);
+        EXPECT_EQ(r.computed_root, root6);
+        EXPECT_EQ(eng.compute_sml_root(), eng.compute_sml_root_full());
+        EXPECT_EQ(eng.compute_sml_root(), root6);
+    }
+}
+
+// Real mainnet, large N (~2972 / ~4900): the incremental root equals the full
+// recompute across the case-D PoSe BAN (isValid flip false) at h=2516412 and
+// the REVIVE (isValid flip true) + confirmedHash + quiet sequence at
+// h=2516756..2516760 — the demanding window the port targets.
+TEST(DashReplayFoldIncremental, RealCaseDBanIncrementalEqualsFull)
+{
+    auto fx  = parse_prestate(kDashReplayPrestate2516411);
+    auto eng = seed_from_fixture(fx);
+    EXPECT_EQ(eng.compute_sml_root(), eng.compute_sml_root_full());
+
+    auto qf = parse_quorum(kDashReplayQuorum2516412);
+    const uint256 quorum_hash = from_display(qf.quorum_hash_display.c_str());
+    eng.set_members_fn([&](uint8_t llmq_type, const uint256& qh)
+                           -> std::optional<std::vector<uint256>> {
+        if (llmq_type == qf.llmq_type && qh == quorum_hash) return qf.members;
+        return std::nullopt;
+    });
+
+    auto blk = parse_block(kDashReplayBlock2516412);
+    auto r   = eng.fold_block(blk, 2516412);
+    ASSERT_TRUE(r.ok) << r.error;
+    EXPECT_EQ(r.banned, 1u);
+    EXPECT_EQ(r.computed_root.GetHex(), kRoot2516412);
+    EXPECT_EQ(eng.compute_sml_root(), eng.compute_sml_root_full());
+    EXPECT_EQ(eng.compute_sml_root().GetHex(), kRoot2516412);
+}
+
+TEST(DashReplayFoldIncremental, RealReviveAndQuietSequenceIncrementalEqualsFull)
+{
+    auto fx  = parse_prestate(kDashReplayPrestate2516755);
+    auto eng = seed_from_fixture(fx);
+    EXPECT_EQ(eng.compute_sml_root(), eng.compute_sml_root_full());
+
+    auto r = eng.fold_block(parse_block(kDashReplayBlock2516756), 2516756);
+    ASSERT_TRUE(r.ok) << r.error;
+    EXPECT_EQ(r.revived, 1u);
+    EXPECT_EQ(r.computed_root.GetHex(), kRoot2516756);
+    EXPECT_EQ(eng.compute_sml_root(), eng.compute_sml_root_full());
+
+    const char* seq[] = {kDashReplayBlock2516757, kDashReplayBlock2516758,
+                         kDashReplayBlock2516759, kDashReplayBlock2516760};
+    uint32_t h = 2516757;
+    for (const char* bh : seq) {
+        auto rr = eng.fold_block(parse_block(bh), h);
+        ASSERT_TRUE(rr.ok) << "h=" << h << ": " << rr.error;
+        EXPECT_EQ(eng.compute_sml_root(), eng.compute_sml_root_full()) << "h=" << h;
+        EXPECT_EQ(rr.computed_root.GetHex(), kRoot2516756) << "h=" << h;
+        ++h;
+    }
+}
+
+// POISON: a deliberately-wrong incremental invalidation (a mutation that
+// changed an entry's SML fields but failed to mark its proTxHash dirty) makes
+// compute_sml_root() return a STALE root; the self-check then MISMATCHES the
+// committed cbTx root and HARD-STOPS. Proves the incremental path can never
+// silently serve a wrong list — a missed invalidation is fail-CLOSED.
+TEST(DashReplayFoldIncremental, MissedInvalidationPoisonsAtSelfCheck)
+{
+    auto fx  = parse_prestate(kDashReplayPrestate2516755);
+    auto eng = seed_from_fixture(fx);
+    ASSERT_TRUE(eng.fold_block(parse_block(kDashReplayBlock2516756), 2516756).ok);
+    EXPECT_EQ(eng.compute_sml_root().GetHex(), kRoot2516756);
+
+    // Pick a long-confirmed MN (confirmedHash already set ⇒ pass 1 will not
+    // re-mark it, and the quiet block 2516757 does not otherwise touch it).
+    uint256 victim;
+    for (const auto& [protx, st] : eng.entries()) {
+        if (!st.confirmedHash.IsNull()) { victim = protx; break; }
+    }
+    ASSERT_FALSE(victim.IsNull());
+
+    // Simulate the missed invalidation.
+    eng.test_only_corrupt_incremental_cache(victim);
+
+    // The incremental root now diverges from the truth (full recompute).
+    EXPECT_NE(eng.compute_sml_root(), eng.compute_sml_root_full());
+
+    // Folding the next (correct) block: the stale incremental root != the
+    // block's committed cbTx root ⇒ HARD STOP, engine poisoned.
+    auto r = eng.fold_block(parse_block(kDashReplayBlock2516757), 2516757);
+    EXPECT_FALSE(r.ok);
+    EXPECT_TRUE(eng.poisoned());
+    EXPECT_NE(r.error.find("ROOT MISMATCH"), std::string::npos) << r.error;
+
+    // Sticky: no further fold is accepted after poison.
+    auto r2 = eng.fold_block(parse_block(kDashReplayBlock2516758), 2516758);
+    EXPECT_FALSE(r2.ok);
+    EXPECT_NE(r2.error.find("POISONED"), std::string::npos) << r2.error;
+}
