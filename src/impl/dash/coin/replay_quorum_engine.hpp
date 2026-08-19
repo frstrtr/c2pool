@@ -660,6 +660,18 @@ struct QuorumReplayConfig {
     /// testnet 905100. Observation below refuses — pre-V20 modifier eras
     /// are Phase-2 work, fail closed, never guessed.
     uint32_t    v20_floor{1'987'776u};
+    /// DEPLOYMENT_V19 activation (chainparams.cpp / llmq/utils.cpp
+    /// IsV19Active): mainnet 1899072, testnet 850100. dashd's
+    /// GetAllQuorumMembers restricts the platform LLMQ (mainnet
+    /// LLMQ_100_67 type 4, testnet type 6) to EvoNodes ONLY once v19 is
+    /// active; BEFORE v19 the platform quorum draws members from ALL
+    /// confirmed+valid MNs (no Evo MNs exist yet). The early producer
+    /// gates evo_only on this height exactly as dashd does
+    /// (EvoOnly = isPlatform && IsV19Active(baseIndex)); without the gate
+    /// the pre-v19 platform quorum is EMPTY and its PoSe punishes are
+    /// silently dropped — the h=1516043 divergence class (first type-4 DKG
+    /// at DIP0020 h=1516032 through v19).
+    uint32_t    v19_activation{1'899'072u};
     /// Retention for derived per-cycle state (members / snapshots /
     /// modifiers / block-hash window), in blocks behind the cursor. Must
     /// cover 3 rotated cycles + the longest mining window; the default is
@@ -1073,10 +1085,22 @@ public:
 
             const uint256 modifier = vendor::compute_quorum_modifier(
                 p.type, base_height, /*best_cl_sig=*/std::nullopt, base_hash);
-            const bool evo_only =
+            // dashd llmq/utils.cpp GetAllQuorumMembers:
+            //   EvoOnly = isPlatform && IsV19Active(pQuorumBaseBlockIndex)
+            // The platform quorum is Evo-restricted ONLY from v19 on. Before
+            // v19 (this early era runs [DIP0003, v20_floor)) it draws from ALL
+            // confirmed+valid MNs, exactly like every other non-rotated type.
+            // The UNCONDITIONAL evo_only here dropped the entire pre-v19
+            // platform member set (no Evo MNs exist until h~=1899072), so its
+            // qfcommit PoSe punishes were silently skipped and a double-punish
+            // ban (h=1516043) never flipped isValid — folded merkleRootMNList
+            // then diverged from the committed root. Gate it as dashd does.
+            const bool is_platform_type =
                 (m_cfg.network == LlmqNetwork::Mainnet
                      ? p.type == vendor::kLlmqTypePlatformMainnet
                      : p.type == vendor::kLlmqTypePlatformTestnet);
+            const bool evo_only =
+                is_platform_type && base_height >= m_cfg.v19_activation;
             std::string err;
             auto members = compute_nonrotated_members(
                 p, evo_only, list_at_base, modifier, &err);

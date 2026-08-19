@@ -942,7 +942,16 @@ if (BUILD_TESTING AND GTest_FOUND)
         # set-membership test got wrong. Folded into this target per the same
         # #769 rule as the leaves above (the push bot cannot add a build.yml
         # --target, so a standalone executable would be a NOT_BUILT sentinel).
-        test_dash_mempool_validity_gate.cpp)
+        test_dash_mempool_validity_gate.cpp
+        # test_dash_replay_v19_type4_punish.cpp: the h=1516043 divergence class
+        # (replay_quorum_engine.hpp produce_early_nonrotated_members) — the
+        # pre-v19 PLATFORM quorum (LLMQ_100_67) must draw from ALL confirmed+
+        # valid MNs, not evo-only; the double-PoSe-punish ban of 86f863af folds
+        # to dashd's committed merkleRootMNList 028ef00b… at 1516043. Reads the
+        # real mnlistdiff fixture (dash_mainnet_mnlistdiff_1516032.bin) via the
+        # same DASH_FIXTURE_DIR path as the from-wire root-parity leaf, and is
+        # folded into this target for the same #769 NOT_BUILT reason.
+        test_dash_replay_v19_type4_punish.cpp)
     target_compile_definitions(test_dash_embedded_gbt PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_embedded_gbt PRIVATE

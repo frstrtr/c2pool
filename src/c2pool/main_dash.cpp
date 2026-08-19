@@ -6276,6 +6276,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             ? dash::coin::LlmqNetwork::Testnet
                             : dash::coin::LlmqNetwork::Mainnet;
                         if (testnet) qcfg.v20_floor = 905'100u;
+                        qcfg.v19_activation = testnet ? 850'100u : 1'899'072u;
                         mn_bridge_quorum_engine =
                             std::make_unique<rq::QuorumReplayEngine>(qcfg);
                         mn_bridge_quorum_engine->seed_cursor(
@@ -7030,6 +7031,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         ? dash::coin::LlmqNetwork::Testnet
                         : dash::coin::LlmqNetwork::Mainnet;
                     if (testnet) qcfg.v20_floor = 905'100u;
+                    qcfg.v19_activation = testnet ? 850'100u : 1'899'072u;
                     replay_quorum_engine =
                         std::make_unique<rp::QuorumReplayEngine>(qcfg);
                     replay_quorum_engine->seed_cursor(

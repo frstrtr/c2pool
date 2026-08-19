@@ -1394,6 +1394,27 @@ private:
                  + " for quorumHash "
                  + qc.commitment.quorumHash.GetHex().substr(0, 16);
 
+        // dashd HARDENING (h=1516043 divergence class): a MINED commitment
+        // never has an empty member set — GetAllQuorumMembers always returns
+        // params.size members for a quorum that produced a commitment. An
+        // EMPTY member set that still carries invalid-marked members is
+        // therefore a DERIVATION defect (the pre-v19 platform-quorum bug that
+        // drew evo_only members and got none), not a benign thin list: the
+        // punishes those invalid bits demand would be silently skipped and the
+        // folded merkleRootMNList would diverge from the committed root. Fail
+        // CLOSED here rather than fold a knowingly-incomplete punish pass.
+        // (The all-valid commitment already returned above, so reaching here
+        // with an empty member set means punishes were owed and dropped.)
+        if (members->empty())
+            return "quorum member set is EMPTY for a commitment carrying "
+                   "invalid-marked members (llmqType="
+                 + std::to_string(int(qc.commitment.llmqType))
+                 + " quorumHash="
+                 + qc.commitment.quorumHash.GetHex().substr(0, 16)
+                 + ") — the member derivation dropped the whole set (pre-v19 "
+                   "platform-quorum evo_only defect class); failing closed so "
+                   "the dropped PoSe punishes cannot silently diverge the root";
+
         // HandleQuorumCommitment (specialtxman.cpp:159-174): punish every
         // invalid-marked member still present in the list.
         for (size_t i = 0; i < members->size(); ++i) {
