@@ -21,8 +21,9 @@ daemonless-finalize item below.
 
 ## Governance
 
-Daemonless-Dash finalization is funded through Dash on-chain governance.
-Masternode operators can vote on the c2pool-daemonless-finalize proposal.
+Daemonless-Dash finalization has a funding proposal in Dash on-chain governance.
+The c2pool-daemonless-finalize proposal is in its voting phase; masternode
+operators can vote on it before the next superblock.
 
 - DashCentral: https://www.dashcentral.org/p/c2pool-daemonless-finalize
 - Governance object: fa758340f1bd2391d17bb43667f76c5d9070d737b68e018e42ed75b09c6ba631
