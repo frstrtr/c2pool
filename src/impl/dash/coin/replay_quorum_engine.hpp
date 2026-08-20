@@ -131,6 +131,13 @@
 #include <utility>
 #include <vector>
 
+// Feature-detection for the DIP0024 rotated pre-V20 bootstrap fold (split
+// floor + bootstrap base case + V19 skipRemovedMNs gate). KATs that reference
+// the skip_removed_mns parameter of build_new_quarter_members / of
+// compute_rotation_cycle guard on this so the same test TU still compiles
+// against a tree that predates the change (red-on-master demonstration).
+#define DASH_ROTATED_PREV20_BOOTSTRAP 1
+
 namespace dash {
 namespace coin {
 namespace replay {
@@ -416,7 +423,8 @@ struct NewQuarterOutput {
 inline std::optional<NewQuarterOutput> build_new_quarter_members(
     size_t num_quorums, size_t quarter_size,
     const std::vector<QuorumMnEntry>& work_list, const uint256& modifier,
-    const std::array<std::vector<std::vector<MnRef>>, 3>& previous_quarters)
+    const std::array<std::vector<std::vector<MnRef>>, 3>& previous_quarters,
+    bool skip_removed_mns = true)
 {
     NewQuarterOutput out;
     out.quarters.assign(num_quorums, {});
@@ -425,9 +433,15 @@ inline std::optional<NewQuarterOutput> build_new_quarter_members(
     for (const auto& e : work_list) if (e.is_valid) ++enabled;
 
     // MnsUsedAtH (union across quorum indexes, PREVIOUS quarters only) +
-    // MnsUsedAtHIndexed[i]. AddMN keeps the FIRST insertion; post-V19
-    // upstream drops members no longer in the H list (skipRemovedMNs — this
-    // engine only serves post-V20, so always true) and PoSe-banned ones.
+    // MnsUsedAtHIndexed[i]. AddMN keeps the FIRST insertion. skipRemovedMNs
+    // (dashd utils.cpp:363-386) is a V19 gate:
+    //   * post-V19 (skip_removed_mns=true): a previous-quarter member no longer
+    //     in the H list is DROPPED (!allMns.HasMN => continue); a member still
+    //     present but PoSe-banned is dropped (allMns.IsMNPoSeBanned).
+    //   * pre-V19 (skip_removed_mns=false, v18.2.2 ground truth — the DIP0024
+    //     bootstrap window [1737792,1899072) lives here): a DEPARTED member
+    //     still CONSUMES its used-slot (no HasMN skip); the PoSe-ban check only
+    //     applies to members actually present in the H list.
     ProRegSet          used_all;
     std::vector<MnRef> used_all_refs;
     std::vector<ProRegSet> used_indexed(num_quorums);
@@ -437,8 +451,13 @@ inline std::optional<NewQuarterOutput> build_new_quarter_members(
             for (MnRef mn : previous_quarters[c][idx]) {
                 if (mn == nullptr) return std::nullopt;
                 MnRef at_h = find_by_protx(work_list, mn->proTxHash);
-                if (at_h == nullptr) continue;    // !allMns.HasMN
-                if (!at_h->is_valid) continue;    // allMns.IsMNPoSeBanned
+                if (at_h == nullptr) {
+                    if (skip_removed_mns) continue;   // post-V19: !allMns.HasMN
+                    // pre-V19: departed member still consumes its slot; there
+                    // is no H-list entry to PoSe-check.
+                } else if (!at_h->is_valid) {
+                    continue;    // allMns.IsMNPoSeBanned (present but banned)
+                }
                 if (used_all.insert(mn->proTxHash).second)
                     used_all_refs.push_back(mn);
                 used_indexed[idx].insert(mn->proTxHash);
@@ -565,7 +584,8 @@ inline std::optional<RotationCycleOutput> compute_rotation_cycle(
     const LlmqParamsView& params,
     const std::array<RotationCycleInput, 4>& cycles,
     const std::array<const vendor::CQuorumSnapshot*, 3>& snapshots,
-    std::string* err = nullptr)
+    std::string* err = nullptr,
+    bool skip_removed_mns = true)
 {
     auto fail = [&](const std::string& why) -> std::optional<RotationCycleOutput> {
         if (err) *err = why;
@@ -577,13 +597,26 @@ inline std::optional<RotationCycleOutput> compute_rotation_cycle(
     if (num_quorums == 0 || quorum_size == 0 || quorum_size % 4 != 0)
         return fail("degenerate rotation params");
     const size_t quarter_size = quorum_size / 4;
-    for (const auto& c : cycles)
-        if (c.mn_list == nullptr) return fail("missing cycle MN list");
-    for (const auto* s : snapshots)
-        if (s == nullptr || !s->sane()) return fail("missing/insane snapshot");
+    // The NEW quarter (cycle 0) MN list is always required. A nullptr PREVIOUS
+    // snapshot (index i) marks a cycle that predates DIP0024 activation — its
+    // quarter is EMPTY (dashd GetPreviousQuorumQuarterMembers nested-null base
+    // case), and its MN list is not consulted. A present snapshot must be sane.
+    if (cycles[0].mn_list == nullptr) return fail("missing new-quarter MN list");
+    bool bootstrap = false;
+    for (const auto* s : snapshots) {
+        if (s == nullptr) { bootstrap = true; continue; }
+        if (!s->sane()) return fail("insane snapshot");
+    }
 
     std::array<std::vector<std::vector<rotdetail::MnRef>>, 3> previous;
     for (size_t i = 0; i < 3; ++i) {
+        if (snapshots[i] == nullptr) {          // pre-activation => empty
+            previous[i].assign(num_quorums, {});
+            continue;
+        }
+        if (cycles[i + 1].mn_list == nullptr)
+            return fail("missing MN list for present cycle H-"
+                        + std::to_string(i + 1) + "C");
         auto q = rotdetail::get_quarter_members_by_snapshot(
             num_quorums, quarter_size, *cycles[i + 1].mn_list,
             cycles[i + 1].modifier, *snapshots[i]);
@@ -594,7 +627,7 @@ inline std::optional<RotationCycleOutput> compute_rotation_cycle(
 
     auto built = rotdetail::build_new_quarter_members(
         num_quorums, quarter_size, *cycles[0].mn_list, cycles[0].modifier,
-        previous);
+        previous, skip_removed_mns);
     if (!built) return fail("new-quarter build failed");
 
     RotationCycleOutput out;
@@ -609,11 +642,18 @@ inline std::optional<RotationCycleOutput> compute_rotation_cycle(
         }
         members.insert(members.end(), built->quarters[i].begin(),
                        built->quarters[i].end());
-        if (members.size() != quorum_size)
+        // A sub-full assembly is a HARD FAILURE on the steady-state path (a
+        // corrupt/missing input must fail closed), but is EXPECTED during the
+        // DIP0024 bootstrap: with one or more previous quarters empty the
+        // assembled quorum grows 15 -> 30 -> 45 across the first three cycles
+        // (each < minSize => a NULL commitment with no member-set consumer),
+        // reaching the full size only once all three previous cycles exist.
+        // The produced snapshot is still emitted so the recurrence continues.
+        if (members.size() != quorum_size && !bootstrap)
             return fail("assembled quorum index " + std::to_string(i) + " has "
                         + std::to_string(members.size()) + " members != "
                         + std::to_string(quorum_size) + " — refusing partial");
-        out.member_protx[i].reserve(quorum_size);
+        out.member_protx[i].reserve(members.size());
         for (rotdetail::MnRef mn : members)
             out.member_protx[i].push_back(mn->proTxHash);
     }
@@ -657,9 +697,27 @@ struct QuorumReplayConfig {
     bool        enabled{false};
     LlmqNetwork network{LlmqNetwork::Mainnet};
     /// DEPLOYMENT_V20 activation (chainparams.cpp): mainnet 1987776,
-    /// testnet 905100. Observation below refuses — pre-V20 modifier eras
-    /// are Phase-2 work, fail closed, never guessed.
+    /// testnet 905100. The NON-ROTATED lanes refuse below this: their pre-V20
+    /// GetHashModifier form (utils.cpp:110, quorum-base-hash-direct) is
+    /// genuinely unported — fail closed, never guessed.
     uint32_t    v20_floor{1'987'776u};
+    /// DIP0024 cycle base (chainparams.cpp DIP0024Height): mainnet 1737792,
+    /// testnet 769700. The ROTATED lane (LLMQ_60_75, quarter-rotation) derives
+    /// from HERE, not from v20_floor: the DIP0024 rotated modifier fallback
+    /// (utils.cpp:107-108, s<<llmqType; s<<workBlockHash) IS ported
+    /// (vendor/quorum_members.hpp:126-149) and the quarter recurrence is
+    /// self-sustaining from the cycle base up. The FIRST non-null LLMQ_60_75
+    /// commitment is at DIP0024QuorumsHeight (mainnet 1738698), whose 60-member
+    /// set the fold needs — refusing the rotated lane below v20_floor failed
+    /// the whole replay CLOSED there. rotated_floor <= v20_floor always.
+    uint32_t    rotated_floor{1'737'792u};
+    /// DEPLOYMENT_V19 activation (chainparams.cpp): mainnet 1899072, testnet
+    /// 850100. skipRemovedMNs (BuildNewQuorumQuarterMembers, utils.cpp:363-386)
+    /// was introduced at V19; BELOW it (v18.2.2 ground truth) a previous-quarter
+    /// member no longer in the H list still consumes its used-slot. The DIP0024
+    /// rotated bootstrap window [1737792,1899072) is pre-V19, so this gate is
+    /// load-bearing for byte-parity there.
+    uint32_t    v19_floor{1'899'072u};
     /// Retention for derived per-cycle state (members / snapshots /
     /// modifiers / block-hash window), in blocks behind the cursor. Must
     /// cover 3 rotated cycles + the longest mining window; the default is
@@ -937,12 +995,24 @@ public:
                     + ": engine has no seeded cursor";
             return r;
         }
-        if (in.height < m_cfg.v20_floor) {
+        // Split-floor admission (edit 1): the outer gate admits at/above the
+        // LOWEST lane floor that can do useful work — the rotated lane's
+        // DIP0024 cycle base (rotated_floor) on any network where it is < the
+        // non-rotated V20 floor (mainnet/testnet both). Per-lane refusal below
+        // the lane's own floor happens inside derive_cycles_at; the block-level
+        // root fold still runs for every admitted block (it folds commitment
+        // HASHES, needs no member set) and remains fail-closed. A NON-rotated
+        // commitment with invalid bits in [rotated_floor, v20_floor) still
+        // fails closed at its use site — the acknowledged reward-safe residual.
+        const uint32_t admit_floor =
+            std::min(m_cfg.rotated_floor, m_cfg.v20_floor);
+        if (in.height < admit_floor) {
             r.error = "observe refused at h=" + std::to_string(in.height)
-                    + ": below the V20 floor h="
-                    + std::to_string(m_cfg.v20_floor)
-                    + " (pre-V20 modifier eras are Phase-2 scope — fail "
-                      "closed, never drift)";
+                    + ": below the observation floor h="
+                    + std::to_string(admit_floor)
+                    + " (rotated lanes derive from the DIP0024 cycle base; "
+                      "pre-DIP0024 eras are out of scope — fail closed, never "
+                      "drift)";
             return r;
         }
         if (in.height != m_height + 1) {
@@ -1171,6 +1241,22 @@ private:
         for (const auto& p : enabled_llmqs(m_cfg.network)) {
             if (H % p.dkg_interval != 0 || H < kWorkDiffDepth) continue;
 
+            // Split-floor per lane (edit 1): the rotated lane derives from the
+            // DIP0024 cycle base (rotated_floor); the non-rotated lanes' pre-V20
+            // modifier form is unported and must fail closed below v20_floor.
+            const uint32_t lane_floor =
+                p.use_rotation ? m_cfg.rotated_floor : m_cfg.v20_floor;
+            if (H < lane_floor) {
+                ++r.member_cycles_skipped;
+                r.member_skip_reasons.push_back(
+                    "type " + std::to_string(int(p.type)) + " cycle h="
+                    + std::to_string(H) + ": below the "
+                    + (p.use_rotation ? std::string("rotated")
+                                      : std::string("V20"))
+                    + " lane floor h=" + std::to_string(lane_floor));
+                continue;
+            }
+
             std::string why;
             auto modifier = compute_modifier(p.type, H, &why);
             if (!modifier) {
@@ -1226,11 +1312,17 @@ private:
             // snapshots come from the OWN store (seeded at the anchor,
             // self-produced thereafter — the qrinfo-replacing recurrence).
             const uint32_t C = p.dkg_interval;
-            if (H < 3 * C + kWorkDiffDepth) {
+            // Underflow guard only (edit 2): the "fewer than 3 previous cycles"
+            // blanket refusal is RELAXED — at the DIP0024 bootstrap the previous
+            // cycle bases legitimately predate activation and are treated as
+            // EMPTY per-i below (dashd's nested-null GetPreviousQuorumQuarter-
+            // Members bottoms out empty). Only a genuine height underflow (which
+            // never occurs at a real DIP0024 cycle base) is refused.
+            if (H < kWorkDiffDepth) {
                 ++r.member_cycles_skipped;
                 r.member_skip_reasons.push_back(
                     "type " + std::to_string(int(p.type)) + " cycle h="
-                    + std::to_string(H) + ": fewer than 3 previous cycles");
+                    + std::to_string(H) + ": height below the work-diff depth");
                 continue;
             }
             std::array<std::vector<QuorumMnEntry>, 4> lists;
@@ -1242,6 +1334,19 @@ private:
             cycles[0].mn_list  = &lists[0];
             cycles[0].modifier = *modifier;
             for (size_t i = 1; i <= 3 && inputs_ok; ++i) {
+                // A previous cycle base at or below the underflow boundary, or
+                // below the DIP0024 rotated floor, PREDATES the rotated
+                // deployment: its quarter is EMPTY (nullptr snapshot => the
+                // compute leg yields empty quarters, dashd nested-null). The
+                // cycle's own snapshot/modifier/MN-list are NOT consulted.
+                const bool underflow = (static_cast<uint32_t>(i) * C > H)
+                    || (H - static_cast<uint32_t>(i) * C < kWorkDiffDepth);
+                if (underflow
+                    || (H - static_cast<uint32_t>(i) * C) < m_cfg.rotated_floor) {
+                    snaps[i - 1]      = nullptr;   // pre-activation => empty
+                    cycles[i].mn_list = nullptr;   // not consulted
+                    continue;
+                }
                 const uint32_t base = H - static_cast<uint32_t>(i) * C;
                 auto sit = m_snapshots.find({p.type, base});
                 if (sit == m_snapshots.end()) {
@@ -1281,7 +1386,12 @@ private:
             }
 
             std::string err;
-            auto out = compute_rotation_cycle(p, cycles, snaps, &err);
+            // skipRemovedMNs (edit 3) is a V19 gate: below V19 a departed
+            // previous-quarter member still consumes its used-slot (v18.2.2
+            // ground truth). The DIP0024 bootstrap window is pre-V19.
+            const bool skip_removed_mns = (H >= m_cfg.v19_floor);
+            auto out = compute_rotation_cycle(p, cycles, snaps, &err,
+                                              skip_removed_mns);
             if (!out) {
                 ++r.member_cycles_skipped;
                 r.member_skip_reasons.push_back(
