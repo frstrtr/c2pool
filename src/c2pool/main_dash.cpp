@@ -7757,6 +7757,66 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             (*feed)(blk, h);
                         });
 
+                    // ── DASHD-CUT: self-derived MN-set checkpoint DUMP off the
+                    // MN-CKPT BRIDGE (task #154, the #1 dashd-cut pacing item).
+                    // The bridge SEEDS from the baked checkpoint and forward-
+                    // folds block-by-block (apply_block == dashd
+                    // BuildNewListFromBlock parity) to H in MINUTES over the
+                    // coin-P2P feed — no --replay-bulk, no --replay-fold-prestate,
+                    // no dashd. When it reaches H the hook serializes the bridge's
+                    // OWN payout-bearing set (MnStateMachine::entries()) to FILE.
+                    // SELF-DERIVED: every field comes from the bridge's own fold
+                    // (scriptPayout verbatim from the ProRegTx it replayed;
+                    // nLastPaidHeight from the payee bookkeeping it keeps), never
+                    // a dashd protx snapshot and never getmnlistdiff (which is
+                    // payout-stripped). The write self-verifies through
+                    // parse_mn_checkpoint() so it can never emit a file the
+                    // runtime cold-start would refuse. This is the exact analog
+                    // of the replay-fold consumer's set_dump_hook install (the
+                    // --replay-fold-prestate arm); the two are mutually exclusive
+                    // by the g_replay_fold_prestate predicate this block already
+                    // stands under.
+                    if (g_dump_mn_checkpoint_height != 0) {
+                        const uint32_t    dump_h    = g_dump_mn_checkpoint_height;
+                        const std::string dump_file = g_dump_mn_checkpoint_file;
+                        const std::string net       = net_name;
+                        mn_ckpt_lane->set_dump_hook(
+                            dump_h,
+                            [dump_file, net](const dash::coin::MnStateMachine& machine,
+                                             uint32_t reached,
+                                             const uint256& blockhash) {
+                                const std::string source =
+                                    "self-derived from chain via c2pool MN-CKPT"
+                                    " bridge at H=" + std::to_string(reached)
+                                    + " (blockhash " + blockhash.GetHex() + ")";
+                                const std::string generated =
+                                    dash::coin::mn_dump_detail::iso8601_utc_now();
+                                std::string err;
+                                if (dash::coin::write_mn_checkpoint_inc(
+                                        machine.entries(), reached, blockhash,
+                                        net, dump_file, source, generated, err)) {
+                                    std::cout << "[run] --dump-mn-checkpoint"
+                                                 " (BRIDGE): WROTE "
+                                              << machine.size() << " registered"
+                                                 " masternodes at h=" << reached
+                                              << " to " << dump_file
+                                              << " (self-derived via the MN-CKPT"
+                                                 " bridge, no dashd) — verified"
+                                                 " through parse_mn_checkpoint()\n";
+                                } else {
+                                    std::cerr << "[run] --dump-mn-checkpoint"
+                                                 " (BRIDGE) FAILED at h="
+                                              << reached << ": " << err << "\n";
+                                }
+                            });
+                        std::cout << "[run] --dump-mn-checkpoint ARMED on the"
+                                     " MN-CKPT BRIDGE: the bridge will serialize"
+                                     " its registered MN set at h=" << dump_h
+                                  << " to " << dump_file
+                                  << " (self-derived from chain via the baked-"
+                                     "checkpoint fold; no dashd RPC)\n";
+                    }
+
                     // THE READ SEAM: the 0-RTT gap-repair the SOURCE callers
                     // use, reconstructed from the store and cross-checked at
                     // every hop against OUR PoW-validated header chain.
