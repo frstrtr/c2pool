@@ -361,6 +361,29 @@ target_link_libraries(dash_hdr_backfill_window_kat
 )
 add_test(NAME dash_hdr_backfill_window_kat COMMAND dash_hdr_backfill_window_kat)
 
+# #154 daemonless bulk-fetch dashd-parity KAT: LEVER 1 (protected-local primary
+# stays bulk-eligible; remote primary still excluded; discover-only unchanged)
+# and LEVER 2 (throughput-weighted per-peer inflight window). Links the same
+# DASH library set as dash_hdr_backfill_window_kat (pulls replay_bulk_fetch /
+# block_producer / header_chain / x11 / block-replay via the dash object graph).
+add_executable(dash_bulk_local_primary_kat dash_bulk_local_primary_kat.cpp)
+target_link_libraries(dash_bulk_local_primary_kat
+    core pool sharechain
+    c2pool_node_enhanced
+    dash
+    c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
+    dash_x11
+    dash_rpc
+    dash_stratum
+    dash_block_replay
+    dash_bls_verify
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+)
+add_test(NAME dash_bulk_local_primary_kat COMMAND dash_bulk_local_primary_kat)
+
 # Windows: Boost.Asio requires Winsock libraries; /bigobj for large translation units
 if(WIN32)
     target_link_libraries(c2pool ws2_32 mswsock bcrypt dbghelp)
