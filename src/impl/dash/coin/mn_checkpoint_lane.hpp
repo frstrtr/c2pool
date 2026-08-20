@@ -362,6 +362,24 @@ public:
         m_on_block_applied = std::move(fn);
     }
 
+    /// ── DASHD-CUT: self-derived checkpoint DUMP-AT-HEIGHT hook (task #154) ──
+    /// One-shot: install a target height and a sink. The instant the bridge
+    /// folds CLEANLY up to `target_height` at its contiguous cursor, the hook
+    /// fires with the bridged MnStateMachine, the reached height, and that
+    /// height's block hash (from OUR PoW-validated header chain). The caller
+    /// serializes the bridge's own payout-bearing set to a checkpoint .inc —
+    /// self-derived, no dashd. Exact analog of FoldReplayConsumer::set_dump_hook.
+    /// Fires from the SAME clean-fold event that feeds set_on_block_applied
+    /// (forward-contiguous, once per height), so it never fires on a gapped or
+    /// payee-desynced fold. Optional — unset is a no-op.
+    void set_dump_hook(uint32_t target_height,
+                       std::function<void(const MnStateMachine&, uint32_t,
+                                          const uint256&)> h)
+    {
+        m_dump_target = target_height;
+        m_dump_hook   = std::move(h);
+    }
+
     /// FULL-STATE ANCHOR SEED seam (dashd-cut MN diff store). The lane's OWN
     /// first fold is the anchor fold: begin_fold(m_anchor_height) requests
     /// getmnlistd(base=ZERO, target=anchor_hash) and on_historical_snapshot()
@@ -1980,6 +1998,8 @@ public:
         // engine so the store writer emits this height's root+payee-checked
         // diff. Forward-contiguous, once per height, in order.
         if (m_on_block_applied) m_on_block_applied(block, height);
+        // task #154: self-derived checkpoint dump, off the SAME clean fold.
+        maybe_fire_dump(height);
         // #91: DELIVERED, and only now. Every guard above had to pass — no
         // gap, no payee desync, a non-empty set — before this height is a
         // height a restart may resume from.
@@ -3135,6 +3155,8 @@ private:
         // feed it to the parallel engine exactly as the ordinary post-apply
         // path does, so the store's per-height diff chain has no hole here.
         if (m_on_block_applied) m_on_block_applied(m_ondemand_block, height);
+        // task #154: self-derived checkpoint dump, off the SAME clean fold.
+        maybe_fire_dump(height);
         m_sml_recovered += m_ondemand_r.sml_recovered;
         m_registered    += m_ondemand_r.registered;
         m_spent         += m_ondemand_r.spent;
@@ -3994,6 +4016,34 @@ public:
     // payee-only checkpoint omits. Unset = no-op.
     std::function<void(const vendor::CSimplifiedMNList&, uint32_t)>
         m_on_anchor_snapshot;
+    // dashd-cut SELF-DERIVED CHECKPOINT DUMP seam (task #154). One-shot: when
+    // the bridge's contiguous cursor reaches m_dump_target, hand the caller the
+    // bridged MnStateMachine (its payout-bearing set) + the reached height + the
+    // block hash so it can serialize a self-derived checkpoint (.inc) from the
+    // bridge's OWN reconstruction — no dashd, no getmnlistdiff. Exact analog of
+    // FoldReplayConsumer::set_dump_hook on the replay-fold path. Unset = no-op.
+    uint32_t    m_dump_target{0};   // 0 = off
+    bool        m_dumped{false};
+    std::function<void(const MnStateMachine&, uint32_t /*reached*/,
+                       const uint256& /*blockhash*/)>
+        m_dump_hook;
+
+    // Fire the one-shot self-derived checkpoint dump the instant the bridge's
+    // clean, contiguous cursor reaches m_dump_target. Called from every
+    // clean-fold site (right after m_on_block_applied fires), so it inherits the
+    // same "no gap, no payee desync, non-empty set" guarantees those sites do.
+    void maybe_fire_dump(uint32_t height)
+    {
+        if (!m_dump_hook || m_dumped || m_dump_target == 0
+            || height != m_dump_target)
+            return;
+        m_dumped = true;
+        uint256 blockhash;
+        if (m_header_hash_at) {
+            if (auto h = m_header_hash_at(height)) blockhash = *h;
+        }
+        m_dump_hook(m_machine, height, blockhash);
+    }
     // dashd-cut SOURCE observability: pre-block ban state resolved from the
     // diff store (0-RTT) instead of a capped network probe/fold. These are the
     // counts that prove the store SERVED — a green run has probe/fold caps
