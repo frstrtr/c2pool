@@ -1006,15 +1006,11 @@ public:
         // fails closed at its use site — the acknowledged reward-safe residual.
         const uint32_t admit_floor =
             std::min(m_cfg.rotated_floor, m_cfg.v20_floor);
-        if (in.height < admit_floor) {
-            r.error = "observe refused at h=" + std::to_string(in.height)
-                    + ": below the observation floor h="
-                    + std::to_string(admit_floor)
-                    + " (rotated lanes derive from the DIP0024 cycle base; "
-                      "pre-DIP0024 eras are out of scope — fail closed, never "
-                      "drift)";
-            return r;
-        }
+
+        // The fold is strictly forward-contiguous: the cursor advances by
+        // exactly one block, EVERY block, from the seed — BELOW the floor too
+        // (see the split-floor cursor advance below). This gate runs first so
+        // it is enforced uniformly across the floor.
         if (in.height != m_height + 1) {
             r.error = "observe refused at h=" + std::to_string(in.height)
                     + ": cursor is at h=" + std::to_string(m_height)
@@ -1025,11 +1021,39 @@ public:
 
         // Register this block in the height/hash window BEFORE anything
         // else — its own commitments may name earlier observed blocks, and
-        // members_for() resolution needs every quorum base hash.
+        // members_for() resolution needs every quorum base hash. Registered
+        // for below-floor blocks too: the rotated lane's first cycle base
+        // (rotated_floor) selects members over the work blocks at cycleBase-8,
+        // which sit JUST BELOW the floor — their hashes and bestCLSignatures
+        // must already be observed when that cycle's derivation runs.
         m_hash_by_height[in.height] = in.block_hash;
         m_height_by_hash[in.block_hash] = in.height;
         if (in.best_cl_sig) m_cl_by_height[in.height] = *in.best_cl_sig;
         m_cl_known.insert(in.height);   // "observed" even when null CL
+
+        // ── Split-floor cursor advance (edit 2) ──────────────────────────
+        // Below the observation floor the Phase-2 producers — rotated cycle
+        // derivation and the merkleRootQuorums self-check — are OUT OF SCOPE:
+        // pre-DIP0024 eras carry no rotated quorum and no cbTx quorum root to
+        // check, and early NON-rotated member sets are produced by the
+        // separate post-fold produce_early_nonrotated_members() path (left
+        // unchanged). But the cursor MUST still advance one block at a time so
+        // it reaches the floor CONTIGUOUS. Edit 1 lowered the admission floor
+        // to rotated_floor yet left this refusal returning BEFORE the
+        // contiguity gate, so the cursor stayed pinned at the (far lower) seed:
+        // the forward-contiguous gate could never be satisfied at rotated_floor
+        // and the rotated lane starved forever (the h=1738698 llmqType=5 "no
+        // member set" fail-closed). So: register the window (done above),
+        // advance the cursor, and return. Fail-closed is preserved — NO member
+        // set is invented here; a rotated commitment mined below the floor
+        // still finds none and fails closed at its use site.
+        if (in.height < admit_floor) {
+            prune(in.height);
+            m_height     = in.height;
+            m_block_hash = in.block_hash;
+            r.ok = true;
+            return r;
+        }
 
         // ── Per-cycle derivations at quorum/cycle bases ─────────────────
         derive_cycles_at(in.height, r);
