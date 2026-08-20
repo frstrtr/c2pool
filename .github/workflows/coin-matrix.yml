@@ -44,6 +44,19 @@ jobs:
       fail-fast: false
       matrix:
         coin: [ltc, doge, dash, btc, dgb, bch]
+        include:
+          # PRE-STAGED daemonless dash smoke (2026-08-20). Reuses THIS same
+          # per-coin template -- no forked workflow. Builds the SAME c2pool-dash
+          # target and runs the embedded dashd-cut replay/fold gtests on the
+          # self-derive path with NO --coin-rpc arm (pure daemonless boot).
+          # Gate-fenced dark on the dashd-cut daemonless artifact
+          # (src/impl/dash/coin/replay_fold_engine.hpp), which lands with the
+          # #1293 dashd-cut family. Until that file is on master this entry
+          # self-skips (exists=0), exactly like the forward-compat coin gates.
+          - coin: dash-daemonless
+            binary: dash
+            gate_file: src/impl/dash/coin/replay_fold_engine.hpp
+            gtest: "1"
     steps:
       - uses: actions/checkout@v6
 
@@ -67,7 +80,17 @@ jobs:
       - name: Check source presence
         id: presence
         run: |
-          if [ -f "src/c2pool/main_${{ matrix.coin }}.cpp" ] && [ -d "src/impl/${{ matrix.coin }}" ]; then
+          GATE="${{ matrix.gate_file }}"
+          if [ -n "$GATE" ]; then
+            # Daemonless entry: gate on the dashd-cut artifact (#1293 family).
+            if [ -f "$GATE" ]; then
+              echo "exists=1" >> "$GITHUB_OUTPUT"
+              echo "::notice::daemonless gate $GATE present — building/testing."
+            else
+              echo "exists=0" >> "$GITHUB_OUTPUT"
+              echo "::notice::daemonless gate $GATE not on this branch — skipping (expected until the dashd-cut family lands)."
+            fi
+          elif [ -f "src/c2pool/main_${{ matrix.coin }}.cpp" ] && [ -d "src/impl/${{ matrix.coin }}" ]; then
             echo "exists=1" >> "$GITHUB_OUTPUT"
             echo "::notice::c2pool-${{ matrix.coin }} source present — building."
           else
@@ -163,14 +186,28 @@ jobs:
 
       - name: Build c2pool-${{ matrix.coin }}
         if: steps.presence.outputs.exists == '1'
-        run: cmake --build build_${{ matrix.coin }} --target c2pool-${{ matrix.coin }} -j$(nproc)
+        run: cmake --build build_${{ matrix.coin }} --target c2pool-${{ matrix.binary || matrix.coin }} -j$(nproc)
 
       - name: Smoke test (--help)
-        if: steps.presence.outputs.exists == '1'
+        if: steps.presence.outputs.exists == '1' && matrix.gtest != '1'
         run: |
-          BIN=build_${{ matrix.coin }}/src/c2pool/c2pool-${{ matrix.coin }}
+          BIN=build_${{ matrix.coin }}/src/c2pool/c2pool-${{ matrix.binary || matrix.coin }}
           file "$BIN"
           "$BIN" --help 2>&1 | head -5 || true
+
+      - name: Embedded daemonless gtest (no --coin-rpc; self-derive path)
+        if: steps.presence.outputs.exists == '1' && matrix.gtest == '1'
+        # PRE-STAGED: runs the dashd-cut replay/fold gtests that exercise the
+        # daemonless self-derive path with NO --coin-rpc arm. Selector is pinned
+        # to the #1293 dashd-cut family (test_dash_replay_*, test_dash_mn_checkpoint,
+        # test_dash_preanchor_header_backfill). --no-tests=error makes an empty
+        # selector FAIL LOUD rather than fake-green. Finalize the ctest -R once
+        # that family is on master.
+        run: |
+          cmake --build build_${{ matrix.coin }} -j$(nproc)
+          ctest --test-dir build_${{ matrix.coin }} \
+            --output-on-failure --no-tests=error \
+            -R 'dash.*(replay|mn_checkpoint|preanchor|daemonless)'
 
       - name: Upload build artifacts on failure
         if: failure() && steps.presence.outputs.exists == '1'
