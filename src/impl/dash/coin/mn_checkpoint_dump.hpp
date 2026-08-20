@@ -73,6 +73,7 @@
 #include <cstdint>
 #include <ctime>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -243,43 +244,20 @@ struct MnCheckpointDump {
     uint64_t    count{0};
 };
 
-/// Serialize a fold engine's REGISTERED masternode set at its current cursor
-/// height to the checkpoint payload + .inc. `source` becomes the `source`
-/// line (the operator decision requires it to name the self-derived
-/// provenance, e.g. "self-derived from chain via c2pool --replay-bulk at H");
-/// `generated` is the ISO-8601 timestamp (mn_dump_detail::iso8601_utc_now()).
-inline MnCheckpointDump emit_mn_checkpoint_dump(const replay::DmlFoldEngine& engine,
-                                                const std::string& source,
-                                                const std::string& generated)
+/// Shared assembly tail: sorted `rows` (proTxHash DISPLAY hex, mn line) ->
+/// 7-line header + digest + payload + .inc, in the exact gen_mn_checkpoint.py
+/// byte format. REWARD-SAFETY-CRITICAL: single-sourced so the DmlFoldEngine
+/// dumper and the MN-CKPT bridge dumper cannot ever diverge in the format they
+/// emit. Pure serialization — no consensus/fold logic.
+inline MnCheckpointDump finish_mn_checkpoint_dump(
+    std::vector<std::pair<std::string, std::string>> rows,
+    uint32_t height, const uint256& blockhash, const std::string& network,
+    const std::string& source, const std::string& generated)
 {
     using namespace mn_dump_detail;
     MnCheckpointDump r;
-    r.height = engine.height();
+    r.height = height;
 
-    if (engine.poisoned()) {
-        r.error = "fold engine is POISONED (" + engine.poison_reason()
-                + ") — refusing to dump a diverged set";
-        return r;
-    }
-    if (engine.size() == 0) {
-        r.error = "fold holds 0 registered masternodes — refusing to write an"
-                  " empty anchor (fail-closed)";
-        return r;
-    }
-
-    // Format every registered MN; refuse a payee-less one exactly as the
-    // runtime parser would (mn_checkpoint.hpp:470-480).
-    std::vector<std::pair<std::string, std::string>> rows;  // (protx display hex, line)
-    rows.reserve(engine.size());
-    for (const auto& [protx, st] : engine.entries()) {
-        if (st.scriptPayout.m_data.empty()) {
-            r.error = "registered MN " + protx.GetHex().substr(0, 16)
-                    + " carries an empty scriptPayout — a payee-less MN would"
-                      " project a wrong payee (fail-closed)";
-            return r;
-        }
-        rows.emplace_back(protx.GetHex(), emit_mn_record_line(protx, st));
-    }
     // Sort by proTxHash DISPLAY hex ascending — byte-parity with
     // gen_mn_checkpoint.py `records.sort(key=lambda r: r[0])`. Map order is
     // internal-byte order and would NOT match.
@@ -293,9 +271,9 @@ inline MnCheckpointDump emit_mn_checkpoint_dump(const replay::DmlFoldEngine& eng
     // 7-line header, exact order/formatting of gen_mn_checkpoint.py.
     std::vector<std::string> header = {
         std::string(kMnCheckpointMagic),
-        "network " + engine.network(),
-        "height " + std::to_string(engine.height()),
-        "blockhash " + engine.block_hash().GetHex(),
+        "network " + network,
+        "height " + std::to_string(height),
+        "blockhash " + blockhash.GetHex(),
         "source " + source,
         "generated " + generated,
         "count " + std::to_string(mn_lines.size()),
@@ -333,6 +311,119 @@ inline MnCheckpointDump emit_mn_checkpoint_dump(const replay::DmlFoldEngine& eng
     return r;
 }
 
+/// MNState (mn_state_db.hpp — the MN-CKPT bridge's per-entry payee state) ->
+/// the ReplayMNState fields emit_mn_record_line() serializes. The bridge's
+/// MnStateMachine folds the SAME 17 checkpoint fields (it is SEEDED from a
+/// parsed checkpoint, whose native entry type IS MNState), so this is a pure
+/// field-copy — no consensus/fold logic — and produces byte-identical output
+/// to a dump of the same MN off the DmlFoldEngine path. Heights are
+/// non-negative in MNState (0 == "never/unset"); emit_mn_record_line clamps
+/// <=0 to 0 either way, so the ban/revive sentinels agree.
+inline replay::ReplayMNState mnstate_to_replay_line(const MNState& mn)
+{
+    replay::ReplayMNState st;
+    st.nType                = mn.nType;
+    st.nVersion             = mn.nVersion;
+    st.collateralOutpoint   = mn.collateralOutpoint;
+    st.nOperatorReward      = mn.nOperatorReward;
+    st.nRegisteredHeight    = static_cast<int32_t>(mn.nRegisteredHeight);
+    st.nLastPaidHeight      = static_cast<int32_t>(mn.nLastPaidHeight);
+    st.nConsecutivePayments = static_cast<int32_t>(mn.nConsecutivePayments);
+    st.nPoSeRevivedHeight   = static_cast<int32_t>(mn.nPoSeRevivedHeight);
+    st.nPoSeBanHeight       = static_cast<int32_t>(mn.nPoSeBanHeight);
+    st.nRevocationReason    = mn.nRevocationReason;
+    st.keyIDOwner           = mn.keyIDOwner;
+    st.pubKeyOperator       = mn.pubKeyOperator;
+    st.keyIDVoting          = mn.keyIDVoting;
+    st.scriptPayout         = mn.scriptPayout;
+    st.scriptOperatorPayout = mn.scriptOperatorPayout;
+    return st;
+}
+
+/// Serialize a fold engine's REGISTERED masternode set at its current cursor
+/// height to the checkpoint payload + .inc. `source` becomes the `source`
+/// line (the operator decision requires it to name the self-derived
+/// provenance, e.g. "self-derived from chain via c2pool --replay-bulk at H");
+/// `generated` is the ISO-8601 timestamp (mn_dump_detail::iso8601_utc_now()).
+inline MnCheckpointDump emit_mn_checkpoint_dump(const replay::DmlFoldEngine& engine,
+                                                const std::string& source,
+                                                const std::string& generated)
+{
+    using namespace mn_dump_detail;
+    MnCheckpointDump r;
+    r.height = engine.height();
+
+    if (engine.poisoned()) {
+        r.error = "fold engine is POISONED (" + engine.poison_reason()
+                + ") — refusing to dump a diverged set";
+        return r;
+    }
+    if (engine.size() == 0) {
+        r.error = "fold holds 0 registered masternodes — refusing to write an"
+                  " empty anchor (fail-closed)";
+        return r;
+    }
+
+    // Format every registered MN; refuse a payee-less one exactly as the
+    // runtime parser would (mn_checkpoint.hpp:470-480).
+    std::vector<std::pair<std::string, std::string>> rows;  // (protx display hex, line)
+    rows.reserve(engine.size());
+    for (const auto& [protx, st] : engine.entries()) {
+        if (st.scriptPayout.m_data.empty()) {
+            r.error = "registered MN " + protx.GetHex().substr(0, 16)
+                    + " carries an empty scriptPayout — a payee-less MN would"
+                      " project a wrong payee (fail-closed)";
+            return r;
+        }
+        rows.emplace_back(protx.GetHex(), emit_mn_record_line(protx, st));
+    }
+    return finish_mn_checkpoint_dump(std::move(rows), engine.height(),
+                                     engine.block_hash(), engine.network(),
+                                     source, generated);
+}
+
+/// MN-CKPT BRIDGE overload. Serialize the bridge's OWN reconstructed set —
+/// MnStateMachine::entries(), std::map<uint256, MNState> — at the height it
+/// bridged to. Byte-identical format to the DmlFoldEngine dumper above: it
+/// shares finish_mn_checkpoint_dump() and emit_mn_record_line() verbatim, only
+/// adapting each MNState to the line fields (mnstate_to_replay_line). The
+/// bridge carries no `poisoned()` flag; a diverged bridge fails closed at the
+/// lane (it never reaches the dump height), and an empty/payee-less set is
+/// still refused here exactly as the engine path refuses it. `height`,
+/// `blockhash` and `network` name the cursor the bridge stands on (the lane
+/// supplies the block hash from OUR PoW-validated header chain).
+inline MnCheckpointDump emit_mn_checkpoint_dump(
+    const std::map<uint256, MNState>& entries,
+    uint32_t height, const uint256& blockhash, const std::string& network,
+    const std::string& source, const std::string& generated)
+{
+    MnCheckpointDump r;
+    r.height = height;
+
+    if (entries.empty()) {
+        r.error = "bridge holds 0 registered masternodes — refusing to write an"
+                  " empty anchor (fail-closed)";
+        return r;
+    }
+
+    // Format every registered MN; refuse a payee-less one exactly as the
+    // runtime parser would (mn_checkpoint.hpp:470-480).
+    std::vector<std::pair<std::string, std::string>> rows;  // (protx display hex, line)
+    rows.reserve(entries.size());
+    for (const auto& [protx, mn] : entries) {
+        if (mn.scriptPayout.m_data.empty()) {
+            r.error = "registered MN " + protx.GetHex().substr(0, 16)
+                    + " carries an empty scriptPayout — a payee-less MN would"
+                      " project a wrong payee (fail-closed)";
+            return r;
+        }
+        rows.emplace_back(protx.GetHex(),
+                          emit_mn_record_line(protx, mnstate_to_replay_line(mn)));
+    }
+    return finish_mn_checkpoint_dump(std::move(rows), height, blockhash,
+                                     network, source, generated);
+}
+
 /// Dump + SELF-VERIFY + write the .inc. Never writes a file the runtime parser
 /// would refuse: the payload is round-tripped through parse_mn_checkpoint()
 /// (with the engine's own network) before the file is opened. Returns true on
@@ -350,6 +441,45 @@ inline bool write_mn_checkpoint_inc(const replay::DmlFoldEngine& engine,
     // The reward-safety gate: our own output must parse clean under the very
     // parser the runtime cold-start uses, or we do not ship it.
     MnCheckpoint cp = parse_mn_checkpoint(d.payload, engine.network());
+    if (!cp.ok) {
+        error = "self-check FAILED — the dumped payload was rejected by"
+                " parse_mn_checkpoint(): " + cp.error;
+        return false;
+    }
+    if (cp.entries.size() != d.count) {
+        error = "self-check FAILED — parsed " + std::to_string(cp.entries.size())
+              + " entries, dumped " + std::to_string(d.count);
+        return false;
+    }
+
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) { error = "cannot open '" + path + "' for writing"; return false; }
+    f << d.inc;
+    f.flush();
+    if (!f.good()) { error = "write to '" + path + "' failed"; return false; }
+    return true;
+}
+
+/// MN-CKPT BRIDGE overload of the self-verifying writer. The self-check is the
+/// same reward-safety gate VERBATIM: the emitted payload is round-tripped
+/// through parse_mn_checkpoint(payload, network) — the very parser the runtime
+/// cold-start uses — before the file is opened, so a bridge set that fails
+/// self-parse is NEVER written.
+inline bool write_mn_checkpoint_inc(const std::map<uint256, MNState>& entries,
+                                    uint32_t height, const uint256& blockhash,
+                                    const std::string& network,
+                                    const std::string& path,
+                                    const std::string& source,
+                                    const std::string& generated,
+                                    std::string& error)
+{
+    MnCheckpointDump d = emit_mn_checkpoint_dump(entries, height, blockhash,
+                                                 network, source, generated);
+    if (!d.ok) { error = d.error; return false; }
+
+    // The reward-safety gate: our own output must parse clean under the very
+    // parser the runtime cold-start uses, or we do not ship it.
+    MnCheckpoint cp = parse_mn_checkpoint(d.payload, network);
     if (!cp.ok) {
         error = "self-check FAILED — the dumped payload was rejected by"
                 " parse_mn_checkpoint(): " + cp.error;
