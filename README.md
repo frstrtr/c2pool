@@ -9,6 +9,32 @@ Bitcoin wiki: <https://en.bitcoin.it/wiki/P2Pool>
 
 Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 
+## Daemonless Dash
+
+c2pool-dash builds valid Dash mainnet blocks from embedded coin-state. The
+deterministic masternode list, LLMQ quorums, ChainLocks and the DIP-4 coinbase
+are reconstructed inside c2pool. No Dash Core node is required on the serve path.
+Blocks built this way have been accepted on Dash mainnet, including the pool
+development-fee split. Independence from dashd is not yet complete; the
+Supported-chains matrix marks DASH in development. The remaining work is the
+daemonless-finalize item below.
+
+## Governance
+
+Daemonless-Dash finalization is funded through Dash on-chain governance.
+Masternode operators can vote on the c2pool-daemonless-finalize proposal.
+
+- DashCentral: https://www.dashcentral.org/p/c2pool-daemonless-finalize
+- Governance object: fa758340f1bd2391d17bb43667f76c5d9070d737b68e018e42ed75b09c6ba631
+- Vote from a masternode:
+
+  ```
+  dash-cli gobject vote-many fa758340f1bd2391d17bb43667f76c5d9070d737b68e018e42ed75b09c6ba631 funding yes
+  ```
+
+Funding requires net yes votes equal to 10 percent of enabled masternodes by the
+next superblock.
+
 ## Supported chains
 
 c2pool builds one binary per **parent chain** (`c2pool-<coin>`). Several parents also merge-mine **AuxPoW child chains** in the same coinbase.
