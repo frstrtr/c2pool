@@ -628,20 +628,64 @@ TEST(DashReplayQuorumEngine, CursorIsForwardContiguous)
     EXPECT_FALSE(eng.poisoned()) << "cursor refusals are not poison";
 }
 
-// The outer observation gate now admits at/above the LOWEST lane floor (the
-// rotated lane's DIP0024 cycle base, mainnet 1737792) — a block below THAT is
-// out of scope and refused by name. (A block in [rotated_floor, v20_floor) is
-// admitted; the non-rotated lanes still refuse member derivation below
-// v20_floor inside derive_cycles_at — proven by the bootstrap KAT below.)
+// Post-#154 SPLIT FLOOR. The OUTER observe gate now admits from the LOWEST lane
+// floor (rotated_floor 1737792) so the rotated DIP0024 lane can reach its cycle
+// bases; a block BELOW that is no longer HARD-REFUSED — the observe lane
+// REGISTERS its height/hash/CL window and ADVANCES the forward-contiguous cursor
+// (edit 2 in observe_block; this is exactly what let the .191 self-derive fold
+// byte-exact THROUGH h=1738698). What still FAILS CLOSED, BY NAME, is member-set
+// DERIVATION below a lane's OWN floor: a non-rotated (V20) lane cycle inside
+// [rotated_floor, v20_floor) is skipped "below the V20 lane floor" in
+// derive_cycles_at and NO member set is invented. This test pins BOTH halves —
+// the observe path advances, the member-set derivation refuses by name — so the
+// fail-closed guarantee (never guess a member set) is asserted, not weakened.
 TEST(DashReplayQuorumEngine, BelowObservationFloorRefusesNamed)
 {
-    QuorumReplayEngine eng(mainnet_cfg());
-    eng.seed_cursor(1'737'000, uint256::ZERO);   // below rotated_floor 1737792
-    QuorumBlockInput in;
-    in.height = 1'737'001;
-    auto r = eng.observe_block(in);
-    EXPECT_FALSE(r.ok);
-    EXPECT_NE(r.error.find("floor"), std::string::npos) << r.error;
+    // (1) OBSERVE ADVANCES below the admission floor (the split-floor cursor
+    //     advance; pre-#154 this returned a hard refusal).
+    {
+        QuorumReplayEngine eng(mainnet_cfg());
+        eng.seed_cursor(1'737'000, uint256::ZERO);   // < rotated_floor 1737792
+        QuorumBlockInput in;
+        in.height = 1'737'001;
+        in.block_hash.SetHex(
+            "00000000000000000000000000000000000000000000000000000000000000a1");
+        auto r = eng.observe_block(in);
+        EXPECT_TRUE(r.ok)
+            << "below-floor observe must register+advance, not hard-refuse: " << r.error;
+        EXPECT_FALSE(eng.poisoned()) << "a below-floor advance is not poison";
+        EXPECT_FALSE(eng.members_for(5, in.block_hash).has_value())
+            << "no member set may be invented below the floor (fail-closed)";
+    }
+
+    // (2) MEMBER-SET DERIVATION REFUSES BY NAME at a NON-rotated (V20) lane
+    //     cycle base inside [rotated_floor, v20_floor): the block is admitted
+    //     and observed (advances), but the type-4 (LLMQ_100_67, dkg_interval 24)
+    //     member cycle is skipped by name and produces no set.
+    {
+        QuorumReplayEngine eng(mainnet_cfg());
+        // 1737816 = rotated_floor + 24: divisible by 24 (a type-4 cycle base),
+        // NOT by 288/576 (so only the type-4 non-rotated lane fires), and inside
+        // [rotated_floor 1737792, v20_floor 1987776).
+        const uint32_t kV20LaneCycle = 1'737'816;
+        eng.seed_cursor(kV20LaneCycle - 1, uint256::ZERO);
+        QuorumBlockInput cyc;
+        cyc.height = kV20LaneCycle;
+        cyc.block_hash.SetHex(
+            "00000000000000000000000000000000000000000000000000000000000000b2");
+        auto r = eng.observe_block(cyc);
+        EXPECT_TRUE(r.ok)
+            << "a block in [rotated_floor, v20_floor) is admitted+observed: " << r.error;
+        EXPECT_GT(r.member_cycles_skipped, 0u)
+            << "the below-V20-floor member cycle must be SKIPPED, never derived";
+        bool named_v20_floor = false;
+        for (const auto& why : r.member_skip_reasons)
+            if (why.find("V20 lane floor") != std::string::npos) named_v20_floor = true;
+        EXPECT_TRUE(named_v20_floor)
+            << "member-set derivation must refuse BY NAME below the V20 lane floor";
+        EXPECT_FALSE(eng.members_for(4, cyc.block_hash).has_value())
+            << "no type-4 member set may be invented below the V20 floor (fail-closed)";
+    }
 }
 
 TEST(DashReplayQuorumEngine, UnseededEngineRefuses)
