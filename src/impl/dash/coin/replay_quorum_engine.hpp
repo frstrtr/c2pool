@@ -304,6 +304,73 @@ struct ProRegLess {
 };
 using ProRegSet = std::set<uint256, ProRegLess>;
 
+/// dashd CDeterministicMNList::AddMN, member-derivation edition
+/// (evo/deterministicmns.cpp:421-476). A CDeterministicMNList refuses a
+/// masternode that would DUPLICATE any of a set of unique properties —
+/// proTxHash, collateralOutpoint, pubKeyOperator, keyIDOwner, service — and
+/// the rotation code (BuildNewQuorumQuarterMembers, llmq/utils.cpp) leans on
+/// that refusal: every AddMN there is wrapped in a try/catch, so a colliding
+/// candidate is SILENTLY DROPPED (union) or SKIPPED (quarter fill), not
+/// added. Modelling MnsUsedAtH / MnsUsedAtHIndexed as a bare proTxHash set
+/// loses exactly this: a REMOVED masternode retained pre-V19 (skip_removed
+/// =false) still holds its collateral/operator slot, so a DIFFERENT-proTxHash
+/// RE-REGISTRATION on the SAME collateral (or operator key) must be rejected
+/// from that quorum's fill — a proTxHash-only set wrongly accepts it and the
+/// whole subsequent fill shifts by one (mainnet 1800288 quorumIndex 31).
+///
+/// The properties enforced here are the ones a QuorumMnEntry carries:
+/// proTxHash always; collateralOutpoint when has_collateral (the replay-fed
+/// / full-DIP3 list — the SML-fed list cannot and degrades to proTxHash+
+/// operator only, exactly as it already fails ties closed); pubKeyOperator
+/// when non-null. keyIDOwner and service are not carried, so those two of
+/// dashd's five unique properties are not modelled — a strict subset, and
+/// re-registration (the retained-removed-MN case that bites here) always
+/// reuses the collateralOutpoint, which IS modelled.
+struct UniqueMnList {
+    ProRegSet                          protx;
+    std::set<std::array<uint8_t, 36>>  collateral;   // 32-byte hash ‖ LE index
+    std::set<std::array<uint8_t, 48>>  operators;     // BLS operator pubkey
+
+    static std::array<uint8_t, 36> coll_key(const QuorumMnEntry& e)
+    {
+        std::array<uint8_t, 36> k{};
+        std::memcpy(k.data(), e.collateral_hash.data(), 32);
+        k[32] = static_cast<uint8_t>(e.collateral_index & 0xff);
+        k[33] = static_cast<uint8_t>((e.collateral_index >> 8) & 0xff);
+        k[34] = static_cast<uint8_t>((e.collateral_index >> 16) & 0xff);
+        k[35] = static_cast<uint8_t>((e.collateral_index >> 24) & 0xff);
+        return k;
+    }
+    static bool operator_active(const QuorumMnEntry& e)
+    {
+        for (uint8_t b : e.pub_key_operator) if (b != 0) return true;
+        return false;   // CBLSLazyPublicKey() default → not a unique property
+    }
+
+    bool   has_mn(const uint256& h) const { return protx.count(h) != 0; }
+    size_t size() const { return protx.size(); }   // == GetCounts().total()
+
+    /// AddMN: false on ANY unique-property collision (the caught throw),
+    /// true when the entry is admitted. Checks are made BEFORE any mutation
+    /// so a rejected add leaves the list untouched (dashd's rollback).
+    bool try_add(const QuorumMnEntry& e)
+    {
+        if (protx.count(e.proTxHash)) return false;          // duplicate proTxHash
+        const bool op = operator_active(e);
+        std::array<uint8_t, 36> ck{};
+        if (e.has_collateral) {
+            ck = coll_key(e);
+            if (collateral.count(ck)) return false;          // duplicate collateral
+        }
+        if (op && operators.count(e.pub_key_operator))
+            return false;                                    // duplicate operator
+        protx.insert(e.proTxHash);
+        if (e.has_collateral) collateral.insert(ck);
+        if (op) operators.insert(e.pub_key_operator);
+        return true;
+    }
+};
+
 inline MnRef find_by_protx(const std::vector<QuorumMnEntry>& list,
                            const uint256& protx)
 {
@@ -442,9 +509,16 @@ inline std::optional<NewQuarterOutput> build_new_quarter_members(
     //     bootstrap window [1737792,1899072) lives here): a DEPARTED member
     //     still CONSUMES its used-slot (no HasMN skip); the PoSe-ban check only
     //     applies to members actually present in the H list.
-    ProRegSet          used_all;
-    std::vector<MnRef> used_all_refs;
-    std::vector<ProRegSet> used_indexed(num_quorums);
+    // MnsUsedAtH is the UNION (across quorum indexes) and MnsUsedAtHIndexed[i]
+    // the PER-INDEX list; dashd AddMN's each into a CDeterministicMNList inside
+    // its OWN try/catch (utils.cpp:378-385), so a unique-property collision
+    // drops a member from ONE list independently of the other. Both are
+    // UniqueMnList here (proTxHash + collateral + operator uniqueness), NOT a
+    // bare proTxHash set — the retained-removed-MN / re-registration case
+    // (mainnet 1800288 qi31) collides on collateralOutpoint and MUST be caught.
+    UniqueMnList              used_all;
+    std::vector<MnRef>        used_all_refs;
+    std::vector<UniqueMnList> used_indexed(num_quorums);
     for (size_t idx = 0; idx < num_quorums; ++idx) {
         for (size_t c = 0; c < previous_quarters.size(); ++c) { // H-C,H-2C,H-3C
             if (idx >= previous_quarters[c].size()) continue;
@@ -458,9 +532,14 @@ inline std::optional<NewQuarterOutput> build_new_quarter_members(
                 } else if (!at_h->is_valid) {
                     continue;    // allMns.IsMNPoSeBanned (present but banned)
                 }
-                if (used_all.insert(mn->proTxHash).second)
+                // Two INDEPENDENT AddMN try/catches (union, then per-index):
+                // a member rejected by the union on a collision still enters
+                // its per-index list if that list has no clashing property,
+                // and vice versa. used_all_refs holds exactly what the union
+                // admitted (== MnsUsedAtH, the input to CalculateQuorum).
+                if (used_all.try_add(*mn))
                     used_all_refs.push_back(mn);
-                used_indexed[idx].insert(mn->proTxHash);
+                used_indexed[idx].try_add(*mn);
             }
         }
     }
@@ -476,7 +555,7 @@ inline std::optional<NewQuarterOutput> build_new_quarter_members(
     {
         size_t i = 0;
         for (MnRef mn : *sorted_all) {
-            if (used_all.count(mn->proTxHash))
+            if (used_all.has_mn(mn->proTxHash))
                 out.snapshot.activeQuorumMembers[i] = true;
             ++i;
         }
@@ -491,7 +570,7 @@ inline std::optional<NewQuarterOutput> build_new_quarter_members(
     std::vector<MnRef> not_used;
     not_used.reserve(work_list.size());
     for (const auto& e : work_list) {
-        if (used_all.count(e.proTxHash)) continue;
+        if (used_all.has_mn(e.proTxHash)) continue;   // !MnsUsedAtH.HasMN
         if (!e.is_valid) continue;
         not_used.push_back(&e);
     }
@@ -535,8 +614,16 @@ inline std::optional<NewQuarterOutput> build_new_quarter_members(
             if (++iters > max_iters) return std::nullopt;
             bool skip = true;
             MnRef cand = (*sorted_combined)[idx];
-            if (!used_indexed[i].count(cand->proTxHash)) {
-                used_indexed[i].insert(cand->proTxHash);
+            // dashd: !MnsUsedAtHIndexed[i].HasMN(cand) THEN AddMN(cand) inside
+            // a try/catch (utils.cpp:415-427). AddMN throws — and the caught
+            // throw leaves skip=true — when cand DUPLICATES a unique property
+            // (collateralOutpoint / operator) of a member already in this
+            // quarter's list, e.g. a retained removed MN it re-registers. A
+            // bare proTxHash set never throws and would wrongly admit it,
+            // shifting the whole fill by one (1800288 qi31: 72b0847… wrongly
+            // admitted where dashd retains 7cfcf4… at the same slot).
+            if (!used_indexed[i].has_mn(cand->proTxHash)
+                && used_indexed[i].try_add(*cand)) {
                 out.quarters[i].push_back(cand);
                 updated = true;
                 skip    = false;
