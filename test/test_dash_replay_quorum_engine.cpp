@@ -628,15 +628,64 @@ TEST(DashReplayQuorumEngine, CursorIsForwardContiguous)
     EXPECT_FALSE(eng.poisoned()) << "cursor refusals are not poison";
 }
 
-TEST(DashReplayQuorumEngine, BelowV20FloorRefusesNamed)
+// Post-#154 SPLIT FLOOR. The OUTER observe gate now admits from the LOWEST lane
+// floor (rotated_floor 1737792) so the rotated DIP0024 lane can reach its cycle
+// bases; a block BELOW that is no longer HARD-REFUSED — the observe lane
+// REGISTERS its height/hash/CL window and ADVANCES the forward-contiguous cursor
+// (edit 2 in observe_block; this is exactly what let the .191 self-derive fold
+// byte-exact THROUGH h=1738698). What still FAILS CLOSED, BY NAME, is member-set
+// DERIVATION below a lane's OWN floor: a non-rotated (V20) lane cycle inside
+// [rotated_floor, v20_floor) is skipped "below the V20 lane floor" in
+// derive_cycles_at and NO member set is invented. This test pins BOTH halves —
+// the observe path advances, the member-set derivation refuses by name — so the
+// fail-closed guarantee (never guess a member set) is asserted, not weakened.
+TEST(DashReplayQuorumEngine, BelowObservationFloorRefusesNamed)
 {
-    QuorumReplayEngine eng(mainnet_cfg());
-    eng.seed_cursor(1'900'000, uint256::ZERO);
-    QuorumBlockInput in;
-    in.height = 1'900'001;
-    auto r = eng.observe_block(in);
-    EXPECT_FALSE(r.ok);
-    EXPECT_NE(r.error.find("V20 floor"), std::string::npos) << r.error;
+    // (1) OBSERVE ADVANCES below the admission floor (the split-floor cursor
+    //     advance; pre-#154 this returned a hard refusal).
+    {
+        QuorumReplayEngine eng(mainnet_cfg());
+        eng.seed_cursor(1'737'000, uint256::ZERO);   // < rotated_floor 1737792
+        QuorumBlockInput in;
+        in.height = 1'737'001;
+        in.block_hash.SetHex(
+            "00000000000000000000000000000000000000000000000000000000000000a1");
+        auto r = eng.observe_block(in);
+        EXPECT_TRUE(r.ok)
+            << "below-floor observe must register+advance, not hard-refuse: " << r.error;
+        EXPECT_FALSE(eng.poisoned()) << "a below-floor advance is not poison";
+        EXPECT_FALSE(eng.members_for(5, in.block_hash).has_value())
+            << "no member set may be invented below the floor (fail-closed)";
+    }
+
+    // (2) MEMBER-SET DERIVATION REFUSES BY NAME at a NON-rotated (V20) lane
+    //     cycle base inside [rotated_floor, v20_floor): the block is admitted
+    //     and observed (advances), but the type-4 (LLMQ_100_67, dkg_interval 24)
+    //     member cycle is skipped by name and produces no set.
+    {
+        QuorumReplayEngine eng(mainnet_cfg());
+        // 1737816 = rotated_floor + 24: divisible by 24 (a type-4 cycle base),
+        // NOT by 288/576 (so only the type-4 non-rotated lane fires), and inside
+        // [rotated_floor 1737792, v20_floor 1987776).
+        const uint32_t kV20LaneCycle = 1'737'816;
+        eng.seed_cursor(kV20LaneCycle - 1, uint256::ZERO);
+        QuorumBlockInput cyc;
+        cyc.height = kV20LaneCycle;
+        cyc.block_hash.SetHex(
+            "00000000000000000000000000000000000000000000000000000000000000b2");
+        auto r = eng.observe_block(cyc);
+        EXPECT_TRUE(r.ok)
+            << "a block in [rotated_floor, v20_floor) is admitted+observed: " << r.error;
+        EXPECT_GT(r.member_cycles_skipped, 0u)
+            << "the below-V20-floor member cycle must be SKIPPED, never derived";
+        bool named_v20_floor = false;
+        for (const auto& why : r.member_skip_reasons)
+            if (why.find("V20 lane floor") != std::string::npos) named_v20_floor = true;
+        EXPECT_TRUE(named_v20_floor)
+            << "member-set derivation must refuse BY NAME below the V20 lane floor";
+        EXPECT_FALSE(eng.members_for(4, cyc.block_hash).has_value())
+            << "no type-4 member set may be invented below the V20 floor (fail-closed)";
+    }
 }
 
 TEST(DashReplayQuorumEngine, UnseededEngineRefuses)
@@ -1187,3 +1236,228 @@ TEST(DashReplayQuorumEngine, ActiveSetShortfallNamesTheTypeAndClosesExactly)
         EXPECT_EQ(eng.active_set_shortfall_text(), "complete");
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KAT — DIP0024 ROTATED PRE-V20 BOOTSTRAP FOLD (the h=1738698 fail-closed)
+//
+// Root cause reproduced: mainnet DIP0024QuorumsHeight 1738698 is the FIRST
+// non-null LLMQ_60_75 (rotated, llmqType=5) quorum commitment. Its 60-member
+// set is derived from the DIP0024 cycle base 1738656, which chains back through
+// cycle bases 1738368 / 1738080 / 1737792 (interval 288). The over-broad V20
+// floor (1987776) refused ALL member derivation below it, so the replay-fold
+// failed CLOSED at 1738698 — 249078 blocks below the floor.
+//
+// The split floor admits the ROTATED lane from rotated_floor 1737792; the
+// bootstrap base case yields EMPTY previous quarters for the pre-activation
+// cycles (dashd nested-null), so the assembled quorum grows 15 -> 30 -> 45 ->
+// 60 across the four bootstrap cycles (the first three < minSize 50 => NULL
+// commitment, no consumer). This is the structural KAT the FABLE verdict
+// sanctions:  (a) old floor => resolver EMPTY at 1738698 [RED on master],
+// (b) new floor => 60-member set for llmqType=5 [GREEN], (c) C1/C2/C3 yield
+// 15/30/45 (< 50) null-commitment fall-through, (d) skipRemovedMNs=false pre-V19
+// keeps a departed previous-quarter member.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Deterministic distinct 32-byte hash for a synthetic height (block-hash /
+// work-block-hash generator for the bootstrap drive).
+uint256 boot_hash(uint32_t height, char tag)
+{
+    std::string h(64, '0');
+    h[0]  = tag;
+    h[52] = "0123456789abcdef"[(height >> 20) & 0xf];
+    h[53] = "0123456789abcdef"[(height >> 16) & 0xf];
+    h[54] = "0123456789abcdef"[(height >> 12) & 0xf];
+    h[55] = "0123456789abcdef"[(height >> 8) & 0xf];
+    h[56] = "0123456789abcdef"[(height >> 4) & 0xf];
+    h[57] = "0123456789abcdef"[height & 0xf];
+    uint256 u;
+    u.SetHex(h);
+    return u;
+}
+
+// 60 eligible synthetic MNs (>= LLMQ_60_75 size), distinct proTxHash +
+// confirmedHash so every score is distinct (no tie -> calculate_quorum_all
+// resolves without collateral).
+std::vector<QuorumMnEntry> boot_mn_list()
+{
+    std::vector<QuorumMnEntry> list(60);
+    for (size_t i = 0; i < list.size(); ++i) {
+        auto& e = list[i];
+        std::string h(64, '0');
+        h[40] = "0123456789abcdef"[(i >> 4) & 0xf];
+        h[41] = "0123456789abcdef"[i & 0xf];
+        h[63] = '5';
+        e.proTxHash.SetHex(h);
+        h[0] = '7';
+        e.confirmedHash.SetHex(h);
+        e.is_valid = true;
+        e.n_type   = 0;
+        e.pub_key_operator[0] = static_cast<uint8_t>(0x10 + i);
+    }
+    return list;
+}
+
+}  // namespace
+
+// (a)+(b)+(c): drive the rotated bootstrap through observe_block from the first
+// cycle base up to DIP0024QuorumsHeight and prove the resolver returns the full
+// 60-member type-5 set (and the three prior cycles fall through at 15/30/45).
+//
+// RED ON MASTER: mainnet_cfg() leaves the floor at the (master) V20 value, so
+// observe_block REFUSES the very first bootstrap block (1737792 < 1987776) and
+// the loop's first ASSERT_TRUE(r.ok) fails — the resolver is EMPTY at 1738698.
+TEST(DashReplayQuorumEngine, KatRotatedBootstrapDerivesType5MemberSetAt1738698)
+{
+    // Mainnet DIP0024 geometry (chainparams.cpp; dkg_commitments.hpp note):
+    //   DIP0024Height (rotated_floor) 1737792, interval 288,
+    //   cycle bases 1737792 / 1738080 / 1738368 / 1738656,
+    //   DIP0024QuorumsHeight 1738698 (= 1738656 + mining_window_start 42).
+    const uint32_t kFirstCycle   = 1'737'792;
+    const uint32_t kFullCycle    = 1'738'656;   // first FULL 60-member cycle
+    const uint32_t kQuorumsH     = 1'738'698;   // first non-null type-5 commit
+    const uint32_t kWorkOfFirst  = kFirstCycle - 8;  // 1737784
+
+    auto list = boot_mn_list();
+    QuorumReplayEngine eng(mainnet_cfg());
+    eng.set_mn_list_at_fn([&](uint32_t) { return list; });
+
+    // Cursor one below the first cycle base; the first cycle's WORK block
+    // (1737784) is below the cursor, so seed its hash + (null) CL observability
+    // — the ≤1 pre-anchor work block a bootstrap cannot observe. No CL => the
+    // DIP0024 rotated modifier fallback form (llmqType || workBlockHash).
+    eng.seed_cursor(kFirstCycle - 1, boot_hash(kFirstCycle - 1, 'c'));
+    eng.seed_block_hash(kWorkOfFirst, boot_hash(kWorkOfFirst, 'w'));
+    eng.seed_work_block_cl(kWorkOfFirst, std::nullopt);
+
+    // Walk every block from the first cycle base to DIP0024QuorumsHeight. No
+    // commitments, no CLs (pre-V20 modifier fallback), self-check unarmed.
+    std::map<uint32_t, uint256> hash_at;
+    for (uint32_t h = kFirstCycle; h <= kQuorumsH; ++h) {
+        QuorumBlockInput in;
+        in.height     = h;
+        in.block_hash = boot_hash(h, 'b');
+        hash_at[h]    = in.block_hash;
+        auto r = eng.observe_block(in);
+        ASSERT_TRUE(r.ok)
+            << "observe refused at h=" << h << ": " << r.error
+            << "  (on master the rotated lane is refused below the V20 floor "
+               "1987776 — this is the h=1738698 fail-closed)";
+    }
+
+    // (b) The first FULL rotated cycle (1738656) resolves a 60-member type-5
+    // set — the set the fold needs at 1738698. Its quorums are stored keyed by
+    // the cycle base + quorumIndex; probe the whole 32-slot ring.
+    for (uint32_t off = 0; off < 32; ++off) {
+        auto m = eng.members_for(5, hash_at[kFullCycle + off]);
+        ASSERT_TRUE(m.has_value())
+            << "rotated type-5 members unresolved at cycle-base slot " << off;
+        EXPECT_EQ(m->size(), 60u)
+            << "quorumIndex " << off << " is not a full LLMQ_60_75 set";
+    }
+
+    // (c) The three bootstrap cycles fall through at 15 / 30 / 45 members — each
+    // < minSize 50, i.e. a NULL commitment with no member-set consumer.
+    auto c1 = eng.members_for(5, hash_at[1'737'792]);
+    auto c2 = eng.members_for(5, hash_at[1'738'080]);
+    auto c3 = eng.members_for(5, hash_at[1'738'368]);
+    ASSERT_TRUE(c1 && c2 && c3);
+    EXPECT_EQ(c1->size(), 15u);
+    EXPECT_EQ(c2->size(), 30u);
+    EXPECT_EQ(c3->size(), 45u);
+    EXPECT_LT(c1->size(), 50u);
+    EXPECT_LT(c2->size(), 50u);
+    EXPECT_LT(c3->size(), 50u);
+
+    // The engine never poisoned: every stop on this path is a named skip, not a
+    // hard fault.
+    EXPECT_FALSE(eng.poisoned()) << "bootstrap must not poison";
+}
+
+#ifdef DASH_ROTATED_PREV20_BOOTSTRAP
+// (d): skipRemovedMNs is a V19 gate. A previous-quarter member that has DEPARTED
+// the H list is DROPPED post-V19 (skip_removed_mns=true) but STILL CONSUMES its
+// used-slot pre-V19 (skip_removed_mns=false, v18.2.2 ground truth — the DIP0024
+// bootstrap window [1737792,1899072) is pre-V19). Construction forces the
+// difference to be observable: index 1's H-list candidates are all already used,
+// so the departed member is the deciding extra candidate.
+//
+// This case references the skip_removed_mns parameter added by the fix, so it is
+// compiled only when the fixed header is present (DASH_ROTATED_PREV20_BOOTSTRAP)
+// — the same TU still builds against master for the red-on-master run above.
+TEST(DashReplayQuorumEngine, KatRotatedBootstrapSkipRemovedMnsIsAV19Gate)
+{
+    using dash::coin::replay::rotdetail::build_new_quarter_members;
+    using dash::coin::replay::rotdetail::MnRef;
+
+    // H work list M0..M4 (5 valid). prev_list additionally holds a DEPARTED MN
+    // Mdep (present in a previous quarter, absent from the H list).
+    std::vector<QuorumMnEntry> work_list(5);
+    for (size_t i = 0; i < work_list.size(); ++i) {
+        auto& e = work_list[i];
+        std::string h(64, '0');
+        h[30] = "0123456789abcdef"[i & 0xf];
+        h[63] = '1';
+        e.proTxHash.SetHex(h);
+        h[0] = '2';
+        e.confirmedHash.SetHex(h);
+        e.is_valid = true;
+    }
+    std::vector<QuorumMnEntry> prev_list = work_list;   // same M0..M4 ...
+    QuorumMnEntry mdep;                                  // ... plus a departed MN
+    mdep.proTxHash.SetHex(
+        "00000000000000000000000000000000000000000000000000000000deadbeef");
+    mdep.confirmedHash.SetHex(
+        "00000000000000000000000000000000000000000000000000000000feedface");
+    mdep.is_valid = true;
+    prev_list.push_back(mdep);
+    const uint256 mdep_hash = mdep.proTxHash;
+
+    // 2 quorum indexes. Previous quarter (H-C) at index 0 = {Mdep}; at index 1 =
+    // {M0..M3} (all present). H-2C / H-3C empty.
+    std::array<std::vector<std::vector<MnRef>>, 3> prev{};
+    prev[0].assign(2, {});
+    prev[0][0] = { &prev_list[5] };                              // Mdep
+    prev[0][1] = { &prev_list[0], &prev_list[1],
+                   &prev_list[2], &prev_list[3] };               // M0..M3
+    prev[1].assign(2, {});
+    prev[2].assign(2, {});
+
+    uint256 modifier;
+    modifier.SetHex(
+        "abababababababababababababababababababababababababababababababab01");
+
+    auto post_v19 = build_new_quarter_members(
+        /*num_quorums=*/2, /*quarter_size=*/2, work_list, modifier, prev,
+        /*skip_removed_mns=*/true);
+    auto pre_v19 = build_new_quarter_members(
+        2, 2, work_list, modifier, prev, /*skip_removed_mns=*/false);
+    ASSERT_TRUE(post_v19.has_value());
+    ASSERT_TRUE(pre_v19.has_value());
+
+    auto contains = [](const std::vector<std::vector<MnRef>>& quarters,
+                       const uint256& h) {
+        for (const auto& q : quarters)
+            for (MnRef m : q)
+                if (m->proTxHash == h) return true;
+        return false;
+    };
+
+    // Post-V19: Mdep is dropped BEFORE it can enter the candidate pool, so
+    // index 1 has only M4 left and completes SHORT (1 member); Mdep never
+    // appears anywhere.
+    EXPECT_EQ(post_v19->quarters[1].size(), 1u);
+    EXPECT_FALSE(contains(post_v19->quarters, mdep_hash))
+        << "post-V19 skipRemovedMNs must DROP the departed member";
+
+    // Pre-V19: Mdep is retained as a used candidate, so index 1 has {M4, Mdep}
+    // and completes FULL (2 members) with the departed member placed.
+    EXPECT_EQ(pre_v19->quarters[1].size(), 2u);
+    EXPECT_TRUE(contains(pre_v19->quarters, mdep_hash))
+        << "pre-V19 keeps the departed member in the used set (v18.2.2 truth)";
+
+    // The gate is load-bearing: the two eras do not agree.
+    EXPECT_NE(post_v19->quarters[1].size(), pre_v19->quarters[1].size());
+}
+#endif  // DASH_ROTATED_PREV20_BOOTSTRAP
