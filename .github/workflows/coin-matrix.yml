@@ -201,13 +201,15 @@ jobs:
         # daemonless self-derive path with NO --coin-rpc arm. Selector is pinned
         # to the #1293 dashd-cut family (test_dash_replay_*, test_dash_mn_checkpoint,
         # test_dash_preanchor_header_backfill). --no-tests=error makes an empty
-        # selector FAIL LOUD rather than fake-green. Finalize the ctest -R once
-        # that family is on master.
+        # selector FAIL LOUD rather than fake-green. Selector FINALIZED against
+        # the real CamelCase gtest suites (gtest_add_tests AUTO): DashBlockReplay
+        # in test_dash_block_replay + DashReplay*/DashMnCheckpoint*/DashMnPayee*/
+        # DashMnAnchor*/DashMnBridge* in test_dash_mn_state, plus ReplayUtxo* fold.
         run: |
           cmake --build build_${{ matrix.coin }} -j$(nproc)
           ctest --test-dir build_${{ matrix.coin }} \
             --output-on-failure --no-tests=error \
-            -R 'dash.*(replay|mn_checkpoint|preanchor|daemonless)'
+            -R '^(DashBlockReplay|DashReplay|DashMnCheckpoint|DashMnPayee|DashMnAnchor|DashMnBridge|ReplayUtxo)'
 
       - name: Upload build artifacts on failure
         if: failure() && steps.presence.outputs.exists == '1'
