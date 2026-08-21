@@ -82,6 +82,31 @@ namespace dash {
 namespace coin {
 namespace vendor {
 
+// TEST SEAM (task #154 incremental-merkle cache). Two finer-grained counters
+// that measure the ACTUAL SHA256 work, wherever it happens — the naive full
+// recompute AND the incremental cache (incremental_sml_merkle.hpp) bump these
+// SAME sites, so a fold that re-hashes all ~4900 leaves every block and one
+// that re-hashes only the handful that changed produce directly comparable
+// numbers.
+//   * sml_leaf_hash_count() — one bump per CSimplifiedMNListEntry::CalcHash()
+//     (the expensive ~200-byte serialize + SHA256d of a single MN leaf).
+//   * sml_node_hash_count() — one bump per internal merkle pair-hash (the
+//     64-byte SHA256d of two child node hashes).
+// Declared ahead of the entry struct because CalcHash() (a member) bumps the
+// leaf counter. Same single-io-thread discipline as sml_calc_merkle_root_count
+// (declared below): plain uint64, no atomics.
+inline uint64_t& sml_leaf_hash_count()
+{
+    static uint64_t n = 0;
+    return n;
+}
+
+inline uint64_t& sml_node_hash_count()
+{
+    static uint64_t n = 0;
+    return n;
+}
+
 struct CSimplifiedMNListEntry
 {
     static constexpr uint16_t VER_LEGACY_BLS = 1;
@@ -167,6 +192,7 @@ struct CSimplifiedMNListEntry
     // OMITTED, per-entry nVersion-conditional fields are HONOURED.
     uint256 CalcHash() const
     {
+        ++sml_leaf_hash_count();   // #154 seam — one leaf serialize+SHA256d
         ::PackStream s;
         s << proRegTxHash;
         s << confirmedHash;
@@ -291,14 +317,16 @@ public:
 
     size_t size() const { return mnList.size(); }
 
-private:
-    // Standard Bitcoin/Dash SHA256d-pairwise merkle root with
-    // duplicate-last-on-odd. Inlined from
-    // ltc::coin::compute_merkle_root() to keep this header free of
-    // mweb_builder.hpp's btclibs/serialize.h transitive include —
-    // see preamble re landmine #1.
+    // Standard Bitcoin/Dash SHA256d of two 32-byte child node hashes with
+    // duplicate-last-on-odd pairing. Inlined from ltc::coin::compute_merkle_
+    // root() to keep this header free of mweb_builder.hpp's btclibs/serialize.h
+    // transitive include — see preamble re landmine #1. PUBLIC so the
+    // incremental cache (incremental_sml_merkle.hpp) reuses this EXACT routine
+    // — one pairing implementation, byte-identical between the naive and
+    // incremental paths by construction, and one node-hash counting site.
     static uint256 merkle_pair_hash(const uint256& a, const uint256& b)
     {
+        ++sml_node_hash_count();   // #154 seam — one internal pair SHA256d
         uint256 out;
         CHash256()
             .Write(std::span<const unsigned char>(a.data(), 32))
@@ -307,6 +335,7 @@ private:
         return out;
     }
 
+private:
     static uint256 compute_merkle_root_local(std::vector<uint256> hashes)
     {
         if (hashes.empty()) return uint256::ZERO;
