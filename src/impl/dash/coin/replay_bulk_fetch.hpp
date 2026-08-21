@@ -86,6 +86,7 @@
 #include "block.hpp"
 #include "block_producer.hpp"   // block_body_binds_to_header (body↔header bind)
 #include "header_chain.hpp"     // check_pow / x11_hash / DashChainParams
+#include "bulk_peer_policy.hpp" // #154 weighted_peer_inflight (LEVER 2 pure logic)
 
 #include <core/leveldb_store.hpp>
 #include <core/log.hpp>
@@ -793,6 +794,14 @@ public:
     {
         uint32_t window{2000};            // max heights ahead of the delivered cursor (spec §4.3 bounded work-ahead)
         uint32_t per_peer_inflight{32};   // outstanding bodies per peer (keeps reply queues short — priority inv. 4)
+        // #154 LEVER 2 floor: the minimum per-peer inflight window a peer keeps
+        // even when it is the slowest deliverer. effective_per_peer_inflight()
+        // scales linearly across [min_peer_inflight, per_peer_inflight] by the
+        // peer's DELIVERED throughput relative to the fastest peer, so a slow /
+        // timing-out peer can no longer claim a wide contiguous low-height range
+        // and stall the in-order delivery cursor. Set == per_peer_inflight to
+        // restore byte-identical flat round-robin.
+        uint32_t min_peer_inflight{8};
         uint32_t batch{16};               // invs per getdata message
         int64_t  request_timeout_sec{30}; // unanswered this long ⇒ re-request elsewhere
         // dashd net_processing BLOCK_STALLING_TIMEOUT parity (reactive half of
@@ -880,6 +889,24 @@ public:
     uint64_t notfound_count() const { return m_notfound; }
     uint64_t timeout_count() const { return m_timeouts; }
     const std::map<std::string, PeerTally>& tallies() const { return m_tallies; }
+
+    /// #154 LEVER 2: this peer's throughput-weighted inflight window. Scales
+    /// across [min_peer_inflight, per_peer_inflight] by the peer's DELIVERED
+    /// block count relative to the fastest peer in the set. Degenerate cold
+    /// start (no peer has delivered ⇒ flat per_peer_inflight) is byte-identical
+    /// to the pre-#154 round-robin. Public so the KAT asserts the weighting and
+    /// the flat degenerate case on the REAL scheduler state.
+    uint32_t effective_per_peer_inflight(const std::string& peer) const
+    {
+        uint64_t max_delivered = 0;
+        for (const auto& [key, t] : m_tallies)
+            max_delivered = std::max(max_delivered, t.blocks);
+        auto it = m_tallies.find(peer);
+        const uint64_t mine = (it == m_tallies.end()) ? 0 : it->second.blocks;
+        return bulkpolicy::weighted_peer_inflight(
+            m_cfg.per_peer_inflight, m_cfg.min_peer_inflight, mine,
+            max_delivered);
+    }
 
     /// Peers currently held off fresh-range assignment (stall-demoted). Purely
     /// observational — for telemetry / the live [BULK] line.
@@ -1043,13 +1070,19 @@ public:
         {
             const std::string& peer = peers[(m_rr + pi) % peers.size()];
             auto& tally = m_tallies[peer];
-            if (tally.inflight >= m_cfg.per_peer_inflight) continue;
+            // #154 LEVER 2: throughput-weighted per-peer inflight ceiling (flat
+            // per_peer_inflight until peers have delivered, then the fast local /
+            // archival deliverer earns a wider window and a slow / timing-out
+            // peer a narrower one — so the laggard cannot hold a wide contiguous
+            // low-height range and stall the in-order delivery cursor).
+            const uint32_t peer_cap = effective_per_peer_inflight(peer);
+            if (tally.inflight >= peer_cap) continue;
             // A demoted peer still takes retries below, but is skipped for fresh
             // contiguous ranges while any healthy peer remains.
             const bool fresh_ok =
                 !any_fresh_eligible || tally.demoted_until <= now;
             uint32_t capacity = std::min<uint32_t>(
-                m_cfg.batch, m_cfg.per_peer_inflight - tally.inflight);
+                m_cfg.batch, peer_cap - tally.inflight);
 
             Assignment a;
             a.peer = peer;

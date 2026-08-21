@@ -90,6 +90,7 @@
 #include <impl/dash/crypto/hash_x11.hpp>   // block identity on Dash = X11(header)
 #include <impl/dash/coin/governance_object.hpp> // govobject_hash / govvote_signature_hash (dashcore-exact digests)
 #include <impl/dash/coin/historical_sml.hpp>    // HistoricalMnListDiffDemux (reward-critical tip/historical split)
+#include <impl/dash/coin/bulk_peer_policy.hpp>   // #154 select_bulk_eligible_keys (LEVER 1 pure logic)
 
 #include <algorithm>
 #include <chrono>
@@ -107,6 +108,7 @@
 
 #include <core/config.hpp>
 #include <core/log.hpp>
+#include <core/netaddress.hpp>   // classify_address / AddrClass (#154 protected-local primary predicate)
 #include <core/random.hpp>
 #include <core/factory.hpp>
 #include <core/timer.hpp>
@@ -1410,7 +1412,8 @@ public:
     /// fallback: if the CanServeBlocks filter empties the set (a transient
     /// all-pruned/all-demoted pool), fall back to the raw handshaked set so the
     /// lane never freezes — the same Pass-0/Pass-1 shape as next_bulk_peer().
-    /// Primary excluded unless it is the only survivor (priority invariant 1).
+    /// A REMOTE primary is excluded unless it is the only survivor (priority
+    /// invariant 1); a pinned PROTECTED-LOCAL primary is KEPT (see #154 below).
     std::vector<std::string> eligible_bulk_peer_keys() const
     {
         std::vector<std::string> serving, handshaked;
@@ -1423,10 +1426,29 @@ public:
         }
         std::vector<std::string> keys =
             serving.empty() ? std::move(handshaked) : std::move(serving);
-        const std::string prim = primary_peer_key();
-        if (keys.size() > 1 && !prim.empty())
-            keys.erase(std::remove(keys.begin(), keys.end(), prim), keys.end());
-        return keys;
+        // #154 LEVER 1: priority invariant 1 keeps the bulk lane off the PRIMARY
+        // while any other handshaked peer exists — but that invariant exists only
+        // to protect the live-tip request/response legs a REMOTE primary carries.
+        // A pinned PROTECTED-LOCAL primary (a loopback / LAN archival dashd — the
+        // "Protected local dashd node") carries no tip-lane pressure during a
+        // historical replay and is the FASTEST bulk deliverer, so it stays
+        // bulk-eligible. The pure decision lives in bulkpolicy so this shipped
+        // path and the KAT exercise identical logic.
+        return bulkpolicy::select_bulk_eligible_keys(
+            std::move(keys), primary_peer_key(), primary_is_protected_local());
+    }
+
+    /// True when the PRIMARY is a pinned PROTECTED-LOCAL dashd node: its address
+    /// classifies as loopback or private-LAN (AddrClass loopback / private_net —
+    /// the same local/private class CoinPeerManager::set_local_node pins as the
+    /// "Protected local dashd node"). #154: such a primary is kept bulk-eligible;
+    /// a REMOTE primary (routable) is still excluded from the bulk lane. No
+    /// primary ⇒ false (nothing to protect, nothing to keep).
+    bool primary_is_protected_local() const
+    {
+        if (!m_primary) return false;
+        const AddrClass c = classify_address(m_primary->addr.address());
+        return c == AddrClass::loopback || c == AddrClass::private_net;
     }
 
     /// dashd FindNextBlocksToDownload per-(peer,height) coverage for the replay

@@ -361,6 +361,14 @@ target_link_libraries(dash_hdr_backfill_window_kat
 )
 add_test(NAME dash_hdr_backfill_window_kat COMMAND dash_hdr_backfill_window_kat)
 
+# #154 daemonless bulk-fetch dashd-parity KAT (LEVER 1 protected-local primary
+# stays bulk-eligible; LEVER 2 throughput-weighted per-peer inflight) is NOT a
+# standalone target here: it was folded into the already-allowlisted
+# test/test_dash_p2p_node gtest target as test_dash_bulk_local_primary_kat.cpp
+# so CI's "Build tests" --target list actually compiles+runs it. A standalone
+# executable was never in the allowlist and became a NOT_BUILT/"Not Run" CTest
+# sentinel that red the suite (the #769 unregistered-KAT class).
+
 # Windows: Boost.Asio requires Winsock libraries; /bigobj for large translation units
 if(WIN32)
     target_link_libraries(c2pool ws2_32 mswsock bcrypt dbghelp)
