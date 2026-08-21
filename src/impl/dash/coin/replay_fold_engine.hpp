@@ -863,6 +863,20 @@ public:
         // the named height instead of serving wrong bytes.
         r.computed_root = compute_sml_root();
         if (r.computed_root != r.committed_root) {
+            {
+                size_t nban = 0;
+                for (const auto& kv : m_entries) {
+                    if (kv.second.IsBanned()) ++nban;
+                    if (dbg_is_target154(kv.first))
+                        LOG_INFO << "[TARGET-DUMP] h=" << height << " protx="
+                                 << kv.first.GetHex().substr(0,16) << " penalty="
+                                 << kv.second.nPoSePenalty << " banned="
+                                 << kv.second.IsBanned() << " max="
+                                 << calc_max_pose_penalty();
+                }
+                LOG_INFO << "[TARGET-DUMP] h=" << height
+                         << " my_banned_total=" << nban;
+            }
             r.error = "DML FOLD ROOT MISMATCH at h=" + std::to_string(height)
                     + ": folded merkleRootMNList " + r.computed_root.GetHex()
                     + " != committed cbTx root " + r.committed_root.GetHex()
@@ -1635,6 +1649,22 @@ private:
                    "platform-quorum evo_only defect class); failing closed so "
                    "the dropped PoSe punishes cannot silently diverge the root";
 
+        // DBG: full ordered member-list dump for the divergent quorum.
+        if (qc.commitment.quorumHash.GetHex() ==
+            "000000000000003254410f6efdfd9fb1231976275ff362cfdaa5f959831edc6b") {
+            LOG_INFO << "[QDUMP] quorumHash=...325441 llmqType="
+                     << int(qc.commitment.llmqType) << " H=" << H
+                     << " members=" << members->size()
+                     << " validBits=" << qc.commitment.validMembers.size();
+            for (size_t i = 0; i < members->size(); ++i) {
+                const bool vb = (i < qc.commitment.validMembers.size())
+                                    ? bool(qc.commitment.validMembers[i]) : true;
+                LOG_INFO << "[QDUMP]  idx=" << i << " protx="
+                         << (*members)[i].GetHex() << " valid=" << vb
+                         << (dbg_is_target154((*members)[i]) ? " <==1a1cee4d" : "");
+            }
+        }
+
         // HandleQuorumCommitment (specialtxman.cpp:159-174): punish every
         // invalid-marked member still present in the list.
         for (size_t i = 0; i < members->size(); ++i) {
@@ -1642,7 +1672,19 @@ private:
             auto it = m_entries.find(protx);
             if (it == m_entries.end()) continue;
             if (qc.commitment.validMembers[i]) continue;
+            const bool dbg_t = dbg_is_target154(protx);
+            if (dbg_t)
+                LOG_INFO << "[TARGET-PUNISH] h=" << H << " type="
+                         << int(qc.commitment.llmqType) << " qh="
+                         << qc.commitment.quorumHash.GetHex().substr(0,16)
+                         << " idx=" << i << " penBefore="
+                         << it->second.nPoSePenalty
+                         << " max=" << calc_max_pose_penalty();
             pose_punish(it->second, protx, calc_penalty(66), H, r);
+            if (dbg_t)
+                LOG_INFO << "[TARGET-PUNISH]   -> penAfter="
+                         << it->second.nPoSePenalty << " banned="
+                         << it->second.IsBanned();
         }
         return {};
     }
@@ -1651,6 +1693,13 @@ private:
     /// penalty += p, saturate at CalcMaxPoSePenalty; crossing max on a
     /// not-yet-banned MN ⇒ ban — the isValid flip that changes the SML root
     /// (the 2516412/2516435 case-D events).
+    static bool dbg_is_target154(const uint256& p) {
+        const std::string h = p.GetHex();
+        return h == "1a1cee4d9c5da1341e84d8979db56ffaf02887e5177a60f17b887da278469b62"
+            || h == "92621390174260d6d9028c2320f574cf3f2a922fa98aa4c14fbad2600425c38b"
+            || h == "ecb943dd503dd1ef8f7a0da8ae9d11c49404145c16e0ab234bb5c58d842d1394";
+    }
+
     void pose_punish(ReplayMNState& st, const uint256& protx,
                      int32_t penalty, int32_t H, FoldResult& r)
     {
