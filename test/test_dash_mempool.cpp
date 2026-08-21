@@ -1832,3 +1832,109 @@ TEST(DashMempoolConsecutiveFailed, ResetPerAdmittedPackagePreventsBreak)
         << "with the per-package reset, 600+600 non-consecutive failures never "
            "reach 1001 in a row → no break → FINAL is still selected";
 }
+
+// ─── MNHF/EHF-signal auto-prioritise (dashd txmempool.cpp:701-702) ────────────
+//
+// dashd's CTxMemPool::addUnchecked applies PrioritiseTransaction(hash, 0.1*COIN)
+// to EVERY type-7 (TRANSACTION_MNHF_SIGNAL) tx at admission — a deterministic
+// mapDeltas write that every node reproduces. These EHF-signal txs are ~0-fee on
+// the wire but MUST sort to the top of the block template. Without the delta the
+// embedded ancestor-score selector orders them at their base feerate, so a
+// higher-fee ordinary tx precedes them → the served tx-set (and its tx-merkle
+// root) diverges from dashd's getblocktemplate.
+//
+// This trio pins the fix:
+//   1. a low-base-fee type-7 tx OUTRANKS a much higher-fee ordinary tx in the
+//      template  (RED on master: no delta ⇒ type-7 sorts SECOND);
+//   2. the auto-delta touches ONLY modified_fee(): the raw base fee that feeds
+//      SelectedTx.fee and total_fees → coinbasevalue is UNCHANGED  (reward-safe:
+//      the coinbase can never be overstated by the delta);
+//   3. an identical-shape type-0 tx gets NO delta  (the change is type-scoped);
+//   4. a type-7 tx whose input the UTXO fold cannot price stays
+//      fee_fold_proven==false ⇒ template-EXCLUDED  (fail-closed withhold).
+
+// Build a priced type-7 EHF-signal tx: one input worth `in_val`, one output of
+// `in_val - base_fee`, nType=7, version=3 (dashd SPECIAL_VERSION). Seeds the
+// coin into `utxo` so compute_fee_locked can price it.
+static MutableTransaction make_mnhf_signal(UTXOViewCache& utxo, uint32_t seed,
+                                           int64_t in_val, int64_t base_fee) {
+    uint256 prev = mint_hash(seed);
+    utxo.add_coin(Outpoint(prev, 0), Coin(in_val, {}, /*height=*/1, /*cb=*/false));
+    MutableTransaction tx = make_spend(prev, 0, in_val - base_fee, /*salt=*/seed);
+    tx.version = 3;   // dashd SPECIAL_VERSION (payload-bearing special tx)
+    tx.type    = 7;   // TRANSACTION_MNHF_SIGNAL
+    return tx;
+}
+
+TEST(DashMempool, MnhfSignalAutoPrioritiseSortsToTopButFeeStaysBase)
+{
+    UTXOViewCache utxo(nullptr);
+    Mempool mp; mp.set_utxo(&utxo);
+
+    // A high-fee ordinary tx: 50'000 duffs on a ~one-input/one-output body.
+    uint256 prevN = mint_hash(70'002);
+    utxo.add_coin(Outpoint(prevN, 0), Coin(100'000, {}, 1, false));
+    auto norm = make_spend(prevN, 0, 50'000, /*salt=*/70'002);   // base fee 50'000
+    // A LOW-fee EHF signal: only 1'000 duffs base fee (far lower feerate).
+    auto mnhf = make_mnhf_signal(utxo, /*seed=*/70'001,
+                                 /*in_val=*/100'000, /*base_fee=*/1'000);
+
+    ASSERT_TRUE(mp.add_tx(norm));
+    ASSERT_TRUE(mp.add_tx(mnhf));
+
+    const uint256 mnhf_id = dash_txid(mnhf);
+    const uint256 norm_id = dash_txid(norm);
+
+    // Entry-level: the +0.1 COIN delta lands on modified_fee() only.
+    auto em = mp.get_entry(mnhf_id);
+    ASSERT_TRUE(em.has_value());
+    EXPECT_TRUE(em->fee_fold_proven) << "priced type-7 is fold-proven → selectable";
+    EXPECT_EQ(em->fee, 1'000u)        << "raw/base fee (accounting) is untouched";
+    EXPECT_EQ(em->modified_fee(), 1'000u + 10'000'000u)
+        << "dashd auto-prioritise: base + 0.1 COIN modified fee";
+
+    auto en = mp.get_entry(norm_id);
+    ASSERT_TRUE(en.has_value());
+    EXPECT_EQ(en->modified_fee(), 50'000u)
+        << "ordinary tx carries NO auto-delta (modified == base)";
+
+    // Template-level: the EHF signal sorts to the TOP despite its lower base
+    // feerate, and the coinbase-facing fee accounting excludes the delta.
+    auto [sel, total_fees] = mp.get_sorted_txs_with_fees(1u << 20);
+    ASSERT_EQ(sel.size(), 2u);
+    EXPECT_EQ(dash_txid(sel[0].tx), mnhf_id)
+        << "MNHF/EHF signal must be first — the auto-prioritise delta outranks "
+           "a higher-base-fee ordinary tx (RED on master without the delta)";
+    EXPECT_EQ(dash_txid(sel[1].tx), norm_id);
+    // SelectedTx.fee and total_fees are BASE fees (dashd AddToBlock nFees +=
+    // GetFee(), never the modified fee) — the delta must not inflate coinbase.
+    EXPECT_EQ(sel[0].fee, 1'000u)   << "served fee for the EHF tx is its base fee";
+    EXPECT_EQ(total_fees, 51'000u)
+        << "total_fees → coinbasevalue sums BASE fees only; the 0.1 COIN "
+           "prioritise delta must NEVER enter the coinbase (reward-safety)";
+}
+
+TEST(DashMempool, MnhfSignalUnpriceableIsFailClosed)
+{
+    // A type-7 EHF signal whose input is NOT in our UTXO view. dashd still
+    // records the mapDeltas prioritise, but the embedded exclusion discipline
+    // cannot PROVE the fee (fee_fold_proven stays false) → the tx is withheld
+    // from the template. Fail-closed: an unprovable tx is never served.
+    UTXOViewCache utxo(nullptr);     // empty view — input unpriceable
+    Mempool mp; mp.set_utxo(&utxo);
+
+    uint256 prev = mint_hash(70'050);   // deliberately NOT added to the view
+    MutableTransaction mnhf = make_spend(prev, 0, 99'000, /*salt=*/70'050);
+    mnhf.version = 3; mnhf.type = 7;
+    ASSERT_TRUE(mp.add_tx(mnhf));       // admitted to the relay pool …
+
+    auto e = mp.get_entry(dash_txid(mnhf));
+    ASSERT_TRUE(e.has_value());
+    EXPECT_FALSE(e->fee_fold_proven)
+        << "unpriceable type-7 must NOT be fold-proven";
+
+    auto [sel, total_fees] = mp.get_sorted_txs_with_fees(1u << 20);
+    EXPECT_TRUE(sel.empty())
+        << "fail-closed: an unpriceable EHF signal is WITHHELD from the template";
+    EXPECT_EQ(total_fees, 0u);
+}
