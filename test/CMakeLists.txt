@@ -889,12 +889,23 @@ if (BUILD_TESTING AND GTest_FOUND)
     # backward-walk with the fail-closed missing-row inversion, 'F'
     # wipe-on-mismatch and the startup newest-pair verify. Same allowlisted
     # target, same #143 NOT_BUILT reason. Links leveldb (via core).
+    # Seventh TU (OPTIONAL, default-OFF V20 getmnlistdiff seed):
+    # test_dash_replay_mnlist_seed.cpp — the path-ii escape hatch for #154
+    # (mnlist_seed.hpp). Proves the arming policy (source must be
+    # "getmnlistdiff", height required and >= the V20 floor, file required,
+    # height/network must match the snapshot) and the REUSED reward-safety root
+    # gate (seed_engine_from_prestate): a valid getmnlistdiff seed loads +
+    # verifies + is fold-ready at H, and a seed whose committed root != computed
+    # FAILS CLOSED. Folded into this SAME allowlisted target for the #143/#769
+    # NOT_BUILT reason (a standalone add_executable is not in build.yml's
+    # --target list and would silently report "Not Run").
     add_executable(test_dash_mn_state test_dash_mn_state.cpp
                    test_dash_mn_diff_store.cpp
                    test_dash_replay_fold.cpp
                    test_dash_replay_run.cpp
                    test_dash_replay_quorum_seam.cpp
-                   test_dash_replay_payee_publish.cpp)
+                   test_dash_replay_payee_publish.cpp
+                   test_dash_replay_mnlist_seed.cpp)
     target_link_libraries(test_dash_mn_state PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
