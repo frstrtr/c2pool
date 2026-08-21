@@ -100,6 +100,7 @@
 #include <impl/dash/coin/replay_bulk_fetch.hpp>  // W2: full-history replay bulk block-fetch lane (--replay-bulk)
 #include <impl/dash/coin/replay_utxo_fold.hpp>   // W3: full-history replay standalone UTXO fold (--replay-utxo-*)
 #include <impl/dash/coin/replay_prestate.hpp>    // W5: anchor prestate loader (--replay-fold-prestate)
+#include <impl/dash/coin/mnlist_seed.hpp>        // OPTIONAL V20 getmnlistdiff seed (--replay-mnlist-seed-*, #154 escape hatch)
 #include <impl/dash/coin/replay_fold_consumer.hpp> // W5: bulk lane -> W1 DML fold + per-block root check
 #include <impl/dash/coin/replay_quorum_bridge.hpp> // SEAM: W4 quorum lane <-> W1 MembersFn
 #include <impl/dash/coin/replay_payee_publish.hpp> // SEAM: W1 fold -> the PAYEE queue that gates serving
@@ -281,6 +282,18 @@ std::string g_replay_fold_prestate;           // --replay-fold-prestate FILE
 bool        g_replay_fold_quorums = false;    // --replay-fold-quorums
 std::string g_replay_fold_qsnapshot;          // --replay-fold-qsnapshot FILE
 std::string g_replay_fold_worklists;          // --replay-fold-worklists FILE
+// ── OPTIONAL, DEFAULT-OFF V20 getmnlistdiff SEED (path-ii escape hatch for
+// #154 — mnlist_seed.hpp). When ALL THREE are absent nothing below changes and
+// the from-DIP3 default is byte-identical to master. When armed, the fold is
+// SEEDED from a dashd getmnlistdiff snapshot at/after the V20 activation floor
+// (mainnet 1'987'776) instead of DERIVED from DIP3, sidestepping the pre-v19
+// rotated-quorum derivation for the checkpoint-generation use case. The seed's
+// merkleRootMNList must reproduce the committed root at the seed height
+// (seed_engine_from_prestate, fail-closed) BEFORE any block is folded forward;
+// from H+1 the normal per-block byte-exact self-check is unchanged.
+uint32_t    g_replay_mnlist_seed_height = 0;  // --replay-mnlist-seed-height H (0 => disarmed)
+std::string g_replay_mnlist_seed_source;      // --replay-mnlist-seed-source getmnlistdiff
+std::string g_replay_mnlist_seed_file;        // --replay-mnlist-seed-file FILE (offline snapshot)
 // --embedded-no-dashd-mn-seed: cut the PAYEE axis off from dashd while KEEPING
 // the dashd RPC for the OBSERVE-only shadow-compare. The E2c `protx list` seed
 // and the E2d checkpoint bridge are both skipped, so the root-checked replay
@@ -424,6 +437,7 @@ void print_banner(const char* argv0)
         << "           [--replay-bulk] [--replay-bulk-capture DIR] [--replay-bulk-start H]\n"
         << "           [--replay-fold-prestate FILE] [--replay-fold-quorums]\n"
         << "           [--replay-fold-qsnapshot FILE] [--replay-fold-worklists FILE]\n"
+        << "           [--replay-mnlist-seed-height H --replay-mnlist-seed-source getmnlistdiff --replay-mnlist-seed-file FILE]\n"
         << "           [--replay-mined-commitment-index]\n"
         << "           [--embedded-no-dashd-mn-seed]\n"
         << "           [--oracle-graduation-blocks N] [--oracle-class-coverage K]\n"
@@ -548,6 +562,16 @@ void print_banner(const char* argv0)
         << "        without any anchor-supplied member set;\n"
         << "        --replay-fold-qsnapshot FILE seeds ONLY the pre-anchor\n"
         << "        rotated-cycle snapshots a Phase-1 run cannot have produced.\n"
+        << "        --replay-mnlist-seed-height H (with --replay-mnlist-seed-source\n"
+        << "        getmnlistdiff and --replay-mnlist-seed-file FILE) is an\n"
+        << "        OPTIONAL, DEFAULT-OFF escape hatch (path-ii, #154): instead of\n"
+        << "        DERIVING pre-V20 state from DIP3, SEED the fold from a dashd\n"
+        << "        getmnlistdiff snapshot at/after the V20 floor (mainnet\n"
+        << "        1987776) and walk V20+ ONLY, sidestepping the pre-v19\n"
+        << "        rotated-quorum derivation for checkpoint generation. The seed\n"
+        << "        must reproduce the committed merkleRootMNList at H (fail-closed)\n"
+        << "        before any block folds; from H+1 the self-check is unchanged.\n"
+        << "        When these flags are ABSENT the from-DIP3 default is untouched.\n"
         << "        THE SERVE SEAM: once the fold is PROVEN CURRENT (not\n"
         << "        poisoned, DIVERGED=none, roots_matched == folded, the list\n"
         << "        re-hashes to the root its last block committed, cursor AT\n"
@@ -6615,13 +6639,49 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // computed merkleRootMNList checked byte-exact against that
             // block's own committed cbTx root — the per-block proof.
             uint32_t replay_fold_anchor = 0;
-            if (!g_replay_fold_prestate.empty()) {
-                auto ps = rp::load_prestate_file(g_replay_fold_prestate);
-                if (!ps.ok) {
-                    std::cerr << "[run] FATAL: --replay-fold-prestate "
-                              << g_replay_fold_prestate << ": " << ps.error
-                              << "\n";
-                    return 1;
+            // The escape hatch (mnlist_seed.hpp) is armed iff the operator
+            // supplied any --replay-mnlist-seed-* flag; it and the plain
+            // --replay-fold-prestate arm are mutually exclusive seed SOURCES
+            // that converge on the SAME Prestate + SAME root gate below.
+            rp::MnListSeedRequest mnseed_req;
+            mnseed_req.seed_height = g_replay_mnlist_seed_height;
+            mnseed_req.source      = g_replay_mnlist_seed_source;
+            mnseed_req.file        = g_replay_mnlist_seed_file;
+            mnseed_req.testnet     = testnet;
+            const bool mnlist_seed_on = rp::mnlist_seed_armed(mnseed_req);
+            if (mnlist_seed_on && !g_replay_fold_prestate.empty()) {
+                std::cerr << "[run] FATAL: --replay-mnlist-seed-* (V20"
+                             " getmnlistdiff escape hatch) and"
+                             " --replay-fold-prestate are mutually exclusive"
+                             " seed sources — pick one\n";
+                return 1;
+            }
+            if (mnlist_seed_on || !g_replay_fold_prestate.empty()) {
+                rp::Prestate ps;
+                if (mnlist_seed_on) {
+                    ps = rp::load_and_validate_mnlist_seed(mnseed_req);
+                    if (!ps.ok) {
+                        std::cerr << "[run] FATAL: --replay-mnlist-seed-* "
+                                     "(V20 getmnlistdiff escape hatch, #154): "
+                                  << ps.error << "\n";
+                        return 1;
+                    }
+                    std::cout << "[run] V20 MNLIST-SEED ARMED (OPTIONAL, "
+                                 "default-OFF getmnlistdiff escape hatch for"
+                                 " #154 pre-V20 derivation): seeding at h="
+                              << ps.height << " (>= V20 floor "
+                              << rp::mnlist_seed_v20_floor(testnet)
+                              << ") from source '" << mnseed_req.source
+                              << "' — walking V20+ ONLY, per-block self-check"
+                                 " unchanged from H+1\n";
+                } else {
+                    ps = rp::load_prestate_file(g_replay_fold_prestate);
+                    if (!ps.ok) {
+                        std::cerr << "[run] FATAL: --replay-fold-prestate "
+                                  << g_replay_fold_prestate << ": " << ps.error
+                                  << "\n";
+                        return 1;
+                    }
                 }
                 dash::coin::replay::FoldConfig fcfg;
                 fcfg.enabled = true;   // W1 feature flag, explicit opt-in
@@ -8776,6 +8836,23 @@ int main(int argc, char** argv)
             g_replay_fold_qsnapshot = argv[++i];
         else if (std::strcmp(argv[i], "--replay-fold-worklists") == 0 && i + 1 < argc)
             g_replay_fold_worklists = argv[++i];
+        // OPTIONAL, DEFAULT-OFF V20 getmnlistdiff seed (path-ii escape hatch
+        // for #154). Armed only when the operator supplies these; absent, the
+        // from-DIP3 default is untouched. Implies --replay-bulk (the fold has
+        // nothing to walk forward without the lane).
+        else if (std::strcmp(argv[i], "--replay-mnlist-seed-height") == 0 && i + 1 < argc) {
+            g_replay_mnlist_seed_height = static_cast<uint32_t>(
+                std::strtoul(argv[++i], nullptr, 10));
+            g_replay_bulk = true;
+        }
+        else if (std::strcmp(argv[i], "--replay-mnlist-seed-source") == 0 && i + 1 < argc) {
+            g_replay_mnlist_seed_source = argv[++i];
+            g_replay_bulk = true;
+        }
+        else if (std::strcmp(argv[i], "--replay-mnlist-seed-file") == 0 && i + 1 < argc) {
+            g_replay_mnlist_seed_file = argv[++i];
+            g_replay_bulk = true;
+        }
         // PR-2 FORWARD: the mined-commitment store, fed from our own replay.
         else if (std::strcmp(argv[i], "--replay-mined-commitment-index") == 0)
             g_mined_commitment_index = true;
