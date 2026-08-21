@@ -3096,8 +3096,54 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // Fee policy: one roll per job build (p2pool's per-get_work
                 // fee roll); resolve the share identity + donation.
                 const uint32_t roll_x100 = static_cast<uint32_t>(nonce_rng() % 10000u);
+
+                // --redistribute pplns/boost: when the miner's stratum
+                // credentials do NOT decode to a P2PKH script, the share is
+                // minted under a payout identity chosen from the accrued PPLNS
+                // window (weighted-random for pplns; zero-share boost else
+                // pplns for boost). Gather the SAME oracle-window weights the
+                // DASH payout uses (consensus-neutral local choice — every peer
+                // still recomputes identical coinbase outputs). Only walk the
+                // chain when the miner is actually broken-cred AND the mode is
+                // pplns/boost, so miner-ok / fee / donate jobs pay nothing.
+                dash::mint::RedistributeInputs redistribute;
+                {
+                    const bool miner_broken =
+                        !dash::stratum::pubkey_hash_from_p2pkh(payout_script).has_value();
+                    const bool needs_redist =
+                        fee_policy.redistribute ==
+                            dash::mint::MintFeePolicy::Redistribute::PPLNS ||
+                        fee_policy.redistribute ==
+                            dash::mint::MintFeePolicy::Redistribute::BOOST;
+                    if (miner_broken && needs_redist) {
+                        redistribute.candidates =
+                            dash::mint::gather_redistribute_candidates(
+                                guard->chain, mint_params, prev_share_hash,
+                                wd.m_bits);
+                        redistribute.pplns_roll =
+                            (static_cast<uint64_t>(nonce_rng()) << 32) |
+                            static_cast<uint64_t>(nonce_rng());
+                        redistribute.boost_zero_roll =
+                            (static_cast<uint64_t>(nonce_rng()) << 32) |
+                            static_cast<uint64_t>(nonce_rng());
+                        if (fee_policy.redistribute ==
+                                dash::mint::MintFeePolicy::Redistribute::BOOST &&
+                            stratum_server) {
+                            for (const auto& [pk, rate] :
+                                     stratum_server->get_local_addr_rates()) {
+                                if (rate <= 0.0)
+                                    continue;
+                                uint160 h;
+                                std::memcpy(h.data(), pk.data(), 20);
+                                redistribute.connected.push_back(
+                                    dash::pubkey_hash_to_script2(h));
+                            }
+                        }
+                    }
+                }
+
                 auto identity = dash::mint::resolve_mint_identity(
-                    fee_policy, payout_script, roll_x100);
+                    fee_policy, payout_script, roll_x100, redistribute);
                 if (!identity) {
                     static int redist_log = 0;
                     if (redist_log++ % 50 == 0)

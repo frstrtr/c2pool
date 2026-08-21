@@ -807,3 +807,165 @@ TEST(DashMintRunloopPoolShareCap, FrozenDesiredTargetIsTheModulatedOne)
     EXPECT_EQ(built->frozen.desired_target.GetHex(),
         "000000000000016635c48b2e932ea609a3b4aa32cefaa1ba023ea945da766f85");
 }
+
+
+// ── (11-13) --redistribute pplns+boost port KATs ─────────────────────────────
+//
+// The gap these cover: on master resolve_mint_identity's PPLNS/BOOST arms
+// returned std::nullopt ("weighted redistribution engine: later port"), so a
+// miner whose stratum credentials do not decode to a P2PKH script DECLINED the
+// producer job — and pplns is the DEFAULT mode. These KATs assert the port:
+// such a share now resolves to a VALID payout identity chosen weighted-random
+// over the accrued PPLNS window (pplns) or zero-share-boosted then pplns
+// (boost). Consensus-neutral: it only chooses whose PPLNS weight THIS node's
+// broken-cred share carries; every peer recomputes identical coinbase outputs.
+
+// (11) Broken-credential miner under pplns AND boost -> valid identity, not
+//      decline. RED on master (nullopt); GREEN after the selector port.
+TEST(DashMintRunloopRedistribute, PplnsAndBoostResolveBrokenCredToValidIdentity)
+{
+    const auto params = easy_params();
+    dash::ShareTracker tracker;
+    tracker.m_coin_params = params;
+
+    // Chain g1(A) <- g2(B) <- g3(C tip). Oracle window on tip=g3 credits A,B.
+    const uint160 miner_a = h160_uniform(0xa1);
+    const uint160 miner_b = h160_uniform(0xb2);
+    const uint160 miner_c = h160_uniform(0xc3);
+    const uint256 g1 = mint_onto(tracker, params, uint256(), miner_a, 11);
+    ASSERT_FALSE(g1.IsNull());
+    const uint256 g2 = mint_onto(tracker, params, g1, miner_b, 12);
+    ASSERT_FALSE(g2.IsNull());
+    const uint256 g3 = mint_onto(tracker, params, g2, miner_c, 13);
+    ASSERT_FALSE(g3.IsNull());
+
+    const auto wd = make_workdata();
+    auto candidates = dash::mint::gather_redistribute_candidates(
+        tracker.chain, params, g3, wd.m_bits);
+    ASSERT_FALSE(candidates.empty());   // the window has accrued weight
+
+    const auto script_a = dash::pubkey_hash_to_script2(miner_a);
+    const auto script_b = dash::pubkey_hash_to_script2(miner_b);
+    const auto script_c = dash::pubkey_hash_to_script2(miner_c);
+    const std::vector<unsigned char> broken_script = {0x00, 0x14};  // not P2PKH
+
+    auto in_window = [&](const std::vector<unsigned char>& sc) {
+        for (const auto& c : candidates) if (c.payout_script == sc) return true;
+        return false;
+    };
+    EXPECT_TRUE(in_window(script_a));
+    EXPECT_TRUE(in_window(script_b));
+    EXPECT_FALSE(in_window(script_c));   // the tip carries no weight yet
+
+    dash::mint::MintFeePolicy policy;
+    policy.donation_u16 = 66;
+
+    // PPLNS (the DEFAULT): broken cred -> a valid identity from the window.
+    {
+        policy.redistribute = dash::mint::MintFeePolicy::Redistribute::PPLNS;
+        dash::mint::RedistributeInputs ri;
+        ri.candidates = candidates;
+        ri.pplns_roll = 12345;
+        auto id = dash::mint::resolve_mint_identity(policy, broken_script, 5000, ri);
+        ASSERT_TRUE(id.has_value());          // RED on master (was nullopt)
+        EXPECT_TRUE(id->substituted);
+        EXPECT_TRUE(id->payout_script == script_a || id->payout_script == script_b);
+        EXPECT_EQ(id->donation_u16, 66);
+    }
+
+    // BOOST, no connected miners -> degrades to the pplns selector (ltc parity).
+    {
+        policy.redistribute = dash::mint::MintFeePolicy::Redistribute::BOOST;
+        dash::mint::RedistributeInputs ri;
+        ri.candidates = candidates;
+        ri.pplns_roll = 777;
+        auto id = dash::mint::resolve_mint_identity(policy, broken_script, 5000, ri);
+        ASSERT_TRUE(id.has_value());          // RED on master (was nullopt)
+        EXPECT_TRUE(id->payout_script == script_a || id->payout_script == script_b);
+    }
+
+    // BOOST with a connected miner carrying ZERO window weight (C) -> boosted:
+    // the share is minted under C so it begins accruing.
+    {
+        policy.redistribute = dash::mint::MintFeePolicy::Redistribute::BOOST;
+        dash::mint::RedistributeInputs ri;
+        ri.candidates = candidates;
+        ri.connected = { script_c };
+        ri.boost_zero_roll = 0;
+        auto id = dash::mint::resolve_mint_identity(policy, broken_script, 5000, ri);
+        ASSERT_TRUE(id.has_value());
+        EXPECT_EQ(id->payout_script, script_c);
+    }
+
+    // Cold window (no candidates) stays fail-closed under both modes.
+    {
+        dash::mint::RedistributeInputs empty;
+        policy.redistribute = dash::mint::MintFeePolicy::Redistribute::PPLNS;
+        EXPECT_FALSE(
+            dash::mint::resolve_mint_identity(policy, broken_script, 0, empty).has_value());
+        policy.redistribute = dash::mint::MintFeePolicy::Redistribute::BOOST;
+        EXPECT_FALSE(
+            dash::mint::resolve_mint_identity(policy, broken_script, 0, empty).has_value());
+    }
+
+    // A miner WITH valid credentials is never redistributed (keeps its own).
+    {
+        policy.redistribute = dash::mint::MintFeePolicy::Redistribute::PPLNS;
+        dash::mint::RedistributeInputs ri;
+        ri.candidates = candidates;
+        auto id = dash::mint::resolve_mint_identity(policy, script_a, 5000, ri);
+        ASSERT_TRUE(id.has_value());
+        EXPECT_FALSE(id->substituted);
+        EXPECT_EQ(id->payout_script, script_a);
+    }
+}
+
+// (12) The pure deterministic selector core: fixed candidates + fixed roll ->
+//      fixed pick (cumulative weighted-random walk, ltc pick_pplns parity).
+TEST(DashMintRunloopRedistribute, SelectWeightedIsDeterministicAndProportional)
+{
+    using dash::mint::WeightedCandidate;
+    const std::vector<unsigned char> A = {1};
+    const std::vector<unsigned char> B = {2};
+    std::vector<WeightedCandidate> cands = {{A, 10}, {B, 30}};   // total 40
+
+    // roll in [0,10) -> A; [10,40) -> B (cumulative bands).
+    EXPECT_EQ(*dash::mint::select_weighted(cands, 0),  A);
+    EXPECT_EQ(*dash::mint::select_weighted(cands, 9),  A);
+    EXPECT_EQ(*dash::mint::select_weighted(cands, 10), B);
+    EXPECT_EQ(*dash::mint::select_weighted(cands, 39), B);
+    // roll reduced modulo total: 40 == 0 -> A again.
+    EXPECT_EQ(*dash::mint::select_weighted(cands, 40), A);
+
+    // Empty / all-zero -> nullopt (caller fails closed).
+    EXPECT_FALSE(dash::mint::select_weighted({}, 0).has_value());
+    std::vector<WeightedCandidate> zeros = {{A, 0}, {B, 0}};
+    EXPECT_FALSE(dash::mint::select_weighted(zeros, 5).has_value());
+}
+
+// (13) Boost zero-share selection: a connected miner absent from the pplns
+//      window is boosted; when all connected miners already carry weight (or
+//      none connected) it degrades to the pplns selector.
+TEST(DashMintRunloopRedistribute, SelectBoostZeroSharePrefersConnectedNewcomer)
+{
+    using dash::mint::WeightedCandidate;
+    const std::vector<unsigned char> A = {0xa};
+    const std::vector<unsigned char> B = {0xb};
+    const std::vector<unsigned char> C = {0xc};
+    std::vector<WeightedCandidate> cands = {{A, 100}, {B, 100}};   // total 200
+
+    // C is connected but has zero window weight -> boosted.
+    auto pick = dash::mint::select_boost(cands, {C}, /*zero_roll=*/0, /*pplns_roll=*/0);
+    ASSERT_TRUE(pick.has_value());
+    EXPECT_EQ(*pick, C);
+
+    // All connected miners already carry weight -> pplns fallback (A or B).
+    auto fb = dash::mint::select_boost(cands, {A, B}, 0, 0);
+    ASSERT_TRUE(fb.has_value());
+    EXPECT_TRUE(*fb == A || *fb == B);
+
+    // No connected list -> pure pplns fallback; roll 150 lands in B's band.
+    auto pf = dash::mint::select_boost(cands, {}, 0, /*pplns_roll=*/150);
+    ASSERT_TRUE(pf.has_value());
+    EXPECT_EQ(*pf, B);
+}
