@@ -135,6 +135,7 @@
 #include <impl/dash/coin/vendor/llmq_commitment.hpp>
 #include <impl/dash/coin/vendor/providertx.hpp>
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
+#include <impl/dash/coin/vendor/bls_verify.hpp>
 #include <impl/bitcoin_family/coin/base_transaction.hpp>
 
 #include <core/hash.hpp>
@@ -278,7 +279,7 @@ struct ReplayMNState
         e.confirmedHash    = confirmedHash;
         e.netAddress       = netInfo.ip;
         e.netPort          = netInfo.port_be;
-        e.pubKeyOperator   = pubKeyOperator;
+        e.pubKeyOperator   = vendor::opkey_for_leaf(pubKeyOperator, nVersion < vendor::ProTxVersion::BASIC_BLS);
         e.keyIDVoting      = keyIDVoting;
         e.isValid          = !IsBanned();
         e.nType            = nType;
@@ -1426,7 +1427,7 @@ private:
         // (CDeterministicMNState(CProRegTx), dmnstate.h:68-79).
         st.nVersion          = p.nVersion;
         st.keyIDOwner        = p.keyIDOwner;
-        st.pubKeyOperator    = p.pubKeyOperator;
+        st.pubKeyOperator    = vendor::opkey_to_basic(p.pubKeyOperator, p.nVersion < vendor::ProTxVersion::BASIC_BLS);
         st.keyIDVoting       = p.keyIDVoting;
         st.netInfo           = p.netInfo;
         st.scriptPayout      = p.scriptPayout;
@@ -1520,7 +1521,28 @@ private:
 
         // Operator-key change ⇒ reset all operator fields + ban until a
         // ProUpServTx revives (specialtxman.cpp:395-405).
-        if (st.pubKeyOperator != p.pubKeyOperator) {
+        if (H == 1047829 || H == 1874081) {
+            auto __hx=[](const auto& a){ std::string r; char b[3]; for (auto x : a){ snprintf(b,3,"%02x",(int)(unsigned char)x); r+=b; } return r; };
+            LOG_INFO << "[OPKEY-DIAG] h=" << H << " proTx=" << p.proTxHash.GetHex().substr(0,16)
+                     << " st.nVersion=" << (int)st.nVersion
+                     << " st=" << __hx(st.pubKeyOperator)
+                     << " wire=" << __hx(p.pubKeyOperator)
+                     << " peq=" << (vendor::opkey_point_eq(st.pubKeyOperator, /*a_legacy=*/false,
+                                                           p.pubKeyOperator,
+                                                           /*b_legacy=*/p.nVersion < vendor::ProTxVersion::BASIC_BLS)?1:0)
+                     << " banned=" << (st.IsBanned()?1:0)
+                     << " netempty=" << (st.netinfo_empty()?1:0);
+        }
+        // dashd specialtxman.cpp:388 — reset iff the operator key POINT differs.
+        // STORED side is canonical BASIC (opkey_to_basic at the store sites, so
+        // a_legacy=false); WIRE side is decoded under the tx payload scheme
+        // (legacy iff nVersion < BasicBLS, providertx.h:221). Faithful point
+        // compare (no cross-scheme fallback) — see opkey_point_eq. This replaces
+        // opkey_same_g1, whose dual-scheme intersection read a v1 wire key under
+        // basic and falsely matched a byte-identical stored basic point (h=1874081).
+        if (!vendor::opkey_point_eq(st.pubKeyOperator, /*a_legacy=*/false,
+                                    p.pubKeyOperator,
+                                    /*b_legacy=*/p.nVersion < vendor::ProTxVersion::BASIC_BLS)) {
             const bool was_banned = st.IsBanned();
             st.ResetOperatorFields();
             st.BanIfNotBanned(H);
@@ -1529,7 +1551,7 @@ private:
             st.nVersion = st.nVersion > vendor::ProTxVersion::BASIC_BLS
                         ? st.nVersion : p.nVersion;
             // netInfo stays the empty MakeNetInfo(nVersion) from the reset.
-            st.pubKeyOperator = p.pubKeyOperator;
+            st.pubKeyOperator = vendor::opkey_to_basic(p.pubKeyOperator, p.nVersion < vendor::ProTxVersion::BASIC_BLS);
             if (m_cfg.debug_logs) {
                 LOG_INFO << "[DML-FOLD] h=" << H << " MN "
                          << p.proTxHash.GetHex().substr(0, 16)

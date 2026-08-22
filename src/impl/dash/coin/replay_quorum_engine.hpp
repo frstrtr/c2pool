@@ -184,6 +184,9 @@ struct QuorumMnEntry {
     bool                    has_collateral{false};
     uint256                 collateral_hash;
     uint32_t                collateral_index{0};
+    std::array<uint8_t, 16> service_ip{};       // #154: netInfo IP (raw IPv6), for service uniqueness
+    uint16_t                service_port_be{0}; // #154: netInfo port (big-endian)
+    uint160                 key_id_owner;       // #154: ProReg owner key (replay-only)
 };
 
 /// height → the full MN list at that height (a WORK block: cycle base − 8).
@@ -330,6 +333,8 @@ struct UniqueMnList {
     ProRegSet                          protx;
     std::set<std::array<uint8_t, 36>>  collateral;   // 32-byte hash ‖ LE index
     std::set<std::array<uint8_t, 48>>  operators;     // BLS operator pubkey
+    std::set<std::array<uint8_t, 18>> services;    // #154: 16B ip || 2B BE port (netInfo GetPrimary)
+    std::set<uint160>                 owners;       // #154: ProReg owner key (replay-only)
 
     static std::array<uint8_t, 36> coll_key(const QuorumMnEntry& e)
     {
@@ -347,6 +352,24 @@ struct UniqueMnList {
         return false;   // CBLSLazyPublicKey() default → not a unique property
     }
 
+    static std::array<uint8_t, 18> svc_key(const QuorumMnEntry& e)
+    {
+        std::array<uint8_t, 18> k{};
+        std::memcpy(k.data(), e.service_ip.data(), 16);
+        k[16] = static_cast<uint8_t>((e.service_port_be >> 8) & 0xff);
+        k[17] = static_cast<uint8_t>(e.service_port_be & 0xff);
+        return k;
+    }
+    static bool service_active(const QuorumMnEntry& e)
+    {
+        if (e.service_port_be != 0) return true;
+        for (uint8_t b : e.service_ip) if (b != 0) return true;
+        return false;   // #154: null netInfo not a unique property (mirrors netinfo_empty)
+    }
+    static bool owner_active(const QuorumMnEntry& e)
+    {
+        return !e.key_id_owner.IsNull();   // #154: zero owner key not carried (SML path)
+    }
     bool   has_mn(const uint256& h) const { return protx.count(h) != 0; }
     size_t size() const { return protx.size(); }   // == GetCounts().total()
 
@@ -364,9 +387,20 @@ struct UniqueMnList {
         }
         if (op && operators.count(e.pub_key_operator))
             return false;                                    // duplicate operator
+        const bool svc = service_active(e);
+        std::array<uint8_t, 18> sk{};
+        if (svc) {
+            sk = svc_key(e);
+            if (services.count(sk)) return false;            // #154: duplicate service (netInfo)
+        }
+        const bool owner = owner_active(e);
+        if (owner && owners.count(e.key_id_owner))
+            return false;                                    // #154: duplicate keyIDOwner
         protx.insert(e.proTxHash);
         if (e.has_collateral) collateral.insert(ck);
         if (op) operators.insert(e.pub_key_operator);
+        if (svc) services.insert(sk);
+        if (owner) owners.insert(e.key_id_owner);
         return true;
     }
 };
@@ -590,7 +624,7 @@ inline std::optional<NewQuarterOutput> build_new_quarter_members(
         // NotUsed||Used boundary and the exact score order.
         for (size_t k = 0; k < sorted_combined->size(); ++k) {
             const uint256& ph = (*sorted_combined)[k]->proTxHash;
-            const bool isused = used_all.count(ph) > 0;
+            const bool isused = used_all.has_mn(ph);
             LOG_INFO << "[RSORT] k=" << k << " " << ph.GetHex()
                      << " used=" << isused;
         }
@@ -1544,9 +1578,31 @@ private:
         return std::nullopt;
     }
 
-    /// GetHashModifier, post-V20 (llmq/utils.cpp:88-111): from the WORK
-    /// block's own cbTx CL when non-null, else the work block hash.
+    /// GetHashModifier (dashd llmq/utils.cpp:88-111). dashd selects the
+    /// pre/post-V20 modifier form by the DEPLOYMENT state of the WORK block
+    /// (pWorkBlockIndex = base − WORK_DIFF_DEPTH), NOT the cycle base:
+    ///
+    ///   pWorkBlockIndex = base->GetAncestor(base->nHeight - WORK_DIFF_DEPTH);
+    ///   if (DeploymentActiveAfter(pWorkBlockIndex, V20)) {           // POST-V20
+    ///       cbcl = GetNonNullCoinbaseChainlock(pWorkBlockIndex);
+    ///       if (cbcl) return SerializeHash(tuple(type, work->nHeight, bestCLSig));
+    ///       return SerializeHash(pair(type, work->GetBlockHash()));
+    ///   }
+    ///   if (llmqParams.useRotation)                                  // PRE-V20 rotated
+    ///       return SerializeHash(pair(type, work->GetBlockHash()));
+    ///   return SerializeHash(pair(type, base->GetBlockHash()));      // PRE-V20 non-rotated
+    ///
+    /// DeploymentActiveAfter(pWorkBlockIndex, V20) (buried) ==
+    ///   (work_h + 1) >= DeploymentHeight(V20) == (work_h + 1) >= v20_floor.
+    /// The previous code UNCONDITIONALLY returned the POST-V20 form, so a cycle
+    /// base in [v20_floor, v20_floor+WORK_DIFF_DEPTH) — whose WORK block is
+    /// PRE-V20 — hashed the WORK block hash instead of the BASE block hash. At
+    /// mainnet base 1987776 (== V20 height) this selected the wrong LLMQ_400_60
+    /// member set (dashd invalid-marked MN b61cf487 @ index 45) and diverged the
+    /// fold (the h=1987797 poison). No cbTx CL exists PRE-V20, so the two
+    /// PRE-V20 forms never carry a CL.
     std::optional<uint256> compute_modifier(uint8_t type, uint32_t cycle_base,
+                                            bool use_rotation,
                                             std::string* why) const
     {
         const uint32_t work_h = cycle_base - kWorkDiffDepth;
@@ -1556,6 +1612,29 @@ private:
                           + " not in the observed window";
             return std::nullopt;
         }
+
+        // dashd DeploymentActiveAfter(pWorkBlockIndex, DEPLOYMENT_V20).
+        const bool post_v20 = (work_h + 1) >= m_cfg.v20_floor;
+
+        if (!post_v20) {
+            // PRE-V20: no coinbase ChainLock exists yet. Non-rotated hashes the
+            // CYCLE BASE block hash; rotated hashes the WORK block hash.
+            if (use_rotation) {
+                return vendor::compute_quorum_modifier(
+                    type, work_h, /*best_cl_sig=*/std::nullopt, hh->second);
+            }
+            auto bh = m_hash_by_height.find(cycle_base);
+            if (bh == m_hash_by_height.end()) {
+                if (why) *why = "cycle base block h=" + std::to_string(cycle_base)
+                              + " not in the observed window";
+                return std::nullopt;
+            }
+            return vendor::compute_quorum_modifier(
+                type, work_h, /*best_cl_sig=*/std::nullopt, bh->second);
+        }
+
+        // POST-V20: from the WORK block's own cbTx CL when non-null, else the
+        // work block hash.
         if (!m_cl_known.count(work_h)) {
             if (why) *why = "work block h=" + std::to_string(work_h)
                           + " has no observed cbTx CL field";
@@ -1584,8 +1663,14 @@ private:
             if (H % p.dkg_interval != 0 || H < kWorkDiffDepth) continue;
 
             // Split-floor per lane (edit 1): the rotated lane derives from the
-            // DIP0024 cycle base (rotated_floor); the non-rotated lanes' pre-V20
-            // modifier form is unported and must fail closed below v20_floor.
+            // DIP0024 cycle base (rotated_floor); the non-rotated lane derives
+            // from the V20 floor. Non-rotated cycle bases STRICTLY below
+            // v20_floor are the pre-V20 early era owned by the bridge's
+            // produce_early_nonrotated_members() path. A base AT/above the floor
+            // whose WORK block is still pre-V20 (the [v20_floor, v20_floor+8)
+            // window — mainnet base 1987776) derives HERE, and compute_modifier
+            // now selects the correct pre-V20 non-rotated (base-hash) form for
+            // it (the V20 off-by-8 fix). rotated_floor <= v20_floor always.
             const uint32_t lane_floor =
                 p.use_rotation ? m_cfg.rotated_floor : m_cfg.v20_floor;
             if (H < lane_floor) {
@@ -1600,7 +1685,7 @@ private:
             }
 
             std::string why;
-            auto modifier = compute_modifier(p.type, H, &why);
+            auto modifier = compute_modifier(p.type, H, p.use_rotation, &why);
             if (!modifier) {
                 ++r.member_cycles_skipped;
                 r.member_skip_reasons.push_back(

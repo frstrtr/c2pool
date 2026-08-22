@@ -777,6 +777,9 @@ public:
         e.has_collateral   = true;
         e.collateral_hash  = st.collateralOutpoint.hash;
         e.collateral_index = st.collateralOutpoint.index;
+        e.service_ip       = st.netInfo.ip;
+        e.service_port_be  = st.netInfo.port_be;
+        e.key_id_owner     = st.keyIDOwner;
         return e;
     }
 
