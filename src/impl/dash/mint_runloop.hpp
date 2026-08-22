@@ -47,6 +47,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -298,6 +299,87 @@ struct ResolvedIdentity
     bool substituted{false};                   // true when NOT the miner's own
 };
 
+// ── weighted redistribution engine (pplns / boost) ───────────────────────────
+//
+// Port of the LTC Redistributor selection semantics (src/impl/ltc/
+// redistribute.hpp: pick_pplns :416-438, pick_boost :306-414) into the DASH
+// mint path. This is a LOCAL, consensus-NEUTRAL choice of which payout script a
+// broken-credential share is minted under — the DASH analogue of p2pool's
+// address fallback ("-f"): it only decides whose PPLNS weight THIS node's share
+// carries. Every peer still recomputes identical coinbase outputs from each
+// share's recorded m_pubkey_hash (dash::pplns::compute_payouts), so nothing
+// here touches DIP4 CbTx / merkleRootMNList / quorum commitments / block
+// validity. It is the same share-identity field the --fee path substitutes.
+//
+// The candidate weights are gathered from the SAME oracle window the DASH
+// payout uses (get_cumulative_weights via pplns_weights_for below), keyed by
+// scriptPubKey, so redistribution is proportional to real accrued PPLNS weight.
+struct WeightedCandidate
+{
+    std::vector<unsigned char> payout_script;  // P2PKH scriptPubKey
+    uint64_t                   weight{0};      // accrued PPLNS weight (oracle window)
+};
+
+// Bundle of the impure inputs the pplns/boost arms need. Default-constructed
+// (all empty) preserves the pre-port fail-closed decline: an empty candidate
+// set (cold chain) yields nullopt, exactly the historical genesis behaviour.
+struct RedistributeInputs
+{
+    std::vector<WeightedCandidate>              candidates;  // pplns weights, oracle window
+    std::vector<std::vector<unsigned char>>     connected;   // boost: live-rate miner scripts
+    uint64_t                                    pplns_roll{0};      // weighted-random draw
+    uint64_t                                    boost_zero_roll{0}; // zero-share pick draw
+};
+
+// Pure deterministic selector (KAT surface) — the cumulative weighted-random
+// walk of ltc::Redistributor::pick_pplns (redistribute.hpp:428-437). `roll` is
+// reduced modulo the grand total, then the entry whose cumulative band it lands
+// in is returned. Empty or all-zero-weight -> nullopt (caller fails closed).
+inline std::optional<std::vector<unsigned char>> select_weighted(
+    const std::vector<WeightedCandidate>& cands, uint64_t roll)
+{
+    uint64_t total = 0;
+    for (const auto& c : cands) total += c.weight;
+    if (total == 0)
+        return std::nullopt;
+    const uint64_t r = roll % total;
+    uint64_t cumulative = 0;
+    for (const auto& c : cands) {
+        cumulative += c.weight;
+        if (r < cumulative)
+            return c.payout_script;
+    }
+    return cands.back().payout_script;
+}
+
+// Pure boost selector — mirrors ltc::Redistributor::pick_boost's V1 zero-share
+// arm + pplns final fallback (redistribute.hpp:393-414). A currently-connected
+// miner (live pseudoshare rate this window) that carries ZERO pplns weight is
+// "boosted": picked uniformly so it starts accruing. When every connected miner
+// already has weight (or none are connected), fall through to the weighted
+// pplns selector — i.e. boost degrades to pplns exactly as LTC does at runtime
+// (its V2 graduated path is never wired). Consensus-neutral, like select_weighted.
+inline std::optional<std::vector<unsigned char>> select_boost(
+    const std::vector<WeightedCandidate>& pplns_cands,
+    const std::vector<std::vector<unsigned char>>& connected_scripts,
+    uint64_t zero_roll,
+    uint64_t pplns_roll)
+{
+    if (!connected_scripts.empty()) {
+        std::set<std::vector<unsigned char>> have;
+        for (const auto& c : pplns_cands)
+            if (c.weight > 0)
+                have.insert(c.payout_script);
+        std::vector<std::vector<unsigned char>> zero_miners;
+        for (const auto& s : connected_scripts)
+            if (!s.empty() && have.find(s) == have.end())
+                zero_miners.push_back(s);
+        if (!zero_miners.empty())
+            return zero_miners[zero_roll % zero_miners.size()];
+    }
+    return select_weighted(pplns_cands, pplns_roll);
+}
+
 // Deterministic core (KAT-able): the caller supplies the fee roll as
 // roll_x100 in [0, 10000) — one roll per job build, matching p2pool's
 // per-get_work fee roll. Substitution triggers when roll_x100 <
@@ -306,7 +388,8 @@ struct ResolvedIdentity
 inline std::optional<ResolvedIdentity> resolve_mint_identity(
     const MintFeePolicy& policy,
     const std::vector<unsigned char>& miner_script,
-    uint32_t roll_x100)
+    uint32_t roll_x100,
+    const RedistributeInputs& redistribute = {})
 {
     const bool miner_ok =
         dash::stratum::pubkey_hash_from_p2pkh(miner_script).has_value();
@@ -332,9 +415,26 @@ inline std::optional<ResolvedIdentity> resolve_mint_identity(
             return ResolvedIdentity{policy.node_owner_script, 65535, true};
         return std::nullopt;
     case MintFeePolicy::Redistribute::PPLNS:
-    case MintFeePolicy::Redistribute::BOOST:
-    default:
-        return std::nullopt;   // weighted redistribution engine: later port
+    default: {
+        // Weighted-random over the accrued PPLNS window (ltc pick_pplns). Empty
+        // window (cold chain) -> decline, preserving the fail-closed genesis
+        // behaviour. donation_u16 is the normal dev-fee decay, as the fee arm.
+        auto script = select_weighted(redistribute.candidates,
+                                      redistribute.pplns_roll);
+        if (script)
+            return ResolvedIdentity{*script, policy.donation_u16, true};
+        return std::nullopt;
+    }
+    case MintFeePolicy::Redistribute::BOOST: {
+        // Zero-share boost, else pplns fallback (ltc pick_boost V1 + final).
+        auto script = select_boost(redistribute.candidates,
+                                   redistribute.connected,
+                                   redistribute.boost_zero_roll,
+                                   redistribute.pplns_roll);
+        if (script)
+            return ResolvedIdentity{*script, policy.donation_u16, true};
+        return std::nullopt;
+    }
     }
 }
 
@@ -548,6 +648,33 @@ pplns_weights_for(ChainT& chain,
     if (out.weights.empty())
         return std::nullopt;
     return out;
+}
+
+// ── gather_redistribute_candidates ───────────────────────────────────────────
+//
+// Impure gather feeding resolve_mint_identity's pplns/boost arms: walks the
+// SAME oracle window the DASH payout uses (pplns_weights_for -> get_cumulative_
+// weights) and returns the per-scriptPubKey accrued weight as a candidate list.
+// Reusing pplns_weights_for guarantees the redistribution weights are bit-for-bit
+// the payout weights (grandparent start, min(height,RCL)-1 window, 288->64
+// normalization). Empty (cold chain / no window) -> empty vector -> the arm
+// declines fail-closed, exactly the pre-port genesis behaviour.
+template <typename ChainT>
+inline std::vector<WeightedCandidate> gather_redistribute_candidates(
+    ChainT& chain,
+    const core::CoinParams& params,
+    const uint256& prev_share_hash,
+    uint32_t block_bits)
+{
+    std::vector<WeightedCandidate> cands;
+    auto w = pplns_weights_for(chain, params, prev_share_hash, block_bits);
+    if (!w)
+        return cands;
+    cands.reserve(w->weights.size());
+    for (const auto& [script, weight] : w->weights)
+        if (weight > 0)
+            cands.push_back(WeightedCandidate{script, weight});
+    return cands;
 }
 
 } // namespace dash::mint
