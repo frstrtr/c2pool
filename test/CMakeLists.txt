@@ -898,7 +898,7 @@ if (BUILD_TESTING AND GTest_FOUND)
                    test_dash_replay_prestate_empty_dip3.cpp)
     target_link_libraries(test_dash_mn_state PRIVATE
         GTest::gtest_main GTest::gtest
-        dash_x11 core
+        dash_bls_verify dash_x11 core
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}
     )

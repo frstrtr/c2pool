@@ -1588,3 +1588,71 @@ TEST(DashMnReviveBanState, LoadRetiresTheMeasurement) {
     EXPECT_FALSE(f.m.ban_state_measured_for(2514574));
     EXPECT_EQ(f.m.apply_block(f.blk, 2514574).revive_unmeasured, 1u);
 }
+
+// ─── same-block self-ProUpReg: pay the PRE-block script (dashd ordering) ────
+// Mainnet h=2525714 (proTx f5a49888ec1d00db...): the projected payee's OWN
+// ProUpRegTx rides the very block it is paid in, moving its payout script
+// a7f7252d -> Xv4Ys1mi. dashd pays block H's masternode from the list AS OF H-1
+// (payments.cpp GetBlockTxOuts reads oldList.GetMNPayee(pindexPrev)->pdmnState->
+// scriptPayout BEFORE the block's special txs fold in BuildNewListFromBlock), so
+// the coinbase correctly pays the PRE-block a7f7252d. Cross-checking the entry
+// pass 1 just rewrote (Xv4Ys1mi) is a FALSE payee_desync that fail-closes the
+// daemonless bridge. RED before the pass-0 snapshot fix, GREEN after.
+TEST(DashMnState, ProjectedPayeePaidByPreBlockScriptWhenSelfProUpRegSameBlock) {
+    MnStateMachine m;
+    auto s_old  = script_bytes(0xA7, 25);   // pre-block payout, paid by coinbase
+    auto s_new  = script_bytes(0x54, 25);   // in-block ProUpReg's new payout
+    auto op_key = seq_array<48>(0x55);       // UNCHANGED operator key -> no ban
+
+    MNState a;
+    a.isValid                 = true;
+    a.scriptPayout.m_data     = s_old;
+    a.pubKeyOperator          = op_key;
+    a.nRegisteredHeight       = 2'500'940;
+    a.nLastPaidHeight         = 2'521'534;   // oldest paid -> projected winner
+    a.collateralOutpoint.hash = raw256_byte(0, 0xA7);
+    uint256 hA = raw256_byte(0, 0x01);
+
+    // A more-recently-paid MN so the ranked queue has a runner-up and the
+    // projection is unambiguous (A is the sole eligible winner this block).
+    MNState b = a;
+    b.scriptPayout.m_data     = script_bytes(0xB0, 25);
+    b.nLastPaidHeight         = 2'525'000;
+    b.collateralOutpoint.hash = raw256_byte(0, 0xB0);
+    uint256 hB = raw256_byte(0, 0x02);
+
+    m.load(std::vector<std::pair<uint256, MNState>>{{hA, a}, {hB, b}});
+
+    // Block H=2525714: coinbase pays A's PRE-block script (s_old); A's OWN
+    // ProUpRegTx (same operator key -> no ResetOperatorFields/ban) rewrites its
+    // payout to s_new within the same block.
+    CProUpRegTx upreg;
+    upreg.nVersion            = ProTxVersion::BASIC_BLS;
+    upreg.proTxHash           = hA;
+    upreg.pubKeyOperator      = op_key;      // unchanged -> stays valid, stays payee
+    upreg.keyIDVoting         = raw160(0x66);
+    upreg.scriptPayout.m_data = s_new;
+    upreg.inputsHash          = raw256(0x34);
+    upreg.vchSig              = {0x01};
+
+    BlockType blk;
+    blk.m_txs.push_back(coinbase_tx(std::vector<std::vector<unsigned char>>{s_old}));
+    blk.m_txs.push_back(special_tx(CProUpRegTx::SPECIALTX_TYPE, protx_payload(upreg)));
+
+    auto r = m.apply_block(blk, 2'525'714);
+
+    // The ProUpReg applied: post-block state carries the new payout...
+    EXPECT_EQ(r.updated, 1u);
+    EXPECT_EQ(m.entries().at(hA).scriptPayout.m_data, s_new)
+        << "post-block state must carry the in-block ProUpReg's new payout";
+
+    // ...but the payment is attributed to A on its PRE-block script -- no desync.
+    EXPECT_FALSE(r.payee_desync)
+        << "coinbase pays the script dashd pays from the H-1 list; cross-checking "
+           "the mutated post-block script is a false payee_desync (h=2525714 class)";
+    EXPECT_EQ(r.paid, 1u);
+    ASSERT_TRUE(r.projected_payee.has_value());
+    EXPECT_EQ(*r.projected_payee, hA);
+    EXPECT_EQ(m.entries().at(hA).nLastPaidHeight, 2'525'714u)
+        << "the projected payee must be marked paid at this height";
+}
