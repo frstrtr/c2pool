@@ -55,6 +55,7 @@
 // AppleClang/arm64 ("use of undeclared identifier s / ser_action").
 #include <impl/ltc/coin/coin_node.hpp>
 #include <impl/ltc/config.hpp>
+#include <impl/ltc/work_target.hpp>
 
 // Chain seed discovery
 #include <impl/ltc/coin/chain_seeds.hpp>
@@ -4557,14 +4558,9 @@ int main(int argc, char* argv[]) {
                     if (local_hash_rate > 0.0) {
                         double avg_attempts = local_hash_rate * ltc::PoolConfig::share_period() / 0.0167;
                         if (avg_attempts > 1.0) {
-                            // average_attempts_to_target(n) = min(2^256/n - 1, 2^256-1)
-                            uint288 two_256;
-                            two_256.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
-                            uint288 avg_288(static_cast<uint64_t>(avg_attempts));
-                            uint288 cap_288 = two_256 / avg_288;
-                            if (cap_288 > uint288(1)) cap_288 = cap_288 - uint288(1);
-                            uint256 cap_target;
-                            cap_target.SetHex(cap_288.GetHex());
+                            // #859: saturating narrowing (ltc::stratum helper) --
+                            // avoids UB / a "Division by zero" throw for avg >= 2^64.
+                            uint256 cap_target = ltc::stratum::average_attempts_to_target(avg_attempts);
                             if (cap_target < desired_target)
                                 desired_target = cap_target;
                         }
@@ -4596,14 +4592,8 @@ int main(int argc, char* argv[]) {
                                             * ltc::PoolConfig::dust_threshold()
                                             / static_cast<double>(subsidy);
                                         if (dust_avg > 1.0) {
-                                            uint288 two_256;
-                                            two_256.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
-                                            uint288 dust_avg_288(static_cast<uint64_t>(dust_avg));
-                                            uint288 dust_target_288 = two_256 / dust_avg_288;
-                                            if (dust_target_288 > uint288(1))
-                                                dust_target_288 = dust_target_288 - uint288(1);
-                                            uint256 dust_target;
-                                            dust_target.SetHex(dust_target_288.GetHex());
+                                            // #859 sibling: same saturating helper.
+                                            uint256 dust_target = ltc::stratum::average_attempts_to_target(dust_avg);
                                             if (dust_target < desired_target)
                                                 desired_target = dust_target;
                                         }
