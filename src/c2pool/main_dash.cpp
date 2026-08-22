@@ -271,6 +271,10 @@ uint32_t    g_replay_bulk_start = 0;          // --replay-bulk-start H (0 = netw
 // (operator decision 2026-08-17). One-shot; the fold is unaffected otherwise.
 uint32_t    g_dump_mn_checkpoint_height = 0;  // 0 = off
 std::string g_dump_mn_checkpoint_file;
+// Periodic cadence for the same self-derived dump: write a checkpoint every
+// N blocks (0 = off). Files land next to g_dump_mn_checkpoint_file (or cwd),
+// named mn_ckpt_mainnet_<h>.inc. Operator request: 200000-block anchors.
+uint32_t    g_dump_mn_checkpoint_interval = 0;  // 0 = off
 
 // ── W5 INTEGRATION: drive the W1 DML fold from the W2 bulk lane ───────────
 // --replay-fold-prestate FILE seeds the W1 fold engine from a full-state
@@ -434,7 +438,8 @@ void print_banner(const char* argv0)
         << "           [--replay-fold-prestate FILE] [--replay-fold-quorums]\n"
         << "           [--replay-fold-qsnapshot FILE] [--replay-fold-worklists FILE]\n"
         << "           [--replay-mined-commitment-index]\n"
-        << "           [--dump-mn-checkpoint H FILE]\n"
+        << "           [--dump-mn-checkpoint H FILE]"
+           " [--dump-mn-checkpoint-interval N]\n"
         << "           [--embedded-no-dashd-mn-seed]\n"
         << "           [--oracle-graduation-blocks N] [--oracle-class-coverage K]\n"
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
@@ -7367,6 +7372,58 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                               << " (self-derived from chain; no dashd RPC)\n";
                 }
 
+                // ── DASHD-CUT: PERIODIC self-derived checkpoint dumps ─────
+                // Same self-derived, root-verified serialization as the
+                // one-shot dump, but at every N-block boundary. Files are
+                // written next to the one-shot --dump-mn-checkpoint FILE (or
+                // cwd), named mn_ckpt_mainnet_<h>.inc, so a long re-fold lays
+                // down resumable anchors (operator request: 200000 cadence).
+                if (g_dump_mn_checkpoint_interval != 0 && replay_fold_consumer) {
+                    const uint32_t interval = g_dump_mn_checkpoint_interval;
+                    std::string dir = ".";
+                    if (!g_dump_mn_checkpoint_file.empty()) {
+                        const auto slash =
+                            g_dump_mn_checkpoint_file.find_last_of('/');
+                        dir = (slash == std::string::npos)
+                                  ? std::string(".")
+                                  : g_dump_mn_checkpoint_file.substr(0, slash);
+                    }
+                    replay_fold_consumer->set_dump_interval_hook(
+                        interval,
+                        [dir](const rp::DmlFoldEngine& eng, uint32_t reached) {
+                            const std::string file =
+                                dir + "/mn_ckpt_mainnet_"
+                                + std::to_string(reached) + ".inc";
+                            const std::string source =
+                                "self-derived from chain via c2pool"
+                                " --replay-bulk at H=" + std::to_string(reached)
+                                + " (blockhash " + eng.block_hash().GetHex()
+                                + ")";
+                            const std::string generated =
+                                dash::coin::mn_dump_detail::iso8601_utc_now();
+                            std::string err;
+                            if (dash::coin::write_mn_checkpoint_inc(
+                                    eng, file, source, generated, err)) {
+                                std::cout << "[run] --dump-mn-checkpoint-interval:"
+                                             " WROTE " << eng.size()
+                                          << " registered masternodes at h="
+                                          << reached << " to " << file
+                                          << " (self-derived, no dashd) —"
+                                             " verified through"
+                                             " parse_mn_checkpoint()\n";
+                            } else {
+                                std::cerr << "[run] --dump-mn-checkpoint-interval"
+                                             " FAILED at h=" << reached << ": "
+                                          << err << "\n";
+                            }
+                        });
+                    std::cout << "[run] --dump-mn-checkpoint-interval ARMED: the"
+                                 " fold will serialize its registered MN set"
+                                 " every " << interval << " blocks to " << dir
+                              << "/mn_ckpt_mainnet_<h>.inc (self-derived from"
+                                 " chain; no dashd RPC)\n";
+                }
+
                 if (replay_fold_consumer) {
                     replay_payee_pub =
                         std::make_unique<rp::ReplayPayeePublisher>(
@@ -9379,6 +9436,12 @@ int main(int argc, char** argv)
             g_dump_mn_checkpoint_height = static_cast<uint32_t>(
                 std::strtoul(argv[++i], nullptr, 10));
             g_dump_mn_checkpoint_file = argv[++i];
+        }
+        // DASHD-CUT: periodic self-derived checkpoint dumps every N blocks.
+        else if (std::strcmp(argv[i], "--dump-mn-checkpoint-interval") == 0
+                 && i + 1 < argc) {
+            g_dump_mn_checkpoint_interval = static_cast<uint32_t>(
+                std::strtoul(argv[++i], nullptr, 10));
         }
         // W5: anchor-seeded DML fold driven by the bulk lane.
         else if (std::strcmp(argv[i], "--replay-fold-prestate") == 0 && i + 1 < argc) {

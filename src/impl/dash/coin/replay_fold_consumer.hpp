@@ -171,6 +171,21 @@ public:
         m_dump_hook   = std::move(h);
     }
 
+    /// ── Periodic self-derived checkpoint DUMP seam (operator request) ────
+    /// Same serve-inert, root-verified serialization as set_dump_hook, but
+    /// fires at EVERY `interval` boundary (height % interval == 0) instead of
+    /// once — so a long re-fold lays down mn_ckpt_mainnet_<h>.inc anchors at a
+    /// fixed cadence (200000 blocks). Fires on the same fold-complete commit as
+    /// the one-shot dump, so a diverged/poisoned fold never reaches it. The two
+    /// dump seams are independent and may both be armed.
+    void set_dump_interval_hook(
+        uint32_t interval,
+        std::function<void(const DmlFoldEngine&, uint32_t)> h)
+    {
+        m_dump_interval      = interval;
+        m_dump_interval_hook = std::move(h);
+    }
+
     /// ── The diff-store seam (mn_diff_store.hpp) ──────────────────────────
     /// Invoked for every block whose fold COMPLETED — i.e. after the root
     /// self-check passed and the counters above were credited. This is the
@@ -277,6 +292,14 @@ public:
             m_dump_hook(m_engine, height);
         }
 
+        // Periodic self-derived checkpoint dump at every interval boundary.
+        // Serve-inert (reads engine, writes one file, self-verifies through
+        // parse_mn_checkpoint); only reached on a fold that root-checked H.
+        if (m_dump_interval_hook && m_dump_interval != 0
+                && height % m_dump_interval == 0) {
+            m_dump_interval_hook(m_engine, height);
+        }
+
         if (m_utxo_sink && !m_utxo_sink(height, hash, block)) {
             // Tier-B is a DECORATION: its failure is reported but must never
             // invalidate the Tier-A root chain that already passed here.
@@ -355,6 +378,8 @@ private:
     uint32_t          m_dump_target{0};
     bool              m_dumped{false};
     std::function<void(const DmlFoldEngine&, uint32_t)> m_dump_hook;
+    uint32_t          m_dump_interval{0};
+    std::function<void(const DmlFoldEngine&, uint32_t)> m_dump_interval_hook;
     uint32_t          m_progress_every;
     FoldConsumerStats m_stats;
     std::chrono::steady_clock::time_point m_started;
