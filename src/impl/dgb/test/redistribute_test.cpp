@@ -186,15 +186,92 @@ TEST(DgbRedistribute, DonateIdentityRoundTripsCombinedDonationP2SH)
 
 TEST(DgbRedistribute, FeeWithoutOperatorIdentityIsFailSafeNull)
 {
-    // main_dgb does not (yet) plumb an operator payout identity, so a bare
-    // --redistribute fee must yield a NULL pubkey -> the fallback returns an
-    // empty script (never a burn output to the all-zero hash).
+    // A bare --redistribute fee with NO --node-owner-address leaves the operator
+    // payout identity unset, so pick() must yield a NULL pubkey -> the fallback
+    // returns an empty script (never a burn output to the all-zero hash). The
+    // address-plumbed path is covered by
+    // FeeIdentityPlumbedFromNodeOwnerAddressMintsOperatorScript below.
     dgb::Redistributor r;
     r.set_mode(dgb::RedistributeMode::FEE);   // operator identity unset
     dgb::ShareTracker tracker;
     uint256 best;
     auto res = r.pick(tracker, best);
     EXPECT_TRUE(res.pubkey_hash.IsNull());
+}
+
+// --- #307 fee-identity PLUMBING (this PR) ---------------------------------
+// --redistribute fee + a configured --node-owner-address must mint under the
+// operator's payout script, NOT the empty-script no-op.
+//
+// RED before this PR: main_dgb never called set_operator_identity for the fee
+// arm, so pick(FEE) handed back a null hash and the fallback closure returned
+// {} (empty script). GREEN after: dgb::set_operator_identity_from_address
+// decodes the operator address to a hash160 and arms the FEE identity, so the
+// fee arm mints the operator P2PKH script. This test reproduces main_dgb.cpp's
+// fallback-payout script builder byte-for-byte.
+TEST(DgbRedistribute, FeeIdentityPlumbedFromNodeOwnerAddressMintsOperatorScript)
+{
+    // Canonical DGB mainnet P2PKH address (base58 version byte 0x1e) whose
+    // hash160 is 0102..14. Independently derived: base58check over
+    // 0x1e || hash160 || sha256d(0x1e||hash160)[:4].
+    const std::string kNodeOwnerAddr = "D5ERdEN1gsouFSs7zsq7VYJxyWP6dP28H1";
+    static const uint8_t kExpectedH160[20] = {
+        0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,
+        0x0b,0x0c,0x0d,0x0e,0x0f,0x10,0x11,0x12,0x13,0x14};
+
+    dgb::Redistributor r;
+    r.set_hybrid_weights(dgb::parse_redistribute_spec("fee")); // --redistribute fee
+    dgb::ShareTracker tracker;   // empty
+    uint256 best;                // null
+
+    // Reproduce main_dgb.cpp's fallback-payout closure: pick() -> script bytes
+    // (RAW 20-byte / script-order path, NOT uint160::GetHex which reverses).
+    auto fallback_script = [&]() -> std::vector<unsigned char> {
+        dgb::RedistributeResult rr = r.pick(tracker, best);
+        if (rr.pubkey_hash.IsNull()) return {};    // the master no-op
+        unsigned char hb[20];
+        std::memcpy(hb, rr.pubkey_hash.data(), 20);
+        std::vector<unsigned char> sp;
+        if (rr.pubkey_type == 2) {                 // P2SH:  a9 14 <h160> 87
+            sp = {0xa9, 0x14};
+            sp.insert(sp.end(), hb, hb + 20);
+            sp.push_back(0x87);
+        } else {                                   // P2PKH: 76 a9 14 <h160> 88 ac
+            sp = {0x76, 0xa9, 0x14};
+            sp.insert(sp.end(), hb, hb + 20);
+            sp.push_back(0x88);
+            sp.push_back(0xac);
+        }
+        return sp;
+    };
+
+    // RED baseline (no operator identity, exactly master's shipped fee arm):
+    // the fallback yields an EMPTY script.
+    EXPECT_TRUE(fallback_script().empty());
+
+    // GREEN (the fix): plumb the operator identity from the node-owner address.
+    ASSERT_TRUE(dgb::set_operator_identity_from_address(r, kNodeOwnerAddr));
+
+    // The fee arm now mints under the operator's P2PKH payout identity.
+    dgb::RedistributeResult armed = r.pick(tracker, best);
+    ASSERT_FALSE(armed.pubkey_hash.IsNull());
+    EXPECT_EQ(armed.pubkey_type, 0);   // P2PKH (0x1e is not a P2SH version byte)
+    EXPECT_EQ(std::memcmp(armed.pubkey_hash.data(), kExpectedH160, 20), 0);
+
+    // ...and the fallback closure builds the canonical 25-byte P2PKH script.
+    std::vector<unsigned char> expected = {0x76, 0xa9, 0x14};
+    expected.insert(expected.end(), kExpectedH160, kExpectedH160 + 20);
+    expected.push_back(0x88);
+    expected.push_back(0xac);
+    EXPECT_EQ(fallback_script(), expected);
+
+    // Empty / undecodable address -> false, operator identity left untouched
+    // (fail-safe: the fee arm stays the empty-script no-op).
+    dgb::Redistributor r2;
+    EXPECT_FALSE(dgb::set_operator_identity_from_address(r2, ""));
+    EXPECT_FALSE(dgb::set_operator_identity_from_address(r2, "not-a-valid-address"));
+    r2.set_mode(dgb::RedistributeMode::FEE);
+    EXPECT_TRUE(r2.pick(tracker, best).pubkey_hash.IsNull());
 }
 
 } // namespace
