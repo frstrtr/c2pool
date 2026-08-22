@@ -5528,7 +5528,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             [&coin_state, &stratum_server, hc = header_chain.get(),
              addr_ver, p2sh_ver, ws = work_source.get(),
              cp = coin_p2p.get(), sml_base, m = maintainer.get(),
-             mnl = mn_ckpt_lane.get(), qcms = qc_ms_prefetch_handle]
+             mnl = mn_ckpt_lane.get(), qcms = qc_ms_prefetch_handle,
+             // PR-2 UNDO. By REFERENCE (same lifetime class as the qc_plan_fn
+             // capture above): the index is constructed later in this function,
+             // and on a reorg its symmetric UndoBlock half must roll the tip
+             // back before the new branch is folded forward.
+             &mined_commitment_index]
             (const uint256&, uint32_t, const uint256& new_tip, uint32_t new_height,
              bool was_reorg) {
                 // E2d bridge driver. Safe + REACHABLE here: HeaderChain fires
@@ -5567,6 +5572,37 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                 << " -> SML wipe + cold-resync";
                     m->on_sml_reorg();
                     *sml_base = uint256::ZERO;
+                }
+                // PR-2 UNDO: roll the mined-commitment store back over the
+                // disconnected tail. dashd's UndoBlock, expressed over the
+                // store's retained journal: walk the cursor down to the fork
+                // point (the first height whose recorded hash still matches the
+                // switched chain) erasing each orphaned block's mined records,
+                // so has_mined_commitment() cannot answer true for a commitment
+                // the new branch never mined. A reorg deeper than the retained
+                // undo window fails closed to a cold rebuild + re-seed on the
+                // next contiguous fold — the over-mandating (never phantom)
+                // direction.
+                if (was_reorg && mined_commitment_index
+                    && mined_commitment_index->armed()) {
+                    std::string uerr;
+                    const auto ur = mined_commitment_index->handle_reorg(
+                        [hc](uint32_t q) -> std::optional<uint256> {
+                            if (auto e = hc->get_header_by_height(q))
+                                return e->hash;
+                            return std::nullopt;
+                        },
+                        &uerr);
+                    if (ur == dash::coin::MinedUndoResult::Undone) {
+                        LOG_INFO << "[QC-MINED-INDEX] reorg undo -> "
+                                 << mined_commitment_index->summary();
+                    } else {
+                        LOG_WARNING << "[QC-MINED-INDEX] reorg undo could not "
+                                       "roll back exactly (" << uerr
+                                    << ") -> cold rebuild; store will re-seed on "
+                                       "the next contiguous fold";
+                        mined_commitment_index->clear_for_cold_rebuild();
+                    }
                 }
                 // SML axis: pull the mnlistdiff current AT the new tip. dashcore
                 // computes block (tip+1)'s CbTx merkleRootMNList/Quorums from the
@@ -7066,10 +7102,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 mi->seed_cursor(replay_fold_engine->height());
                 dash::coin::TipPosture posture;
                 posture.live = (replay_live_tail != nullptr);
+                // The header-chain reorg seam (set_on_tip_changed below) drives
+                // mi->handle_reorg() on every branch switch, so a live tip is
+                // now reorg-safe: dashd's UndoBlock half is ported AND wired.
+                posture.reorg_undo_wired = true;
                 posture.declared_by =
                     replay_live_tail
                         ? "FoldLiveTail is wired (live tip blocks are folded "
-                          "into this same consumer)"
+                          "into this same consumer); header-chain reorg seam "
+                          "drives handle_reorg on disconnect"
                         : "no FoldLiveTail: this consumer sees only replayed "
                           "historical bodies";
                 const auto verdict = mi->arm(posture);

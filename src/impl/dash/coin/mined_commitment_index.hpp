@@ -43,24 +43,30 @@
 /// already consume.
 ///
 /// ───────────────────────────────────────────────────────────────────────────
-/// FORWARD HALF ONLY — AND THE CODE ENFORCES IT
+/// BOTH HALVES — AND THE CODE ENFORCES THE SYMMETRY
 /// ───────────────────────────────────────────────────────────────────────────
 ///
-/// `UndoBlock` (llmq/blockprocessor.cpp:383-408) is NOT ported. It erases the
-/// same three records and re-offers the commitment as mineable when a block is
-/// DISCONNECTED. Without it a reorg leaves a phantom mined record, `has_mined`
-/// answers true for a commitment the new chain never mined, the slot drops out
-/// of the mandatory set, and the template we serve is short one type-6 tx —
-/// `bad-qc-missing` (blockprocessor.cpp:198), i.e. a LOST BLOCK. This is not
-/// hypothetical on this fleet: the hotel primary lost 2508008 to a stale payee
-/// and orphaned 2517855.
+/// `UndoBlock` (llmq/blockprocessor.cpp:383-408) IS now ported — `undo_input`,
+/// `undo_block` and `handle_reorg` below. It erases the same records the
+/// forward half wrote and gives the slot back to whoever mines next when a
+/// block is DISCONNECTED. Without it a reorg would leave a phantom mined
+/// record, `has_mined` would answer true for a commitment the new chain never
+/// mined, the slot would drop out of the mandatory set, and the template we
+/// serve would be short one type-6 tx — `bad-qc-missing`
+/// (blockprocessor.cpp:198), i.e. a LOST BLOCK. This is not hypothetical on
+/// this fleet: the hotel primary lost 2508008 to a stale payee and orphaned
+/// 2517855.
 ///
-/// So the index REFUSES TO ARM on a node whose tip is live (`arm()` below).
-/// The refusal is a code path, not a paragraph in a design doc: whoever turns
-/// the flag on next month gets a named refusal instead of a silent gamble.
+/// Because add and remove are now symmetric, the index MAY arm on a live tip —
+/// but ONLY when the caller declares it has wired a disconnect handler that
+/// drives the undo (`TipPosture.reorg_undo_wired`, `arm()` below). A live tip
+/// with no such wiring still gets a named refusal, not a silent gamble: the
+/// undo half existing in this file is not the same as a caller actually
+/// CALLING it on every reorg, and the guard demands the latter.
 /// A second, independent guard runs per block — `process_block()` refuses any
-/// height it did not expect next, so the store can only ever be built by a
-/// strictly forward, contiguous walk.
+/// height it did not expect next, so the forward store is built by a strictly
+/// contiguous walk, and undo unwinds that walk in strict LIFO (dashd
+/// DisconnectTip order).
 ///
 /// ───────────────────────────────────────────────────────────────────────────
 /// TRUST BOUNDARY
@@ -119,6 +125,14 @@ struct MinedCommitmentIndexConfig {
     /// height window is the wrong shape here: mainnet's LLMQ_50_60 active
     /// commitments are 775k blocks old and never leave the active set.
     uint16_t    keep_cycles{4};
+    /// How many of the most-recently-ingested heights keep a rollback journal
+    /// entry (see UndoEntry / handle_reorg). This is the DEPTH the reorg-undo
+    /// path can roll back EXACTLY, and it is the same shape as the replay UTXO
+    /// fold's undo window (replay_utxo_fold.hpp ships 100): a reorg deeper than
+    /// this cannot be rolled back commitment-for-commitment and fails closed
+    /// into a cold rebuild. dashd reorgs are 1-2 blocks in practice; 100 is a
+    /// wide margin bounded to a few hundred journal entries.
+    uint32_t    undo_window{100};
 };
 
 /// What the caller declares about the chain position it is feeding from.
@@ -130,6 +144,13 @@ struct MinedCommitmentIndexConfig {
 /// heuristic like "the tip looks old".
 struct TipPosture {
     bool        live{true};
+    /// Set only when the caller has wired dashd's UndoBlock half — a
+    /// disconnect handler that calls handle_reorg() (or undo_input/undo_block)
+    /// so a branch switch rolls the store back exactly. This is what makes a
+    /// LIVE tip safe to arm: without it a disconnected block would leave a
+    /// phantom mined record. It is a DECLARATION about the wiring, read off
+    /// structure (is a reorg handler installed for this store?), never guessed.
+    bool        reorg_undo_wired{false};
     /// Names WHO declared it. Reproduced verbatim in the refusal so the
     /// operator can see which wiring decided, not just that something did.
     std::string declared_by{"unspecified"};
@@ -171,6 +192,33 @@ inline const char* mined_ingest_result_name(MinedIngestResult r)
         case MinedIngestResult::BadQcHeight:         return "bad-qc-height";
         case MinedIngestResult::BadQcBlock:          return "bad-qc-block";
         case MinedIngestResult::BaseUnresolvable:    return "quorum-base-unresolvable";
+    }
+    return "n/a";
+}
+
+/// Per-disconnect outcome for the UndoBlock port (undo_input / undo_block /
+/// handle_reorg). Every non-Undone value NAMES why the rollback could not be
+/// applied, so a refusal here is as legible as a forward refusal.
+enum class MinedUndoResult : uint8_t {
+    Undone = 0,
+    NotArmed,             // arm() was never called, or refused
+    NotTip,               // dashd disconnects the TIP only (DisconnectTip)
+    BeyondUndoWindow,     // reorg deeper than the retained journal => cold rebuild
+    BodyNotBound,         // undo_block: body merkle root != header commitment
+    BadQcPayload,         // undo_block: type-6 payload unparseable
+    BadQcCommitmentType,  // llmqType not in this network's chainparams llmq list
+};
+
+inline const char* mined_undo_result_name(MinedUndoResult r)
+{
+    switch (r) {
+        case MinedUndoResult::Undone:              return "undone";
+        case MinedUndoResult::NotArmed:            return "not-armed";
+        case MinedUndoResult::NotTip:              return "not-tip";
+        case MinedUndoResult::BeyondUndoWindow:    return "beyond-undo-window";
+        case MinedUndoResult::BodyNotBound:        return "body-not-bound";
+        case MinedUndoResult::BadQcPayload:        return "bad-qc-payload";
+        case MinedUndoResult::BadQcCommitmentType: return "bad-qc-commitment-type";
     }
     return "n/a";
 }
@@ -230,26 +278,34 @@ public:
             m_arm_reason = v.reason;
             return v;
         }
-        if (posture.live) {
+        if (posture.live && !posture.reorg_undo_wired) {
             v.reason =
                 "mined-commitment index REFUSED TO ARM: the node's tip is "
-                "LIVE (declared by " + posture.declared_by + "). This is the "
-                "FORWARD half only — dashd's UndoBlock "
-                "(v23.1.7 llmq/blockprocessor.cpp:383-408) is NOT ported, so "
-                "a disconnected block would leave a phantom mined record; "
-                "has_mined_commitment() would then answer true for a "
-                "commitment the new chain never mined, the slot would drop "
-                "out of the mandatory set, and the served template would be "
-                "short one qfcommit => bad-qc-missing "
-                "(blockprocessor.cpp:198) => LOST BLOCK. Arm this only on a "
-                "replay/backfill consumer, or land the undo half first.";
+                "LIVE (declared by " + posture.declared_by + ") and NO "
+                "reorg-undo handler is wired. dashd's UndoBlock "
+                "(v23.1.7 llmq/blockprocessor.cpp:383-408) is ported here "
+                "(undo_input/undo_block + handle_reorg), but the CALLER must "
+                "install a disconnect handler that drives it and declare "
+                "TipPosture.reorg_undo_wired. Until then a disconnected block "
+                "would leave a phantom mined record; has_mined_commitment() "
+                "would answer true for a commitment the new chain never mined, "
+                "the slot would drop out of the mandatory set, and the served "
+                "template would be short one qfcommit => bad-qc-missing "
+                "(blockprocessor.cpp:198) => LOST BLOCK. Arm this on a "
+                "replay/backfill consumer, or wire the undo handler first.";
             m_armed = false;
             m_arm_reason = v.reason;
             return v;
         }
         v.armed  = true;
-        v.reason = "mined-commitment index ARMED (forward-only; tip declared "
-                   "NOT live by " + posture.declared_by + ")";
+        v.reason = posture.live
+            ? ("mined-commitment index ARMED on a LIVE tip: dashd's UndoBlock "
+               "(v23.1.7 llmq/blockprocessor.cpp:383-408) is ported "
+               "(undo_input/undo_block + handle_reorg), so a disconnected "
+               "block is rolled back exactly. Reorg-undo declared wired by "
+               + posture.declared_by + ".")
+            : ("mined-commitment index ARMED (forward-only; tip declared NOT "
+               "live by " + posture.declared_by + ")");
         m_armed = true;
         m_arm_reason = v.reason;
         return v;
@@ -360,8 +416,9 @@ public:
                         + (m_seeded ? "" : " (NO seeded cursor)")
                         + " and this port is forward-only — only h="
                         + std::to_string(m_height + 1) + " is ingestible. "
-                        "UndoBlock is not ported, so a gap can never be "
-                        "closed by re-walking.");
+                        "The reorg-undo half rolls the TIP back (handle_reorg); "
+                        "it never fills a forward gap, so a skipped height must "
+                        "be refused, not silently absorbed.");
         // Re-assert the per-block dup rule on the parsed path too: a caller
         // that assembled the input itself must not be able to smuggle two
         // non-rotated commitments of one type past bad-qc-dup.
@@ -452,6 +509,14 @@ public:
         }
 
         // ── The two writes (blockprocessor.cpp:359-368) ──────────────────
+        // The rollback journal records, per height, EXACTLY the keys these
+        // writes touched, so handle_reorg can erase them without re-supplying
+        // the body — dashd re-parses the disconnected CBlock in UndoBlock; we
+        // keep a compact per-height journal instead, the same shape the replay
+        // UTXO fold keeps a BlockUndo (replay_utxo_fold.hpp).
+        UndoEntry undo;
+        undo.block_hash = block_hash;
+        undo.writes.reserve(staged.size());
         for (auto& rec : staged) {
             const LlmqParamsView* p = params_for(rec.commitment.llmqType);
             const uint8_t t = rec.commitment.llmqType;
@@ -462,14 +527,183 @@ public:
             else
                 m_by_height[t][rec.mined_height] = v;
             m_mined[key_of(t, rec.commitment.quorumHash)] = rec;
+            undo.writes.push_back(UndoWrite{t, rec.commitment.quorumHash,
+                                            rec.quorum_index, p->use_rotation});
             ++m_stats.commitments_mined;
         }
+        m_undo_journal[height] = std::move(undo);
+        trim_undo_journal();
 
         m_height = height;
         ++m_stats.blocks_ingested;
         prune(height);
         if (err) err->clear();
         return MinedIngestResult::Applied;
+    }
+
+    // ── UndoBlock — the symmetric reorg port ─────────────────────────────
+
+    /// Port of `CQuorumBlockProcessor::UndoBlock`'s STORE half
+    /// (v23.1.7 llmq/blockprocessor.cpp:383-408). dashd, on DisconnectBlock,
+    /// re-reads the disconnected block's commitments via GetCommitmentsFromBlock
+    /// (:391), skips nulls (:394), and for every non-null one ERASES the two
+    /// records ProcessCommitment wrote — DB_MINED_COMMITMENT by (llmqType,
+    /// quorumHash) (:399) and the inversed-height key at THIS block's height
+    /// (:402-406) — then re-offers the commitment as mineable (:408). This is
+    /// the exact inverse of process_input's two writes.
+    ///
+    /// NOT ported here, symmetrically to the forward half:
+    ///   * AddMineableCommitment (:408) — re-offering a disconnected commitment
+    ///     as mineable is MineableCommitmentCache's job, unchanged; this store
+    ///     only owns the MINED question. Erasing the mined record is already
+    ///     enough for compute_required_qc_slots to re-mandate the slot.
+    ///   * PreComputeQuorumMembers (:387) — a cache warm-up with no store effect.
+    ///
+    /// dashd only ever disconnects the TIP (DisconnectTip walks the active
+    /// chain back one block at a time), so undo is LIFO: `in.height` must be the
+    /// current cursor. That is the same invariant that makes the forward walk
+    /// contiguous, run backwards.
+    MinedUndoResult undo_input(const MinedBlockInput& in, std::string* err = nullptr)
+    {
+        auto fail = [&](MinedUndoResult r, const std::string& why) {
+            if (err)
+                *err = "h=" + std::to_string(in.height) + " "
+                     + mined_undo_result_name(r) + ": " + why;
+            ++m_stats.blocks_undo_refused;
+            return r;
+        };
+        if (!m_armed)
+            return fail(MinedUndoResult::NotArmed, m_arm_reason);
+        if (!m_seeded || in.height != m_height)
+            return fail(MinedUndoResult::NotTip,
+                        "UndoBlock disconnects the TIP only (dashd "
+                        "DisconnectTip). The store cursor is at h="
+                        + std::to_string(m_height)
+                        + (m_seeded ? "" : " (NO seeded cursor)")
+                        + " — only that height is disconnectable.");
+        // GetCommitmentsFromBlock + the null skip (blockprocessor.cpp:391-394):
+        // build the erase list from the body, exactly as the forward path built
+        // the write list.
+        std::vector<UndoWrite> writes;
+        for (const auto& qc : in.commitments) {
+            const LlmqParamsView* p = params_for(qc.llmqType);
+            if (p == nullptr)
+                return fail(MinedUndoResult::BadQcCommitmentType,
+                            "llmqType " + std::to_string(int(qc.llmqType))
+                            + " is not in this network's chainparams llmq list");
+            if (is_null_commitment(qc))
+                continue;   // dashd: `if (qc.IsNull()) continue;` (:394)
+            writes.push_back(UndoWrite{qc.llmqType, qc.quorumHash,
+                                       qc.quorumIndex, p->use_rotation});
+        }
+        erase_writes_at(in.height, writes);
+        m_undo_journal.erase(in.height);
+        m_height = in.height - 1;
+        ++m_stats.blocks_disconnected;
+        if (err) err->clear();
+        return MinedUndoResult::Undone;
+    }
+
+    /// The BODY entry point for undo — mirror of process_block. Re-parses the
+    /// disconnected block's type-6 payloads (the GetCommitmentsFromBlock half
+    /// of dashd's UndoBlock) and asserts the body binds to its header, then
+    /// hands the parsed commitments to undo_input. Whoever has the disconnected
+    /// body uses this; the live reorg path, which does not retain bodies, uses
+    /// handle_reorg (journal-driven) instead.
+    MinedUndoResult undo_block(uint32_t height, const uint256& block_hash,
+                               const BlockType& block, std::string* err = nullptr)
+    {
+        auto fail = [&](MinedUndoResult r, const std::string& why) {
+            if (err)
+                *err = "h=" + std::to_string(height) + " "
+                     + mined_undo_result_name(r) + ": " + why;
+            ++m_stats.blocks_undo_refused;
+            return r;
+        };
+        if (!block_body_binds_to_header(block))
+            return fail(MinedUndoResult::BodyNotBound,
+                        "body merkle root != header commitment — a forged or "
+                        "mutated body must never drive an erase either");
+        MinedBlockInput in;
+        in.height     = height;
+        in.block_hash = block_hash;
+        for (size_t i = 0; i < block.m_txs.size(); ++i) {
+            const auto& tx = block.m_txs[i];
+            if (tx.type != vendor::CFinalCommitmentTxPayload::SPECIALTX_TYPE)
+                continue;
+            vendor::CFinalCommitmentTxPayload payload;
+            if (!vendor::parse_qfcommit_payload(tx.extra_payload, payload))
+                return fail(MinedUndoResult::BadQcPayload,
+                            "tx[" + std::to_string(i) + "] type-6 payload is "
+                            "unparseable");
+            in.commitments.push_back(std::move(payload.commitment));
+        }
+        return undo_input(in, err);
+    }
+
+    /// The LIVE reorg driver. A branch switch disconnects every tip block that
+    /// is no longer on the (already-switched) chain. This walks the cursor
+    /// DOWN, and at each height compares the journal's recorded block hash
+    /// against `hash_at_height` (the new chain): the FIRST height that still
+    /// matches is the fork point, and everything above it is rolled back from
+    /// the journal — no disconnected body needed. It is the exact analogue of
+    /// the credit-pool axis's fork-point search (coin_state_maintainer.hpp), and
+    /// dashd's per-block DisconnectTip loop expressed over the retained journal.
+    ///
+    /// A reorg deeper than the retained undo window cannot be rolled back
+    /// exactly; this refuses BeyondUndoWindow and the caller must
+    /// clear_for_cold_rebuild() (mirrors on_sml_reorg's cold-resync) — the
+    /// fail-CLOSED direction: an empty store over-mandates slots, it never
+    /// serves a phantom.
+    MinedUndoResult handle_reorg(const HashAtHeightFn& hash_at_height,
+                                 std::string* err = nullptr)
+    {
+        auto fail = [&](MinedUndoResult r, const std::string& why) {
+            if (err)
+                *err = mined_undo_result_name(r) + std::string(": ") + why;
+            ++m_stats.blocks_undo_refused;
+            return r;
+        };
+        if (!m_armed)
+            return fail(MinedUndoResult::NotArmed, m_arm_reason);
+        while (m_seeded && m_height > 0) {
+            auto jit = m_undo_journal.find(m_height);
+            if (jit == m_undo_journal.end())
+                return fail(MinedUndoResult::BeyondUndoWindow,
+                            "reorg is deeper than the retained undo window ("
+                            + std::to_string(m_cfg.undo_window)
+                            + " blocks): no journal entry for tip h="
+                            + std::to_string(m_height)
+                            + ". The store cannot roll back exactly and must be "
+                              "cold-rebuilt (clear_for_cold_rebuild + re-seed).");
+            auto on_chain = hash_at_height ? hash_at_height(m_height)
+                                           : std::nullopt;
+            if (on_chain && !on_chain->IsNull()
+                && *on_chain == jit->second.block_hash)
+                break;   // fork point: this tip block is still on the new chain
+            erase_writes_at(m_height, jit->second.writes);
+            m_undo_journal.erase(jit);
+            --m_height;
+            ++m_stats.blocks_disconnected;
+        }
+        if (err) err->clear();
+        return MinedUndoResult::Undone;
+    }
+
+    /// Fail-closed reset for a reorg beyond the undo window (or any axis that
+    /// invalidated the store). Empties every record and drops the cursor, so
+    /// process_input refuses until the caller re-seeds and re-seeds the cursor —
+    /// the same cold-resync contract on_sml_reorg gives the SML axis. The arm
+    /// verdict and config are kept.
+    void clear_for_cold_rebuild()
+    {
+        m_mined.clear();
+        m_by_height.clear();
+        m_by_height_indexed.clear();
+        m_undo_journal.clear();
+        m_seeded = false;
+        m_height = 0;
+        ++m_stats.cold_rebuilds;
     }
 
     // ── Readers ──────────────────────────────────────────────────────────
@@ -690,6 +924,10 @@ public:
         uint64_t commitments_mined{0};
         uint64_t commitments_null{0};
         uint64_t commitments_seeded{0};
+        uint64_t blocks_disconnected{0};   // UndoBlock port: heights rolled back
+        uint64_t commitments_erased{0};    // mined records removed by undo
+        uint64_t blocks_undo_refused{0};   // undo/reorg refusals
+        uint64_t cold_rebuilds{0};         // clear_for_cold_rebuild() calls
     };
     const Stats& stats() const { return m_stats; }
     size_t       size() const  { return m_mined.size(); }
@@ -730,7 +968,9 @@ public:
                       + " mined=" + std::to_string(m_mined.size())
                       + " blocks=" + std::to_string(m_stats.blocks_ingested)
                       + " refused=" + std::to_string(m_stats.blocks_refused)
-                      + " nulls=" + std::to_string(m_stats.commitments_null);
+                      + " nulls=" + std::to_string(m_stats.commitments_null)
+                      + " disconnected="
+                      + std::to_string(m_stats.blocks_disconnected);
         if (!m_armed) return s + " reason=\"" + m_arm_reason + "\"";
         const auto miss = active_set_shortfall(m_height);
         if (miss.empty()) return s + " active_set=COMPLETE";
@@ -753,6 +993,24 @@ public:
     }
 
 private:
+    /// One erased key for the rollback journal — enough to invert the two
+    /// writes without the disconnected body: which map (rotation) and which
+    /// keys (type, quorumHash, quorumIndex). The mined height is the journal
+    /// key itself.
+    struct UndoWrite {
+        uint8_t  llmq_type{0};
+        uint256  quorum_hash;
+        int16_t  quorum_index{0};
+        bool     rotation{false};
+    };
+    /// Per-height rollback record: the block hash this height ingested (the
+    /// fork-point discriminator handle_reorg compares against the new chain)
+    /// plus every mined record written at it.
+    struct UndoEntry {
+        uint256                block_hash;
+        std::vector<UndoWrite> writes;
+    };
+
     const std::vector<LlmqParamsView>& chainparams_llmqs() const
     {
         // The CHAINPARAMS list, not the runtime-enabled one: upstream's
@@ -787,6 +1045,39 @@ private:
     {
         auto it = m_mined.find(key_of(type, qh));
         return it == m_mined.end() ? nullptr : &it->second;
+    }
+
+    /// The inverse of process_input's two writes, for one height. Removes the
+    /// DB_MINED_COMMITMENT record by (type, quorumHash) and the inversed-height
+    /// entry at `height` — exactly what dashd's UndoBlock erases. Erasing a key
+    /// prune() already dropped is a harmless no-op, which is why undo is
+    /// prune-independent: the journal, not the count-bounded inversed indices,
+    /// is the authority on what a height wrote.
+    void erase_writes_at(uint32_t height, const std::vector<UndoWrite>& writes)
+    {
+        for (const auto& w : writes) {
+            m_mined.erase(key_of(w.llmq_type, w.quorum_hash));
+            if (w.rotation) {
+                auto it = m_by_height_indexed.find(w.llmq_type);
+                if (it != m_by_height_indexed.end()) {
+                    auto qit = it->second.find(w.quorum_index);
+                    if (qit != it->second.end()) qit->second.erase(height);
+                }
+            } else {
+                auto it = m_by_height.find(w.llmq_type);
+                if (it != m_by_height.end()) it->second.erase(height);
+            }
+            ++m_stats.commitments_erased;
+        }
+    }
+
+    /// Keep only the last `undo_window` heights of rollback journal. Bounds the
+    /// journal exactly as prune() bounds the inversed indices — the reorg depth
+    /// beyond this is fail-closed in handle_reorg, never silently unrepairable.
+    void trim_undo_journal()
+    {
+        while (m_undo_journal.size() > m_cfg.undo_window)
+            m_undo_journal.erase(m_undo_journal.begin());
     }
 
     /// Bound the in-memory inversed-height indices BY COUNT, never by height.
@@ -856,6 +1147,9 @@ private:
     // …_Q_INDEXED: type -> quorumIndex -> minedHeight -> value
     std::map<uint8_t, std::map<int16_t, std::map<uint32_t, IndexValue>>>
         m_by_height_indexed;
+    // Rollback journal for the UndoBlock port: minedHeight -> UndoEntry,
+    // bounded to the last undo_window heights (trim_undo_journal).
+    std::map<uint32_t, UndoEntry> m_undo_journal;
 };
 
 } // namespace coin
