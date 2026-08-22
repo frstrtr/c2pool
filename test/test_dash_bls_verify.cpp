@@ -271,4 +271,60 @@ TEST(DashBlsVerify, VerifyFinalCommitmentSyntheticRoundTrip)
     }
 }
 
+// ── task #154 KAT (c): operator-key POINT compare (opkey_point_eq) ───────────
+//
+// The DML fold's ProUpRegTx reset gate (replay_fold_engine.hpp fold_proupreg)
+// resets+bans a masternode iff the operator key POINT changed, a 1:1 port of
+// dashd specialtxman.cpp:388 (CBLSPublicKey operator== / bls.h:512). The store
+// is canonical BASIC; the wire key is serialized in the scheme its ProUpRegTx
+// nVersion dictates (legacy iff nVersion < BasicBLS). A same G1 point encodes
+// to DIFFERENT bytes under legacy vs basic, and legacy bytes read under basic
+// decode to a DIFFERENT point. A naive byte compare therefore OVER-resets a
+// legacy-wire/same-point update, and a dual-scheme intersection UNDER-resets it
+// — the h=1874081/@1899899 derive walls. opkey_point_eq decodes each side under
+// EXACTLY its declared scheme and compares points, matching dashd byte-for-byte.
+TEST(DashBlsVerify, OpkeyPointEqIsSchemeFaithful)
+{
+    auto to_arr = [](const std::vector<uint8_t>& v) {
+        std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE> a{};
+        for (size_t i = 0; i < a.size() && i < v.size(); ++i) a[i] = v[i];
+        return a;
+    };
+
+    bls::BasicSchemeMPL scheme;
+    // Key P and a DISTINCT key Q.
+    bls::G1Element P = scheme.KeyGen(std::vector<uint8_t>(32, 0x51)).GetG1Element();
+    bls::G1Element Q = scheme.KeyGen(std::vector<uint8_t>(32, 0x77)).GetG1Element();
+
+    const auto p_basic  = to_arr(P.Serialize(false)); // basic (v19+) encoding of P
+    const auto p_legacy = to_arr(P.Serialize(true));  // legacy (pre-v19) encoding of P
+    const auto q_basic  = to_arr(Q.Serialize(false));
+
+    // The two encodings of the SAME point are DIFFERENT bytes — a naive byte
+    // compare would (wrongly) treat a legacy-wire update as a key change.
+    EXPECT_NE(p_basic, p_legacy)
+        << "basic and legacy encodings of one point must differ (else the KAT is vacuous)";
+
+    // Stored BASIC vs wire LEGACY, each read under its DECLARED scheme => SAME
+    // point => EQUAL => the reset does NOT fire (no over-reset). This is the
+    // h=1874081 case dashd does not reset on.
+    EXPECT_TRUE(opkey_point_eq(p_basic, /*a_legacy=*/false,
+                               p_legacy, /*b_legacy=*/true));
+
+    // Same legacy bytes MIS-declared as basic => decode to a different/invalid
+    // point => NOT-EQUAL. (Shows the declared scheme is load-bearing.)
+    EXPECT_FALSE(opkey_point_eq(p_basic, /*a_legacy=*/false,
+                                p_legacy, /*b_legacy=*/false));
+
+    // A REAL operator-key change => NOT-EQUAL => the reset+ban fires.
+    EXPECT_FALSE(opkey_point_eq(p_basic, /*a_legacy=*/false,
+                                q_basic, /*b_legacy=*/false));
+
+    // Scheme normalization round-trips: a legacy wire key canonicalizes to the
+    // stored basic bytes, and a stored basic key re-emits the legacy leaf bytes.
+    EXPECT_EQ(opkey_to_basic(p_legacy, /*wire_legacy=*/true), p_basic);
+    EXPECT_EQ(opkey_for_leaf(p_basic, /*want_legacy=*/true),  p_legacy);
+    EXPECT_EQ(opkey_for_leaf(p_basic, /*want_legacy=*/false), p_basic);
+}
+
 #endif // C2POOL_DASH_BLS

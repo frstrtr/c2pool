@@ -50,6 +50,18 @@
 #include <functional>
 #include <optional>
 #include <vector>
+#include <algorithm>
+
+#ifdef C2POOL_DASH_BLS
+// Pulled ONLY under the BLS backend (which already links dashbls): the opkey
+// scheme helpers below are inline so a BLS-OFF translation unit that includes
+// this header (e.g. the fold/replay test targets, which do not link
+// dash_bls_verify) resolves them via the byte-fallback path with no new link
+// dependency — while the real crypto is exercised in every BLS-ON build.
+#include <dashbls/bls.hpp>
+#include <dashbls/schemes.hpp>
+#include <dashbls/elements.hpp>
+#endif
 
 namespace dash {
 namespace coin {
@@ -173,6 +185,112 @@ bool verify_chainlock_sig(
     const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& quorum_public_key,
     const uint256& sign_hash,
     const std::array<uint8_t, CFinalCommitment::BLS_SIG_SIZE>& sig);
+
+
+// Scheme-FAITHFUL operator-pubkey point equality — the 1:1 port of dashd's
+// operator-key reset gate compare (specialtxman.cpp:388
+// `newState->pubKeyOperator != opt_proTx->pubKeyOperator`, a CBLSPublicKey
+// operator== / bls.h:512 POINT compare). Each side is decoded under EXACTLY
+// its declared scheme with NO fallback to the other scheme: `a` under
+// a_legacy, `b` under b_legacy. Returns true iff BOTH decode (validly) under
+// their declared scheme AND encode the SAME underlying G1 point.
+//
+// WHY (h=1874081 divergence): the DML store canonicalizes every operator key to
+// BASIC (opkey_to_basic), so the STORED side is basic (a_legacy=false). A
+// ProUpRegTx serializes its operator key in the scheme its payload nVersion
+// dictates (legacy iff nVersion < BASIC_BLS, providertx.h:221), so the WIRE side
+// MUST be decoded under that scheme. When a v1 (legacy) wire key is BYTE-IDENTICAL
+// to a stored basic key but is a DIFFERENT point, dashd resets — a dual-scheme
+// intersection read of the wire under BASIC would find the stored point and
+// falsely report "same" (no reset). This helper reads the wire ONLY under its
+// declared scheme so the points differ and the reset fires, exactly as dashd
+// does. Fail-closed (NOT-EQUAL) when either side fails to decode under its
+// declared scheme. Without a BLS backend, falls back to byte-equality only when
+// the declared schemes match.
+//
+// Defined inline (not in bls_verify.cpp) so a BLS-OFF test target that folds a
+// TU which ODR-uses these (the fold/replay suite computes SML roots via
+// to_sml_entry → opkey_for_leaf) links via the fallback path without pulling
+// dash_bls_verify.
+inline bool opkey_point_eq(const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& a, bool a_legacy,
+                           const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& b, bool b_legacy)
+{
+#ifndef C2POOL_DASH_BLS
+    // No BLS backend: bytes are only comparable as points when serialized under
+    // the SAME scheme; differing schemes are unresolvable → conservatively false.
+    return a_legacy == b_legacy && a == b;
+#else
+    bls::G1Element pa, pb;
+    try {
+        // DECLARED scheme only — a v1 wire key read under basic would decode to a
+        // DIFFERENT point and mask a real key change (the h=1874081 bug).
+        pa = bls::G1Element::FromBytes(bls::Bytes(a.data(), a.size()), a_legacy);
+        pb = bls::G1Element::FromBytes(bls::Bytes(b.data(), b.size()), b_legacy);
+    } catch (...) {
+        return false;   // either side undecodable under its declared scheme
+    }
+    if (!pa.IsValid() || !pb.IsValid()) return false;
+    return pa == pb;    // G1Element::operator== — scheme-insensitive point compare
+#endif
+}
+
+
+// --- opkey scheme normalization (dashd stores a POINT and serializes per the
+// entry nVersion; we store raw bytes, so we must convert explicitly). A same
+// G1 point encodes differently under the LEGACY (pre-v19) and BASIC (v19+)
+// schemes; a basic key even mis-parses under legacy to a DIFFERENT valid point.
+// We canonicalize every STORED opkey to BASIC (opkey_to_basic) so the store is
+// scheme-unambiguous, then emit each SML leaf in the scheme its nVersion dictates
+// (opkey_for_leaf: legacy iff nVersion < BASIC_BLS). Both no-op the a==b path and
+// fall back to the input on decode failure.
+inline std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>
+opkey_to_basic(const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& wire, bool wire_legacy)
+{
+#ifndef C2POOL_DASH_BLS
+    (void)wire_legacy;
+    return wire;
+#else
+    const bls::Bytes bb(wire.data(), wire.size());
+    // Decode with the declared wire scheme first (a v1 tx carries legacy, a v2 tx
+    // basic); fall back to the other scheme, then to the raw bytes.
+    for (bool legacy : { wire_legacy, !wire_legacy }) {
+        try {
+            bls::G1Element e = bls::G1Element::FromBytes(bb, legacy);
+            if (e.IsValid()) {
+                const std::vector<uint8_t> v = e.Serialize(false); // basic
+                std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE> out{};
+                std::copy_n(v.begin(), std::min(v.size(), out.size()), out.begin());
+                return out;
+            }
+        } catch (...) { /* try the other scheme */ }
+    }
+    return wire;
+#endif
+}
+
+inline std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>
+opkey_for_leaf(const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& stored_basic, bool want_legacy)
+{
+#ifndef C2POOL_DASH_BLS
+    (void)want_legacy;
+    return stored_basic;
+#else
+    const bls::Bytes bb(stored_basic.data(), stored_basic.size());
+    // The store is canonical BASIC; decode basic first, fall back to legacy, then raw.
+    for (bool legacy : { false, true }) {
+        try {
+            bls::G1Element e = bls::G1Element::FromBytes(bb, legacy);
+            if (e.IsValid()) {
+                const std::vector<uint8_t> v = e.Serialize(want_legacy);
+                std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE> out{};
+                std::copy_n(v.begin(), std::min(v.size(), out.size()), out.begin());
+                return out;
+            }
+        } catch (...) { /* try the other scheme */ }
+    }
+    return stored_basic;
+#endif
+}
 
 } // namespace vendor
 } // namespace coin
