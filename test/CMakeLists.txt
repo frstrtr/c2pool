@@ -409,6 +409,19 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_work_target PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
     gtest_add_tests(test_dash_work_target "" AUTO)
 
+    # #859: LTC producer-target helper (average_attempts_to_target saturation).
+    # Header-only (impl/ltc/work_target.hpp over core/uint256.hpp); pure,
+    # socket-free. Mirrors the test_dash_work_target link set (minus dash_x11).
+    add_executable(test_ltc_work_target test_ltc_work_target.cpp)
+    target_link_libraries(test_ltc_work_target PRIVATE
+        GTest::gtest_main GTest::gtest
+        core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_ltc_work_target PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
+    gtest_add_tests(test_ltc_work_target "" AUTO)
+
     # Header-only (stratum/work_job_targets.hpp over work_target.hpp + config_pool);
     # pure, socket-free. get_work() job-target assembly KAT.
     add_executable(test_dash_work_job_targets test_dash_work_job_targets.cpp)
