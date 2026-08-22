@@ -174,6 +174,56 @@ bool verify_chainlock_sig(
     const uint256& sign_hash,
     const std::array<uint8_t, CFinalCommitment::BLS_SIG_SIZE>& sig);
 
+
+// Scheme-agnostic operator-pubkey equality: true iff a and b encode the SAME
+// BLS G1 point, independent of legacy/basic serialization scheme. The DML fold
+// needs this because a ProUpRegTx can carry the operator key in a different BLS
+// scheme than the stored entry (basic wire vs legacy-stored, post-V19); a raw
+// byte compare then falsely reports an operator-key change and wrongly
+// reset+bans the MN (the h=1899899 derive wall). Falls back to byte-equality
+// when no BLS backend is linked.
+bool opkey_same_g1(const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& a,
+                   const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& b);
+
+
+// Scheme-FAITHFUL operator-pubkey point equality — the 1:1 port of dashd's
+// operator-key reset gate compare (specialtxman.cpp:388
+// `newState->pubKeyOperator != opt_proTx->pubKeyOperator`, a CBLSPublicKey
+// operator== / bls.h:512 POINT compare). UNLIKE opkey_same_g1, each side is
+// decoded under EXACTLY its declared scheme with NO fallback to the other
+// scheme: `a` under a_legacy, `b` under b_legacy. Returns true iff BOTH decode
+// (validly) under their declared scheme AND encode the SAME underlying G1 point.
+//
+// WHY (h=1874081 divergence): the DML store canonicalizes every operator key to
+// BASIC (opkey_to_basic), so the STORED side is basic (a_legacy=false). A
+// ProUpRegTx serializes its operator key in the scheme its payload nVersion
+// dictates (legacy iff nVersion < BASIC_BLS, providertx.h:221), so the WIRE side
+// MUST be decoded under that scheme. When a v1 (legacy) wire key is BYTE-IDENTICAL
+// to a stored basic key but is a DIFFERENT point (basic P vs legacy Q share the
+// bytes 9411..), dashd resets — but opkey_same_g1's dual-scheme intersection
+// read the wire under BASIC too, found P, and falsely reported "same" (no reset).
+// This helper reads the wire ONLY under its declared scheme (legacy → Q) so the
+// points differ and the reset fires, exactly as dashd does. Fail-closed
+// (NOT-EQUAL) when either side fails to decode under its declared scheme. Without
+// a BLS backend, falls back to byte-equality only when the declared schemes match.
+bool opkey_point_eq(const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& a, bool a_legacy,
+                    const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& b, bool b_legacy);
+
+
+// --- opkey scheme normalization (dashd stores a POINT and serializes per the
+// entry nVersion; we store raw bytes, so we must convert explicitly). A same
+// G1 point encodes differently under the LEGACY (pre-v19) and BASIC (v19+)
+// schemes; a basic key even mis-parses under legacy to a DIFFERENT valid point.
+// We canonicalize every STORED opkey to BASIC (opkey_to_basic) so the store is
+// scheme-unambiguous, then emit each SML leaf in the scheme its nVersion dictates
+// (opkey_for_leaf: legacy iff nVersion < BASIC_BLS). Both no-op the a==b path and
+// fall back to the input on decode failure.
+std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>
+opkey_to_basic(const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& wire, bool wire_legacy);
+
+std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>
+opkey_for_leaf(const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& stored_basic, bool want_legacy);
+
 } // namespace vendor
 } // namespace coin
 } // namespace dash

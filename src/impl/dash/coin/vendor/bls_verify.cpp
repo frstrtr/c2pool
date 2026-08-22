@@ -16,6 +16,7 @@
 
 #include <cstring>
 #include <span>
+#include <algorithm>
 
 #ifdef C2POOL_DASH_BLS
 // dashpay/bls-signatures ("dashbls") — the exact library dashd wraps in
@@ -308,6 +309,121 @@ make_commitment_bls_verifier(MemberKeysProvider provider)
         if (!members) return false;   // member set uncertain → fail closed
         return verify_final_commitment(c, *members);
     };
+}
+
+
+// See bls_verify.hpp. Self-contained (does not depend on the anon-namespace
+// deser_g1): robust dual-scheme G1 deserialize, compare canonical basic bytes.
+bool opkey_same_g1(const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& a,
+                   const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& b)
+{
+    if (a == b) return true;
+#ifndef C2POOL_DASH_BLS
+    return false;   // no BLS backend: fall back to byte-equality (already != here)
+#else
+    // A same G1 point can be encoded under either the LEGACY or the BASIC scheme,
+    // and a BASIC-scheme key can silently DESERIALIZE (without throwing) under the
+    // legacy convention as a DIFFERENT valid point. So "first scheme that decodes
+    // wins" is unsafe: it may canonicalize the two sides via different points and
+    // report a spurious difference (proven at h=1900676: wire 93d0.. mis-parses as
+    // b3d0.. under legacy). Instead collect EVERY canonical (basic-serialized) form
+    // each side can decode to, under BOTH schemes, and treat the keys as equal iff
+    // those form-sets intersect.
+    auto canon_set = [](const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& k,
+                        std::vector<std::vector<uint8_t>>& out) {
+        const bls::Bytes bb(k.data(), k.size());
+        for (bool legacy : {true, false}) {
+            try {
+                bls::G1Element e = bls::G1Element::FromBytes(bb, legacy);
+                if (e.IsValid()) out.push_back(e.Serialize(false));
+            } catch (...) { /* try the other scheme */ }
+        }
+    };
+    std::vector<std::vector<uint8_t>> sa, sb;
+    canon_set(a, sa);
+    canon_set(b, sb);
+    for (const auto& x : sa)
+        for (const auto& y : sb)
+            if (x == y) return true;
+    return false;
+#endif
+}
+
+
+// See bls_verify.hpp. Faithful port of dashd's reset-gate point compare
+// (specialtxman.cpp:388 CBLSPublicKey operator== / bls.h:512): decode EACH side
+// under EXACTLY its declared scheme (NO cross-scheme fallback) and compare the
+// two G1 points. Equal iff both decode validly AND are the same point.
+bool opkey_point_eq(const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& a, bool a_legacy,
+                    const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& b, bool b_legacy)
+{
+#ifndef C2POOL_DASH_BLS
+    // No BLS backend: bytes are only comparable as points when serialized under
+    // the SAME scheme; differing schemes are unresolvable → conservatively false.
+    return a_legacy == b_legacy && a == b;
+#else
+    bls::G1Element pa, pb;
+    try {
+        // DECLARED scheme only — a v1 wire key read under basic would decode to a
+        // DIFFERENT point and mask a real key change (the h=1874081 bug).
+        pa = bls::G1Element::FromBytes(bls::Bytes(a.data(), a.size()), a_legacy);
+        pb = bls::G1Element::FromBytes(bls::Bytes(b.data(), b.size()), b_legacy);
+    } catch (...) {
+        return false;   // either side undecodable under its declared scheme
+    }
+    if (!pa.IsValid() || !pb.IsValid()) return false;
+    return pa == pb;    // G1Element::operator== — scheme-insensitive point compare
+#endif
+}
+
+
+std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>
+opkey_to_basic(const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& wire, bool wire_legacy)
+{
+#ifndef C2POOL_DASH_BLS
+    (void)wire_legacy;
+    return wire;
+#else
+    const bls::Bytes bb(wire.data(), wire.size());
+    // Decode with the declared wire scheme first (a v1 tx carries legacy, a v2 tx
+    // basic); fall back to the other scheme, then to the raw bytes.
+    for (bool legacy : { wire_legacy, !wire_legacy }) {
+        try {
+            bls::G1Element e = bls::G1Element::FromBytes(bb, legacy);
+            if (e.IsValid()) {
+                const std::vector<uint8_t> v = e.Serialize(false); // basic
+                std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE> out{};
+                std::copy_n(v.begin(), std::min(v.size(), out.size()), out.begin());
+                return out;
+            }
+        } catch (...) { /* try the other scheme */ }
+    }
+    return wire;
+#endif
+}
+
+std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>
+opkey_for_leaf(const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& stored_basic, bool want_legacy)
+{
+#ifndef C2POOL_DASH_BLS
+    (void)want_legacy;
+    return stored_basic;
+#else
+    const bls::Bytes bb(stored_basic.data(), stored_basic.size());
+    // The store is canonical BASIC; decode basic first, fall back to legacy, then raw.
+    for (bool legacy : { false, true }) {
+        try {
+            bls::G1Element e = bls::G1Element::FromBytes(bb, legacy);
+            if (e.IsValid()) {
+                const std::vector<uint8_t> v = e.Serialize(want_legacy);
+                std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE> out{};
+                std::copy_n(v.begin(), std::min(v.size(), out.size()), out.begin());
+                return out;
+            }
+        } catch (...) { /* try the other scheme */ }
+    }
+    return stored_basic;
+#endif
 }
 
 } // namespace vendor
