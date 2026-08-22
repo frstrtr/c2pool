@@ -1299,10 +1299,19 @@ if (BUILD_TESTING AND GTest_FOUND)
     # event. FOLDED into this EXISTING allowlisted target for the same reason
     # the E2d TU was: a new add_executable would not be in the build.yml
     # --target list and would silently report "Not Run" (#143 NOT_BUILT trap).
+    # test_dash_154_parity_kat.cpp — the #154 byte-parity KATs: the golden
+    # self-derived checkpoint at 2522504 (2991 registered MNs) parses + digest,
+    # and the V20 hash-modifier off-by-8 (pre/post-V20 form selected by the WORK
+    # block's deployment state). BLS-independent (the opkey point-compare KAT is
+    # in test_dash_bls_verify.cpp), so it links with THIS target's dash_x11+core
+    # set and is folded here for the same #143/#769 NOT_BUILT reason as the E2d
+    # checkpoint TU above (a standalone add_executable is not in build.yml's
+    # --target list and would silently report "Not Run").
     add_executable(test_dash_node_reception_wire test_dash_node_reception_wire.cpp
                    test_dash_live_feed_bridge.cpp
                    test_dash_mn_seed.cpp
                    test_dash_mn_checkpoint.cpp
+                   test_dash_154_parity_kat.cpp
                    test_dash_lane_diag.cpp
                    test_dash_header_checkpoint_coincide.cpp
                    test_dash_anchor_header_merkle_root.cpp)

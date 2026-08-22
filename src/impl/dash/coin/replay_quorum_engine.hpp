@@ -1313,9 +1313,29 @@ private:
         return std::nullopt;
     }
 
-    /// GetHashModifier, post-V20 (llmq/utils.cpp:88-111): from the WORK
-    /// block's own cbTx CL when non-null, else the work block hash.
+    /// GetHashModifier (dashd llmq/utils.cpp:88-111). dashd selects the
+    /// pre/post-V20 modifier form by the DEPLOYMENT state of the WORK block
+    /// (pWorkBlockIndex = base − WORK_DIFF_DEPTH), NOT the cycle base:
+    ///
+    ///   pWorkBlockIndex = base->GetAncestor(base->nHeight - WORK_DIFF_DEPTH);
+    ///   if (DeploymentActiveAfter(pWorkBlockIndex, V20)) {           // POST-V20
+    ///       cbcl = GetNonNullCoinbaseChainlock(pWorkBlockIndex);
+    ///       if (cbcl) return SerializeHash(tuple(type, work->nHeight, bestCLSig));
+    ///       return SerializeHash(pair(type, work->GetBlockHash()));
+    ///   }
+    ///   if (llmqParams.useRotation)                                  // PRE-V20 rotated
+    ///       return SerializeHash(pair(type, work->GetBlockHash()));
+    ///   return SerializeHash(pair(type, base->GetBlockHash()));      // PRE-V20 non-rotated
+    ///
+    /// DeploymentActiveAfter(pWorkBlockIndex, V20) == (work_h + 1) >= v20_floor.
+    /// The previous code UNCONDITIONALLY returned the POST-V20 form, so a cycle
+    /// base in [v20_floor, v20_floor+WORK_DIFF_DEPTH) — whose WORK block is
+    /// PRE-V20 — hashed the WORK block hash instead of the BASE block hash. At
+    /// mainnet base 1987776 (== V20 height) this selected the wrong LLMQ_400_60
+    /// member set (dashd invalid-marked MN b61cf487 @ index 45) and diverged the
+    /// fold (the h=1987797 poison). No cbTx CL exists PRE-V20.
     std::optional<uint256> compute_modifier(uint8_t type, uint32_t cycle_base,
+                                            bool use_rotation,
                                             std::string* why) const
     {
         const uint32_t work_h = cycle_base - kWorkDiffDepth;
@@ -1325,6 +1345,29 @@ private:
                           + " not in the observed window";
             return std::nullopt;
         }
+
+        // dashd DeploymentActiveAfter(pWorkBlockIndex, DEPLOYMENT_V20).
+        const bool post_v20 = (work_h + 1) >= m_cfg.v20_floor;
+
+        if (!post_v20) {
+            // PRE-V20: no coinbase ChainLock exists yet. Non-rotated hashes the
+            // CYCLE BASE block hash; rotated hashes the WORK block hash.
+            if (use_rotation) {
+                return vendor::compute_quorum_modifier(
+                    type, work_h, /*best_cl_sig=*/std::nullopt, hh->second);
+            }
+            auto bh = m_hash_by_height.find(cycle_base);
+            if (bh == m_hash_by_height.end()) {
+                if (why) *why = "cycle base block h=" + std::to_string(cycle_base)
+                              + " not in the observed window";
+                return std::nullopt;
+            }
+            return vendor::compute_quorum_modifier(
+                type, work_h, /*best_cl_sig=*/std::nullopt, bh->second);
+        }
+
+        // POST-V20: from the WORK block's own cbTx CL when non-null, else the
+        // work block hash.
         if (!m_cl_known.count(work_h)) {
             if (why) *why = "work block h=" + std::to_string(work_h)
                           + " has no observed cbTx CL field";
@@ -1353,8 +1396,12 @@ private:
             if (H % p.dkg_interval != 0 || H < kWorkDiffDepth) continue;
 
             // Split-floor per lane (edit 1): the rotated lane derives from the
-            // DIP0024 cycle base (rotated_floor); the non-rotated lanes' pre-V20
-            // modifier form is unported and must fail closed below v20_floor.
+            // DIP0024 cycle base (rotated_floor); the non-rotated lane derives
+            // from the V20 floor. A base AT/above the floor whose WORK block is
+            // still pre-V20 (the [v20_floor, v20_floor+8) window — mainnet base
+            // 1987776) derives HERE, and compute_modifier now selects the
+            // correct pre-V20 non-rotated (base-hash) form for it (the V20
+            // off-by-8 fix). rotated_floor <= v20_floor always.
             const uint32_t lane_floor =
                 p.use_rotation ? m_cfg.rotated_floor : m_cfg.v20_floor;
             if (H < lane_floor) {
@@ -1369,7 +1416,7 @@ private:
             }
 
             std::string why;
-            auto modifier = compute_modifier(p.type, H, &why);
+            auto modifier = compute_modifier(p.type, H, p.use_rotation, &why);
             if (!modifier) {
                 ++r.member_cycles_skipped;
                 r.member_skip_reasons.push_back(

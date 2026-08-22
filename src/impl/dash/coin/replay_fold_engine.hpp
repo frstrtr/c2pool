@@ -135,6 +135,7 @@
 #include <impl/dash/coin/vendor/llmq_commitment.hpp>
 #include <impl/dash/coin/vendor/providertx.hpp>
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
+#include <impl/dash/coin/vendor/bls_verify.hpp>
 #include <impl/dash/coin/vendor/incremental_sml_merkle.hpp>
 #include <impl/bitcoin_family/coin/base_transaction.hpp>
 
@@ -279,7 +280,11 @@ struct ReplayMNState
         e.confirmedHash    = confirmedHash;
         e.netAddress       = netInfo.ip;
         e.netPort          = netInfo.port_be;
-        e.pubKeyOperator   = pubKeyOperator;
+        // dashd serializes the SML leaf's operator key in the scheme the entry
+        // nVersion dictates (legacy iff nVersion < BasicBLS). We store canonical
+        // BASIC, so re-encode per nVersion here (opkey_for_leaf) — otherwise a
+        // legacy-era entry's leaf hashes the wrong bytes and diverges the root.
+        e.pubKeyOperator   = vendor::opkey_for_leaf(pubKeyOperator, nVersion < vendor::ProTxVersion::BASIC_BLS);
         e.keyIDVoting      = keyIDVoting;
         e.isValid          = !IsBanned();
         e.nType            = nType;
@@ -1131,7 +1136,7 @@ private:
         // (CDeterministicMNState(CProRegTx), dmnstate.h:68-79).
         st.nVersion          = p.nVersion;
         st.keyIDOwner        = p.keyIDOwner;
-        st.pubKeyOperator    = p.pubKeyOperator;
+        st.pubKeyOperator    = vendor::opkey_to_basic(p.pubKeyOperator, p.nVersion < vendor::ProTxVersion::BASIC_BLS);
         st.keyIDVoting       = p.keyIDVoting;
         st.netInfo           = p.netInfo;
         st.scriptPayout      = p.scriptPayout;
@@ -1223,7 +1228,18 @@ private:
 
         // Operator-key change ⇒ reset all operator fields + ban until a
         // ProUpServTx revives (specialtxman.cpp:395-405).
-        if (st.pubKeyOperator != p.pubKeyOperator) {
+        //
+        // dashd specialtxman.cpp:388 resets iff the operator key POINT differs.
+        // The STORED side is canonical BASIC (opkey_to_basic at the store sites,
+        // so a_legacy=false); the WIRE side is decoded under the tx payload
+        // scheme (legacy iff nVersion < BasicBLS, providertx.h:221). Faithful
+        // point compare with NO cross-scheme fallback (opkey_point_eq): a v1
+        // wire key read under basic would decode to a DIFFERENT point and
+        // byte-match a stored basic key, falsely suppressing the reset — the
+        // h=1874081/@1899899 derive walls.
+        if (!vendor::opkey_point_eq(st.pubKeyOperator, /*a_legacy=*/false,
+                                    p.pubKeyOperator,
+                                    /*b_legacy=*/p.nVersion < vendor::ProTxVersion::BASIC_BLS)) {
             const bool was_banned = st.IsBanned();
             st.ResetOperatorFields();
             st.BanIfNotBanned(H);
@@ -1232,7 +1248,7 @@ private:
             st.nVersion = st.nVersion > vendor::ProTxVersion::BASIC_BLS
                         ? st.nVersion : p.nVersion;
             // netInfo stays the empty MakeNetInfo(nVersion) from the reset.
-            st.pubKeyOperator = p.pubKeyOperator;
+            st.pubKeyOperator = vendor::opkey_to_basic(p.pubKeyOperator, p.nVersion < vendor::ProTxVersion::BASIC_BLS);
             if (m_cfg.debug_logs) {
                 LOG_INFO << "[DML-FOLD] h=" << H << " MN "
                          << p.proTxHash.GetHex().substr(0, 16)
