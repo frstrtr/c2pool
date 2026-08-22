@@ -609,8 +609,13 @@ public:
     // the dedicated rpc_pool). When set, cached_work() NEVER blocks the caller
     // on a dashd GBT: it serves the (possibly stale) cache immediately and hands
     // the blocking re-source to this executor as a SINGLE-FLIGHT background job.
-    // Set once at startup before the io loop runs. Only wired on the dashd-
-    // fallback arm; unset -> the legacy inline-blocking path (embedded/tests).
+    // Set once at startup before the io loop runs. Wired on EVERY arm with a
+    // dashd rpc armed (#139: the coin-p2p arm used to take the inline path and
+    // starved the io thread under tx-serving load); unset -> the legacy
+    // inline-blocking path (rpc-less pure-daemonless / tests), which never
+    // blocks on dashd because no rpc exists there. Safe off-io by the #1134
+    // ownership handoff: the posted job receives a by-value CoinStateArm and
+    // resource_template_now(arm) names no coin state.
     void set_refresh_executor(std::function<void(std::function<void()>)> fn)
     { refresh_executor_ = std::move(fn); }
 
