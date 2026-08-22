@@ -1015,6 +1015,104 @@ TEST(DashReplayQuorumEngine, ScoreTieNeedsCollateralToResolve)
     EXPECT_EQ((*sorted)[1], &a);
 }
 
+// ── Quarter-fill unique-property refusal (mainnet 1800288 qi31 wall) ────────
+// dashd's MnsUsedAtHIndexed[i] is a CDeterministicMNList; AddMN throws (and
+// BuildNewQuorumQuarterMembers CATCHES it) when a fill candidate duplicates a
+// unique property — collateralOutpoint / operator — of a member already in the
+// quarter. A retained-but-REMOVED masternode (pre-V19 skip_removed=false keeps
+// its slot) that has been RE-REGISTERED under a NEW proTxHash on the SAME
+// collateral is exactly that: dashd SKIPS the re-registration and keeps the
+// removed MN's slot, so the fill does not shift. Modelling the used set as a
+// bare proTxHash std::set loses the refusal (distinct proTxHash ⇒ wrongly
+// admitted), which is the 1800288 qi31 divergence (merkleRootMNList wall at
+// 1800598). RED on the proTxHash-set master, GREEN once UniqueMnList enforces
+// collateralOutpoint uniqueness the way dashd's AddMN does.
+TEST(DashReplayQuorumEngine, QuarterFillRefusesReRegistrationOnRetainedCollateral)
+{
+    using dash::coin::replay::rotdetail::build_new_quarter_members;
+    using MnRef = const QuorumMnEntry*;
+
+    auto set256 = [](uint256& h, const std::string& hex) { h.SetHex(hex); };
+
+    // The retained REMOVED masternode Y: a member of the previous quarter,
+    // no longer in the H work list, holding collateral C.
+    QuorumMnEntry y;
+    set256(y.proTxHash,
+           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    set256(y.confirmedHash,
+           "1111111111111111111111111111111111111111111111111111111111111111");
+    y.is_valid       = true;   // was valid when selected; only later removed
+    y.has_collateral = true;
+    set256(y.collateral_hash,
+           "00000000000000000000000000000000000000000000000000000000000000cc");
+    y.collateral_index = 1;
+
+    // Z: the RE-REGISTRATION — a DIFFERENT proTxHash on the SAME collateral C,
+    // present and valid in the H work list.
+    QuorumMnEntry z;
+    set256(z.proTxHash,
+           "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    set256(z.confirmedHash,
+           "2222222222222222222222222222222222222222222222222222222222222222");
+    z.is_valid       = true;
+    z.has_collateral = true;
+    set256(z.collateral_hash,
+           "00000000000000000000000000000000000000000000000000000000000000cc");
+    z.collateral_index = 1;   // == Y's outpoint
+
+    // A: an unrelated valid MN on its own collateral D.
+    QuorumMnEntry a;
+    set256(a.proTxHash,
+           "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+    set256(a.confirmedHash,
+           "3333333333333333333333333333333333333333333333333333333333333333");
+    a.is_valid       = true;
+    a.has_collateral = true;
+    set256(a.collateral_hash,
+           "00000000000000000000000000000000000000000000000000000000000000dd");
+    a.collateral_index = 0;
+
+    uint256 modifier;
+    set256(modifier,
+           "4444444444444444444444444444444444444444444444444444444444444444");
+
+    // One rotated quorum, quarter size 2. Work list = {A, Z} (Y is REMOVED,
+    // so it is not here). previous_quarters[H-C][qi0] retains Y.
+    const std::vector<QuorumMnEntry> work_list{a, z};
+    std::array<std::vector<std::vector<MnRef>>, 3> previous_quarters{};
+    previous_quarters[0] = {{&y}};   // H-C, quorumIndex 0, member Y
+
+    auto out = build_new_quarter_members(
+        /*num_quorums=*/1, /*quarter_size=*/2, work_list, modifier,
+        previous_quarters, /*skip_removed_mns=*/false);   // pre-V19 retention
+    ASSERT_TRUE(out.has_value());
+    ASSERT_EQ(out->quarters.size(), 1u);
+
+    bool z_selected = false;
+    for (MnRef m : out->quarters[0])
+        if (m->proTxHash == z.proTxHash) z_selected = true;
+
+    // The consensus claim: dashd never admits Z into this quarter, because Z's
+    // collateralOutpoint is already held by the retained (removed) Y. A
+    // proTxHash-only used set wrongly admits it — that is the wall.
+    EXPECT_FALSE(z_selected)
+        << "a re-registration on a retained removed MN's collateral must be "
+           "refused from the quarter fill, exactly as dashd's AddMN throws";
+
+    // Control: with skip_removed_mns=TRUE (post-V19) Y is DROPPED from the used
+    // set (not retained), so its collateral no longer blocks Z, and Z IS a
+    // legitimate quarter member — proving the refusal is gated on retention,
+    // not a blanket collateral ban.
+    auto out_v19 = build_new_quarter_members(
+        1, 2, work_list, modifier, previous_quarters, /*skip_removed_mns=*/true);
+    ASSERT_TRUE(out_v19.has_value());
+    bool z_v19 = false;
+    for (MnRef m : out_v19->quarters[0])
+        if (m->proTxHash == z.proTxHash) z_v19 = true;
+    EXPECT_TRUE(z_v19)
+        << "post-V19 the removed MN is not retained, so Z is admissible";
+}
+
 // The parsed-block adapter (W1's consumer shape): cbTx fields + type-6
 // payloads lifted from a synthetic block; unparseable payloads fail closed.
 TEST(DashReplayQuorumEngine, InputFromBlockAdapterLiftsCbTxAndCommitments)
