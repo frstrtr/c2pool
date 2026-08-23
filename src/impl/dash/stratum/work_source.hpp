@@ -60,6 +60,7 @@
 
 #include <impl/dash/coin/node_coin_state.hpp>   // coin::NodeCoinState, coin::DashWorkData seam
 #include <impl/dash/coin/serve_gate_journal.hpp> // coin::ServeGateJournal — decline rate policy (DEFECT-3)
+#include <impl/dash/coin/serve_gate_persist.hpp> // cross-restart cumulative accounting + QC-NULL-SERVE counters
 #include <impl/dash/coin/embedded_shadow_compare.hpp> // coin::EmbeddedShadowCompare — OBSERVE-only serve-vs-dashd diff
 #include <impl/dash/stratum/get_work.hpp>       // dash::stratum::get_work() fused capstone
 
@@ -362,6 +363,30 @@ public:
     /// Pure-daemonless mode (no rpc) therefore leaves it off and relies on the
     /// independent seed-height + pre-emit gates.
     void set_gbt_xcheck(bool v) { gbt_xcheck_ = v; }
+
+    /// Path to the cross-restart cumulative serve-gate state file (JSON).
+    /// Empty (default) => the cumulative accounting is OFF and this class is
+    /// byte-identical to before: no load, no save, no extra log line. When set
+    /// (--serve-gate-state-file), note_arm_decision() write-throughs the
+    /// combined prior+live roll-up + QC-NULL-SERVE counters on each roll-up
+    /// tick so a STANDING soak is readable across restarts.
+    void set_serve_gate_state_file(std::string p) { serve_gate_state_path_ = std::move(p); }
+
+    /// (b) QC-NULL-SERVE live hooks. Record one required DKG mining-window tip
+    /// and its disposition (null-served / real-served / fell-back), and one
+    /// block submission from a null-carrying template (never-a-reject
+    /// conjunct). Thread-safe (serve_gate_mutex_). The per-tip disposition call
+    /// site is the daemonless_qc_commitments fold consumer (soak-gated wiring);
+    /// note_null_submit is called from the block-submit path.
+    void note_null_serve_disposition(int llmq_type,
+                                     coin::QcNullServeCounters::Disposition d) const {
+        std::lock_guard<std::mutex> lk(serve_gate_mutex_);
+        null_serve_counters_.note(llmq_type, d);
+    }
+    void note_null_submit(bool rejected) const {
+        std::lock_guard<std::mutex> lk(serve_gate_mutex_);
+        null_serve_counters_.note_submit(rejected);
+    }
 
     /// PIN SPLICE ON THE XCHECK-SWAPPED ARM (--pin-splice-xcheck-arm).
     /// DEFAULT OFF -- this is the money path.
@@ -767,6 +792,16 @@ private:
     // first arm decision, so the first observation seeds the cadence without
     // emitting an empty summary. Guarded by serve_gate_mutex_.
     mutable int64_t                 last_rollup_sec_{-1};
+
+    // Cross-restart cumulative accounting (flag-gated by serve_gate_state_path_).
+    // serve_gate_prior_ is the PRIOR-process state loaded once at the first
+    // roll-up tick; null_serve_counters_ are this process's live QC-NULL-SERVE
+    // tallies. Both guarded by serve_gate_mutex_; combine()+save happen OFF the
+    // lock in note_arm_decision. Empty path => all of this stays dormant.
+    std::string                        serve_gate_state_path_;
+    mutable coin::ServeGateCumulative  serve_gate_prior_;
+    mutable bool                       serve_gate_prior_loaded_{false};
+    mutable coin::QcNullServeCounters  null_serve_counters_;
 
     // ── Serve-staleness observation (lock-free by requirement) ─────────────
     // Written on the serve path (get_current_work_template /

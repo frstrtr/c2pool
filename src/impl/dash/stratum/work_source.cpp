@@ -1304,6 +1304,9 @@ void DASHWorkSource::note_arm_decision(coin::ServeGateJournal::Served served,
     coin::ServeGateJournal::Decision d;
     coin::ServeGateJournal::Rollup rollup;
     bool emit_rollup = false;
+    coin::ServeGateCumulative cum_combined;
+    coin::QcNullServeCounters cum_counters_snapshot;
+    bool have_cum = false;
     {
         std::lock_guard<std::mutex> lk(serve_gate_mutex_);
         d = serve_gate_journal_.observe(served, why.cause, now_sec);
@@ -1321,6 +1324,19 @@ void DASHWorkSource::note_arm_decision(coin::ServeGateJournal::Served served,
             last_rollup_sec_ = now_sec;
             rollup           = serve_gate_journal_.rollup(now_sec);
             emit_rollup      = true;
+            // (a)+(b) cross-restart cumulative accounting: load the prior
+            // state ONCE, snapshot this process's live QC-NULL-SERVE counters.
+            // combine()+save_atomic()+log run OFF the lock below (no file I/O
+            // under serve_gate_mutex_). Empty path => dormant, byte-unchanged.
+            if (!serve_gate_state_path_.empty()) {
+                if (!serve_gate_prior_loaded_) {
+                    serve_gate_prior_ =
+                        coin::load_serve_gate_state(serve_gate_state_path_);
+                    serve_gate_prior_loaded_ = true;
+                }
+                cum_counters_snapshot = null_serve_counters_;
+                have_cum = true;
+            }
         }
     }
 
@@ -1345,6 +1361,21 @@ void DASHWorkSource::note_arm_decision(coin::ServeGateJournal::Served served,
             }
         }
         LOG_WARNING << os.str();
+
+        // CUMULATIVE line ALONGSIDE the per-process one: prior + this process,
+        // write-through to the state file so a STANDING soak (across restarts)
+        // is readable from the log/file alone — closing the observed=7211s
+        // per-process denominator trap (04:00 restart) the critic found. File
+        // I/O is OFF serve_gate_mutex_; serve_gate_prior_ is immutable after
+        // its one-time load, so reading it here without the lock is safe.
+        if (have_cum) {
+            cum_combined =
+                coin::combine(serve_gate_prior_, rollup, cum_counters_snapshot);
+            coin::save_serve_gate_state_atomic(serve_gate_state_path_,
+                                               cum_combined);
+            LOG_WARNING << coin::cumulative_rollup_line(cum_combined);
+            LOG_WARNING << coin::qc_null_serve_line(cum_combined.null_serve);
+        }
     }
 
     // A CAUSE SEGMENT closed on THIS decision (a cause change or a resume):
