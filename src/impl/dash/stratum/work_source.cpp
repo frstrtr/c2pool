@@ -44,6 +44,7 @@
 #include <impl/dash/coin/vendor/cbtx.hpp>     // vendor::parse_cbtx (GBT-xcheck creditPool)
 #include <impl/dash/coin/special_tx_pool_delta.hpp> // #107: explain the pool delta
 #include <impl/dash/coin/tx_serve_referee.hpp>  // tx-serve internal-consistency referee (own-set vs dashd-parity)
+#include <impl/dash/coin/gbt_quorum_staleness.hpp>   // GBT-xcheck quorumroot-dashd-stale classifier
 #include <impl/dash/coin/serve_staleness.hpp> // serve-staleness sentinel (steady_now_ms + the incident catalogue)
 
 #include <core/address_utils.hpp>             // core::address_to_script (mint payout from username)
@@ -1023,6 +1024,19 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                 // hotel behaviour is unchanged. The sel.source==Embedded guard skips
                 // this when the creditPool branch above already swapped (and MOVED
                 // dref), so dref is never double-served.
+                // Record the last quorum root the two arms AGREED on -- the
+                // reference the DKG-boundary staleness classifier below compares
+                // against. Guarded by sel.source==Embedded so a creditPool swap
+                // above (which MOVED dref) can never make this read a moved-from
+                // dref.m_height (the source guard short-circuits first).
+                if (emb_ok && dref_ok
+                    && sel.source == coin::WorkSource::Embedded
+                    && dref.m_height == sel.work.m_height
+                    && emb_cb.merkleRootQuorums == dref_cb.merkleRootQuorums) {
+                    std::lock_guard<std::mutex> lk(quorum_root_cache_mutex_);
+                    last_agreed_quorum_root_ = emb_cb.merkleRootQuorums;
+                    has_agreed_quorum_root_  = true;
+                }
                 if (emb_ok && dref_ok
                     && sel.source == coin::WorkSource::Embedded
                     && dref.m_height == sel.work.m_height
@@ -1030,6 +1044,47 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                         || emb_cb.merkleRootMNList != dref_cb.merkleRootMNList)) {
                     const bool quorums_differ =
                         emb_cb.merkleRootQuorums != dref_cb.merkleRootQuorums;
+                    const bool mnlist_matches =
+                        emb_cb.merkleRootMNList == dref_cb.merkleRootMNList;
+                    // GBT-xcheck quorumroot-dashd-stale reclassification. At an
+                    // LLMQ DKG commitment boundary dashd's getblocktemplate
+                    // briefly serves the PREVIOUS cycle's quorum root while our
+                    // embedded arm already carries the freshly-committed one --
+                    // chain-proven (mainnet 2525987 / 2526011): the mined block
+                    // commits the EMBEDDED root, so swapping to dashd here would
+                    // serve the would-be-rejected bad-cbtx-quorummerkleroot
+                    // template. Isolated by the pure predicate; the inverse skew
+                    // (embedded stale, dashd fresh) fails it and takes the swap.
+                    bool dashd_stale = false;
+                    if (quorums_differ) {
+                        uint256 agreed;
+                        bool     have_agreed;
+                        {
+                            std::lock_guard<std::mutex> lk(quorum_root_cache_mutex_);
+                            agreed      = last_agreed_quorum_root_;
+                            have_agreed = has_agreed_quorum_root_;
+                        }
+                        dashd_stale = coin::quorumroot_dashd_is_stale(
+                            emb_cb.merkleRootQuorums, dref_cb.merkleRootQuorums,
+                            mnlist_matches, have_agreed ? &agreed : nullptr);
+                    }
+                    if (dashd_stale) {
+                        // KEEP embedded: classification-only, no swap. sel stays
+                        // Embedded, served_via_xcheck_swap stays false, and the
+                        // embedded arm's own pins ride untouched.
+                        LOG_INFO << "[DASH-STRATUM-GBT] GBT-xcheck quorumroot-dashd-stale"
+                                 << " at h=" << sel.work.m_height
+                                 << " embedded quorums="
+                                 << emb_cb.merkleRootQuorums.GetHex().substr(0, 16)
+                                 << " dashd quorums="
+                                 << dref_cb.merkleRootQuorums.GetHex().substr(0, 16)
+                                 << " (== last agreed root one cycle earlier) —"
+                                    " KEEP embedded: the chain commits the embedded"
+                                    " quorum root at the DKG boundary; dashd's GBT"
+                                    " is momentarily serving the pre-boundary cycle"
+                                    " (swapping would serve a bad-cbtx-"
+                                    "quorummerkleroot template)";
+                    } else {
                     LOG_WARNING << "[DASH-STRATUM-GBT] GBT-xcheck "
                                 << (quorums_differ ? "merkleRootQuorums"
                                                    : "merkleRootMNList")
@@ -1058,6 +1113,7 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                                                coin::WorkSource::DashdFallback,
                                                std::move(xcheck) };
                     served_via_xcheck_swap = true;
+                    }
                 }
                 // #130 tx-serving reward-safety — NON-COINBASE tx-merkleroot
                 // xcheck. The #1216 creditPool / quorum / MN branches above
