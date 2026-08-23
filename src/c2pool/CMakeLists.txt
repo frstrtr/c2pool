@@ -361,6 +361,31 @@ target_link_libraries(dash_hdr_backfill_window_kat
 )
 add_test(NAME dash_hdr_backfill_window_kat COMMAND dash_hdr_backfill_window_kat)
 
+# KAT: DASHD-FREE self-validated own-set tx serving (successor to #1318). Pure
+# red/green over two header-only units with NO node and NO daemon: the
+# mempool-validity classifier (Window-1 dashd-ahead propagation -> demoted to
+# measurement, does not reset the clean run) and the serve-time internal-
+# consistency referee (own-state self-validation: coinbase fee-exact, no
+# intra-set double-spend, fee_fold_proven) that decides own-set serving with
+# ZERO dashd calls. Links the same DASH library set as c2pool-dash.
+add_executable(dash_tx_serve_self_validation_kat dash_tx_serve_self_validation_kat.cpp)
+target_link_libraries(dash_tx_serve_self_validation_kat
+    core pool sharechain
+    c2pool_node_enhanced
+    dash
+    c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
+    dash_x11
+    dash_rpc
+    dash_stratum
+    dash_block_replay
+    dash_bls_verify
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+)
+add_test(NAME dash_tx_serve_self_validation_kat COMMAND dash_tx_serve_self_validation_kat)
+
 # Windows: Boost.Asio requires Winsock libraries; /bigobj for large translation units
 if(WIN32)
     target_link_libraries(c2pool ws2_32 mswsock bcrypt dbghelp)
