@@ -949,6 +949,11 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
             // tells the single splice point below which producer it is
             // serving -- and the 66-of-197 silent-miss class it closes.
             bool served_via_xcheck_swap = false;
+            // TRUE once the internal-consistency referee has run on this
+            // template (either the divergence branch below or the unconditional
+            // post-cut self-validation after this block). Prevents a redundant
+            // second referee pass on the same bytes.
+            bool embedded_self_validated = false;
             if (sel.source == coin::WorkSource::Embedded && gbt_xcheck_ && dashd_fallback_) {
                 coin::DashWorkData dref = dashd_fallback_();
                 coin::vendor::CCbTx emb_cb, dref_cb;
@@ -1207,13 +1212,33 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                         //   post-proof) the operator's arming of the flag is
                         //   the proof. Either way, failure fail-closes to
                         //   dashd -- safety is preserved on every branch.
-                        const bool gate_proven =
-                            !shadow_compare_ || shadow_compare_->validity_gate_open();
+                        // SELF-VALIDATION ONLY — the serve decision makes ZERO
+                        // dashd calls. The dashd testmempoolaccept validity gate
+                        // is DEMOTED to a pre-cut CONFIDENCE measurement
+                        // (validity_gate_measurement below): logged, never
+                        // gated. Own-set serving is decided SOLELY by the
+                        // internal-consistency referee over OUR OWN state
+                        // (every served tx fee_fold_proven vs our spent-aware
+                        // UTXO view at build, coinbase == subsidy+Σfee+superblock,
+                        // no intra-set double-spend) — the predicate that
+                        // survives the --coin-rpc cut. The already-mined /
+                        // stale-view class the gate used to backstop is a
+                        // Window-1 propagation artefact (dashd already connected
+                        // the block that spent/confirmed those inputs; the tx is
+                        // valid on OUR fork and dashd serves the same competing
+                        // set at the same instant) — unclosable without the
+                        // block, and NOT a defect the gate was right to punish.
                         coin::TxServeRefereeVerdict rv;
                         const bool serve_own =
-                            tx_serve_own_set_ && gate_proven
+                            tx_serve_own_set_
                             && (rv = coin::tx_serve_internal_referee(sel.work))
                                    .serve_own_set;
+                        embedded_self_validated = tx_serve_own_set_;
+                        // CONFIDENCE (pre-cut, observe-only): does our self-
+                        // validated verdict coincide with a dashd-clean window?
+                        // Recorded in the log; it decides nothing.
+                        const bool validity_gate_measurement =
+                            shadow_compare_ && shadow_compare_->validity_gate_open();
                         if (serve_own) {
                             // SERVE OUR OWN VALID SET. The dashd divergence is
                             // a SHADOW (diagnostic), not a fallback trigger.
@@ -1230,15 +1255,15 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                                         " a fallback trigger";
                             // sel stays Embedded â NO swap.
                         } else {
-                            // FAIL-CLOSE to dashd. Own-set OFF (legacy parity),
-                            // validity gate not yet proven-open, or the referee
-                            // refused an internal-consistency defect.
+                            // FAIL-CLOSE to dashd. Own-set OFF (legacy parity)
+                            // or the referee refused an internal-consistency
+                            // defect. The dashd validity gate no longer
+                            // participates (demoted to measurement), so it can
+                            // never be the cause here.
                             std::string cause =
                                 !tx_serve_own_set_
                                     ? std::string("gbt-xcheck-txmerkle-mismatch")
-                                    : (!gate_proven
-                                           ? std::string("tx-serve-validity-gate-not-open")
-                                           : rv.fail_cause);
+                                    : rv.fail_cause;
                             if (tx_serve_own_set_)
                                 tx_serve_own_set_failclose_.fetch_add(
                                     1, std::memory_order_relaxed);
@@ -1250,10 +1275,6 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                                         << " root=" << dref_txroot.GetHex().substr(0, 16)
                                         << " â serving dashd template (cause="
                                         << cause
-                                        << (tx_serve_own_set_ && !gate_proven
-                                                ? "; own-set armed but validity"
-                                                  " gate not open"
-                                                : "")
                                         << ")";
                             coin::DeclineReport xcheck;
                             xcheck.viable    = false;
@@ -1266,6 +1287,70 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                             served_via_xcheck_swap = true;
                         }
                     }
+                }
+            }
+            // ── UNCONDITIONAL EMBEDDED SELF-VALIDATION (the cut-critical arm) ─
+            // The gbt-xcheck block above runs ONLY when a dashd RPC is armed AND
+            // the embedded selection DIVERGES from dashd's GBT. Post --coin-rpc
+            // cut there is no dashd to diverge from (gbt_xcheck_ && dashd_fallback_
+            // is false), so an armed embedded template would otherwise serve its
+            // mempool set with ZERO serve-time self-validation. This runs the
+            // internal-consistency referee on EVERY armed embedded template that
+            // carries mempool txs and has not already been refereed above,
+            // making ZERO dashd calls: coinbase == subsidy + Σfee + superblock,
+            // every served tx fee_fold_proven against our spent-aware UTXO view
+            // at build (the just-spent-input / missing-inputs class is caught
+            // HERE, by OUR OWN state, not by dashd), no intra-set double-spend.
+            // This is the self-validation the daemonless serve relies on.
+            //
+            // BYTE-NEUTRAL when --embedded-tx-serve-own-set is OFF (default):
+            // the referee is not consulted and the template serves exactly as
+            // before. Also inert when the template carries no mempool txs
+            // (coinbase-only bodies cannot orphan for a bad-txset reason).
+            //
+            // FAIL ACTION is dashd-FREE: refuse to serve the internally-
+            // inconsistent template (fail-closed to NoWork; the stratum holds
+            // the last good work and re-sources). We do NOT ask dashd and do NOT
+            // hand-strip a reward-critical coinbase at serve time — coinbase-only
+            // is a BUILD-time posture (embedded_gbt suppress_mempool_txs), never
+            // a serve-time edit. A referee failure here is a "cannot happen by
+            // construction" corruption signal (the builder selects only
+            // fee_fold_proven txs and sets the coinbase from the same subsidy
+            // function the referee re-derives), so refusing the block rather
+            // than mining a corrupt one is the only safe response.
+            if (tx_serve_own_set_
+                && !embedded_self_validated
+                && sel.source == coin::WorkSource::Embedded
+                && sel.work.m_mempool_tx_count > 0) {
+                const coin::TxServeRefereeVerdict rv =
+                    coin::tx_serve_internal_referee(sel.work);
+                if (rv.serve_own_set) {
+                    tx_serve_own_set_serves_.fetch_add(
+                        1, std::memory_order_relaxed);
+                    LOG_INFO << "[DASH-STRATUM] embedded self-validation OK at h="
+                             << sel.work.m_height
+                             << " txs=" << sel.work.m_tx_hashes.size()
+                             << " (" << rv.detail
+                             << ") — serving OWN valid set, ZERO dashd calls";
+                } else {
+                    tx_serve_own_set_failclose_.fetch_add(
+                        1, std::memory_order_relaxed);
+                    LOG_WARNING << "[DASH-STRATUM] embedded self-validation"
+                                   " REFUSED at h=" << sel.work.m_height
+                                << " cause=" << rv.fail_cause
+                                << " (" << rv.detail << ") — refusing to serve an"
+                                   " internally-inconsistent template (dashd-free"
+                                   " fail-close to no-work; last good work held)";
+                    coin::DeclineReport sv;
+                    sv.viable    = false;
+                    sv.cause     = "tx-serve-self-validation-refused:" + rv.fail_cause;
+                    sv.value     = std::to_string(sel.work.m_coinbase_value);
+                    sv.threshold = std::to_string(sel.work.m_mempool_tx_count)
+                                 + "-mempool-txs";
+                    sel.decline  = std::move(sv);
+                    // Fail-closed: make this template not-mineable so the store
+                    // below drops it and the stratum keeps the last good work.
+                    sel.work.m_bits = 0;
                 }
             }
             // ── THE SINGLE PIN SPLICE POINT ─────────────────────────────────

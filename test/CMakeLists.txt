@@ -317,6 +317,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_dash_serve_gate_journal PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
     gtest_add_tests(test_dash_serve_gate_journal "" AUTO)
+    # Force-build the daemonless tx-serve self-validation KAT (defined in
+    # src/c2pool/CMakeLists.txt) whenever this target builds. That KAT exe is NOT in
+    # the fixed --target allowlist in .github/workflows/build.yml and we have no
+    # workflow scope to add it; test_dash_serve_gate_journal IS allowlisted in BOTH
+    # the Linux and AsAN CI jobs, so this dependency makes CI build the KAT and CTest
+    # find it instead of reporting it NOT_BUILT / Not Run.
+    add_dependencies(test_dash_serve_gate_journal dash_tx_serve_self_validation_kat)
 
     # DASH serve-gate LEDGER cross-restart never-a-reject accounting KAT: the
     # CUMULATIVE, persisted companion to ServeGateJournal (the journal wipes on
