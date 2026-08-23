@@ -60,6 +60,7 @@
 
 #include <impl/dash/coin/node_coin_state.hpp>   // coin::NodeCoinState, coin::DashWorkData seam
 #include <impl/dash/coin/serve_gate_journal.hpp> // coin::ServeGateJournal — decline rate policy (DEFECT-3)
+#include <impl/dash/coin/serve_gate_ledger.hpp>  // coin::ServeGateLedger — cumulative cross-restart never-a-reject accounting
 #include <impl/dash/coin/embedded_shadow_compare.hpp> // coin::EmbeddedShadowCompare — OBSERVE-only serve-vs-dashd diff
 #include <impl/dash/stratum/get_work.hpp>       // dash::stratum::get_work() fused capstone
 
@@ -454,6 +455,18 @@ public:
                            const std::string& miner, bool reached_network)>;
     void set_on_found_block_fn(FoundBlockFn fn);
 
+    /// Wire the CUMULATIVE cross-restart serve-gate ledger to its persisted
+    /// backing file (<data-dir>/<net_subdir>/serve_gate_ledger.json). Loads any
+    /// existing blob (folding the previous process's carry, bumping epochs) and
+    /// stamps `writer_commit` (C2POOL_VERSION) so the standing figure always
+    /// names the binary that produced it. Idempotent-ish: call ONCE at wiring
+    /// time, before the first template is sourced. While unset the ledger still
+    /// accumulates in memory and logs [EMBED-CUMULATIVE], it just never persists
+    /// across a restart — so this call is what turns the per-process figure into
+    /// the standing, cut-gate figure.
+    void set_serve_gate_ledger_path(const std::string& path,
+                                    const std::string& writer_commit);
+
     /// Wire the sharechain mint dispatch (stage 4d follow-up). While unbound,
     /// share-target submissions are accepted for vardiff + loudly logged.
     void set_mint_share_fn(MintShareFn fn);
@@ -767,6 +780,19 @@ private:
     // first arm decision, so the first observation seeds the cadence without
     // emitting an empty summary. Guarded by serve_gate_mutex_.
     mutable int64_t                 last_rollup_sec_{-1};
+
+    // CUMULATIVE cross-restart never-a-reject accounting. ServeGateJournal wipes
+    // on restart (its clock is process-monotonic steady_clock seconds), so the
+    // program-level "% embedded / never-a-reject" figure is per-process. The
+    // ledger banks the SAME events the journal sees (from note_arm_decision,
+    // under serve_gate_mutex_) into cumulative totals, persisted write-through
+    // to serve_gate_ledger_path_ (atomic tmp+rename) on the hourly roll-up tick
+    // so the standing claim survives >=3 restarts. Guarded by serve_gate_mutex_.
+    mutable coin::ServeGateLedger    serve_gate_ledger_;
+    // Persisted backing file; empty until set_serve_gate_ledger_path() (then the
+    // ledger accumulates in memory + logs, but never persists). Set once at
+    // wiring time; read on the hourly flush. Guarded by serve_gate_mutex_.
+    std::string                      serve_gate_ledger_path_;
 
     // ── Serve-staleness observation (lock-free by requirement) ─────────────
     // Written on the serve path (get_current_work_template /
