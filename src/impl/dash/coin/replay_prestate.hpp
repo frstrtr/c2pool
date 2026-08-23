@@ -262,6 +262,16 @@ inline Prestate parse_prestate_text(const std::string& text)
         if (!d::u160_wire(f[7], st.keyIDOwner))  return fail("bad keyIDOwner" + at);
         if (!u16(8, "nVersion", st.nVersion)) return ps;
         if (!u16(9, "nType", st.nType))       return ps;
+        // STORE CONTRACT: the DML engine stores CANONICAL BASIC operator keys and
+        // re-encodes each SML leaf per its nVersion (to_sml_entry -> opkey_for_leaf).
+        // The prestate field is RAW WIRE bytes, encoded in the scheme the entry's
+        // nVersion dictates (legacy iff nVersion < BASIC_BLS); canonicalize on ingest
+        // here — same conversion the fold_proupreg store sites and the E2d anchor-SML
+        // seed apply — so legacy-era leaves hash the right bytes and the anchor root
+        // reproduces. Without this the seed self-check (seed_engine_from_prestate)
+        // fail-closes (reward-safe) and the engine never arms.
+        st.pubKeyOperator = vendor::opkey_to_basic(
+            st.pubKeyOperator, st.nVersion < vendor::ProTxVersion::BASIC_BLS);
         if (f[10] != "-" && !d::u160_wire(f[10], st.platformNodeID))
             return fail("bad platformNodeID" + at);
         if (!u16(11, "platformP2PPort", st.platformP2PPort))   return ps;
