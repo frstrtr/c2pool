@@ -308,7 +308,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # DASH serve-gate journal per-cause time KAT (h=2518004 count-vs-time trap):
     # pure, header-only policy object; no socket/ltc/pool dependency. Mirrors
     # the test_dash_min_protocol_gate link set.
-    add_executable(test_dash_serve_gate_journal test_dash_serve_gate_journal.cpp)
+    add_executable(test_dash_serve_gate_journal test_dash_serve_gate_journal.cpp test_dash_serve_gate_ledger.cpp)
     target_link_libraries(test_dash_serve_gate_journal PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -323,15 +323,6 @@ if (BUILD_TESTING AND GTest_FOUND)
     # restart; the ledger survives via write-through JSON). Pure-policy header +
     # JSON companion; the KAT does a real atomic save->load round-trip through a
     # temp file. Same link set as the journal KAT.
-    add_executable(test_dash_serve_gate_ledger test_dash_serve_gate_ledger.cpp)
-    target_link_libraries(test_dash_serve_gate_ledger PRIVATE
-        GTest::gtest_main GTest::gtest
-        dash_x11 core
-        nlohmann_json::nlohmann_json
-        ${Boost_LIBRARIES}
-    )
-    target_link_libraries(test_dash_serve_gate_ledger PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
-    gtest_add_tests(test_dash_serve_gate_ledger "" AUTO)
 
     # DASH S8 pool-node leaf 4 — share_tracker.hpp KAT: DensePPLNSWindow decayed
     # weight ring buffer (compute_v36_weights), decay table, donation split,
