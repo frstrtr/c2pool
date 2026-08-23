@@ -2424,6 +2424,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // spends. The dashd fallback is unaffected.
             node_coin_state.set_utxo_ready_fn(
                 [&utxo_lane]() { return utxo_lane.mining_utxo_ready(); });
+            // WINDOW-2 currency gate (Window 2 = intra-node eviction lag).
+            // The serve tip can be promoted to H by the diff-driven path
+            // (CoinStateMaintainer mnlistdiff-at-tip / cbTx credit-pool
+            // re-anchor) BEFORE this UTXO lane connects+evicts block H. In that
+            // window the view is at H-1 and a template on H could pack a tx
+            // already spent by H (invalid, thrown-away block). This predicate
+            // lets make_embedded_work_inputs serve coinbase-only until the view
+            // catches up -- dashd's removeForBlock-before-SetTip invariant,
+            // fail-closed. Only material when --embedded-serve-mempool-txs is
+            // armed; coinbase-only / fallback postures are byte-unchanged.
+            // On the LIVE full-block path the utxo-lane subscription (2438,
+            // subscriber 1) connects+evicts BEFORE the maintainer promotes the
+            // serve tip (3908, subscriber 2) on the same io thread, so this
+            // predicate is already true there and suppresses nothing.
+            node_coin_state.set_utxo_current_fn(
+                [&utxo_lane](const uint256& tip_hash) {
+                    return utxo_lane.utxo_current_at(tip_hash);
+                });
             // What the arm DOES during that window. Default (flag absent):
             // REFUSE -- p2pool semantics, the project design law: an unsynced
             // node does not serve block templates; miners idling is correct,
