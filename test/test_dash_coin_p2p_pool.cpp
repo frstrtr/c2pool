@@ -1504,6 +1504,61 @@ TEST(DashStatefulFold, fold_getmnlistd_never_wedges_when_only_pruned_peers_exist
                            "archival peer exists (fallback to the handshaked pool)";
 }
 
+// (STATEFUL-STALL B) THE DIRECT EXPANSION SIGNAL (2026-08-19 ondemand freeze).
+// (STATEFUL-STALL A) below demotes the carrier via TWO re-asks landing on the
+// SAME peer — which reaches BULK_NONSERVER_STRIKE_MAX only when the pool has a
+// SINGLE eligible carrier. On the live ondemand-mnlist freeze the re-asks
+// ROTATE across many peers, so no single carrier ever accumulates two strikes
+// and the block-body demotion tally stays EMPTY even after 22 minutes frozen.
+// The mn-ckpt lane's wall-clock watchdog therefore signals the stall DIRECTLY
+// (dashd TipMayBeStale -> SetTryNewOutboundPeer): note_stateful_stall(true)
+// raises outbound_behind() with ZERO demoted peers, so the pool dials past its
+// base target and rotates onto a peer that will answer. It self-clears the
+// moment the leg is served. RED contrast: pre-port, outbound_behind() read
+// ONLY the demotion tally, so a rotation-spread getmnlistd stall was invisible
+// and the pool stayed frozen at 8.
+TEST(DashStatefulFold, a_frozen_bridging_getmnlistd_expands_outbound_directly)
+{
+    PoolRig rig;
+    rig.use_fake_clock();
+    rig.client.set_max_peers(8);
+
+    std::vector<NetService> plan;
+    for (int i = 1; i <= 8; ++i) plan.push_back(PoolRig::peer_addr(i));
+    rig.client.connect(plan);
+    for (int i = 1; i <= 8; ++i) rig.handshake_services(i, SVC_FULL);
+    ASSERT_EQ(rig.client.connected_peer_count(), 8u);
+
+    // Fresh archival candidates the frozen set never reached.
+    rig.client.update_dial_targets({PoolRig::peer_addr(9), PoolRig::peer_addr(10)});
+
+    // Healthy AND with NO demoted peer: (STATEFUL-STALL A)'s demotion path
+    // cannot be what expands here — the tally is empty.
+    EXPECT_FALSE(rig.client.outbound_behind_for_test());
+    EXPECT_EQ(rig.client.effective_max_peers_for_test(), 8u);
+
+    // The lane's wall-clock watchdog found a bridging getmnlistd frozen and
+    // raised the direct stall signal. Expansion engages with ZERO strikes.
+    rig.client.note_stateful_stall(true);
+    EXPECT_TRUE(rig.client.outbound_behind_for_test())
+        << "a frozen ondemand-mnlist must expand the pool WITHOUT waiting for a "
+           "carrier to accumulate block-body strikes";
+    EXPECT_EQ(rig.client.effective_max_peers_for_test(), 10u)
+        << "a frozen stateful leg must raise the dial target directly";
+
+    // A pool tick dials the extra fresh archival outbound (dashd extra outbound).
+    rig.run_seconds(1);
+    EXPECT_GE(rig.client.dialing_count(), 1u)
+        << "behind on a frozen stateful leg, the pool must acquire a fresh peer";
+
+    // The (rotated) peer answers => the lane clears the signal => the pool
+    // contracts back to its base target (dashd stops opening extras on recovery).
+    rig.client.note_stateful_stall(false);
+    EXPECT_FALSE(rig.client.outbound_behind_for_test());
+    EXPECT_EQ(rig.client.effective_max_peers_for_test(), 8u)
+        << "once the leg is served the expansion signal must drop, not latch";
+}
+
 // (STATEFUL-STALL A) THE EXPANSION HALF, DRIVEN BY A STATEFUL STALL.
 // The live A/B (wf w8cr3yepg) proved the acquisition ROTATION fired but the
 // effective_max_peers EXPANSION never engaged: the near-tip window was

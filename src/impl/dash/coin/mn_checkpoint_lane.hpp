@@ -409,6 +409,18 @@ public:
     {
         m_reask_snapshot = std::move(fn);
     }
+    /// OPTIONAL. Wall-clock outbound STALL SIGNAL seam (dashd TipMayBeStale ->
+    /// SetTryNewOutboundPeer). watchdog_tick() calls this with TRUE while a
+    /// bridging getmnlistd has been outstanding past kStatefulStallGraceMs and
+    /// FALSE otherwise, so the coin-P2P pool raises its dial target to acquire
+    /// a peer that will answer and rotate off the silent one, then contracts
+    /// once the leg is served. Unwired, the lane behaves exactly as before: no
+    /// expansion signal. Pure connection management — no serve/arm/consensus
+    /// effect, the applied list is untouched.
+    void set_stateful_stall_fn(std::function<void(bool)> fn)
+    {
+        m_stateful_stall_fn = std::move(fn);
+    }
     void set_merkle_root_at_fn(MerkleRootAtFn fn)
     {
         m_merkle_root_at = std::move(fn);
@@ -563,6 +575,48 @@ public:
     void watchdog_tick()
     {
         const int64_t now = m_now();
+
+        // ── WALL-CLOCK STALL SIGNAL + RE-ASK (dashd CheckForStaleTipAnd
+        // EvictPeers parity). Runs on EVERY tick, OUTSIDE the log's due()
+        // cadence and independent of whether set_watchdog() was configured,
+        // because a frozen bridging getmnlistd must be recovered on wall clock:
+        // the tip-driven tick_pending_fold() re-ask never fires while the
+        // header tip is itself stalled, which is exactly the 2026-08-19
+        // single-peer freeze (waiting_for=ondemand-mnlist-reply, 1316 s, ONE
+        // ask to ONE peer, no rotation, pool pinned at 8/8). dashd never
+        // single-peer-wedges: it re-asks mnlistdiff from another peer on
+        // timeout and opens an extra OUTBOUND_FULL_RELAY when it falls behind.
+        //
+        // REWARD-SAFE: this only (a) tells the coin-P2P pool it is "behind" so
+        // it dials MORE and rotates the silent carrier, and (b) re-issues the
+        // SAME getmnlistd to a DIFFERENT peer through the rotate+demote seam. It
+        // never applies a list, never publishes, never changes m_snapshot_hash
+        // (a reply to any re-ask is matched by that unchanged hash and folded
+        // through the identical merkleRoot self-check + payee cross-check), and
+        // it acts only while a leg is genuinely outstanding.
+        // NB: m_snapshot_asked_at is set by begin_fold() (the ONLY site that
+        // sets m_snapshot_pending) at the moment the ask goes out, so
+        // m_snapshot_pending implies it is meaningful — no unset-sentinel guard
+        // (which would collide with a legitimate now==0 on a test clock).
+        const bool stateful_stalled =
+            m_snapshot_pending
+            && (now - m_snapshot_asked_at) >= kStatefulStallGraceMs;
+        if (m_stateful_stall_fn) m_stateful_stall_fn(stateful_stalled);
+        if (stateful_stalled && m_reask_snapshot
+            && now - m_last_wallclock_reask >= kStatefulReaskIntervalMs) {
+            m_last_wallclock_reask = now;
+            ++m_wallclock_reasks;
+            LOG_WARNING << "[MN-CKPT] wall-clock RE-ASK of the "
+                        << (m_ondemand_pending ? "ON-DEMAND " : "")
+                        << "masternode-list request at h=" << m_snapshot_height
+                        << " after " << ((now - m_snapshot_asked_at) / 1000)
+                        << "s of silence — rotating to a fresh peer and"
+                           " striking the silent carrier (dashd wall-clock"
+                           " mnlistdiff re-ask; does NOT wait for a tip"
+                           " change). wall_reasks=" << m_wallclock_reasks;
+            m_reask_snapshot(m_snapshot_hash);
+        }
+
         auto due = m_watchdog.due(now);
         if (!due) return;
         LOG_WARNING << "[LANE-WATCHDOG] lane=mn-ckpt state=" << state_name()
@@ -1384,6 +1438,9 @@ public:
     /// mismatch ever occurred — in which case every other number here is
     /// "never evaluated", NOT "evaluated and zero", and the reports say n/a.
     size_t   ondemand_folds()     const { return m_ondemand_folds; }
+    /// Wall-clock re-asks issued for a frozen bridging getmnlistd (telemetry;
+    /// also the KAT's green signal that the ondemand freeze now recovers).
+    size_t   wallclock_reasks()   const { return m_wallclock_reasks; }
     size_t   ondemand_excluded()  const { return m_ondemand_excluded; }
     /// Masternodes whose queue ORDERING (nPoSeRevivedHeight) an on-demand fold
     /// repaired — a ProUpServTx-revive this bridge applied with the ban
@@ -2797,6 +2854,12 @@ public:
                  << ") — replay PAUSED until it lands, so the cursor cannot"
                     " run past the height the list describes";
         m_request_snapshot(*hash);
+        // Start the wall-clock re-ask clock for this outstanding ask. dashd
+        // re-asks and rotates its sync peer on a wall-clock schedule, not on a
+        // new tip; watchdog_tick() reads these so a frozen leg recovers even
+        // while the header tip is itself stalled (the ondemand-mnlist freeze).
+        m_snapshot_asked_at    = m_now();
+        m_last_wallclock_reask = m_snapshot_asked_at;
         return true;
     }
 
@@ -3043,6 +3106,12 @@ public:
     /// costs the bridge its burst-proof mechanism for that interval.
     static constexpr uint32_t kFoldRetryPumps  = 3;
     static constexpr uint32_t kFoldGiveUpPumps = 12;
+    // dashd EXTRA_PEER_CHECK_INTERVAL (45 s): the WALL-CLOCK cadence on which a
+    // frozen bridging getmnlistd is declared stalled (so the outbound pool
+    // expands) and re-asked to a DIFFERENT peer. Independent of tip changes —
+    // the whole point of the port. watchdog_tick() enforces it.
+    static constexpr int64_t kStatefulStallGraceMs    = 45000;
+    static constexpr int64_t kStatefulReaskIntervalMs = 45000;
 
 private:
     /// Keep claiming a small ring of abandoned request hashes. Bounded: this
@@ -3858,6 +3927,9 @@ public:
         m_snapshot_hash    = uint256();
         m_snapshot_height  = 0;
         m_snapshot_waits   = 0;
+        m_snapshot_asked_at = 0;
+        m_last_wallclock_reask = 0;
+        m_wallclock_reasks = 0;
         m_abandoned_folds  = 0;
         m_abandoned.clear();
         // ── #1033 ON-DEMAND fold state. Every field the on-demand arm carries
@@ -4081,6 +4153,18 @@ public:
     bool      m_revive_probe_cap_hit{false};
     RequestSnapshotFn m_request_snapshot;
     RequestSnapshotFn m_reask_snapshot;   // optional rotate+demote re-ask seam
+    // ── WALL-CLOCK RE-ASK of a frozen fold/ondemand snapshot (dashd
+    // CheckForStaleTipAndEvictPeers parity). The tip-driven tick_pending_fold()
+    // re-ask stalls whenever the header tip stalls — precisely when a bridging
+    // getmnlistd most needs to rotate off a silent carrier (the 2026-08-19
+    // ondemand-mnlist single-peer freeze). watchdog_tick() reads these to
+    // re-ask on WALL CLOCK instead, and to raise the outbound stall signal so
+    // the coin-P2P pool dials past its base target while the leg is frozen.
+    // Peer-selection / dial-count only; the applied list is never touched.
+    int64_t  m_snapshot_asked_at{0};        // m_now() when the outstanding ask went out
+    int64_t  m_last_wallclock_reask{0};     // m_now() of the last wall-clock re-ask
+    size_t   m_wallclock_reasks{0};         // telemetry: wall-clock re-asks issued
+    std::function<void(bool)> m_stateful_stall_fn; // raise/clear outbound-behind
     MerkleRootAtFn    m_merkle_root_at;
     size_t   m_sml_recovery_cap{0}; // budget handed to the machine, mirrored
     size_t   m_registered{0};       // ADDS observed across the replay
