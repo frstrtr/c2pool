@@ -86,6 +86,7 @@
 #include <impl/dash/coin/block.hpp>
 #include <impl/dash/coin/mn_state_db.hpp>
 #include <impl/dash/coin/vendor/providertx.hpp>
+#include <impl/dash/coin/vendor/bls_verify.hpp>   // opkey_to_basic — canonical-BASIC store contract (#154 legacy<->basic ProUpReg)
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
 #include <impl/bitcoin_family/coin/base_transaction.hpp>
 
@@ -1344,7 +1345,12 @@ public:
                     st.collateralOutpoint = ptx.collateralOutpoint;
                 }
                 st.keyIDOwner        = ptx.keyIDOwner;
-                st.pubKeyOperator    = ptx.pubKeyOperator;
+                // STORE CONTRACT: canonical BASIC (#1327 seed ingest / fold_proupreg
+                // parity) — a v1 (LEGACY_BLS) payload carries the legacy wire encoding
+                // of the SAME G1 point; storing it raw makes every later byte-compare
+                // see a phantom operator change.
+                st.pubKeyOperator    = vendor::opkey_to_basic(
+                    ptx.pubKeyOperator, ptx.nVersion < vendor::ProTxVersion::BASIC_BLS);
                 st.keyIDVoting       = ptx.keyIDVoting;
                 st.nOperatorReward   = ptx.nOperatorReward;
                 st.scriptPayout.m_data = ptx.scriptPayout.m_data;
@@ -1502,9 +1508,19 @@ public:
                 }
                 auto it = m_entries.find(ptx.proTxHash);
                 if (it == m_entries.end()) break;
+                // #154 h=2526494 payee-desync class: the stored side is canonical
+                // BASIC; a v1 ProUpRegTx payload encodes the SAME point in the LEGACY
+                // scheme (h=2525069: 04c4... wire vs 84c4... stored). A raw byte
+                // compare manufactures a phantom operator change -> spurious
+                // dashd-semantics PoSe-ban -> SML-fold revive re-orders the payment
+                // queue -> fail-closed one cycle later. dashd compares deserialized
+                // points (CBLSLazyPublicKey), so canonicalize-then-compare is the
+                // scheme-faithful equivalent (canonical serialization is injective).
+                const auto incoming_opkey_basic = vendor::opkey_to_basic(
+                    ptx.pubKeyOperator, ptx.nVersion < vendor::ProTxVersion::BASIC_BLS);
                 bool key_changed = (it->second.pubKeyOperator
-                                  != ptx.pubKeyOperator);
-                it->second.pubKeyOperator   = ptx.pubKeyOperator;
+                                  != incoming_opkey_basic);
+                it->second.pubKeyOperator   = incoming_opkey_basic;
                 it->second.keyIDVoting      = ptx.keyIDVoting;
                 it->second.scriptPayout.m_data = ptx.scriptPayout.m_data;
                 if (key_changed) {
