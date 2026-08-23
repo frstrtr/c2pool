@@ -37,6 +37,7 @@
 
 #include <impl/dash/stratum/submit_payee_guard.hpp>  // check_submit_payee (won-block stale-payee gate)
 #include <impl/dash/coin/serve_gate_rollup_json.hpp>  // serve_gate_rollup_json — #119 follow-up web leg (per-cause TIME)
+#include <impl/dash/coin/serve_gate_ledger_json.hpp>  // serve_gate_ledger_{to_json,save,load} — cumulative cross-restart accounting
 #include <impl/dash/coinbase_builder.hpp>     // compute_dash_payouts, build, split_coinb, merkle helpers
 #include <impl/dash/coin/block_producer.hpp>  // compute_merkle_root, append_compact_size, target_from_nbits
 #include <impl/dash/crypto/hash_x11.hpp>      // dash::crypto::hash_x11 (X11 PoW SSOT)
@@ -1428,9 +1429,29 @@ void DASHWorkSource::note_arm_decision(coin::ServeGateJournal::Served served,
     coin::ServeGateJournal::Decision d;
     coin::ServeGateJournal::Rollup rollup;
     bool emit_rollup = false;
+    // Cumulative-ledger flush payload, captured under the lock and emitted /
+    // persisted OUTSIDE it (I/O off the held mutex; the LevelDB found-block
+    // ledger takes the same lock, and the status surface try_locks it).
+    coin::ServeGateLedger::Totals cum_totals;
+    std::string cum_path;
+    bool emit_cum = false;
     {
         std::lock_guard<std::mutex> lk(serve_gate_mutex_);
         d = serve_gate_journal_.observe(served, why.cause, now_sec);
+        // CUMULATIVE cross-restart accounting: bank the SAME decision the
+        // journal just returned, so ledger and journal cannot disagree (the
+        // ledger consumes Decision.prev_cause_sec — the exact quantity the
+        // journal folds into m_cause_totals). Embedded maps to embedded_real
+        // here; the null-arm split (embedded_null) is a follow-up that sets
+        // DashWorkData.m_qc_null_slots — until then a null serve counts as
+        // embedded_real, never as a fallback, so the never-a-reject denominator
+        // is unaffected. why.cause is ignored by the ledger while serving.
+        const auto ledger_arm =
+            served_embedded ? coin::ServeGateLedger::Arm::EmbeddedReal
+            : (served == coin::ServeGateJournal::Served::NoWork)
+                ? coin::ServeGateLedger::Arm::NoWork
+                : coin::ServeGateLedger::Arm::Fallback;
+        serve_gate_ledger_.bank_serve(ledger_arm, why.cause, d, now_sec);
         last_decline_      = served_embedded ? coin::DeclineReport{} : why;
         last_arm_embedded_ = served_embedded;
         arm_ever_observed_ = true;
@@ -1445,6 +1466,13 @@ void DASHWorkSource::note_arm_decision(coin::ServeGateJournal::Served served,
             last_rollup_sec_ = now_sec;
             rollup           = serve_gate_journal_.rollup(now_sec);
             emit_rollup      = true;
+            // Piggyback the cumulative flush on the same hourly tick. Snapshot
+            // the open segment into carry (folded once on next load), copy the
+            // totals for the log line, and grab the path for the write-through.
+            serve_gate_ledger_.snapshot_carry_for_flush();
+            cum_totals = serve_gate_ledger_.totals();
+            cum_path   = serve_gate_ledger_path_;
+            emit_cum   = true;
         }
     }
 
@@ -1469,6 +1497,67 @@ void DASHWorkSource::note_arm_decision(coin::ServeGateJournal::Served served,
             }
         }
         LOG_WARNING << os.str();
+    }
+
+    if (emit_cum) {
+        // Write-through FIRST (atomic tmp+rename), so the standing figure the
+        // line reports is the one now on disk; a failed write keeps the
+        // in-memory ledger and simply loses this cadence of durations. Empty
+        // path = set_serve_gate_ledger_path() was never called (the ledger
+        // still accumulates + logs, it just does not persist across restarts).
+        if (!cum_path.empty())
+            coin::serve_gate_ledger_save(cum_path, cum_totals);
+        // The operator-facing standing total: "null-arm covered the 4.51%
+        // floor, 0 rejects over N heights", carried ACROSS restarts (epochs=N).
+        // DENOMINATOR (observed) first, then the never-a-reject numerators —
+        // any reject on an embedded arm is the hard cut-stopper, so it is named
+        // explicitly and can never hide behind a percentage.
+        const bool nar =
+            cum_totals.rpc_rejected_embedded_real == 0 &&
+            cum_totals.rpc_rejected_embedded_null == 0 &&
+            cum_totals.orphaned_embedded_real == 0 &&
+            cum_totals.orphaned_embedded_null == 0;
+        const uint64_t serves_emb =
+            cum_totals.serves_embedded_real + cum_totals.serves_embedded_null;
+        const uint64_t serves_all = serves_emb + cum_totals.serves_fallback +
+                                     cum_totals.serves_no_work;
+        const uint64_t nr_span =
+            cum_totals.nr_span_start_height == 0
+                ? 0
+                : (cum_totals.nr_span_last_height -
+                   cum_totals.nr_span_start_height + 1);
+        std::ostringstream cs;
+        cs << "[EMBED-CUMULATIVE] epochs=" << cum_totals.epochs
+           << " commit=" << (cum_totals.last_writer_commit.empty()
+                                 ? "unknown" : cum_totals.last_writer_commit)
+           << " observed=" << cum_totals.observed_sec << "s"
+           << " off_embedded=" << cum_totals.off_embedded_sec << "s";
+        if (cum_totals.observed_sec > 0)
+            cs << " (" << (cum_totals.off_embedded_sec * 100 /
+                           cum_totals.observed_sec) << "% off)";
+        cs << " serves{real=" << cum_totals.serves_embedded_real
+           << " null=" << cum_totals.serves_embedded_null
+           << " fallback=" << cum_totals.serves_fallback
+           << " no_work=" << cum_totals.serves_no_work << "}";
+        if (serves_all > 0)
+            cs << " embedded=" << (serves_emb * 100 / serves_all) << "%";
+        cs << " blocks{won_real=" << cum_totals.blocks_won_embedded_real
+           << " won_null=" << cum_totals.blocks_won_embedded_null
+           << " won_fallback=" << cum_totals.blocks_won_fallback
+           << " submitted=" << cum_totals.blocks_submitted
+           << " confirmed=" << cum_totals.blocks_confirmed
+           << " orphaned=" << cum_totals.blocks_orphaned << "}"
+           << " rejects{rpc_real=" << cum_totals.rpc_rejected_embedded_real
+           << " rpc_null=" << cum_totals.rpc_rejected_embedded_null
+           << " rpc_fallback=" << cum_totals.rpc_rejected_fallback
+           << " payee_guard=" << cum_totals.local_payee_guard_rejects << "}"
+           << " null_arm{dkg_floor=" << cum_totals.null_dkg_floor_tips_served
+           << " real_quorum_but_null="
+           << cum_totals.null_real_quorum_available_but_null_served << "}"
+           << " never_a_reject=" << (nar ? "true" : "false")
+           << " reject_free_span=" << nr_span << "h"
+           << " total_rejects=" << cum_totals.nr_total_rejects;
+        LOG_WARNING << cs.str();
     }
 
     // A CAUSE SEGMENT closed on THIS decision (a cause change or a resume):
@@ -1722,6 +1811,11 @@ nlohmann::json DASHWorkSource::embedded_arm_status_json() const
                                  .count();
         j["gate_rollup"] =
             coin::serve_gate_rollup_json(serve_gate_journal_.rollup(now_sec));
+        // CUMULATIVE cross-restart companion (the per-process gate_rollup above
+        // wipes on restart; this survives via the persisted ledger, epochs=N).
+        // Same lock already held; the ledger is a plain in-memory aggregate.
+        j["gate_rollup_cumulative"] =
+            coin::serve_gate_ledger_to_json(serve_gate_ledger_.totals());
     }
     if (!arm_ever_observed_) {
         j["arm"]               = "unknown";
@@ -2623,6 +2717,27 @@ void DASHWorkSource::set_mint_share_fn(MintShareFn fn)
 {
     std::lock_guard<std::mutex> lk(mint_share_mutex_);
     mint_share_fn_ = std::move(fn);
+}
+
+void DASHWorkSource::set_serve_gate_ledger_path(const std::string& path,
+                                                const std::string& writer_commit)
+{
+    std::lock_guard<std::mutex> lk(serve_gate_mutex_);
+    serve_gate_ledger_path_ = path;
+    // Restore any persisted blob so the cumulative figure carries across this
+    // restart (folds the previous process's open-segment carry exactly once,
+    // bumps epochs). Absent/unparseable => fresh at epoch 0. load() is called
+    // unconditionally so epochs increments even from a default blob.
+    coin::ServeGateLedger::Totals persisted;
+    coin::serve_gate_ledger_load(path, persisted);  // best-effort; leaves default on miss
+    serve_gate_ledger_.load(persisted);
+    serve_gate_ledger_.set_writer_commit(writer_commit);
+    LOG_INFO << "[EMBED-CUMULATIVE] ledger restored: epochs="
+             << serve_gate_ledger_.totals().epochs
+             << " observed=" << serve_gate_ledger_.totals().observed_sec << "s"
+             << " never_a_reject="
+             << (serve_gate_ledger_.never_a_reject() ? "true" : "false")
+             << " path=" << path;
 }
 
 void DASHWorkSource::set_pplns_weights_fn(PplnsWeightsFn fn)

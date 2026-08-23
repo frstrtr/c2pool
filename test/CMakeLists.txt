@@ -318,6 +318,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_serve_gate_journal PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
     gtest_add_tests(test_dash_serve_gate_journal "" AUTO)
 
+    # DASH serve-gate LEDGER cross-restart never-a-reject accounting KAT: the
+    # CUMULATIVE, persisted companion to ServeGateJournal (the journal wipes on
+    # restart; the ledger survives via write-through JSON). Pure-policy header +
+    # JSON companion; the KAT does a real atomic save->load round-trip through a
+    # temp file. Same link set as the journal KAT.
+    add_executable(test_dash_serve_gate_ledger test_dash_serve_gate_ledger.cpp)
+    target_link_libraries(test_dash_serve_gate_ledger PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_serve_gate_ledger PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
+    gtest_add_tests(test_dash_serve_gate_ledger "" AUTO)
+
     # DASH S8 pool-node leaf 4 — share_tracker.hpp KAT: DensePPLNSWindow decayed
     # weight ring buffer (compute_v36_weights), decay table, donation split,
     # window slides. PoW-independent consensus core; socket-free, chain-free.

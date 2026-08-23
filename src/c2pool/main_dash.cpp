@@ -2850,6 +2850,22 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         " when shadow-compare is bound)"
                       : "OFF (dashd-parity backstop on any tx-merkle divergence)")
               << std::endl;
+    // CUMULATIVE cross-restart serve-gate ledger: persist the never-a-reject
+    // accounting to <data-dir>/<net_subdir>/serve_gate_ledger.json so the
+    // standing "% embedded / null-arm covered the 4.51% floor / 0 rejects over
+    // N heights" figure survives the >=3 restarts the dashd-cut soak spans
+    // (ServeGateJournal wipes on restart). Stamp C2POOL_VERSION so the figure
+    // always names the binary that produced it (measurement-without-commit).
+    {
+        const std::string ledger_path =
+            (core::filesystem::config_path() / net_subdir /
+             "serve_gate_ledger.json").string();
+#ifdef C2POOL_VERSION
+        work_source->set_serve_gate_ledger_path(ledger_path, C2POOL_VERSION);
+#else
+        work_source->set_serve_gate_ledger_path(ledger_path, "dev");
+#endif
+    }
     // Pin splice on the xcheck-SWAPPED arm (default OFF). Announce the state
     // either way: with it off the donation still misses every swapped
     // template -- it just no longer does so silently.
