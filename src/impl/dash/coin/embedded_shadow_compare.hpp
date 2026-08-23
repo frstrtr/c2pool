@@ -698,7 +698,19 @@ private:
             std::lock_guard<std::mutex> lk(mu_);
             counters_.apply(o);
         }
-        probe_validity(served);
+        // TIP CONTEXT for the validity gate. dashd's getblocktemplate height is
+        // its NEXT block (tip+1); ours (served.m_height) is likewise our next
+        // block. dashd building a STRICTLY HIGHER block than us means dashd has
+        // already connected the block at our template's height (or beyond) while
+        // OUR tip is still its parent — the propagation Window 1 in which a tx
+        // dashd reports "txn-already-known" was mined in a block WE HAVE NOT YET
+        // CONNECTED. From our tip that tx is a valid unconfirmed tx and our
+        // template is a valid fork competitor, so the gate must not treat it as
+        // a staleness defect. When the oracle is absent we cannot tell, and pass
+        // false (conservative: already-known stays INVALID, gate stays CLOSED).
+        const bool dashd_ahead =
+            dashd.has_value() && dashd->m_height > served.m_height;
+        probe_validity(served, dashd_ahead);
     }
 
     /// THE MEMPOOL VALIDITY GATE, on the SAME worker thread as the oracle
@@ -709,7 +721,7 @@ private:
     ///
     /// This CANNOT change what is served. Its only outputs are log lines, the
     /// counters, and a readiness verdict on a DEFAULT-OFF flag.
-    void probe_validity(const DashWorkData& w) {
+    void probe_validity(const DashWorkData& w, bool dashd_ahead_of_serve_height) {
         if (!accept_) return;
         const auto set = mempool_probe_set(w);
 
@@ -727,7 +739,8 @@ private:
             answers.push_back(std::move(a));
         }
 
-        const auto sample = mempool_validity_sample(w.m_height, set, answers);
+        const auto sample = mempool_validity_sample(w.m_height, set, answers,
+                                                    dashd_ahead_of_serve_height);
         std::lock_guard<std::mutex> lk(mu_);
         validity_.apply(sample);
         for (const auto& line : mempool_validity_log_lines(sample, validity_)) {

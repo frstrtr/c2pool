@@ -115,17 +115,137 @@ TEST(DashMempoolValidityGate, AnyOtherReasonIsInvalidAndCarriesItVerbatim) {
 // ── 2. THE EXEMPTION IS BY EXACT NAME ───────────────────────────────────────
 
 TEST(DashMempoolValidityGate, NearMissReasonIsNotExempted) {
-    // "txn-already-known" is a DIFFERENT dashd reason (the transaction is in a
-    // block / recently rejected, not in the mempool). Excusing it would widen
-    // the gate by prefix-matching, and a tx we would serve that dashd has
-    // already MINED is a staleness defect worth stopping on.
+    // None of these is the exact "txn-already-in-mempool" name. Excusing them
+    // would widen the gate by prefix-matching. "txn-already-known" is a REAL
+    // dashd reason (the tx is already CONFIRMED in dashd's chain), but WITHOUT
+    // tip context (the default here) we cannot tell benign propagation from a
+    // current-tip staleness defect, so the conservative reading is INVALID —
+    // exactly the pre-tip-context behaviour, and the gate-CLOSED direction.
+    // The tip-aware benign path is pinned separately below.
     for (const char* reason : {"txn-already-known",
                                "txn-already-in-mempool-ish",
                                "already-in-mempool"}) {
         const auto r = classify_mempool_accept(tx("dd"), refused("dd", reason));
         EXPECT_EQ(r.verdict, MempoolAcceptVerdict::Invalid)
-            << "reason=" << reason << " must NOT be exempted";
+            << "reason=" << reason << " must NOT be exempted without tip context";
     }
+}
+
+// ── 2b. THE PROPAGATION WINDOW: "txn-already-known" IS TIP-CONDITIONAL ───────
+//
+// FIELD MEASUREMENT (creditpool-arm + cert soaks, heights 2526398..2526404):
+// 23/23 of the live [MEMPOOL-VALIDITY] invalids were reason="txn-already-known"
+// and EVERY ONE was confirmed at EXACTLY the probe height — i.e. mined in the
+// very block our template competed for, while our tip was legitimately h-1.
+// That is benign propagation (Window 1): dashd connected block h before we did,
+// so it answers "already confirmed"; our template is a valid FORK COMPETITOR at
+// height h, never an orphan. The old gate reset the clean run on every one of
+// these, which is why clean_run was pinned at 0/576 forever. These KATs pin the
+// tip-context split that fixes it.
+
+TEST(DashMempoolValidityGate, AlreadyKnownWithDashdAheadIsBenignPropagationNotInvalid) {
+    // dashd is AHEAD of the height we built for -> the tx was confirmed in a
+    // block WE HAVE NOT YET CONNECTED -> benign, not a defect.
+    const auto r = classify_mempool_accept(
+        tx("mined_elsewhere"), refused("mined_elsewhere", "txn-already-known"),
+        /*dashd_ahead_of_serve_height=*/true);
+    EXPECT_EQ(r.verdict, MempoolAcceptVerdict::ConfirmedAhead);
+}
+
+TEST(DashMempoolValidityGate, AlreadyKnownWithDashdNotAheadIsStillAnInvalidDefect) {
+    // dashd sits on OUR parent (not ahead) and STILL reports the tx confirmed
+    // -> it was confirmed at/below our serve-tip while we serve it: a genuine
+    // current-tip staleness defect (Window 2). The gate MUST still catch this.
+    const auto r = classify_mempool_accept(
+        tx("stale"), refused("stale", "txn-already-known"),
+        /*dashd_ahead_of_serve_height=*/false);
+    EXPECT_EQ(r.verdict, MempoolAcceptVerdict::Invalid);
+    EXPECT_EQ(r.reason, "txn-already-known");
+}
+
+TEST(DashMempoolValidityGate, PropagationTransientDoesNotResetTheCleanRun) {
+    // The whole point. A clean run in progress must SURVIVE a height whose only
+    // "invalids" are already-confirmed-in-a-block-we-haven't-connected txs.
+    MempoolValidityGate g;
+    feed_clean(g, 100);
+    ASSERT_EQ(g.consecutive_clean, 100u);
+
+    // A propagation sample: 4 txs, all "txn-already-known", dashd AHEAD.
+    const std::vector<MempoolProbeTx> set{tx("p1"), tx("p2"), tx("p3"), tx("p4")};
+    const std::vector<nlohmann::json> ans{
+        refused("p1", "txn-already-known"), refused("p2", "txn-already-known"),
+        refused("p3", "txn-already-known"), refused("p4", "txn-already-known")};
+    const auto s = mempool_validity_sample(50000, set, ans,
+                                           /*dashd_ahead_of_serve_height=*/true);
+    // Not evidence, not a defect: 4 confirmed-ahead, 0 invalid.
+    EXPECT_EQ(s.confirmed_ahead, 4u);
+    EXPECT_EQ(s.invalid, 0u);
+    EXPECT_FALSE(s.evidence_bearing());
+
+    g.apply(s);
+    EXPECT_EQ(g.consecutive_clean, 100u) << "propagation Window 1 must NOT reset";
+    EXPECT_EQ(g.txs_invalid, 0u);
+    EXPECT_EQ(g.txs_confirmed_ahead, 4u);
+}
+
+TEST(DashMempoolValidityGate, TheSamePropagationSampleWithoutTipContextWouldHaveResetIt) {
+    // RED->GREEN CONTRAST. Feed the IDENTICAL already-known set the way the
+    // pre-fix gate saw it (no tip context => dashd_ahead=false): it classifies
+    // as 4 INVALID and nukes a 100-height run to 0. This is the exact live
+    // defect (clean_run stuck at 0/576). The only difference from the test above
+    // is the tip-context bit, which is what the fix threads through.
+    MempoolValidityGate g;
+    feed_clean(g, 100);
+    ASSERT_EQ(g.consecutive_clean, 100u);
+
+    const std::vector<MempoolProbeTx> set{tx("p1"), tx("p2"), tx("p3"), tx("p4")};
+    const std::vector<nlohmann::json> ans{
+        refused("p1", "txn-already-known"), refused("p2", "txn-already-known"),
+        refused("p3", "txn-already-known"), refused("p4", "txn-already-known")};
+    const auto s = mempool_validity_sample(50000, set, ans,
+                                           /*dashd_ahead_of_serve_height=*/false);
+    EXPECT_EQ(s.invalid, 4u);
+    EXPECT_EQ(s.confirmed_ahead, 0u);
+
+    g.apply(s);
+    EXPECT_EQ(g.consecutive_clean, 0u) << "no tip context => conservative reset";
+    EXPECT_EQ(g.best_consecutive_clean, 100u);
+}
+
+TEST(DashMempoolValidityGate, PropagationDoesNotMaskAGenuineInvalidInTheSameSample) {
+    // Belt: a sample carrying BOTH benign propagation AND a real defect still
+    // resets. The confirmed-ahead reclassification must never swallow a true
+    // invalid that shares the height.
+    MempoolValidityGate g;
+    feed_clean(g, 100);
+    const std::vector<MempoolProbeTx> set{tx("ahead"), tx("realbad")};
+    const std::vector<nlohmann::json> ans{
+        refused("ahead", "txn-already-known"),
+        refused("realbad", "bad-txns-inputs-missingorspent")};
+    const auto s = mempool_validity_sample(50000, set, ans,
+                                           /*dashd_ahead_of_serve_height=*/true);
+    EXPECT_EQ(s.confirmed_ahead, 1u);
+    EXPECT_EQ(s.invalid, 1u);
+    g.apply(s);
+    EXPECT_EQ(g.consecutive_clean, 0u) << "a real defect still resets";
+    EXPECT_EQ(g.last_invalid_reason, "bad-txns-inputs-missingorspent");
+}
+
+TEST(DashMempoolValidityGate, AMixedValidAndPropagationHeightStillAdvances) {
+    // A height with at least one genuinely VALID tx is evidence and advances,
+    // even when the rest of the set is benign propagation.
+    MempoolValidityGate g;
+    feed_clean(g, 10);
+    const std::vector<MempoolProbeTx> set{tx("good"), tx("ahead")};
+    const std::vector<nlohmann::json> ans{
+        allowed_true("good"), refused("ahead", "txn-already-known")};
+    const auto s = mempool_validity_sample(60000, set, ans,
+                                           /*dashd_ahead_of_serve_height=*/true);
+    EXPECT_TRUE(s.evidence_bearing());
+    EXPECT_EQ(s.valid, 1u);
+    EXPECT_EQ(s.confirmed_ahead, 1u);
+    g.apply(s);
+    EXPECT_EQ(g.consecutive_clean, 11u);
 }
 
 // ── 3. A MISSING ANSWER IS NEVER A PASS ─────────────────────────────────────
