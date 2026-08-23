@@ -309,6 +309,114 @@ TEST(DashLaneDiag, WatchdogStaysSilentOnAnUnstartedLane)
     EXPECT_EQ(rig.lane.cursor_height(), kDiagAnchorHeight);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 3b. THE ONDEMAND-MNLIST FREEZE KAT (2026-08-19). A bridging getmnlistd that
+//     goes unanswered must RE-ASK A DIFFERENT PEER and raise the outbound
+//     stall signal on WALL CLOCK — WITHOUT waiting for a tip change. dashd
+//     re-asks mnlistdiff from another peer on timeout and opens an extra
+//     outbound when behind; our tip-driven tick_pending_fold() re-ask cannot,
+//     because a 1.38M-block-behind fold sees no new tip while it is frozen
+//     (live: waiting_for=ondemand-mnlist-reply, 1316 s, ONE ask, ONE peer,
+//     pool pinned at 8/8).
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+/// WatchdogRig plus the rotate+demote RE-ASK seam and the outbound STALL
+/// SIGNAL seam the fix drives from wall clock.
+struct OndemandReaskRig
+{
+    MnCheckpointLane lane;
+    std::map<uint32_t, uint256> headers;
+    uint32_t tip{0};
+    int64_t  now{0};
+    int first_asks{0};
+    int reasks{0};
+    bool last_stall{false};
+
+    OndemandReaskRig()
+    {
+        lane.set_clock_fn([this] { return now; });
+        lane.set_tip_height_fn([this] { return tip; });
+        lane.set_header_hash_at_fn(
+            [this](uint32_t h) -> std::optional<uint256> {
+                auto it = headers.find(h);
+                if (it == headers.end()) return std::nullopt;
+                return it->second;
+            });
+        lane.set_publish_fn(
+            [](std::vector<std::pair<uint256, MNState>>, uint32_t) {});
+        lane.set_request_block_fn([](uint32_t) { return true; });
+        lane.set_request_snapshot_fn([this](const uint256&) { ++first_asks; });
+        // Production wires this to send_getmnlistd_reask (strike the silent
+        // carrier + rotate to a fresh eligible peer). Here we observe only that
+        // the lane DROVE it — the peer rotation itself is proven in
+        // test_dash_coin_p2p_pool.cpp.
+        lane.set_reask_snapshot_fn([this](const uint256&) { ++reasks; });
+        // The outbound expansion signal (dashd SetTryNewOutboundPeer).
+        lane.set_stateful_stall_fn([this](bool s) { last_stall = s; });
+        lane.set_merkle_root_at_fn(
+            [](const uint256&) -> std::optional<uint256> { return std::nullopt; });
+    }
+};
+
+} // namespace
+
+TEST(DashLaneDiag, FrozenOndemandMnlistReasksAnotherPeerAndExpandsOnWallClock)
+{
+    OndemandReaskRig rig;
+    auto cp = diag_checkpoint();
+    rig.headers[kDiagAnchorHeight] = cp.blockhash;
+    rig.tip = kDiagAnchorHeight + 50;
+    rig.lane.arm(cp);
+
+    // Nothing outstanding yet: a wall-clock tick, even far past the grace, must
+    // NOT declare the pool behind. The stall signal is CONDITIONAL, not latched.
+    rig.now = MnCheckpointLane::kStatefulStallGraceMs * 10;
+    rig.lane.watchdog_tick();
+    EXPECT_FALSE(rig.last_stall);
+    rig.now = 0;
+
+    // Park on the anchor fold: ONE getmnlistd out, replay PAUSED — the exact
+    // shape the live freeze was stuck in.
+    rig.lane.pump();
+    ASSERT_TRUE(rig.lane.snapshot_pending());
+    ASSERT_EQ(rig.first_asks, 1);
+    ASSERT_EQ(rig.reasks, 0);
+
+    // THE FREEZE: the header tip never advances (a fold 1.38M blocks behind
+    // sees no new tip), so pump() is NEVER CALLED again — pump() is driven by
+    // HeaderChain::on_tip_changed, and there is no tip change while the leg is
+    // frozen. tick_pending_fold() therefore never runs, so its own tip-counted
+    // re-ask (kFoldRetryPumps) and give-up (kFoldGiveUpPumps) cannot fire. This
+    // is the exact live shape: ONE ask, ONE peer, no rotation, forever. Only
+    // the wall clock moves from here — nothing calls pump().
+    ASSERT_EQ(rig.reasks, 0);
+
+    // Below the grace: not yet stalled.
+    rig.now = MnCheckpointLane::kStatefulStallGraceMs - 1;
+    rig.lane.watchdog_tick();
+    EXPECT_FALSE(rig.last_stall);
+    EXPECT_EQ(rig.reasks, 0);
+
+    // Past the grace: THE FIX. Wall clock alone re-asks a fresh peer AND raises
+    // the outbound-behind stall signal — no tip change involved.
+    rig.now = MnCheckpointLane::kStatefulStallGraceMs;
+    rig.lane.watchdog_tick();
+    EXPECT_TRUE(rig.last_stall)
+        << "a frozen ondemand-mnlist must signal BEHIND so the pool dials past 8";
+    EXPECT_EQ(rig.reasks, 1)
+        << "a frozen ondemand-mnlist must re-ask on wall clock, not on a tip";
+    EXPECT_EQ(rig.lane.wallclock_reasks(), 1u);
+
+    // Still frozen one interval later: it keeps rotating (dashd re-asks another
+    // peer each cycle), not one-shot.
+    rig.now += MnCheckpointLane::kStatefulReaskIntervalMs;
+    rig.lane.watchdog_tick();
+    EXPECT_EQ(rig.reasks, 2);
+    EXPECT_TRUE(rig.last_stall);
+}
+
 TEST(DashLaneDiag, ColdStartIsTheDefaultAndIsStated)
 {
     WatchdogRig rig;
