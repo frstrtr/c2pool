@@ -37,12 +37,15 @@
 
 #include <impl/dash/stratum/submit_payee_guard.hpp>  // check_submit_payee (won-block stale-payee gate)
 #include <impl/dash/coin/serve_gate_rollup_json.hpp>  // serve_gate_rollup_json — #119 follow-up web leg (per-cause TIME)
+#include <impl/dash/coin/serve_gate_ledger_json.hpp>  // serve_gate_ledger_{to_json,save,load} — cumulative cross-restart accounting
 #include <impl/dash/coinbase_builder.hpp>     // compute_dash_payouts, build, split_coinb, merkle helpers
 #include <impl/dash/coin/block_producer.hpp>  // compute_merkle_root, append_compact_size, target_from_nbits
 #include <impl/dash/crypto/hash_x11.hpp>      // dash::crypto::hash_x11 (X11 PoW SSOT)
 #include <impl/dash/params.hpp>               // dash::make_coin_params
 #include <impl/dash/coin/vendor/cbtx.hpp>     // vendor::parse_cbtx (GBT-xcheck creditPool)
 #include <impl/dash/coin/special_tx_pool_delta.hpp> // #107: explain the pool delta
+#include <impl/dash/coin/tx_serve_referee.hpp>  // tx-serve internal-consistency referee (own-set vs dashd-parity)
+#include <impl/dash/coin/gbt_quorum_staleness.hpp>   // GBT-xcheck quorumroot-dashd-stale classifier
 #include <impl/dash/coin/serve_staleness.hpp> // serve-staleness sentinel (steady_now_ms + the incident catalogue)
 
 #include <core/address_utils.hpp>             // core::address_to_script (mint payout from username)
@@ -1022,6 +1025,19 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                 // hotel behaviour is unchanged. The sel.source==Embedded guard skips
                 // this when the creditPool branch above already swapped (and MOVED
                 // dref), so dref is never double-served.
+                // Record the last quorum root the two arms AGREED on -- the
+                // reference the DKG-boundary staleness classifier below compares
+                // against. Guarded by sel.source==Embedded so a creditPool swap
+                // above (which MOVED dref) can never make this read a moved-from
+                // dref.m_height (the source guard short-circuits first).
+                if (emb_ok && dref_ok
+                    && sel.source == coin::WorkSource::Embedded
+                    && dref.m_height == sel.work.m_height
+                    && emb_cb.merkleRootQuorums == dref_cb.merkleRootQuorums) {
+                    std::lock_guard<std::mutex> lk(quorum_root_cache_mutex_);
+                    last_agreed_quorum_root_ = emb_cb.merkleRootQuorums;
+                    has_agreed_quorum_root_  = true;
+                }
                 if (emb_ok && dref_ok
                     && sel.source == coin::WorkSource::Embedded
                     && dref.m_height == sel.work.m_height
@@ -1029,6 +1045,47 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                         || emb_cb.merkleRootMNList != dref_cb.merkleRootMNList)) {
                     const bool quorums_differ =
                         emb_cb.merkleRootQuorums != dref_cb.merkleRootQuorums;
+                    const bool mnlist_matches =
+                        emb_cb.merkleRootMNList == dref_cb.merkleRootMNList;
+                    // GBT-xcheck quorumroot-dashd-stale reclassification. At an
+                    // LLMQ DKG commitment boundary dashd's getblocktemplate
+                    // briefly serves the PREVIOUS cycle's quorum root while our
+                    // embedded arm already carries the freshly-committed one --
+                    // chain-proven (mainnet 2525987 / 2526011): the mined block
+                    // commits the EMBEDDED root, so swapping to dashd here would
+                    // serve the would-be-rejected bad-cbtx-quorummerkleroot
+                    // template. Isolated by the pure predicate; the inverse skew
+                    // (embedded stale, dashd fresh) fails it and takes the swap.
+                    bool dashd_stale = false;
+                    if (quorums_differ) {
+                        uint256 agreed;
+                        bool     have_agreed;
+                        {
+                            std::lock_guard<std::mutex> lk(quorum_root_cache_mutex_);
+                            agreed      = last_agreed_quorum_root_;
+                            have_agreed = has_agreed_quorum_root_;
+                        }
+                        dashd_stale = coin::quorumroot_dashd_is_stale(
+                            emb_cb.merkleRootQuorums, dref_cb.merkleRootQuorums,
+                            mnlist_matches, have_agreed ? &agreed : nullptr);
+                    }
+                    if (dashd_stale) {
+                        // KEEP embedded: classification-only, no swap. sel stays
+                        // Embedded, served_via_xcheck_swap stays false, and the
+                        // embedded arm's own pins ride untouched.
+                        LOG_INFO << "[DASH-STRATUM-GBT] GBT-xcheck quorumroot-dashd-stale"
+                                 << " at h=" << sel.work.m_height
+                                 << " embedded quorums="
+                                 << emb_cb.merkleRootQuorums.GetHex().substr(0, 16)
+                                 << " dashd quorums="
+                                 << dref_cb.merkleRootQuorums.GetHex().substr(0, 16)
+                                 << " (== last agreed root one cycle earlier) —"
+                                    " KEEP embedded: the chain commits the embedded"
+                                    " quorum root at the DKG boundary; dashd's GBT"
+                                    " is momentarily serving the pre-boundary cycle"
+                                    " (swapping would serve a bad-cbtx-"
+                                    "quorummerkleroot template)";
+                    } else {
                     LOG_WARNING << "[DASH-STRATUM-GBT] GBT-xcheck "
                                 << (quorums_differ ? "merkleRootQuorums"
                                                    : "merkleRootMNList")
@@ -1057,6 +1114,7 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                                                coin::WorkSource::DashdFallback,
                                                std::move(xcheck) };
                     served_via_xcheck_swap = true;
+                    }
                 }
                 // #130 tx-serving reward-safety — NON-COINBASE tx-merkleroot
                 // xcheck. The #1216 creditPool / quorum / MN branches above
@@ -1121,25 +1179,92 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                     const uint256 dref_txroot =
                         coin::compute_merkle_root(dref.m_tx_hashes);
                     if (emb_txroot != dref_txroot) {
-                        LOG_WARNING << "[DASH-STRATUM-GBT] GBT-xcheck tx-merkleroot"
-                                    << " MISMATCH at h=" << sel.work.m_height
-                                    << " embedded txs=" << sel.work.m_tx_hashes.size()
-                                    << " root=" << emb_txroot.GetHex().substr(0, 16)
-                                    << " dashd txs=" << dref.m_tx_hashes.size()
-                                    << " root=" << dref_txroot.GetHex().substr(0, 16)
-                                    << " — serving dashd template (reward-safety"
-                                       " backstop: a divergent mempool tx selection"
-                                       " / commitment order is the bad-txns-"
-                                       "merkleroot orphan vector)";
-                        coin::DeclineReport xcheck;
-                        xcheck.viable    = false;
-                        xcheck.cause     = "gbt-xcheck-txmerkle-mismatch";
-                        xcheck.value     = emb_txroot.GetHex();
-                        xcheck.threshold = dref_txroot.GetHex();
-                        sel = coin::WorkSelection{ std::move(dref),
-                                                   coin::WorkSource::DashdFallback,
-                                                   std::move(xcheck) };
-                        served_via_xcheck_swap = true;
+                        // The embedded selection DIVERGES from dashd's. Two
+                        // independently-connected nodes never hold identical
+                        // mempools, so a divergent-but-VALID set is NORMAL and
+                        // yields a perfectly valid block. Whether we may serve
+                        // OUR OWN set or must fall back to dashd is decided
+                        // here, per --embedded-tx-serve-own-set:
+                        //
+                        //   OFF (default, shipped posture): the legacy dashd-
+                        //   PARITY backstop -- swap to dashd on ANY divergence
+                        //   (cause gbt-xcheck-txmerkle-mismatch). Byte-
+                        //   identical to before this change.
+                        //
+                        //   ON: run the INTERNAL-CONSISTENCY referee
+                        //   (tx_serve_referee.hpp): coinbase fee-exact, every
+                        //   served tx fee_fold_proven, no intra-set double-
+                        //   spend. The referee shares the selector's UTXO
+                        //   view, so it CANNOT catch a tx that view still
+                        //   shows unspent while dashd sees it spent (already-
+                        //   mined / stale-view class, field-observed at
+                        //   h=2526403: probed=4 invalid=4 on fee_fold_proven
+                        //   txs). The MEMPOOL VALIDITY GATE catches exactly
+                        //   that class via dashd testmempoolaccept over a
+                        //   sustained clean window, so when a shadow-compare
+                        //   probe is bound we require it OPEN before trusting
+                        //   the referee. With NO probe bound (pure daemonless,
+                        //   post-proof) the operator's arming of the flag is
+                        //   the proof. Either way, failure fail-closes to
+                        //   dashd -- safety is preserved on every branch.
+                        const bool gate_proven =
+                            !shadow_compare_ || shadow_compare_->validity_gate_open();
+                        coin::TxServeRefereeVerdict rv;
+                        const bool serve_own =
+                            tx_serve_own_set_ && gate_proven
+                            && (rv = coin::tx_serve_internal_referee(sel.work))
+                                   .serve_own_set;
+                        if (serve_own) {
+                            // SERVE OUR OWN VALID SET. The dashd divergence is
+                            // a SHADOW (diagnostic), not a fallback trigger.
+                            tx_serve_own_set_serves_.fetch_add(
+                                1, std::memory_order_relaxed);
+                            LOG_INFO << "[DASH-STRATUM-GBT] tx-serve OWN-SET at h="
+                                     << sel.work.m_height
+                                     << " embedded txs=" << sel.work.m_tx_hashes.size()
+                                     << " root=" << emb_txroot.GetHex().substr(0, 16)
+                                     << " != dashd txs=" << dref.m_tx_hashes.size()
+                                     << " root=" << dref_txroot.GetHex().substr(0, 16)
+                                     << " â SERVING OWN VALID SET (" << rv.detail
+                                     << "); a different-but-valid selection is not"
+                                        " a fallback trigger";
+                            // sel stays Embedded â NO swap.
+                        } else {
+                            // FAIL-CLOSE to dashd. Own-set OFF (legacy parity),
+                            // validity gate not yet proven-open, or the referee
+                            // refused an internal-consistency defect.
+                            std::string cause =
+                                !tx_serve_own_set_
+                                    ? std::string("gbt-xcheck-txmerkle-mismatch")
+                                    : (!gate_proven
+                                           ? std::string("tx-serve-validity-gate-not-open")
+                                           : rv.fail_cause);
+                            if (tx_serve_own_set_)
+                                tx_serve_own_set_failclose_.fetch_add(
+                                    1, std::memory_order_relaxed);
+                            LOG_WARNING << "[DASH-STRATUM-GBT] GBT-xcheck tx-merkleroot"
+                                        << " MISMATCH at h=" << sel.work.m_height
+                                        << " embedded txs=" << sel.work.m_tx_hashes.size()
+                                        << " root=" << emb_txroot.GetHex().substr(0, 16)
+                                        << " dashd txs=" << dref.m_tx_hashes.size()
+                                        << " root=" << dref_txroot.GetHex().substr(0, 16)
+                                        << " â serving dashd template (cause="
+                                        << cause
+                                        << (tx_serve_own_set_ && !gate_proven
+                                                ? "; own-set armed but validity"
+                                                  " gate not open"
+                                                : "")
+                                        << ")";
+                            coin::DeclineReport xcheck;
+                            xcheck.viable    = false;
+                            xcheck.cause     = cause;
+                            xcheck.value     = emb_txroot.GetHex();
+                            xcheck.threshold = dref_txroot.GetHex();
+                            sel = coin::WorkSelection{ std::move(dref),
+                                                       coin::WorkSource::DashdFallback,
+                                                       std::move(xcheck) };
+                            served_via_xcheck_swap = true;
+                        }
                     }
                 }
             }
@@ -1304,9 +1429,32 @@ void DASHWorkSource::note_arm_decision(coin::ServeGateJournal::Served served,
     coin::ServeGateJournal::Decision d;
     coin::ServeGateJournal::Rollup rollup;
     bool emit_rollup = false;
+    // Cumulative-ledger flush payload, captured under the lock and emitted /
+    // persisted OUTSIDE it (I/O off the held mutex; the LevelDB found-block
+    // ledger takes the same lock, and the status surface try_locks it).
+    coin::ServeGateLedger::Totals cum_totals;
+    std::string cum_path;
+    bool emit_cum = false;
+    coin::ServeGateCumulative cum_combined;
+    coin::QcNullServeCounters cum_counters_snapshot;
+    bool have_cum = false;
     {
         std::lock_guard<std::mutex> lk(serve_gate_mutex_);
         d = serve_gate_journal_.observe(served, why.cause, now_sec);
+        // CUMULATIVE cross-restart accounting: bank the SAME decision the
+        // journal just returned, so ledger and journal cannot disagree (the
+        // ledger consumes Decision.prev_cause_sec — the exact quantity the
+        // journal folds into m_cause_totals). Embedded maps to embedded_real
+        // here; the null-arm split (embedded_null) is a follow-up that sets
+        // DashWorkData.m_qc_null_slots — until then a null serve counts as
+        // embedded_real, never as a fallback, so the never-a-reject denominator
+        // is unaffected. why.cause is ignored by the ledger while serving.
+        const auto ledger_arm =
+            served_embedded ? coin::ServeGateLedger::Arm::EmbeddedReal
+            : (served == coin::ServeGateJournal::Served::NoWork)
+                ? coin::ServeGateLedger::Arm::NoWork
+                : coin::ServeGateLedger::Arm::Fallback;
+        serve_gate_ledger_.bank_serve(ledger_arm, why.cause, d, now_sec);
         last_decline_      = served_embedded ? coin::DeclineReport{} : why;
         last_arm_embedded_ = served_embedded;
         arm_ever_observed_ = true;
@@ -1321,6 +1469,26 @@ void DASHWorkSource::note_arm_decision(coin::ServeGateJournal::Served served,
             last_rollup_sec_ = now_sec;
             rollup           = serve_gate_journal_.rollup(now_sec);
             emit_rollup      = true;
+            // Piggyback the cumulative flush on the same hourly tick. Snapshot
+            // the open segment into carry (folded once on next load), copy the
+            // totals for the log line, and grab the path for the write-through.
+            serve_gate_ledger_.snapshot_carry_for_flush();
+            cum_totals = serve_gate_ledger_.totals();
+            cum_path   = serve_gate_ledger_path_;
+            emit_cum   = true;
+            // (a)+(b) cross-restart cumulative accounting: load the prior
+            // state ONCE, snapshot this process's live QC-NULL-SERVE counters.
+            // combine()+save_atomic()+log run OFF the lock below (no file I/O
+            // under serve_gate_mutex_). Empty path => dormant, byte-unchanged.
+            if (!serve_gate_state_path_.empty()) {
+                if (!serve_gate_prior_loaded_) {
+                    serve_gate_prior_ =
+                        coin::load_serve_gate_state(serve_gate_state_path_);
+                    serve_gate_prior_loaded_ = true;
+                }
+                cum_counters_snapshot = null_serve_counters_;
+                have_cum = true;
+            }
         }
     }
 
@@ -1345,6 +1513,82 @@ void DASHWorkSource::note_arm_decision(coin::ServeGateJournal::Served served,
             }
         }
         LOG_WARNING << os.str();
+
+        // CUMULATIVE line ALONGSIDE the per-process one: prior + this process,
+        // write-through to the state file so a STANDING soak (across restarts)
+        // is readable from the log/file alone — closing the observed=7211s
+        // per-process denominator trap (04:00 restart) the critic found. File
+        // I/O is OFF serve_gate_mutex_; serve_gate_prior_ is immutable after
+        // its one-time load, so reading it here without the lock is safe.
+        if (have_cum) {
+            cum_combined =
+                coin::combine(serve_gate_prior_, rollup, cum_counters_snapshot);
+            coin::save_serve_gate_state_atomic(serve_gate_state_path_,
+                                               cum_combined);
+            LOG_WARNING << coin::cumulative_rollup_line(cum_combined);
+            LOG_WARNING << coin::qc_null_serve_line(cum_combined.null_serve);
+        }
+    }
+
+    if (emit_cum) {
+        // Write-through FIRST (atomic tmp+rename), so the standing figure the
+        // line reports is the one now on disk; a failed write keeps the
+        // in-memory ledger and simply loses this cadence of durations. Empty
+        // path = set_serve_gate_ledger_path() was never called (the ledger
+        // still accumulates + logs, it just does not persist across restarts).
+        if (!cum_path.empty())
+            coin::serve_gate_ledger_save(cum_path, cum_totals);
+        // The operator-facing standing total: "null-arm covered the 4.51%
+        // floor, 0 rejects over N heights", carried ACROSS restarts (epochs=N).
+        // DENOMINATOR (observed) first, then the never-a-reject numerators —
+        // any reject on an embedded arm is the hard cut-stopper, so it is named
+        // explicitly and can never hide behind a percentage.
+        const bool nar =
+            cum_totals.rpc_rejected_embedded_real == 0 &&
+            cum_totals.rpc_rejected_embedded_null == 0 &&
+            cum_totals.orphaned_embedded_real == 0 &&
+            cum_totals.orphaned_embedded_null == 0;
+        const uint64_t serves_emb =
+            cum_totals.serves_embedded_real + cum_totals.serves_embedded_null;
+        const uint64_t serves_all = serves_emb + cum_totals.serves_fallback +
+                                     cum_totals.serves_no_work;
+        const uint64_t nr_span =
+            cum_totals.nr_span_start_height == 0
+                ? 0
+                : (cum_totals.nr_span_last_height -
+                   cum_totals.nr_span_start_height + 1);
+        std::ostringstream cs;
+        cs << "[EMBED-CUMULATIVE] epochs=" << cum_totals.epochs
+           << " commit=" << (cum_totals.last_writer_commit.empty()
+                                 ? "unknown" : cum_totals.last_writer_commit)
+           << " observed=" << cum_totals.observed_sec << "s"
+           << " off_embedded=" << cum_totals.off_embedded_sec << "s";
+        if (cum_totals.observed_sec > 0)
+            cs << " (" << (cum_totals.off_embedded_sec * 100 /
+                           cum_totals.observed_sec) << "% off)";
+        cs << " serves{real=" << cum_totals.serves_embedded_real
+           << " null=" << cum_totals.serves_embedded_null
+           << " fallback=" << cum_totals.serves_fallback
+           << " no_work=" << cum_totals.serves_no_work << "}";
+        if (serves_all > 0)
+            cs << " embedded=" << (serves_emb * 100 / serves_all) << "%";
+        cs << " blocks{won_real=" << cum_totals.blocks_won_embedded_real
+           << " won_null=" << cum_totals.blocks_won_embedded_null
+           << " won_fallback=" << cum_totals.blocks_won_fallback
+           << " submitted=" << cum_totals.blocks_submitted
+           << " confirmed=" << cum_totals.blocks_confirmed
+           << " orphaned=" << cum_totals.blocks_orphaned << "}"
+           << " rejects{rpc_real=" << cum_totals.rpc_rejected_embedded_real
+           << " rpc_null=" << cum_totals.rpc_rejected_embedded_null
+           << " rpc_fallback=" << cum_totals.rpc_rejected_fallback
+           << " payee_guard=" << cum_totals.local_payee_guard_rejects << "}"
+           << " null_arm{dkg_floor=" << cum_totals.null_dkg_floor_tips_served
+           << " real_quorum_but_null="
+           << cum_totals.null_real_quorum_available_but_null_served << "}"
+           << " never_a_reject=" << (nar ? "true" : "false")
+           << " reject_free_span=" << nr_span << "h"
+           << " total_rejects=" << cum_totals.nr_total_rejects;
+        LOG_WARNING << cs.str();
     }
 
     // A CAUSE SEGMENT closed on THIS decision (a cause change or a resume):
@@ -1554,6 +1798,17 @@ nlohmann::json DASHWorkSource::embedded_arm_status_json() const
     j["serve_recheck_fail_count"] =
         serve_recheck_fail_count_.load(std::memory_order_relaxed);
 
+    // --embedded-tx-serve-own-set observability (lock-free). serves = times a
+    // divergent-from-dashd mempool selection was served as OUR OWN valid set
+    // (internal-consistency referee passed AND the validity gate was proven
+    // open); failclose = times such a divergence fell back to dashd (own-set
+    // off, validity gate not open, or a referee defect). Both zero until the
+    // flag is armed.
+    j["tx_serve_own_set_serves"] =
+        tx_serve_own_set_serves_.load(std::memory_order_relaxed);
+    j["tx_serve_own_set_failclose"] =
+        tx_serve_own_set_failclose_.load(std::memory_order_relaxed);
+
     // TRY_LOCK, not lock_guard. serve_gate_mutex_ is taken by the SERVE PATH
     // (note_arm_decision, :759; the found-block ledger, :1478). Blocking here
     // meant the whole status response waited on the very path this lane exists
@@ -1587,6 +1842,11 @@ nlohmann::json DASHWorkSource::embedded_arm_status_json() const
                                  .count();
         j["gate_rollup"] =
             coin::serve_gate_rollup_json(serve_gate_journal_.rollup(now_sec));
+        // CUMULATIVE cross-restart companion (the per-process gate_rollup above
+        // wipes on restart; this survives via the persisted ledger, epochs=N).
+        // Same lock already held; the ledger is a plain in-memory aggregate.
+        j["gate_rollup_cumulative"] =
+            coin::serve_gate_ledger_to_json(serve_gate_ledger_.totals());
     }
     if (!arm_ever_observed_) {
         j["arm"]               = "unknown";
@@ -2488,6 +2748,27 @@ void DASHWorkSource::set_mint_share_fn(MintShareFn fn)
 {
     std::lock_guard<std::mutex> lk(mint_share_mutex_);
     mint_share_fn_ = std::move(fn);
+}
+
+void DASHWorkSource::set_serve_gate_ledger_path(const std::string& path,
+                                                const std::string& writer_commit)
+{
+    std::lock_guard<std::mutex> lk(serve_gate_mutex_);
+    serve_gate_ledger_path_ = path;
+    // Restore any persisted blob so the cumulative figure carries across this
+    // restart (folds the previous process's open-segment carry exactly once,
+    // bumps epochs). Absent/unparseable => fresh at epoch 0. load() is called
+    // unconditionally so epochs increments even from a default blob.
+    coin::ServeGateLedger::Totals persisted;
+    coin::serve_gate_ledger_load(path, persisted);  // best-effort; leaves default on miss
+    serve_gate_ledger_.load(persisted);
+    serve_gate_ledger_.set_writer_commit(writer_commit);
+    LOG_INFO << "[EMBED-CUMULATIVE] ledger restored: epochs="
+             << serve_gate_ledger_.totals().epochs
+             << " observed=" << serve_gate_ledger_.totals().observed_sec << "s"
+             << " never_a_reject="
+             << (serve_gate_ledger_.never_a_reject() ? "true" : "false")
+             << " path=" << path;
 }
 
 void DASHWorkSource::set_pplns_weights_fn(PplnsWeightsFn fn)

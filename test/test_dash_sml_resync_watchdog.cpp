@@ -114,16 +114,21 @@ TEST(DashSmlResyncWatchdog, ReachingTheTipClearsEverything)
     EXPECT_EQ(w.attempts(), 0u);
 }
 
-// ── Bounded: backoff, then silence ──────────────────────────────────────────
+// ── Bounded: geometric backoff, then a CLAMPED perpetual retry ──────────────
 // The failure mode of a retry is hammering a peer that is already struggling,
-// so the cap is the safety property, not a nicety.
-TEST(DashSmlResyncWatchdog, BacksOffGeometricallyThenStopsAtTheCap)
+// so the interval must never collapse. But going SILENT forever is the OTHER
+// bug: an 18-min block gap never changes the (tip, sml) pair, so a hard stop at
+// max_attempts stranded the arm on the dashd fallback for the whole gap with
+// healthy peers idle. After max_attempts the interval is pinned at its cap and
+// the re-ask CONTINUES at that clamped cadence — bounded to ~1 request per cap
+// interval, but never giving up.
+TEST(DashSmlResyncWatchdog, BacksOffGeometricallyThenClampsAndKeepsRetrying)
 {
     SmlResyncWatchdog w(fast());
     const uint256 tip = blk(0x11), sml = blk(0x22);
     w.observe(tip, sml, 1000);
 
-    ASSERT_TRUE(w.observe(tip, sml, 1020).has_value());          // +20
+    ASSERT_TRUE(w.observe(tip, sml, 1020).has_value());          // +20  attempt 1
     EXPECT_FALSE(w.observe(tip, sml, 1059).has_value());         // needs +40
     ASSERT_TRUE(w.observe(tip, sml, 1060).has_value());          // attempt 2
     EXPECT_FALSE(w.observe(tip, sml, 1139).has_value());         // needs +80
@@ -131,12 +136,60 @@ TEST(DashSmlResyncWatchdog, BacksOffGeometricallyThenStopsAtTheCap)
     ASSERT_TRUE(third.has_value());
     EXPECT_EQ(third->attempt, 3u);
 
-    // Cap reached: from here we are silent and the next block does what it
-    // does today. A stuck peer therefore sees today's traffic plus at most
-    // max_attempts extra requests, ever.
-    EXPECT_FALSE(w.observe(tip, sml, 5000).has_value());
-    EXPECT_FALSE(w.observe(tip, sml, 99999).has_value());
-    EXPECT_EQ(w.attempts(), 3u);
+    // Cap reached (max_attempts=3): the interval is now CLAMPED at
+    // min_quiet * backoff^max_attempts = 20 * 2^3 = 160 s and stays there.
+    EXPECT_FALSE(w.observe(tip, sml, 1140 + 159).has_value())
+        << "inside the clamped interval nothing is re-sent";
+    auto fourth = w.observe(tip, sml, 1140 + 160);
+    ASSERT_TRUE(fourth.has_value())
+        << "past the clamped interval the re-ask CONTINUES — going silent "
+           "forever here is the measured 18-min fallback wedge";
+    EXPECT_EQ(fourth->attempt, 4u) << "attempts keep counting past the cap";
+
+    // ...and it keeps going, never faster than the clamped cadence.
+    EXPECT_FALSE(w.observe(tip, sml, 1140 + 160 + 159).has_value());
+    ASSERT_TRUE(w.observe(tip, sml, 1140 + 160 + 160).has_value());
+}
+
+// ── RED->GREEN: a wedged tip must NOT go silent forever ─────────────────────
+// The measured 1068 s wedge (hotel primary, 2026-08-23 03:39:40 -> ~03:58):
+// SmlResyncWatchdog fired attempts 1/3, 2/3, 3/3 and then went SILENT while the
+// chain sat on the SAME tip for ~18 min with 8 healthy peers idle — the arm
+// served the dashd fallback the entire time. The (tip, sml) pair never changed
+// (no new block), so the old hard stop at max_attempts never re-armed: the
+// armed-once-never-re-armed class (#1151 / #1162 / #103). This pins that past
+// the cap the re-ask CONTINUES at the clamped cadence, so an 18-min block gap
+// can recover a lost diff instead of wedging on it.
+//
+// RED on the pre-fix code: observe() returned std::nullopt for every call past
+// max_attempts, so the loop below counted ZERO re-asks during the wedge.
+TEST(DashSmlResyncWatchdog, WedgedTipIsReAskedPerpetuallyNotSilencedAtTheCap)
+{
+    SmlResyncWatchdog w(fast());
+    const uint256 tip = blk(0x11), sml = blk(0x22);
+
+    // Exhaust the geometric budget exactly as the hotel wedge did (1/3..3/3).
+    w.observe(tip, sml, 1000);
+    ASSERT_TRUE(w.observe(tip, sml, 1020).has_value());
+    ASSERT_TRUE(w.observe(tip, sml, 1060).has_value());
+    ASSERT_TRUE(w.observe(tip, sml, 1140).has_value());
+    ASSERT_GE(w.attempts(), 3u);
+
+    // Now the chain STALLS on this tip for 18 minutes. Poll the watchdog once a
+    // second — exactly like check_tip_body_overdue's high-cadence clock — and
+    // count the re-asks it emits. The pre-fix code emitted ZERO here.
+    const int64_t wedge_start = 1140;
+    int reasks_during_wedge = 0;
+    for (int64_t t = wedge_start + 1; t <= wedge_start + 18 * 60; ++t) {
+        if (w.observe(tip, sml, t).has_value()) ++reasks_during_wedge;
+    }
+
+    EXPECT_GT(reasks_during_wedge, 0)
+        << "the wedged tip must keep being re-asked — going silent forever here "
+           "is the measured 1068 s dashd-fallback wedge";
+    EXPECT_LE(reasks_during_wedge, (18 * 60) / 150)
+        << "but still bounded to ~one request per clamp interval, never a burst "
+           "against a peer that is already struggling";
 }
 
 // A new tip is a new situation: the previous budget described a lag that no
@@ -149,7 +202,8 @@ TEST(DashSmlResyncWatchdog, NewTipRestartsTheBudget)
     w.observe(blk(0x11), sml, 1020);
     w.observe(blk(0x11), sml, 1060);
     ASSERT_TRUE(w.observe(blk(0x11), sml, 1140).has_value());
-    EXPECT_FALSE(w.observe(blk(0x11), sml, 9000).has_value());   // capped
+    EXPECT_TRUE(w.observe(blk(0x11), sml, 9000).has_value())     // clamped, still re-asking
+        << "past the clamp the same stuck pair keeps being re-asked, not silenced";
 
     EXPECT_FALSE(w.observe(blk(0x44), sml, 9001).has_value());   // new tip: first sighting
     EXPECT_EQ(w.attempts(), 0u);

@@ -629,6 +629,30 @@ public:
         return j;
     }
 
+    /// Thread-safe readiness snapshot for the SERVE PATH (work_source.cpp).
+    /// TRUE only when a dashd testmempoolaccept oracle is bound AND the mempool
+    /// validity gate has accrued its sustained clean window (open()).
+    ///
+    /// The tx-serve-own-set referee consults this so that serving OUR OWN valid
+    /// tx set -- dropping the dashd-tx-merkle PARITY backstop -- cannot begin
+    /// until the SELECTOR has been PROVEN dashd-acceptable over the window.
+    /// This is the direct runtime answer to the field finding at h=2526403:
+    /// our fee_fold_proven selection can still offer transactions dashd rejects
+    /// (the already-mined / stale-UTXO-view class), and the internal-
+    /// consistency referee shares a UTXO view with the selector, so it cannot
+    /// independently catch that class. Only dashd's external view (this gate,
+    /// or the parity backstop) can. Requiring open() here keeps the parity
+    /// backstop in force until the gate demonstrates the class is gone.
+    ///
+    /// Returns false when no oracle is bound: the gate cannot be proven without
+    /// dashd, so it fail-closes. (A post-proof PURE-daemonless node runs with
+    /// no shadow-compare object at all; the caller bypasses the coupling only
+    /// when the probe is absent, never when it is present-but-empty.)
+    bool validity_gate_open() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return static_cast<bool>(accept_) && validity_.open();
+    }
+
 private:
     void worker_loop() {
         for (;;) {
@@ -674,7 +698,19 @@ private:
             std::lock_guard<std::mutex> lk(mu_);
             counters_.apply(o);
         }
-        probe_validity(served);
+        // TIP CONTEXT for the validity gate. dashd's getblocktemplate height is
+        // its NEXT block (tip+1); ours (served.m_height) is likewise our next
+        // block. dashd building a STRICTLY HIGHER block than us means dashd has
+        // already connected the block at our template's height (or beyond) while
+        // OUR tip is still its parent — the propagation Window 1 in which a tx
+        // dashd reports "txn-already-known" was mined in a block WE HAVE NOT YET
+        // CONNECTED. From our tip that tx is a valid unconfirmed tx and our
+        // template is a valid fork competitor, so the gate must not treat it as
+        // a staleness defect. When the oracle is absent we cannot tell, and pass
+        // false (conservative: already-known stays INVALID, gate stays CLOSED).
+        const bool dashd_ahead =
+            dashd.has_value() && dashd->m_height > served.m_height;
+        probe_validity(served, dashd_ahead);
     }
 
     /// THE MEMPOOL VALIDITY GATE, on the SAME worker thread as the oracle
@@ -685,7 +721,7 @@ private:
     ///
     /// This CANNOT change what is served. Its only outputs are log lines, the
     /// counters, and a readiness verdict on a DEFAULT-OFF flag.
-    void probe_validity(const DashWorkData& w) {
+    void probe_validity(const DashWorkData& w, bool dashd_ahead_of_serve_height) {
         if (!accept_) return;
         const auto set = mempool_probe_set(w);
 
@@ -703,7 +739,8 @@ private:
             answers.push_back(std::move(a));
         }
 
-        const auto sample = mempool_validity_sample(w.m_height, set, answers);
+        const auto sample = mempool_validity_sample(w.m_height, set, answers,
+                                                    dashd_ahead_of_serve_height);
         std::lock_guard<std::mutex> lk(mu_);
         validity_.apply(sample);
         for (const auto& line : mempool_validity_log_lines(sample, validity_)) {

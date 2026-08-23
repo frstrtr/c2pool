@@ -308,7 +308,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # DASH serve-gate journal per-cause time KAT (h=2518004 count-vs-time trap):
     # pure, header-only policy object; no socket/ltc/pool dependency. Mirrors
     # the test_dash_min_protocol_gate link set.
-    add_executable(test_dash_serve_gate_journal test_dash_serve_gate_journal.cpp)
+    add_executable(test_dash_serve_gate_journal test_dash_serve_gate_journal.cpp test_dash_serve_gate_ledger.cpp)
     target_link_libraries(test_dash_serve_gate_journal PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -317,6 +317,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_dash_serve_gate_journal PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
     gtest_add_tests(test_dash_serve_gate_journal "" AUTO)
+
+    # DASH serve-gate LEDGER cross-restart never-a-reject accounting KAT: the
+    # CUMULATIVE, persisted companion to ServeGateJournal (the journal wipes on
+    # restart; the ledger survives via write-through JSON). Pure-policy header +
+    # JSON companion; the KAT does a real atomic save->load round-trip through a
+    # temp file. Same link set as the journal KAT.
 
     # DASH S8 pool-node leaf 4 — share_tracker.hpp KAT: DensePPLNSWindow decayed
     # weight ring buffer (compute_v36_weights), decay table, donation split,
@@ -617,7 +623,15 @@ if (BUILD_TESTING AND GTest_FOUND)
     # genesis short-circuit), resumable cursor across reopen, versioned-format
     # fail-loud, 100-block undo window retention, disconnect/reconnect set-
     # hash identity. Same target, no new allowlist entry.
-    add_executable(test_dash_mempool test_dash_mempool.cpp test_dash_replay_utxo_fold.cpp)
+    # test_dash_mempool_validity_gate.cpp also rides the test_dash_embedded_gbt
+    # target above, but that target currently FAILS TO LINK (a pre-existing
+    # #154-era gap: test_dash_replay_v19_type4_punish.cpp needs opkey_* from
+    # bls_verify.cpp). Fold the gate suite into this LINKING target too so the
+    # readiness-gate KATs — including the tip-context propagation split — are
+    # actually built and run. Header-only over mempool_validity_gate.hpp +
+    # nlohmann/json; no new SCC dependency, no new build.yml --target (#769).
+    add_executable(test_dash_mempool test_dash_mempool.cpp test_dash_replay_utxo_fold.cpp
+        test_dash_mempool_validity_gate.cpp)
     target_link_libraries(test_dash_mempool PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -1010,18 +1024,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         # dash_mainnet_quorum_scan_* / _active_quorums_ fixtures as the W4
         # suite above, and is folded into this target for the same #769
         # reason (the push bot cannot add a build.yml --target).
-        test_dash_mined_commitment_index.cpp
-        # test_dash_mempool_validity_gate.cpp: THE condition that decides when
-        # --embedded-serve-mempool-txs may be armed
-        # (mempool_validity_gate.hpp). Pins the three-valued
-        # testmempoolaccept logic, the exact-name "txn-already-in-mempool"
-        # exemption, "a missing answer is never a pass", the refusal line's
-        # txid/reason/threshold (#1038/#1039 discipline), the sustained-window
-        # arithmetic, and the two directions the retired `ours_only == 0`
-        # set-membership test got wrong. Folded into this target per the same
-        # #769 rule as the leaves above (the push bot cannot add a build.yml
-        # --target, so a standalone executable would be a NOT_BUILT sentinel).
-        test_dash_mempool_validity_gate.cpp)
+        test_dash_mined_commitment_index.cpp)
     target_compile_definitions(test_dash_embedded_gbt PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_embedded_gbt PRIVATE
@@ -1193,9 +1196,14 @@ if (BUILD_TESTING AND GTest_FOUND)
     #                       mutation case.
     add_executable(test_dash_stratum_work_source
         test_dash_stratum_work_source.cpp
+        # test_dash_tx_serve_referee.cpp: internal-consistency referee unit KAT
+        # (tx_serve_referee.hpp). Folded into this already-built target (it links
+        # the full dash_stratum set the referee header needs) per the #769 rule.
+        test_dash_tx_serve_referee.cpp
         test_dash_submit_gate_scaling.cpp
         test_dash_serve_staleness_seam.cpp
         test_dash_serve_staleness_unit.cpp
+        test_dash_gbt_quorum_staleness.cpp
         ${CMAKE_SOURCE_DIR}/src/impl/dash/coin/zmq_tip_notify.cpp)
     target_link_libraries(test_dash_stratum_work_source PRIVATE
         GTest::gtest_main GTest::gtest

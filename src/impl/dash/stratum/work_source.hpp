@@ -60,6 +60,8 @@
 
 #include <impl/dash/coin/node_coin_state.hpp>   // coin::NodeCoinState, coin::DashWorkData seam
 #include <impl/dash/coin/serve_gate_journal.hpp> // coin::ServeGateJournal — decline rate policy (DEFECT-3)
+#include <impl/dash/coin/serve_gate_ledger.hpp>  // coin::ServeGateLedger — cumulative cross-restart never-a-reject accounting
+#include <impl/dash/coin/serve_gate_persist.hpp> // cross-restart cumulative accounting + QC-NULL-SERVE counters
 #include <impl/dash/coin/embedded_shadow_compare.hpp> // coin::EmbeddedShadowCompare — OBSERVE-only serve-vs-dashd diff
 #include <impl/dash/stratum/get_work.hpp>       // dash::stratum::get_work() fused capstone
 
@@ -363,6 +365,48 @@ public:
     /// independent seed-height + pre-emit gates.
     void set_gbt_xcheck(bool v) { gbt_xcheck_ = v; }
 
+    /// TX-SERVE-OWN-SET referee (--embedded-tx-serve-own-set). DEFAULT OFF.
+    ///
+    /// When OFF (default, and the shipped posture): a divergent-from-dashd
+    /// mempool tx selection SWAPS to dashd's template exactly as before
+    /// (cause gbt-xcheck-txmerkle-mismatch) -- byte-identical to today.
+    ///
+    /// When ON: on a tx-merkle divergence the arm runs the INTERNAL-
+    /// CONSISTENCY referee (tx_serve_referee.hpp) instead of the dashd-parity
+    /// backstop. If the embedded template is internally consistent (coinbase
+    /// fee-exact, every served tx fee_fold_proven, no intra-set double-spend)
+    /// AND -- when a shadow-compare validity probe is bound -- the mempool
+    /// validity gate is currently open(), c2pool SERVES ITS OWN valid set (the
+    /// divergence is logged as a shadow, not a fallback). Otherwise it fail-
+    /// closes to the dashd template. The validity-gate coupling is the runtime
+    /// guard against the already-mined / stale-UTXO-view class the referee
+    /// cannot catch alone (h=2526403 field finding); see set_shadow_compare.
+    void set_tx_serve_own_set(bool v) { tx_serve_own_set_ = v; }
+
+    /// Path to the cross-restart cumulative serve-gate state file (JSON).
+    /// Empty (default) => the cumulative accounting is OFF and this class is
+    /// byte-identical to before: no load, no save, no extra log line. When set
+    /// (--serve-gate-state-file), note_arm_decision() write-throughs the
+    /// combined prior+live roll-up + QC-NULL-SERVE counters on each roll-up
+    /// tick so a STANDING soak is readable across restarts.
+    void set_serve_gate_state_file(std::string p) { serve_gate_state_path_ = std::move(p); }
+
+    /// (b) QC-NULL-SERVE live hooks. Record one required DKG mining-window tip
+    /// and its disposition (null-served / real-served / fell-back), and one
+    /// block submission from a null-carrying template (never-a-reject
+    /// conjunct). Thread-safe (serve_gate_mutex_). The per-tip disposition call
+    /// site is the daemonless_qc_commitments fold consumer (soak-gated wiring);
+    /// note_null_submit is called from the block-submit path.
+    void note_null_serve_disposition(int llmq_type,
+                                     coin::QcNullServeCounters::Disposition d) const {
+        std::lock_guard<std::mutex> lk(serve_gate_mutex_);
+        null_serve_counters_.note(llmq_type, d);
+    }
+    void note_null_submit(bool rejected) const {
+        std::lock_guard<std::mutex> lk(serve_gate_mutex_);
+        null_serve_counters_.note_submit(rejected);
+    }
+
     /// PIN SPLICE ON THE XCHECK-SWAPPED ARM (--pin-splice-xcheck-arm).
     /// DEFAULT OFF -- this is the money path.
     ///
@@ -453,6 +497,18 @@ public:
         std::function<void(uint32_t height, const uint256& block_hash,
                            const std::string& miner, bool reached_network)>;
     void set_on_found_block_fn(FoundBlockFn fn);
+
+    /// Wire the CUMULATIVE cross-restart serve-gate ledger to its persisted
+    /// backing file (<data-dir>/<net_subdir>/serve_gate_ledger.json). Loads any
+    /// existing blob (folding the previous process's carry, bumping epochs) and
+    /// stamps `writer_commit` (C2POOL_VERSION) so the standing figure always
+    /// names the binary that produced it. Idempotent-ish: call ONCE at wiring
+    /// time, before the first template is sourced. While unset the ledger still
+    /// accumulates in memory and logs [EMBED-CUMULATIVE], it just never persists
+    /// across a restart — so this call is what turns the per-process figure into
+    /// the standing, cut-gate figure.
+    void set_serve_gate_ledger_path(const std::string& path,
+                                    const std::string& writer_commit);
 
     /// Wire the sharechain mint dispatch (stage 4d follow-up). While unbound,
     /// share-target submissions are accepted for vardiff + loudly logged.
@@ -729,6 +785,20 @@ private:
     bool is_testnet_{false};
     bool embedded_mainnet_{false};   // gate-lift opt-in: daemonless embedded arm on mainnet
     bool gbt_xcheck_{false};         // reward-safety backstop: cross-check embedded creditPool vs dashd
+    bool tx_serve_own_set_{false};   // --embedded-tx-serve-own-set: serve own valid tx set instead of dashd-parity swap (DEFAULT OFF)
+    // Observability for the own-set referee (lock-free; published in embedded_arm_status_json).
+    mutable std::atomic<uint64_t> tx_serve_own_set_serves_{0};      // divergent set served as own (referee passed)
+    mutable std::atomic<uint64_t> tx_serve_own_set_failclose_{0};   // divergent set fail-closed to dashd (referee/gate refused)
+    // GBT-xcheck quorumroot-dashd-stale classifier state -- the fix for the
+    // inverted reward-safety direction at LLMQ DKG commitment boundaries.
+    // last_agreed_quorum_root_ is the most recent merkleRootQuorums both the
+    // embedded and dashd arms matched on; the classifier KEEPS embedded when
+    // dashd's current root REGRESSES to it while embedded ADVANCES past it.
+    // Touched only inside the single-flight template re-source, but guarded for
+    // defence in depth; mutable because resource_template_now() is const.
+    mutable std::mutex quorum_root_cache_mutex_;
+    mutable uint256    last_agreed_quorum_root_;
+    mutable bool       has_agreed_quorum_root_{false};
     bool pin_splice_xcheck_arm_{false};  // money path: splice pins onto an xcheck-SWAPPED template (default OFF)
     bool pin_splice_block_budget_{false};  // money path: ENFORCE the block-size budget (changes served bytes; default OFF)
 
@@ -767,6 +837,28 @@ private:
     // first arm decision, so the first observation seeds the cadence without
     // emitting an empty summary. Guarded by serve_gate_mutex_.
     mutable int64_t                 last_rollup_sec_{-1};
+
+    // CUMULATIVE cross-restart never-a-reject accounting. ServeGateJournal wipes
+    // on restart (its clock is process-monotonic steady_clock seconds), so the
+    // program-level "% embedded / never-a-reject" figure is per-process. The
+    // ledger banks the SAME events the journal sees (from note_arm_decision,
+    // under serve_gate_mutex_) into cumulative totals, persisted write-through
+    // to serve_gate_ledger_path_ (atomic tmp+rename) on the hourly roll-up tick
+    // so the standing claim survives >=3 restarts. Guarded by serve_gate_mutex_.
+    mutable coin::ServeGateLedger    serve_gate_ledger_;
+    // Persisted backing file; empty until set_serve_gate_ledger_path() (then the
+    // ledger accumulates in memory + logs, but never persists). Set once at
+    // wiring time; read on the hourly flush. Guarded by serve_gate_mutex_.
+    std::string                      serve_gate_ledger_path_;
+    // Cross-restart cumulative accounting (flag-gated by serve_gate_state_path_).
+    // serve_gate_prior_ is the PRIOR-process state loaded once at the first
+    // roll-up tick; null_serve_counters_ are this process's live QC-NULL-SERVE
+    // tallies. Both guarded by serve_gate_mutex_; combine()+save happen OFF the
+    // lock in note_arm_decision. Empty path => all of this stays dormant.
+    std::string                        serve_gate_state_path_;
+    mutable coin::ServeGateCumulative  serve_gate_prior_;
+    mutable bool                       serve_gate_prior_loaded_{false};
+    mutable coin::QcNullServeCounters  null_serve_counters_;
 
     // ── Serve-staleness observation (lock-free by requirement) ─────────────
     // Written on the serve path (get_current_work_template /

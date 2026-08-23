@@ -302,6 +302,12 @@ std::string g_replay_mnlist_seed_file;        // --replay-mnlist-seed-file FILE 
 // serve are both fine WITHOUT proving the serve is daemonless.
 bool        g_no_dashd_mn_seed = false;       // --embedded-no-dashd-mn-seed
 
+// --serve-gate-state-file: path to the cross-restart cumulative serve-gate
+// accounting state (JSON). Empty (default) => OFF; the serve path is
+// byte-identical. Non-consensus, non-reward: a soak convenience whose
+// bad read fails to a clean zero and never wedges the node.
+std::string g_serve_gate_state_file;           // --serve-gate-state-file
+
 // ── PR-2 FORWARD: --replay-mined-commitment-index ─────────────────────────
 // Arms the forward half of dashd's mined-commitment store
 // (mined_commitment_index.hpp, ported from v23.1.7 llmq/blockprocessor.cpp)
@@ -425,6 +431,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-utxo] [--embedded-mainnet] [--embedded-null-arm] [--embedded-mn-bridge-max N]\n"
         << "           [--embedded-mn-bridge-no-cursor]\n"
         << "           [--embedded-utxo-immature-serve-empty] [--embedded-serve-mempool-txs]\n"
+        << "           [--embedded-tx-serve-own-set]\n"
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
         << "           [--embedded-ingest-isdlock] [--embedded-ingest-dstx]\n"
         << "           [--pin-local-tx-hex FILE]  (zero-fee self-mined tx, e.g. donation consolidation)\n"
@@ -810,6 +817,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // body path (G1-G4 guards, mempool.hpp) only enters block
              // production when the operator explicitly arms it.
              bool embedded_serve_mempool_txs = false,
+             // --embedded-tx-serve-own-set: when a served embedded
+             // template's mempool selection diverges from dashd's, serve
+             // OUR OWN internally-consistent valid set instead of falling
+             // back to dashd on tx-merkle difference. DEFAULT OFF. MUST NOT
+             // be armed until the [MEMPOOL-VALIDITY] gate has reached
+             // open() (576 clean heights) in a dashd-oracle soak -- the
+             // internal-consistency referee shares the selector's UTXO view
+             // and cannot alone catch the already-mined/stale-view class
+             // (h=2526403). When --embedded-shadow-compare is also on, the
+             // own-set path auto-fail-closes until that gate is open.
+             bool embedded_tx_serve_own_set = false,
              // --embedded-shadow-compare: OBSERVE-only serve-vs-dashd block-
              // template field diff (diagnostic; NOT a serve gate). Off the hot
              // path (worker-thread dashd fetch). Default false; only meaningful
@@ -2412,6 +2430,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // spends. The dashd fallback is unaffected.
             node_coin_state.set_utxo_ready_fn(
                 [&utxo_lane]() { return utxo_lane.mining_utxo_ready(); });
+            // WINDOW-2 currency gate (Window 2 = intra-node eviction lag).
+            // The serve tip can be promoted to H by the diff-driven path
+            // (CoinStateMaintainer mnlistdiff-at-tip / cbTx credit-pool
+            // re-anchor) BEFORE this UTXO lane connects+evicts block H. In that
+            // window the view is at H-1 and a template on H could pack a tx
+            // already spent by H (invalid, thrown-away block). This predicate
+            // lets make_embedded_work_inputs serve coinbase-only until the view
+            // catches up -- dashd's removeForBlock-before-SetTip invariant,
+            // fail-closed. Only material when --embedded-serve-mempool-txs is
+            // armed; coinbase-only / fallback postures are byte-unchanged.
+            // On the LIVE full-block path the utxo-lane subscription (2438,
+            // subscriber 1) connects+evicts BEFORE the maintainer promotes the
+            // serve tip (3908, subscriber 2) on the same io thread, so this
+            // predicate is already true there and suppresses nothing.
+            node_coin_state.set_utxo_current_fn(
+                [&utxo_lane](const uint256& tip_hash) {
+                    return utxo_lane.utxo_current_at(tip_hash);
+                });
             // What the arm DOES during that window. Default (flag absent):
             // REFUSE -- p2pool semantics, the project design law: an unsynced
             // node does not serve block templates; miners idling is correct,
@@ -2810,6 +2846,40 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // consulted, i.e. during an actual embedded outage.
     const bool xcheck_wanted = (testnet || embedded_mainnet);
     work_source->set_gbt_xcheck(xcheck_wanted && static_cast<bool>(rpc));
+    // --embedded-tx-serve-own-set: serve own valid tx set on a divergent
+    // mempool selection instead of the dashd-parity swap (DEFAULT OFF).
+    work_source->set_tx_serve_own_set(embedded_tx_serve_own_set);
+    std::cout << "[DASH-STRATUM-GBT] tx-serve own-set referee: "
+              << (embedded_tx_serve_own_set
+                      ? "ON (--embedded-tx-serve-own-set: divergent-but-valid"
+                        " mempool set served as own; validity-gate-coupled"
+                        " when shadow-compare is bound)"
+                      : "OFF (dashd-parity backstop on any tx-merkle divergence)")
+              << std::endl;
+    // CUMULATIVE cross-restart serve-gate ledger: persist the never-a-reject
+    // accounting to <data-dir>/<net_subdir>/serve_gate_ledger.json so the
+    // standing "% embedded / null-arm covered the 4.51% floor / 0 rejects over
+    // N heights" figure survives the >=3 restarts the dashd-cut soak spans
+    // (ServeGateJournal wipes on restart). Stamp C2POOL_VERSION so the figure
+    // always names the binary that produced it (measurement-without-commit).
+    {
+        const std::string ledger_path =
+            (core::filesystem::config_path() / net_subdir /
+             "serve_gate_ledger.json").string();
+#ifdef C2POOL_VERSION
+        work_source->set_serve_gate_ledger_path(ledger_path, C2POOL_VERSION);
+#else
+        work_source->set_serve_gate_ledger_path(ledger_path, "dev");
+#endif
+    }
+    // Cross-restart cumulative serve-gate accounting. Empty path keeps the
+    // per-process behaviour byte-for-byte; when set, note_arm_decision()
+    // write-throughs the combined prior+live roll-up + QC-NULL-SERVE
+    // counters so a STANDING soak is readable across restarts.
+    work_source->set_serve_gate_state_file(g_serve_gate_state_file);
+    if (!g_serve_gate_state_file.empty())
+        std::cout << "[run] serve-gate cumulative accounting ARMED: state="
+                  << g_serve_gate_state_file << "\n";
     // Pin splice on the xcheck-SWAPPED arm (default OFF). Announce the state
     // either way: with it off the donation still misses every swapped
     // template -- it just no longer does so silently.
@@ -8757,6 +8827,7 @@ int main(int argc, char** argv)
     // (mempool_validity_gate.hpp) reports zero transactions refused by dashd's
     // testmempoolaccept over its sustained window.
     bool embedded_serve_mempool_txs = false;
+    bool embedded_tx_serve_own_set = false;  // --embedded-tx-serve-own-set, default OFF
     bool embedded_accrue_asset_locks = false;  // #107 PHASE 2, default OFF
     bool embedded_accrue_asset_unlocks = false;  // #143 Variant B (type-9), default OFF
     // --embedded-creditpool-publish-at-serve-tip: publish the derived credit
@@ -8886,6 +8957,8 @@ int main(int argc, char** argv)
             embedded_utxo_immature_serve_empty = true;
         else if (std::strcmp(argv[i], "--embedded-serve-mempool-txs") == 0)
             embedded_serve_mempool_txs = true;
+        else if (std::strcmp(argv[i], "--embedded-tx-serve-own-set") == 0)
+            embedded_tx_serve_own_set = true;
         else if (std::strcmp(argv[i], "--embedded-accrue-asset-locks") == 0)
             embedded_accrue_asset_locks = true;   // #107 PHASE 2
         else if (std::strcmp(argv[i], "--embedded-accrue-asset-unlocks") == 0)
@@ -8919,6 +8992,12 @@ int main(int argc, char** argv)
             bestcl_policy = argv[++i];
         else if (std::strcmp(argv[i], "--coinbase-text") == 0 && i + 1 < argc)
             coinbase_text = argv[++i];
+        // Cross-restart cumulative serve-gate accounting (#127 follow-up):
+        // path to a small JSON state file. Empty (default) => OFF and the
+        // serve path is byte-identical. Non-consensus, non-reward: a soak
+        // convenience whose bad read fails to a clean zero, never wedges.
+        else if (std::strcmp(argv[i], "--serve-gate-state-file") == 0 && i + 1 < argc)
+            g_serve_gate_state_file = argv[++i];
         else if (std::strcmp(argv[i], "--embedded-oracle-shadow") == 0)
             embedded_oracle_shadow = true;
         else if (std::strcmp(argv[i], "--embedded-shadow-compare") == 0)
@@ -9204,6 +9283,7 @@ int main(int argc, char** argv)
                         oracle_class_coverage, coin_p2p_peers, bestcl_policy,
                         embedded_utxo_immature_serve_empty,
                         embedded_serve_mempool_txs,
+                        embedded_tx_serve_own_set,
                         embedded_shadow_compare,
                         embedded_mempool_ingest,
                         pin_local_tx_hex_path,

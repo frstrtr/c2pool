@@ -2302,6 +2302,173 @@ TEST(DashStratumC1MainnetGate, GbtXcheckTxMerkleMatchServesEmbeddedUnchanged)
         << "a matching tx-merkleroot must NOT record a swap";
 }
 
+// =============================================================================
+// --embedded-tx-serve-own-set : SERVE OUR OWN VALID SET on a divergent-from-
+// dashd mempool selection, instead of the dashd-tx-merkle PARITY swap. The two
+// tests below are the load-bearing red->green through the work source:
+//
+//   * with the flag OFF the divergent set SWAPS to dashd (unchanged behaviour,
+//     proven by GbtXcheckServesDashdOnTxMerkleMismatch above);
+//   * with the flag ON and the validity-gate coupling satisfied, the SAME
+//     divergent set is served as EMBEDDED (this file);
+//   * with the flag ON but a validity probe bound and NOT yet open, it fail-
+//     closes to dashd -- the runtime guard against the already-mined / stale-
+//     UTXO-view class the internal-consistency referee cannot catch alone.
+// =============================================================================
+TEST(DashStratumC1MainnetGate, GbtXcheckOwnSetServesEmbeddedOnConsistentTxDivergence)
+{
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    uint256 funding;  funding.begin()[0] = 0x51;
+
+    // (0) Capture the EMBEDDED template (xcheck OFF): CbTx roots for dref to
+    // match, and the served tx set the flag-ON serve must reproduce byte-for-
+    // byte (serving OUR OWN set means the embedded body is untouched).
+    dash::coin::vendor::CCbTx emb_cb;
+    std::vector<uint256> emb_txids;
+    uint32_t emb_mempool_n = 0;
+    {
+        ::core::coin::UTXOViewCache utxo(nullptr);
+        auto cs = make_txmerkle_xcheck_cs(utxo, funding);
+        auto never = []() -> dash::coin::DashWorkData { return {}; };
+        dash::stratum::DASHWorkSource ws(*cs, never, xcheck_submit,
+                                         core::stratum::StratumConfig{},
+                                         /*is_testnet=*/true);
+        ASSERT_FALSE(ws.get_current_work_template().empty());
+        auto t = ws.peek_template();
+        ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+        ASSERT_TRUE(dash::coin::vendor::parse_cbtx(t->m_coinbase_payload, emb_cb));
+        emb_txids     = t->m_tx_hashes;
+        emb_mempool_n = t->m_mempool_tx_count;
+    }
+    ASSERT_GT(emb_mempool_n, 0u)
+        << "fixture broken: no mempool txs served -> the m_mempool_tx_count>0"
+           " gate would skip the branch and this KAT would be vacuous";
+    const uint256 emb_txroot = dash::coin::compute_merkle_root(emb_txids);
+
+    // dashd fallback: SAME height + SAME CbTx roots (so only the tx axis
+    // diverges), DIFFERENT non-coinbase tx set.
+    std::vector<uint256> dref_txids(1);
+    dref_txids[0].SetHex(std::string(64, 'e'));
+    ASSERT_NE(emb_txroot, dash::coin::compute_merkle_root(dref_txids));
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height         = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits           = 0x1e0ffff0u;
+        w.m_version        = static_cast<uint32_t>(kVersion);
+        w.m_curtime        = kCurtime;
+        dash::coin::vendor::CCbTx cb;
+        cb.nVersion           = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+        cb.nHeight            = static_cast<int32_t>(kEmbeddedPrevHeight + 1);
+        cb.merkleRootMNList   = emb_cb.merkleRootMNList;
+        cb.merkleRootQuorums  = emb_cb.merkleRootQuorums;
+        cb.creditPoolBalance  = emb_cb.creditPoolBalance;
+        w.m_coinbase_payload  = dash::coin::encode_cbtx(cb);
+        w.m_tx_hashes         = dref_txids;
+        w.m_mempool_tx_count  = 1;
+        return w;
+    };
+
+    ::core::coin::UTXOViewCache utxo(nullptr);
+    auto cs = make_txmerkle_xcheck_cs(utxo, funding);
+    dash::stratum::DASHWorkSource ws(*cs, fallback, xcheck_submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    ws.set_gbt_xcheck(true);
+    // NO shadow-compare bound -> the validity-gate coupling is bypassed
+    // (pure-daemonless, operator-armed posture); the referee decides alone.
+    ws.set_tx_serve_own_set(true);
+
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+    // The served body is OUR OWN embedded set, NOT dashd's, despite the tx-
+    // merkle divergence.
+    EXPECT_EQ(t->m_tx_hashes, emb_txids)
+        << "own-set: a divergent-but-consistent embedded template is served"
+           " unchanged, not swapped for dashd's";
+    EXPECT_EQ(dash::coin::compute_merkle_root(t->m_tx_hashes), emb_txroot);
+    const auto st = ws.embedded_arm_status_json();
+    EXPECT_EQ(st.value("arm", std::string{}), "EMBEDDED")
+        << "the divergence must leave the embedded arm serving";
+    EXPECT_NE(st.value("no_work_reason", std::string{}), "gbt-xcheck-txmerkle-mismatch")
+        << "own-set must NOT record a parity swap";
+    EXPECT_GE(st.value("tx_serve_own_set_serves", (uint64_t)0), (uint64_t)1)
+        << "the referee must have actively served the divergent set as own";
+}
+
+TEST(DashStratumC1MainnetGate, GbtXcheckOwnSetFailClosesWhenValidityGateNotOpen)
+{
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    uint256 funding;  funding.begin()[0] = 0x51;
+
+    dash::coin::vendor::CCbTx emb_cb;
+    {
+        ::core::coin::UTXOViewCache utxo(nullptr);
+        auto cs = make_txmerkle_xcheck_cs(utxo, funding);
+        auto never = []() -> dash::coin::DashWorkData { return {}; };
+        dash::stratum::DASHWorkSource ws(*cs, never, xcheck_submit,
+                                         core::stratum::StratumConfig{},
+                                         /*is_testnet=*/true);
+        ASSERT_FALSE(ws.get_current_work_template().empty());
+        auto t = ws.peek_template();
+        ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+        ASSERT_TRUE(dash::coin::vendor::parse_cbtx(t->m_coinbase_payload, emb_cb));
+        ASSERT_GT(t->m_mempool_tx_count, 0u);
+    }
+
+    std::vector<uint256> dref_txids(1);
+    dref_txids[0].SetHex(std::string(64, 'e'));
+    const uint256 dref_txroot = dash::coin::compute_merkle_root(dref_txids);
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height         = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits           = 0x1e0ffff0u;
+        w.m_version        = static_cast<uint32_t>(kVersion);
+        w.m_curtime        = kCurtime;
+        dash::coin::vendor::CCbTx cb;
+        cb.nVersion           = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+        cb.nHeight            = static_cast<int32_t>(kEmbeddedPrevHeight + 1);
+        cb.merkleRootMNList   = emb_cb.merkleRootMNList;
+        cb.merkleRootQuorums  = emb_cb.merkleRootQuorums;
+        cb.creditPoolBalance  = emb_cb.creditPoolBalance;
+        w.m_coinbase_payload  = dash::coin::encode_cbtx(cb);
+        w.m_tx_hashes         = dref_txids;
+        w.m_mempool_tx_count  = 1;
+        return w;
+    };
+
+    ::core::coin::UTXOViewCache utxo(nullptr);
+    auto cs = make_txmerkle_xcheck_cs(utxo, funding);
+    dash::stratum::DASHWorkSource ws(*cs, fallback, xcheck_submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    ws.set_gbt_xcheck(true);
+    ws.set_tx_serve_own_set(true);
+
+    // Bind a shadow-compare with a testmempoolaccept oracle -> the mempool
+    // validity gate is ARMED but has accrued ZERO clean heights, so open() is
+    // false. The own-set path must therefore fail-close to dashd even though
+    // the embedded template is internally consistent: the runtime guard against
+    // serving a set the validity gate has not yet proven dashd-acceptable.
+    auto oracle = []() -> std::optional<dash::coin::DashWorkData> { return std::nullopt; };
+    auto accept = [](const std::string&) -> nlohmann::json { return nlohmann::json(); };
+    auto sc = std::make_shared<dash::coin::EmbeddedShadowCompare>(oracle, accept);
+    ws.set_shadow_compare(sc);
+
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+    EXPECT_EQ(dash::coin::compute_merkle_root(t->m_tx_hashes), dref_txroot)
+        << "validity gate not open -> must serve dashd's body, not own";
+    const auto st = ws.embedded_arm_status_json();
+    EXPECT_EQ(st.value("arm", std::string{}), "dashd-fallback");
+    EXPECT_EQ(st.value("no_work_reason", std::string{}), "tx-serve-validity-gate-not-open")
+        << "the fail-close cause must name the un-open validity gate";
+    ws.set_shadow_compare(nullptr);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tip-transition fallback leak: on every new block the serve path re-sources
 // during the body-pending window and (correctly) gets the dashd fallback; the

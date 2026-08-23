@@ -124,8 +124,26 @@ namespace coin {
 
 /// dashd's reject-reason for "I already hold this transaction", verbatim
 /// (Dash Core validation.cpp: TxValidationResult TX_CONFLICT,
-/// "txn-already-in-mempool"). The ONE exempted reason. Compared for EQUALITY.
+/// "txn-already-in-mempool"). The ONE unconditionally-exempted reason.
+/// Compared for EQUALITY.
 inline constexpr const char* kAlreadyInMempoolReason = "txn-already-in-mempool";
+
+/// dashd's reject-reason for "this transaction is ALREADY CONFIRMED in my
+/// active chain", verbatim (Dash Core MemPoolAccept::PreChecks: a tx whose
+/// outputs are already present as coins in dashd's UTXO view —
+/// `HaveCoin(COutPoint(hash, out))` — returns TX_CONFLICT "txn-already-known").
+/// This is a CONDITIONAL exemption, not an unconditional one: it is benign
+/// ONLY when the block that confirmed the tx is one WE HAVE NOT YET CONNECTED
+/// (propagation Window 1 — our tip is h-1, someone else mined h and dashd
+/// connected it before we did; from our tip the tx is a valid UNCONFIRMED tx
+/// and our template is a valid fork competitor at height h, never an orphan).
+/// It is a genuine DEFECT only when dashd sits on OUR parent (or behind) and
+/// still reports the tx confirmed — i.e. it was confirmed at or below OUR
+/// serve-tip while we still serve it (the intra-node eviction-lag class,
+/// "Window 2"). The caller supplies the tip context (classify_mempool_accept's
+/// `dashd_ahead_of_serve_height`), which alone decides which case applies.
+/// Compared for EQUALITY.
+inline constexpr const char* kAlreadyConfirmedReason = "txn-already-known";
 
 /// The ONE reject-reason that can mean ONLY "I do not know this input" — the
 /// answer a SINGLE-transaction probe gets for a child whose parent rides the
@@ -149,6 +167,10 @@ inline bool is_missing_or_spent_reason(const std::string& reason)
 enum class MempoolAcceptVerdict : uint8_t {
     Valid,              // allowed == true
     AlreadyInMempool,   // allowed == false, reason == txn-already-in-mempool
+    ConfirmedAhead,     // reason == txn-already-known AND dashd is ahead of our
+                        // serve-tip -> benign propagation (Window 1). NOT a
+                        // defect and NOT evidence: it neither resets nor
+                        // advances the readiness run.
     Invalid,            // allowed == false, any other reason -> A DEFECT
     Unprobed            // no answer, or an in-set-parent probe artefact
 };
@@ -158,6 +180,7 @@ inline const char* mempool_accept_verdict_name(MempoolAcceptVerdict v)
     switch (v) {
         case MempoolAcceptVerdict::Valid:            return "VALID";
         case MempoolAcceptVerdict::AlreadyInMempool: return "ALSO-VALID(already-in-mempool)";
+        case MempoolAcceptVerdict::ConfirmedAhead:   return "PROPAGATION(confirmed-in-not-yet-connected-block)";
         case MempoolAcceptVerdict::Invalid:          return "INVALID";
         default:                                     return "UNPROBED";
     }
@@ -188,8 +211,20 @@ struct MempoolProbeTx {
 /// `entry` is the single result object (`{"txid":..,"allowed":..,
 /// "reject-reason":..}`); a null/non-object entry means the probe produced no
 /// answer (RPC blip, daemon absent) and yields Unprobed.
+///
+/// `dashd_ahead_of_serve_height` is the sample-level tip context: TRUE when
+/// dashd's chain tip is STRICTLY AHEAD of the block WE built the probed
+/// template for (dashd's next-block height > our served height). It is
+/// consulted for EXACTLY ONE reason string — "txn-already-known" — to separate
+/// benign propagation (Window 1: dashd already connected a block we have not)
+/// from a genuine intra-node staleness defect (Window 2: dashd sits on our
+/// parent and still holds the tx confirmed at/below our serve-tip). It changes
+/// NOTHING for any other reason: every real reject stays a reject. Defaulting
+/// to FALSE preserves the pre-tip-context behaviour (already-known -> INVALID)
+/// for callers that cannot supply it — the conservative, gate-CLOSED direction.
 inline MempoolAcceptResult classify_mempool_accept(const MempoolProbeTx& tx,
-                                                   const nlohmann::json& entry)
+                                                   const nlohmann::json& entry,
+                                                   bool dashd_ahead_of_serve_height = false)
 {
     MempoolAcceptResult r;
     r.txid = tx.txid;
@@ -212,6 +247,27 @@ inline MempoolAcceptResult classify_mempool_accept(const MempoolProbeTx& tx,
     if (r.reason == kAlreadyInMempoolReason) {
         r.verdict = MempoolAcceptVerdict::AlreadyInMempool;
         return r;
+    }
+
+    // dashd says the tx is ALREADY CONFIRMED in its chain ("txn-already-known").
+    // Whether that is a defect depends ENTIRELY on WHICH block confirmed it,
+    // which the tip context decides (see kAlreadyConfirmedReason). dashd AHEAD
+    // of our serve-tip => it was confirmed in a block we have not connected =>
+    // benign propagation (Window 1): our template is a valid fork competitor at
+    // our height, so this must NOT reset the readiness run. dashd NOT ahead
+    // (on our parent, or behind) => confirmed at/below OUR serve-tip while we
+    // still serve it => a genuine current-tip staleness defect (Window 2) =>
+    // falls through to INVALID and resets, exactly as a served already-mined tx
+    // should. This is the ONLY reason whose disposition the tip context can
+    // change; the field-measured invalids were 23/23 this class, all Window 1.
+    if (r.reason == kAlreadyConfirmedReason) {
+        if (dashd_ahead_of_serve_height) {
+            r.verdict        = MempoolAcceptVerdict::ConfirmedAhead;
+            r.unprobed_cause = "confirmed-in-block-we-have-not-connected(propagation)";
+            return r;
+        }
+        // else: dashd on our parent or behind -> a real at/below-serve-tip
+        // defect; fall through to INVALID below.
     }
 
     // The ONLY excused rejection beyond the named one: a child probed alone
@@ -261,12 +317,20 @@ struct MempoolValiditySample {
     size_t   already_in_mempool{0};
     size_t   invalid{0};
     size_t   unprobed{0};
+    /// Benign propagation (Window 1): dashd reported the tx already-CONFIRMED in
+    /// a block WE HAVE NOT YET CONNECTED. Neither a defect nor evidence — it is
+    /// counted here only so the log/JSON can say how much of the "already-known"
+    /// traffic was the propagation transient rather than a real staleness.
+    size_t   confirmed_ahead{0};
     /// The defects, verbatim — txid + dashd's reason. These are what the
     /// refusal line prints.
     std::vector<MempoolAcceptResult> invalids;
 
     /// A height that actually OBSERVED validity. A height whose probe set was
-    /// empty, or whose every entry came back Unprobed, observed nothing.
+    /// empty, or whose every entry came back Unprobed / ConfirmedAhead,
+    /// observed nothing about CURRENT-TIP validity — a ConfirmedAhead answer is
+    /// dashd speaking from a NEWER tip than the one we probed for, so it is not
+    /// evidence either way (see the tip-context note on kAlreadyConfirmedReason).
     bool evidence_bearing() const
     {
         return (valid + already_in_mempool + invalid) > 0;
@@ -277,10 +341,18 @@ struct MempoolValiditySample {
 /// PURE. Classify a whole probe set against the per-transaction answers.
 /// `answers[i]` is dashd's result object for `set[i]`; a shorter answers vector
 /// means the remaining entries got no answer (Unprobed), never a pass.
+///
+/// `dashd_ahead_of_serve_height` is the sample-level tip context threaded into
+/// each per-tx classification (see classify_mempool_accept). It ONLY affects
+/// the "txn-already-known" reason: dashd-ahead makes that a benign
+/// ConfirmedAhead (propagation Window 1, no reset), dashd-not-ahead keeps it a
+/// current-tip Invalid. Defaults FALSE so legacy/test callers get the pre-
+/// tip-context behaviour unchanged.
 inline MempoolValiditySample
 mempool_validity_sample(uint32_t height,
                         const std::vector<MempoolProbeTx>& set,
-                        const std::vector<nlohmann::json>& answers)
+                        const std::vector<nlohmann::json>& answers,
+                        bool dashd_ahead_of_serve_height = false)
 {
     MempoolValiditySample s;
     s.height = height;
@@ -288,10 +360,12 @@ mempool_validity_sample(uint32_t height,
     for (size_t i = 0; i < set.size(); ++i) {
         const nlohmann::json& a = (i < answers.size()) ? answers[i]
                                                        : nlohmann::json();
-        const MempoolAcceptResult r = classify_mempool_accept(set[i], a);
+        const MempoolAcceptResult r =
+            classify_mempool_accept(set[i], a, dashd_ahead_of_serve_height);
         switch (r.verdict) {
             case MempoolAcceptVerdict::Valid:            ++s.valid; break;
             case MempoolAcceptVerdict::AlreadyInMempool: ++s.already_in_mempool; break;
+            case MempoolAcceptVerdict::ConfirmedAhead:   ++s.confirmed_ahead; break;
             case MempoolAcceptVerdict::Invalid:
                 ++s.invalid;
                 s.invalids.push_back(r);
@@ -394,6 +468,13 @@ struct MempoolValidityGate {
     uint64_t txs_valid{0};
     uint64_t txs_already_in_mempool{0};
     uint64_t txs_unprobed{0};
+    /// Benign propagation transients (already-CONFIRMED in a block we have not
+    /// yet connected) seen over every applied sample. NOT defects, NOT
+    /// evidence — this counter exists so the operator can see how much of the
+    /// "already-known" traffic the tip context reclassified out of the invalid
+    /// bucket. A large value here with consecutive_clean advancing is the whole
+    /// point: propagation no longer stalls the readiness run.
+    uint64_t txs_confirmed_ahead{0};
     uint64_t repeat_txs_probed{0};
 
     /// DEFECTS ARE COUNTED WHEREVER THEY ARE OBSERVED — counted sample or
@@ -421,8 +502,9 @@ struct MempoolValidityGate {
             // moved: a later probe of this same height that DOES find
             // transactions is the first evidence there, and must count.
             ++samples_without_evidence;
-            txs_unprobed     += s.unprobed;
-            last_disposition  = SampleDisposition::NoEvidence;
+            txs_unprobed        += s.unprobed;
+            txs_confirmed_ahead += s.confirmed_ahead;
+            last_disposition     = SampleDisposition::NoEvidence;
             return;
         }
 
@@ -456,6 +538,7 @@ struct MempoolValidityGate {
         txs_valid              += s.valid;
         txs_already_in_mempool += s.already_in_mempool;
         txs_unprobed           += s.unprobed;
+        txs_confirmed_ahead    += s.confirmed_ahead;
         last_disposition        = SampleDisposition::Counted;
 
         if (s.invalid > 0) return;        // already reset above
@@ -487,6 +570,7 @@ struct MempoolValidityGate {
         j["txs-already-in-mempool"]    = txs_already_in_mempool;
         j["txs-invalid"]               = txs_invalid;
         j["txs-unprobed"]              = txs_unprobed;
+        j["txs-confirmed-ahead-propagation"] = txs_confirmed_ahead;
         j["last-invalid-height"]       = last_invalid_height;
         j["last-invalid-txid"]         = last_invalid_txid;
         j["last-invalid-reason"]       = last_invalid_reason;
@@ -525,6 +609,7 @@ mempool_validity_log_lines(const MempoolValiditySample& s,
         + " valid="     + std::to_string(s.valid)
         + " already_in_mempool=" + std::to_string(s.already_in_mempool)
         + " invalid="   + std::to_string(s.invalid)
+        + " confirmed_ahead=" + std::to_string(s.confirmed_ahead)
         + " unprobed="  + std::to_string(s.unprobed)
         + " clean_run=" + std::to_string(g.consecutive_clean) + "/"
         + std::to_string(g.required)
@@ -532,8 +617,13 @@ mempool_validity_log_lines(const MempoolValiditySample& s,
         + " sample=" + MempoolValidityGate::disposition_name(g.last_disposition)
         + " gate=" + (g.open() ? "OPEN" : "CLOSED");
     if (!s.evidence_bearing())
-        l += " (no-evidence: nothing to probe at this height — the run neither"
-             " advances nor resets)";
+        l += s.confirmed_ahead > 0
+             ? " (no-evidence: every probed tx is already CONFIRMED in a block we"
+               " have not yet connected — benign propagation Window 1, dashd is"
+               " ahead of the height we built for; the run neither advances nor"
+               " resets, and this is NOT a staleness defect)"
+             : " (no-evidence: nothing to probe at this height — the run neither"
+               " advances nor resets)";
     else if (g.last_disposition == MempoolValidityGate::SampleDisposition::RepeatHeight)
         l += " (repeat-height: h<=" + std::to_string(g.last_counted_height)
            + " is already banked — the probe fires ~5-6x per block, so this"

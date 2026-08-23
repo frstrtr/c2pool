@@ -689,9 +689,15 @@ TEST(DashCoinStateMaintainer, FourthAxisColdSmlDoesNotBlockPromotion) {
 // STEP 3 — the LOAD-BEARING companion: the diff-phase sub-threshold re-request.
 // Without it the conjunct turns a dropped/lost getmnlistd into up to 30 s of
 // silent H-1 serving (which orphans past propagation). check_tip_body_overdue,
-// driven opportunistically (on_mempool_tx is the clock), fires ONE bounded
-// getmnlistd(base=sml, target=hdr-tip) after ~min_quiet, capped, before the
-// unchanged 30 s hard demote.
+// driven opportunistically (on_mempool_tx is the clock), fires the first
+// getmnlistd(base=sml, target=hdr-tip) after ~min_quiet, then re-asks on a
+// GEOMETRIC backoff for max_attempts tries and, past the cap, at a CLAMPED
+// perpetual cadence (min_quiet * backoff^max_attempts) — never a burst, but
+// never silent either (#1315: an unchanging stuck (tip, sml) pair used to go
+// silent at the cap and strand the arm on the dashd fallback for the whole
+// 18-min block gap). The 30 s hard doomed-tip demote is unchanged and still
+// governs; the re-ask only makes the promotion state arrive sooner, it never
+// widens what is served.
 // ════════════════════════════════════════════════════════════════════════
 TEST(DashCoinStateMaintainer, DiffPhaseReRequestFiresBoundedThenDefersToDemote) {
     NodeCoinState st;
@@ -703,9 +709,11 @@ TEST(DashCoinStateMaintainer, DiffPhaseReRequestFiresBoundedThenDefersToDemote) 
     m.set_now_fn([&now]() { return now; });
 
     std::vector<std::pair<uint256, uint256>> reqs;
+    std::vector<int64_t> req_times;  // wall-clock of each re-ask, to pin the cadence
     m.set_on_sml_rerequest(
-        [&reqs](const uint256& base, const uint256& target) {
+        [&reqs, &req_times, &now](const uint256& base, const uint256& target) {
             reqs.emplace_back(base, target);
+            req_times.push_back(now);
         });
 
     // Tip body-pending with the SML stuck one behind the tip.
@@ -738,15 +746,54 @@ TEST(DashCoinStateMaintainer, DiffPhaseReRequestFiresBoundedThenDefersToDemote) 
     EXPECT_EQ(reqs[0].first,  raw256(0xCD)) << "base = where the SML is";
     EXPECT_EQ(reqs[0].second, PREV_HASH)    << "target = the header tip";
 
-    // Geometric backoff + hard cap at 3: keep ticking well past any wait; the
-    // count must stop at 3, never grow unbounded (never hammer a struggling peer).
-    for (int64_t t = 1010; t <= 1200; t += 5) tick(t);
-    EXPECT_EQ(reqs.size(), 3u)
-        << "re-request must cap at max_attempts (3), then go quiet and let the "
-           "unchanged 30 s hard demote take over exactly as today";
+    // Geometric backoff, then a CLAMPED perpetual cadence: keep ticking on a 5 s
+    // clock across a long stall on the SAME stuck (tip, sml) pair. The re-ask
+    // must (a) keep going PAST the old max_attempts=3 cap — going silent here is
+    // the measured 18-min wedge (#1315) — while (b) never collapsing to a burst:
+    // past the cap the spacing is pinned at the clamp interval
+    //   min_quiet(4) * backoff(2)^max_attempts(3) = 32 s.
+    const int64_t kClampSec = 32;   // = 4 * 2^3
+    const int64_t kTickStep = 5;
+    int loop_ticks = 0;
+    for (int64_t t = 1010; t <= 1200; t += kTickStep) { tick(t); ++loop_ticks; }
 
-    // Throughout, the SML never reached the tip, so the conjunct kept the tip
-    // body-pending the entire time — it never promoted into a dmn-stale serve.
+    // (a) It did NOT stop at the old cap of 3 — the whole point of the fix.
+    EXPECT_GT(reqs.size(), 3u)
+        << "past max_attempts the re-ask must CONTINUE at the clamped cadence; "
+           "the pre-fix code went silent at 3 and stranded the 18-min wedge";
+
+    // Deterministic and bounded: over this exact window the clamped cadence
+    // yields precisely these re-asks — never one-per-tick.
+    EXPECT_EQ(reqs.size(), 7u)
+        << "first re-ask at ~min_quiet, geometric (8 s, 16 s), then clamped at "
+           "32 s for the rest of the window — a fixed, bounded schedule";
+    EXPECT_LT(static_cast<int>(reqs.size()), loop_ticks / 4)
+        << "the clamped cadence must stay far below one request per tick — "
+           "never a burst against a struggling peer";
+    ASSERT_EQ(reqs.size(), req_times.size());
+
+    // (b) Cadence proof: every gap AFTER the geometric ramp (attempts >= 4, i.e.
+    // from req index 3 on) sits at the clamp — at least kClampSec (never faster)
+    // and at most one tick past it (re-asks the instant the clamp elapses, so it
+    // is a steady clamped cadence, not a one-shot that then goes quiet).
+    for (size_t i = 4; i < req_times.size(); ++i) {
+        const int64_t gap = req_times[i] - req_times[i - 1];
+        EXPECT_GE(gap, kClampSec)
+            << "clamped interval must never collapse below the cap (i=" << i << ")";
+        EXPECT_LE(gap, kClampSec + kTickStep)
+            << "but it must re-ask as soon as the clamp elapses (i=" << i << ")";
+    }
+
+    // The re-ask stays byte-identical to the tip-change getmnlistd for the whole
+    // clamped run: base = where the SML is, target = the header tip.
+    EXPECT_EQ(reqs.back().first,  raw256(0xCD)) << "base = where the SML is";
+    EXPECT_EQ(reqs.back().second, PREV_HASH)    << "target = the header tip";
+
+    // STILL DEFERS TO DEMOTE: the perpetual re-ask does not change what is
+    // served. The SML never reached the tip, so the conjunct kept the tip
+    // body-pending the entire time (well past the 30 s doomed-tip demote
+    // boundary) — it never promoted into a dmn-stale serve. The clamped re-ask
+    // only tries to heal the stall sooner; the demote gate is untouched.
     EXPECT_TRUE(m.tip_body_pending());
 }
 
