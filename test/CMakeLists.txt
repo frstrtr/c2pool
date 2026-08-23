@@ -409,6 +409,19 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_work_target PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
     gtest_add_tests(test_dash_work_target "" AUTO)
 
+    # #859: LTC producer-target helper (average_attempts_to_target saturation).
+    # Header-only (impl/ltc/work_target.hpp over core/uint256.hpp); pure,
+    # socket-free. Mirrors the test_dash_work_target link set (minus dash_x11).
+    add_executable(test_ltc_work_target test_ltc_work_target.cpp)
+    target_link_libraries(test_ltc_work_target PRIVATE
+        GTest::gtest_main GTest::gtest
+        core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_ltc_work_target PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
+    gtest_add_tests(test_ltc_work_target "" AUTO)
+
     # Header-only (stratum/work_job_targets.hpp over work_target.hpp + config_pool);
     # pure, socket-free. get_work() job-target assembly KAT.
     add_executable(test_dash_work_job_targets test_dash_work_job_targets.cpp)
@@ -627,6 +640,22 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_dash_simplifiedmns PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_simplifiedmns "" AUTO)
+
+    # DASH daemonless-fold SIMD-SHA256 reward-safety KAT (dashd-cut replay
+    # speedup): proves SHA256AutoDetect()-dispatched SIMD/SHA-NI reproduces the
+    # merkleRootMNList byte-for-byte vs the scalar transform (self-check input
+    # unchanged), that a one-entry mutation still changes the root (poison
+    # intact), and reports the scalar->SIMD speedup. Mirrors the
+    # test_dash_simplifiedmns link set.
+    add_executable(test_dash_sml_simd_sha256 test_dash_sml_simd_sha256.cpp)
+    target_link_libraries(test_dash_sml_simd_sha256 PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_sml_simd_sha256 PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_sml_simd_sha256 "" AUTO)
 
     # Header-only LLMQ quorum-tail verification leaf over core/uint256 +
     # core/pack; no ltc/pool SCC dependency. Sits between the
@@ -873,15 +902,26 @@ if (BUILD_TESTING AND GTest_FOUND)
     # backward-walk with the fail-closed missing-row inversion, 'F'
     # wipe-on-mismatch and the startup newest-pair verify. Same allowlisted
     # target, same #143 NOT_BUILT reason. Links leveldb (via core).
+    # Seventh TU (OPTIONAL, default-OFF V20 getmnlistdiff seed):
+    # test_dash_replay_mnlist_seed.cpp — the path-ii escape hatch for #154
+    # (mnlist_seed.hpp). Proves the arming policy (source must be
+    # "getmnlistdiff", height required and >= the V20 floor, file required,
+    # height/network must match the snapshot) and the REUSED reward-safety root
+    # gate (seed_engine_from_prestate): a valid getmnlistdiff seed loads +
+    # verifies + is fold-ready at H, and a seed whose committed root != computed
+    # FAILS CLOSED. Folded into this SAME allowlisted target for the #143/#769
+    # NOT_BUILT reason (a standalone add_executable is not in build.yml's
+    # --target list and would silently report "Not Run").
     add_executable(test_dash_mn_state test_dash_mn_state.cpp
                    test_dash_mn_diff_store.cpp
                    test_dash_replay_fold.cpp
                    test_dash_replay_run.cpp
                    test_dash_replay_quorum_seam.cpp
-                   test_dash_replay_payee_publish.cpp)
+                   test_dash_replay_payee_publish.cpp
+                   test_dash_replay_mnlist_seed.cpp)
     target_link_libraries(test_dash_mn_state PRIVATE
         GTest::gtest_main GTest::gtest
-        dash_x11 core
+        dash_bls_verify dash_x11 core
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}
     )
@@ -1259,10 +1299,19 @@ if (BUILD_TESTING AND GTest_FOUND)
     # event. FOLDED into this EXISTING allowlisted target for the same reason
     # the E2d TU was: a new add_executable would not be in the build.yml
     # --target list and would silently report "Not Run" (#143 NOT_BUILT trap).
+    # test_dash_154_parity_kat.cpp — the #154 byte-parity KATs: the golden
+    # self-derived checkpoint at 2522504 (2991 registered MNs) parses + digest,
+    # and the V20 hash-modifier off-by-8 (pre/post-V20 form selected by the WORK
+    # block's deployment state). BLS-independent (the opkey point-compare KAT is
+    # in test_dash_bls_verify.cpp), so it links with THIS target's dash_x11+core
+    # set and is folded here for the same #143/#769 NOT_BUILT reason as the E2d
+    # checkpoint TU above (a standalone add_executable is not in build.yml's
+    # --target list and would silently report "Not Run").
     add_executable(test_dash_node_reception_wire test_dash_node_reception_wire.cpp
                    test_dash_live_feed_bridge.cpp
                    test_dash_mn_seed.cpp
                    test_dash_mn_checkpoint.cpp
+                   test_dash_154_parity_kat.cpp
                    test_dash_lane_diag.cpp
                    test_dash_header_checkpoint_coincide.cpp
                    test_dash_anchor_header_merkle_root.cpp)
@@ -1364,7 +1413,14 @@ if (BUILD_TESTING AND GTest_FOUND)
     # same #769 reason as every TU above: this target IS in the build.yml
     # "Build tests" --target allowlist, and a standalone target would be a
     # NOT_BUILT sentinel.
-    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp test_dash_coin_p2p_pool.cpp test_dash_qrinfo_wire.cpp test_dash_coin_peer_rearm.cpp test_dash_replay_bulk_fetch.cpp test_dash_spork.cpp)
+    # Ninth TU: test_dash_bulk_local_primary_kat.cpp — #154 daemonless bulk-fetch
+    # dashd-parity KAT (LEVER 1 protected-local primary stays bulk-eligible +
+    # LEVER 2 throughput-weighted per-peer inflight). Folded here for the same
+    # #769 reason as every TU above: this target IS in the build.yml "Build tests"
+    # --target allowlist AND already compiles coin/replay_bulk_fetch.hpp, so its
+    # link set resolves BulkBlockScheduler/bulkpolicy with no new deps; a
+    # standalone executable was a NOT_BUILT/"Not Run" CTest sentinel.
+    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp test_dash_coin_p2p_pool.cpp test_dash_qrinfo_wire.cpp test_dash_coin_peer_rearm.cpp test_dash_replay_bulk_fetch.cpp test_dash_spork.cpp test_dash_bulk_local_primary_kat.cpp)
     target_compile_definitions(test_dash_p2p_node PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_p2p_node PRIVATE

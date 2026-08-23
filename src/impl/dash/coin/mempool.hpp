@@ -531,6 +531,34 @@ private:
         auto packed      = ::pack(tx);
         entry.base_size  = static_cast<uint32_t>(packed.size());
         entry.time_added = std::time(nullptr);
+        // W5-B: dashd's ONE automatic mapDeltas write that EVERY node performs.
+        // CTxMemPool::addUnchecked prioritises every MNHF/EHF-signal tx by
+        // +0.1 COIN at admission — src/txmempool.cpp:701-702 (v23.1.7):
+        //     if (tx.nType == TRANSACTION_MNHF_SIGNAL)
+        //         PrioritiseTransaction(entry.GetTx().GetHash(), 0.1 * COIN);
+        // These type-7 EHF-signal txs are ~0-fee on the wire but MUST sort to
+        // the very top of the block template; without the delta the embedded
+        // ancestor-score selector orders them at their base (≈0) feerate and
+        // drops/misplaces them, diverging dashd's tx-set and tx-merkle root.
+        // Unlike the DSTX delta (recorded in add_dstx, network-DSTX-only), this
+        // one is intrinsic to the tx type, so it is reproduced on EVERY
+        // admission path (plain MSG_TX included), exactly as dashd does it in
+        // addUnchecked. Recorded into m_fee_deltas (dashd mapDeltas) so the
+        // entry.fee_delta read just below picks it up AND it survives /
+        // retro-applies identically to the DSTX delta.
+        //
+        // REWARD-SAFE: the delta only raises modified_fee() — the scoring /
+        // ordering / blockMinFeeRate basis (dashd nModFeesWithAncestors). The
+        // raw `fee` that feeds total_fees → coinbasevalue is UNTOUCHED, so the
+        // coinbase is never overstated and no invalid block can result. A
+        // type-7 whose inputs our UTXO fold cannot price stays fee_fold_proven
+        // == false → template-excluded (fail-closed), matching the exclusion
+        // discipline; the recorded delta simply lets it ride at the correct
+        // modified fee once recompute_unknown_fees can price it.
+        // TRANSACTION_MNHF_SIGNAL == nType 7 (dashd primitives/transaction.h).
+        static constexpr uint16_t TRANSACTION_MNHF_SIGNAL = 7;
+        if (tx.type == TRANSACTION_MNHF_SIGNAL)
+            record_fee_delta_locked(txid, DSTX_FEE_DELTA);
         // W5-B: a recorded prioritisation delta applies WHENEVER the tx is
         // admitted, on either path (dashd mapDeltas semantics — the delta
         // pre-dates and survives acceptance).

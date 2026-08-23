@@ -1284,6 +1284,28 @@ public:
                            : std::optional<uint256>{ranked.front()};
         r.projected_payee = projected;
 
+        // -- Pre-block payout snapshot (dashd payment ordering) ----
+        // dashd pays block H's masternode from the PRE-block list: payments.cpp
+        // GetBlockTxOuts reads oldList.GetMNPayee(pindexPrev)->pdmnState->
+        // scriptPayout, i.e. the payout AS OF H-1, BEFORE this block's special
+        // txs are folded (deterministicmns.cpp BuildNewListFromBlock applies the
+        // ProUpRegTx only afterwards). The pass-3 coinbase cross-check below must
+        // therefore compare against that pre-block script, NOT the entry pass 1
+        // is about to rewrite. Capture it here, before pass 1 -- exactly as
+        // DmlFoldEngine::fold_block captures payee_script_pre (replay_fold_engine
+        // .hpp). Without it, when the projected payee's OWN ProUpRegTx rides the
+        // very block it is paid in (mainnet h=2525714, proTx f5a49888...:
+        // scriptPayout a7f7252d -> Xv4Ys1mi in-block, coinbase pays the pre-block
+        // a7f7252d), pass 1 rewrites scriptPayout to Xv4Ys1mi and pass 3 no longer
+        // finds the paid script -- a FALSE payee_desync that fail-closes the
+        // daemonless bridge.
+        std::vector<unsigned char> projected_script_pre;
+        if (projected) {
+            auto ppit = m_entries.find(*projected);
+            if (ppit != m_entries.end())
+                projected_script_pre = ppit->second.scriptPayout.m_data;
+        }
+
         // Past the guards, so this block WILL be applied: any pending
         // re-adjudication belongs to an earlier height and is now unusable
         // (its `ranked` was computed on a list this block is about to change).
@@ -1585,7 +1607,9 @@ public:
             // payee whose MN was removed by THIS block's passes 1/2 is
             // silently skipped (no mark, no desync).
             if (it != m_entries.end()) {
-                if (paid_in_cb(it->second.scriptPayout.m_data)) {
+                // Cross-check the coinbase against the PRE-block payout
+                // (captured at pass 0), mirroring dashd GetBlockTxOuts.
+                if (paid_in_cb(projected_script_pre)) {
                     mark_paid(it);
                     // The accepted coinbase also attests the paid MN's
                     // CURRENT operator-reward split — cross-check a KNOWN

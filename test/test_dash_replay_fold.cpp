@@ -41,6 +41,7 @@
 #include <impl/dash/coin/vendor/llmq_commitment.hpp>
 #include <impl/dash/coin/vendor/providertx.hpp>
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
+#include <impl/dash/coin/vendor/incremental_sml_merkle.hpp>
 #include <impl/dash/coin/transaction.hpp>
 #include <impl/dash/coin/block.hpp>
 
@@ -49,8 +50,10 @@
 #include <core/hash.hpp>
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <iostream>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -1321,4 +1324,269 @@ TEST(DashReplayFoldSynthetic, SnapshotV3FailLoudPaths)
     // A failed load never clobbers existing state.
     EXPECT_EQ(eng.size(), 1u);
     EXPECT_EQ(eng.height(), 100u);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// task #154 — INCREMENTAL merkleRootMNList cache KATs.
+//
+// The DASH replay fold recomputes merkleRootMNList every block as a reward-safe
+// self-check. The naive path (CSimplifiedMNList::CalcMerkleRoot) rebuilds the
+// whole ~4900-leaf tree each block; IncrementalSmlMerkle reuses the leaf hashes
+// and internal nodes the block did not disturb. These KATs prove the two
+// deliverables:
+//   (a) THE HARD INVARIANT — for EVERY mutation the incremental root byte-
+//       matches the naive full recompute (a fast-but-wrong root would serve a
+//       forked list). Proven step-by-step over a synthetic mutation sequence.
+//   (b) THE REDUCED HASH COUNT — measured via the shared sml_leaf_hash_count()
+//       / sml_node_hash_count() seams that BOTH paths bump, so the numbers are
+//       directly comparable. A payment-rotation-only block hashes NOTHING; a
+//       block touching k SML entries re-hashes only those k leaves + O(k·log n)
+//       internal nodes, versus the naive ~n leaves + ~n nodes every block.
+// ═══════════════════════════════════════════════════════════════════════════
+
+using dash::coin::vendor::IncrementalSmlMerkle;
+using dash::coin::vendor::sml_leaf_hash_count;
+using dash::coin::vendor::sml_node_hash_count;
+
+namespace {
+
+// Deterministic, well-spread, unique proRegTxHash for a given seed. Spread
+// across all 32 bytes so the memcmp merkle sort interleaves the MNs (a
+// realistic tree, not a degenerate one).
+uint256 incmerkle_protx_of(uint32_t seed)
+{
+    uint256 h;
+    unsigned char* p = h.data();
+    uint64_t x = 0x9E3779B97F4A7C15ull ^ (static_cast<uint64_t>(seed) * 0xD1B54A32D192ED03ull);
+    for (int b = 0; b < 32; ++b) {
+        x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ull;
+        x ^= x >> 27; x *= 0x94D049BB133111EBull;
+        x ^= x >> 31;
+        p[b] = static_cast<unsigned char>(x & 0xFF);
+    }
+    return h;
+}
+
+CSimplifiedMNListEntry incmerkle_mk_entry(uint32_t seed, bool valid = true)
+{
+    CSimplifiedMNListEntry e;
+    e.nVersion      = CSimplifiedMNListEntry::VER_BASIC_BLS;
+    e.proRegTxHash  = incmerkle_protx_of(seed);
+    e.confirmedHash = uint256::ZERO;
+    e.netPort       = static_cast<uint16_t>(9999u);
+    e.isValid       = valid;
+    e.nType         = CSimplifiedMNListEntry::TYPE_REGULAR;
+    // give the operator key deterministic non-zero content so CalcHash is
+    // hashing a realistic ~200-byte leaf.
+    for (size_t i = 0; i < e.pubKeyOperator.size(); ++i)
+        e.pubKeyOperator[i] = static_cast<uint8_t>((seed * 31u + i) & 0xFF);
+    return e;
+}
+
+} // namespace
+
+// The whole point of the fold self-check is to catch divergence from
+// consensus, so the incremental root MUST equal the naive full recompute at
+// EVERY step. Drives a synthetic sequence of MN-list mutations — the exact
+// shapes the fold produces per block — and asserts byte-identical roots while
+// measuring the hash-count reduction.
+TEST(DashReplayFoldIncrementalMerkle, ByteIdenticalRootsAndReducedHashCount)
+{
+    const uint32_t N = 300;
+    std::map<uint32_t, CSimplifiedMNListEntry> state;   // seed -> current SML entry
+    for (uint32_t i = 0; i < N; ++i) state[i] = incmerkle_mk_entry(i, true);
+
+    IncrementalSmlMerkle cache;
+
+    struct StepCost { uint64_t nl, nn, il, in; std::string root; };
+    uint64_t tot_nl = 0, tot_nn = 0, tot_il = 0, tot_in = 0;
+
+    auto entries_of = [&]() {
+        std::vector<CSimplifiedMNListEntry> v;
+        v.reserve(state.size());
+        for (const auto& [k, e] : state) { (void)k; v.push_back(e); }
+        return v;
+    };
+
+    auto step = [&](const char* label) -> StepCost {
+        const std::vector<CSimplifiedMNListEntry> v = entries_of();
+
+        // NAIVE full recompute (the correctness oracle). Its CalcHash /
+        // merkle_pair_hash bump the shared counters.
+        const uint64_t nl0 = sml_leaf_hash_count(), nn0 = sml_node_hash_count();
+        const uint256 rn =
+            CSimplifiedMNList(std::vector<CSimplifiedMNListEntry>(v)).CalcMerkleRoot();
+        const uint64_t nl = sml_leaf_hash_count() - nl0;
+        const uint64_t nn = sml_node_hash_count() - nn0;
+
+        // INCREMENTAL cache — same shared counters.
+        const uint64_t il0 = sml_leaf_hash_count(), in0 = sml_node_hash_count();
+        const uint256 ri = cache.update(v);
+        const uint64_t il = sml_leaf_hash_count() - il0;
+        const uint64_t in = sml_node_hash_count() - in0;
+
+        // THE HARD INVARIANT.
+        EXPECT_EQ(rn.GetHex(), ri.GetHex())
+            << "incremental root diverged from naive recompute at step: " << label;
+
+        tot_nl += nl; tot_nn += nn; tot_il += il; tot_in += in;
+        std::cout << "  [#154 KAT] " << label
+                  << " | naive leaf=" << nl << " node=" << nn
+                  << " | incr leaf=" << il << " node=" << in
+                  << " | root=" << ri.GetHex().substr(0, 16) << "\n";
+        return { nl, nn, il, in, ri.GetHex() };
+    };
+
+    // ── Step 1: cold build (first fold) — every leaf hashed once. ──────────
+    const StepCost s1 = step("cold-build N=300 (structural)");
+    EXPECT_EQ(s1.il, static_cast<uint64_t>(N)) << "cold build must hash all leaves once";
+    EXPECT_EQ(s1.nl, static_cast<uint64_t>(N));
+
+    // ── Step 2: pure payment rotation — nLastPaidHeight/PoSePenalty are NOT
+    // in the SML entry, so the SML is byte-unchanged. ZERO incremental hashes;
+    // naive re-hashes the whole list regardless. This is the dashd invariant. ─
+    const StepCost s2 = step("payment-rotation (SML unchanged)");
+    EXPECT_EQ(s2.il, 0u) << "no SML entry changed -> no leaf may be re-hashed";
+    EXPECT_EQ(s2.in, 0u) << "no SML entry changed -> no internal node may be re-hashed";
+    EXPECT_EQ(s2.nl, static_cast<uint64_t>(N)) << "naive re-hashes everything anyway";
+
+    // ── Step 3: PoSe ban one MN (isValid flip) — 1 leaf changed, same set. ──
+    state[7].isValid = false;
+    const StepCost s3 = step("pose-ban 1 MN (isValid flip, same set)");
+    EXPECT_EQ(s3.il, 1u) << "exactly one leaf changed";
+    EXPECT_GE(s3.in, 1u);
+    EXPECT_LE(s3.in, 12u) << "single-leaf update must be O(log n), not O(n)";
+    EXPECT_LT(s3.in, s3.nn) << "incremental node work must beat the full rebuild";
+
+    // ── Step 4: confirmedHash crosses on three MNs — 3 leaves, same set. ───
+    state[10].confirmedHash = incmerkle_protx_of(900010);
+    state[20].confirmedHash = incmerkle_protx_of(900020);
+    state[30].confirmedHash = incmerkle_protx_of(900030);
+    const StepCost s4 = step("confirmedHash on 3 MNs (same set)");
+    EXPECT_EQ(s4.il, 3u) << "exactly three leaves changed";
+    EXPECT_LE(s4.in, 3u * 12u) << "three O(log n) paths";
+    EXPECT_LT(s4.in, s4.nn);
+
+    // ── Step 5: ProReg adds a new MN (structural, shifts sorted positions). ─
+    state[N] = incmerkle_mk_entry(N, true);
+    const StepCost s5 = step("proreg add 1 MN (structural)");
+    EXPECT_EQ(s5.il, 1u) << "only the new leaf is hashed; all others reused";
+    EXPECT_LT(s5.il, s5.nl) << "naive re-hashes the whole grown list";
+
+    // ── Step 6: collateral spend removes one MN (structural). ──────────────
+    state.erase(50);
+    const StepCost s6 = step("collateral-spend remove 1 MN (structural)");
+    EXPECT_EQ(s6.il, 0u) << "a removal hashes no leaf; survivors reuse cached hashes";
+
+    // ── Step 7: another quiet block — back to zero work. ───────────────────
+    const StepCost s7 = step("quiet block (SML unchanged)");
+    EXPECT_EQ(s7.il, 0u);
+    EXPECT_EQ(s7.in, 0u);
+
+    // ── Aggregate proof of the reduced hash-count. ─────────────────────────
+    std::cout << "  [#154 KAT] TOTAL  naive leaf=" << tot_nl << " node=" << tot_nn
+              << "  |  incr leaf=" << tot_il << " node=" << tot_in << "\n";
+
+    // Steady-state (everything after the unavoidable cold build): incremental
+    // hashed exactly the 5 leaves that actually changed (1+3+1 over steps
+    // 2..7), while naive re-hashed the full list on all six blocks.
+    const uint64_t steady_incr_leaf  = tot_il - s1.il;
+    const uint64_t steady_naive_leaf = tot_nl - s1.nl;
+    EXPECT_EQ(steady_incr_leaf, 5u) << "0+1+3+1+0+0 across steps 2..7";
+    EXPECT_GT(steady_naive_leaf, 1500u) << "naive re-hashes ~N leaves every block";
+    EXPECT_LT(tot_il, tot_nl);
+    EXPECT_LT(tot_in, tot_nn);
+    // Order-of-magnitude reduction overall (dominated by the cold build here;
+    // on a real 1.5M-block fold the cold build is a one-time cost and the
+    // steady-state ratio — 5 vs ~1800 above — is what matters).
+    EXPECT_LT(tot_il * 3, tot_nl) << "incremental leaf hashing is a small fraction of naive";
+
+    // The cache's root reflects the last mutation, and its size tracks the set.
+    EXPECT_EQ(cache.root().GetHex(), s7.root);
+    EXPECT_EQ(cache.size(), state.size());
+}
+
+// reset() drops the diff base so the next update() rebuilds in full — the
+// contract the fold relies on across seed()/load_snapshot() (wholesale state
+// replacement). After a reset the root must still equal the naive recompute of
+// the NEW list, and the rebuild must re-hash every leaf (nothing carried over).
+TEST(DashReplayFoldIncrementalMerkle, ResetForcesFullRebuildAndStaysCorrect)
+{
+    IncrementalSmlMerkle cache;
+
+    std::vector<CSimplifiedMNListEntry> listA;
+    for (uint32_t i = 0; i < 64; ++i) listA.push_back(incmerkle_mk_entry(i));
+    const uint256 rootA_incr = cache.update(listA);
+    const uint256 rootA_naive =
+        CSimplifiedMNList(std::vector<CSimplifiedMNListEntry>(listA)).CalcMerkleRoot();
+    EXPECT_EQ(rootA_incr.GetHex(), rootA_naive.GetHex());
+
+    // A completely different list (as a snapshot resume would install).
+    std::vector<CSimplifiedMNListEntry> listB;
+    for (uint32_t i = 1000; i < 1090; ++i) listB.push_back(incmerkle_mk_entry(i));
+
+    cache.reset();
+    EXPECT_FALSE(cache.valid());
+
+    const uint64_t l0 = sml_leaf_hash_count();
+    const uint256 rootB_incr = cache.update(listB);
+    const uint64_t hashed = sml_leaf_hash_count() - l0;
+    const uint256 rootB_naive =
+        CSimplifiedMNList(std::vector<CSimplifiedMNListEntry>(listB)).CalcMerkleRoot();
+
+    EXPECT_EQ(rootB_incr.GetHex(), rootB_naive.GetHex());
+    EXPECT_EQ(hashed, listB.size()) << "post-reset rebuild re-hashes every leaf";
+    EXPECT_NE(rootB_incr.GetHex(), rootA_incr.GetHex());
+}
+
+// Fuzz-ish invariant sweep: a long pseudo-random walk of adds / removes /
+// value-changes / no-ops, asserting the incremental root byte-matches the
+// naive recompute at every one of many steps. This is the reward-safety net —
+// if any mutation shape produced a divergent root, one of these steps reds.
+TEST(DashReplayFoldIncrementalMerkle, RandomWalkAlwaysMatchesNaive)
+{
+    IncrementalSmlMerkle cache;
+    std::map<uint32_t, CSimplifiedMNListEntry> state;
+    uint32_t next_seed = 0;
+    for (; next_seed < 128; ++next_seed) state[next_seed] = incmerkle_mk_entry(next_seed);
+
+    // Deterministic LCG — reproducible, no external RNG dependency.
+    uint64_t rng = 0xC0FFEEULL;
+    auto nextu = [&]() { rng = rng * 6364136223846793005ULL + 1442695040888963407ULL; return rng >> 33; };
+
+    for (int stepno = 0; stepno < 400; ++stepno) {
+        const uint32_t op = nextu() % 5;
+        if (op == 0) {
+            // add
+            state[next_seed] = incmerkle_mk_entry(next_seed);
+            ++next_seed;
+        } else if (op == 1 && state.size() > 8) {
+            // remove a pseudo-random existing key
+            auto it = state.begin();
+            std::advance(it, static_cast<long>(nextu() % state.size()));
+            state.erase(it);
+        } else if (op == 2 && !state.empty()) {
+            // value-change: flip isValid
+            auto it = state.begin();
+            std::advance(it, static_cast<long>(nextu() % state.size()));
+            it->second.isValid = !it->second.isValid;
+        } else if (op == 3 && !state.empty()) {
+            // value-change: bump confirmedHash
+            auto it = state.begin();
+            std::advance(it, static_cast<long>(nextu() % state.size()));
+            it->second.confirmedHash = incmerkle_protx_of(500000u + stepno);
+        }
+        // op == 4 (and the guarded fall-throughs): no-op quiet block.
+
+        std::vector<CSimplifiedMNListEntry> v;
+        v.reserve(state.size());
+        for (const auto& [k, e] : state) { (void)k; v.push_back(e); }
+
+        const uint256 ri = cache.update(v);
+        const uint256 rn =
+            CSimplifiedMNList(std::vector<CSimplifiedMNListEntry>(v)).CalcMerkleRoot();
+        ASSERT_EQ(ri.GetHex(), rn.GetHex())
+            << "random-walk divergence at step " << stepno
+            << " (op=" << op << ", size=" << state.size() << ")";
+    }
 }

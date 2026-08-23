@@ -135,6 +135,8 @@
 #include <impl/dash/coin/vendor/llmq_commitment.hpp>
 #include <impl/dash/coin/vendor/providertx.hpp>
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
+#include <impl/dash/coin/vendor/bls_verify.hpp>
+#include <impl/dash/coin/vendor/incremental_sml_merkle.hpp>
 #include <impl/bitcoin_family/coin/base_transaction.hpp>
 
 #include <core/hash.hpp>
@@ -146,6 +148,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -277,7 +280,11 @@ struct ReplayMNState
         e.confirmedHash    = confirmedHash;
         e.netAddress       = netInfo.ip;
         e.netPort          = netInfo.port_be;
-        e.pubKeyOperator   = pubKeyOperator;
+        // dashd serializes the SML leaf's operator key in the scheme the entry
+        // nVersion dictates (legacy iff nVersion < BasicBLS). We store canonical
+        // BASIC, so re-encode per nVersion here (opkey_for_leaf) — otherwise a
+        // legacy-era entry's leaf hashes the wrong bytes and diverges the root.
+        e.pubKeyOperator   = vendor::opkey_for_leaf(pubKeyOperator, nVersion < vendor::ProTxVersion::BASIC_BLS);
         e.keyIDVoting      = keyIDVoting;
         e.isValid          = !IsBanned();
         e.nType            = nType;
@@ -452,6 +459,9 @@ public:
         m_network                = std::move(network);
         m_poisoned               = false;
         m_poison_reason.clear();
+        // The held list was replaced wholesale — the incremental merkle cache's
+        // diff base is gone, so drop it. The next fold rebuilds it in full.
+        m_sml_cache.reset();
     }
 
     // ── Accessors ────────────────────────────────────────────────────────
@@ -503,6 +513,13 @@ public:
 
     /// DIP-4 merkleRootMNList of the CURRENT state — the value the
     /// self-check compares against each block's committed cbTx root.
+    ///
+    /// NAIVE full recompute: rebuilds the whole ~4900-leaf tree from scratch.
+    /// Kept as a PURE function (no cache) for the one-shot re-derivations that
+    /// are NOT the per-block hotspot — the publish-gate G6
+    /// (replay_payee_publish.hpp), the mn_diff_store reconstruct verify, the
+    /// prestate cross-check — and as the correctness oracle the incremental
+    /// path is proven against (KAT + the debug assert below).
     uint256 compute_sml_root() const
     {
         std::vector<vendor::CSimplifiedMNListEntry> ents;
@@ -511,6 +528,37 @@ public:
             ents.push_back(st.to_sml_entry(protx));
         vendor::CSimplifiedMNList sml(std::move(ents));
         return sml.CalcMerkleRoot();
+    }
+
+    /// THE per-block hotspot, incrementalised (task #154). Same value as
+    /// compute_sml_root() — byte-identical by construction — but reusing the
+    /// leaf hashes and internal merkle nodes the block did not disturb, so a
+    /// payment-rotation-only block (the overwhelming majority) hashes NOTHING
+    /// and a block that touches a handful of SML entries re-hashes only those
+    /// leaves plus the O(k·log n) internal nodes on their root-paths. This is
+    /// the routine fold_block's self-check calls; the naive one is the oracle.
+    ///
+    /// The cache maintains its own diff base, so this MUST be driven in strict
+    /// cursor order (which fold_block is) and re-seeded via reset() whenever
+    /// the held list is replaced wholesale (seed()/load_snapshot() do this).
+    uint256 compute_sml_root_incremental()
+    {
+        std::vector<vendor::CSimplifiedMNListEntry> ents;
+        ents.reserve(m_entries.size());
+        for (const auto& [protx, st] : m_entries)
+            ents.push_back(st.to_sml_entry(protx));
+        const uint256 root = m_sml_cache.update(std::move(ents));
+#ifndef NDEBUG
+        // Belt-and-suspenders in debug builds: the incremental root MUST equal
+        // the naive full recompute at every block. (In release the fold's own
+        // committed-root compare is the authority and a divergence fails
+        // closed — poison + re-seed — so this assert is a developer tripwire,
+        // not the production guard.)
+        assert(root == compute_sml_root()
+               && "task#154: incremental merkleRootMNList diverged from the "
+                  "naive full recompute — reward-path hazard");
+#endif
+        return root;
     }
 
     /// dashd CDeterministicMNList::GetMNPayee (deterministicmns.cpp:183-215)
@@ -752,7 +800,7 @@ public:
         // this fold must produce. Equality here is the whole point of
         // replay: a wrong fold rule, wrong body or wrong seed HARD-STOPS at
         // the named height instead of serving wrong bytes.
-        r.computed_root = compute_sml_root();
+        r.computed_root = compute_sml_root_incremental();
         if (r.computed_root != r.committed_root) {
             r.error = "DML FOLD ROOT MISMATCH at h=" + std::to_string(height)
                     + ": folded merkleRootMNList " + r.computed_root.GetHex()
@@ -936,6 +984,10 @@ public:
             m_total_registered_count = total_registered;
             m_poisoned               = false;
             m_poison_reason.clear();
+            // Resumed from a snapshot: the held list is a fresh wholesale load,
+            // so the incremental merkle cache's diff base does not apply. Drop
+            // it; the first post-resume fold rebuilds it in full.
+            m_sml_cache.reset();
             return true;
         } catch (const std::exception& ex) {
             error = std::string("snapshot deserialize failed: ") + ex.what();
@@ -973,6 +1025,11 @@ private:
     MembersFn  m_members_fn;
 
     Entries m_entries;
+    // task #154 — the per-block merkleRootMNList self-check's incremental
+    // leaf-hash + tree cache. Diff base is m_entries; kept in sync by driving
+    // it only through compute_sml_root_incremental() in cursor order, and
+    // reset() on any wholesale state replacement (seed/load_snapshot).
+    vendor::IncrementalSmlMerkle m_sml_cache;
     std::map<bitcoin_family::coin::TxPrevOut, uint256, ReplayOutpointLess>
         m_collateral_index;
     uint64_t    m_total_registered_count{0};
@@ -1079,7 +1136,7 @@ private:
         // (CDeterministicMNState(CProRegTx), dmnstate.h:68-79).
         st.nVersion          = p.nVersion;
         st.keyIDOwner        = p.keyIDOwner;
-        st.pubKeyOperator    = p.pubKeyOperator;
+        st.pubKeyOperator    = vendor::opkey_to_basic(p.pubKeyOperator, p.nVersion < vendor::ProTxVersion::BASIC_BLS);
         st.keyIDVoting       = p.keyIDVoting;
         st.netInfo           = p.netInfo;
         st.scriptPayout      = p.scriptPayout;
@@ -1171,7 +1228,18 @@ private:
 
         // Operator-key change ⇒ reset all operator fields + ban until a
         // ProUpServTx revives (specialtxman.cpp:395-405).
-        if (st.pubKeyOperator != p.pubKeyOperator) {
+        //
+        // dashd specialtxman.cpp:388 resets iff the operator key POINT differs.
+        // The STORED side is canonical BASIC (opkey_to_basic at the store sites,
+        // so a_legacy=false); the WIRE side is decoded under the tx payload
+        // scheme (legacy iff nVersion < BasicBLS, providertx.h:221). Faithful
+        // point compare with NO cross-scheme fallback (opkey_point_eq): a v1
+        // wire key read under basic would decode to a DIFFERENT point and
+        // byte-match a stored basic key, falsely suppressing the reset — the
+        // h=1874081/@1899899 derive walls.
+        if (!vendor::opkey_point_eq(st.pubKeyOperator, /*a_legacy=*/false,
+                                    p.pubKeyOperator,
+                                    /*b_legacy=*/p.nVersion < vendor::ProTxVersion::BASIC_BLS)) {
             const bool was_banned = st.IsBanned();
             st.ResetOperatorFields();
             st.BanIfNotBanned(H);
@@ -1180,7 +1248,7 @@ private:
             st.nVersion = st.nVersion > vendor::ProTxVersion::BASIC_BLS
                         ? st.nVersion : p.nVersion;
             // netInfo stays the empty MakeNetInfo(nVersion) from the reset.
-            st.pubKeyOperator = p.pubKeyOperator;
+            st.pubKeyOperator = vendor::opkey_to_basic(p.pubKeyOperator, p.nVersion < vendor::ProTxVersion::BASIC_BLS);
             if (m_cfg.debug_logs) {
                 LOG_INFO << "[DML-FOLD] h=" << H << " MN "
                          << p.proTxHash.GetHex().substr(0, 16)

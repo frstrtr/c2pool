@@ -77,6 +77,7 @@ using dash::coin::MinedCommitmentIndex;
 using dash::coin::MinedCommitmentIndexConfig;
 using dash::coin::MinedBlockInput;
 using dash::coin::MinedIngestResult;
+using dash::coin::MinedUndoResult;
 using dash::coin::TipPosture;
 using dash::coin::vendor::CFinalCommitment;
 using dash::coin::vendor::CFinalCommitmentTxPayload;
@@ -221,6 +222,47 @@ MinedCommitmentIndex make_armed(LlmqNetwork net = LlmqNetwork::Mainnet)
     const auto v = idx.arm(posture);
     EXPECT_TRUE(v.armed) << v.reason;
     return idx;
+}
+
+/// An armed index with pruning and journal trimming turned OFF for the span of
+/// a KAT, so a derived merkleRootQuorums at a PAST height is reconstructed from
+/// the full retained history rather than the count-bounded window — the undo
+/// KATs compare roots at a rolled-back cursor, and the count bound would
+/// otherwise legitimately evict a past-height active entry over 3101 blocks.
+MinedCommitmentIndex make_armed_full(LlmqNetwork net = LlmqNetwork::Mainnet)
+{
+    MinedCommitmentIndexConfig cfg;
+    cfg.enabled     = true;
+    cfg.network     = net;
+    cfg.keep_cycles = 65535;      // no inversed-index pruning within the window
+    cfg.undo_window = 1000000u;   // journal retains the whole KAT window
+    MinedCommitmentIndex idx(cfg);
+    TipPosture posture;
+    posture.live = false;
+    posture.declared_by = "KAT: replay-only consumer";
+    const auto v = idx.arm(posture);
+    EXPECT_TRUE(v.armed) << v.reason;
+    return idx;
+}
+
+/// Parse the scan into the contiguous list of MinedBlockInput above the anchor
+/// (heights 2513686..2516786), nulls included, in tx order.
+std::vector<MinedBlockInput> build_scan_inputs(const std::vector<ScanBlock>& scan)
+{
+    std::vector<MinedBlockInput> ins;
+    for (const auto& b : scan) {
+        if (b.height <= 2513685) continue;
+        MinedBlockInput in;
+        in.height     = b.height;
+        in.block_hash = b.block_hash;
+        for (const auto& hex : b.qc_hex) {
+            auto p = parse_qc_payload_hex(hex);
+            EXPECT_TRUE(p.has_value());
+            if (p) in.commitments.push_back(p->commitment);
+        }
+        ins.push_back(std::move(in));
+    }
+    return ins;
 }
 
 /// Seed the anchor's 88-commitment active set. Columns:
@@ -1101,5 +1143,408 @@ TEST(DashMinedCommitmentIndex, ProcessBlockRefusesABodyNotBoundToItsHeader)
         EXPECT_EQ(idx.stats().commitments_mined, 0u);
         EXPECT_EQ(idx.stats().blocks_ingested, 0u);
         EXPECT_EQ(idx.stats().blocks_refused, 1u);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// THE UNDO HALF — dashd's CQuorumBlockProcessor::UndoBlock
+// (v23.1.7 llmq/blockprocessor.cpp:383-408), ported as undo_input / undo_block
+// / handle_reorg. These KATs are what let the index ARM on a live tip: without
+// a proven symmetric rollback a reorg would leave a phantom mined record and
+// drop a MANDATORY qfcommit out of the served template (bad-qc-missing, a lost
+// block). Each is red-provable by breaking exactly the arm it names.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── KAT-L — the port itself: a disconnected block's mined records are erased
+//    EXACTLY, and re-connecting the same blocks reproduces identical state.
+//
+//    Connect the anchor + a 3101-block run, snapshot the store at a fork height
+//    A (cursor, size, derived merkleRootQuorums, the has_mined set), connect on
+//    to the tip B, then DISCONNECT B..A+1 in strict LIFO through undo_input.
+//    After the undo the store must be byte-for-byte the A snapshot again:
+//    every commitment mined ABOVE the fork is gone (no phantom), every one at
+//    or below it survives, size and derived root are identical. Re-connecting
+//    the same tail then reproduces the B snapshot exactly — add and remove are
+//    inverse.
+//
+//    RED: make erase_writes_at() a no-op (or drop the `m_mined.erase(...)` in
+//    it, or stop undo_input decrementing m_height). A disconnected block's
+//    mined records then linger: has_mined_commitment stays true for a
+//    commitment the roll-back removed, idx.size() does not return to sizeA, and
+//    the derived root at A no longer matches — the phantom-record failure the
+//    whole arm exists to prevent.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashMinedCommitmentIndexUndo, UndoErasesExactlyAndReconnectReproducesState)
+{
+    const auto scan = load_scan();
+    ASSERT_GE(scan.size(), 3000u);
+    const auto hashes = build_hash_map(scan);
+    auto at_h = hash_fn(hashes);
+    const auto ins = build_scan_inputs(scan);
+    ASSERT_GE(ins.size(), 100u);
+
+    // Heights that mined at least one non-null commitment.
+    std::vector<uint32_t> nn_heights;
+    for (const auto& in : ins) {
+        for (const auto& c : in.commitments)
+            if (!MinedCommitmentIndex::is_null_commitment(c)) {
+                nn_heights.push_back(in.height);
+                break;
+            }
+    }
+    ASSERT_GE(nn_heights.size(), 2u)
+        << "the window must mine non-null commitments at >=2 heights";
+    const uint32_t lateH = nn_heights.back();
+    ASSERT_GT(lateH, nn_heights.front());
+    const uint32_t A = lateH - 1;             // the fork / split cursor
+    const uint32_t B = ins.back().height;     // the full tip
+    ASSERT_LE(nn_heights.front(), A);
+    ASSERT_LT(A, B);
+
+    // Non-null (type,quorumHash) mined at/below A, and those FIRST mined above
+    // A. A quorum is mined at most once (bad-qc-dup), so the two sets are
+    // disjoint by construction.
+    std::vector<std::pair<uint8_t, uint256>> early, late;
+    for (const auto& in : ins) {
+        for (const auto& c : in.commitments) {
+            if (MinedCommitmentIndex::is_null_commitment(c)) continue;
+            const std::pair<uint8_t, uint256> k{c.llmqType, c.quorumHash};
+            if (in.height <= A) {
+                early.push_back(k);
+            } else if (std::find(early.begin(), early.end(), k) == early.end()) {
+                late.push_back(k);
+            }
+        }
+    }
+    ASSERT_FALSE(early.empty());
+    ASSERT_FALSE(late.empty());
+
+    auto idx = make_armed_full();
+    ASSERT_EQ(seed_anchor(idx), 88u);
+    idx.seed_cursor(2513685);
+
+    // ── Connect to A; snapshot.
+    size_t iA = 0;
+    for (; iA < ins.size(); ++iA) {
+        std::string err;
+        ASSERT_EQ(idx.process_input(ins[iA], at_h, &err),
+                  MinedIngestResult::Applied) << err;
+        if (ins[iA].height == A) break;
+    }
+    ASSERT_EQ(idx.height(), A);
+    const size_t  sizeA = idx.size();
+    const uint256 rootA = root_from_index(idx, A);
+    for (const auto& [t, qh] : early)
+        ASSERT_TRUE(idx.has_mined_commitment(t, qh));
+
+    // ── Connect to B; snapshot.
+    for (size_t i = iA + 1; i < ins.size(); ++i) {
+        std::string err;
+        ASSERT_EQ(idx.process_input(ins[i], at_h, &err),
+                  MinedIngestResult::Applied) << err;
+    }
+    ASSERT_EQ(idx.height(), B);
+    const size_t  sizeB = idx.size();
+    const uint256 rootB = root_from_index(idx, B);
+    ASSERT_GT(sizeB, sizeA);
+    for (const auto& [t, qh] : late)
+        ASSERT_TRUE(idx.has_mined_commitment(t, qh));
+
+    // ── DISCONNECT B..A+1 in strict LIFO through the UndoBlock port.
+    for (size_t i = ins.size(); i-- > iA + 1; ) {
+        std::string err;
+        ASSERT_EQ(idx.undo_input(ins[i], &err), MinedUndoResult::Undone) << err;
+        ASSERT_EQ(idx.height(), ins[i].height - 1)
+            << "each disconnect steps the cursor back exactly one";
+    }
+
+    // EXACT rollback to the A snapshot.
+    EXPECT_EQ(idx.height(), A);
+    EXPECT_EQ(idx.size(), sizeA);
+    EXPECT_EQ(root_from_index(idx, A).GetHex(), rootA.GetHex())
+        << "the derived merkleRootQuorums at the fork must be identical after "
+           "the roll-back";
+    for (const auto& [t, qh] : early)
+        EXPECT_TRUE(idx.has_mined_commitment(t, qh))
+            << "a commitment mined at/below the fork must survive the undo";
+    for (const auto& [t, qh] : late)
+        EXPECT_FALSE(idx.has_mined_commitment(t, qh))
+            << "a commitment mined ABOVE the fork must be erased — dashd "
+               "UndoBlock (blockprocessor.cpp:399); a lingering one is the "
+               "phantom mined record that arming on a live tip forbids";
+
+    // ── RE-CONNECT the same tail: the B snapshot is reproduced byte-for-byte.
+    for (size_t i = iA + 1; i < ins.size(); ++i) {
+        std::string err;
+        ASSERT_EQ(idx.process_input(ins[i], at_h, &err),
+                  MinedIngestResult::Applied)
+            << "re-connect from the rolled-back cursor must be contiguous: "
+            << err;
+    }
+    EXPECT_EQ(idx.height(), B);
+    EXPECT_EQ(idx.size(), sizeB);
+    EXPECT_EQ(root_from_index(idx, B).GetHex(), rootB.GetHex());
+    for (const auto& [t, qh] : late)
+        EXPECT_TRUE(idx.has_mined_commitment(t, qh));
+    for (const auto& [t, qh] : early)
+        EXPECT_TRUE(idx.has_mined_commitment(t, qh));
+    EXPECT_EQ(idx.stats().blocks_disconnected,
+              static_cast<uint64_t>(ins.size() - (iA + 1)));
+}
+
+// ── KAT-M — handle_reorg: the LIVE driver rolls the tip back to the fork point
+//    a switched chain implies, and lands on EXACTLY the state a forward-only
+//    walk to that fork would have produced.
+//
+//    Connect anchor + the full run to tip B. Then present a divergent chain to
+//    handle_reorg — real block hashes at/below a fork F, a flipped hash above
+//    it — as production's header chain would after a branch switch. The store
+//    must disconnect every height above F (journal-driven, no body re-supplied)
+//    and stop at F. A reference index connected forward-only to F must match it
+//    record-for-record: same size, same derived merkleRootQuorums.
+//
+//    RED: make handle_reorg's fork test `*on_chain == jit->second.block_hash`
+//    always false (it then rolls back past the fork), or make erase_writes_at()
+//    a no-op (the tip is not rolled back at all). Either way the post-reorg
+//    store no longer equals the forward-to-F reference.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashMinedCommitmentIndexUndo, HandleReorgRollsBackToForkPointExactly)
+{
+    const auto scan = load_scan();
+    const auto hashes = build_hash_map(scan);
+    auto at_h = hash_fn(hashes);
+    const auto ins = build_scan_inputs(scan);
+    ASSERT_GE(ins.size(), 100u);
+
+    std::vector<uint32_t> nn_heights;
+    for (const auto& in : ins)
+        for (const auto& c : in.commitments)
+            if (!MinedCommitmentIndex::is_null_commitment(c)) {
+                nn_heights.push_back(in.height);
+                break;
+            }
+    ASSERT_GE(nn_heights.size(), 2u);
+    const uint32_t F = nn_heights.back() - 1;   // a fork with a non-null above it
+
+    // Build the store forward to the tip.
+    auto idx = make_armed_full();
+    ASSERT_EQ(seed_anchor(idx), 88u);
+    idx.seed_cursor(2513685);
+    for (const auto& in : ins) {
+        std::string err;
+        ASSERT_EQ(idx.process_input(in, at_h, &err), MinedIngestResult::Applied)
+            << err;
+    }
+    const uint32_t B = idx.height();
+    ASSERT_GT(B, F);
+
+    // Reference: a fresh store walked forward-only to F.
+    auto ref = make_armed_full();
+    ASSERT_EQ(seed_anchor(ref), 88u);
+    ref.seed_cursor(2513685);
+    for (const auto& in : ins) {
+        if (in.height > F) break;
+        std::string err;
+        ASSERT_EQ(ref.process_input(in, at_h, &err), MinedIngestResult::Applied)
+            << err;
+    }
+    ASSERT_EQ(ref.height(), F);
+
+    // The switched chain: truth at/below F, a divergent hash above it.
+    auto reorg_at_h = [&hashes, F](uint32_t h) -> std::optional<uint256> {
+        auto it = hashes.find(h);
+        if (it == hashes.end()) return std::nullopt;
+        if (h <= F) return it->second;
+        uint256 flipped = it->second;
+        flipped.data()[0] ^= 0xff;              // a block the new branch lacks
+        return flipped;
+    };
+
+    std::string uerr;
+    ASSERT_EQ(idx.handle_reorg(reorg_at_h, &uerr), MinedUndoResult::Undone)
+        << uerr;
+
+    // Landed on the fork, and IS the forward-to-F state.
+    EXPECT_EQ(idx.height(), F);
+    EXPECT_EQ(idx.size(), ref.size())
+        << "handle_reorg must leave exactly the mined set a forward walk to the "
+           "fork would have";
+    EXPECT_EQ(root_from_index(idx, F).GetHex(), root_from_index(ref, F).GetHex());
+    EXPECT_EQ(idx.stats().blocks_disconnected, B - F);
+
+    // Every commitment first mined above the fork is gone; the fork's own set
+    // is intact and answers has_mined identically to the reference.
+    for (const auto& in : ins) {
+        for (const auto& c : in.commitments) {
+            if (MinedCommitmentIndex::is_null_commitment(c)) continue;
+            EXPECT_EQ(idx.has_mined_commitment(c.llmqType, c.quorumHash),
+                      ref.has_mined_commitment(c.llmqType, c.quorumHash))
+                << "post-reorg has_mined disagrees with the forward-to-fork "
+                   "reference for a type=" << int(c.llmqType) << " quorum";
+        }
+    }
+
+    // And it can fold forward again from the fork.
+    for (const auto& in : ins) {
+        if (in.height <= F) continue;
+        std::string err;
+        ASSERT_EQ(idx.process_input(in, at_h, &err), MinedIngestResult::Applied)
+            << "re-fold from the fork must be contiguous: " << err;
+    }
+    EXPECT_EQ(idx.height(), B);
+}
+
+// ── KAT-N — the arm gate, both directions. With the undo half ported, a LIVE
+//    tip ARMS when the caller declares a reorg-undo handler wired, and still
+//    REFUSES (naming UndoBlock, bad-qc-missing and who declared it) when it
+//    does not. Existence of the undo code is not the same as a caller driving
+//    it, and the guard demands the latter.
+//
+//    RED: change `if (posture.live && !posture.reorg_undo_wired)` in arm() to
+//    `if (posture.live)` — the wired arm is then refused and the first
+//    EXPECT_TRUE fails; or to `if (false)` — the unwired live tip arms and the
+//    unsafe-refusal half fails.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashMinedCommitmentIndexUndo, ArmsOnLiveTipOnlyWhenReorgUndoWired)
+{
+    MinedCommitmentIndexConfig cfg;
+    cfg.enabled = true;
+
+    // LIVE + wired -> ARMS.
+    {
+        MinedCommitmentIndex idx(cfg);
+        TipPosture p;
+        p.live             = true;
+        p.reorg_undo_wired = true;
+        p.declared_by      = "header-chain reorg seam drives handle_reorg";
+        const auto v = idx.arm(p);
+        EXPECT_TRUE(v.armed) << v.reason;
+        EXPECT_TRUE(idx.armed());
+        EXPECT_NE(v.reason.find("UndoBlock"), std::string::npos)
+            << "the arming verdict names the ported half: " << v.reason;
+        EXPECT_NE(v.reason.find("header-chain reorg seam drives handle_reorg"),
+                  std::string::npos)
+            << "and who declared the wiring: " << v.reason;
+    }
+
+    // LIVE + NOT wired -> REFUSES, and still names the risk.
+    {
+        MinedCommitmentIndex idx(cfg);
+        TipPosture p;
+        p.live             = true;
+        p.reorg_undo_wired = false;
+        p.declared_by      = "FoldLiveTail wired but no undo handler";
+        const auto v = idx.arm(p);
+        EXPECT_FALSE(v.armed);
+        EXPECT_FALSE(idx.armed());
+        EXPECT_NE(v.reason.find("UndoBlock"), std::string::npos) << v.reason;
+        EXPECT_NE(v.reason.find("bad-qc-missing"), std::string::npos) << v.reason;
+        EXPECT_NE(v.reason.find("FoldLiveTail wired but no undo handler"),
+                  std::string::npos) << v.reason;
+    }
+}
+
+// ── KAT-O — undo_block, the BODY entry point (mirror of process_block): it
+//    parses the disconnected block's type-6 payloads itself and asserts the
+//    body binds to its header before erasing, and undo is strictly LIFO.
+//
+//    RED: delete undo_block's `block_body_binds_to_header` guard (a forged body
+//    then drives an erase), or delete undo_input's `in.height != m_height`
+//    clause (a non-tip disconnect is silently accepted).
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashMinedCommitmentIndexUndo, UndoBlockBodyPathAndLifoGuard)
+{
+    const auto scan   = load_scan();
+    const auto hashes = build_hash_map(scan);
+    auto at_h = hash_fn(hashes);
+
+    const auto subj = first_type4_commitment(scan);
+    ASSERT_TRUE(subj.has_value());
+
+    const ScanBlock* sb = nullptr;
+    for (const auto& b : scan)
+        if (b.height == subj->mined_height) sb = &b;
+    ASSERT_NE(sb, nullptr);
+    ASSERT_FALSE(sb->qc_hex.empty());
+
+    // A header-bound body: coinbase-shaped tx 0, then the real type-6 txs.
+    dash::coin::BlockType blk;
+    blk.m_bits = 0x19158dc7u;
+    {
+        dash::coin::MutableTransaction coinbase;
+        coinbase.version = 3;
+        coinbase.type    = 0;
+        dash::coin::TxIn cin;
+        cin.prevout.hash  = uint256::ZERO;
+        cin.prevout.index = 0xffffffffu;
+        coinbase.vin.push_back(cin);
+        blk.m_txs.push_back(std::move(coinbase));
+    }
+    for (const auto& hex : sb->qc_hex) {
+        dash::coin::MutableTransaction tx;
+        tx.version       = 3;
+        tx.type          = CFinalCommitmentTxPayload::SPECIALTX_TYPE;
+        tx.extra_payload = from_hex(hex);
+        ASSERT_FALSE(tx.extra_payload.empty());
+        blk.m_txs.push_back(std::move(tx));
+    }
+    {
+        std::vector<uint256> txids;
+        for (const auto& tx : blk.m_txs) {
+            auto packed = ::pack(tx);
+            txids.push_back(::Hash(packed.get_span()));
+        }
+        blk.m_merkle_root = dash::coin::compute_merkle_root(txids);
+    }
+    ASSERT_TRUE(dash::coin::block_body_binds_to_header(blk));
+
+    // Connect the block, then UNDO it through the body entry point.
+    auto idx = make_armed_full();
+    idx.seed_cursor(subj->mined_height - 1);
+    std::string err;
+    ASSERT_EQ(idx.process_block(subj->mined_height, sb->block_hash, blk, at_h,
+                                &err),
+              MinedIngestResult::Applied) << err;
+    ASSERT_TRUE(idx.has_mined_commitment(subj->commitment.llmqType,
+                                         subj->commitment.quorumHash));
+    ASSERT_EQ(idx.height(), subj->mined_height);
+
+    ASSERT_EQ(idx.undo_block(subj->mined_height, sb->block_hash, blk, &err),
+              MinedUndoResult::Undone) << err;
+    EXPECT_EQ(idx.height(), subj->mined_height - 1)
+        << "undo_block rolls the cursor back one";
+    EXPECT_FALSE(idx.has_mined_commitment(subj->commitment.llmqType,
+                                          subj->commitment.quorumHash))
+        << "the body entry point must erase the same records process_block "
+           "wrote";
+    EXPECT_EQ(idx.stats().blocks_disconnected, 1u);
+
+    // LIFO guard: a body that does not bind to its header must not drive an
+    // erase, and only the TIP is disconnectable.
+    {
+        auto idx2 = make_armed_full();
+        idx2.seed_cursor(subj->mined_height - 1);
+        ASSERT_EQ(idx2.process_block(subj->mined_height, sb->block_hash, blk,
+                                     at_h, &err),
+                  MinedIngestResult::Applied) << err;
+
+        dash::coin::BlockType forged = blk;
+        forged.m_txs[0].locktime ^= 1u;         // m_merkle_root NOT updated
+        ASSERT_FALSE(dash::coin::block_body_binds_to_header(forged));
+        EXPECT_EQ(idx2.undo_block(subj->mined_height, sb->block_hash, forged,
+                                  &err),
+                  MinedUndoResult::BodyNotBound);
+        EXPECT_TRUE(idx2.has_mined_commitment(subj->commitment.llmqType,
+                                              subj->commitment.quorumHash))
+            << "a forged body must NOT erase anything";
+        EXPECT_EQ(idx2.height(), subj->mined_height);
+
+        // Disconnecting a non-tip height is refused not-tip.
+        MinedBlockInput wrong;
+        wrong.height = subj->mined_height - 5;   // not the cursor
+        EXPECT_EQ(idx2.undo_input(wrong, &err), MinedUndoResult::NotTip);
+        EXPECT_NE(err.find("not-tip"), std::string::npos) << err;
+        EXPECT_EQ(idx2.height(), subj->mined_height)
+            << "a refused disconnect must not move the cursor";
     }
 }

@@ -108,7 +108,8 @@ void print_banner(const char* argv0, const core::CoinParams& p)
         << " [--version] [--help] [--selftest] [--run] [--stratum [H:]P] [--http [H:]P]\n"
         << "       [--coin-daemon H:P] [--coin-magic HEX] [--regtest]\n"
         << "       [--regtest-force-won-share] [--no-p2p-relay]\n"
-        << "       [--redistribute SPEC] [--sharechain-port P]\n"
+        << "       [--redistribute SPEC] [--node-owner-address ADDR]\n"
+        << "       [--sharechain-port P]\n"
         << "       [--data-dir PATH] [--dev-relax-algo-softforks]\n"
         << "       [--coin-p2p-discover]\n\n"
         << "  --data-dir PATH  root all per-instance state here (default ~/.c2pool);\n"
@@ -182,6 +183,7 @@ int run_node(const core::CoinParams& params, bool testnet,
              bool regtest = false, bool force_won_share = false,
              bool no_p2p_relay = false,
              const std::string& redistribute_spec = "",
+             const std::string& node_owner_address = "",
              bool dev_relax_algo_softforks = false,
              bool coin_p2p_discover = false,
              const std::string& http_addr = "0.0.0.0",
@@ -971,14 +973,26 @@ int run_node(const core::CoinParams& params, bool testnet,
         redistributor->set_hybrid_weights(dgb::parse_redistribute_spec(redistribute_spec));
         // "donate" identity: P2SH hash160 == COMBINED_DONATION_SCRIPT[2..22]
         // (V36 1-of-2 forrestv+maintainer combined donation, byte-identical to
-        // the gentx donation output). "fee" needs an operator payout identity
-        // not yet plumbed here -> pick() returns a null hash for it and the
-        // fallback yields an empty script (fail-safe: never a burn output).
+        // the gentx donation output).
         {
             const auto& ds = dgb::PoolConfig::COMBINED_DONATION_SCRIPT;
             uint160 donation_hash;
             std::memcpy(donation_hash.data(), ds.data() + 2, 20);
             redistributor->set_donation_identity(donation_hash, /*P2SH=*/2);
+        }
+        // "fee" identity: the node operator's payout address -> hash160, decoded
+        // via core::address_to_hash160 (mirrors main_ltc.cpp's set_operator_
+        // identity wiring; DGB has no MiningInterface bridge). Absent a
+        // --node-owner-address the operator identity stays null and a bare
+        // --redistribute fee remains the fail-safe empty-script no-op (never a
+        // burn output). CONSENSUS-SAFE: node-local pubkey_hash choice only.
+        if (dgb::set_operator_identity_from_address(*redistributor, node_owner_address)) {
+            std::cout << "[DGB] redistribute fee identity ARMED: operator payout \""
+                      << node_owner_address << "\" -> hash160" << std::endl;
+        } else if (!node_owner_address.empty()) {
+            std::cout << "[DGB] WARNING: --node-owner-address \"" << node_owner_address
+                      << "\" did not decode to a hash160; fee arm stays null "
+                         "(empty script, no burn)" << std::endl;
         }
         auto& redist_tracker = p2p_node.tracker();
         work_source->set_fallback_payout_fn(
@@ -1526,6 +1540,7 @@ int main(int argc, char** argv)
     std::string rpc_endpoint;               // --coin-rpc HOST:PORT (external digibyted submit arm)
     std::string rpc_conf_path;              // --coin-rpc-auth PATH to digibyte.conf (creds source)
     std::string redistribute_spec;         // --redistribute SPEC (node-local payout policy, #307)
+    std::string node_owner_address;        // --node-owner-address ADDR (operator payout identity for --redistribute fee, #307)
     // ── #82 regtest-gated forced-won-share LIVE seam (decision (a), 2026-06-21) ──
     // --regtest-force-won-share synthesizes ONE won share into the live
     // ShareTracker and fires m_on_block_found AFTER both broadcast arms are
@@ -1611,6 +1626,9 @@ int main(int argc, char** argv)
         if (std::strcmp(argv[i], "--redistribute") == 0 && i + 1 < argc) {
             redistribute_spec = argv[++i];     // pplns|fee|boost|donate or hybrid "boost:70,donate:20"
         }
+        if (std::strcmp(argv[i], "--node-owner-address") == 0 && i + 1 < argc) {
+            node_owner_address = argv[++i];    // operator payout addr -> "fee" identity (#307 fee arm)
+        }
         if (std::strcmp(argv[i], "--sharechain-port") == 0 && i + 1 < argc) {
             // --sharechain-port PORT - bind the sharechain (pool P2P) listener on
             // a non-default port so a SECOND isolated c2pool-dgb instance can run
@@ -1634,7 +1652,7 @@ int main(int argc, char** argv)
                         coin_daemon, coin_magic, coin_genesis,
                         rpc_endpoint, rpc_conf_path,
                         regtest, force_won_share, no_p2p_relay,
-                        redistribute_spec, dev_relax_algo_softforks,
+                        redistribute_spec, node_owner_address, dev_relax_algo_softforks,
                         coin_p2p_discover,
                         http_addr, http_port);
 

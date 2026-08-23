@@ -44,6 +44,7 @@
 #include <impl/dash/crypto/hash_x11.hpp>
 #include <impl/dash/coin/utxo_adapter.hpp>   // must precede subsidy.hpp (dash_txid in scope)
 #include <impl/dash/coin/subsidy.hpp>
+#include <btclibs/crypto/sha256.h>   // SHA256AutoDetect (CPU-dispatched SIMD/SHA-NI transform)
 
 #include <core/coin_params.hpp>
 #include <core/coinbase_builder.hpp>       // c2pool::MAX_OPERATOR_TEXT_SOLO (--coinbase-text budget SSOT)
@@ -99,6 +100,7 @@
 #include <impl/dash/coin/replay_bulk_fetch.hpp>  // W2: full-history replay bulk block-fetch lane (--replay-bulk)
 #include <impl/dash/coin/replay_utxo_fold.hpp>   // W3: full-history replay standalone UTXO fold (--replay-utxo-*)
 #include <impl/dash/coin/replay_prestate.hpp>    // W5: anchor prestate loader (--replay-fold-prestate)
+#include <impl/dash/coin/mnlist_seed.hpp>        // OPTIONAL V20 getmnlistdiff seed (--replay-mnlist-seed-*, #154 escape hatch)
 #include <impl/dash/coin/replay_fold_consumer.hpp> // W5: bulk lane -> W1 DML fold + per-block root check
 #include <impl/dash/coin/replay_quorum_bridge.hpp> // SEAM: W4 quorum lane <-> W1 MembersFn
 #include <impl/dash/coin/replay_payee_publish.hpp> // SEAM: W1 fold -> the PAYEE queue that gates serving
@@ -280,6 +282,18 @@ std::string g_replay_fold_prestate;           // --replay-fold-prestate FILE
 bool        g_replay_fold_quorums = false;    // --replay-fold-quorums
 std::string g_replay_fold_qsnapshot;          // --replay-fold-qsnapshot FILE
 std::string g_replay_fold_worklists;          // --replay-fold-worklists FILE
+// ── OPTIONAL, DEFAULT-OFF V20 getmnlistdiff SEED (path-ii escape hatch for
+// #154 — mnlist_seed.hpp). When ALL THREE are absent nothing below changes and
+// the from-DIP3 default is byte-identical to master. When armed, the fold is
+// SEEDED from a dashd getmnlistdiff snapshot at/after the V20 activation floor
+// (mainnet 1'987'776) instead of DERIVED from DIP3, sidestepping the pre-v19
+// rotated-quorum derivation for the checkpoint-generation use case. The seed's
+// merkleRootMNList must reproduce the committed root at the seed height
+// (seed_engine_from_prestate, fail-closed) BEFORE any block is folded forward;
+// from H+1 the normal per-block byte-exact self-check is unchanged.
+uint32_t    g_replay_mnlist_seed_height = 0;  // --replay-mnlist-seed-height H (0 => disarmed)
+std::string g_replay_mnlist_seed_source;      // --replay-mnlist-seed-source getmnlistdiff
+std::string g_replay_mnlist_seed_file;        // --replay-mnlist-seed-file FILE (offline snapshot)
 // --embedded-no-dashd-mn-seed: cut the PAYEE axis off from dashd while KEEPING
 // the dashd RPC for the OBSERVE-only shadow-compare. The E2c `protx list` seed
 // and the E2d checkpoint bridge are both skipped, so the root-checked replay
@@ -423,6 +437,7 @@ void print_banner(const char* argv0)
         << "           [--replay-bulk] [--replay-bulk-capture DIR] [--replay-bulk-start H]\n"
         << "           [--replay-fold-prestate FILE] [--replay-fold-quorums]\n"
         << "           [--replay-fold-qsnapshot FILE] [--replay-fold-worklists FILE]\n"
+        << "           [--replay-mnlist-seed-height H --replay-mnlist-seed-source getmnlistdiff --replay-mnlist-seed-file FILE]\n"
         << "           [--replay-mined-commitment-index]\n"
         << "           [--embedded-no-dashd-mn-seed]\n"
         << "           [--oracle-graduation-blocks N] [--oracle-class-coverage K]\n"
@@ -547,6 +562,16 @@ void print_banner(const char* argv0)
         << "        without any anchor-supplied member set;\n"
         << "        --replay-fold-qsnapshot FILE seeds ONLY the pre-anchor\n"
         << "        rotated-cycle snapshots a Phase-1 run cannot have produced.\n"
+        << "        --replay-mnlist-seed-height H (with --replay-mnlist-seed-source\n"
+        << "        getmnlistdiff and --replay-mnlist-seed-file FILE) is an\n"
+        << "        OPTIONAL, DEFAULT-OFF escape hatch (path-ii, #154): instead of\n"
+        << "        DERIVING pre-V20 state from DIP3, SEED the fold from a dashd\n"
+        << "        getmnlistdiff snapshot at/after the V20 floor (mainnet\n"
+        << "        1987776) and walk V20+ ONLY, sidestepping the pre-v19\n"
+        << "        rotated-quorum derivation for checkpoint generation. The seed\n"
+        << "        must reproduce the committed merkleRootMNList at H (fail-closed)\n"
+        << "        before any block folds; from H+1 the self-check is unchanged.\n"
+        << "        When these flags are ABSENT the from-DIP3 default is untouched.\n"
         << "        THE SERVE SEAM: once the fold is PROVEN CURRENT (not\n"
         << "        poisoned, DIVERGED=none, roots_matched == folded, the list\n"
         << "        re-hashes to the root its last block committed, cursor AT\n"
@@ -3071,8 +3096,54 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // Fee policy: one roll per job build (p2pool's per-get_work
                 // fee roll); resolve the share identity + donation.
                 const uint32_t roll_x100 = static_cast<uint32_t>(nonce_rng() % 10000u);
+
+                // --redistribute pplns/boost: when the miner's stratum
+                // credentials do NOT decode to a P2PKH script, the share is
+                // minted under a payout identity chosen from the accrued PPLNS
+                // window (weighted-random for pplns; zero-share boost else
+                // pplns for boost). Gather the SAME oracle-window weights the
+                // DASH payout uses (consensus-neutral local choice — every peer
+                // still recomputes identical coinbase outputs). Only walk the
+                // chain when the miner is actually broken-cred AND the mode is
+                // pplns/boost, so miner-ok / fee / donate jobs pay nothing.
+                dash::mint::RedistributeInputs redistribute;
+                {
+                    const bool miner_broken =
+                        !dash::stratum::pubkey_hash_from_p2pkh(payout_script).has_value();
+                    const bool needs_redist =
+                        fee_policy.redistribute ==
+                            dash::mint::MintFeePolicy::Redistribute::PPLNS ||
+                        fee_policy.redistribute ==
+                            dash::mint::MintFeePolicy::Redistribute::BOOST;
+                    if (miner_broken && needs_redist) {
+                        redistribute.candidates =
+                            dash::mint::gather_redistribute_candidates(
+                                guard->chain, mint_params, prev_share_hash,
+                                wd.m_bits);
+                        redistribute.pplns_roll =
+                            (static_cast<uint64_t>(nonce_rng()) << 32) |
+                            static_cast<uint64_t>(nonce_rng());
+                        redistribute.boost_zero_roll =
+                            (static_cast<uint64_t>(nonce_rng()) << 32) |
+                            static_cast<uint64_t>(nonce_rng());
+                        if (fee_policy.redistribute ==
+                                dash::mint::MintFeePolicy::Redistribute::BOOST &&
+                            stratum_server) {
+                            for (const auto& [pk, rate] :
+                                     stratum_server->get_local_addr_rates()) {
+                                if (rate <= 0.0)
+                                    continue;
+                                uint160 h;
+                                std::memcpy(h.data(), pk.data(), 20);
+                                redistribute.connected.push_back(
+                                    dash::pubkey_hash_to_script2(h));
+                            }
+                        }
+                    }
+                }
+
                 auto identity = dash::mint::resolve_mint_identity(
-                    fee_policy, payout_script, roll_x100);
+                    fee_policy, payout_script, roll_x100, redistribute);
                 if (!identity) {
                     static int redist_log = 0;
                     if (redist_log++ % 50 == 0)
@@ -5503,7 +5574,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             [&coin_state, &stratum_server, hc = header_chain.get(),
              addr_ver, p2sh_ver, ws = work_source.get(),
              cp = coin_p2p.get(), sml_base, m = maintainer.get(),
-             mnl = mn_ckpt_lane.get(), qcms = qc_ms_prefetch_handle]
+             mnl = mn_ckpt_lane.get(), qcms = qc_ms_prefetch_handle,
+             // PR-2 UNDO. By REFERENCE (same lifetime class as the qc_plan_fn
+             // capture above): the index is constructed later in this function,
+             // and on a reorg its symmetric UndoBlock half must roll the tip
+             // back before the new branch is folded forward.
+             &mined_commitment_index]
             (const uint256&, uint32_t, const uint256& new_tip, uint32_t new_height,
              bool was_reorg) {
                 // E2d bridge driver. Safe + REACHABLE here: HeaderChain fires
@@ -5542,6 +5618,37 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                 << " -> SML wipe + cold-resync";
                     m->on_sml_reorg();
                     *sml_base = uint256::ZERO;
+                }
+                // PR-2 UNDO: roll the mined-commitment store back over the
+                // disconnected tail. dashd's UndoBlock, expressed over the
+                // store's retained journal: walk the cursor down to the fork
+                // point (the first height whose recorded hash still matches the
+                // switched chain) erasing each orphaned block's mined records,
+                // so has_mined_commitment() cannot answer true for a commitment
+                // the new branch never mined. A reorg deeper than the retained
+                // undo window fails closed to a cold rebuild + re-seed on the
+                // next contiguous fold — the over-mandating (never phantom)
+                // direction.
+                if (was_reorg && mined_commitment_index
+                    && mined_commitment_index->armed()) {
+                    std::string uerr;
+                    const auto ur = mined_commitment_index->handle_reorg(
+                        [hc](uint32_t q) -> std::optional<uint256> {
+                            if (auto e = hc->get_header_by_height(q))
+                                return e->hash;
+                            return std::nullopt;
+                        },
+                        &uerr);
+                    if (ur == dash::coin::MinedUndoResult::Undone) {
+                        LOG_INFO << "[QC-MINED-INDEX] reorg undo -> "
+                                 << mined_commitment_index->summary();
+                    } else {
+                        LOG_WARNING << "[QC-MINED-INDEX] reorg undo could not "
+                                       "roll back exactly (" << uerr
+                                    << ") -> cold rebuild; store will re-seed on "
+                                       "the next contiguous fold";
+                        mined_commitment_index->clear_for_cold_rebuild();
+                    }
                 }
                 // SML axis: pull the mnlistdiff current AT the new tip. dashcore
                 // computes block (tip+1)'s CbTx merkleRootMNList/Quorums from the
@@ -6614,13 +6721,49 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // computed merkleRootMNList checked byte-exact against that
             // block's own committed cbTx root — the per-block proof.
             uint32_t replay_fold_anchor = 0;
-            if (!g_replay_fold_prestate.empty()) {
-                auto ps = rp::load_prestate_file(g_replay_fold_prestate);
-                if (!ps.ok) {
-                    std::cerr << "[run] FATAL: --replay-fold-prestate "
-                              << g_replay_fold_prestate << ": " << ps.error
-                              << "\n";
-                    return 1;
+            // The escape hatch (mnlist_seed.hpp) is armed iff the operator
+            // supplied any --replay-mnlist-seed-* flag; it and the plain
+            // --replay-fold-prestate arm are mutually exclusive seed SOURCES
+            // that converge on the SAME Prestate + SAME root gate below.
+            rp::MnListSeedRequest mnseed_req;
+            mnseed_req.seed_height = g_replay_mnlist_seed_height;
+            mnseed_req.source      = g_replay_mnlist_seed_source;
+            mnseed_req.file        = g_replay_mnlist_seed_file;
+            mnseed_req.testnet     = testnet;
+            const bool mnlist_seed_on = rp::mnlist_seed_armed(mnseed_req);
+            if (mnlist_seed_on && !g_replay_fold_prestate.empty()) {
+                std::cerr << "[run] FATAL: --replay-mnlist-seed-* (V20"
+                             " getmnlistdiff escape hatch) and"
+                             " --replay-fold-prestate are mutually exclusive"
+                             " seed sources — pick one\n";
+                return 1;
+            }
+            if (mnlist_seed_on || !g_replay_fold_prestate.empty()) {
+                rp::Prestate ps;
+                if (mnlist_seed_on) {
+                    ps = rp::load_and_validate_mnlist_seed(mnseed_req);
+                    if (!ps.ok) {
+                        std::cerr << "[run] FATAL: --replay-mnlist-seed-* "
+                                     "(V20 getmnlistdiff escape hatch, #154): "
+                                  << ps.error << "\n";
+                        return 1;
+                    }
+                    std::cout << "[run] V20 MNLIST-SEED ARMED (OPTIONAL, "
+                                 "default-OFF getmnlistdiff escape hatch for"
+                                 " #154 pre-V20 derivation): seeding at h="
+                              << ps.height << " (>= V20 floor "
+                              << rp::mnlist_seed_v20_floor(testnet)
+                              << ") from source '" << mnseed_req.source
+                              << "' — walking V20+ ONLY, per-block self-check"
+                                 " unchanged from H+1\n";
+                } else {
+                    ps = rp::load_prestate_file(g_replay_fold_prestate);
+                    if (!ps.ok) {
+                        std::cerr << "[run] FATAL: --replay-fold-prestate "
+                                  << g_replay_fold_prestate << ": " << ps.error
+                                  << "\n";
+                        return 1;
+                    }
                 }
                 dash::coin::replay::FoldConfig fcfg;
                 fcfg.enabled = true;   // W1 feature flag, explicit opt-in
@@ -7005,10 +7148,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 mi->seed_cursor(replay_fold_engine->height());
                 dash::coin::TipPosture posture;
                 posture.live = (replay_live_tail != nullptr);
+                // The header-chain reorg seam (set_on_tip_changed below) drives
+                // mi->handle_reorg() on every branch switch, so a live tip is
+                // now reorg-safe: dashd's UndoBlock half is ported AND wired.
+                posture.reorg_undo_wired = true;
                 posture.declared_by =
                     replay_live_tail
                         ? "FoldLiveTail is wired (live tip blocks are folded "
-                          "into this same consumer)"
+                          "into this same consumer); header-chain reorg seam "
+                          "drives handle_reorg on disconnect"
                         : "no FoldLiveTail: this consumer sees only replayed "
                           "historical bodies";
                 const auto verdict = mi->arm(posture);
@@ -7405,8 +7553,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // socket timeout + m_rpc_mutex bound this thread). Declared here (after rpc /
     // work_source / stratum_server) so its explicit stop()+join() after the run
     // loop -- and its destructor -- happen BEFORE those objects unwind: no
-    // background probe is ever mid-flight against freed state. Only created on
-    // the fallback arm; null on the embedded arm (legacy inline path unchanged).
+    // background probe is ever mid-flight against freed state. Created on ANY
+    // arm with a dashd rpc armed (#139: see the executor wiring below); the
+    // rpc-less pure-daemonless arm keeps the legacy inline path, which is
+    // non-blocking there (no dashd RPC exists to block on).
     // The opt-in ZMQ subscriber (declared here for the same teardown ordering)
     // only posts onto ioc; when unconfigured/uncompiled the poll is the whole
     // mechanism -- byte-identical to the poll-only #770/#781 behavior.
@@ -7414,19 +7564,50 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     std::unique_ptr<dash::coin::ZmqHashblockSubscriber> zmq_sub;
 #endif
     std::shared_ptr<boost::asio::thread_pool> rpc_pool;
-    if (!coin_p2p && rpc && stratum_server) {
+    if (rpc && stratum_server) {
         rpc_pool = std::make_shared<boost::asio::thread_pool>(1);
 
         // Non-blocking template re-source: cached_work() hands the blocking
-        // select_work()/GBT to rpc_pool as a single-flight background job
-        // instead of blocking the io thread on every stale/generation miss (the
-        // per-share ~15-30 s GBT block). The io thread serves the cached template
-        // immediately; the pool updates it and the next notify picks it up.
+        // GBT to rpc_pool as a single-flight background job instead of blocking
+        // the io thread on every stale/generation miss (the per-share ~15-30 s
+        // GBT block). The io thread serves the cached template immediately; the
+        // pool updates it and the next notify picks it up.
+        //
+        // #139 SERVE-FREEZE FIX: this wiring used to sit under `!coin_p2p`,
+        // so the coin-p2p arm ran the LEGACY INLINE path -- and with --coin-rpc
+        // kept, EVERY template re-source ran a blocking dashd getblocktemplate
+        // (the gbt-xcheck at work_source.cpp:949 plus the embedded-decline
+        // fallback) on the ONE ioc.run() thread that is simultaneously the
+        // stratum server, the coin-P2P ingest (incl. MSG_TX), the web server,
+        // and every tip-recovery clock (lost-body watchdog, tip-body-overdue
+        // demote). Under tx-serving mempool load the handler queue grew faster
+        // than it drained: the served height fell 4->11->13 blocks behind and
+        // self-cleared only when the mempool wave subsided (canary 9f4a424d,
+        // both episodes, NRestarts=0).
+        //
+        // THREAD CONTRACT (#1134/#1150) -- why this is safe on the coin-p2p arm:
+        // cached_work() resolves EVERY NodeCoinState read on the io thread via
+        // resolve_coin_state_arm() and hands the posted job a self-contained
+        // VALUE; resource_template_now(arm) never names coin_state_ (pinned by
+        // test/test_dash_work_source_ownership.cpp). Only the blocking dashd
+        // RPC moves off ioc. Off-io readers of NodeCoinState stay ZERO -- this
+        // does NOT reintroduce the pre-#1150 arm-exclusivity dependency.
+        //
+        // Gated on `rpc` alone (not the arm): without an rpc there is no
+        // blocking call to decouple -- the inline path is already non-blocking
+        // (dashd_fallback returns the empty set-gap immediately, gbt_xcheck_
+        // is off via set_gbt_xcheck(xcheck_wanted && rpc)).
         work_source->set_refresh_executor(
             [rpc_pool](std::function<void()> job) {
                 boost::asio::post(*rpc_pool, std::move(job));
             });
+    }
 
+    // Fallback-arm-only tip machinery (poll / ZMQ / bestblock announce /
+    // reconnect probe): on the coin-p2p arm the tip edge comes from header
+    // ingest (set_on_tip_changed -> invalidate+bump+notify), so none of this
+    // is wired there. rpc_pool above IS shared with it on the fallback arm.
+    if (!coin_p2p && rpc && stratum_server) {
         // Shared last-seen-tip dedup — the poll AND the ZMQ subscriber consult
         // it, so if both observe the same new block only the first fires the
         // refresh trio (the second is_new_tip() returns false → no-op).
@@ -8474,6 +8655,52 @@ int main(int argc, char** argv)
                       << (nofile < 65536 ? " (< 65536; hard limit too low)" : "") << "\n";
     }
 
+    // Light the CPUID-dispatched SIMD SHA256 backend (sse4 single-block, and
+    // SHA-NI where the CPU has it) before any hashing runs. The DASH daemonless
+    // replay fold recomputes the full merkleRootMNList / merkleRootQuorums every
+    // block as its reward-safety self-check, and that recompute was ~70% scalar
+    // SHA256 (single-thread CPU bound). SHA256AutoDetect() probes CPUID and
+    // installs the fastest transform the running CPU proves correct; the fold's
+    // committed-root byte-compare stays the authority, so a wrong primitive can
+    // only fail closed, never mis-fold. Byte-identical output by construction.
+    {
+        const std::string sha_backend = SHA256AutoDetect();
+        std::cout << "[init] SHA256 backend: " << sha_backend << "\n";
+        // Release defines NDEBUG, which turns AutoDetect's internal
+        // assert(SelfTest()) into a no-op -- so run an explicit KAT here that
+        // survives NDEBUG. SHA256("abc") exercises the single-block transform
+        // (the fold's leaf + pairwise-merkle hot path); a double-SHA256 of a
+        // 64-byte block exercises the CHash256 merkle-node form. A miscompiled
+        // transform aborts startup rather than folding a wrong root.
+        {
+            static const unsigned char kAbc[3] = {'a','b','c'};
+            static const unsigned char kAbcSha[32] = {
+                0xba,0x78,0x16,0xbf,0x8f,0x01,0xcf,0xea,0x41,0x41,0x40,0xde,
+                0x5d,0xae,0x22,0x23,0xb0,0x03,0x61,0xa3,0x96,0x17,0x7a,0x9c,
+                0xb4,0x10,0xff,0x61,0xf2,0x00,0x15,0xad};
+            unsigned char out[32];
+            CSHA256().Write(kAbc, 3).Finalize(out);
+            if (std::memcmp(out, kAbcSha, 32) != 0) {
+                std::cout << "[init] FATAL: SHA256 SIMD KAT failed (single-block); aborting\n";
+                return 2;
+            }
+            // double-SHA256 of 64 zero bytes == the CHash256 merkle-node form.
+            static const unsigned char kZero64[64] = {0};
+            static const unsigned char kZero64d[32] = {
+                0xe2,0xf6,0x1c,0x3f,0x71,0xd1,0xde,0xfd,0x3f,0xa9,0x99,0xdf,
+                0xa3,0x69,0x53,0x75,0x5c,0x69,0x06,0x89,0x79,0x99,0x62,0xb4,
+                0x8b,0xeb,0xd8,0x36,0x97,0x4e,0x8c,0xf9};
+            unsigned char d1[32], d2[32];
+            CSHA256().Write(kZero64, 64).Finalize(d1);
+            CSHA256().Write(d1, 32).Finalize(d2);
+            if (std::memcmp(d2, kZero64d, 32) != 0) {
+                std::cout << "[init] FATAL: SHA256 SIMD KAT failed (double/merkle); aborting\n";
+                return 2;
+            }
+            std::cout << "[init] SHA256 SIMD KAT: OK (byte-exact vs scalar goldens)\n";
+        }
+    }
+
     // Name the BLS backend unconditionally at startup: a stub (BLS-dark) node
     // is otherwise indistinguishable from an armed one until a DKG-window
     // height silently fails closed to the dashd fallback (no verifier => no
@@ -8729,6 +8956,23 @@ int main(int argc, char** argv)
             g_replay_fold_qsnapshot = argv[++i];
         else if (std::strcmp(argv[i], "--replay-fold-worklists") == 0 && i + 1 < argc)
             g_replay_fold_worklists = argv[++i];
+        // OPTIONAL, DEFAULT-OFF V20 getmnlistdiff seed (path-ii escape hatch
+        // for #154). Armed only when the operator supplies these; absent, the
+        // from-DIP3 default is untouched. Implies --replay-bulk (the fold has
+        // nothing to walk forward without the lane).
+        else if (std::strcmp(argv[i], "--replay-mnlist-seed-height") == 0 && i + 1 < argc) {
+            g_replay_mnlist_seed_height = static_cast<uint32_t>(
+                std::strtoul(argv[++i], nullptr, 10));
+            g_replay_bulk = true;
+        }
+        else if (std::strcmp(argv[i], "--replay-mnlist-seed-source") == 0 && i + 1 < argc) {
+            g_replay_mnlist_seed_source = argv[++i];
+            g_replay_bulk = true;
+        }
+        else if (std::strcmp(argv[i], "--replay-mnlist-seed-file") == 0 && i + 1 < argc) {
+            g_replay_mnlist_seed_file = argv[++i];
+            g_replay_bulk = true;
+        }
         // PR-2 FORWARD: the mined-commitment store, fed from our own replay.
         else if (std::strcmp(argv[i], "--replay-mined-commitment-index") == 0)
             g_mined_commitment_index = true;

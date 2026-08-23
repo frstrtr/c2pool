@@ -27,6 +27,7 @@
 
 #include <core/log.hpp>
 #include <core/target_utils.hpp>
+#include <core/address_utils.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -497,5 +498,39 @@ private:
             pplns_cache_.push_back({e.script, e.hash, e.type, e.weight});
     }
 };
+
+// Configure the FEE-mode operator payout identity from a node-owner address.
+// This is the DGB analogue of main_ltc.cpp's operator-identity wiring
+// (set_operator_identity fed by get_node_fee_hash160): DGB has no
+// MiningInterface bridge, so the hash160 is decoded directly from the
+// operator's base58check / bech32 payout address via core::address_to_hash160.
+//
+// Returns true iff the address decoded to a 20-byte hash160 and the identity
+// was set; on empty / undecodable input it returns false and leaves the
+// operator identity NULL (fail-safe: --redistribute fee then yields an empty
+// script, never a burn output to the all-zero hash).
+//
+// CONSENSUS-SAFE: only selects the pubkey_hash this node stamps onto shares it
+// mints from broken-credential submissions; it touches nothing on the
+// sharechain (validation / codec / PPLNS unchanged).
+inline bool set_operator_identity_from_address(Redistributor& redistributor,
+                                               const std::string& address)
+{
+    if (address.empty())
+        return false;
+    std::string addr_type;
+    const std::string h160 = core::address_to_hash160(address, addr_type);
+    if (h160.size() != 40)
+        return false;  // undecodable / non-convertible (segwit v0 P2WSH, P2TR)
+    uint160 op_hash;
+    for (int i = 0; i < 20; ++i)
+        op_hash.data()[i] = static_cast<uint8_t>(
+            std::stoul(h160.substr(i * 2, 2), nullptr, 16));
+    // addr_type: "p2sh" -> 2, everything else -> 0 (P2PKH). Matches the fallback
+    // closure's script builder in main_dgb.cpp (0x76a914..88ac for P2PKH vs
+    // 0xa914..87 for P2SH) and the ltc operator-identity convention.
+    redistributor.set_operator_identity(op_hash, (addr_type == "p2sh") ? 2 : 0);
+    return true;
+}
 
 } // namespace dgb

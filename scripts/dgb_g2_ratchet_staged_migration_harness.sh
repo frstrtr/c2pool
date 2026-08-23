@@ -185,7 +185,7 @@ check_c3_staged_accept_gate() {
   log "C3 STAGED ACCEPT GATE (#288): flat-95% desired is GATED behind 60%-by-WORK accept"
   if [ "$SIM_VOTES" -eq 1 ]; then
     log "  [sim] tail-guard: flat 95% must NOT activate below 60%-by-work -- AutoRatchetTailGuard.* KATs"
-    ctest --test-dir build_dgb -R 'AutoRatchetTailGuard' \
+    ctest --test-dir build_dgb -R '^AutoRatchetTailGuard\.' \
       --output-on-failure || die "C3 sim (#288 tail-guard) failed -- mint outran accept"
   else
     gated "C3 live mint-cannot-outrun-accept needs rigs to move work weights"
