@@ -61,6 +61,7 @@
 #include <impl/dash/coin/node_coin_state.hpp>   // coin::NodeCoinState, coin::DashWorkData seam
 #include <impl/dash/coin/serve_gate_journal.hpp> // coin::ServeGateJournal — decline rate policy (DEFECT-3)
 #include <impl/dash/coin/serve_gate_ledger.hpp>  // coin::ServeGateLedger — cumulative cross-restart never-a-reject accounting
+#include <impl/dash/coin/serve_gate_persist.hpp> // cross-restart cumulative accounting + QC-NULL-SERVE counters
 #include <impl/dash/coin/embedded_shadow_compare.hpp> // coin::EmbeddedShadowCompare — OBSERVE-only serve-vs-dashd diff
 #include <impl/dash/stratum/get_work.hpp>       // dash::stratum::get_work() fused capstone
 
@@ -381,6 +382,30 @@ public:
     /// guard against the already-mined / stale-UTXO-view class the referee
     /// cannot catch alone (h=2526403 field finding); see set_shadow_compare.
     void set_tx_serve_own_set(bool v) { tx_serve_own_set_ = v; }
+
+    /// Path to the cross-restart cumulative serve-gate state file (JSON).
+    /// Empty (default) => the cumulative accounting is OFF and this class is
+    /// byte-identical to before: no load, no save, no extra log line. When set
+    /// (--serve-gate-state-file), note_arm_decision() write-throughs the
+    /// combined prior+live roll-up + QC-NULL-SERVE counters on each roll-up
+    /// tick so a STANDING soak is readable across restarts.
+    void set_serve_gate_state_file(std::string p) { serve_gate_state_path_ = std::move(p); }
+
+    /// (b) QC-NULL-SERVE live hooks. Record one required DKG mining-window tip
+    /// and its disposition (null-served / real-served / fell-back), and one
+    /// block submission from a null-carrying template (never-a-reject
+    /// conjunct). Thread-safe (serve_gate_mutex_). The per-tip disposition call
+    /// site is the daemonless_qc_commitments fold consumer (soak-gated wiring);
+    /// note_null_submit is called from the block-submit path.
+    void note_null_serve_disposition(int llmq_type,
+                                     coin::QcNullServeCounters::Disposition d) const {
+        std::lock_guard<std::mutex> lk(serve_gate_mutex_);
+        null_serve_counters_.note(llmq_type, d);
+    }
+    void note_null_submit(bool rejected) const {
+        std::lock_guard<std::mutex> lk(serve_gate_mutex_);
+        null_serve_counters_.note_submit(rejected);
+    }
 
     /// PIN SPLICE ON THE XCHECK-SWAPPED ARM (--pin-splice-xcheck-arm).
     /// DEFAULT OFF -- this is the money path.
@@ -825,6 +850,15 @@ private:
     // ledger accumulates in memory + logs, but never persists). Set once at
     // wiring time; read on the hourly flush. Guarded by serve_gate_mutex_.
     std::string                      serve_gate_ledger_path_;
+    // Cross-restart cumulative accounting (flag-gated by serve_gate_state_path_).
+    // serve_gate_prior_ is the PRIOR-process state loaded once at the first
+    // roll-up tick; null_serve_counters_ are this process's live QC-NULL-SERVE
+    // tallies. Both guarded by serve_gate_mutex_; combine()+save happen OFF the
+    // lock in note_arm_decision. Empty path => all of this stays dormant.
+    std::string                        serve_gate_state_path_;
+    mutable coin::ServeGateCumulative  serve_gate_prior_;
+    mutable bool                       serve_gate_prior_loaded_{false};
+    mutable coin::QcNullServeCounters  null_serve_counters_;
 
     // ── Serve-staleness observation (lock-free by requirement) ─────────────
     // Written on the serve path (get_current_work_template /

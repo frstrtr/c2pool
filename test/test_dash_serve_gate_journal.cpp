@@ -29,6 +29,13 @@
 
 #include <impl/dash/coin/serve_gate_journal.hpp>
 #include <impl/dash/coin/serve_gate_rollup_json.hpp>
+#include <impl/dash/coin/serve_gate_persist.hpp>
+
+#include <cstdio>
+#include <fstream>
+
+#include <unistd.h>  // getpid
+
 
 #include <string>
 
@@ -384,6 +391,251 @@ TEST(DashServeGateJournal, RollupJsonShapePinsTheWebField) {
     EXPECT_EQ(empty["off_embedded_sec"].get<int64_t>(), 0);
     EXPECT_TRUE(empty["per_cause"].is_array());
     EXPECT_TRUE(empty["per_cause"].empty());
+}
+
+
+// ── NULL-ARM DKG-FLOOR COVERAGE: cross-restart cumulative accounting ─────────
+//
+// THE DEFECT THIS PINS (hotel-primary, 2026-08-23): the [EMBED-GATE-ROLLUP]
+// denominator `observed=` equals wall clock since the LAST restart (7211 s at
+// the 06:00 tick for a 04:00 restart), because ServeGateJournal is pure policy
+// and every counter resets with the process. So the dashd-cut gate that
+// matters — "the null-arm covered the 4.51% DKG floor with 0 rejects over a
+// STANDING soak" — was unprovable program-level, and there was no explicit
+// null-served counter at all. serve_gate_persist.hpp is the write-through
+// cumulative layer that closes both halves.
+//
+// RED ON MASTER: serve_gate_persist.hpp does not exist there, so this TU does
+// not COMPILE — the intended failure this branch turns green (same red shape
+// as NoWorkIsTheDistinctThirdArmState above).
+
+using dash::coin::QcNullServeCounters;
+using dash::coin::ServeGateCumulative;
+using Disposition = dash::coin::QcNullServeCounters::Disposition;
+
+inline std::string na_temp_path(const char* tag) {
+    std::string p = ::testing::TempDir();
+    if (!p.empty() && p.back() != '/') p += '/';
+    p += "na_serve_gate_";
+    p += tag;
+    p += "_";
+    p += std::to_string(static_cast<long long>(::getpid()));
+    p += ".json";
+    std::remove(p.c_str());
+    return p;
+}
+
+// THE CORE GAP: cumulative observed/off-embedded/per-cause seconds AND the
+// null-serve counters survive a restart and ACCUMULATE across processes, and
+// restart_count records how many processes covered the soak. On master the
+// only cumulative view is per-process; this proves the wipe is gone.
+TEST(DashServeGateCumulative, StateSurvivesRestartAndAccumulates) {
+    const std::string path = na_temp_path("restart");
+
+    // ── process 1 ────────────────────────────────────────────────────────
+    ServeGateJournal j1(1000000);
+    j1.observe(false, "qc-plan-underivable", 0);
+    j1.observe(true, "", 10);                 // 10 s off-embedded on qc-plan
+    // ... serving continues; roll-up read at t=100.
+    ServeGateCumulative prior1 = dash::coin::load_serve_gate_state(path);
+    EXPECT_EQ(prior1.restart_count, 1);       // fresh file: first process
+    EXPECT_EQ(prior1.observed_sec, 0);
+
+    QcNullServeCounters c1;
+    c1.note(4, Disposition::NullServed);
+    c1.note(4, Disposition::NullServed);
+    c1.note(4, Disposition::NullServed);
+    c1.note(2, Disposition::NullServed);
+    c1.note_submit(false);
+    c1.note_submit(false);
+
+    ServeGateCumulative cum1 = dash::coin::combine(prior1, j1.rollup(100), c1);
+    EXPECT_EQ(cum1.restart_count, 1);
+    EXPECT_EQ(cum1.observed_sec, 100);
+    EXPECT_EQ(cum1.off_embedded_sec, 10);
+    ASSERT_EQ(cum1.cause_totals.count("qc-plan-underivable"), 1u);
+    EXPECT_EQ(cum1.cause_totals["qc-plan-underivable"], 10);
+    EXPECT_EQ(cum1.null_serve.total_null_served(), 4);
+    EXPECT_EQ(cum1.null_serve.submits_from_null, 2);
+    EXPECT_EQ(cum1.null_serve.rejects_from_null, 0);
+    ASSERT_TRUE(dash::coin::save_serve_gate_state_atomic(path, cum1));
+
+    // ── process 2 (a restart) ────────────────────────────────────────────
+    ServeGateCumulative prior2 = dash::coin::load_serve_gate_state(path);
+    EXPECT_EQ(prior2.restart_count, 2);       // bumped: second process
+    EXPECT_EQ(prior2.observed_sec, 100);      // process 1's denominator carried
+    EXPECT_EQ(prior2.off_embedded_sec, 10);
+    EXPECT_EQ(prior2.cause_totals["qc-plan-underivable"], 10);
+    EXPECT_EQ(prior2.null_serve.total_null_served(), 4);
+
+    ServeGateJournal j2(1000000);
+    j2.observe(false, "dmn-stale", 0);
+    j2.observe(true, "", 5);                   // 5 s off-embedded on dmn-stale
+    QcNullServeCounters c2;
+    c2.note(4, Disposition::RealServed);       // a real quorum existed -> NOT null
+    c2.note(4, Disposition::RealServed);
+    c2.note(4, Disposition::FellBack);         // freshness unproven -> fail-closed
+
+    ServeGateCumulative cum2 = dash::coin::combine(prior2, j2.rollup(50), c2);
+    EXPECT_EQ(cum2.restart_count, 2);
+    EXPECT_EQ(cum2.observed_sec, 150);         // 100 + 50, across processes
+    EXPECT_EQ(cum2.off_embedded_sec, 15);      // 10 + 5
+    EXPECT_EQ(cum2.cause_totals["qc-plan-underivable"], 10);  // process 1's
+    EXPECT_EQ(cum2.cause_totals["dmn-stale"], 5);             // process 2's
+    EXPECT_EQ(cum2.null_serve.total_null_served(), 4);        // carried
+    EXPECT_EQ(cum2.null_serve.total_real_served(), 2);        // this process
+    EXPECT_EQ(cum2.null_serve.total_fell_back(), 1);
+    EXPECT_EQ(cum2.null_serve.total_window_open(), 7);        // 4 + 2 + 1
+    ASSERT_TRUE(dash::coin::save_serve_gate_state_atomic(path, cum2));
+
+    // ── process 3: the accumulation is durable ───────────────────────────
+    ServeGateCumulative prior3 = dash::coin::load_serve_gate_state(path);
+    EXPECT_EQ(prior3.restart_count, 3);
+    EXPECT_EQ(prior3.observed_sec, 150);
+    EXPECT_EQ(prior3.off_embedded_sec, 15);
+    EXPECT_EQ(prior3.null_serve.total_null_served(), 4);
+    EXPECT_EQ(prior3.null_serve.total_real_served(), 2);
+    EXPECT_EQ(prior3.null_serve.total_fell_back(), 1);
+    EXPECT_EQ(prior3.null_serve.submits_from_null, 2);
+    EXPECT_EQ(prior3.null_serve.rejects_from_null, 0);
+
+    std::remove(path.c_str());
+}
+
+// SERVE-EXACTNESS, expressed as the counter invariant: a required mining-window
+// tip takes EXACTLY one disposition, so window_open == null + real + fell_back
+// per type; the null-arm is counted as null ONLY on the floor tips and as real
+// wherever a verified commitment existed (it was never consulted there). Plus
+// the never-a-reject conjunct: submits from null-carrying templates > 0,
+// rejects == 0. Round-trips through the state file unchanged.
+TEST(DashServeGateCumulative, NullServeCountersLockServeExactness) {
+    QcNullServeCounters n;
+
+    // DKG-floor tips (phase-10 type-4, window-open type-2): the null was served.
+    for (int i = 0; i < 13; ++i) n.note(4, Disposition::NullServed);
+    n.note(2, Disposition::NullServed);
+
+    // A verified real commitment existed for the slot: the null-arm is NEVER
+    // consulted here (verified_for precedes null_evidence). Counted as REAL.
+    for (int i = 0; i < 5; ++i) n.note(4, Disposition::RealServed);
+    n.note(2, Disposition::RealServed);
+    n.note(2, Disposition::RealServed);
+
+    // Freshness unproven: the whole height fails closed to fallback (benign gap).
+    n.note(4, Disposition::FellBack);
+
+    // Block submissions from null-carrying templates — none rejected.
+    for (int i = 0; i < 8; ++i) n.note_submit(false);
+
+    // The dispositions are distinct and correctly bucketed.
+    EXPECT_EQ(n.null_served[4], 13);
+    EXPECT_EQ(n.null_served[2], 1);
+    EXPECT_EQ(n.real_served[4], 5);
+    EXPECT_EQ(n.real_served[2], 2);
+    EXPECT_EQ(n.fell_back[4], 1);
+
+    // THE INVARIANT: every window-open tip took exactly one disposition, so the
+    // null-arm can neither double-count nor fire on a real-quorum tip.
+    EXPECT_EQ(n.window_open[4], 13 + 5 + 1);
+    EXPECT_EQ(n.window_open[2], 1 + 2);
+    EXPECT_EQ(n.total_window_open(),
+              n.total_null_served() + n.total_real_served() + n.total_fell_back());
+
+    // Never-a-reject conjunct.
+    EXPECT_EQ(n.submits_from_null, 8);
+    EXPECT_EQ(n.rejects_from_null, 0);
+
+    // Survives persistence byte-for-byte (bump_restart=false to compare exactly).
+    const std::string path = na_temp_path("exact");
+    ServeGateCumulative c;
+    c.null_serve = n;
+    ASSERT_TRUE(dash::coin::save_serve_gate_state_atomic(path, c));
+    ServeGateCumulative back =
+        dash::coin::load_serve_gate_state(path, /*bump_restart=*/false);
+    EXPECT_EQ(back.null_serve.null_served[4], 13);
+    EXPECT_EQ(back.null_serve.real_served[4], 5);
+    EXPECT_EQ(back.null_serve.fell_back[4], 1);
+    EXPECT_EQ(back.null_serve.window_open[2], 3);
+    EXPECT_EQ(back.null_serve.submits_from_null, 8);
+    EXPECT_EQ(back.null_serve.rejects_from_null, 0);
+    std::remove(path.c_str());
+}
+
+// A missing OR corrupt state file yields a clean zero (still counted as a
+// restart) — the soak file is a convenience, never a consensus input, so a bad
+// read must never wedge the node or invent totals.
+TEST(DashServeGateCumulative, MissingOrCorruptFileYieldsCleanZero) {
+    // Missing.
+    const std::string missing = na_temp_path("missing");
+    ServeGateCumulative m = dash::coin::load_serve_gate_state(missing);
+    EXPECT_EQ(m.restart_count, 1);
+    EXPECT_EQ(m.observed_sec, 0);
+    EXPECT_EQ(m.off_embedded_sec, 0);
+    EXPECT_TRUE(m.cause_totals.empty());
+    EXPECT_EQ(m.null_serve.total_window_open(), 0);
+
+    // Corrupt: half-written JSON must not throw, must reset to zero.
+    const std::string corrupt = na_temp_path("corrupt");
+    {
+        std::ofstream out(corrupt);
+        out << "{ \"observed_sec\": 999, this is not valid js";
+    }
+    ServeGateCumulative c = dash::coin::load_serve_gate_state(corrupt);
+    EXPECT_EQ(c.restart_count, 1);   // still counted
+    EXPECT_EQ(c.observed_sec, 0);    // NOT the 999 from the truncated file
+    EXPECT_TRUE(c.cause_totals.empty());
+    std::remove(corrupt.c_str());
+}
+
+// combine() = prior + live, and prior never absorbs the live part, so saving on
+// every roll-up tick is idempotent: two saves in one process from a growing
+// rollup REPLACE rather than add (20 s, not 10+20=30).
+TEST(DashServeGateCumulative, CombineIsReplaceNotAddWithinOneProcess) {
+    const std::string path = na_temp_path("replace");
+    ServeGateCumulative prior;  // frozen zero
+
+    ServeGateJournal j(1000000);
+    j.observe(false, "cause-x", 0);            // opens an off-embedded segment
+
+    // Tick 1 at t=10.
+    ASSERT_TRUE(dash::coin::save_serve_gate_state_atomic(
+        path, dash::coin::combine(prior, j.rollup(10), {})));
+    // Tick 2 at t=20 — SAME frozen prior, larger live rollup.
+    ASSERT_TRUE(dash::coin::save_serve_gate_state_atomic(
+        path, dash::coin::combine(prior, j.rollup(20), {})));
+
+    ServeGateCumulative loaded =
+        dash::coin::load_serve_gate_state(path, /*bump_restart=*/false);
+    EXPECT_EQ(loaded.observed_sec, 20);        // replace, not 30
+    EXPECT_EQ(loaded.off_embedded_sec, 20);
+    EXPECT_EQ(loaded.cause_totals["cause-x"], 20);
+    std::remove(path.c_str());
+}
+
+// The operator log lines render the cumulative shape: denominator first, the
+// never-a-reject conjunct visible, per-type null/real breakout present.
+TEST(DashServeGateCumulative, LogLinesRenderCumulativeShape) {
+    ServeGateCumulative c;
+    c.restart_count = 3;
+    c.observed_sec = 200;
+    c.off_embedded_sec = 20;
+    c.cause_totals["qc-plan-underivable"] = 18;
+    c.null_serve.note(4, Disposition::NullServed);
+    c.null_serve.note(4, Disposition::RealServed);
+    c.null_serve.note_submit(false);
+
+    const std::string roll = dash::coin::cumulative_rollup_line(c);
+    EXPECT_NE(roll.find("[EMBED-GATE-ROLLUP-CUM]"), std::string::npos);
+    EXPECT_NE(roll.find("restarts=3"), std::string::npos);
+    EXPECT_NE(roll.find("observed=200s"), std::string::npos);
+    EXPECT_NE(roll.find("qc-plan-underivable=18s"), std::string::npos);
+
+    const std::string ns = dash::coin::qc_null_serve_line(c.null_serve);
+    EXPECT_NE(ns.find("[QC-NULL-SERVE]"), std::string::npos);
+    EXPECT_NE(ns.find("null=1"), std::string::npos);
+    EXPECT_NE(ns.find("real=1"), std::string::npos);
+    EXPECT_NE(ns.find("rejects=0"), std::string::npos);
+    EXPECT_NE(ns.find("type4:"), std::string::npos);
 }
 
 }  // namespace

@@ -302,6 +302,12 @@ std::string g_replay_mnlist_seed_file;        // --replay-mnlist-seed-file FILE 
 // serve are both fine WITHOUT proving the serve is daemonless.
 bool        g_no_dashd_mn_seed = false;       // --embedded-no-dashd-mn-seed
 
+// --serve-gate-state-file: path to the cross-restart cumulative serve-gate
+// accounting state (JSON). Empty (default) => OFF; the serve path is
+// byte-identical. Non-consensus, non-reward: a soak convenience whose
+// bad read fails to a clean zero and never wedges the node.
+std::string g_serve_gate_state_file;           // --serve-gate-state-file
+
 // ── PR-2 FORWARD: --replay-mined-commitment-index ─────────────────────────
 // Arms the forward half of dashd's mined-commitment store
 // (mined_commitment_index.hpp, ported from v23.1.7 llmq/blockprocessor.cpp)
@@ -2866,6 +2872,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         work_source->set_serve_gate_ledger_path(ledger_path, "dev");
 #endif
     }
+    // Cross-restart cumulative serve-gate accounting. Empty path keeps the
+    // per-process behaviour byte-for-byte; when set, note_arm_decision()
+    // write-throughs the combined prior+live roll-up + QC-NULL-SERVE
+    // counters so a STANDING soak is readable across restarts.
+    work_source->set_serve_gate_state_file(g_serve_gate_state_file);
+    if (!g_serve_gate_state_file.empty())
+        std::cout << "[run] serve-gate cumulative accounting ARMED: state="
+                  << g_serve_gate_state_file << "\n";
     // Pin splice on the xcheck-SWAPPED arm (default OFF). Announce the state
     // either way: with it off the donation still misses every swapped
     // template -- it just no longer does so silently.
@@ -8978,6 +8992,12 @@ int main(int argc, char** argv)
             bestcl_policy = argv[++i];
         else if (std::strcmp(argv[i], "--coinbase-text") == 0 && i + 1 < argc)
             coinbase_text = argv[++i];
+        // Cross-restart cumulative serve-gate accounting (#127 follow-up):
+        // path to a small JSON state file. Empty (default) => OFF and the
+        // serve path is byte-identical. Non-consensus, non-reward: a soak
+        // convenience whose bad read fails to a clean zero, never wedges.
+        else if (std::strcmp(argv[i], "--serve-gate-state-file") == 0 && i + 1 < argc)
+            g_serve_gate_state_file = argv[++i];
         else if (std::strcmp(argv[i], "--embedded-oracle-shadow") == 0)
             embedded_oracle_shadow = true;
         else if (std::strcmp(argv[i], "--embedded-shadow-compare") == 0)
