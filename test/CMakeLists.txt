@@ -1193,6 +1193,10 @@ if (BUILD_TESTING AND GTest_FOUND)
     #                       mutation case.
     add_executable(test_dash_stratum_work_source
         test_dash_stratum_work_source.cpp
+        # test_dash_tx_serve_referee.cpp: internal-consistency referee unit KAT
+        # (tx_serve_referee.hpp). Folded into this already-built target (it links
+        # the full dash_stratum set the referee header needs) per the #769 rule.
+        test_dash_tx_serve_referee.cpp
         test_dash_submit_gate_scaling.cpp
         test_dash_serve_staleness_seam.cpp
         test_dash_serve_staleness_unit.cpp

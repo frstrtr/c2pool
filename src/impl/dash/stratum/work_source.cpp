@@ -43,6 +43,7 @@
 #include <impl/dash/params.hpp>               // dash::make_coin_params
 #include <impl/dash/coin/vendor/cbtx.hpp>     // vendor::parse_cbtx (GBT-xcheck creditPool)
 #include <impl/dash/coin/special_tx_pool_delta.hpp> // #107: explain the pool delta
+#include <impl/dash/coin/tx_serve_referee.hpp>  // tx-serve internal-consistency referee (own-set vs dashd-parity)
 #include <impl/dash/coin/serve_staleness.hpp> // serve-staleness sentinel (steady_now_ms + the incident catalogue)
 
 #include <core/address_utils.hpp>             // core::address_to_script (mint payout from username)
@@ -1121,25 +1122,92 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                     const uint256 dref_txroot =
                         coin::compute_merkle_root(dref.m_tx_hashes);
                     if (emb_txroot != dref_txroot) {
-                        LOG_WARNING << "[DASH-STRATUM-GBT] GBT-xcheck tx-merkleroot"
-                                    << " MISMATCH at h=" << sel.work.m_height
-                                    << " embedded txs=" << sel.work.m_tx_hashes.size()
-                                    << " root=" << emb_txroot.GetHex().substr(0, 16)
-                                    << " dashd txs=" << dref.m_tx_hashes.size()
-                                    << " root=" << dref_txroot.GetHex().substr(0, 16)
-                                    << " — serving dashd template (reward-safety"
-                                       " backstop: a divergent mempool tx selection"
-                                       " / commitment order is the bad-txns-"
-                                       "merkleroot orphan vector)";
-                        coin::DeclineReport xcheck;
-                        xcheck.viable    = false;
-                        xcheck.cause     = "gbt-xcheck-txmerkle-mismatch";
-                        xcheck.value     = emb_txroot.GetHex();
-                        xcheck.threshold = dref_txroot.GetHex();
-                        sel = coin::WorkSelection{ std::move(dref),
-                                                   coin::WorkSource::DashdFallback,
-                                                   std::move(xcheck) };
-                        served_via_xcheck_swap = true;
+                        // The embedded selection DIVERGES from dashd's. Two
+                        // independently-connected nodes never hold identical
+                        // mempools, so a divergent-but-VALID set is NORMAL and
+                        // yields a perfectly valid block. Whether we may serve
+                        // OUR OWN set or must fall back to dashd is decided
+                        // here, per --embedded-tx-serve-own-set:
+                        //
+                        //   OFF (default, shipped posture): the legacy dashd-
+                        //   PARITY backstop -- swap to dashd on ANY divergence
+                        //   (cause gbt-xcheck-txmerkle-mismatch). Byte-
+                        //   identical to before this change.
+                        //
+                        //   ON: run the INTERNAL-CONSISTENCY referee
+                        //   (tx_serve_referee.hpp): coinbase fee-exact, every
+                        //   served tx fee_fold_proven, no intra-set double-
+                        //   spend. The referee shares the selector's UTXO
+                        //   view, so it CANNOT catch a tx that view still
+                        //   shows unspent while dashd sees it spent (already-
+                        //   mined / stale-view class, field-observed at
+                        //   h=2526403: probed=4 invalid=4 on fee_fold_proven
+                        //   txs). The MEMPOOL VALIDITY GATE catches exactly
+                        //   that class via dashd testmempoolaccept over a
+                        //   sustained clean window, so when a shadow-compare
+                        //   probe is bound we require it OPEN before trusting
+                        //   the referee. With NO probe bound (pure daemonless,
+                        //   post-proof) the operator's arming of the flag is
+                        //   the proof. Either way, failure fail-closes to
+                        //   dashd -- safety is preserved on every branch.
+                        const bool gate_proven =
+                            !shadow_compare_ || shadow_compare_->validity_gate_open();
+                        coin::TxServeRefereeVerdict rv;
+                        const bool serve_own =
+                            tx_serve_own_set_ && gate_proven
+                            && (rv = coin::tx_serve_internal_referee(sel.work))
+                                   .serve_own_set;
+                        if (serve_own) {
+                            // SERVE OUR OWN VALID SET. The dashd divergence is
+                            // a SHADOW (diagnostic), not a fallback trigger.
+                            tx_serve_own_set_serves_.fetch_add(
+                                1, std::memory_order_relaxed);
+                            LOG_INFO << "[DASH-STRATUM-GBT] tx-serve OWN-SET at h="
+                                     << sel.work.m_height
+                                     << " embedded txs=" << sel.work.m_tx_hashes.size()
+                                     << " root=" << emb_txroot.GetHex().substr(0, 16)
+                                     << " != dashd txs=" << dref.m_tx_hashes.size()
+                                     << " root=" << dref_txroot.GetHex().substr(0, 16)
+                                     << " â SERVING OWN VALID SET (" << rv.detail
+                                     << "); a different-but-valid selection is not"
+                                        " a fallback trigger";
+                            // sel stays Embedded â NO swap.
+                        } else {
+                            // FAIL-CLOSE to dashd. Own-set OFF (legacy parity),
+                            // validity gate not yet proven-open, or the referee
+                            // refused an internal-consistency defect.
+                            std::string cause =
+                                !tx_serve_own_set_
+                                    ? std::string("gbt-xcheck-txmerkle-mismatch")
+                                    : (!gate_proven
+                                           ? std::string("tx-serve-validity-gate-not-open")
+                                           : rv.fail_cause);
+                            if (tx_serve_own_set_)
+                                tx_serve_own_set_failclose_.fetch_add(
+                                    1, std::memory_order_relaxed);
+                            LOG_WARNING << "[DASH-STRATUM-GBT] GBT-xcheck tx-merkleroot"
+                                        << " MISMATCH at h=" << sel.work.m_height
+                                        << " embedded txs=" << sel.work.m_tx_hashes.size()
+                                        << " root=" << emb_txroot.GetHex().substr(0, 16)
+                                        << " dashd txs=" << dref.m_tx_hashes.size()
+                                        << " root=" << dref_txroot.GetHex().substr(0, 16)
+                                        << " â serving dashd template (cause="
+                                        << cause
+                                        << (tx_serve_own_set_ && !gate_proven
+                                                ? "; own-set armed but validity"
+                                                  " gate not open"
+                                                : "")
+                                        << ")";
+                            coin::DeclineReport xcheck;
+                            xcheck.viable    = false;
+                            xcheck.cause     = cause;
+                            xcheck.value     = emb_txroot.GetHex();
+                            xcheck.threshold = dref_txroot.GetHex();
+                            sel = coin::WorkSelection{ std::move(dref),
+                                                       coin::WorkSource::DashdFallback,
+                                                       std::move(xcheck) };
+                            served_via_xcheck_swap = true;
+                        }
                     }
                 }
             }
@@ -1553,6 +1621,17 @@ nlohmann::json DASHWorkSource::embedded_arm_status_json() const
     // from the operator surface, not inferred from log archaeology.
     j["serve_recheck_fail_count"] =
         serve_recheck_fail_count_.load(std::memory_order_relaxed);
+
+    // --embedded-tx-serve-own-set observability (lock-free). serves = times a
+    // divergent-from-dashd mempool selection was served as OUR OWN valid set
+    // (internal-consistency referee passed AND the validity gate was proven
+    // open); failclose = times such a divergence fell back to dashd (own-set
+    // off, validity gate not open, or a referee defect). Both zero until the
+    // flag is armed.
+    j["tx_serve_own_set_serves"] =
+        tx_serve_own_set_serves_.load(std::memory_order_relaxed);
+    j["tx_serve_own_set_failclose"] =
+        tx_serve_own_set_failclose_.load(std::memory_order_relaxed);
 
     // TRY_LOCK, not lock_guard. serve_gate_mutex_ is taken by the SERVE PATH
     // (note_arm_decision, :759; the found-block ledger, :1478). Blocking here
