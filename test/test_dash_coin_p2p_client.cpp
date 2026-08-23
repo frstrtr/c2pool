@@ -736,4 +736,96 @@ TEST(DashCoinP2PClient, pool_tick_timer_is_actually_armed_on_the_io_context)
            "clock-driven test above would still pass with the tick deleted";
 }
 
+// ── (e) Mempool-ingest completeness — DSTX visibility + body-busy retry ─────
+//
+// Two mechanisms the daemonless mempool-ingest lane depends on, pinned here:
+//
+//   1. tx_ingest_status() surfaces the DSTX counters. dashd announces CoinJoin
+//      broadcast txs ONLY via inv(MSG_DSTX=16), never MSG_TX, so the whole
+//      DSTX class — 17.2 % of mined block txs, ~half the mempool BYTES — is
+//      invisible in [MEMPOOL-INGEST] logs unless the counters the client
+//      already keeps are printed. An armed DSTX lane is unmeasurable without
+//      them.
+//
+//   2. A tx/dstx inv admitted by InvDedup but skipped because a tip body was
+//      in flight is PARKED and re-issued when the body clears — not stranded
+//      behind the 600 s InvDedup TTL (which suppresses every re-announcement
+//      from every peer, losing the tx until the entry ages out, by which time
+//      it is usually already mined).
+
+TEST(DashCoinP2PIngest, dstx_counters_are_visible_in_tx_ingest_status)
+{
+    ClientRig rig;
+    rig.wire_connected();
+    rig.deliver(rig.peer_version(70230, /*services=*/5, /*height=*/2526000,
+                                 "/Dash Core:21.1.0/"));
+    rig.deliver(dash::coin::p2p::message_verack::make_raw());
+    ASSERT_TRUE(rig.client.is_handshake_complete());
+
+    // Arm the DSTX lane (the --embedded-ingest-dstx runtime opt-in).
+    rig.client.set_dstx_pull(true);
+
+    // dashd announces a mixing tx as inv(MSG_DSTX=16) — the inv hash is the
+    // plain txid. With no tip body in flight it earns a getdata immediately
+    // and the counters the client keeps must move.
+    auto dstx_inv = dash::coin::p2p::message_inv::make_raw(
+        std::vector<dash::coin::p2p::inventory_type>{
+            dash::coin::p2p::inventory_type(
+                dash::coin::p2p::inventory_type::dstx, uint256::ONE)});
+    rig.deliver(std::move(dstx_inv));
+
+    const std::string status = rig.client.tx_ingest_status();
+    // RED on the pre-change code: tx_ingest_status() never prints a dstx
+    // field, so the armed lane cannot be measured. GREEN with the instrument.
+    EXPECT_NE(status.find("dstx_inv=1"), std::string::npos) << status;
+    EXPECT_NE(status.find("dstx_getdata=1"), std::string::npos) << status;
+    EXPECT_NE(status.find("dstx_received=0"), std::string::npos) << status;
+}
+
+TEST(DashCoinP2PIngest, tx_inv_skipped_while_body_in_flight_is_retried_not_stranded)
+{
+    ClientRig rig;
+    rig.wire_connected();
+    rig.deliver(rig.peer_version(70230, /*services=*/5, /*height=*/2526000,
+                                 "/Dash Core:21.1.0/"));
+    rig.deliver(dash::coin::p2p::message_verack::make_raw());
+    ASSERT_TRUE(rig.client.is_handshake_complete());
+    ASSERT_GE(rig.client.handshaked_peer_count(), 1u);
+
+    rig.client.set_tx_pull(true);
+
+    // A tracked tip body is in flight — strict priority means no tx getdata
+    // may go out while it is outstanding.
+    rig.client.request_block_tracked(uint256::ONE);
+    ASSERT_GE(rig.client.pending_body_count(), 1u);
+
+    // A tx inv arrives while the body is outstanding: admitted by InvDedup,
+    // then skipped by the tip-body-priority rule.
+    const uint256 txid = uint256(static_cast<uint64_t>(0xAAull));
+    auto tx_inv = dash::coin::p2p::message_inv::make_raw(
+        std::vector<dash::coin::p2p::inventory_type>{
+            dash::coin::p2p::inventory_type(
+                dash::coin::p2p::inventory_type::tx, txid)});
+    rig.deliver(std::move(tx_inv));
+
+    // Skipped: nothing in flight yet, and the announcement was parked.
+    EXPECT_EQ(rig.client.tx_pull_inflight(), 0u);
+    EXPECT_EQ(rig.client.tx_pull_sent_count(), 0u);
+    EXPECT_EQ(rig.client.tx_pull_skipped_busy_count(), 1u);
+    EXPECT_EQ(rig.client.tx_retry_busy_count(), 1u);
+
+    // The tip body lands — pending bodies clear. The next pool tick must
+    // re-issue the parked getdata.
+    rig.client.clear_pending_bodies_for_test();
+    rig.client.tick_for_test();
+
+    // RED on the pre-change code: the skipped inv is never re-pulled (stranded
+    // behind the 600 s InvDedup TTL), so tx_pull_inflight() stays 0 forever.
+    // GREEN with the retry queue: exactly one getdata is now in flight.
+    EXPECT_EQ(rig.client.tx_pull_inflight(), 1u);
+    EXPECT_EQ(rig.client.tx_pull_sent_count(), 1u);
+    EXPECT_EQ(rig.client.tx_retry_busy_count(), 0u);
+    EXPECT_EQ(rig.client.tx_retry_drained_count(), 1u);
+}
+
 } // namespace
