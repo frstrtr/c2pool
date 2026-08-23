@@ -113,9 +113,9 @@ inline DashChainParams make_dash_chain_params_mainnet() {
     // verify). The coincidence is machine-enforced by that KAT, so the two
     // pins can never silently drift apart again.
     p.fast_start_checkpoint = DashChainParams::Checkpoint{};
-    p.fast_start_checkpoint->height = 2513000;
+    p.fast_start_checkpoint->height = 2522504;
     p.fast_start_checkpoint->hash.SetHex(
-        "000000000000002114d621d90f28b52c07746414491cbffc7cd373b3a56bc950");
+        "0000000000000016359051c239e552f2423a9f47585dda1273a9a0e1743d64f5");
     // The FULL header of the anchor block (mainnet 2513000), so the cold seed
     // populates entry.header — not just entry.hash. Without it the seeded
     // IndexEntry carries a default (all-zero) hashMerkleRoot, and the DIP-4
@@ -132,12 +132,12 @@ inline DashChainParams make_dash_chain_params_mainnet() {
     p.fast_start_checkpoint->has_header = true;
     p.fast_start_checkpoint->hdr_version = 536870912u;   // 0x20000000
     p.fast_start_checkpoint->hdr_prev_block.SetHex(
-        "000000000000002affa937f36922946849675632312981c160133b94365408c1");
+        "000000000000001ba36f24ad2f5c2a8fbe7a5bddcd87c05ceb175fbfaf66cef3");
     p.fast_start_checkpoint->hdr_merkle_root.SetHex(
-        "01470ce31e4ec9934a229f6eef4c9f561e42898be48d0bd646ab80f4bcc15b9c");
-    p.fast_start_checkpoint->hdr_time  = 1785337727u;
-    p.fast_start_checkpoint->hdr_bits  = 0x192cf712u;
-    p.fast_start_checkpoint->hdr_nonce = 3457493362u;
+        "68a1e828b55bddf70048e5ea8403aa2c7c0ae2e7e9d73cd8fe066feb352c88b3");
+    p.fast_start_checkpoint->hdr_time  = 1786835924u;
+    p.fast_start_checkpoint->hdr_bits  = 0x19251a49u;
+    p.fast_start_checkpoint->hdr_nonce = 3493802570u;
     return p;
 }
 
