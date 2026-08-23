@@ -2382,7 +2382,7 @@ private:
                             << discriminating_hash_tail(m_state.sml_current_hash())
                             << " != tip ..." << discriminating_hash_tail(m_hdr_prev_hash)
                             << ") — re-requesting getmnlistd (attempt "
-                            << req->attempt << "/3) before the doomed-tip demote";
+                            << req->attempt << ") before the doomed-tip demote";
                 m_on_sml_rerequest(req->base, req->target);
             }
         }
