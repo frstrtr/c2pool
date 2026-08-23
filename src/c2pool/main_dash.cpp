@@ -295,12 +295,26 @@ uint32_t    g_replay_mnlist_seed_height = 0;  // --replay-mnlist-seed-height H (
 std::string g_replay_mnlist_seed_source;      // --replay-mnlist-seed-source getmnlistdiff
 std::string g_replay_mnlist_seed_file;        // --replay-mnlist-seed-file FILE (offline snapshot)
 // --embedded-no-dashd-mn-seed: cut the PAYEE axis off from dashd while KEEPING
-// the dashd RPC for the OBSERVE-only shadow-compare. The E2c `protx list` seed
-// and the E2d checkpoint bridge are both skipped, so the root-checked replay
-// fold is the only thing that can populate the payee queue. Exists to make a
-// parity run measurable: a run that was dashd-seeded proves the fold and the
-// serve are both fine WITHOUT proving the serve is daemonless.
+// the dashd RPC for the OBSERVE-only shadow-compare. Only the E2c `protx list`
+// seed is disabled; the DAEMONLESS E2d checkpoint bridge STAYS ARMED so the
+// payee/MN axis still bootstraps without dashd (compiled trust anchor + P2P
+// getmnlistd anchor SML, DIP-4 self-checked against our own PoW header chain,
+// per-block merkleRootMNList forward fold — fail-closed). This is the hotel
+// cut-rehearsal posture: serve daemonless, keep the RPC observe-only for the
+// shadow-compare and the reward-safe fallback arm.
+//   Provenance guarantee UNCHANGED: with this flag the payee source can only
+//   ever be the mn-ckpt bridge or the replay fold, NEVER a dashd seed — the
+//   E2c `protx list` seed is the one thing this flag cuts.
 bool        g_no_dashd_mn_seed = false;       // --embedded-no-dashd-mn-seed
+
+// --embedded-fold-only-proof: the STRICT measurement posture (the old meaning
+// of --embedded-no-dashd-mn-seed). Requires --embedded-no-dashd-mn-seed. On top
+// of cutting the E2c dashd seed it ALSO leaves the E2d checkpoint bridge UNARMED,
+// so the ROOT-CHECKED REPLAY FOLD (behind the --replay-* lanes) is the only
+// thing that may populate the payee queue. Exists for the .211 LAN parity runs
+// that want to isolate "the replay serves correctly" from "the bridge seeded it".
+// Default OFF: a plain --embedded-no-dashd-mn-seed now ARMS the bridge.
+bool        g_fold_only_proof = false;        // --embedded-fold-only-proof
 
 // --serve-gate-state-file: path to the cross-restart cumulative serve-gate
 // accounting state (JSON). Empty (default) => OFF; the serve path is
@@ -446,7 +460,7 @@ void print_banner(const char* argv0)
         << "           [--replay-fold-qsnapshot FILE] [--replay-fold-worklists FILE]\n"
         << "           [--replay-mnlist-seed-height H --replay-mnlist-seed-source getmnlistdiff --replay-mnlist-seed-file FILE]\n"
         << "           [--replay-mined-commitment-index]\n"
-        << "           [--embedded-no-dashd-mn-seed]\n"
+        << "           [--embedded-no-dashd-mn-seed [--embedded-fold-only-proof]]\n"
         << "           [--oracle-graduation-blocks N] [--oracle-class-coverage K]\n"
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
         << "           [--redistribute pplns|fee|boost|donate]\n"
@@ -600,10 +614,12 @@ void print_banner(const char* argv0)
         << "        naming the rule) — it is never half-resumed. Use this flag\n"
         << "        to measure cold-vs-warm on one binary.\n"
         << "        --embedded-no-dashd-mn-seed cuts the PAYEE axis off from a\n"
-        << "        configured dashd (no `protx list` seed, no checkpoint\n"
-        << "        bridge) while KEEPING the RPC for --embedded-shadow-compare:\n"
-        << "        the posture in which a serve-vs-dashd parity run actually\n"
-        << "        measures a DAEMONLESS serve instead of a dashd-seeded one.\n"
+        << "        configured dashd (no `protx list` seed) while KEEPING the\n"
+        << "        daemonless E2d checkpoint bridge ARMED and the RPC observe-\n"
+        << "        only for --embedded-shadow-compare: the hotel cut-rehearsal\n"
+        << "        that serves DAEMONLESS instead of dashd-seeded. Add\n"
+        << "        --embedded-fold-only-proof to also leave the bridge unarmed\n"
+        << "        (strict replay-fold-only measurement, the old semantics).\n"
         << "        PRUNED (bodies never persisted). Strictly lower priority than\n"
         << "        the tip lane; resumable (high-water cursor); [BULK] telemetry.\n"
         << "        OBSERVE-only in W2 (counting consumer stands in for the W1 fold);\n"
@@ -6052,26 +6068,29 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 seed_mn_set_from_rpc("payee-desync re-seed");
             };
             maintainer->set_on_mn_reseed(mn_reseed_fallback);
-        } else if (rpc) {
-            // ── --embedded-no-dashd-mn-seed: THE PROOF POSTURE ─────────────
-            // A dashd RPC IS configured, but the payee axis is deliberately
-            // cut off from it. Nothing else changes: the shadow-compare
-            // diagnostic keeps asking dashd for its template so the two can
-            // be diffed — which is the entire point. Without this switch a
-            // parity run cannot separate "the replay serves correctly" from
-            // "dashd seeded the queue and the replay watched": the LAN run on
-            // .211 served in 7 minutes off
+        } else if (rpc && g_fold_only_proof) {
+            // ── --embedded-fold-only-proof: THE STRICT MEASUREMENT POSTURE ───
+            // Reached only with BOTH --embedded-no-dashd-mn-seed AND
+            // --embedded-fold-only-proof. A dashd RPC IS configured, but the
+            // payee axis is deliberately cut off from it AND the E2d checkpoint
+            // bridge is left UNARMED, so the ROOT-CHECKED REPLAY FOLD is the
+            // only thing that can populate the payee queue. Nothing else
+            // changes: the shadow-compare diagnostic keeps asking dashd for its
+            // template so the two can be diffed — which is the entire point.
+            // Without this the run cannot separate "the replay serves
+            // correctly" from "the bridge/dashd seeded the queue and the replay
+            // watched": the LAN run on .211 served in 7 minutes off a dashd seed
             //   [run] E2c MN-set seed LOADED (startup): 2971/2971 registered
             //         MNs as-of h=2516893 FROM DASHD `protx list registered
             //         true`
             // and that is NOT a daemonless serve, however daemonless the fold
             // beside it was.
             //
-            // The E2d checkpoint bridge is skipped too: this posture exists to
-            // leave the ROOT-CHECKED REPLAY FOLD as the only thing that can
-            // populate the payee queue. If the fold does not get there, the
-            // node does not serve — which is the honest outcome to measure.
-            std::cout << "[run] --embedded-no-dashd-mn-seed: the E2c dashd"
+            // If the fold does not get there, the node does not serve — which
+            // is the honest outcome to measure. A plain
+            // --embedded-no-dashd-mn-seed (without this flag) instead ARMS the
+            // E2d bridge and serves daemonless (the else branch below).
+            std::cout << "[run] --embedded-fold-only-proof: the E2c dashd"
                          " `protx list` MN-set seed is DISABLED and the E2d"
                          " checkpoint bridge is NOT armed.\n"
                          "      The PAYEE queue can now be populated by ONE"
@@ -6084,8 +6103,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                          " publishes, the embedded arm will not serve and no"
                          " masternode payee will be guessed.\n";
         } else {
-            // ── E2d (#738): PURE DAEMONLESS MN-SET SEED ────────────────────
-            // No dashd RPC, so no `protx list`. The set comes from a
+            // ── E2d (#738): DAEMONLESS MN-SET SEED (checkpoint bridge) ───────
+            // Reached when there is NO dashd RPC, OR when --embedded-no-dashd-mn-seed
+            // is set WITHOUT --embedded-fold-only-proof (the hotel cut-rehearsal:
+            // RPC present but observe-only, payee axis seeded daemonlessly). Either
+            // way the `protx list` dashd seed is NOT used here. The set comes from a
             // RELEASE-PINNED CHECKPOINT compiled into this binary, replayed
             // forward to the tip through the SAME block-connect ingest leg 3
             // already uses. This is the last structurally daemon-dependent
@@ -9055,10 +9077,17 @@ int main(int argc, char** argv)
         // PR-2 FORWARD: the mined-commitment store, fed from our own replay.
         else if (std::strcmp(argv[i], "--replay-mined-commitment-index") == 0)
             g_mined_commitment_index = true;
-        // THE PROOF POSTURE: keep the dashd RPC (shadow-compare) but cut the
-        // PAYEE axis off from it — see g_no_dashd_mn_seed.
+        // CUT THE DASHD PAYEE SEED: disable the E2c `protx list` seed but KEEP
+        // the daemonless E2d checkpoint bridge armed (shadow-compare still runs
+        // off the RPC) — see g_no_dashd_mn_seed.
         else if (std::strcmp(argv[i], "--embedded-no-dashd-mn-seed") == 0)
             g_no_dashd_mn_seed = true;
+        // STRICT MEASUREMENT POSTURE: additionally leave the E2d bridge UNARMED
+        // so ONLY the replay fold may populate the payee queue — the old meaning
+        // of --embedded-no-dashd-mn-seed. Requires that flag too. See
+        // g_fold_only_proof.
+        else if (std::strcmp(argv[i], "--embedded-fold-only-proof") == 0)
+            g_fold_only_proof = true;
         else if (std::strcmp(argv[i], "--oracle-graduation-blocks") == 0 && i + 1 < argc)
             oracle_grad_blocks = std::strtoull(argv[++i], nullptr, 10);
         else if (std::strcmp(argv[i], "--oracle-class-coverage") == 0 && i + 1 < argc)
