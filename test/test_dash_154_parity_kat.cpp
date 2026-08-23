@@ -78,17 +78,29 @@ TEST(DashParity154_GoldenCheckpoint, ParsesExactly2991RegisteredMasternodes)
     ASSERT_EQ(cp.entries.size(), 2991u)
         << "the self-derived registered set must equal dashd's at 2522504";
 
-    // Every registered entry carries a payee script and a 48-byte operator key
-    // (a byte-lossy dump would parse but strand the payment queue).
-    size_t empty_payout = 0, zero_opkey = 0;
+    // Every PAYABLE (valid, unbanned) entry carries a payee script and a
+    // 48-byte operator key: a byte-lossy dump that dropped a payable node's
+    // key would parse but strand the payment queue. The self-derived golden
+    // legitimately emits `-` (unset) for the operator key of PoSe-BANNED
+    // masternodes (poseBanHeight != 0 -> MNState::isValid == false): a banned
+    // MN is excluded from BOTH the payment projection and quorum selection, so
+    // its operator key is consensus-irrelevant to this anchor and its absence
+    // cannot strand a payee. The guard therefore scopes to the valid set.
+    // mainnet 2522504: 2098 valid (all keyed) + 893 banned (354 of them the
+    // service-less checkpoint leaves keyless) == 2991 registered.
+    size_t empty_payout = 0, zero_opkey = 0, valid_entries = 0;
     for (const auto& [protx, st] : cp.entries) {
+        if (!st.isValid) continue;  // PoSe-banned: not projected for payee/quorum
+        ++valid_entries;
         if (st.scriptPayout.m_data.empty()) ++empty_payout;
         bool all_zero = true;
         for (uint8_t b : st.pubKeyOperator) if (b != 0) { all_zero = false; break; }
         if (all_zero) ++zero_opkey;
     }
-    EXPECT_EQ(empty_payout, 0u) << empty_payout << " entries have no scriptPayout";
-    EXPECT_EQ(zero_opkey, 0u)   << zero_opkey   << " entries have a zero operator key";
+    ASSERT_EQ(valid_entries, 2098u)
+        << "the valid (unbanned) projected set at 2522504 must equal dashd's";
+    EXPECT_EQ(empty_payout, 0u) << empty_payout << " valid entries have no scriptPayout";
+    EXPECT_EQ(zero_opkey, 0u)   << zero_opkey   << " valid entries have a zero operator key";
 }
 
 TEST(DashParity154_GoldenCheckpoint, CommittedDigestIsTheOneTheRuleRecomputes)
