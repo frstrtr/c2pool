@@ -6597,7 +6597,22 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                 // ROOT-COMMITTING fields -- SML authoritative.
                                 st.nVersion         = e.nVersion;
                                 st.nType            = e.nType;
-                                st.pubKeyOperator   = e.pubKeyOperator;
+                                // STORE CONTRACT: the DML engine stores the operator
+                                // key in CANONICAL BASIC encoding and re-encodes each
+                                // SML leaf per its own nVersion (to_sml_entry ->
+                                // opkey_for_leaf: legacy iff nVersion < BASIC_BLS).
+                                // The anchor SML carries the key in the scheme the
+                                // entry's nVersion dictates (legacy for the pre-v19
+                                // nVersion=1 entries), so canonicalize on ingest here
+                                // exactly as the fold_proupreg store sites do
+                                // (replay_fold_engine.hpp opkey_to_basic). Storing the
+                                // raw wire bytes lets a legacy-era leaf re-encode from
+                                // the wrong point -> merkleRootMNList diverges and the
+                                // seed self-check below UNSEEDS the engine (the
+                                // observed ff99366e != committed 2315e6df at h=2513000).
+                                st.pubKeyOperator   = dash::coin::vendor::opkey_to_basic(
+                                    e.pubKeyOperator,
+                                    e.nVersion < dash::coin::vendor::ProTxVersion::BASIC_BLS);
                                 st.keyIDVoting      = e.keyIDVoting;
                                 st.netInfo.ip       = e.netAddress;
                                 st.netInfo.port_be  = e.netPort;
