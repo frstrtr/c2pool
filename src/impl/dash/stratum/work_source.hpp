@@ -724,6 +724,16 @@ private:
     bool is_testnet_{false};
     bool embedded_mainnet_{false};   // gate-lift opt-in: daemonless embedded arm on mainnet
     bool gbt_xcheck_{false};         // reward-safety backstop: cross-check embedded creditPool vs dashd
+    // GBT-xcheck quorumroot-dashd-stale classifier state -- the fix for the
+    // inverted reward-safety direction at LLMQ DKG commitment boundaries.
+    // last_agreed_quorum_root_ is the most recent merkleRootQuorums both the
+    // embedded and dashd arms matched on; the classifier KEEPS embedded when
+    // dashd's current root REGRESSES to it while embedded ADVANCES past it.
+    // Touched only inside the single-flight template re-source, but guarded for
+    // defence in depth; mutable because resource_template_now() is const.
+    mutable std::mutex quorum_root_cache_mutex_;
+    mutable uint256    last_agreed_quorum_root_;
+    mutable bool       has_agreed_quorum_root_{false};
     bool pin_splice_xcheck_arm_{false};  // money path: splice pins onto an xcheck-SWAPPED template (default OFF)
     bool pin_splice_block_budget_{false};  // money path: ENFORCE the block-size budget (changes served bytes; default OFF)
 

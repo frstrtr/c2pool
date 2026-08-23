@@ -1182,6 +1182,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_submit_gate_scaling.cpp
         test_dash_serve_staleness_seam.cpp
         test_dash_serve_staleness_unit.cpp
+        test_dash_gbt_quorum_staleness.cpp
         ${CMAKE_SOURCE_DIR}/src/impl/dash/coin/zmq_tip_notify.cpp)
     target_link_libraries(test_dash_stratum_work_source PRIVATE
         GTest::gtest_main GTest::gtest
