@@ -449,6 +449,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-fresh-datum-race] [--embedded-fresh-datum-race-k N]\n"
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
         << "           [--embedded-ingest-isdlock] [--embedded-ingest-dstx]\n"
+        << "           [--embedded-proactive-rotate]\n"
         << "           [--pin-local-tx-hex FILE]  (zero-fee self-mined tx, e.g. donation consolidation)\n"
         << "           [--pin-splice-xcheck-arm]  (let pins ride an xcheck-SWAPPED dashd template; default OFF)\n"
         << "           [--pin-splice-block-budget] (EXCLUDE a pin that pushes the template past the block size cap; default OFF)\n"
@@ -973,7 +974,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // byte-identical to master. Template EFFECT additionally
              // requires --embedded-serve-mempool-txs; the #1218
              // gbt-xcheck-txmerkle guard is untouched and stays the referee.
-             bool embedded_ingest_dstx = false)
+             bool embedded_ingest_dstx = false,
+             // --embedded-proactive-rotate (PR-3): arm the LOW-RATE proactive
+             // coin-P2P peer rotation. DEFAULT OFF => the coin client runs the
+             // stall-only rotation (#147/#148), byte-identical to master. ON, a
+             // healthy pool periodically probes one fresh CanServeBlocks
+             // candidate and sheds its slowest measured non-primary server so
+             // the working set trends toward the fastest deliverers. Reward-safe
+             // (connection-management only; every reply still self-checked).
+             bool embedded_proactive_rotate = false)
 {
     namespace io = boost::asio;
 
@@ -2028,6 +2037,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // object that can never be fetched. One peer made "we didn't hear it"
         // a guess; N peers make it evidence. See p2p_client.hpp.
         coin_p2p->set_max_peers(coin_p2p_peers);
+        // PR-3: arm the LOW-RATE proactive rotation when requested. Default OFF
+        // => the coin client keeps its stall-only rotation (byte-identical to
+        // master); the setter only flips a member bool.
+        coin_p2p->set_proactive_rotate_enabled(embedded_proactive_rotate);
 
         if (coin_p2p_discover_eff) {
             // ── Network-standalone arm: seed-discovered, SCORED, group-diverse
@@ -8910,6 +8923,10 @@ int main(int argc, char** argv)
     // pull + BLS-verified zero-fee admission with dashd's +0.1 COIN
     // prioritisation delta). DEFAULT OFF — wire and templates byte-identical.
     bool embedded_ingest_dstx = false;
+    // --embedded-proactive-rotate (PR-3): LOW-RATE proactive coin-P2P peer
+    // rotation. DEFAULT OFF — the coin client keeps its stall-only rotation,
+    // byte-identical to master.
+    bool embedded_proactive_rotate = false;
     std::string bestcl_policy = "freshness";   // --bestcl-policy: freshness (default, conservative proxy) | consensus-exact (dashcore's actual CheckCbTxBestChainlock rule)
     bool embedded_oracle_shadow = false;       // --embedded-oracle-shadow: per-block dashd cross-check (OBSERVE-only)
     bool embedded_shadow_compare = false;      // --embedded-shadow-compare: serve-vs-dashd template diff (OBSERVE-only, NOT a gate)
@@ -9036,6 +9053,8 @@ int main(int argc, char** argv)
             embedded_ingest_isdlock = true;   // G4 conflict-tx-lock feed
         else if (std::strcmp(argv[i], "--embedded-ingest-dstx") == 0)
             embedded_ingest_dstx = true;      // W5-B CoinJoin DSTX feed
+        else if (std::strcmp(argv[i], "--embedded-proactive-rotate") == 0)
+            embedded_proactive_rotate = true; // PR-3 proactive peer rotation
         else if (std::strcmp(argv[i],
                              "--embedded-creditpool-publish-at-serve-tip") == 0)
             embedded_creditpool_publish_at_serve_tip = true;
@@ -9365,7 +9384,8 @@ int main(int argc, char** argv)
                         embedded_null_arm,             // #127
                         embedded_accrue_asset_unlocks, // #143 Variant B
                         embedded_ingest_isdlock,       // G4 isdlock feed
-                        embedded_ingest_dstx);         // W5-B DSTX feed
+                        embedded_ingest_dstx,          // W5-B DSTX feed
+                        embedded_proactive_rotate);    // PR-3 proactive rotation
     }
     return run_selftest();
 }
