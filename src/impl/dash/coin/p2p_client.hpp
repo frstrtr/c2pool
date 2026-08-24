@@ -94,6 +94,7 @@
 #include <impl/dash/coin/arrival_timing.hpp>     // PR-0: per-peer per-datum-class delivery-latency EWMA (instrumentation only)
 #include <impl/dash/coin/fresh_datum_race.hpp>   // PR-2: fresh-datum race (K-way fan-out selector + single-flight dedup; flag/K default-OFF)
 #include <impl/dash/coin/coin_peer_manager.hpp> // PR-2: peer_network_group() for distinct-netgroup racing
+#include <impl/dash/coin/proactive_rotation_policy.hpp>  // PR-3: LOW-RATE proactive rotation decision helpers (pure, shared with the KAT)
 
 #include <algorithm>
 #include <chrono>
@@ -724,6 +725,11 @@ public:
     // analog) so refill_pool() draws a genuinely fresh candidate instead of
     // immediately re-dialing the non-server we just dropped.
     static constexpr int64_t OUTBOUND_ROTATE_COOLDOWN_SEC = 120;
+    // PR-3 proactive rotation cadence: a LOW rate (5 min) — far slower than
+    // the stall rotation (OUTBOUND_ROTATE_INTERVAL_SEC=20s). Bounds the
+    // proactive probe+shed so a HEALTHY pool trends toward the fastest
+    // deliverers without churning connections.
+    static constexpr int64_t PROACTIVE_ROTATE_INTERVAL_SEC = 300;
 
 private:
     dash::interfaces::Node* m_coin;
@@ -761,6 +767,14 @@ private:
     // Telemetry: how many demoted slot-holders we have rotated out for a fresh
     // archival dial (asserted by the KATs, surfaced in the pool-status log).
     uint64_t m_outbound_rotations{0};
+    // ── PR-3 proactive rotation (LOW-RATE, default OFF) ────────────────────
+    // When armed (--embedded-proactive-rotate), a HEALTHY pool periodically
+    // probes one fresh candidate and sheds its slowest measured non-primary
+    // server (maybe_proactive_rotate). OFF by default => on_pool_tick() runs the
+    // stall-only path, BYTE-IDENTICAL to master.
+    bool     m_proactive_rotate_enabled{false};
+    int64_t  m_last_proactive_rotate{0};
+    uint64_t m_proactive_rotations{0};
     // Round-robin cursor for the STATEFUL request legs (the mn-checkpoint
     // anchor->tip fold's getmnlistd snapshot). dashd picks a sync peer for a
     // mnlistdiff and ROTATES to another on stall rather than re-asking one slow
@@ -1438,6 +1452,11 @@ public:
     /// TEST-ONLY: master switch. Default ON; OFF restores the byte-identical
     /// pre-port frozen-full-pool behaviour (the RED arm of the acquisition KATs).
     void set_outbound_rotate_enabled_for_test(bool on) { m_outbound_rotate_enabled = on; }
+    /// PR-3: arm the LOW-RATE proactive rotation (--embedded-proactive-rotate).
+    /// Default OFF => byte-identical to master (stall-only rotation).
+    void set_proactive_rotate_enabled(bool on) { m_proactive_rotate_enabled = on; }
+    void set_proactive_rotate_enabled_for_test(bool on) { m_proactive_rotate_enabled = on; }
+    uint64_t proactive_rotations_for_test() const { return m_proactive_rotations; }
     /// TEST-ONLY: the dashd GetExtraFullOutboundCount-raised effective target.
     std::size_t effective_max_peers_for_test() const { return effective_max_peers(); }
     /// TEST-ONLY: behind on archival coverage (a demoted non-server holds a slot)?
@@ -2788,6 +2807,132 @@ private:
         refill_pool();                  // immediate redial; 30s loop is backstop
     }
 
+    /// PR-3: dial EXACTLY ONE fresh plan candidate (the proactive probe).
+    /// Unlike refill_pool() this ignores the effective target and dials a single
+    /// fresh address the pool does not already hold / dial / just rotated out,
+    /// so a HEALTHY pool can add one probe peer without a stall having raised the
+    /// target. Returns true iff a dial was issued. Reward-safe: a connection
+    /// only — the probe's replies flow through the identical fold self-checks.
+    bool dial_one_fresh_candidate(int64_t now)
+    {
+        if (!m_reconnect_enabled || m_dial_plan.empty()) return false;
+        prune_stale_dials(now);
+        const std::size_t n = m_dial_plan.size();
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const NetService target_addr = m_dial_plan.current();
+            m_dial_plan.advance();
+            const std::string key = target_addr.to_string();
+            if (holds_key(key) || m_dialing.count(key)) continue;
+            if (is_rotation_cooled(key, now)) continue;
+            m_dialing[key] = now;
+            LOG_INFO << "[" << m_chain_label << "] proactive probe dial " << key
+                     << " (pool " << m_pool.size() << "/" << m_max_peers
+                     << ", " << m_dialing.size() << " in flight)";
+            core::Factory<core::Client>::connect(target_addr);
+            return true;
+        }
+        return false;
+    }
+
+    // ── PR-3 proactive rotation (LOW-RATE, default OFF) ────────────────────
+    /// The proactive half of the acquisition loop, gated behind
+    /// --embedded-proactive-rotate. Even when NOT behind (no demoted slot-holder
+    /// and no stateful stall, so maybe_rotate_outbound() is a no-op), a healthy
+    /// pool that has latched on its frozen first-come set never discovers a
+    /// faster peer. Once per PROACTIVE_ROTATE_INTERVAL_SEC this:
+    ///   (1) PROBES — dials ONE fresh candidate if there is head-room under the
+    ///       hard cap, so its TipBody delivery-latency EWMA (PR-0 feed) starts
+    ///       filling on the next tip it answers; and
+    ///   (2) RETIRES — sheds the SLOWEST measured non-primary CanServeBlocks
+    ///       server, but ONLY when a genuine surplus remains afterwards (pool
+    ///       above the base target) and a fresh candidate exists to replace it.
+    /// m_primary and any protected-local peer (#147) are the latency reference
+    /// and are NEVER retired; selection operates ONLY among CanServeBlocks peers
+    /// (#148) and never promotes a non-server. Bounded by the cadence + the hard
+    /// cap. Default OFF => this whole method returns immediately, so
+    /// on_pool_tick() is byte-identical to master.
+    ///
+    /// Reward-safe (same class as #1329): only WHICH / HOW-MANY peers we fetch
+    /// from and WHEN we probe changes — never WHAT is fetched or derived. Every
+    /// reply still passes the identical merkle/payee/DIP-4/BLS self-checks;
+    /// worst case is one extra probe connection + one reconnect.
+    void maybe_proactive_rotate(int64_t now)
+    {
+        if (!proactivepolicy::proactive_due(m_proactive_rotate_enabled, now,
+                                            m_last_proactive_rotate,
+                                            PROACTIVE_ROTATE_INTERVAL_SEC))
+            return;
+
+        prune_rotation_cooldown(now);
+        bool acted = false;
+
+        // (1) PROBE one fresh candidate while there is head-room under the cap.
+        if (m_pool.size() + m_dialing.size() < POOL_PEERS_HARD_CAP
+            && has_fresh_dial_candidate(now))
+        {
+            acted = dial_one_fresh_candidate(now);
+        }
+
+        // (2) RETIRE the slowest measured non-primary server — only with a
+        // surplus over the base target AND a fresh candidate to replace it, so
+        // proactive rotation can never drop the pool below its healthy count.
+        if (m_pool.size() > m_max_peers && has_fresh_dial_candidate(now))
+        {
+            std::vector<proactivepolicy::PeerLatencyView> views;
+            views.reserve(m_pool.size());
+            for (const auto& up : m_pool)
+            {
+                PeerSession* p = up.get();
+                if (!p->handshake.complete()) continue;
+                if (is_rotation_cooled(p->key, now)) continue;
+                const AddrClass ac = classify_address(p->addr.address());
+                const auto& e = p->delivery.get(DatumClass::TipBody);
+                proactivepolicy::PeerLatencyView v;
+                v.key = p->key;
+                v.is_primary = (p == m_primary);
+                v.is_protected_local =
+                    (ac == AddrClass::loopback || ac == AddrClass::private_net);
+                v.can_serve_blocks = can_serve_blocks(p);
+                v.has_latency = e.has_sample();
+                v.ewma_ms = e.ewma_ms();
+                views.push_back(std::move(v));
+            }
+            const int idx = proactivepolicy::slowest_retirement_victim(views);
+            if (idx >= 0)
+            {
+                const std::string vkey = views[static_cast<std::size_t>(idx)].key;
+                PeerSession* victim = find_peer(vkey);
+                // Belt-and-suspenders: the primary is exempt in the selector,
+                // but never remove it here even if identity somehow shifted.
+                if (victim && victim != m_primary)
+                {
+                    LOG_INFO << "[" << m_chain_label << "] proactive rotation: "
+                                "retiring slowest server " << vkey
+                             << " (tip_body_ewma_ms="
+                             << views[static_cast<std::size_t>(idx)].ewma_ms
+                             << ") for a fresh archival probe (PR-3, reward-safe: "
+                                "connection-management only)";
+                    m_rotation_cooldown[vkey] = now + OUTBOUND_ROTATE_COOLDOWN_SEC;
+                    forgive_bulk_nonserver(vkey);
+                    remove_peer(victim, "proactive rotation: slowest measured "
+                                        "server shed for a fresh probe");
+                    refill_pool();   // immediate redial; 30s loop is backstop
+                    acted = true;
+                }
+            }
+        }
+
+        // Advance the cadence clock only when we actually acted, so a quiet
+        // interval (no fresh candidate, pool already at cap) re-checks next tick
+        // rather than silently burning the interval.
+        if (acted)
+        {
+            m_last_proactive_rotate = now;
+            ++m_proactive_rotations;
+        }
+    }
+
     /// Reclaim dial slots whose callback never came. Without this a Factory
     /// dial that neither connects nor fails (a black-holed SYN) would hold a
     /// pool slot for the life of the process and silently cap the pool.
@@ -2906,6 +3051,10 @@ private:
         // more and rotate the frozen full pool's worst non-server out for a
         // fresh archival candidate (connection-management only, reward-safe).
         maybe_rotate_outbound(now);
+        // PR-3: LOW-RATE proactive rotation — even a HEALTHY (not-behind) pool
+        // periodically probes a fresh candidate and sheds its slowest measured
+        // server. Default OFF => no-op (byte-identical to master).
+        maybe_proactive_rotate(now);
         maybe_log_pool_status(now);
     }
 

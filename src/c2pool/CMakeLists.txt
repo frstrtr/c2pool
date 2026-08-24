@@ -454,6 +454,16 @@ add_test(NAME dash_latency_scoring_kat COMMAND dash_latency_scoring_kat)
 # -DC2POOL_DASH_BLS=ON like the rest of the dash suite; carries no BLS symbols.
 add_executable(dash_fresh_datum_race_kat dash_fresh_datum_race_kat.cpp)
 add_test(NAME dash_fresh_datum_race_kat COMMAND dash_fresh_datum_race_kat)
+# ── KAT: PR-3 PROACTIVE PEER ROTATION policy (dashd-cut coin-P2P foundation) ──
+# Locks the proactive-rotation decision invariants — primary/protected-local
+# NEVER retired (#147), retirement picks the SLOWEST measured CanServeBlocks
+# server (#148), and the cadence is bounded (default-OFF => never). Runs over the
+# pure header proactive_rotation_policy.hpp (header-only, no node, no daemon,
+# standard library only), the EXACT logic the shipped maybe_proactive_rotate
+# calls, so this target links NOTHING and still exercises the real path. Built
+# under -DC2POOL_DASH_BLS=ON like the rest of the dash suite; no BLS symbols.
+add_executable(dash_proactive_rotation_kat dash_proactive_rotation_kat.cpp)
+add_test(NAME dash_proactive_rotation_kat COMMAND dash_proactive_rotation_kat)
 
 # Legacy applications have been archived to ../../archive/
 # - c2pool_legacy.cpp (original c2pool.cpp)
