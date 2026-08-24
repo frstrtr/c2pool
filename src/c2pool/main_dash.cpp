@@ -322,21 +322,30 @@ bool        g_fold_only_proof = false;        // --embedded-fold-only-proof
 // bad read fails to a clean zero and never wedges the node.
 std::string g_serve_gate_state_file;           // --serve-gate-state-file
 
-// ── PR-2 FORWARD: --replay-mined-commitment-index ─────────────────────────
-// Arms the forward half of dashd's mined-commitment store
-// (mined_commitment_index.hpp, ported from v23.1.7 llmq/blockprocessor.cpp)
-// off the replay lane, and — ONLY once armed — offers it as a SECOND
-// "already mined" source to the daemonless qc plan, alongside the
+// ── PR-2 FORWARD: mined-commitment index arming flags ─────────────────────
+// Arms dashd's mined-commitment store (mined_commitment_index.hpp). BOTH
+// halves of CQuorumBlockProcessor are ported and merged in #1309: the
+// connect-half ProcessBlock (llmq/blockprocessor.cpp:165 → DB_MINED_COMMITMENT)
+// and the symmetric UndoBlock reorg-half (:383). Once armed the store offers a
+// SECOND "already mined" source to the daemonless qc plan, alongside the
 // mnlistdiff/qrinfo-fed QuorumManager.
 //
 // ⚠ MONEY PATH, default OFF. A slot that reads already-mined is a type-6 tx
-// the served template no longer carries, so this is byte-visible. The index
-// itself REFUSES TO ARM when the node's tip is live (dashd's UndoBlock half
-// is not ported; a reorg would leave a phantom mined record and the template
-// would be short one qfcommit => bad-qc-missing => lost block). The flag is
-// therefore two gates deep: the operator must ask for it AND the tip posture
-// must permit it.
+// the served template no longer carries, so this is byte-visible. Arming is
+// posture-gated inside MinedCommitmentIndex::arm(): a LIVE tip is permitted
+// ONLY when the UndoBlock half is wired (reorg_undo_wired). That seam is now
+// live — set_on_tip_changed drives handle_reorg() on every branch switch
+// (#1309, main_dash.cpp:5747) — so the index is reorg-safe on the live
+// embedded lane, no longer replay-only.
+//
+//   --replay-mined-commitment-index   arm off the REPLAY lane (historical).
+//   --embedded-mined-commitment-index arm off the LIVE chain-follow lane
+//                                     (FoldLiveTail consumer). Same arm(),
+//                                     same body-to-header self-verify, same
+//                                     fail-closed null arm. Default OFF; the
+//                                     operator flips it during canary soak.
 bool        g_mined_commitment_index = false; // --replay-mined-commitment-index
+bool        g_embedded_mined_commitment_index = false; // --embedded-mined-commitment-index
 
 // ───────────────────────────────────────────────────────────────────────────
 // [BLOCK-LEDGER] — our own block accounting, from PERSISTENT state
@@ -463,7 +472,7 @@ void print_banner(const char* argv0)
         << "           [--replay-fold-prestate FILE] [--replay-fold-quorums]\n"
         << "           [--replay-fold-qsnapshot FILE] [--replay-fold-worklists FILE]\n"
         << "           [--replay-mnlist-seed-height H --replay-mnlist-seed-source getmnlistdiff --replay-mnlist-seed-file FILE]\n"
-        << "           [--replay-mined-commitment-index]\n"
+        << "           [--replay-mined-commitment-index] [--embedded-mined-commitment-index]\n"
         << "           [--embedded-no-dashd-mn-seed [--embedded-fold-only-proof]]\n"
         << "           [--oracle-graduation-blocks N] [--oracle-class-coverage K]\n"
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
@@ -5042,11 +5051,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         // "another miner already mined this slot" into
                         // qc-plan-underivable episodes of 512/302/283/249 s.
                         //
-                        // Two gates deep: null unless the operator passed
-                        // --replay-mined-commitment-index AND the index armed
-                        // (it REFUSES on a live tip — the undo half is not
-                        // ported). Both false => this is nullptr and the plan
-                        // is byte-identical to before.
+                        // Null unless the operator armed the index by name
+                        // (--replay-mined-commitment-index on the replay lane,
+                        // or --embedded-mined-commitment-index on the live
+                        // chain-follow lane) AND arm() accepted the tip posture.
+                        // The UndoBlock half IS ported and wired (#1309:
+                        // handle_reorg driven from set_on_tip_changed,
+                        // main_dash.cpp:5747), so a live tip no longer forces a
+                        // refusal. Unarmed => this is nullptr and the plan is
+                        // byte-identical to before.
                         (mined_commitment_index
                          && mined_commitment_index->armed())
                             ? std::function<bool(uint8_t, const uint256&)>(
@@ -7292,10 +7305,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // node's tip live?". FoldLiveTail subscribes block_connected and
             // hands LIVE TIP blocks to the same fold consumer this index
             // rides — so its existence means a disconnect can reach us, and
-            // the missing UndoBlock half would matter. The posture is read
-            // off the wiring, never guessed from how old the tip looks.
-            if (g_mined_commitment_index && replay_fold_consumer
-                && replay_fold_engine) {
+            // the UndoBlock half (now ported+wired, #1309) is what makes that
+            // reorg-safe. The posture is read off the wiring, never guessed
+            // from how old the tip looks.
+            //
+            // DECOUPLED from the replay-only double gate: either flag arms the
+            // store. --replay-mined-commitment-index feeds it from historical
+            // replay; --embedded-mined-commitment-index feeds it from the LIVE
+            // chain-follow (the FoldLiveTail consumer), which is exactly the
+            // lane the embedded/daemonless node runs. arm() self-gates on the
+            // tip posture regardless of which flag asked, so a live tip is
+            // permitted only because reorg_undo_wired is true below.
+            if ((g_mined_commitment_index || g_embedded_mined_commitment_index)
+                && replay_fold_consumer && replay_fold_engine) {
                 dash::coin::MinedCommitmentIndexConfig micfg;
                 micfg.enabled = true;   // the operator asked for it by name
                 micfg.network = testnet ? dash::coin::LlmqNetwork::Testnet
@@ -7351,11 +7373,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             return out;
                         });
                 }
-            } else if (g_mined_commitment_index) {
-                std::cout << "[run] --replay-mined-commitment-index given but "
-                             "no replay fold consumer (needs "
-                             "--replay-fold-prestate) — mined-commitment "
-                             "index NOT armed\n";
+            } else if (g_mined_commitment_index
+                       || g_embedded_mined_commitment_index) {
+                std::cout << "[run] mined-commitment index requested "
+                             "(--replay-mined-commitment-index / "
+                             "--embedded-mined-commitment-index) but no fold "
+                             "consumer exists — a seeded fold is required "
+                             "(--replay-fold-prestate or --replay-mnlist-seed-*)"
+                             " — mined-commitment index NOT armed\n";
             }
 
             if (!g_replay_bulk_capture_dir.empty()) {
@@ -9187,6 +9212,8 @@ int main(int argc, char** argv)
         // PR-2 FORWARD: the mined-commitment store, fed from our own replay.
         else if (std::strcmp(argv[i], "--replay-mined-commitment-index") == 0)
             g_mined_commitment_index = true;
+        else if (std::strcmp(argv[i], "--embedded-mined-commitment-index") == 0)
+            g_embedded_mined_commitment_index = true;
         // CUT THE DASHD PAYEE SEED: disable the E2c `protx list` seed but KEEP
         // the daemonless E2d checkpoint bridge armed (shadow-compare still runs
         // off the RPC) — see g_no_dashd_mn_seed.
