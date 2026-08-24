@@ -143,6 +143,20 @@ inline bool is_missing_or_spent_reason(const std::string& reason)
     return reason == "bad-txns-inputs-missingorspent";
 }
 
+/// dashd's reject-reason for "I already hold this transaction as a CONFIRMED
+/// tx on my own chain", verbatim (Dash Core validation.cpp:854: TX_CONFLICT,
+/// "txn-already-known"). It is returned when a HaveCoinInCache probe over the
+/// transaction's OWN outputs succeeds while an input HaveCoin fails: dashd is
+/// telling us the tx is ALREADY CONFIRMED in its UTXO set (its outputs exist),
+/// not that an input is unknown. It is non-punishable (net_processing.cpp
+/// MaybePunishNodeForTx: TX_CONFLICT falls to `break`, misbehaviour 0), exactly
+/// like the other propagation-class reasons. Compared for EQUALITY only — NO
+/// prefix matching, per this file's discipline.
+inline bool is_confirmed_tx_reason(const std::string& reason)
+{
+    return reason == "txn-already-known";
+}
+
 /// Three-valued logic, plus TWO honest "no verdict" states.
 /// Unprobed is NEVER counted as valid and NEVER counted as a defect: it is the
 /// absence of a measurement, and it advances nothing. PendingPropagation is the
@@ -306,9 +320,30 @@ inline MempoolAcceptResult classify_mempool_accept(const MempoolProbeTx& tx,
     // caught by the serve-time internal-consistency referee (tx_serve_referee.
     // hpp), which shares the selector's spent-aware UTXO view and runs on EVERY
     // armed embedded template independent of dashd.
-    if (is_unknown_input_only_reason(r.reason) && tx.dashd_ahead_of_serve_height) {
+    //
+    // The SAME Window-1 logic covers dashd's "txn-already-known" reason under
+    // the ahead skew. That reason (validation.cpp:854) means dashd found the
+    // transaction's OWN outputs already in its UTXO set: the tx is CONFIRMED on
+    // dashd's chain. When dashd's probe-time tip is STRICTLY AHEAD of our serve
+    // parent, that confirmation lives in the ahead block(s) our still-valid fork
+    // template competed for — the tx is VALID ON OUR FORK, and dashd, probing
+    // against its newer view, reports it as already-confirmed. This is the proven
+    // h=2526495 class (both leak txs were CONFIRMED IN BLOCK 2526495 itself). Like
+    // the missing-inputs arm it is FACT-gated on `dashd_ahead_of_serve_height`,
+    // never on the reason alone, and it advances NOTHING and resets NOTHING.
+    //
+    // REWARD-SAFE FAIL-CLOSED: WITHOUT the ahead skew, "txn-already-known" means
+    // the tx is confirmed in OUR OWN ancestry — a genuine double-inclusion that
+    // would cost the block — so it falls through to Invalid below and RESETS the
+    // clean run, flagging a selector/ingest eviction miss. The gate is only ever
+    // widened in the one direction (ahead skew) where the tx is provably valid on
+    // our fork; on ambiguous or non-skewed evidence it stays CLOSED.
+    if ((is_unknown_input_only_reason(r.reason) || is_confirmed_tx_reason(r.reason))
+        && tx.dashd_ahead_of_serve_height) {
         r.verdict        = MempoolAcceptVerdict::PendingPropagation;
-        r.unprobed_cause = "dashd-ahead-of-serve-parent(window-1-propagation)";
+        r.unprobed_cause = is_confirmed_tx_reason(r.reason)
+            ? "confirmed-in-dashd-ahead-block(window-1)"
+            : "dashd-ahead-of-serve-parent(window-1-propagation)";
         return r;
     }
 
