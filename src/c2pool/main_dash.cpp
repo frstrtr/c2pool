@@ -446,6 +446,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-mn-bridge-no-cursor]\n"
         << "           [--embedded-utxo-immature-serve-empty] [--embedded-serve-mempool-txs]\n"
         << "           [--embedded-tx-serve-own-set]\n"
+        << "           [--embedded-fresh-datum-race] [--embedded-fresh-datum-race-k N]\n"
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
         << "           [--embedded-ingest-isdlock] [--embedded-ingest-dstx]\n"
         << "           [--pin-local-tx-hex FILE]  (zero-fee self-mined tx, e.g. donation consolidation)\n"
@@ -9016,6 +9017,21 @@ int main(int argc, char** argv)
             embedded_null_arm = true;   // #127
         else if (std::strcmp(argv[i], "--embedded-null-arm=false") == 0)
             embedded_null_arm = false;  // #127: explicit OFF (OFF-equivalence)
+        // PR-2 FRESH-DATUM RACE (dashd-cut coin-P2P). Race the SINGLE freshest
+        // object (the fold snapshot's getmnlistd today) to K distinct-netgroup
+        // CanServeBlocks carriers and fold the first valid self-checked reply,
+        // deduping the rest. Default OFF; K default 2, K==1 == today. Reward-
+        // safe: only WHO/HOW-MANY is asked changes; every reply still flows
+        // through the identical DIP-4/merkle/payee self-check before it is
+        // believed, and exactly one fold is licensed.
+        else if (std::strcmp(argv[i], "--embedded-fresh-datum-race") == 0)
+            dash::coin::set_fresh_datum_race_enabled(true);
+        else if (std::strcmp(argv[i], "--embedded-fresh-datum-race=false") == 0)
+            dash::coin::set_fresh_datum_race_enabled(false);
+        else if (std::strcmp(argv[i], "--embedded-fresh-datum-race-k") == 0
+                 && i + 1 < argc)
+            dash::coin::set_fresh_datum_race_k(
+                static_cast<int>(std::strtol(argv[++i], nullptr, 10)));
         else if (std::strcmp(argv[i], "--embedded-ingest-isdlock") == 0)
             embedded_ingest_isdlock = true;   // G4 conflict-tx-lock feed
         else if (std::strcmp(argv[i], "--embedded-ingest-dstx") == 0)

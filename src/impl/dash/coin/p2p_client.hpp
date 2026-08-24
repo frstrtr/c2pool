@@ -92,6 +92,8 @@
 #include <impl/dash/coin/historical_sml.hpp>    // HistoricalMnListDiffDemux (reward-critical tip/historical split)
 #include <impl/dash/coin/bulk_peer_policy.hpp>   // #154 select_bulk_eligible_keys (LEVER 1 pure logic)
 #include <impl/dash/coin/arrival_timing.hpp>     // PR-0: per-peer per-datum-class delivery-latency EWMA (instrumentation only)
+#include <impl/dash/coin/fresh_datum_race.hpp>   // PR-2: fresh-datum race (K-way fan-out selector + single-flight dedup; flag/K default-OFF)
+#include <impl/dash/coin/coin_peer_manager.hpp> // PR-2: peer_network_group() for distinct-netgroup racing
 
 #include <algorithm>
 #include <chrono>
@@ -1941,6 +1943,67 @@ public:
     /// still DIP-4 client-verified against the block's own cbTx commitment
     /// before they are believed; and a peer that later delivers a body clears
     /// its strike (forgive_bulk_nonserver on the ingest path).
+    // PR-2 FRESH-DATUM RACE (flag/K default-OFF). Project the live pool into
+    // ranked RaceCandidates for a datum class: only CanServeBlocks + handshaked
+    // + non-demoted carriers are eligible (the SAME gate the stateful/bulk
+    // selectors apply), scored so a lower measured delivery-latency EWMA (PR-0)
+    // ranks higher and an unmeasured peer sits neutral (so it still gets raced
+    // and gathers a measurement). Pure projection — no socket is touched here.
+    std::vector<dash::coin::RaceCandidate> race_candidates(DatumClass cls) const
+    {
+        std::vector<dash::coin::RaceCandidate> out;
+        out.reserve(m_pool.size());
+        for (const auto& up : m_pool) {
+            const PeerSession* pp = up.get();
+            dash::coin::RaceCandidate c;
+            c.key       = pp->key;
+            c.netgroup  = dash::coin::peer_network_group(pp->addr.address());
+            c.can_serve = can_serve_blocks(pp);
+            c.eligible  = pp->handshake.complete() && !bulk_demoted(pp->key);
+            const int64_t e = pp->delivery.ewma_ms(cls);
+            c.score     = (e < 0) ? 0
+                        : (e > 1000000 ? -1000000 : static_cast<int>(1000000 - e));
+            out.push_back(std::move(c));
+        }
+        return out;
+    }
+
+    // Fan the SAME idempotent getmnlistd out to the K fastest-scored
+    // CanServeBlocks carriers in DISTINCT netgroups and let the first valid
+    // self-checked reply win (the lane's on_historical_snapshot dedups the
+    // rest). Returns the number of carriers actually asked (0 => caller must
+    // fall back to its single-carrier send; racing never REMOVES a request).
+    // Reward-safe: this only changes FROM-WHOM and HOW-MANY; every reply still
+    // flows through the identical DIP-4/merkle/payee self-check before it is
+    // believed, and exactly one fold is licensed.
+    int race_getmnlistd(const uint256& base_block_hash, const uint256& block_hash)
+    {
+        const int width = dash::coin::fresh_datum_race_width();
+        if (width <= 1) return 0;   // flag OFF or K==1 -> single carrier (today)
+        auto targets = dash::coin::select_race_targets(
+            race_candidates(DatumClass::MnListDiff), width);
+        if (targets.size() < 2) return 0;   // <2 distinct-group carriers -> today
+        int sent = 0;
+        for (const auto& key : targets) {
+            PeerSession* p = nullptr;
+            for (const auto& up : m_pool) if (up->key == key) { p = up.get(); break; }
+            if (!p) continue;
+            auto msg = message_getmnlistd::make_raw(base_block_hash, block_hash);
+            p->write(msg);
+            // PR-0 instrumentation (record-only): time each carrier's leg.
+            p->note_request_sent(DatumClass::MnListDiff, arrival_now_ms());
+            ++sent;
+        }
+        if (sent > 0)
+            LOG_INFO << "[COIN-P2P] getmnlistd(RACE x" << sent << ") -> "
+                     << targets.size() << " distinct-netgroup carriers,"
+                     << " base=" << base_block_hash.GetHex()
+                     << " target=" << block_hash.GetHex()
+                     << " — first valid self-checked reply wins, the rest are"
+                        " deduped";
+        return sent;
+    }
+
     void send_getmnlistd_reask(const uint256& base_block_hash,
                                const uint256& block_hash)
     {
@@ -1949,6 +2012,13 @@ public:
         // server and expands/rotates the outbound set toward a real server.
         if (!m_last_stateful_peer.empty() && holds_key(m_last_stateful_peer))
             note_bulk_nonserver(m_last_stateful_peer);
+        // (B') PR-2: race the re-ask across K distinct-netgroup carriers so a
+        // slow winner does not cost a whole wall-clock re-ask interval. Only
+        // WHO/HOW-MANY changes; the reply is matched by the unchanged
+        // m_snapshot_hash and DIP-4 self-checked before it is folded. Flag OFF
+        // or K==1 or <2 carriers => race_getmnlistd() returns 0 and we take the
+        // identical single rotating carrier below (byte-identical to master).
+        if (race_getmnlistd(base_block_hash, block_hash) > 0) return;
         // (B) rotate to a fresh archival carrier and send (never drops: the
         // rotating send falls back to any handshaked peer, then m_primary).
         send_getmnlistd_rotating(base_block_hash, block_hash);

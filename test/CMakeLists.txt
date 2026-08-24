@@ -326,6 +326,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     add_dependencies(test_dash_serve_gate_journal dash_tx_serve_self_validation_kat)
     add_dependencies(test_dash_serve_gate_journal dash_arrival_instrumentation_kat)  # PR-0 coin-P2P KAT: not in build.yml --target allowlist; piggyback on allowlisted anchor so CI builds it (avoids NOT_BUILT/Not-Run)
     add_dependencies(test_dash_serve_gate_journal dash_latency_scoring_kat)  # coin-P2P KAT: not in build.yml --target allowlist; piggyback on allowlisted anchor so CI builds it (avoids NOT_BUILT/Not-Run)
+    add_dependencies(test_dash_serve_gate_journal dash_fresh_datum_race_kat)  # coin-P2P KAT: not in build.yml --target allowlist; piggyback on allowlisted anchor so CI builds it (avoids NOT_BUILT/Not-Run)
 
     # DASH serve-gate LEDGER cross-restart never-a-reject accounting KAT: the
     # CUMULATIVE, persisted companion to ServeGateJournal (the journal wipes on
