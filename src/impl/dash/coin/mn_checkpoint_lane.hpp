@@ -213,6 +213,7 @@
 #include <impl/dash/coin/historical_sml.hpp>   // authenticate_historical_snapshot
 #include <impl/dash/coin/lane_diag.hpp>        // ProgressReporter / StallWatchdog / MnSource
 #include <impl/dash/coin/arrival_timing.hpp>   // PR-0: OffEmbeddedWindow arrival/fold split (instrumentation only)
+#include <impl/dash/coin/fresh_datum_race.hpp>   // PR-2: fresh-datum race single-flight dedup / first-valid-wins (flag-gated)
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
 #include <impl/dash/coin/vendor/smldiff.hpp>    // CSimplifiedMNListDiff
 #include <impl/dash/coin/vendor/cbtx.hpp>       // CCbTx
@@ -616,6 +617,9 @@ public:
                            " mnlistdiff re-ask; does NOT wait for a tip"
                            " change). wall_reasks=" << m_wallclock_reasks;
             m_reask_snapshot(m_snapshot_hash);
+            // PR-2: a fresh fan-out attempt — reset the race budget for the new
+            // set of carriers this re-ask reaches (flag-gated width; 1==today).
+            m_fresh_race.arm(m_snapshot_hash, fresh_datum_race_width());
         }
 
         auto due = m_watchdog.due(now);
@@ -2865,6 +2869,14 @@ public:
         // moment the fold ask goes out. t_data_arrived/t_fold_complete/t_resumed
         // are stamped in on_historical_snapshot(). Pure timestamp; no behaviour.
         m_off_window.open(m_snapshot_asked_at);
+        // PR-2: arm the fresh-datum race for THIS snapshot so on_historical_
+        // snapshot() can dedup a K-way fan-out and keep racing past a single
+        // carrier's unauthenticated copy. Width is the flag-gated fan-out
+        // (1 when the flag is OFF => single-flight == today, and the tracker is
+        // read ONLY under fresh_datum_race_enabled(), so an unflagged binary is
+        // byte-identical to master). The client decides how many carriers it
+        // actually reaches; a shortfall is recovered by the wall-clock re-ask.
+        m_fresh_race.arm(m_snapshot_hash, fresh_datum_race_width());
         return true;
     }
 
@@ -3061,6 +3073,30 @@ public:
         vendor::CCbTx cbtx;
         auto sml = authenticate_historical_snapshot(
             diff, h, m_merkle_root_at, cbtx, "MN-CKPT");
+
+        // ── PR-2 FRESH-DATUM RACE reply classification (flag-gated) ──────────
+        // When the fold snapshot was raced to K carriers, K replies land for
+        // this same m_snapshot_hash. `sml.has_value()` is the verdict of the
+        // IDENTICAL DIP-4 self-check the single-carrier path runs — racing
+        // never weakens or re-runs it. A carrier that served an UNAUTHENTICATED
+        // copy does NOT fail-close the fold while a sibling racer is still
+        // outstanding; it is claimed and dropped and we keep awaiting a valid
+        // copy. Only when the last outstanding racer has failed (Exhausted, and
+        // K==1 => that is the very first failure => exactly as today) do we fall
+        // through to the identical fail_closed below.
+        if (fresh_datum_race_enabled() && m_fresh_race.have()) {
+            const auto act = m_fresh_race.on_reply(diff.blockHash, sml.has_value());
+            if (!sml && act == RaceReplyAction::DropKeepRacing) {
+                m_snapshot_pending = true;   // re-open: await a sibling racer
+                LOG_WARNING << "[MN-CKPT] a raced carrier served an"
+                               " UNAUTHENTICATED masternode list for h=" << h
+                            << " — claimed and DROPPED; still awaiting a valid"
+                               " copy from a sibling racer (fresh-datum race,"
+                               " fold NOT failed)";
+                return true;   // consumed our await; do NOT fail-close yet
+            }
+        }
+
         if (!sml) {
             m_ondemand_pending = false;
             fail_closed(
@@ -3074,6 +3110,13 @@ public:
                        : ""));
             return true;   // consumed: it matched our await
         }
+
+        // PR-2: the race is won. Remember the folded hash so the K-1 slower
+        // duplicate racer copies are claimed & dropped by the is_abandoned
+        // guard above — a past-dated snapshot can never reach the live tip SML.
+        // Bounded ring (kAbandonedRing); a no-op when racing is off (with one
+        // carrier there is never a duplicate to drop).
+        if (fresh_datum_race_enabled()) remember_abandoned(m_snapshot_hash);
 
         if (on_demand) { finish_ondemand_fold(*sml, h); return true; }
 
@@ -3977,6 +4020,7 @@ public:
         m_wallclock_reasks = 0;
         m_abandoned_folds  = 0;
         m_abandoned.clear();
+        m_fresh_race.clear();   // PR-2: forget any in-flight fresh-datum race
         // ── #1033 ON-DEMAND fold state. Every field the on-demand arm carries
         // across a bridge, reset for the next one. The one-shot-ish latches
         // are the dangerous half again: m_ondemand_cap_hit unreset makes a
@@ -4198,6 +4242,12 @@ public:
     bool      m_revive_probe_cap_hit{false};
     RequestSnapshotFn m_request_snapshot;
     RequestSnapshotFn m_reask_snapshot;   // optional rotate+demote re-ask seam
+    // PR-2 FRESH-DATUM RACE single-flight tracker (flag-gated). Keyed by the
+    // snapshot hash; armed by begin_fold() and the wall-clock re-ask; READ only
+    // when fresh_datum_race_enabled(). Enforces first-valid-wins + dedup so a
+    // K-way fan-out of the fold snapshot folds EXACTLY ONCE and the losing
+    // carriers' copies never reach the live tip SML.
+    FreshDatumRaceInflight<uint256> m_fresh_race;
     // ── WALL-CLOCK RE-ASK of a frozen fold/ondemand snapshot (dashd
     // CheckForStaleTipAndEvictPeers parity). The tip-driven tick_pending_fold()
     // re-ask stalls whenever the header tip stalls — precisely when a bridging

@@ -442,6 +442,18 @@ add_executable(dash_latency_scoring_kat dash_latency_scoring_kat.cpp)
 target_link_libraries(dash_latency_scoring_kat core ltc c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage ltc_coin pool)
 target_link_libraries(dash_latency_scoring_kat nlohmann_json::nlohmann_json)
 add_test(NAME dash_latency_scoring_kat COMMAND dash_latency_scoring_kat)
+# ── KAT: PR-2 RACE THE FRESHEST DATUM (dashd-cut coin-P2P stack) ──
+# Locks (1) select_race_targets() naming the K fastest-scored CanServeBlocks
+# peers in DISTINCT netgroups (width<=1 == single carrier == today), and
+# (2) FreshDatumRaceInflight first-VALID-wins + single-flight dedup: the fold
+# self-check is licensed EXACTLY ONCE, duplicate racer copies are dropped, an
+# invalid copy with a sibling outstanding keeps racing, and the last racer
+# failing is fail-closed. fresh_datum_race.hpp is pure policy (header-only, no
+# node, no daemon, standard library only), so this target links NOTHING and
+# still exercises the reward-safety contract the wiring depends on. Built under
+# -DC2POOL_DASH_BLS=ON like the rest of the dash suite; carries no BLS symbols.
+add_executable(dash_fresh_datum_race_kat dash_fresh_datum_race_kat.cpp)
+add_test(NAME dash_fresh_datum_race_kat COMMAND dash_fresh_datum_race_kat)
 
 # Legacy applications have been archived to ../../archive/
 # - c2pool_legacy.cpp (original c2pool.cpp)
