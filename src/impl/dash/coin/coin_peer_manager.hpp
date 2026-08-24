@@ -60,6 +60,7 @@
 #include <core/dns_seeder.hpp>
 #include <core/coin_addrman.hpp>
 #include <impl/dash/coin/arrival_timing.hpp>   // PR-0: per-peer per-datum-class delivery-latency EWMA (instrumentation only)
+#include <impl/dash/coin/asn_diversity.hpp>    // PR-4: ASN/geo diversity buckets + race-set diversity objective (flag-gated)
 
 namespace dash {
 namespace coin {
@@ -345,6 +346,16 @@ struct DashPeerManagerConfig
     int         max_peers_per_group{4};         // max peers from same /16 (IPv4) or /32 (IPv6)
     int         max_new_peers_per_group{3};     // stricter limit for unverified (new) peers
     int         anchor_count{2};                // number of anchor connections to persist
+
+    // PR-4 ASN/GEO DIVERSITY (--embedded-asn-diversity). DEFAULT OFF => the dial
+    // plan is byte-identical to master. When on, get_peers_to_connect() applies
+    // enforce_asn_diversity() so the head of the returned candidate list (the
+    // fast path + its backup) spans >= min_race_asns INDEPENDENT ASN buckets
+    // when the candidate pool allows it. Pure reordering of already-scored,
+    // already /16-group-diverse candidates; never changes WHAT is fetched.
+    bool        asn_diversity{false};           // OFF => no behavioural change
+    int         asn_race_slots{2};              // head slots required to be ASN-diverse
+    int         min_race_asns{2};               // >= this many distinct ASNs across the head
 };
 
 // ─── DashCoinPeerManager ─────────────────────────────────────────────────────
@@ -573,6 +584,20 @@ public:
                 result.push_back(*ep);
                 connected_groups[grp]++;
             }
+        }
+
+        // PR-4 (--embedded-asn-diversity, default OFF): reorder the already
+        // score-sorted, /16-group-diverse result so the head (fast path + its
+        // backup) spans >= min_race_asns INDEPENDENT ASN buckets when the pool
+        // allows it. Pure reordering of THIS node's own dial candidates; it
+        // never adds, drops, or alters a target, and every fetched reply still
+        // flows through the identical self-checks. OFF => untouched order.
+        if (m_config.asn_diversity && result.size() > 1) {
+            result = enforce_asn_diversity(
+                result,
+                [](const PeerEndpoint& ep) { return peer_asn_group(ep.host()); },
+                static_cast<std::size_t>(m_config.asn_race_slots),
+                m_config.min_race_asns);
         }
         return result;
     }
