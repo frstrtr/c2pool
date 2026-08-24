@@ -432,6 +432,17 @@ add_test(NAME coin_peer_rearm_kat COMMAND coin_peer_rearm_kat)
 add_executable(dash_arrival_instrumentation_kat dash_arrival_instrumentation_kat.cpp)
 add_test(NAME dash_arrival_instrumentation_kat COMMAND dash_arrival_instrumentation_kat)
 
+# -- KAT: PR-1 LATENCY-AWARE PEER SCORING (dashd-cut coin-P2P stack) --
+# Exercises the REAL dash::coin::DashPeerInfo::compute_score(): flag OFF is
+# byte-identical to master (latency term == 0), flag ON adds a bounded/clamped
+# tie-breaker so the faster deliverer ranks up. coin_peer_manager.hpp is a
+# header-only dash coin leaf; it needs the core lib for NetService + the JSON
+# header it includes. Built under -DC2POOL_DASH_BLS=ON; carries no BLS symbols.
+add_executable(dash_latency_scoring_kat dash_latency_scoring_kat.cpp)
+target_link_libraries(dash_latency_scoring_kat core ltc c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage ltc_coin pool)
+target_link_libraries(dash_latency_scoring_kat nlohmann_json::nlohmann_json)
+add_test(NAME dash_latency_scoring_kat COMMAND dash_latency_scoring_kat)
+
 # Legacy applications have been archived to ../../archive/
 # - c2pool_legacy.cpp (original c2pool.cpp)
 # - c2pool_node_legacy.cpp (original c2pool_node.cpp)
