@@ -9074,6 +9074,14 @@ int main(int argc, char** argv)
             embedded_ingest_dstx = true;      // W5-B CoinJoin DSTX feed
         else if (std::strcmp(argv[i], "--embedded-proactive-rotate") == 0)
             embedded_proactive_rotate = true; // PR-3 proactive peer rotation
+        // PR-1 LATENCY-AWARE PEER SCORING. Wire the CLI flag to the existing
+        // set_peer_latency_score_enabled() setter (coin_peer_manager.hpp). Default
+        // OFF => latency term = 0 => compute_score() byte-identical to master.
+        // Reward-safe: only reorders preference WITHIN the already-eligible set.
+        else if (std::strcmp(argv[i], "--embedded-peer-latency-score") == 0)
+            dash::coin::set_peer_latency_score_enabled(true);   // PR-1: latency tie-breaker ON
+        else if (std::strcmp(argv[i], "--embedded-peer-latency-score=false") == 0)
+            dash::coin::set_peer_latency_score_enabled(false);  // PR-1: explicit OFF
         else if (std::strcmp(argv[i],
                              "--embedded-creditpool-publish-at-serve-tip") == 0)
             embedded_creditpool_publish_at_serve_tip = true;
