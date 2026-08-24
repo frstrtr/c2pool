@@ -411,6 +411,15 @@ public:
     {
         m_reask_snapshot = std::move(fn);
     }
+    /// #154 k-inflight-live: the CURRENTLY PENDING fold target (a base=ZERO
+    /// snapshot) as hex, or "" when no fold is pending. Read by the coin-P2P
+    /// client's getmnlistd-tracker hook to gate its slot bookkeeping on THIS
+    /// lane's own target, so a member-sourcing reply for a DIFFERENT target can
+    /// never clear the mn-checkpoint slots. Pure read; no behaviour.
+    std::string pending_snapshot_hash_hex() const
+    {
+        return m_snapshot_pending ? m_snapshot_hash.GetHex() : std::string();
+    }
     /// OPTIONAL. Wall-clock outbound STALL SIGNAL seam (dashd TipMayBeStale ->
     /// SetTryNewOutboundPeer). watchdog_tick() calls this with TRUE while a
     /// bridging getmnlistd has been outstanding past kStatefulStallGraceMs and

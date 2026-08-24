@@ -93,6 +93,7 @@
 #include <impl/dash/coin/bulk_peer_policy.hpp>   // #154 select_bulk_eligible_keys (LEVER 1 pure logic)
 #include <impl/dash/coin/arrival_timing.hpp>     // PR-0: per-peer per-datum-class delivery-latency EWMA (instrumentation only)
 #include <impl/dash/coin/fresh_datum_race.hpp>   // PR-2: fresh-datum race (K-way fan-out selector + single-flight dedup; flag/K default-OFF)
+#include <impl/dash/coin/getmnlistd_tracker.hpp> // #154: getmnlistd slot tracker (fixed 10s per-slot re-ask, 3 boolean tiers, capability filter; flag default-OFF)
 #include <impl/dash/coin/coin_peer_manager.hpp> // PR-2: peer_network_group() for distinct-netgroup racing
 #include <impl/dash/coin/proactive_rotation_policy.hpp>  // PR-3: LOW-RATE proactive rotation decision helpers (pure, shared with the KAT)
 
@@ -785,6 +786,16 @@ private:
     // DIFFERENT carrier so it actually fans out.
     std::size_t  m_stateful_rr{0};
     std::string  m_last_stateful_peer;
+    // #154 EMBEDDED getmnlistd SLOT TRACKER (flag default-OFF). Owns TIME for
+    // the live stateful re-ask: K slots (K = fresh_datum_race_width), each its
+    // OWN fixed 10s timer (no backoff), 3 boolean session-local tiers, the
+    // proto>=70214 capability filter, and the 100s expiry->ESCALATE bound. When
+    // --embedded-getmnlistd-tracker is ON it GOVERNS which capable carriers a
+    // re-ask reaches (reask_via_tracker below); OFF it is never consulted and
+    // the existing race+rotating ladder runs verbatim (byte-identical to
+    // master). Touched only on the single io_context thread, like every other
+    // member here.
+    dash::coin::GetmnlistdSlotTracker m_getmnlistd_tracker;
     // dashd TipMayBeStale/SetTryNewOutboundPeer analog for the STATEFUL leg: a
     // bridging getmnlistd (fold / ondemand-mnlist) that the mn-ckpt lane has
     // found outstanding past its wall-clock re-ask grace. While set,
@@ -1017,6 +1028,13 @@ private:
     // E2+ seams (callbacks, all optional)
     using AddrCallback = std::function<void(const std::vector<NetService>&)>;
     AddrCallback m_addr_callback;
+    /// #154 k-inflight-live gate: reads the mn-checkpoint lane's CURRENTLY
+    /// PENDING fold target (hex), or "" when no fold is pending. Wired by
+    /// main_dash to MnCheckpointLane::pending_snapshot_hash_hex(). Used ONLY to
+    /// gate the getmnlistd slot-tracker bookkeeping so a member-sourcing reply
+    /// for a different target cannot clear the mn-ckpt slots. Flag-guarded at
+    /// the call site; unset => the gate reads "" and the hook never fires.
+    std::function<std::string()> m_active_fold_target_fn;
     using PeerHeightCallback = std::function<void(uint32_t)>;
     PeerHeightCallback m_on_peer_height;
     using HandshakeCallback = std::function<void()>;
@@ -1485,6 +1503,10 @@ public:
     // ── E2+ seams ────────────────────────────────────────────────────────
     /// addr-message peer discovery feed.
     void set_addr_callback(AddrCallback cb) { m_addr_callback = std::move(cb); }
+    /// #154 k-inflight-live: wire the mn-checkpoint lane's pending-fold-target
+    /// accessor (see m_active_fold_target_fn). Reward-safety seam only.
+    void set_active_fold_target_fn(std::function<std::string()> fn)
+    { m_active_fold_target_fn = std::move(fn); }
     /// Peer's reported chain height (from its version message).
     void set_on_peer_height(PeerHeightCallback cb) { m_on_peer_height = std::move(cb); }
     /// Fired once per session when the version/verack handshake completes —
@@ -1894,10 +1916,28 @@ public:
                         << " — the SML cannot advance until a peer is up";
             return;
         }
+        // #154 CAPABILITY FILTER on the initial ask (flag default-OFF). The
+        // pinned m_primary can be a proto<70214 peer structurally incapable of
+        // serving GETMNLISTDIFF (NODE_NETWORK proves nothing — the silent
+        // carriers ARE NODE_NETWORK). When the tracker is armed, rotate the ask
+        // onto a capable carrier instead of burning it on a peer that cannot
+        // answer; if none is capable, drop with a named cause. OFF => carrier is
+        // m_primary and every byte below is identical to master.
+        PeerSession* carrier = m_primary;
+        if (!dash::coin::getmnlistd_emit_eligible(m_primary->version)) {
+            carrier = next_stateful_peer();   // capability-filtered when armed
+            if (!carrier || !dash::coin::getmnlistd_emit_eligible(carrier->version)) {
+                LOG_WARNING << "[COIN-P2P] getmnlistd DROPPED (no getmnlistd-"
+                               "capable peer, proto>=70214):"
+                            << " base=" << base_block_hash.GetHex()
+                            << " target=" << block_hash.GetHex();
+                return;
+            }
+        }
         LOG_INFO << "[COIN-P2P] getmnlistd -> base=" << base_block_hash.GetHex()
                  << " target=" << block_hash.GetHex();
         auto msg = message_getmnlistd::make_raw(base_block_hash, block_hash);
-        m_primary->write(msg);
+        carrier->write(msg);
     }
 
     /// Fold-snapshot variant of send_getmnlistd that ROTATES its carrier across
@@ -1978,7 +2018,20 @@ public:
             c.key       = pp->key;
             c.netgroup  = dash::coin::peer_network_group(pp->addr.address());
             c.can_serve = can_serve_blocks(pp);
-            c.eligible  = pp->handshake.complete() && !bulk_demoted(pp->key);
+            // #154 getmnlistd SLOT TRACKER capability gate (flag default-OFF).
+            // When the tracker is armed AND we are ranking the MnListDiff class,
+            // a peer whose advertised protocol version cannot serve GETMNLISTDIFF
+            // is made INELIGIBLE so a raced slot never lands on a structurally-
+            // incapable carrier (NODE_NETWORK proves nothing; the silent carriers
+            // ARE NODE_NETWORK). OFF => the extra term is `true` and this line is
+            // byte-identical to master. Only WHO is asked changes; admission stays
+            // content-addressed (diff.blockHash == m_snapshot_hash), never peer.
+            const bool mnlistd_capable =
+                !(dash::coin::embedded_getmnlistd_tracker_enabled()
+                  && cls == DatumClass::MnListDiff)
+                || dash::coin::getmnlistd_capable(pp->version);
+            c.eligible  = pp->handshake.complete() && !bulk_demoted(pp->key)
+                          && mnlistd_capable;
             const int64_t e = pp->delivery.ewma_ms(cls);
             c.score     = (e < 0) ? 0
                         : (e > 1000000 ? -1000000 : static_cast<int>(1000000 - e));
@@ -2031,6 +2084,19 @@ public:
         // server and expands/rotates the outbound set toward a real server.
         if (!m_last_stateful_peer.empty() && holds_key(m_last_stateful_peer))
             note_bulk_nonserver(m_last_stateful_peer);
+        // #154 TRACKER-GOVERNED re-ask (flag default-OFF). When armed, the slot
+        // tracker OWNS this re-ask: it applies the proto>=70214 capability
+        // filter, the <=K in-flight budget, the fixed 10s per-slot timer (no
+        // backoff) and the 3 boolean tiers, and it decides WHICH capable
+        // carriers get asked NOW. A slot still younger than 10s is left running
+        // (no new ask) so the tracker — not a growing wall-clock ladder — bounds
+        // the cadence; at 100s the oldest ask ESCALATES the outbound set. OFF =>
+        // the tracker is never consulted and the race+rotating ladder below runs
+        // verbatim (byte-identical to master).
+        if (dash::coin::embedded_getmnlistd_tracker_enabled()) {
+            reask_via_tracker(base_block_hash, block_hash);
+            return;
+        }
         // (B') PR-2: race the re-ask across K distinct-netgroup carriers so a
         // slow winner does not cost a whole wall-clock re-ask interval. Only
         // WHO/HOW-MANY changes; the reply is matched by the unchanged
@@ -2041,6 +2107,72 @@ public:
         // (B) rotate to a fresh archival carrier and send (never drops: the
         // rotating send falls back to any handshaked peer, then m_primary).
         send_getmnlistd_rotating(base_block_hash, block_hash);
+    }
+
+    /// #154: project the live pool into the slot tracker and let it GOVERN the
+    /// re-ask — capability filter (proto>=70214) + <=K slots + fixed 10s per-slot
+    /// timers (no backoff) + 3 boolean tiers + 100s expiry->ESCALATE. Returns the
+    /// number of getmnlistd messages actually written (0 => every slot is still
+    /// younger than 10s, or no capable carrier exists; either way the tracker has
+    /// decided no NEW ask is due). Reward-safe: only WHEN a slot retargets and
+    /// FROM-WHOM changes; the reply is matched by the unchanged m_snapshot_hash
+    /// and DIP-4 self-checked before it is folded, and no fold is rewound.
+    int reask_via_tracker(const uint256& base_block_hash, const uint256& block_hash)
+    {
+        m_getmnlistd_tracker.configure(dash::coin::fresh_datum_race_width());
+        const int64_t now = arrival_now_ms();
+        // 100s EXPIRY -> ESCALATE: the oldest outstanding ask has gone unanswered
+        // ~10x past the fixed cadence. Raise the stateful-stall signal so the
+        // acquisition pump expands the outbound set (dashd SetTryNewOutboundPeer)
+        // toward a fresher capable carrier. This ESCALATES the peer set; it never
+        // repeats an identical ask to the same set and never rewinds a fold.
+        const int64_t oldest = m_getmnlistd_tracker.oldest_asked_at(now);
+        if (dash::coin::classify_getmnlistd_expiry(now, oldest)
+                == dash::coin::GetmnlistdExpiryAction::Escalate)
+            m_stateful_stall = true;
+        auto cands = getmnlistd_candidates();
+        auto keys  = m_getmnlistd_tracker.plan(cands, now);
+        int sent = 0;
+        for (const auto& key : keys) {
+            PeerSession* p = nullptr;
+            for (const auto& up : m_pool) if (up->key == key) { p = up.get(); break; }
+            if (!p) continue;
+            m_last_stateful_peer = p->key;
+            auto msg = message_getmnlistd::make_raw(base_block_hash, block_hash);
+            p->write(msg);
+            p->note_request_sent(DatumClass::MnListDiff, now);
+            ++sent;
+        }
+        if (sent > 0)
+            LOG_INFO << "[COIN-P2P] getmnlistd(TRACKER x" << sent << ") -> "
+                     << sent << " capable slot-tracked carrier(s)"
+                        " (proto>=70214, fixed 10s per-slot, <=K in-flight),"
+                     << " base=" << base_block_hash.GetHex()
+                     << " target=" << block_hash.GetHex();
+        return sent;
+    }
+
+    /// #154: project every handshaked, serve-eligible peer into a slot-tracker
+    /// candidate. The tracker itself applies the capability filter (proto>=70214)
+    /// and the tier/slot/netgroup discipline — this is a pure projection, no
+    /// socket is touched. serve_eligible mirrors the race's own gate (handshaked,
+    /// CanServeBlocks, not bulk-demoted).
+    std::vector<dash::coin::GetmnlistdCandidate> getmnlistd_candidates() const
+    {
+        std::vector<dash::coin::GetmnlistdCandidate> out;
+        out.reserve(m_pool.size());
+        for (const auto& up : m_pool) {
+            const PeerSession* pp = up.get();
+            dash::coin::GetmnlistdCandidate c;
+            c.key            = pp->key;
+            c.netgroup       = dash::coin::peer_network_group(pp->addr.address());
+            c.proto_version  = pp->version;
+            c.serve_eligible = pp->handshake.complete()
+                               && can_serve_blocks(pp)
+                               && !bulk_demoted(pp->key);
+            out.push_back(std::move(c));
+        }
+        return out;
     }
 
     /// dashd SetTryNewOutboundPeer for the STATEFUL leg. The mn-ckpt lane's
@@ -2418,7 +2550,7 @@ private:
     PeerSession* next_stateful_peer()
     {
         const std::size_t n = m_pool.size();
-        if (n == 0) return m_primary;
+        if (n == 0) return getmnlistd_capable_fallback(m_primary);
         for (int pass = 0; pass < 3; ++pass)
         {
             for (std::size_t i = 0; i < n; ++i)
@@ -2426,12 +2558,31 @@ private:
                 PeerSession* p = m_pool[(m_stateful_rr + i) % n].get();
                 if (!p->handshake.complete()) continue;
                 if (pass < 2 && !bulk_eligible(p)) continue;
+                // #154 CAPABILITY FILTER (flag default-OFF): a getmnlistd slot
+                // must never land on a peer whose advertised proto cannot serve
+                // GETMNLISTDIFF (>=70214). getmnlistd_emit_eligible() is the SAME
+                // predicate the initial send_getmnlistd() and the KAT drive. OFF
+                // => it is always true, this continue is never taken, and the
+                // selection is byte-identical to master.
+                if (!dash::coin::getmnlistd_emit_eligible(p->version)) continue;
                 if (pass == 0 && p->key == m_last_stateful_peer) continue;
                 m_stateful_rr = (m_stateful_rr + i + 1) % n;
                 return p;
             }
         }
-        return m_primary;
+        return getmnlistd_capable_fallback(m_primary);
+    }
+
+    /// #154: the final m_primary fallback of the stateful selectors must itself
+    /// respect the capability filter when the tracker is armed — otherwise the
+    /// "no eligible peer" fallback would re-introduce the very incapable carrier
+    /// the filter just excluded. OFF (or a capable primary) => returns the
+    /// pointer unchanged, byte-identical to master.
+    PeerSession* getmnlistd_capable_fallback(PeerSession* p) const
+    {
+        if (p && !dash::coin::getmnlistd_emit_eligible(p->version))
+            return nullptr;
+        return p;
     }
 
     /// dashd mapBlocksInFlight bound: MAX_BLOCKS_IN_TRANSIT_PER_PEER across
@@ -2552,6 +2703,11 @@ private:
 
         if (m_active == p) m_active = nullptr;
         if (was_primary) m_primary = nullptr;
+        // #154: a disconnect erases the peer's session-local tier state and
+        // frees any getmnlistd slot it held (the T1 "answered" boolean resets on
+        // disconnect, exactly as the spec requires). No-op unless the tracker was
+        // ever consulted; harmless when the flag is OFF.
+        m_getmnlistd_tracker.on_disconnect(key);
 
         // Erase LAST: the unique_ptr destructor tears the Connection (and its
         // socket) down, so nothing may hold p afterwards.
@@ -3810,6 +3966,17 @@ private:
         // the old block. Only tip-sync diffs fall through. The tip feed is
         // passed IN so it is structurally impossible to fire it on a consumed
         // reply (see HistoricalMnListDiffDemux::dispatch).
+        //
+        // #154 k-inflight-live: stamp the slot tracker's ACTIVE fold target from
+        // the mn-checkpoint lane's CURRENTLY PENDING snapshot hash BEFORE
+        // dispatch — dispatch runs on_historical_snapshot(), which clears the
+        // lane's pending flag, so a read AFTER would always be "". This is the
+        // reward-safety term the tracker bookkeeping is gated on below. OFF =>
+        // never read.
+        if (dash::coin::embedded_getmnlistd_tracker_enabled())
+            m_getmnlistd_tracker.set_active_target(
+                m_active_fold_target_fn ? m_active_fold_target_fn()
+                                        : std::string());
         const bool consumed = m_historical_mnlistdiff_demux.dispatch(
             msg->m_diff,
             [this](const vendor::CSimplifiedMNListDiff& d) {
@@ -3818,6 +3985,32 @@ private:
         if (consumed) {
             LOG_INFO << "[" << m_chain_label << "] mnlistdiff consumed as "
                         "HISTORICAL (tip SML untouched)";
+        }
+        // #154: a HISTORICAL mnlistdiff is the stateful getmnlistd leg the slot
+        // tracker governs. When armed, mark the answering carrier T1 (answered,
+        // session-local) and free the whole race — a sibling that was genuinely
+        // asked this session and lost the race draws NO strike (late/duplicate
+        // copies are dropped, not penalised). OFF => the tracker is untouched.
+        //
+        // k-inflight-live GATE: `consumed` is the non-short-circuiting OR of
+        // ALL historical demux filters, so it is true even when only the
+        // QuorumMemberSource filter (which sourced its OWN getmnlistd for a
+        // DIFFERENT target) claimed the reply. Firing on `consumed` alone would
+        // clear all K mn-ckpt slots and mis-mark that member-sourcing peer T1,
+        // leaving the K real asks outstanding for the still-unanswered target
+        // (the next tick then refills up to K MORE — up to 2K on the wire, and a
+        // repeat inside the fixed-10s guarantee). So we additionally require the
+        // reply to ACTUALLY answer the tracker's active fold target: a full
+        // snapshot (base==ZERO) whose blockHash equals the pending target
+        // captured above. A member-sourcing reply for a different target can
+        // never satisfy this; a genuine answer to the tracked target always
+        // does (liveness: win_race still fires, slots clear, the fold proceeds).
+        if (dash::coin::embedded_getmnlistd_tracker_enabled() && consumed && m_active
+            && m_getmnlistd_tracker.reply_answers_active_target(
+                   msg->m_diff.baseBlockHash.IsNull(),
+                   msg->m_diff.blockHash.GetHex())) {
+            m_getmnlistd_tracker.note_answered(m_active->key);
+            m_getmnlistd_tracker.win_race();
         }
     }
 
