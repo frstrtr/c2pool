@@ -992,7 +992,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // of THIS node's own dial targets — never changes WHAT is fetched
              // or how a reply is verified. OFF => dial plan byte-identical to
              // master.
-             bool embedded_asn_diversity = false)
+             bool embedded_asn_diversity = false,
+             // --embedded-connectblock-ordering (PR-C3): DEFAULT OFF. Port of
+             // dashcore ConnectBlock atomicity to the tip-publish seam
+             // (NodeCoinState::set_tip). When on, the arm refuses to publish a
+             // tip to the work source ahead of that tip block's body-derived
+             // credit-pool fold — closing the intra-node per-tip ordering
+             // window (#1154) that surfaces as creditpool/dmn/payee-stale.
+             // Ordering discipline ONLY (no derivation change); composes with
+             // the maintainer's body-first promotion gate. OFF => set_tip is
+             // byte-identical to master.
+             bool embedded_connectblock_ordering = false)
 {
     namespace io = boost::asio;
 
@@ -5643,6 +5653,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // advance. `creditpool-stale` then ceases to exist as a class in
         // normal operation; the ~1-2 s window is named `tip-body-pending`.
         maintainer->set_body_first_serve_tip(true);
+        // PR-C3 ConnectBlock ordering (default OFF): enforce fold-before-publish
+        // at the set_tip seam as a fail-closed backstop to the body-first
+        // promotion gate above. Only meaningful here, on the body-first arm.
+        node_coin_state.set_connectblock_ordering(embedded_connectblock_ordering);
+        std::cout << "[run] embedded ConnectBlock ordering (fold-before-publish): "
+                  << (embedded_connectblock_ordering
+                          ? "ENFORCED (--embedded-connectblock-ordering)"
+                          : "off (default; body-first promotion gate still orders "
+                            "the serve tip)")
+                  << "\n";
         // C-startup-invariant (gapless MN-list / daemonless re-seed): couple the
         // money-path freshness gates to body-first serving. The daemonless arm
         // sets body-first UNCONDITIONALLY one line up, so this can never
@@ -8940,6 +8960,7 @@ int main(int argc, char** argv)
     // OFF, money/consensus path; byte-unchanged when off (nullptr null_evidence).
     bool embedded_null_arm = false;
     bool embedded_asn_diversity = false;   // PR-4 (--embedded-asn-diversity): default OFF
+    bool embedded_connectblock_ordering = false;  // PR-C3 (--embedded-connectblock-ordering): default OFF
     // --embedded-ingest-isdlock: arm the coin-P2P MSG_ISDLOCK pull (G4
     // conflict-tx-lock feed). DEFAULT OFF — off, no getdata for inv type 31
     // and the handler decodes-and-discards (wire + template behaviour
@@ -9091,6 +9112,10 @@ int main(int argc, char** argv)
             embedded_asn_diversity = true;   // PR-4: require racing set to span >=2 ASNs
         else if (std::strcmp(argv[i], "--embedded-asn-diversity=false") == 0)
             embedded_asn_diversity = false;  // PR-4: explicit OFF (OFF-equivalence)
+        else if (std::strcmp(argv[i], "--embedded-connectblock-ordering") == 0)
+            embedded_connectblock_ordering = true;   // PR-C3: fold-before-publish at set_tip
+        else if (std::strcmp(argv[i], "--embedded-connectblock-ordering=false") == 0)
+            embedded_connectblock_ordering = false;  // PR-C3: explicit OFF (OFF-equivalence)
         else if (std::strcmp(argv[i], "--embedded-ingest-isdlock") == 0)
             embedded_ingest_isdlock = true;   // G4 conflict-tx-lock feed
         else if (std::strcmp(argv[i], "--embedded-ingest-dstx") == 0)
@@ -9436,7 +9461,8 @@ int main(int argc, char** argv)
                         embedded_ingest_isdlock,       // G4 isdlock feed
                         embedded_ingest_dstx,          // W5-B DSTX feed
                         embedded_proactive_rotate,    // PR-3 proactive rotation
-                        embedded_asn_diversity);       // PR-4 ASN diversity
+                        embedded_asn_diversity,        // PR-4 ASN diversity
+                        embedded_connectblock_ordering); // PR-C3 fold-before-publish
     }
     return run_selftest();
 }

@@ -1239,8 +1239,17 @@ if (BUILD_TESTING AND GTest_FOUND)
     # contiguous fold; the unrepairable-gap fail-closed floor (wipe + demote +
     # re-seed ask) unchanged; and the consumer half of the G7 split (below-tip
     # seed catch-up / refusal-to-arm). Links leveldb via core.
+    # Third TU (PR-C3): test_dash_connectblock_ordering.cpp — the ConnectBlock
+    # fold-before-publish ordering guard at the NodeCoinState::set_tip seam
+    # (flag default-OFF, byte-identical master when off). Folded into this
+    # ALREADY-ALLOWLISTED target rather than a fresh add_executable so it is
+    # actually built + run in CI: a new target absent from the build.yml
+    # --target list is the #143 NOT_BUILT sentinel that "passes" by never
+    # being compiled. It is header-only over node_coin_state.hpp, so it adds no
+    # link deps beyond this target's existing set.
     add_executable(test_dash_coin_state_maintainer test_dash_coin_state_maintainer.cpp
-                   test_dash_mn_gap_repair.cpp)
+                   test_dash_mn_gap_repair.cpp
+                   test_dash_connectblock_ordering.cpp)
     target_link_libraries(test_dash_coin_state_maintainer PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

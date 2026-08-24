@@ -455,6 +455,64 @@ public:
     /// Default OFF preserves the pre-CCbTx KAT/testnet posture byte-for-byte.
     void set_require_sml(bool v) { m_require_sml = v; }
 
+    /// ── PR-C3: dashd ConnectBlock atomicity at the tip-publish seam ──────────
+    /// dashcore's ConnectBlock (validation.cpp) updates the UTXO set + evo state
+    /// (DML, quorums, credit pool, ChainLocks) from the VALIDATED block body and
+    /// only THEN makes the new tip visible, so its getblocktemplate never sees a
+    /// tip at height N with a body-derived axis still at N-1. This arm advances
+    /// each axis on its own network round trip / local fold, so set_tip() — the
+    /// seam that publishes the tip to the work source (DASHWorkSource reads
+    /// m_prev_* through select_work()) — could in principle be poked with the
+    /// tip HEADER ahead of the tip BODY's credit-pool fold, opening the per-tip
+    /// intra-node-ordering window (#1154 / #102: ~47-80 ms/tip surviving replay)
+    /// that surfaces as the creditpool-stale / dmn-stale / payee-stale decline
+    /// family.
+    ///
+    /// When ARMED, set_tip() enforces the PUBLISH-LAST invariant defensively at
+    /// the seam itself: it REFUSES to advance the published tip to a block whose
+    /// reward-critical body-derived credit-pool seed is not yet folded AT that
+    /// block, leaving the previously-published (fully-folded) tip in place so
+    /// GBT keeps serving a tip it can stand behind. This is ORDERING DISCIPLINE
+    /// ONLY — no derivation changes, the same state is published, only AFTER the
+    /// fold rather than possibly before. It composes with (does not replace) the
+    /// CoinStateMaintainer body-first four-axis promotion gate
+    /// (maybe_promote_pending_tip): the maintainer already only calls set_tip
+    /// after that gate passes, so on the proven path this guard never fires; it
+    /// is the fail-closed backstop that catches a FUTURE wiring which pokes
+    /// set_tip without folding first (same spirit as
+    /// require_body_first_when_fresh_gated).
+    ///
+    /// DEFAULT OFF: set_tip() is byte-identical to the pre-C3 behaviour, so the
+    /// header-first / RPC-seed / KAT callers that legitimately publish before a
+    /// credit-pool fold are unaffected. Only meaningful on the body-first
+    /// (coin-P2P daemonless) arm, where main_dash arms it alongside body-first.
+    void set_connectblock_ordering(bool v) { m_connectblock_ordering = v; }
+    bool connectblock_ordering() const { return m_connectblock_ordering; }
+    /// How many set_tip() publications the ordering guard has deferred (a tip
+    /// whose body was not yet folded). Telemetry only; no serve/reward path
+    /// reads it. 0 on the proven body-first path (the maintainer never poses a
+    /// pre-fold tip); a non-zero value names a caller that violated the order.
+    uint64_t connectblock_ordering_deferrals() const {
+        return m_connectblock_ordering_deferrals;
+    }
+    /// The serve tip currently PUBLISHED to the work source (the values
+    /// select_work() builds a template on). Read-only observability, added
+    /// with PR-C3 so the fold-before-publish invariant is directly assertable
+    /// and so telemetry can print the live serve tip without provoking a build.
+    uint32_t published_tip_height() const { return m_prev_height; }
+    const uint256& published_tip_hash() const { return m_prev_hash; }
+    /// TRUE iff the reward-critical body-derived credit-pool seed is folded AT
+    /// the given tip block (hash AND its own height). This is the credit-pool
+    /// witness dashd's ConnectBlock advances inside the block connect; the
+    /// maintainer's four-axis promotion gate additionally proves the payee/SML
+    /// witnesses, which the seam guard need not re-derive (a stale payee/SML is
+    /// a REFUSE at the serve gate, never a wrong-amount block; a stale
+    /// creditPoolBalance is consensus-fatal, so it is the one the seam pins).
+    bool credit_pool_folded_at(uint32_t prev_height, const uint256& prev_hash) const {
+        return m_credit_pool_height == static_cast<int32_t>(prev_height)
+               && m_credit_pool_current_hash == prev_hash;
+    }
+
     /// Record the header-tip parameters and mark the bundle live. Call after
     /// the tip advances AND the MN list + mempool are seeded; until then the
     /// selector must route to the dashd fallback. curtime/version left 0 use
@@ -463,6 +521,16 @@ public:
                  uint32_t bits_for_next, uint32_t mtp_at_tip,
                  uint8_t address_version, uint8_t address_p2sh_version,
                  uint32_t curtime = 0, uint32_t version = 0) {
+        // PR-C3 ConnectBlock ordering (default OFF): refuse to publish a tip
+        // ahead of its body-derived credit-pool fold. prev_height==0 (genesis /
+        // uninitialised) is exempt — there is no prior block to fold. Fail
+        // CLOSED: leave the previously-published, fully-folded tip in place so
+        // the work source never serves a tip whose derived state is stale.
+        if (m_connectblock_ordering && prev_height != 0
+            && !credit_pool_folded_at(prev_height, prev_hash)) {
+            ++m_connectblock_ordering_deferrals;
+            return;
+        }
         // D2: prev_height/prev_hash are inputs of the confirmation-pass
         // projection (confirmations = prev_height - reg_height; confirmedHash
         // = prev_hash), so a tip move invalidates the memoized projected root.
@@ -1905,6 +1973,10 @@ private:
     uint32_t m_curtime{0};
     uint32_t m_version{0};
     bool     m_populated{false};
+    // PR-C3 ConnectBlock fold-before-publish ordering (default OFF; armed on
+    // the body-first daemonless arm). See set_connectblock_ordering().
+    bool     m_connectblock_ordering{false};
+    uint64_t m_connectblock_ordering_deferrals{0};
 };
 
 } // namespace coin
