@@ -116,6 +116,25 @@ static std::vector<unsigned char> script_bytes(uint8_t tag, size_t n = 25) {
     return v;
 }
 
+
+// A real, valid canonical-BASIC mainnet operator key (from the h=2522504
+// checkpoint, proTxHash 0019bb2a...; first byte 0xae >= 0x80). Used by the
+// #154 E2d apply-path regression lock below to derive a genuine LEGACY wire
+// re-encoding of the SAME G1 point via opkey_for_leaf().
+static std::array<uint8_t, 48> opkey_from_hex(const char* hex) {
+    std::array<uint8_t, 48> a{};
+    for (size_t i = 0; i < 48; ++i) {
+        auto nyb = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return 0;
+        };
+        a[i] = static_cast<uint8_t>((nyb(hex[2 * i]) << 4) | nyb(hex[2 * i + 1]));
+    }
+    return a;
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // ProTx wire round-trips + field gating
 // ════════════════════════════════════════════════════════════════════════
@@ -477,6 +496,79 @@ TEST(DashMnState, UpdateRegistrarKeyChangeBansMN) {
     EXPECT_EQ(m.entries().at(h).nPoSeBanHeight, 2400011u);
     EXPECT_EQ(m.entries().at(h).scriptPayout.m_data, upreg.scriptPayout.m_data);
 }
+
+#ifdef C2POOL_DASH_BLS
+// ════════════════════════════════════════════════════════════════════════
+// #154 legacy<->basic opkey — E2d MN-CKPT apply-path regression lock
+// ════════════════════════════════════════════════════════════════════════
+// mn_state_machine case-3 (PROVIDER_UPDATE_REGISTRAR) stores the operator key
+// canonical-BASIC and compares canonical-vs-canonical. A v1 (LEGACY_BLS)
+// ProUpReg payload carries the SAME G1 point in the legacy wire encoding
+// (mainnet h=2525069: 04c4.. wire vs the 84c4.. basic store). Byte-comparing
+// the raw wire against a basic-stored key manufactures a phantom operator
+// change -> spurious dashd-semantics PoSe-ban (dashd compares deserialized
+// points via CBLSLazyPublicKey and never bans) -> the SML fold revives the MN
+// and re-orders the payment queue -> payee desync one cycle later (first
+// observable mainnet slot h=2526494). Guarded on C2POOL_DASH_BLS because
+// opkey_to_basic / opkey_for_leaf are identity no-ops without a BLS backend,
+// so the legacy re-encoding cannot be produced and the defect is untestable —
+// the exact reason it stayed invisible to the BLS-OFF CI jobs.
+TEST(DashMnState, LegacyProUpRegSamePointDoesNotBan) {
+    const std::array<uint8_t, 48> basic = opkey_from_hex(
+        "aef878fcb417bd993366d8bf42e8aa079bd93ebc207072e7b5c9f973b232091e"
+        "3001416816b7f06750daa2274a57981d");
+
+    // The LEGACY (pre-v19) wire encoding of the SAME underlying G1 point.
+    const std::array<uint8_t, 48> legacy =
+        dash::coin::vendor::opkey_for_leaf(basic, /*want_legacy=*/true);
+    ASSERT_NE(legacy, basic)
+        << "legacy re-encoding must differ byte-wise from basic (else this "
+           "point cannot exercise the scheme-mismatch defect)";
+    // Canonicalizing the legacy wire recovers the basic store form (injective).
+    ASSERT_EQ(dash::coin::vendor::opkey_to_basic(legacy, /*wire_legacy=*/true),
+              basic);
+
+    // Register the MN with the BASIC key (a v2 ProReg stores canonical basic).
+    auto reg = make_proreg(ProTxVersion::BASIC_BLS, MnType::REGULAR);
+    reg.pubKeyOperator = basic;
+    auto regtx = special_tx(CProRegTx::SPECIALTX_TYPE, protx_payload(reg));
+    uint256 h = tx_hash(regtx);
+    BlockType b1;
+    b1.m_txs.push_back(coinbase_tx({script_bytes(0xC2)}));
+    b1.m_txs.push_back(regtx);
+    MnStateMachine m;
+    m.apply_block(b1, 2400010);
+    ASSERT_TRUE(m.entries().at(h).isValid);
+    ASSERT_EQ(m.entries().at(h).pubKeyOperator, basic);
+
+    // v1 (LEGACY_BLS) ProUpReg carrying the SAME point in legacy encoding,
+    // changing only the payout script — dashd does NOT ban (same point).
+    CProUpRegTx upreg;
+    upreg.nVersion = ProTxVersion::LEGACY_BLS;   // == 1
+    upreg.proTxHash = h;
+    upreg.pubKeyOperator = legacy;               // legacy wire of the same point
+    upreg.keyIDVoting = raw160(0x66);
+    upreg.scriptPayout.m_data = script_bytes(0x9A, 25);
+    upreg.inputsHash = raw256(0x34);
+    upreg.vchSig = {0x01};
+    BlockType b2;
+    b2.m_txs.push_back(coinbase_tx({script_bytes(0xC3)}));
+    b2.m_txs.push_back(
+        special_tx(CProUpRegTx::SPECIALTX_TYPE, protx_payload(upreg)));
+    auto r = m.apply_block(b2, 2400011);
+    EXPECT_EQ(r.updated, 1u);
+
+    // THE LOCK: same G1 point => key_changed=false => NO ban, entry stays valid
+    // (pre-fix: raw byte-compare sees 2e.. != ae.. -> spurious ban).
+    EXPECT_TRUE(m.entries().at(h).isValid)
+        << "legacy-encoded same-point ProUpReg spuriously banned the MN "
+           "(raw byte-compare regression #154, h=2526494 payee-desync class)";
+    EXPECT_EQ(m.entries().at(h).nPoSeBanHeight, 0u);
+    // Store stays canonical BASIC; the payout update still applies.
+    EXPECT_EQ(m.entries().at(h).pubKeyOperator, basic);
+    EXPECT_EQ(m.entries().at(h).scriptPayout.m_data, upreg.scriptPayout.m_data);
+}
+#endif // C2POOL_DASH_BLS
 
 TEST(DashMnState, UpdateServiceRevivesBannedMN) {
     auto reg = make_proreg(ProTxVersion::BASIC_BLS, MnType::REGULAR);

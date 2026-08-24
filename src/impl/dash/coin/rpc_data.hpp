@@ -207,6 +207,43 @@ struct DashWorkData {
     // inference from a reject string. Diagnostic: no consensus path reads it.
     std::vector<uint8_t>  m_mempool_probe_depends_in_set;
 
+    // -- EMBEDDED TX-SERVE INTERNAL-CONSISTENCY STAMP -----------------------
+    // Written ONLY by the embedded builder when it produces a mempool-tx-
+    // carrying body (embedded_gbt.hpp; armed == !suppress_mempool_txs). The
+    // serve-time internal-consistency referee (tx_serve_referee.hpp) reads it
+    // to decide whether c2pool may serve ITS OWN valid tx set instead of
+    // falling back to dashd merely because our tx-merkle-root differs. A
+    // divergent-but-internally-consistent set is a NORMAL, perfectly valid
+    // block; the safety requirement is per-tx validity + no double-spend +
+    // coinbase fee-consistency, NOT tx-set parity with dashd.
+    //
+    // The two facts here are the ones the referee cannot re-derive from the
+    // wire body alone: whether every mempool-range tx passed the fee-fold
+    // proof (mempool.hpp exclusion-discipline: the vin-present/unspent,
+    // in_sum>=out_sum guarantee), and the treasury/superblock slice that was
+    // added to m_coinbase_value on a funded superblock height (so the referee
+    // can assert m_coinbase_value == subsidy + Sum(m_tx_fees) + superblock).
+    // armed == false on every non-serving build (coinbase-only, dashd
+    // fallback) -> the referee never runs and behaviour is byte-identical.
+    struct EmbeddedTxServeStamp {
+        // The mempool-serving path produced this body (--embedded-serve-
+        // mempool-txs ON at build time). When false the referee is dormant.
+        bool     armed{false};
+        // Every tx in the mempool-sourced range [m_mempool_tx_first_index,
+        // +m_mempool_tx_count) passed the fee-fold proof at selection. The
+        // selector already refuses non-proven entries (mempool.hpp:~1018
+        // "if(!e.fee_fold_proven) continue;"); this records that guarantee so
+        // the referee can fail-close if a future selection path ever admits an
+        // unproven tx.
+        bool     all_mempool_fee_fold_proven{false};
+        // Treasury payout total added to m_coinbase_value at a funded
+        // superblock height (0 on every ordinary block). Lets the referee
+        // reconstruct the coinbase value exactly from (subsidy + fees +
+        // superblock) rather than approximating it.
+        uint64_t superblock_total{0};
+    };
+    EmbeddedTxServeStamp m_tx_serve_stamp;
+
     // ── PIN OUTCOMES (see PinOutcome above) ───────────────────────────────
     // One entry per configured pinned local tx, written by the splice on the
     // SERVED dashd-fallback arm. Empty on the embedded arm (which splices in

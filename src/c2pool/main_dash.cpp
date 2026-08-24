@@ -295,12 +295,32 @@ uint32_t    g_replay_mnlist_seed_height = 0;  // --replay-mnlist-seed-height H (
 std::string g_replay_mnlist_seed_source;      // --replay-mnlist-seed-source getmnlistdiff
 std::string g_replay_mnlist_seed_file;        // --replay-mnlist-seed-file FILE (offline snapshot)
 // --embedded-no-dashd-mn-seed: cut the PAYEE axis off from dashd while KEEPING
-// the dashd RPC for the OBSERVE-only shadow-compare. The E2c `protx list` seed
-// and the E2d checkpoint bridge are both skipped, so the root-checked replay
-// fold is the only thing that can populate the payee queue. Exists to make a
-// parity run measurable: a run that was dashd-seeded proves the fold and the
-// serve are both fine WITHOUT proving the serve is daemonless.
+// the dashd RPC for the OBSERVE-only shadow-compare. Only the E2c `protx list`
+// seed is disabled; the DAEMONLESS E2d checkpoint bridge STAYS ARMED so the
+// payee/MN axis still bootstraps without dashd (compiled trust anchor + P2P
+// getmnlistd anchor SML, DIP-4 self-checked against our own PoW header chain,
+// per-block merkleRootMNList forward fold — fail-closed). This is the hotel
+// cut-rehearsal posture: serve daemonless, keep the RPC observe-only for the
+// shadow-compare and the reward-safe fallback arm.
+//   Provenance guarantee UNCHANGED: with this flag the payee source can only
+//   ever be the mn-ckpt bridge or the replay fold, NEVER a dashd seed — the
+//   E2c `protx list` seed is the one thing this flag cuts.
 bool        g_no_dashd_mn_seed = false;       // --embedded-no-dashd-mn-seed
+
+// --embedded-fold-only-proof: the STRICT measurement posture (the old meaning
+// of --embedded-no-dashd-mn-seed). Requires --embedded-no-dashd-mn-seed. On top
+// of cutting the E2c dashd seed it ALSO leaves the E2d checkpoint bridge UNARMED,
+// so the ROOT-CHECKED REPLAY FOLD (behind the --replay-* lanes) is the only
+// thing that may populate the payee queue. Exists for the .211 LAN parity runs
+// that want to isolate "the replay serves correctly" from "the bridge seeded it".
+// Default OFF: a plain --embedded-no-dashd-mn-seed now ARMS the bridge.
+bool        g_fold_only_proof = false;        // --embedded-fold-only-proof
+
+// --serve-gate-state-file: path to the cross-restart cumulative serve-gate
+// accounting state (JSON). Empty (default) => OFF; the serve path is
+// byte-identical. Non-consensus, non-reward: a soak convenience whose
+// bad read fails to a clean zero and never wedges the node.
+std::string g_serve_gate_state_file;           // --serve-gate-state-file
 
 // ── PR-2 FORWARD: --replay-mined-commitment-index ─────────────────────────
 // Arms the forward half of dashd's mined-commitment store
@@ -425,6 +445,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-utxo] [--embedded-mainnet] [--embedded-null-arm] [--embedded-mn-bridge-max N]\n"
         << "           [--embedded-mn-bridge-no-cursor]\n"
         << "           [--embedded-utxo-immature-serve-empty] [--embedded-serve-mempool-txs]\n"
+        << "           [--embedded-tx-serve-own-set]\n"
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
         << "           [--embedded-ingest-isdlock] [--embedded-ingest-dstx]\n"
         << "           [--pin-local-tx-hex FILE]  (zero-fee self-mined tx, e.g. donation consolidation)\n"
@@ -439,7 +460,7 @@ void print_banner(const char* argv0)
         << "           [--replay-fold-qsnapshot FILE] [--replay-fold-worklists FILE]\n"
         << "           [--replay-mnlist-seed-height H --replay-mnlist-seed-source getmnlistdiff --replay-mnlist-seed-file FILE]\n"
         << "           [--replay-mined-commitment-index]\n"
-        << "           [--embedded-no-dashd-mn-seed]\n"
+        << "           [--embedded-no-dashd-mn-seed [--embedded-fold-only-proof]]\n"
         << "           [--oracle-graduation-blocks N] [--oracle-class-coverage K]\n"
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
         << "           [--redistribute pplns|fee|boost|donate]\n"
@@ -593,10 +614,12 @@ void print_banner(const char* argv0)
         << "        naming the rule) — it is never half-resumed. Use this flag\n"
         << "        to measure cold-vs-warm on one binary.\n"
         << "        --embedded-no-dashd-mn-seed cuts the PAYEE axis off from a\n"
-        << "        configured dashd (no `protx list` seed, no checkpoint\n"
-        << "        bridge) while KEEPING the RPC for --embedded-shadow-compare:\n"
-        << "        the posture in which a serve-vs-dashd parity run actually\n"
-        << "        measures a DAEMONLESS serve instead of a dashd-seeded one.\n"
+        << "        configured dashd (no `protx list` seed) while KEEPING the\n"
+        << "        daemonless E2d checkpoint bridge ARMED and the RPC observe-\n"
+        << "        only for --embedded-shadow-compare: the hotel cut-rehearsal\n"
+        << "        that serves DAEMONLESS instead of dashd-seeded. Add\n"
+        << "        --embedded-fold-only-proof to also leave the bridge unarmed\n"
+        << "        (strict replay-fold-only measurement, the old semantics).\n"
         << "        PRUNED (bodies never persisted). Strictly lower priority than\n"
         << "        the tip lane; resumable (high-water cursor); [BULK] telemetry.\n"
         << "        OBSERVE-only in W2 (counting consumer stands in for the W1 fold);\n"
@@ -810,6 +833,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // body path (G1-G4 guards, mempool.hpp) only enters block
              // production when the operator explicitly arms it.
              bool embedded_serve_mempool_txs = false,
+             // --embedded-tx-serve-own-set: when a served embedded
+             // template's mempool selection diverges from dashd's, serve
+             // OUR OWN internally-consistent valid set instead of falling
+             // back to dashd on tx-merkle difference. DEFAULT OFF. MUST NOT
+             // be armed until the [MEMPOOL-VALIDITY] gate has reached
+             // open() (576 clean heights) in a dashd-oracle soak -- the
+             // internal-consistency referee shares the selector's UTXO view
+             // and cannot alone catch the already-mined/stale-view class
+             // (h=2526403). When --embedded-shadow-compare is also on, the
+             // own-set path auto-fail-closes until that gate is open.
+             bool embedded_tx_serve_own_set = false,
              // --embedded-shadow-compare: OBSERVE-only serve-vs-dashd block-
              // template field diff (diagnostic; NOT a serve gate). Off the hot
              // path (worker-thread dashd fetch). Default false; only meaningful
@@ -2412,6 +2446,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // spends. The dashd fallback is unaffected.
             node_coin_state.set_utxo_ready_fn(
                 [&utxo_lane]() { return utxo_lane.mining_utxo_ready(); });
+            // WINDOW-2 currency gate (Window 2 = intra-node eviction lag).
+            // The serve tip can be promoted to H by the diff-driven path
+            // (CoinStateMaintainer mnlistdiff-at-tip / cbTx credit-pool
+            // re-anchor) BEFORE this UTXO lane connects+evicts block H. In that
+            // window the view is at H-1 and a template on H could pack a tx
+            // already spent by H (invalid, thrown-away block). This predicate
+            // lets make_embedded_work_inputs serve coinbase-only until the view
+            // catches up -- dashd's removeForBlock-before-SetTip invariant,
+            // fail-closed. Only material when --embedded-serve-mempool-txs is
+            // armed; coinbase-only / fallback postures are byte-unchanged.
+            // On the LIVE full-block path the utxo-lane subscription (2438,
+            // subscriber 1) connects+evicts BEFORE the maintainer promotes the
+            // serve tip (3908, subscriber 2) on the same io thread, so this
+            // predicate is already true there and suppresses nothing.
+            node_coin_state.set_utxo_current_fn(
+                [&utxo_lane](const uint256& tip_hash) {
+                    return utxo_lane.utxo_current_at(tip_hash);
+                });
             // What the arm DOES during that window. Default (flag absent):
             // REFUSE -- p2pool semantics, the project design law: an unsynced
             // node does not serve block templates; miners idling is correct,
@@ -2810,6 +2862,40 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // consulted, i.e. during an actual embedded outage.
     const bool xcheck_wanted = (testnet || embedded_mainnet);
     work_source->set_gbt_xcheck(xcheck_wanted && static_cast<bool>(rpc));
+    // --embedded-tx-serve-own-set: serve own valid tx set on a divergent
+    // mempool selection instead of the dashd-parity swap (DEFAULT OFF).
+    work_source->set_tx_serve_own_set(embedded_tx_serve_own_set);
+    std::cout << "[DASH-STRATUM-GBT] tx-serve own-set referee: "
+              << (embedded_tx_serve_own_set
+                      ? "ON (--embedded-tx-serve-own-set: divergent-but-valid"
+                        " mempool set served as own; validity-gate-coupled"
+                        " when shadow-compare is bound)"
+                      : "OFF (dashd-parity backstop on any tx-merkle divergence)")
+              << std::endl;
+    // CUMULATIVE cross-restart serve-gate ledger: persist the never-a-reject
+    // accounting to <data-dir>/<net_subdir>/serve_gate_ledger.json so the
+    // standing "% embedded / null-arm covered the 4.51% floor / 0 rejects over
+    // N heights" figure survives the >=3 restarts the dashd-cut soak spans
+    // (ServeGateJournal wipes on restart). Stamp C2POOL_VERSION so the figure
+    // always names the binary that produced it (measurement-without-commit).
+    {
+        const std::string ledger_path =
+            (core::filesystem::config_path() / net_subdir /
+             "serve_gate_ledger.json").string();
+#ifdef C2POOL_VERSION
+        work_source->set_serve_gate_ledger_path(ledger_path, C2POOL_VERSION);
+#else
+        work_source->set_serve_gate_ledger_path(ledger_path, "dev");
+#endif
+    }
+    // Cross-restart cumulative serve-gate accounting. Empty path keeps the
+    // per-process behaviour byte-for-byte; when set, note_arm_decision()
+    // write-throughs the combined prior+live roll-up + QC-NULL-SERVE
+    // counters so a STANDING soak is readable across restarts.
+    work_source->set_serve_gate_state_file(g_serve_gate_state_file);
+    if (!g_serve_gate_state_file.empty())
+        std::cout << "[run] serve-gate cumulative accounting ARMED: state="
+                  << g_serve_gate_state_file << "\n";
     // Pin splice on the xcheck-SWAPPED arm (default OFF). Announce the state
     // either way: with it off the donation still misses every swapped
     // template -- it just no longer does so silently.
@@ -5982,26 +6068,29 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 seed_mn_set_from_rpc("payee-desync re-seed");
             };
             maintainer->set_on_mn_reseed(mn_reseed_fallback);
-        } else if (rpc) {
-            // ── --embedded-no-dashd-mn-seed: THE PROOF POSTURE ─────────────
-            // A dashd RPC IS configured, but the payee axis is deliberately
-            // cut off from it. Nothing else changes: the shadow-compare
-            // diagnostic keeps asking dashd for its template so the two can
-            // be diffed — which is the entire point. Without this switch a
-            // parity run cannot separate "the replay serves correctly" from
-            // "dashd seeded the queue and the replay watched": the LAN run on
-            // .211 served in 7 minutes off
+        } else if (rpc && g_fold_only_proof) {
+            // ── --embedded-fold-only-proof: THE STRICT MEASUREMENT POSTURE ───
+            // Reached only with BOTH --embedded-no-dashd-mn-seed AND
+            // --embedded-fold-only-proof. A dashd RPC IS configured, but the
+            // payee axis is deliberately cut off from it AND the E2d checkpoint
+            // bridge is left UNARMED, so the ROOT-CHECKED REPLAY FOLD is the
+            // only thing that can populate the payee queue. Nothing else
+            // changes: the shadow-compare diagnostic keeps asking dashd for its
+            // template so the two can be diffed — which is the entire point.
+            // Without this the run cannot separate "the replay serves
+            // correctly" from "the bridge/dashd seeded the queue and the replay
+            // watched": the LAN run on .211 served in 7 minutes off a dashd seed
             //   [run] E2c MN-set seed LOADED (startup): 2971/2971 registered
             //         MNs as-of h=2516893 FROM DASHD `protx list registered
             //         true`
             // and that is NOT a daemonless serve, however daemonless the fold
             // beside it was.
             //
-            // The E2d checkpoint bridge is skipped too: this posture exists to
-            // leave the ROOT-CHECKED REPLAY FOLD as the only thing that can
-            // populate the payee queue. If the fold does not get there, the
-            // node does not serve — which is the honest outcome to measure.
-            std::cout << "[run] --embedded-no-dashd-mn-seed: the E2c dashd"
+            // If the fold does not get there, the node does not serve — which
+            // is the honest outcome to measure. A plain
+            // --embedded-no-dashd-mn-seed (without this flag) instead ARMS the
+            // E2d bridge and serves daemonless (the else branch below).
+            std::cout << "[run] --embedded-fold-only-proof: the E2c dashd"
                          " `protx list` MN-set seed is DISABLED and the E2d"
                          " checkpoint bridge is NOT armed.\n"
                          "      The PAYEE queue can now be populated by ONE"
@@ -6014,8 +6103,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                          " publishes, the embedded arm will not serve and no"
                          " masternode payee will be guessed.\n";
         } else {
-            // ── E2d (#738): PURE DAEMONLESS MN-SET SEED ────────────────────
-            // No dashd RPC, so no `protx list`. The set comes from a
+            // ── E2d (#738): DAEMONLESS MN-SET SEED (checkpoint bridge) ───────
+            // Reached when there is NO dashd RPC, OR when --embedded-no-dashd-mn-seed
+            // is set WITHOUT --embedded-fold-only-proof (the hotel cut-rehearsal:
+            // RPC present but observe-only, payee axis seeded daemonlessly). Either
+            // way the `protx list` dashd seed is NOT used here. The set comes from a
             // RELEASE-PINNED CHECKPOINT compiled into this binary, replayed
             // forward to the tip through the SAME block-connect ingest leg 3
             // already uses. This is the last structurally daemon-dependent
@@ -6247,6 +6339,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 mn_ckpt_lane->set_reask_snapshot_fn(
                     [cp](const uint256& block_hash) {
                         cp->send_getmnlistd_reask(uint256::ZERO, block_hash);
+                    });
+                // WALL-CLOCK STALL SIGNAL (dashd TipMayBeStale ->
+                // SetTryNewOutboundPeer). The lane's watchdog tick raises this
+                // while a bridging getmnlistd is frozen unanswered so the pool
+                // expands its dial target past 8 and rotates the silent carrier
+                // — even when the header tip is itself stalled and the
+                // tip-driven re-ask never fires. Reward-safe: dial-count only.
+                mn_ckpt_lane->set_stateful_stall_fn(
+                    [cp](bool stalled) {
+                        cp->note_stateful_stall(stalled);
                     });
                 // DEMUX (reward-critical): the reply comes back on the SAME
                 // mnlistdiff message the tip sync uses. Routed here it is
@@ -6505,7 +6607,22 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                 // ROOT-COMMITTING fields -- SML authoritative.
                                 st.nVersion         = e.nVersion;
                                 st.nType            = e.nType;
-                                st.pubKeyOperator   = e.pubKeyOperator;
+                                // STORE CONTRACT: the DML engine stores the operator
+                                // key in CANONICAL BASIC encoding and re-encodes each
+                                // SML leaf per its own nVersion (to_sml_entry ->
+                                // opkey_for_leaf: legacy iff nVersion < BASIC_BLS).
+                                // The anchor SML carries the key in the scheme the
+                                // entry's nVersion dictates (legacy for the pre-v19
+                                // nVersion=1 entries), so canonicalize on ingest here
+                                // exactly as the fold_proupreg store sites do
+                                // (replay_fold_engine.hpp opkey_to_basic). Storing the
+                                // raw wire bytes lets a legacy-era leaf re-encode from
+                                // the wrong point -> merkleRootMNList diverges and the
+                                // seed self-check below UNSEEDS the engine (the
+                                // observed ff99366e != committed 2315e6df at h=2513000).
+                                st.pubKeyOperator   = dash::coin::vendor::opkey_to_basic(
+                                    e.pubKeyOperator,
+                                    e.nVersion < dash::coin::vendor::ProTxVersion::BASIC_BLS);
                                 st.keyIDVoting      = e.keyIDVoting;
                                 st.netInfo.ip       = e.netAddress;
                                 st.netInfo.port_be  = e.netPort;
@@ -8757,6 +8874,7 @@ int main(int argc, char** argv)
     // (mempool_validity_gate.hpp) reports zero transactions refused by dashd's
     // testmempoolaccept over its sustained window.
     bool embedded_serve_mempool_txs = false;
+    bool embedded_tx_serve_own_set = false;  // --embedded-tx-serve-own-set, default OFF
     bool embedded_accrue_asset_locks = false;  // #107 PHASE 2, default OFF
     bool embedded_accrue_asset_unlocks = false;  // #143 Variant B (type-9), default OFF
     // --embedded-creditpool-publish-at-serve-tip: publish the derived credit
@@ -8886,6 +9004,8 @@ int main(int argc, char** argv)
             embedded_utxo_immature_serve_empty = true;
         else if (std::strcmp(argv[i], "--embedded-serve-mempool-txs") == 0)
             embedded_serve_mempool_txs = true;
+        else if (std::strcmp(argv[i], "--embedded-tx-serve-own-set") == 0)
+            embedded_tx_serve_own_set = true;
         else if (std::strcmp(argv[i], "--embedded-accrue-asset-locks") == 0)
             embedded_accrue_asset_locks = true;   // #107 PHASE 2
         else if (std::strcmp(argv[i], "--embedded-accrue-asset-unlocks") == 0)
@@ -8919,6 +9039,12 @@ int main(int argc, char** argv)
             bestcl_policy = argv[++i];
         else if (std::strcmp(argv[i], "--coinbase-text") == 0 && i + 1 < argc)
             coinbase_text = argv[++i];
+        // Cross-restart cumulative serve-gate accounting (#127 follow-up):
+        // path to a small JSON state file. Empty (default) => OFF and the
+        // serve path is byte-identical. Non-consensus, non-reward: a soak
+        // convenience whose bad read fails to a clean zero, never wedges.
+        else if (std::strcmp(argv[i], "--serve-gate-state-file") == 0 && i + 1 < argc)
+            g_serve_gate_state_file = argv[++i];
         else if (std::strcmp(argv[i], "--embedded-oracle-shadow") == 0)
             embedded_oracle_shadow = true;
         else if (std::strcmp(argv[i], "--embedded-shadow-compare") == 0)
@@ -8976,10 +9102,17 @@ int main(int argc, char** argv)
         // PR-2 FORWARD: the mined-commitment store, fed from our own replay.
         else if (std::strcmp(argv[i], "--replay-mined-commitment-index") == 0)
             g_mined_commitment_index = true;
-        // THE PROOF POSTURE: keep the dashd RPC (shadow-compare) but cut the
-        // PAYEE axis off from it — see g_no_dashd_mn_seed.
+        // CUT THE DASHD PAYEE SEED: disable the E2c `protx list` seed but KEEP
+        // the daemonless E2d checkpoint bridge armed (shadow-compare still runs
+        // off the RPC) — see g_no_dashd_mn_seed.
         else if (std::strcmp(argv[i], "--embedded-no-dashd-mn-seed") == 0)
             g_no_dashd_mn_seed = true;
+        // STRICT MEASUREMENT POSTURE: additionally leave the E2d bridge UNARMED
+        // so ONLY the replay fold may populate the payee queue — the old meaning
+        // of --embedded-no-dashd-mn-seed. Requires that flag too. See
+        // g_fold_only_proof.
+        else if (std::strcmp(argv[i], "--embedded-fold-only-proof") == 0)
+            g_fold_only_proof = true;
         else if (std::strcmp(argv[i], "--oracle-graduation-blocks") == 0 && i + 1 < argc)
             oracle_grad_blocks = std::strtoull(argv[++i], nullptr, 10);
         else if (std::strcmp(argv[i], "--oracle-class-coverage") == 0 && i + 1 < argc)
@@ -9204,6 +9337,7 @@ int main(int argc, char** argv)
                         oracle_class_coverage, coin_p2p_peers, bestcl_policy,
                         embedded_utxo_immature_serve_empty,
                         embedded_serve_mempool_txs,
+                        embedded_tx_serve_own_set,
                         embedded_shadow_compare,
                         embedded_mempool_ingest,
                         pin_local_tx_hex_path,

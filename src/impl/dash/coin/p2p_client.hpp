@@ -730,6 +730,15 @@ private:
     // DIFFERENT carrier so it actually fans out.
     std::size_t  m_stateful_rr{0};
     std::string  m_last_stateful_peer;
+    // dashd TipMayBeStale/SetTryNewOutboundPeer analog for the STATEFUL leg: a
+    // bridging getmnlistd (fold / ondemand-mnlist) that the mn-ckpt lane has
+    // found outstanding past its wall-clock re-ask grace. While set,
+    // outbound_behind() is true so effective_max_peers() expands and refill/
+    // rotation dials past the base pool to reach a peer that will answer —
+    // exactly as dashd opens an extra OUTBOUND_FULL_RELAY when it falls behind.
+    // Set/cleared every lane watchdog tick via note_stateful_stall(), so it
+    // self-clears the moment the leg is served. Dial-count only.
+    bool         m_stateful_stall{false};
     // The peer select_block_peer() last sent a block getdata to, so
     // request_block_tracked() arms the watchdog against the peer actually
     // asked (not an unrelated primary).
@@ -758,6 +767,45 @@ private:
             } else {
                 ++it;
             }
+        }
+    }
+
+    /// Re-issue getdata for tx/dstx invs parked while a tip body was in flight
+    /// (mempool-ingest-completeness). One pass per pool tick. The tip body
+    /// ALWAYS keeps priority: nothing drains while a body is outstanding, and
+    /// the loop bails the instant a body arrives mid-drain. Each retry rides
+    /// the SAME inflight budget/cap and txid-keyed dedup as a first-time pull
+    /// (the inv hash IS the txid for both lanes), and echoes the ANNOUNCED
+    /// type so a DSTX is re-asked as MSG_DSTX. The getdata goes to a
+    /// handshaked peer (tx relay is gossiped — any peer holding it in mempool
+    /// serves it; a peer that lacks it answers notfound, which is benign and
+    /// self-correcting, exactly like the block watchdog's cross-peer re-ask).
+    void drain_tx_retry_busy(int64_t now)
+    {
+        if (m_tx_retry_busy.empty())    return;
+        if (!m_pending_bodies.empty())  return;   // tip body still wins
+        // A peer to ask: prefer the active session, else any handshaked peer.
+        PeerSession* peer = (m_active && m_active->handshake.complete())
+                            ? m_active : nullptr;
+        if (!peer)
+            for (auto& up : m_pool)
+                if (up->handshake.complete()) { peer = up.get(); break; }
+        if (!peer) return;   // no one to ask yet — keep the queue for next tick
+        expire_tx_pulls(now);
+        while (!m_tx_retry_busy.empty())
+        {
+            if (!m_pending_bodies.empty()) break;                 // a body arrived
+            if (m_tx_pull_inflight.size() >= m_tx_pull_inflight_cap) break;  // budget
+            const TxRetry r = m_tx_retry_busy.front();
+            m_tx_retry_busy.pop_front();
+            if (m_tx_pull_inflight.count(r.hash)) continue;       // already in flight
+            m_tx_pull_inflight.emplace(r.hash, now);
+            const bool is_dstx = (r.type == static_cast<uint32_t>(inventory_type::dstx));
+            if (is_dstx) ++m_dstx_pull_sent; else ++m_tx_pull_sent;
+            ++m_tx_retry_drained;
+            auto getdata_msg = message_getdata::make_raw(
+                {inventory_type(static_cast<inventory_type::inv_type>(r.type), r.hash)});
+            peer->write(getdata_msg);
         }
     }
 
@@ -807,6 +855,24 @@ private:
     uint64_t m_tx_pull_skipped_busy{0};
     uint64_t m_tx_received{0};       // tx bodies that arrived
     uint64_t m_tx_pull_expired{0};   // getdata that never got an answer
+
+    // ── Tip-body-busy retry queue (mempool-ingest-completeness) ──────────
+    // A tx/dstx inv admitted by InvDedup but then SKIPPED because a tip body
+    // was in flight is parked here — NOT dropped. InvDedup holds the (type,
+    // hash) for its 600 s TTL, so a re-announcement from any other peer is
+    // suppressed and the tx would otherwise be stranded until the entry ages
+    // out (by which time it is usually already mined). When the tip body
+    // clears, drain_tx_retry_busy() re-issues the getdata, recovering the
+    // ~2 % of invs this window costs. Bounded FIFO: a sustained body-in-flight
+    // burst drops the OLDEST parked inv, never grows unbounded. Dormant unless
+    // the owning lane (m_tx_pull_enabled / m_dstx_pull_enabled) is armed — the
+    // park site is downstream of the is_tx/is_dstx flag gate — so a
+    // default-configured node parks nothing and its wire is byte-identical.
+    struct TxRetry { uint32_t type; uint256 hash; };
+    std::deque<TxRetry> m_tx_retry_busy;
+    size_t   m_tx_retry_busy_cap{256};
+    uint64_t m_tx_retry_requeued{0};   // invs parked while a tip body was busy
+    uint64_t m_tx_retry_drained{0};    // parked invs later re-issued as getdata
 
     // ── SPORK listener (state + telemetry ONLY — nothing gates on it) ────
     // Seeded with the assume-active mainnet defaults (7/7 active, matching
@@ -1305,6 +1371,11 @@ public:
     /// pool timer would. Paired with set_now_fn this replaces the io_context
     /// entirely for policy tests — no real timer, no real waiting, no race.
     void tick_for_test() { on_pool_tick(); }
+    /// Test-only: simulate the block handler having consumed every tracked
+    /// tip body (the ONLY in-tree place m_pending_bodies is erased), so a KAT
+    /// can drive the body-busy -> body-clear transition drain_tx_retry_busy
+    /// keys on without constructing a hash-matched block body.
+    void clear_pending_bodies_for_test() { m_pending_bodies.clear(); }
 
     /// TEST-ONLY: exercise the bulk/historical body peer SELECTION directly
     /// (announcer-less path), returning the chosen peer's key — the seam the
@@ -1650,10 +1721,23 @@ public:
              + "/" + std::to_string(m_tx_pull_inflight_cap)
              + " skipped(budget)=" + std::to_string(m_tx_pull_skipped_budget)
              + " skipped(tip-body-busy)=" + std::to_string(m_tx_pull_skipped_busy)
-             + " expired=" + std::to_string(m_tx_pull_expired);
+             + " expired=" + std::to_string(m_tx_pull_expired)
+             + " retry(parked/drained)=" + std::to_string(m_tx_retry_requeued)
+             + "/" + std::to_string(m_tx_retry_drained)
+             + " dstx_inv=" + std::to_string(m_dstx_inv_seen)
+             + " dstx_getdata=" + std::to_string(m_dstx_pull_sent)
+             + " dstx_received=" + std::to_string(m_dstx_received);
     }
     uint64_t tx_received_count() const { return m_tx_received; }
     size_t   tx_pull_inflight()  const { return m_tx_pull_inflight.size(); }
+    uint64_t tx_pull_sent_count()        const { return m_tx_pull_sent; }
+    uint64_t tx_pull_skipped_busy_count()const { return m_tx_pull_skipped_busy; }
+    size_t   tx_retry_busy_count()       const { return m_tx_retry_busy.size(); }
+    uint64_t tx_retry_requeued_count()   const { return m_tx_retry_requeued; }
+    uint64_t tx_retry_drained_count()    const { return m_tx_retry_drained; }
+    uint64_t dstx_inv_seen_count()       const { return m_dstx_inv_seen; }
+    uint64_t dstx_pull_sent_count()      const { return m_dstx_pull_sent; }
+    uint64_t dstx_received_count()       const { return m_dstx_received; }
 
     /// Request a full block via plain MSG_BLOCK getdata (E2 pull seam).
     /// Routed to the peer that ANNOUNCED this block (block_source), which holds
@@ -1824,6 +1908,14 @@ public:
         // rotating send falls back to any handshaked peer, then m_primary).
         send_getmnlistd_rotating(base_block_hash, block_hash);
     }
+
+    /// dashd SetTryNewOutboundPeer for the STATEFUL leg. The mn-ckpt lane's
+    /// wall-clock watchdog calls this TRUE while a bridging getmnlistd has been
+    /// unanswered past its grace and FALSE once it is served, raising/clearing
+    /// the outbound-behind expansion signal so the pool acquires a peer that
+    /// will answer instead of pinning at its base target on a silent carrier.
+    /// Reward-safe: dial-count only, the applied list is untouched.
+    void note_stateful_stall(bool stalled) { m_stateful_stall = stalled; }
 
     /// Send a getqrinfo (DIP-24 quorum-rotation-info request) — the ROTATED
     /// counterpart of send_getmnlistd above. An EMPTY baseBlockHashes asks for
@@ -2461,9 +2553,14 @@ private:
         return n;
     }
 
-    /// Behind on archival coverage ⇒ a demonstrated non-server occupies a slot.
+    /// Behind on archival coverage ⇒ a demonstrated non-server occupies a slot,
+    /// OR a bridging getmnlistd (fold / ondemand-mnlist) is stalled unanswered
+    /// (dashd opens an extra outbound in BOTH cases). The stall arm is what
+    /// makes a frozen ondemand-mnlist expand the pool without waiting for the
+    /// carrier to accumulate block-body strikes.
     bool outbound_behind() const
-    { return m_outbound_rotate_enabled && pool_demoted_count() > 0; }
+    { return m_outbound_rotate_enabled
+             && (pool_demoted_count() > 0 || m_stateful_stall); }
 
     /// dashd GetExtraFullOutboundCount analog: the dial target, RAISED while we
     /// are behind so refill dials MORE fresh candidates to reach archival
@@ -2685,6 +2782,7 @@ private:
         }
 
         service_pending_bodies(now);
+        drain_tx_retry_busy(now);
         prune_stale_dials(now);
         // dashd acquisition parity: while behind on archival coverage, dial
         // more and rotate the frozen full pool's worst non-server out for a
@@ -3046,6 +3144,14 @@ private:
                 // stale template on every attached rig.
                 if (!m_pending_bodies.empty()) {
                     ++m_tx_pull_skipped_busy;
+                    // Do NOT let the 600 s InvDedup TTL strand it: park the
+                    // announcement and re-issue the getdata the moment the
+                    // tip body clears (drain_tx_retry_busy on the pool tick).
+                    if (m_tx_retry_busy.size() >= m_tx_retry_busy_cap)
+                        m_tx_retry_busy.pop_front();
+                    m_tx_retry_busy.push_back(
+                        TxRetry{static_cast<uint32_t>(inv.m_type), inv.m_hash});
+                    ++m_tx_retry_requeued;
                     continue;
                 }
                 if (m_tx_pull_inflight.size() >= m_tx_pull_inflight_cap) {

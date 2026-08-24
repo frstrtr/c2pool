@@ -629,6 +629,37 @@ public:
         return j;
     }
 
+    /// Thread-safe readiness snapshot. TRUE only when a dashd testmempoolaccept
+    /// oracle is bound AND the mempool validity gate has accrued its sustained
+    /// clean window (open()).
+    ///
+    /// ══ DEMOTED TO A PRE-CUT CONFIDENCE MEASUREMENT ═════════════════════════
+    /// This was the serve BLOCKER for the tx-serve-own-set referee: own-set
+    /// serving could not begin until dashd's testmempoolaccept had been clean
+    /// over the window. That made dashd's external view a PERMANENT DEPENDENCY
+    /// of the serve decision — incompatible with the --coin-rpc cut, and, as
+    /// the h=2526495 incident proved, NOISY: it called "invalid" two txs the
+    /// network CONFIRMED in the very block our template competed for (the
+    /// Window-1 class the PendingPropagation classifier now recovers).
+    ///
+    /// The serve decision no longer consults this. work_source.cpp SELF-
+    /// VALIDATES the served set from OUR OWN state — the internal-consistency
+    /// referee (tx_serve_referee.hpp: coinbase fee-exact, every tx
+    /// fee_fold_proven against our spent-aware UTXO view at build, no intra-set
+    /// double-spend) runs on EVERY armed embedded template, making ZERO dashd
+    /// calls, so it survives the cut unchanged. This function remains as a
+    /// CONFIDENCE COUNTER: pre-cut, with a probe bound, `open()` is EVIDENCE
+    /// that our self-validated set == dashd-clean over the window. It proves the
+    /// predicate; it does not gate the serve. Post-cut there is no shadow-
+    /// compare object and no probe — the measurement simply vanishes, and the
+    /// referee is unaffected.
+    ///
+    /// Returns false when no oracle is bound (measurement unavailable).
+    bool validity_gate_open() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return static_cast<bool>(accept_) && validity_.open();
+    }
+
 private:
     void worker_loop() {
         for (;;) {
@@ -674,7 +705,12 @@ private:
             std::lock_guard<std::mutex> lk(mu_);
             counters_.apply(o);
         }
-        probe_validity(served);
+        // dashd's probe-time template height — the FACT the Window-1 classifier
+        // keys on. 0 when no oracle answered (the classifier then never treats
+        // any tx as dashd-ahead, so a missing-inputs stays Invalid: absent
+        // evidence of an ahead tip, we do not excuse the reject).
+        const uint32_t dashd_probe_height = dashd ? dashd->m_height : 0u;
+        probe_validity(served, dashd_probe_height);
     }
 
     /// THE MEMPOOL VALIDITY GATE, on the SAME worker thread as the oracle
@@ -685,9 +721,19 @@ private:
     ///
     /// This CANNOT change what is served. Its only outputs are log lines, the
     /// counters, and a readiness verdict on a DEFAULT-OFF flag.
-    void probe_validity(const DashWorkData& w) {
+    void probe_validity(const DashWorkData& w, uint32_t dashd_probe_height) {
         if (!accept_) return;
-        const auto set = mempool_probe_set(w);
+        auto set = mempool_probe_set(w);
+
+        // WINDOW-1 FACT. dashd's probe-time template height > our template
+        // height means dashd's tip is STRICTLY AHEAD of the serve parent this
+        // template was built on (our serve parent = w.m_height-1, dashd tip =
+        // dashd_probe_height-1). At that skew the classifier reclassifies a
+        // "missing-inputs" reject as PENDING-PROPAGATION (valid on our fork,
+        // stale probe) instead of a defect. A height comparison — never a
+        // reason-string inference. 0 when no oracle answered => never ahead.
+        const bool dashd_ahead = dashd_probe_height > w.m_height;
+        for (auto& t : set) t.dashd_ahead_of_serve_height = dashd_ahead;
 
         std::vector<nlohmann::json> answers;
         answers.reserve(set.size());

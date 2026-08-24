@@ -157,6 +157,17 @@ PpPrestate pp_parse_prestate(const char* text)
         st.keyIDOwner       = pp_u160_wire(f[7]);
         st.nVersion         = static_cast<uint16_t>(std::stoul(f[8]));
         st.nType            = static_cast<uint16_t>(std::stoul(f[9]));
+        // STORE CONTRACT: the DML engine stores canonical BASIC operator keys and
+        // re-encodes each SML leaf per its nVersion (to_sml_entry -> opkey_for_leaf).
+        // The fixture opkey field is RAW WIRE bytes (per-nVersion scheme), so
+        // canonicalize on ingest — exactly what the production wire-ingest boundaries
+        // (main_dash.cpp anchor-SML seed, replay_prestate.hpp) do. Without this a
+        // legacy-era (nVersion=1) leaf hashes the wrong point and the anchor seed
+        // self-check diverges from the committed merkleRootMNList under a real BLS
+        // backend (identity no-op when BLS is OFF).
+        st.pubKeyOperator   = dash::coin::vendor::opkey_to_basic(
+            st.pubKeyOperator,
+            st.nVersion < dash::coin::vendor::ProTxVersion::BASIC_BLS);
         st.platformNodeID   = (f[10] == "-") ? uint160{} : pp_u160_wire(f[10]);
         st.platformP2PPort  = static_cast<uint16_t>(std::stoul(f[11]));
         st.platformHTTPPort = static_cast<uint16_t>(std::stoul(f[12]));

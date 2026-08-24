@@ -503,6 +503,22 @@ public:
         m_utxo_ready_fn = std::move(fn);
     }
 
+    /// WINDOW-2 currency gate (--embedded-serve-mempool-txs only). Optional
+    /// predicate answering "has the embedded UTXO view already connected+
+    /// evicted the block whose hash is passed?" (UtxoLane::utxo_current_at).
+    /// When set AND mempool-tx serving is armed, make_embedded_work_inputs
+    /// suppresses the fee-carrying body while the just-promoted serve tip is
+    /// NOT yet current in the UTXO/mempool view -- the diff-driven promotion
+    /// can race ahead of the full-block connect, and a template built on that
+    /// tip could otherwise select a tx already spent/conflicted by it (an
+    /// invalid, thrown-away block). Coinbase-only in that sub-second window
+    /// reproduces dashd's invariant (removeForBlock runs inside ConnectBlock,
+    /// before any template on the new tip). Unset (default) => no Window-2
+    /// gate, byte-identical to the pre-existing behaviour.
+    void set_utxo_current_fn(std::function<bool(const uint256&)> fn) {
+        m_utxo_current_fn = std::move(fn);
+    }
+
     /// What to do during the immature window the predicate above reports.
     ///
     /// ── WHY THE DEFAULT IS Refuse (operator design law, p2pool semantics) ────
@@ -1326,15 +1342,36 @@ public:
         // utxo-immature serving window names itself; otherwise the default-OFF
         // --embedded-serve-mempool-txs posture does. Fee-carrying templates
         // require BOTH a mature UTXO lane AND the explicit operator opt-in.
+        const bool utxo_immature_serving =
+            utxo_immature
+            && m_utxo_immature_policy == UtxoImmaturePolicy::ServeEmptyTxSet;
+        // WINDOW 2 (intra-node eviction lag). The serve tip was promoted to H
+        // by the diff-driven path (mnlistdiff-at-tip / cbTx credit-pool
+        // re-anchor) BEFORE the embedded UTXO lane connected block H, so the
+        // view is still at H-1: H's spent outpoints resolve as unspent and the
+        // selection stale-input guard (which checks vins against the LIVE view)
+        // is structurally blind to them, so H's txs would be packed into an H+1
+        // template -> bad-txns-inputs-missingorspent on a winning share = a
+        // thrown-away found block. dashd cannot expose this window because
+        // CTxMemPool::removeForBlock runs synchronously inside ConnectBlock
+        // before SetTip. Reproduce that invariant fail-closed: while the just-
+        // promoted serve tip is NOT yet current in the UTXO/mempool view, serve
+        // coinbase-only (fees=0, exact). Only armed when mempool-tx serving is
+        // ON and the currency fn is wired; self-heals when the raced full_block
+        // connects and evicts (median tip-body window 0.771s, p90 2.9s).
+        const bool utxo_stale_at_tip =
+            m_serve_mempool_txs
+            && static_cast<bool>(m_utxo_current_fn)
+            && !m_utxo_current_fn(m_prev_hash);
         e.suppress_mempool_txs =
-            (utxo_immature
-             && m_utxo_immature_policy == UtxoImmaturePolicy::ServeEmptyTxSet)
-            || !m_serve_mempool_txs;
+            utxo_immature_serving || utxo_stale_at_tip || !m_serve_mempool_txs;
+        // Most-specific cause first so soak greps attribute the window. The
+        // cold-start immature window names itself; the Window-2 eviction lag is
+        // next; the default-OFF posture is the residual.
         e.suppress_cause =
-            (utxo_immature
-             && m_utxo_immature_policy == UtxoImmaturePolicy::ServeEmptyTxSet)
-                ? "utxo-immature-serving"
-                : "mempool-txs-disabled";
+              utxo_immature_serving ? "utxo-immature-serving"
+            : utxo_stale_at_tip     ? "utxo-stale-at-tip"
+            :                         "mempool-txs-disabled";
         if (m_require_resolvable_payee && !payee_resolvable) {
             LOG_WARNING << "[EMBED-GATE] h=" << (m_prev_height + 1)
                         << " REFUSE embedded template: MN payment due but payee"
@@ -1791,6 +1828,9 @@ private:
     // (test_dash_submit_gate_scaling.cpp). mutable because the gate is const.
     mutable uint64_t m_emit_ok_calls{0};
     std::function<bool()> m_utxo_ready_fn;   // optional UTXO maturity gate (E2b)
+    // WINDOW-2 currency gate: optional predicate "is the UTXO view current at
+    // this tip hash?" (UtxoLane::utxo_current_at). Unset => no Window-2 gate.
+    std::function<bool(const uint256&)> m_utxo_current_fn;
     // Default REFUSES the immature window (p2pool semantics: an unsynced node
     // does not serve templates) -- byte-identical to the pre-policy behaviour.
     // ServeEmptyTxSet is the pure-daemonless opt-in (subsidy-only block beats

@@ -182,7 +182,8 @@ static std::vector<std::string> split_ws(const std::string& line)
     return out;
 }
 
-static void parse_prestate_into(const char* text, PrestateFixture& fx)
+static void parse_prestate_into(const char* text, PrestateFixture& fx,
+                                bool canonicalize_opkeys = true)
 {
     std::istringstream is(text);
     std::string line;
@@ -220,6 +221,18 @@ static void parse_prestate_into(const char* text, PrestateFixture& fx)
         st.keyIDOwner         = u160_wire(f[7]);
         st.nVersion           = static_cast<uint16_t>(std::stoul(f[8]));
         st.nType              = static_cast<uint16_t>(std::stoul(f[9]));
+        // The fixture opkey field is RAW WIRE bytes (per-nVersion scheme). The DML
+        // engine's STORE CONTRACT is canonical BASIC (to_sml_entry re-encodes each
+        // leaf per nVersion via opkey_for_leaf), so canonicalize on ingest — exactly
+        // what the production wire-ingest boundaries do (main_dash.cpp anchor-SML
+        // seed, replay_prestate.hpp, fold_proupreg store sites). Seeding raw wire
+        // bytes makes a legacy-era (nVersion=1) leaf hash the wrong point and the
+        // seed self-check fails against the committed merkleRootMNList. The
+        // canonicalize_opkeys=false path exists ONLY to reproduce that failure in a
+        // regression-lock test.
+        if (canonicalize_opkeys)
+            st.pubKeyOperator = dash::coin::vendor::opkey_to_basic(
+                st.pubKeyOperator, st.nVersion < ProTxVersion::BASIC_BLS);
         st.platformNodeID     = (f[10] == "-") ? uint160{} : u160_wire(f[10]);
         st.platformP2PPort    = static_cast<uint16_t>(std::stoul(f[11]));
         st.platformHTTPPort   = static_cast<uint16_t>(std::stoul(f[12]));
@@ -383,6 +396,45 @@ TEST(DashReplayFoldReal, PrestateRootParity2516755)
     auto eng = seed_from_fixture(fx); // asserts root parity inside
     EXPECT_EQ(eng.size(), 2971u);
 }
+
+#ifdef C2POOL_DASH_BLS
+// Regression lock for the #154 seed-side opkey scheme bug (this PR): the DML
+// engine's store contract is CANONICAL BASIC operator keys — to_sml_entry
+// re-encodes each SML leaf per its own nVersion (opkey_for_leaf: legacy iff
+// nVersion < BASIC_BLS). Seeding the RAW WIRE bytes (legacy-encoded for the
+// pre-v19 nVersion=1 entries, 1784 of 2971 at this height) makes those leaves
+// hash the wrong point, so compute_sml_root() DIVERGES from the committed
+// merkleRootMNList. The production wire-ingest boundaries (main_dash.cpp
+// anchor-SML seed, replay_prestate.hpp) canonicalize on ingest — when they do,
+// the root reproduces BY CONSTRUCTION and the anchor seed self-check passes
+// (fail-CLOSED preserved: a seed that cannot reproduce the root unseeds).
+// Guarded on C2POOL_DASH_BLS because opkey_to_basic is an identity no-op
+// without a BLS backend, so raw == canonical and both reproduce the root
+// (this is exactly why the defect was invisible to the BLS-OFF CI jobs).
+TEST(DashReplayFoldReal, SeedRawWireOpkeyDivergesCanonicalReproducesRoot2516755)
+{
+    uint256 anchor;
+    // RAW WIRE seed (canonicalize_opkeys=false) MUST NOT reproduce the root.
+    PrestateFixture raw;
+    parse_prestate_into(kDashReplayPrestate2516755, raw,
+                        /*canonicalize_opkeys=*/false);
+    anchor.SetHex(raw.blockhash_display);
+    FoldConfig cfg;
+    cfg.enabled = true;
+    DmlFoldEngine eng_raw(cfg);
+    eng_raw.seed(raw.entries, raw.entries.size(), raw.height, anchor,
+                 raw.network);
+    EXPECT_NE(eng_raw.compute_sml_root().GetHex(), raw.mnroot_display)
+        << "raw-wire opkey seed unexpectedly reproduced the committed root — "
+           "the store contract or the fixture's legacy-scheme mix changed";
+
+    // CANONICAL seed (the production wire-ingest path) MUST reproduce the root.
+    auto fx = parse_prestate(kDashReplayPrestate2516755);
+    DmlFoldEngine eng_can(cfg);
+    eng_can.seed(fx.entries, fx.entries.size(), fx.height, anchor, fx.network);
+    EXPECT_EQ(eng_can.compute_sml_root().GetHex(), fx.mnroot_display);
+}
+#endif // C2POOL_DASH_BLS
 
 TEST(DashReplayFoldReal, Revive2516756ThenQuietSequence)
 {

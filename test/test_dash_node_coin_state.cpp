@@ -1241,6 +1241,153 @@ TEST(DashMempoolTxServing, UtxoImmatureCauseWinsOverDisabled) {
     EXPECT_STREQ(e.suppress_cause, "utxo-immature-serving");
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// WINDOW-2 EVICTION-LAG GATE (intra-node ordering; close the thrown-away
+// found block). The serve tip can be promoted to H by the diff-driven path
+// (CoinStateMaintainer mnlistdiff-at-tip / cbTx credit-pool re-anchor) BEFORE
+// the embedded UTXO lane connects+evicts block H. In that sub-second window
+// the UTXO view is still at H-1, so H's spent outpoints resolve as unspent
+// and the selection stale-input guard is blind to them: a template built on H
+// would pack a tx already spent by H -> bad-txns-inputs-missingorspent on a
+// winning share = a thrown-away found block. dashd cannot expose this window
+// because CTxMemPool::removeForBlock runs synchronously inside ConnectBlock
+// BEFORE SetTip. The serve path consults NodeCoinState::set_utxo_current_fn
+// (UtxoLane::utxo_current_at at the wire) and serves coinbase-only until the
+// view catches up. The predicate is injected here exactly as the other gate
+// fns are; the wire one-liner (get_best_block()==tip) is covered by the
+// main_dash wiring.
+// ════════════════════════════════════════════════════════════════════════
+
+// RED (master) -> GREEN (fix) in one place: identical state, the ONLY toggle
+// is whether the currency fn is wired. Unset == the shipped-master behaviour;
+// wired == this fix.
+TEST(DashWindow2EvictionGate, StaleTipSuppressesBodyWithNamedCause) {
+    NodeCoinState st;
+    seed_healthy_armed(st);            // serve tip prev_hash == raw256(0xAB)
+    st.set_utxo_ready_fn([] { return true; });   // mature lane
+    st.set_serve_mempool_txs(true);              // fee-carrying opt-in ON
+
+    // RED: master ships NO Window-2 axis. With the currency fn UNSET, a serve
+    // tip promoted ahead of the UTXO view still serves the fee-carrying body
+    // -> the doomed tx leaks into the H+1 selection. This asserts the exact
+    // pre-fix behaviour the gate closes.
+    {
+        const auto e = st.make_embedded_work_inputs();
+        EXPECT_TRUE(e.has_state);
+        EXPECT_FALSE(e.suppress_mempool_txs)
+            << "master (no currency fn): the stale-tip body is served -- the bug";
+    }
+
+    // GREEN: wire the currency predicate. The UTXO view is at some OTHER hash
+    // (H-1), NOT the just-promoted serve tip (0xAB) -> Window 2 is open ->
+    // serve coinbase-only, cause named for the soak grep.
+    const uint256 view_tip_h_minus_1 = raw256(0x99);   // != serve tip 0xAB
+    st.set_utxo_current_fn(
+        [&](const uint256& tip) { return tip == view_tip_h_minus_1; });
+    {
+        const auto e = st.make_embedded_work_inputs();
+        EXPECT_TRUE(e.has_state) << "coinbase-only serving is not a refusal";
+        EXPECT_TRUE(e.suppress_mempool_txs)
+            << "stale tip: the fee-carrying body must be suppressed";
+        EXPECT_STREQ(e.suppress_cause, "utxo-stale-at-tip");
+    }
+}
+
+// Negative twin: once the UTXO view is current at the serve tip, the full
+// fee-carrying set is served again -- the gate self-heals, no permanent stall.
+TEST(DashWindow2EvictionGate, CurrentTipServesFullSet) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_utxo_ready_fn([] { return true; });
+    st.set_serve_mempool_txs(true);
+    // view current AT the serve tip (0xAB) -- body H connected + evicted.
+    st.set_utxo_current_fn([](const uint256& tip) { return tip == raw256(0xAB); });
+    const auto e = st.make_embedded_work_inputs();
+    EXPECT_TRUE(e.has_state);
+    EXPECT_FALSE(e.suppress_mempool_txs)
+        << "view current at tip: serve the full mempool-tx body";
+}
+
+// The gate is scoped to the fee-carrying opt-in. With serving OFF the body is
+// coinbase-only for the pre-existing reason regardless of currency, so the
+// Window-2 cause must NOT mask the default-OFF cause. Proves byte-unchanged
+// default posture (the gate cannot fire when unarmed).
+TEST(DashWindow2EvictionGate, InertWhenServingOff) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_utxo_ready_fn([] { return true; });
+    // serving OFF (shipped default); wire a STALE currency fn anyway.
+    st.set_utxo_current_fn([](const uint256&) { return false; });
+    const auto e = st.make_embedded_work_inputs();
+    EXPECT_TRUE(e.suppress_mempool_txs);
+    EXPECT_STREQ(e.suppress_cause, "mempool-txs-disabled")
+        << "unarmed: Window-2 must not fire, default cause stands";
+}
+
+// Cold-start immaturity is the deeper condition; when both windows are open at
+// once the immature cause wins so the soak attributes the (longer) window.
+TEST(DashWindow2EvictionGate, ImmatureCauseWinsOverStale) {
+    NodeCoinState st;
+    seed_healthy_armed(st);
+    st.set_utxo_ready_fn([] { return false; });   // immature lane
+    st.set_utxo_immature_policy(
+        dash::coin::UtxoImmaturePolicy::ServeEmptyTxSet);
+    st.set_serve_mempool_txs(true);
+    st.set_utxo_current_fn([](const uint256&) { return false; });  // also stale
+    const auto e = st.make_embedded_work_inputs();
+    EXPECT_TRUE(e.suppress_mempool_txs);
+    EXPECT_STREQ(e.suppress_cause, "utxo-immature-serving");
+}
+
+// Template-selection proof (the task's "T absent from the next template
+// selection"): build the SAME projection twice and show the doomed tx T is
+// selected when the body is served (suppress=false, the master leak) and
+// ABSENT when the gate suppresses (suppress=true). This exercises the builder
+// path the gate feeds, independent of the header-only decision above.
+TEST(DashWindow2EvictionGate, DoomedTxAbsentFromTemplateWhenSuppressed) {
+    UTXOViewCache utxo(nullptr);
+    const uint256 coin_h = raw256(0x55);
+    utxo.add_coin(Outpoint(coin_h, 0),
+                  Coin(100'000, {}, /*height=*/1, /*cb=*/false));
+
+    NodeCoinState st;
+    seed_single_mn(st, p2pkh_script(0x30));
+    st.mempool().set_utxo(&utxo);
+    // T spends coin_h[0] -- the very outpoint block H will spend. While the
+    // view is at H-1 the coin is live, so T prices and is selectable.
+    ASSERT_TRUE(st.mempool().add_tx(make_spend(coin_h, 0, 90'000, /*salt=*/7)));
+
+    const uint256 prev_hash = raw256(0xAB);
+    const uint32_t bits = 0x1b104be3u, mtp = 1'700'000'000u;
+    const uint32_t curtime = 1'700'000'123u, version = 0x20000000u;
+
+    // Served body (suppress=false): the doomed tx IS in the selection.
+    DashWorkData served = build_embedded_workdata(
+        H - 1, prev_hash, st.mnstates(), st.mempool(),
+        bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, curtime, version);
+    ASSERT_EQ(served.m_tx_hashes.size(), 1u)
+        << "precondition: T is selectable against the H-1 view (the leak)";
+
+    // Gate suppresses (Window 2 open): coinbase-only, T absent. suppress_mempool_txs
+    // is the 20th positional arg; txset_empty_cause the 21st.
+    DashWorkData gated = build_embedded_workdata(
+        H - 1, prev_hash, st.mnstates(), st.mempool(),
+        bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, curtime, version,
+        /*underfill_tripped=*/nullptr,
+        /*sml=*/nullptr, /*qmgr=*/nullptr,
+        /*best_cl_height=*/0, /*best_cl_sig=*/dash::coin::k_zero_cl_sig,
+        /*last_observed_credit_pool=*/0,
+        /*qc_commitments=*/nullptr, /*quorum_root_override=*/nullptr,
+        /*mn_rr_height=*/dash::coin::DASH_MN_RR_HEIGHT_MAINNET,
+        /*superblock_payments=*/nullptr,
+        /*mn_min_confirmations=*/dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+        /*suppress_mempool_txs=*/true,
+        /*txset_empty_cause=*/"utxo-stale-at-tip");
+    EXPECT_TRUE(gated.m_tx_hashes.empty())
+        << "gate open: the doomed tx must be absent from the template selection";
+    EXPECT_EQ(gated.m_tx_fees.size(), 0u);
+}
+
 // The opt-in relaxes ONLY this clause. Every other gate must still refuse —
 // otherwise "serve during immaturity" would have quietly become "serve
 // regardless", which is how a lost block gets shipped as a feature.

@@ -143,14 +143,22 @@ inline bool is_missing_or_spent_reason(const std::string& reason)
     return reason == "bad-txns-inputs-missingorspent";
 }
 
-/// Three-valued logic, plus the honest fourth state for "no answer".
+/// Three-valued logic, plus TWO honest "no verdict" states.
 /// Unprobed is NEVER counted as valid and NEVER counted as a defect: it is the
-/// absence of a measurement, and it advances nothing.
+/// absence of a measurement, and it advances nothing. PendingPropagation is the
+/// Window-1 analog (see the enumerator note): dashd's probe-time tip is AHEAD of
+/// the serve parent this template was built on, and a "missing-inputs" answer at
+/// that skew is the ahead-block having already spent/confirmed the very inputs
+/// (or txs) our still-valid fork template offered — a PROBE TIMING ARTEFACT, not
+/// a defect of the transaction. It, too, advances nothing and resets nothing.
 enum class MempoolAcceptVerdict : uint8_t {
     Valid,              // allowed == true
     AlreadyInMempool,   // allowed == false, reason == txn-already-in-mempool
     Invalid,            // allowed == false, any other reason -> A DEFECT
-    Unprobed            // no answer, or an in-set-parent probe artefact
+    Unprobed,           // no answer, or an in-set-parent probe artefact
+    PendingPropagation  // missing-inputs at a dashd-AHEAD-of-serve-parent skew
+                        // (Window-1: valid on our fork; the probe is stale) —
+                        // NEVER a defect, NEVER counted valid, advances nothing
 };
 
 inline const char* mempool_accept_verdict_name(MempoolAcceptVerdict v)
@@ -159,6 +167,8 @@ inline const char* mempool_accept_verdict_name(MempoolAcceptVerdict v)
         case MempoolAcceptVerdict::Valid:            return "VALID";
         case MempoolAcceptVerdict::AlreadyInMempool: return "ALSO-VALID(already-in-mempool)";
         case MempoolAcceptVerdict::Invalid:          return "INVALID";
+        case MempoolAcceptVerdict::PendingPropagation:
+            return "PENDING-PROPAGATION(dashd-ahead-window-1)";
         default:                                     return "UNPROBED";
     }
 }
@@ -182,6 +192,22 @@ struct MempoolProbeTx {
     /// same probe set. Computed at template-build time from the real vins, not
     /// guessed from a reject string.
     bool        depends_on_in_set_parent{false};
+
+    /// TRUE when dashd's probe-time tip is STRICTLY AHEAD of the serve parent
+    /// this template was built on — a FACT (a height comparison: dashd's GBT
+    /// height > our template height), NOT an inference from any reject string.
+    /// The probe runs asynchronously on a worker thread; between the instant we
+    /// built the template at OUR tip and the instant dashd answered, dashd can
+    /// have connected one or more blocks. At that skew a "missing-inputs" answer
+    /// is the Window-1 propagation artefact: the ahead block already spent or
+    /// confirmed the very inputs (or the very txs) our still-valid fork template
+    /// offered, so dashd — probing against its newer view — cannot see them.
+    /// dashd's own testmempoolaccept detects the already-confirmed case only
+    /// best-effort (HaveCoinInCache over the tx OUTPUTS) and, once those outputs
+    /// are flushed or spent, falls through to the same "missing-inputs" string;
+    /// the field is how we recover the class dashd's string conflated. Set by
+    /// the probe caller (embedded_shadow_compare.hpp) from dashd's GBT height.
+    bool        dashd_ahead_of_serve_height{false};
 };
 
 /// PURE. dashd's testmempoolaccept answer for ONE transaction -> the verdict.
@@ -249,6 +275,43 @@ inline MempoolAcceptResult classify_mempool_accept(const MempoolProbeTx& tx,
         return r;
     }
 
+    // WINDOW-1 PROPAGATION (the #1318 successor; the h=2526495 incident class).
+    // A "missing-inputs" answer while dashd's probe-time tip is STRICTLY AHEAD of
+    // the serve parent this template was built on is a PROBE-TIMING ARTEFACT, not
+    // a defect: dashd connected one or more blocks after we built, and that ahead
+    // block already spent/confirmed the inputs (or the txs themselves — both of
+    // the h=2526495 leak txs, 8c4efd9c… and 81109abf…, were CONFIRMED IN BLOCK
+    // 2526495 itself, the exact height our template competed for). Such a tx is
+    // VALID ON OUR FORK; dashd, probing against its newer view, cannot see it.
+    // The FACT is `dashd_ahead_of_serve_height` — a height comparison the caller
+    // supplies, never a string inference — so the exemption cannot widen on a
+    // reason alone. It is DELIBERATELY NARROW:
+    //
+    //   * Only "missing-inputs" qualifies. `bad-txns-inputs-missingorspent`
+    //     stays INVALID even under the ahead skew (see the note above): that
+    //     reason conflates unknown-with-SPENT in its own name and is the exact
+    //     bad-cb / double-spend loss vector; failing it toward a CLOSED gate on
+    //     ambiguous evidence is the direction a gate is allowed to be wrong in.
+    //   * It advances NOTHING and resets NOTHING — like Unprobed, it is the
+    //     absence of a usable measurement, not evidence in either direction. It
+    //     is counted separately (`pending_propagation`) so the class stays
+    //     visible and MEASURABLE (our-serve-parent vs dashd-tip skew), which is
+    //     precisely what a demoted-to-measurement gate needs to prove that OUR
+    //     self-validation verdict == dashd-clean once the skew resolves.
+    //
+    // Since this gate is a MEASUREMENT (it no longer decides what is served —
+    // work_source.cpp self-validates the served set from OUR OWN state), the
+    // cost of this classification is confidence accounting, never a served
+    // block: a genuine defect that happened to coincide with an ahead skew is
+    // caught by the serve-time internal-consistency referee (tx_serve_referee.
+    // hpp), which shares the selector's spent-aware UTXO view and runs on EVERY
+    // armed embedded template independent of dashd.
+    if (is_unknown_input_only_reason(r.reason) && tx.dashd_ahead_of_serve_height) {
+        r.verdict        = MempoolAcceptVerdict::PendingPropagation;
+        r.unprobed_cause = "dashd-ahead-of-serve-parent(window-1-propagation)";
+        return r;
+    }
+
     r.verdict = MempoolAcceptVerdict::Invalid;
     return r;
 }
@@ -261,12 +324,18 @@ struct MempoolValiditySample {
     size_t   already_in_mempool{0};
     size_t   invalid{0};
     size_t   unprobed{0};
+    /// Window-1 propagation artefacts: dashd-ahead + missing-inputs. Neither
+    /// evidence of validity nor a defect — tracked so the skew class is visible.
+    size_t   pending_propagation{0};
     /// The defects, verbatim — txid + dashd's reason. These are what the
     /// refusal line prints.
     std::vector<MempoolAcceptResult> invalids;
 
     /// A height that actually OBSERVED validity. A height whose probe set was
-    /// empty, or whose every entry came back Unprobed, observed nothing.
+    /// empty, or whose every entry came back Unprobed / PendingPropagation,
+    /// observed nothing. PendingPropagation is EXCLUDED here for the same reason
+    /// Unprobed is: it is the absence of a usable measurement, so it must not
+    /// let a skew-only height count toward the clean window.
     bool evidence_bearing() const
     {
         return (valid + already_in_mempool + invalid) > 0;
@@ -295,6 +364,9 @@ mempool_validity_sample(uint32_t height,
             case MempoolAcceptVerdict::Invalid:
                 ++s.invalid;
                 s.invalids.push_back(r);
+                break;
+            case MempoolAcceptVerdict::PendingPropagation:
+                ++s.pending_propagation;
                 break;
             default:                                     ++s.unprobed; break;
         }
@@ -396,6 +468,13 @@ struct MempoolValidityGate {
     uint64_t txs_unprobed{0};
     uint64_t repeat_txs_probed{0};
 
+    /// Window-1 propagation artefacts observed anywhere (dashd-ahead skew +
+    /// missing-inputs). Accrued on EVERY apply() regardless of disposition so
+    /// the skew class is fully visible; it advances nothing and resets nothing.
+    /// This is the demoted gate's CONFIDENCE evidence that the class dashd's
+    /// string conflated is benign and resolves as our tip catches up.
+    uint64_t txs_pending_propagation{0};
+
     /// DEFECTS ARE COUNTED WHEREVER THEY ARE OBSERVED — counted sample or
     /// repeat. See the asymmetry note at the top of this file.
     uint64_t txs_invalid{0};
@@ -413,6 +492,11 @@ struct MempoolValidityGate {
     void apply(const MempoolValiditySample& s)
     {
         ++samples_seen;
+
+        // Window-1 propagation artefacts accrue unconditionally: they are
+        // measurement, not evidence, so they are counted before the evidence
+        // gate and never touch consecutive_clean in either direction.
+        txs_pending_propagation += s.pending_propagation;
 
         if (!s.evidence_bearing()) {
             // Neither advances nor resets — it is not evidence in either
@@ -487,6 +571,7 @@ struct MempoolValidityGate {
         j["txs-already-in-mempool"]    = txs_already_in_mempool;
         j["txs-invalid"]               = txs_invalid;
         j["txs-unprobed"]              = txs_unprobed;
+        j["txs-pending-propagation"]   = txs_pending_propagation;
         j["last-invalid-height"]       = last_invalid_height;
         j["last-invalid-txid"]         = last_invalid_txid;
         j["last-invalid-reason"]       = last_invalid_reason;
@@ -526,6 +611,7 @@ mempool_validity_log_lines(const MempoolValiditySample& s,
         + " already_in_mempool=" + std::to_string(s.already_in_mempool)
         + " invalid="   + std::to_string(s.invalid)
         + " unprobed="  + std::to_string(s.unprobed)
+        + " pending_propagation=" + std::to_string(s.pending_propagation)
         + " clean_run=" + std::to_string(g.consecutive_clean) + "/"
         + std::to_string(g.required)
         + " heights_with_evidence=" + std::to_string(g.heights_with_evidence)

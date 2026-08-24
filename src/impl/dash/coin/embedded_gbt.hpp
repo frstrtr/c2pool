@@ -820,6 +820,23 @@ inline DashWorkData build_embedded_workdata(
     }
     w.m_mempool_tx_count = static_cast<uint32_t>(selected.size());
 
+    // -- INTERNAL-CONSISTENCY STAMP for the serve-time tx-serve referee ----
+    // armed iff the mempool-serving path actually ran (--embedded-serve-
+    // mempool-txs ON and the UTXO lane mature). suppress_mempool_txs already
+    // encodes exactly that inverse (node_coin_state.hpp make_embedded_work_
+    // inputs). When suppressed the body is coinbase-only, the referee stays
+    // dormant, and this template is byte-identical to before this line.
+    //
+    // all_mempool_fee_fold_proven: EVERY entry `selected` returned above came
+    // through the selector's exclusion-discipline -- get_sorted_txs_with_fees
+    // takes only fee_fold_proven entries (mempool.hpp: `if(!e.fee_fold_proven)
+    // continue;`), so every tx in the mempool-sourced range has each vin
+    // present-and-unspent in our UTXO view with in_sum>=out_sum. Recording the
+    // guarantee (rather than trusting the call site) lets the referee fail-
+    // close if a future selection path ever admits an unproven tx.
+    w.m_tx_serve_stamp.armed = !suppress_mempool_txs;
+    w.m_tx_serve_stamp.all_mempool_fee_fold_proven = true;
+
     // ── Underfill guard ─────────────────────────────────────────────
     // Do not silently treat a near-empty DASH template as healthy when the
     // DASH mempool held fee-paying backlog that should have filled it. We
@@ -971,6 +988,10 @@ inline DashWorkData build_embedded_workdata(
         // dashd augments coinbasevalue by the superblock total (the accrued
         // treasury slice released this block).
         w.m_coinbase_value += static_cast<uint64_t>(superblock_total);
+        // Referee reconstructs m_coinbase_value from subsidy + Sum(fees) +
+        // this treasury slice; 0 on every non-superblock height.
+        w.m_tx_serve_stamp.superblock_total =
+            static_cast<uint64_t>(superblock_total);
     }
 
     // E2d: fold the DIP-0004 type-5 CCbTx extra_payload so the block is

@@ -158,6 +158,33 @@ public:
         return ready;
     }
 
+    /// WINDOW-2 currency predicate (intra-node eviction lag).
+    ///
+    /// Reports whether the embedded UTXO view has ALREADY connected the block
+    /// identified by `tip_hash` -- i.e. its spends are applied and (because
+    /// connect_one calls Mempool::remove_for_block on the same block, same io
+    /// thread, before returning) that block's txs + newly-conflicting mempool
+    /// txs are evicted. `get_best_block()` is set atomically by the per-block
+    /// flush() inside connect_one, so equality is exact.
+    ///
+    /// The serve tip can be promoted to a height H by a DIFFERENT, earlier
+    /// event than the UTXO connect: the diff-driven promotion in
+    /// CoinStateMaintainer (mnlistdiff-at-tip / cbTx credit-pool re-anchor)
+    /// advances the serve tip with no UTXO/mempool axis among its promotion
+    /// conjuncts. In that window the view is still at H-1, H's spent outpoints
+    /// still resolve as unspent, and H's txs would pass the selection guard
+    /// into an H+1 template -> bad-txns-inputs-missingorspent on a winning
+    /// share = a thrown-away found block. dashd cannot expose this window
+    /// because CTxMemPool::removeForBlock runs synchronously inside
+    /// ConnectBlock BEFORE SetTip. The serve path consults this predicate and
+    /// serves coinbase-only (fees=0, exact) until the view catches up -- the
+    /// fail-closed equivalent of dashd's atomicity across two async events
+    /// (header arrival vs body arrival) that c2pool cannot hold one lock over.
+    bool utxo_current_at(const uint256& tip_hash) const
+    {
+        return m_cache && m_cache->get_best_block() == tip_hash;
+    }
+
     /// The E2a seam — subscribe to dash::interfaces::Node::block_connected
     /// (the leg-3 event of block_connect_ingest.hpp; it pairs block+height,
     /// so no header-chain lookup is needed here). Transliterates the LTC
