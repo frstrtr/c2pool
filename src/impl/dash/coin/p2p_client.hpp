@@ -91,6 +91,7 @@
 #include <impl/dash/coin/governance_object.hpp> // govobject_hash / govvote_signature_hash (dashcore-exact digests)
 #include <impl/dash/coin/historical_sml.hpp>    // HistoricalMnListDiffDemux (reward-critical tip/historical split)
 #include <impl/dash/coin/bulk_peer_policy.hpp>   // #154 select_bulk_eligible_keys (LEVER 1 pure logic)
+#include <impl/dash/coin/arrival_timing.hpp>     // PR-0: per-peer per-datum-class delivery-latency EWMA (instrumentation only)
 
 #include <algorithm>
 #include <chrono>
@@ -531,6 +532,34 @@ struct PeerSession
     // stop us issuing N getdata", and on "did the won block reach every peer".
     uint64_t msgs_sent{0};
 
+    // PR-0 ARRIVAL INSTRUMENTATION (record-only). Per-datum-class request-sent
+    // timestamp (monotonic ms; -1 = none outstanding) and the smoothed
+    // delivery-latency EWMA. note_request_sent() stamps when we ask THIS peer;
+    // note_reply_received() closes the latency when the matching reply lands on
+    // THIS peer and returns it (or -1 if there was no outstanding request of
+    // that class — e.g. a rotated fold whose reply came from a different peer).
+    // Pure telemetry: nothing here gates selection, fetch, or derivation.
+    std::array<int64_t, static_cast<size_t>(DatumClass::Count)> req_sent_at_ms{
+        {-1, -1, -1}};
+    PeerDeliveryLatency delivery;
+
+    void note_request_sent(DatumClass cls, int64_t now_ms)
+    {
+        req_sent_at_ms[static_cast<size_t>(cls)] = now_ms;
+    }
+    // Returns the observed latency (ms), or -1 when no request of this class was
+    // outstanding on this peer. Updates the per-class EWMA on a real match.
+    int64_t note_reply_received(DatumClass cls, int64_t now_ms)
+    {
+        const size_t i = static_cast<size_t>(cls);
+        const int64_t sent = req_sent_at_ms[i];
+        if (sent < 0 || now_ms < sent) return -1;
+        req_sent_at_ms[i] = -1;
+        const int64_t latency = now_ms - sent;
+        delivery.observe(cls, latency);
+        return latency;
+    }
+
     int64_t age_sec() const
     {
         return std::chrono::duration_cast<std::chrono::seconds>(
@@ -543,6 +572,16 @@ struct PeerSession
         if (conn) conn->write(rmsg);
     }
 };
+
+// PR-0 ARRIVAL INSTRUMENTATION: monotonic milliseconds for delivery-latency
+// stamps. Independent of the liveness clock; used only to time request->reply
+// round trips for telemetry. Never gates behaviour.
+inline int64_t arrival_now_ms()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 
 #define ADD_P2P_HANDLER(name)\
     void handle(std::unique_ptr<dash::coin::p2p::message_##name> msg)
@@ -1761,6 +1800,9 @@ public:
         auto msg = message_getdata::make_raw(
             {inventory_type(inventory_type::block, block_hash)});
         p->write(msg);
+        // PR-0 instrumentation (record-only): stamp the tip/body getdata on the
+        // chosen carrier so the block reply can be timed. Pure telemetry.
+        p->note_request_sent(DatumClass::TipBody, arrival_now_ms());
         return true;
     }
 
@@ -1865,6 +1907,9 @@ public:
                  << " target=" << block_hash.GetHex();
         auto msg = message_getmnlistd::make_raw(base_block_hash, block_hash);
         p->write(msg);
+        // PR-0 instrumentation (record-only): stamp the mnlistdiff ask on this
+        // carrier so the matching reply can be timed. Pure telemetry.
+        p->note_request_sent(DatumClass::MnListDiff, arrival_now_ms());
     }
 
     /// TIMEOUT RE-ASK of the STATEFUL getmnlistd leg — the recovery half of
@@ -1930,6 +1975,9 @@ public:
         auto msg = message_getqrinfo::make_raw(base_block_hashes,
                                                block_request_hash, extra_share);
         m_primary->write(msg);
+        // PR-0 instrumentation (record-only): stamp the qrinfo ask so the reply
+        // can be timed. Pure telemetry.
+        m_primary->note_request_sent(DatumClass::QrInfo, arrival_now_ms());
     }
 
     /// Send a govsync (MNGOVERNANCESYNC) — E-SUPERBLOCK governance-object sync
@@ -2934,6 +2982,25 @@ private:
                  << " body_stall_evictions=" << m_body_stall_evictions;
     }
 
+    // ── PR-0 ARRIVAL INSTRUMENTATION (record-only) ────────────────────────
+    // Close the delivery-latency clock for `cls` on the peer that answered
+    // (m_active during dispatch), update its per-class EWMA, and — only when the
+    // default-OFF flag is armed — emit the per-peer latency on [COIN-P2P]. When
+    // the flag is OFF this still records into the peer's EWMA (invisible) and
+    // emits nothing, so the log is byte-identical to master. Never gates the
+    // handler; a reply with no matching outstanding request is a silent no-op.
+    void record_delivery_latency(DatumClass cls)
+    {
+        if (!m_active) return;
+        const int64_t lat = m_active->note_reply_received(cls, arrival_now_ms());
+        if (lat < 0 || !arrival_instr_enabled()) return;
+        LOG_INFO << "[COIN-P2P] delivery peer=" << m_active->key
+                 << " datum=" << datum_class_name(cls)
+                 << " delivery_latency_ms=" << lat
+                 << " ewma_ms=" << m_active->delivery.ewma_ms(cls)
+                 << " samples=" << m_active->delivery.get(cls).samples();
+    }
+
     // ── handshake ────────────────────────────────────────────────────────
 
     ADD_P2P_HANDLER(version)
@@ -3207,6 +3274,10 @@ private:
 
     ADD_P2P_HANDLER(block)
     {
+        // PR-0 instrumentation (record-only): time the tip/body delivery on the
+        // peer that answered. Pure telemetry; the block is verified identically
+        // downstream. The emit is gated on the default-OFF flag.
+        record_delivery_latency(DatumClass::TipBody);
         // E2a: BlockType now deserializes the full body (header + tx set), so
         // msg->m_block carries the transactions the ingest legs consume
         // (MnStateMachine::apply_block special txs, UTXO connect_block). The
@@ -3495,6 +3566,10 @@ private:
 
     ADD_P2P_HANDLER(mnlistdiff)
     {
+        // PR-0 instrumentation (record-only): time the mnlistdiff delivery on
+        // the peer that answered. Pure telemetry; the diff is authenticated
+        // identically downstream. The emit is gated on the default-OFF flag.
+        record_delivery_latency(DatumClass::MnListDiff);
         // SML/quorum snapshot. message_mnlistdiff already fully deserialized the
         // wire form into msg->m_diff (a vendor::CSimplifiedMNListDiff, see
         // p2p_messages.hpp) — apply_diff + the QuorumTail parser + the CCbTx
@@ -3529,6 +3604,10 @@ private:
 
     ADD_P2P_HANDLER(qrinfo)
     {
+        // PR-0 instrumentation (record-only): time the qrinfo delivery on the
+        // peer that answered. Pure telemetry; the reply is verified identically
+        // downstream. The emit is gated on the default-OFF flag.
+        record_delivery_latency(DatumClass::QrInfo);
         // DIP-24 quorum rotation info. Decoded HERE (not in the codec) so a
         // malformed reply is a local, logged refusal rather than a stream
         // exception on the coin connection — see p2p_messages.hpp.
