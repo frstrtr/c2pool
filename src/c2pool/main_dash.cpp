@@ -64,6 +64,7 @@
 #include <impl/dash/coin/zmq_tip_notify.hpp> // dash::coin::TipHashDedup / ZmqHashblockSubscriber — dashd ZMQ hashblock INSTANT tip-notify (opt-in, hardening on the #770 poll)
 #include <impl/dash/coin/coin_p2p_magic.hpp>      // dash::coin::select_coin_p2p_magic — E5 --coin-p2p-magic override (regtest ARM A dial)
 #include <impl/dash/coin/node_coin_state.hpp>  // dash::coin::NodeCoinState (embedded work bundle)
+#include <impl/dash/coin/fold_live_controller.hpp>  // dash::coin::FoldLiveController (PR-C1 live tip-tracking fold)
 #include <impl/dash/coin/arm_resolution.hpp>   // dash::coin::resolve_embedded_arm (#738 arm decision, one place)
 #include <impl/dash/coin/embedded_startup_invariant.hpp>  // C-startup-invariant: embedded fresh-gate => body-first serve tip
 #include <impl/dash/coin/dkg_window.hpp>       // dash::coin::is_dkg_commitment_window (BLOCKER-1 guard)
@@ -458,6 +459,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-tx-serve-own-set]\n"
         << "           [--embedded-fresh-datum-race] [--embedded-fresh-datum-race-k N]\n"
         << "           [--embedded-getmnlistd-tracker]\n"
+        << "           [--embedded-fold-live PATH] [--embedded-fold-live-expect HASH]\n"
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
         << "           [--embedded-ingest-isdlock] [--embedded-ingest-dstx]\n"
         << "           [--embedded-proactive-rotate]\n"
@@ -1001,7 +1003,22 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // of THIS node's own dial targets — never changes WHAT is fetched
              // or how a reply is verified. OFF => dial plan byte-identical to
              // master.
-             bool embedded_asn_diversity = false)
+             bool embedded_asn_diversity = false,
+             // --embedded-fold-live PATH (PR-C1): wire the full-history replay
+             // UTXO fold at PATH as the LIVE serve-path input-pricing view.
+             // EMPTY (flag absent) => fold never opened; mempool fee pricing +
+             // pin gate byte-identical to master. Non-empty => price mempool txs
+             // whose inputs predate the forward UTXO view from a set proven
+             // byte-equal to dashd (kernel/coinstats.cpp hash_serialized_2),
+             // marking them fee_fold_proven, and retire the gettxout/--coin-rpc
+             // pin lookup. Reward-safe: fold-exact fees, never overstated.
+             const std::string& fold_live_db = std::string(),
+             // --embedded-fold-live-expect HASH (PR-C1): the dashd
+             // hash_serialized_2 the fold store MUST verify to at open
+             // (at its cursor height) before it may feed any serving
+             // decision. EMPTY => the fold refuses to arm (fail-closed,
+             // byte-identical to master). See replay_utxo_fold.hpp:84-86.
+             const std::string& fold_live_expect = std::string())
 {
     namespace io = boost::asio;
 
@@ -2231,8 +2248,77 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // deliberately -- attach() hands the lane's UTXOViewCache pointer to the
     // bundle's Mempool (set_utxo), so the lane must outlive the mempool that
     // references it (reverse destruction order at scope exit).
+    // PR-C1 (embedded-fold-live): full-history replay UTXO fold opened as the
+    // LIVE serve-path input-pricing view. Declared BEFORE node_coin_state so it
+    // outlives the mempool that captures it (reverse destruction order); the
+    // lambdas below also capture a shared_ptr copy, so the fold survives as long
+    // as any wiring holds it. EMPTY fold_live_db (flag absent) => nothing opened,
+    // fee pricing + pin gate byte-identical to master. NOTE: populating this
+    // store to the tip (the 77G cold start) is task #154, a DEPLOY prereq -- an
+    // empty/partial store simply resolves fewer inputs (fail-closed to today's
+    // fee-unknown), never a wrong value.
+    std::shared_ptr<dash::coin::replay::ReplayUtxoFold> fold_live;
+    // PR-C1: the LIVE tip-tracking controller over the fold. Declared here (with
+    // fold_live) so both outlive node_coin_state / the mempool that reference the
+    // fold, and so the header-chain tip-changed callback can capture it by
+    // reference for the reorg-undo half (like PR-B's mined_commitment_index).
+    std::shared_ptr<dash::coin::FoldLiveController> fold_live_ctl;
+    // PR-C1 (remediation C): the tip-current gettxout/--coin-rpc pin lookup,
+    // built once below. When the fold is armed it becomes the pin's off-tip
+    // fallback rather than being retired; absent the fold it is the pin source.
+    std::function<bool(const ::core::coin::Outpoint&, ::core::coin::Coin&)>
+        rpc_pin_lookup;
     dash::coin::UtxoLane utxo_lane;
     dash::coin::NodeCoinState node_coin_state;
+    if (!fold_live_db.empty()) {
+        fold_live = std::make_shared<dash::coin::replay::ReplayUtxoFold>();
+        if (!fold_live->open(fold_live_db)) {
+            std::cout << "[run] --embedded-fold-live: FAILED to open fold store "
+                      << fold_live_db << " -- fold view NOT wired (fees + pin "
+                         "gate byte-identical to master)\n";
+            fold_live.reset();
+        } else if (fold_live_expect.empty()) {
+            // (D) RUNTIME STORE VERIFY is MANDATORY. Without an expected
+            // hash_serialized_2 the store cannot be proven the right chain and
+            // uncorrupt, so it must not feed a serving decision -- refuse to arm
+            // (fail-closed; fees + pin gate byte-identical to master).
+            std::cout << "[run] --embedded-fold-live: refusing to arm WITHOUT "
+                         "--embedded-fold-live-expect <hash_serialized_2> -- the "
+                         "store cannot be verified (fees + pin gate byte-identical "
+                         "to master). Derive the expected hash with --replay-utxo-db "
+                      << fold_live_db << " --replay-utxo-hash.\n";
+            fold_live.reset();
+        } else {
+            // (D) Verify the store's dashd hash_serialized_2 at its cursor height
+            // BEFORE it feeds anything (same gate as --replay-utxo-expect). Any
+            // mismatch / scan error => refuse to arm.
+            std::cout << "[run] --embedded-fold-live: verifying store "
+                      << fold_live_db << " hash_serialized_2 at height "
+                      << fold_live->best_height()
+                      << " (full-set scan; a few minutes at mainnet tip)...\n";
+            auto res = fold_live->hash_serialized_2();
+            std::string want = fold_live_expect;
+            for (auto& c : want) c = static_cast<char>(std::tolower(c));
+            if (!res || res->hash.GetHex() != want) {
+                std::cout << "[run] --embedded-fold-live: store verify FAILED (got "
+                          << (res ? res->hash.GetHex()
+                                  : std::string("<scan-error: ") + fold_live->refusal() + ">")
+                          << " want " << want << ") -- fold view NOT wired (fees + "
+                             "pin gate byte-identical to master)\n";
+                fold_live.reset();
+            } else {
+                fold_live_ctl =
+                    std::make_shared<dash::coin::FoldLiveController>(fold_live);
+                std::cout << "[run] embedded-fold-live VERIFIED + ARMED: store "
+                          << fold_live_db << " hash_serialized_2=" << res->hash.GetHex()
+                          << " height=" << res->best_height
+                          << " -- LIVE tip-tracking fold. Advance-on-connect +"
+                             " reorg-undo wire below; consulted for input pricing /"
+                             " pin ONLY while caught up to the serve tip. Populating"
+                             " to tip = task #154 (deploy prereq).\n";
+            }
+        }
+    }
 
     // ── Mempool-tx serving switch (--embedded-serve-mempool-txs) ────────────
     // DEFAULT OFF: embedded templates carry a coinbase-only body even once the
@@ -2387,9 +2473,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // an authoritative source, so fee==0 stays COMPUTED rather than
             // assumed, and an input neither source can resolve is still
             // refused. An unreachable daemon returns false — never a guess.
+            // PR-C1 (embedded-fold-live, remediation C): do NOT retire this
+            // tip-current gettxout/--coin-rpc pin lookup unconditionally. Build
+            // it into rpc_pin_lookup here; when the fold is armed it becomes the
+            // pin's FIRST source but ONLY while proven at tip (wired below, after
+            // the header chain exists), falling back to this live lookup off-tip.
+            // Absent the fold, this stays the pin's second source.
             if (rpc) {
                 dash::coin::NodeRPC* rpc_raw = rpc.get();
-                node_coin_state.set_pin_external_coin_lookup(
+                rpc_pin_lookup =
                     [rpc_raw](const ::core::coin::Outpoint& op,
                               ::core::coin::Coin& out) -> bool {
                         try {
@@ -2430,7 +2522,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         } catch (const std::exception&) {
                             return false;
                         }
-                    });
+                    };
+                node_coin_state.set_pin_external_coin_lookup(rpc_pin_lookup);
                 std::cout << "[run] pin input lookup: embedded UTXO view + "
                              "coin-RPC second source (gettxout) ARMED\n";
             }
@@ -5505,6 +5598,53 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         coin_feed_subs.push_back(
             dash::coin::wire_full_block_ingest(coin_state, *header_chain));
 
+        // ── PR-C1 (embedded-fold-live) LIVE tip-tracking wiring ──────────────
+        // Armed only when --embedded-fold-live opened + VERIFIED a store above.
+        // (A) ADVANCE half (dashd ConnectBlock): every connected block folds
+        //     forward, keeping fold_height tracking the serve tip. Same
+        //     block_connected feed as the UTXO/MN legs; a gap simply leaves the
+        //     fold behind tip (the guard then withholds). (B) the mempool
+        //     consults the fold for input pricing/viability ONLY while the fold
+        //     is caught up to the serve tip AND chain-identical, and (C) the pin
+        //     gate uses the fold at tip else the live rpc_pin_lookup.
+        if (fold_live_ctl) {
+            auto ctl = fold_live_ctl;
+            auto* hc = header_chain.get();
+            auto hash_at = [hc](uint32_t h) -> std::optional<uint256> {
+                if (auto e = hc->get_header_by_height(h)) return e->hash;
+                return std::nullopt;
+            };
+            coin_feed_subs.push_back(
+                coin_state.block_connected.subscribe(
+                    [ctl](const dash::interfaces::BlockConnected& bc) {
+                        ctl->on_block_connected(bc.block, bc.height);
+                    }));
+            node_coin_state.set_fold_coin_lookup(
+                [ctl, hc, hash_at](const ::core::coin::Outpoint& op,
+                                   ::core::coin::Coin& out) -> bool {
+                    return ctl->resolve_for_serve(op, out, hc->height(), hash_at);
+                });
+            node_coin_state.set_fold_at_tip_gate(
+                [ctl, hc, hash_at]() -> bool {
+                    return ctl->at_tip(hc->height(), hash_at);
+                });
+            node_coin_state.set_pin_external_coin_lookup(
+                [ctl, hc, hash_at, rpc_pin_lookup](
+                    const ::core::coin::Outpoint& op,
+                    ::core::coin::Coin& out) -> bool {
+                    // At tip: fold is the authoritative daemonless source.
+                    if (ctl->resolve_for_serve(op, out, hc->height(), hash_at))
+                        return true;
+                    // Off-tip: keep the live pin lookup (never a stale-fold guess).
+                    if (rpc_pin_lookup) return rpc_pin_lookup(op, out);
+                    return false;   // fail-closed
+                });
+            std::cout << "[run] embedded-fold-live wired to LIVE feed: "
+                         "advance-on-connect + reorg-undo + at-tip serving guard "
+                         "(fold consulted only while fold_height >= serve_tip and "
+                         "chain-identical; behind tip => fee-unknown = master)\n";
+        }
+
         // new_block(inv hash) -> pull the headers THEN the full block from the
         // peer. The getheaders-first ordering is the steady-state tip-follow
         // fix (E2c): dashd announces new blocks via inv (we never negotiate
@@ -5707,7 +5847,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // capture above): the index is constructed later in this function,
              // and on a reorg its symmetric UndoBlock half must roll the tip
              // back before the new branch is folded forward.
-             &mined_commitment_index]
+             &mined_commitment_index,
+             // PR-C1 (embedded-fold-live) UNDO half: by REFERENCE (same lifetime
+             // class as mined_commitment_index) -- on a reorg the fold's cursor
+             // must roll back to the fork point before the new branch is folded
+             // forward, or a stale coin would read UNSPENT.
+             &fold_live_ctl]
             (const uint256&, uint32_t, const uint256& new_tip, uint32_t new_height,
              bool was_reorg) {
                 // E2d bridge driver. Safe + REACHABLE here: HeaderChain fires
@@ -5777,6 +5922,27 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                        "the next contiguous fold";
                         mined_commitment_index->clear_for_cold_rebuild();
                     }
+                }
+                // PR-C1 (embedded-fold-live) UNDO half (dashd DisconnectBlock):
+                // roll the fold cursor down over the orphaned tail to the fork
+                // point using the retained block bodies, so a coin spent only on
+                // the ABANDONED branch is restored and no coin the new branch
+                // never spent reads spent. A reorg deeper than the retained
+                // window fails closed -- the fold is marked behind tip and the
+                // mempool withholds (fee-unknown = master) until it re-advances.
+                if (was_reorg && fold_live_ctl) {
+                    const bool ok = fold_live_ctl->handle_reorg(
+                        [hc](uint32_t q) -> std::optional<uint256> {
+                            if (auto e = hc->get_header_by_height(q)) return e->hash;
+                            return std::nullopt;
+                        });
+                    LOG_INFO << "[FOLD-LIVE] reorg to h=" << new_height
+                             << (ok ? " -> fold rolled back to the fork point"
+                                      " (tip-tracking preserved)"
+                                    : " -> fold could not roll back within the"
+                                      " retained window; withholding (fee-unknown)"
+                                      " until a fresh contiguous fold re-establishes"
+                                      " chain identity");
                 }
                 // SML axis: pull the mnlistdiff current AT the new tip. dashcore
                 // computes block (tip+1)'s CbTx merkleRootMNList/Quorums from the
@@ -8965,6 +9131,11 @@ int main(int argc, char** argv)
     // OFF, money/consensus path; byte-unchanged when off (nullptr null_evidence).
     bool embedded_null_arm = false;
     bool embedded_asn_diversity = false;   // PR-4 (--embedded-asn-diversity): default OFF
+    // --embedded-fold-live PATH (PR-C1): full-history replay UTXO fold store
+    // wired as the LIVE serve-path input-pricing view. EMPTY (default) => OFF,
+    // byte-identical to master. See run_node / mempool.hpp set_fold_coin_lookup.
+    std::string embedded_fold_live_db;
+    std::string embedded_fold_live_expect;   // PR-C1: --embedded-fold-live-expect (store verify)
     // --embedded-ingest-isdlock: arm the coin-P2P MSG_ISDLOCK pull (G4
     // conflict-tx-lock feed). DEFAULT OFF — off, no getdata for inv type 31
     // and the handler decodes-and-discards (wire + template behaviour
@@ -9116,6 +9287,10 @@ int main(int argc, char** argv)
             embedded_asn_diversity = true;   // PR-4: require racing set to span >=2 ASNs
         else if (std::strcmp(argv[i], "--embedded-asn-diversity=false") == 0)
             embedded_asn_diversity = false;  // PR-4: explicit OFF (OFF-equivalence)
+        else if (std::strcmp(argv[i], "--embedded-fold-live") == 0 && i + 1 < argc)
+            embedded_fold_live_db = argv[++i];  // PR-C1: fold store for live serve-path pricing
+        else if (std::strcmp(argv[i], "--embedded-fold-live-expect") == 0 && i + 1 < argc)
+            embedded_fold_live_expect = argv[++i];  // PR-C1: store hash_serialized_2 verify (D)
         else if (std::strcmp(argv[i], "--embedded-ingest-isdlock") == 0)
             embedded_ingest_isdlock = true;   // G4 conflict-tx-lock feed
         else if (std::strcmp(argv[i], "--embedded-ingest-dstx") == 0)
@@ -9463,7 +9638,9 @@ int main(int argc, char** argv)
                         embedded_ingest_isdlock,       // G4 isdlock feed
                         embedded_ingest_dstx,          // W5-B DSTX feed
                         embedded_proactive_rotate,    // PR-3 proactive rotation
-                        embedded_asn_diversity);       // PR-4 ASN diversity
+                        embedded_asn_diversity,        // PR-4 ASN diversity
+                        embedded_fold_live_db,         // PR-C1 embedded-fold-live
+                        embedded_fold_live_expect);    // PR-C1 store-verify hash
     }
     return run_selftest();
 }
