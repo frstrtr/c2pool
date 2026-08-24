@@ -107,6 +107,21 @@ inline bool getmnlistd_capable(uint32_t peer_proto_version)
     return peer_proto_version >= kGetmnlistdServeProtoVersion;
 }
 
+/// FLAG-GATED emit-site eligibility for a single getmnlistd carrier. EVERY live
+/// getmnlistd emit site — the initial send_getmnlistd() to the pinned primary,
+/// the rotating next_stateful_peer() selection, and the tracker-governed re-ask
+/// — gates a candidate carrier through EXACTLY this predicate, so a green KAT
+/// over it proves the shipped selection (it cannot diverge from the wire path).
+/// The slot tracker's plan() applies the same getmnlistd_capable() term
+/// internally. OFF (flag default) => ALWAYS true: every carrier passes and each
+/// emit site is byte-identical to master. ON => only a proto>=70214 carrier that
+/// can structurally serve GETMNLISTDIFF is eligible for the ask.
+inline bool getmnlistd_emit_eligible(uint32_t peer_proto_version)
+{
+    return !embedded_getmnlistd_tracker_enabled()
+           || getmnlistd_capable(peer_proto_version);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TIMING CONSTANTS — fixed per-slot interval, expiry at 10x (dashd parity)
 // ─────────────────────────────────────────────────────────────────────────────

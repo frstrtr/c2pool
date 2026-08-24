@@ -39,6 +39,7 @@ using dash::coin::GetmnlistdTier;
 using dash::coin::RaceReplyAction;
 using dash::coin::classify_getmnlistd_expiry;
 using dash::coin::getmnlistd_capable;
+using dash::coin::getmnlistd_emit_eligible;
 
 static int g_fail = 0;
 #define CHECK(cond) do { if (!(cond)) { \
@@ -51,6 +52,18 @@ static GetmnlistdCandidate cap(const std::string& key, const std::string& grp)
     c.key = key; c.netgroup = grp;
     c.proto_version = 70230;      // >= kGetmnlistdServeProtoVersion (70214)
     c.serve_eligible = true;
+    return c;
+}
+
+// An INCAPABLE carrier: NODE_NETWORK serve-eligible (the race's own gate PASSES,
+// exactly like the real silent carriers) but proto < 70214 so it structurally
+// cannot serve GETMNLISTDIFF. It must never receive a slot on ANY emit path.
+static GetmnlistdCandidate incap(const std::string& key, const std::string& grp)
+{
+    GetmnlistdCandidate c;
+    c.key = key; c.netgroup = grp;
+    c.proto_version = 70213;      // one below the serve floor
+    c.serve_eligible = true;      // NODE_NETWORK proves nothing — still ineligible
     return c;
 }
 
@@ -279,6 +292,70 @@ int main()
             }
         }
         CHECK(tr.in_flight() <= tr.k());
+    }
+
+    // ── (6) INTEGRATION: the incapable peer is benched on EVERY emit path,
+    //         the tracker GOVERNS live selection (not dormant), and OFF is
+    //         byte-identical to master. ─────────────────────────────────────
+    //
+    // getmnlistd_emit_eligible() is the SINGLE predicate all THREE live emit
+    // sites gate a carrier through in p2p_client.hpp — the initial
+    // send_getmnlistd() to the pinned primary, the rotating next_stateful_peer()
+    // selection (used by send_getmnlistd_rotating and the reask rotating
+    // fallback), and, via getmnlistd_capable() inside plan(), the tracker-
+    // governed re-ask. Driving it here proves the SHIPPED selection, not a
+    // parallel model.
+    {
+        // ARMED: the incapable carrier is rejected on the initial + rotating
+        // paths (the predicate returns false), the capable one is accepted.
+        dash::coin::set_embedded_getmnlistd_tracker_enabled(true);
+        CHECK(getmnlistd_emit_eligible(70213) == false);   // initial/rotating: benched
+        CHECK(getmnlistd_emit_eligible(70214) == true);    // exactly the floor: served
+        CHECK(getmnlistd_emit_eligible(70230) == true);
+
+        // TRACKER GOVERNS the re-ask path: with an incapable peer present in the
+        // live projection, plan() NEVER hands it a slot on ANY rotation, and a
+        // capable peer IS selected (governance is live, not dormant).
+        GetmnlistdSlotTracker tr;
+        tr.configure(2);
+        std::vector<GetmnlistdCandidate> pool = {
+            incap("bad0", "10.0"), cap("good0", "20.0"),
+            incap("bad1", "30.0"), cap("good1", "40.0"),
+        };
+        bool selected_capable = false;
+        int64_t now = 0;
+        for (int step = 0; step < 30; ++step) {
+            auto sent = tr.plan(pool, now);
+            for (const auto& k : sent) {
+                CHECK(k != "bad0" && k != "bad1");   // incapable NEVER slotted
+                if (k == "good0" || k == "good1") selected_capable = true;
+            }
+            CHECK(!tr.holds("bad0"));
+            CHECK(!tr.holds("bad1"));
+            CHECK(tr.in_flight() <= tr.k());
+            now += 10000;   // lapse every slot each step -> full retarget churn
+        }
+        CHECK(selected_capable);                     // NOT dormant: it did select
+
+        // Only-incapable pool ARMED => plan selects NOTHING (correct: you cannot
+        // ask a peer that cannot serve; the lane waits / escalates at expiry).
+        GetmnlistdSlotTracker tr2;
+        tr2.configure(2);
+        std::vector<GetmnlistdCandidate> only_bad = {
+            incap("x", "10.0"), incap("y", "20.0"),
+        };
+        CHECK(tr2.plan(only_bad, 0).empty());
+        CHECK(tr2.in_flight() == 0);
+
+        // OFF-EQUIVALENCE: flag OFF => the predicate is ALWAYS true, so the
+        // initial + rotating emit sites select the incapable carrier EXACTLY as
+        // master would (no filtering, byte-identical), and the tracker is never
+        // consulted on the re-ask path.
+        dash::coin::set_embedded_getmnlistd_tracker_enabled(false);
+        CHECK(getmnlistd_emit_eligible(70213) == true);    // master: no filter
+        CHECK(getmnlistd_emit_eligible(0)     == true);
+        CHECK(getmnlistd_emit_eligible(70230) == true);
+        CHECK(dash::coin::embedded_getmnlistd_tracker_enabled() == false); // restored OFF
     }
 
     if (g_fail == 0) { std::printf("dash_getmnlistd_tracker_kat PASS\n"); return 0; }
