@@ -448,6 +448,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-utxo-immature-serve-empty] [--embedded-serve-mempool-txs]\n"
         << "           [--embedded-tx-serve-own-set]\n"
         << "           [--embedded-fresh-datum-race] [--embedded-fresh-datum-race-k N]\n"
+        << "           [--embedded-getmnlistd-tracker]\n"
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
         << "           [--embedded-ingest-isdlock] [--embedded-ingest-dstx]\n"
         << "           [--embedded-proactive-rotate]\n"
@@ -9064,6 +9065,17 @@ int main(int argc, char** argv)
                  && i + 1 < argc)
             dash::coin::set_fresh_datum_race_k(
                 static_cast<int>(std::strtol(argv[++i], nullptr, 10)));
+        // #154 getmnlistd SLOT TRACKER. Arms the fixed 10s per-slot re-ask with
+        // 3 boolean tiers + capability filter, replacing the growing wall-clock
+        // ladder for the MnListDiff class. Default OFF => the tracker is never
+        // consulted and the existing ladder runs verbatim (byte-identical to
+        // master). Reward-safe: only WHEN a slot retargets and FROM-WHOM the next
+        // getmnlistd goes changes; admission stays content-addressed
+        // (diff.blockHash == m_snapshot_hash), no fold is rewound.
+        else if (std::strcmp(argv[i], "--embedded-getmnlistd-tracker") == 0)
+            dash::coin::set_embedded_getmnlistd_tracker_enabled(true);
+        else if (std::strcmp(argv[i], "--embedded-getmnlistd-tracker=false") == 0)
+            dash::coin::set_embedded_getmnlistd_tracker_enabled(false);
         else if (std::strcmp(argv[i], "--embedded-asn-diversity") == 0)
             embedded_asn_diversity = true;   // PR-4: require racing set to span >=2 ASNs
         else if (std::strcmp(argv[i], "--embedded-asn-diversity=false") == 0)

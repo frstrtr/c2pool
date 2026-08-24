@@ -474,6 +474,20 @@ add_test(NAME dash_proactive_rotation_kat COMMAND dash_proactive_rotation_kat)
 add_executable(dash_asn_diversity_kat dash_asn_diversity_kat.cpp)
 add_test(NAME dash_asn_diversity_kat COMMAND dash_asn_diversity_kat)
 
+# ── KAT: EMBEDDED getmnlistd SLOT TRACKER (dashd-cut coin-P2P stack, #154) ──
+# Locks the five gates the wiring depends on: (1) the <=K in-flight invariant
+# across a simulated rotation with fixed 10s per-slot timers (no backoff), (2)
+# late/duplicate reply => first content-addressed match wins, rest dropped, NO
+# strike, (3) expiry at 100s (10x) => ESCALATE not repeat, applied folds
+# untouched, (4) capability filter => an incapable old-proto peer never gets a
+# slot, (5) OFF-equivalence => flag default-OFF, tracker never consulted.
+# getmnlistd_tracker.hpp is pure policy (header-only, no node, no daemon,
+# standard library only), so this target links NOTHING and still exercises the
+# reward-safety contract the wiring depends on. Built under -DC2POOL_DASH_BLS=ON
+# like the rest of the dash suite; carries no BLS symbols.
+add_executable(dash_getmnlistd_tracker_kat dash_getmnlistd_tracker_kat.cpp)
+add_test(NAME dash_getmnlistd_tracker_kat COMMAND dash_getmnlistd_tracker_kat)
+
 # Legacy applications have been archived to ../../archive/
 # - c2pool_legacy.cpp (original c2pool.cpp)
 # - c2pool_node_legacy.cpp (original c2pool_node.cpp)

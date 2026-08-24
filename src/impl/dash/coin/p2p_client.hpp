@@ -93,6 +93,7 @@
 #include <impl/dash/coin/bulk_peer_policy.hpp>   // #154 select_bulk_eligible_keys (LEVER 1 pure logic)
 #include <impl/dash/coin/arrival_timing.hpp>     // PR-0: per-peer per-datum-class delivery-latency EWMA (instrumentation only)
 #include <impl/dash/coin/fresh_datum_race.hpp>   // PR-2: fresh-datum race (K-way fan-out selector + single-flight dedup; flag/K default-OFF)
+#include <impl/dash/coin/getmnlistd_tracker.hpp> // #154: getmnlistd slot tracker (fixed 10s per-slot re-ask, 3 boolean tiers, capability filter; flag default-OFF)
 #include <impl/dash/coin/coin_peer_manager.hpp> // PR-2: peer_network_group() for distinct-netgroup racing
 #include <impl/dash/coin/proactive_rotation_policy.hpp>  // PR-3: LOW-RATE proactive rotation decision helpers (pure, shared with the KAT)
 
@@ -1978,7 +1979,20 @@ public:
             c.key       = pp->key;
             c.netgroup  = dash::coin::peer_network_group(pp->addr.address());
             c.can_serve = can_serve_blocks(pp);
-            c.eligible  = pp->handshake.complete() && !bulk_demoted(pp->key);
+            // #154 getmnlistd SLOT TRACKER capability gate (flag default-OFF).
+            // When the tracker is armed AND we are ranking the MnListDiff class,
+            // a peer whose advertised protocol version cannot serve GETMNLISTDIFF
+            // is made INELIGIBLE so a raced slot never lands on a structurally-
+            // incapable carrier (NODE_NETWORK proves nothing; the silent carriers
+            // ARE NODE_NETWORK). OFF => the extra term is `true` and this line is
+            // byte-identical to master. Only WHO is asked changes; admission stays
+            // content-addressed (diff.blockHash == m_snapshot_hash), never peer.
+            const bool mnlistd_capable =
+                !(dash::coin::embedded_getmnlistd_tracker_enabled()
+                  && cls == DatumClass::MnListDiff)
+                || dash::coin::getmnlistd_capable(pp->version);
+            c.eligible  = pp->handshake.complete() && !bulk_demoted(pp->key)
+                          && mnlistd_capable;
             const int64_t e = pp->delivery.ewma_ms(cls);
             c.score     = (e < 0) ? 0
                         : (e > 1000000 ? -1000000 : static_cast<int>(1000000 - e));
