@@ -6390,6 +6390,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     (const dash::coin::vendor::CSimplifiedMNListDiff& d) {
                         return mnl->on_historical_snapshot(d);
                     });
+                // #154 k-inflight-live: give the getmnlistd slot tracker THIS
+                // lane's currently-pending fold target so its slot bookkeeping
+                // (note_answered/win_race) fires ONLY on a reply that actually
+                // answers it — never on a member-sourcing reply for a different
+                // target, which the aggregate demux `consumed` flag cannot
+                // distinguish. Pending-hash read; reward-safety only, and the
+                // read is flag-guarded at the call site.
+                cp->set_active_fold_target_fn(
+                    [mnl = mn_ckpt_lane.get()]() -> std::string {
+                        return mnl->pending_snapshot_hash_hex();
+                    });
             }
             // The DIP-4 trust anchor: our own PoW-validated header's merkle
             // root. Without it a snapshot cannot be authenticated and the lane

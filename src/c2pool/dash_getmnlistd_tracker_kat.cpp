@@ -358,6 +358,73 @@ int main()
         CHECK(dash::coin::embedded_getmnlistd_tracker_enabled() == false); // restored OFF
     }
 
+    // ── (7) k-inflight-live GATE: a member-sourcing reply for a DIFFERENT
+    //         target must NOT clear the K mn-checkpoint slots, must NOT trigger
+    //         a second wave of asks, and a reply for the TRACKED target MUST
+    //         still fire win_race (liveness). This models the p2p_client.hpp
+    //         mnlistdiff handler exactly: it gates note_answered()/win_race()
+    //         on reply_answers_active_target(), the SAME predicate the wire hook
+    //         calls, using the mn-checkpoint lane's pending fold target. ──────
+    {
+        const std::string T     = "TARGET_T_hash";      // the tracked fold target
+        const std::string OTHER = "MEMBER_WORK_hash";   // filter #1's own target
+
+        GetmnlistdSlotTracker tr;
+        tr.configure(3);                                 // K = 3 mn-ckpt slots
+        std::vector<GetmnlistdCandidate> pool = {
+            cap("a", "10.0"), cap("b", "20.0"), cap("c", "30.0"),
+        };
+        // The tracker holds K asks outstanding for target T (as reask_via_tracker
+        // does on the wire); the client has stamped the active target to T.
+        auto s0 = tr.plan(pool, 0);
+        CHECK(s0.size() == 3);
+        CHECK(tr.in_flight() == 3);
+        tr.set_active_target(T);
+        CHECK(tr.active_target() == T);
+
+        // A member-sourcing reply arrives: a full snapshot (base==ZERO) but for
+        // OTHER, not T. The demux would set the aggregate `consumed` true (the
+        // QuorumMemberSource filter claimed it), but the gate REFUSES it.
+        const bool member_reply_fires =
+            tr.reply_answers_active_target(/*base_is_null=*/true, OTHER);
+        CHECK(member_reply_fires == false);              // gate: NOT the tracked target
+        if (member_reply_fires) { tr.note_answered("a"); tr.win_race(); }  // (never taken)
+
+        // (1) the K slots are NOT cleared, (2) no peer was mis-marked T1.
+        CHECK(tr.in_flight() == 3);                      // slots intact
+        CHECK(!tr.answered("a") && !tr.answered("b") && !tr.answered("c"));
+
+        // (2) NO second wave: the next tick, still inside the fixed 10s window,
+        // emits nothing and the wire in-flight stays <= K (never grows to 2K).
+        auto s_next = tr.plan(pool, 5000);
+        CHECK(s_next.empty());
+        CHECK(tr.in_flight() == 3);
+        CHECK(tr.in_flight() <= tr.k());
+
+        // A base!=ZERO (delta / tip-sync) reply for T is also refused — only a
+        // full snapshot answers a fold.
+        CHECK(tr.reply_answers_active_target(/*base_is_null=*/false, T) == false);
+        CHECK(tr.in_flight() == 3);
+
+        // (3) LIVENESS: a genuine full-snapshot reply for the TRACKED target T
+        // fires the gate, so win_race clears the slots and the fold proceeds.
+        const bool tracked_reply_fires =
+            tr.reply_answers_active_target(/*base_is_null=*/true, T);
+        CHECK(tracked_reply_fires == true);              // gate: it IS the tracked target
+        if (tracked_reply_fires) { tr.note_answered("a"); tr.win_race(); }
+        CHECK(tr.in_flight() == 0);                      // slots cleared (no wedge)
+        CHECK(tr.tier_of("a") == GetmnlistdTier::Answered);   // answering peer -> T1
+
+        // With no active target (no fold pending) NO reply can win — the empty
+        // active_target short-circuits the gate.
+        GetmnlistdSlotTracker tr2;
+        tr2.configure(2);
+        tr2.plan({cap("x", "10.0"), cap("y", "20.0")}, 0);
+        CHECK(tr2.active_target().empty());
+        CHECK(tr2.reply_answers_active_target(true, T) == false);
+        CHECK(tr2.in_flight() == 2);                     // untouched
+    }
+
     if (g_fail == 0) { std::printf("dash_getmnlistd_tracker_kat PASS\n"); return 0; }
     std::printf("dash_getmnlistd_tracker_kat FAIL (%d)\n", g_fail);
     return 1;

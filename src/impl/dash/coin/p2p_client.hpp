@@ -1028,6 +1028,13 @@ private:
     // E2+ seams (callbacks, all optional)
     using AddrCallback = std::function<void(const std::vector<NetService>&)>;
     AddrCallback m_addr_callback;
+    /// #154 k-inflight-live gate: reads the mn-checkpoint lane's CURRENTLY
+    /// PENDING fold target (hex), or "" when no fold is pending. Wired by
+    /// main_dash to MnCheckpointLane::pending_snapshot_hash_hex(). Used ONLY to
+    /// gate the getmnlistd slot-tracker bookkeeping so a member-sourcing reply
+    /// for a different target cannot clear the mn-ckpt slots. Flag-guarded at
+    /// the call site; unset => the gate reads "" and the hook never fires.
+    std::function<std::string()> m_active_fold_target_fn;
     using PeerHeightCallback = std::function<void(uint32_t)>;
     PeerHeightCallback m_on_peer_height;
     using HandshakeCallback = std::function<void()>;
@@ -1496,6 +1503,10 @@ public:
     // ── E2+ seams ────────────────────────────────────────────────────────
     /// addr-message peer discovery feed.
     void set_addr_callback(AddrCallback cb) { m_addr_callback = std::move(cb); }
+    /// #154 k-inflight-live: wire the mn-checkpoint lane's pending-fold-target
+    /// accessor (see m_active_fold_target_fn). Reward-safety seam only.
+    void set_active_fold_target_fn(std::function<std::string()> fn)
+    { m_active_fold_target_fn = std::move(fn); }
     /// Peer's reported chain height (from its version message).
     void set_on_peer_height(PeerHeightCallback cb) { m_on_peer_height = std::move(cb); }
     /// Fired once per session when the version/verack handshake completes —
@@ -3955,6 +3966,17 @@ private:
         // the old block. Only tip-sync diffs fall through. The tip feed is
         // passed IN so it is structurally impossible to fire it on a consumed
         // reply (see HistoricalMnListDiffDemux::dispatch).
+        //
+        // #154 k-inflight-live: stamp the slot tracker's ACTIVE fold target from
+        // the mn-checkpoint lane's CURRENTLY PENDING snapshot hash BEFORE
+        // dispatch — dispatch runs on_historical_snapshot(), which clears the
+        // lane's pending flag, so a read AFTER would always be "". This is the
+        // reward-safety term the tracker bookkeeping is gated on below. OFF =>
+        // never read.
+        if (dash::coin::embedded_getmnlistd_tracker_enabled())
+            m_getmnlistd_tracker.set_active_target(
+                m_active_fold_target_fn ? m_active_fold_target_fn()
+                                        : std::string());
         const bool consumed = m_historical_mnlistdiff_demux.dispatch(
             msg->m_diff,
             [this](const vendor::CSimplifiedMNListDiff& d) {
@@ -3969,7 +3991,24 @@ private:
         // session-local) and free the whole race — a sibling that was genuinely
         // asked this session and lost the race draws NO strike (late/duplicate
         // copies are dropped, not penalised). OFF => the tracker is untouched.
-        if (dash::coin::embedded_getmnlistd_tracker_enabled() && consumed && m_active) {
+        //
+        // k-inflight-live GATE: `consumed` is the non-short-circuiting OR of
+        // ALL historical demux filters, so it is true even when only the
+        // QuorumMemberSource filter (which sourced its OWN getmnlistd for a
+        // DIFFERENT target) claimed the reply. Firing on `consumed` alone would
+        // clear all K mn-ckpt slots and mis-mark that member-sourcing peer T1,
+        // leaving the K real asks outstanding for the still-unanswered target
+        // (the next tick then refills up to K MORE — up to 2K on the wire, and a
+        // repeat inside the fixed-10s guarantee). So we additionally require the
+        // reply to ACTUALLY answer the tracker's active fold target: a full
+        // snapshot (base==ZERO) whose blockHash equals the pending target
+        // captured above. A member-sourcing reply for a different target can
+        // never satisfy this; a genuine answer to the tracked target always
+        // does (liveness: win_race still fires, slots clear, the fold proceeds).
+        if (dash::coin::embedded_getmnlistd_tracker_enabled() && consumed && m_active
+            && m_getmnlistd_tracker.reply_answers_active_target(
+                   msg->m_diff.baseBlockHash.IsNull(),
+                   msg->m_diff.blockHash.GetHex())) {
             m_getmnlistd_tracker.note_answered(m_active->key);
             m_getmnlistd_tracker.win_race();
         }

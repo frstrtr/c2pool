@@ -251,6 +251,43 @@ public:
     /// not struck. Late copies from these siblings draw NO misbehaviour strike.
     void win_race() { m_slots.clear(); }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // ACTIVE FOLD TARGET (k-inflight-live gate) — the (base=ZERO, target) block
+    // the mn-checkpoint lane is CURRENTLY folding. The mnlistdiff demux
+    // (historical_sml.hpp) is deliberately NOT short-circuiting, so its
+    // aggregate `consumed` flag is true whenever ANY historical filter claimed
+    // the reply — INCLUDING the QuorumMemberSource filter, which emits its OWN
+    // getmnlistd(base=ZERO, workHash) for a DIFFERENT target. Firing
+    // note_answered()/win_race() on that aggregate would clear all K mn-ckpt
+    // slots (and mis-mark the member-sourcing peer T1) on a reply that never
+    // answered the tracked target, leaving the K real asks outstanding while the
+    // next tick refills up to K MORE for the SAME target (up to 2K on the wire,
+    // and a repeat inside the fixed-10s guarantee). So the LIVE-wire hook gates
+    // on THIS target: a reply wins only when it is a full snapshot (base==ZERO)
+    // whose target hash equals the active fold target. The client stamps this
+    // from the lane's PENDING snapshot hash on each reply, so it always reflects
+    // the live target (never stale) — liveness is preserved: when the tracked
+    // target IS answered, it matches and win_race() still fires.
+    void set_active_target(const std::string& target_hash) { m_active_target = target_hash; }
+    void clear_active_target() { m_active_target.clear(); }
+    const std::string& active_target() const { return m_active_target; }
+
+    /// Reward-safe LIVE-wire gate for note_answered()/win_race(). TRUE iff a
+    /// demux-consumed historical reply GENUINELY answered the ACTIVE fold: a
+    /// full snapshot (base==ZERO) whose target hash equals active_target(). A
+    /// member-sourcing reply for a DIFFERENT target — or any reply while no fold
+    /// is active (empty active_target) — returns FALSE, so it can never clear
+    /// the K mn-checkpoint slots or mis-mark a peer. When the tracked target IS
+    /// answered it returns TRUE, so win_race() still fires and the fold proceeds
+    /// (the gate can never wedge a genuine answer).
+    bool reply_answers_active_target(bool reply_base_is_null,
+                                     const std::string& reply_target_hash) const
+    {
+        return !m_active_target.empty()
+            && reply_base_is_null
+            && reply_target_hash == m_active_target;
+    }
+
     /// Fill empty slots and RETARGET lapsed ones, up to K, from `cands`. Returns
     /// the keys newly assigned a slot NOW (the caller sends getmnlistd to each).
     /// Enforces, in order:
@@ -399,6 +436,7 @@ private:
     std::set<std::string> m_struck;                  ///< struck-this-rotation
     std::map<std::string, int64_t> m_last_selected_seq; ///< round-robin ordinal
     int64_t m_seq{0};
+    std::string m_active_target;   ///< k-inflight-live: active fold target (hex), "" => none
 };
 
 }  // namespace coin
