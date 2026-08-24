@@ -34,6 +34,7 @@
 
 #include <impl/dash/coin/replay_bulk_fetch.hpp>  // W2 (merged): IReplayBlockConsumer
 #include <impl/dash/coin/replay_utxo_fold.hpp>
+#include <impl/dash/coin/fold_live_controller.hpp>  // PR-C1 LIVE tip-tracking controller
 
 #include <core/hash.hpp>
 #include <core/uint256.hpp>
@@ -700,6 +701,171 @@ TEST(ReplayUtxoFoldTest, EmptySetHashIsHashBlockOnly)
     EXPECT_EQ(res->coins, 0u);
     std::vector<uint8_t> pre(ghash.data(), ghash.data() + 32);
     EXPECT_EQ(res->hash.GetHex(), ::Hash(pre).GetHex());
+}
+
+
+// ─── PR-C1: embedded-fold-live — LIVE tip-tracking controller ────────────────
+//
+// FoldLiveController ports dashd's ConnectBlock (advance-on-connect) and
+// DisconnectBlock (undo-on-reorg) onto the replay UTXO fold, plus the at-tip
+// serving guard. These KATs prove the mechanism the --embedded-fold-live serve
+// wiring depends on, on small synthetic chains.
+
+using dash::coin::FoldLiveController;
+
+// (a) ADVANCE: a pre-window coin unspent at the resume cursor R reads SPENT
+// once the fold has advanced over the block that spent it in (R, tip] — the
+// frozen-snapshot hole, closed. On master (no advance) the same read stays
+// UNSPENT forever.
+TEST(FoldLiveController, AdvanceSpendsPreWindowCoinReadsSpent)
+{
+    TmpDir dir;
+    auto fold = std::make_shared<ReplayUtxoFold>();
+    ASSERT_TRUE(fold->open(dir.sub("db")));
+
+    // h1: a coinbase mints coin A — the "pre-window" coin (present at R=1).
+    auto cb1 = make_coinbase(1, {{100000, p2pkh(0xAA)}});
+    const uint256 A = dash_txid(cb1);
+    ASSERT_TRUE(fold->on_replay_block(1, fake_block_hash(1), make_block({cb1})));
+
+    FoldLiveController ctl(fold);
+    {   // At R, coin A is UNSPENT.
+        ::core::coin::Coin c;
+        EXPECT_TRUE(fold->get_coin(::core::coin::Outpoint(A, 0), c));
+    }
+
+    // h2 arrives on the LIVE feed and spends A. The controller advances the fold.
+    auto cb2   = make_coinbase(2, {{5000, p2pkh(0xBB)}});
+    auto spend = make_spend({{A, 0}}, {{90000, p2pkh(0xCC)}});
+    ASSERT_TRUE(ctl.on_block_connected(make_block({cb2, spend}), 2));
+    EXPECT_EQ(fold->best_height(), 2u);
+
+    {   // After the advance, A reads SPENT (was UNSPENT at R).
+        ::core::coin::Coin c;
+        EXPECT_FALSE(fold->get_coin(::core::coin::Outpoint(A, 0), c))
+            << "advance-on-connect spent the pre-window coin (frozen-snapshot "
+               "hole closed)";
+    }
+}
+
+// at_tip guard: false while behind the serve tip or when the fold's tip block
+// is not the served chain's block at that height; true only when caught up AND
+// chain-identical.
+TEST(FoldLiveController, AtTipGuardTracksCursorAndChainIdentity)
+{
+    TmpDir dir;
+    auto fold = std::make_shared<ReplayUtxoFold>();
+    ASSERT_TRUE(fold->open(dir.sub("db")));
+    auto cb1 = make_coinbase(1, {{100000, p2pkh(0x11)}});
+    ASSERT_TRUE(fold->on_replay_block(1, fake_block_hash(1), make_block({cb1})));
+
+    FoldLiveController ctl(fold);
+    auto hash_at_ok = [&](uint32_t h) -> std::optional<uint256> {
+        if (h == 1) return fold->best_hash();
+        return std::nullopt;
+    };
+    EXPECT_FALSE(ctl.at_tip(2, hash_at_ok)) << "behind tip (serve_tip=2 > fold h=1)";
+    EXPECT_TRUE(ctl.at_tip(1, hash_at_ok))  << "caught up + chain-identical";
+
+    auto hash_at_fork = [&](uint32_t h) -> std::optional<uint256> {
+        if (h == 1) return fake_block_hash(999);   // reorged away from the fold's block
+        return std::nullopt;
+    };
+    EXPECT_FALSE(ctl.at_tip(1, hash_at_fork)) << "chain hash mismatch at fold tip";
+}
+
+// UNDO: a reorg that abandons the branch on which coin A was spent must restore
+// A (dashd DisconnectBlock), walking the fold cursor down to the fork point.
+TEST(FoldLiveController, ReorgUndoRestoresCoinSpentOnlyOnOrphanedBranch)
+{
+    TmpDir dir;
+    auto fold = std::make_shared<ReplayUtxoFold>();
+    ASSERT_TRUE(fold->open(dir.sub("db")));
+
+    auto cb1 = make_coinbase(1, {{100000, p2pkh(0xAA)}});
+    const uint256 A = dash_txid(cb1);
+    ASSERT_TRUE(fold->on_replay_block(1, fake_block_hash(1), make_block({cb1})));
+
+    FoldLiveController ctl(fold);
+    // h2 on the (soon-orphaned) branch spends A. Controller retains the body.
+    auto cb2   = make_coinbase(2, {{1, p2pkh(0xBB)}});
+    auto spend = make_spend({{A, 0}}, {{90000, p2pkh(0xCC)}});
+    ASSERT_TRUE(ctl.on_block_connected(make_block({cb2, spend}), 2));
+    {
+        ::core::coin::Coin c;
+        EXPECT_FALSE(fold->get_coin(::core::coin::Outpoint(A, 0), c));  // spent on orphan
+    }
+
+    // Switched chain: h1 hash matches (fork point), h2 differs (new branch).
+    auto canonical = [&](uint32_t h) -> std::optional<uint256> {
+        if (h == 1) return fake_block_hash(1);
+        if (h == 2) return fake_block_hash(0xBEEF);   // != orphan h2 identity
+        return std::nullopt;
+    };
+    EXPECT_TRUE(ctl.handle_reorg(canonical));
+    EXPECT_EQ(fold->best_height(), 1u) << "cursor rolled back to the fork point";
+    {
+        ::core::coin::Coin c;
+        EXPECT_TRUE(fold->get_coin(::core::coin::Outpoint(A, 0), c))
+            << "coin spent only on the orphaned branch is restored";
+    }
+    EXPECT_FALSE(ctl.reorg_stranded());
+}
+
+// UNDO fail-closed: a reorg deeper than the retained body window cannot roll
+// back exactly, so the controller latches "stranded" and at_tip withholds —
+// the over-withholding (never phantom-unspent) direction.
+TEST(FoldLiveController, ReorgDeeperThanRetainedBodiesFailsClosed)
+{
+    TmpDir dir;
+    auto fold = std::make_shared<ReplayUtxoFold>();
+    ASSERT_TRUE(fold->open(dir.sub("db")));
+    auto cb1 = make_coinbase(1, {{100000, p2pkh(0x11)}});
+    ASSERT_TRUE(fold->on_replay_block(1, fake_block_hash(1), make_block({cb1})));
+    auto cb2 = make_coinbase(2, {{100000, p2pkh(0x22)}});
+    ASSERT_TRUE(fold->on_replay_block(2, fake_block_hash(2), make_block({cb2})));
+
+    // Controller built AFTER h2 folded => it retains NO body for h2 (the undo
+    // half needs the disconnected block body). A reorg at/below h2 fails closed.
+    FoldLiveController ctl(fold);
+    auto canonical = [&](uint32_t h) -> std::optional<uint256> {
+        if (h == 1) return fake_block_hash(1);
+        if (h == 2) return fake_block_hash(0xBEEF);   // orphaned
+        return std::nullopt;
+    };
+    EXPECT_FALSE(ctl.handle_reorg(canonical)) << "no retained body => cannot undo";
+    EXPECT_TRUE(ctl.reorg_stranded());
+    // Stranded => at_tip withholds even though the cursor height still >= tip.
+    auto hash_at = [&](uint32_t h) -> std::optional<uint256> {
+        if (h == 2) return fold->best_hash();
+        return std::nullopt;
+    };
+    EXPECT_FALSE(ctl.at_tip(2, hash_at)) << "stranded fold is not consulted";
+}
+
+// (d) STORE VERIFY: the set hash is cursor-specific, so the arm gate (equality
+// vs the expected hash_serialized_2) refuses a store at the wrong height or a
+// corrupt/foreign expect — the mechanism run_node uses to refuse to arm.
+TEST(ReplayUtxoStoreVerify, HashIsCursorSpecificSoWrongCursorRefusesArm)
+{
+    TmpDir dir;
+    ReplayUtxoFold fold;
+    ASSERT_TRUE(fold.open(dir.sub("db")));
+    auto cb1 = make_coinbase(1, {{100000, p2pkh(0x01)}});
+    ASSERT_TRUE(fold.on_replay_block(1, fake_block_hash(1), make_block({cb1})));
+    auto hA = fold.hash_serialized_2();
+    ASSERT_TRUE(hA.has_value());
+
+    auto cb2 = make_coinbase(2, {{50000, p2pkh(0x02)}});
+    ASSERT_TRUE(fold.on_replay_block(2, fake_block_hash(2), make_block({cb2})));
+    auto hB = fold.hash_serialized_2();
+    ASSERT_TRUE(hB.has_value());
+
+    EXPECT_NE(hA->hash.GetHex(), hB->hash.GetHex())
+        << "hash_serialized_2 is cursor-specific: an expect for the earlier "
+           "cursor no longer verifies once the store advanced => refuse to arm";
+    EXPECT_NE(hB->hash.GetHex(), std::string(64, '0'))
+        << "a corrupt/absent (all-zero) expect never matches a real store hash";
 }
 
 }  // namespace

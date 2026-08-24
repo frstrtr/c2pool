@@ -654,6 +654,16 @@ public:
         m_mempool.set_fold_coin_lookup(std::move(fn));
     }
 
+    /// PR-C1 (embedded-fold-live) AT-TIP SERVING GUARD forwarder. Carries the
+    /// FoldLiveController::at_tip answer (fold caught up to the serve tip AND
+    /// chain-identical) into the mempool, which consults the fold ONLY while it
+    /// holds. Behind tip / mid-reorg / stranded => the mempool withholds
+    /// (byte-identical to master). Unset (default) => no guard, fold never wired.
+    void set_fold_at_tip_gate(std::function<bool()> fn)
+    {
+        m_mempool.set_fold_at_tip_gate(std::move(fn));
+    }
+
     /// Superblock-height guard. On a Dash superblock height the coinbase MUST
     /// pay the governance/treasury (superblock) outputs; the embedded template
     /// does not compute those, so emitting a normal coinbase there is a
