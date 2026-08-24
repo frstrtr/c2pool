@@ -422,6 +422,16 @@ target_link_libraries(coin_peer_rearm_kat c2pool_payout c2pool_merged_mining c2p
 target_link_libraries(coin_peer_rearm_kat nlohmann_json::nlohmann_json)
 add_test(NAME coin_peer_rearm_kat COMMAND coin_peer_rearm_kat)
 
+# ── KAT: PR-0 ARRIVAL INSTRUMENTATION schema (dashd-cut coin-P2P foundation) ──
+# Locks the OffEmbeddedWindow arrival/fold split invariant
+# (arrival_ms + fold_ms == window_ms) and the per-peer per-datum-class
+# DeliveryLatencyEwma update. arrival_timing.hpp is pure policy (header-only, no
+# node, no daemon, standard library only), so this target links NOTHING and
+# still exercises the schema the stacked coin-P2P PRs consume. Built under
+# -DC2POOL_DASH_BLS=ON like the rest of the dash suite; it carries no BLS symbols.
+add_executable(dash_arrival_instrumentation_kat dash_arrival_instrumentation_kat.cpp)
+add_test(NAME dash_arrival_instrumentation_kat COMMAND dash_arrival_instrumentation_kat)
+
 # Legacy applications have been archived to ../../archive/
 # - c2pool_legacy.cpp (original c2pool.cpp)
 # - c2pool_node_legacy.cpp (original c2pool_node.cpp)

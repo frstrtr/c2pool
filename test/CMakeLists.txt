@@ -324,6 +324,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # the Linux and AsAN CI jobs, so this dependency makes CI build the KAT and CTest
     # find it instead of reporting it NOT_BUILT / Not Run.
     add_dependencies(test_dash_serve_gate_journal dash_tx_serve_self_validation_kat)
+    add_dependencies(test_dash_serve_gate_journal dash_arrival_instrumentation_kat)  # PR-0 coin-P2P KAT: not in build.yml --target allowlist; piggyback on allowlisted anchor so CI builds it (avoids NOT_BUILT/Not-Run)
 
     # DASH serve-gate LEDGER cross-restart never-a-reject accounting KAT: the
     # CUMULATIVE, persisted companion to ServeGateJournal (the journal wipes on

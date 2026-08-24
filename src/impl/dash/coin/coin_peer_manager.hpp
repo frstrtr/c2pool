@@ -59,6 +59,7 @@
 #include <core/netaddress.hpp>
 #include <core/dns_seeder.hpp>
 #include <core/coin_addrman.hpp>
+#include <impl/dash/coin/arrival_timing.hpp>   // PR-0: per-peer per-datum-class delivery-latency EWMA (instrumentation only)
 
 namespace dash {
 namespace coin {
@@ -123,6 +124,20 @@ struct DashPeerInfo
     int                 broadcast_failures{0};
     int                 connection_successes{0};
     int                 blocks_relayed{0};
+
+    // PR-0 ARRIVAL INSTRUMENTATION (record-only): per-datum-class delivery
+    // latency EWMA (tip_body / mnlistdiff / qrinfo) for THIS peer. A later
+    // coin-P2P PR's scorer would consult record_delivery()'s smoothed value to
+    // prefer the carrier that actually answers fastest; in THIS PR it is pure
+    // telemetry — compute_score() does NOT read it, so selection is unchanged.
+    PeerDeliveryLatency delivery_latency;
+
+    // Feed one observed request->reply latency (monotonic ms) for a datum class.
+    // Pure EWMA update; never touches score/backoff/eligibility.
+    void record_delivery(DatumClass cls, int64_t latency_ms)
+    {
+        delivery_latency.observe(cls, latency_ms);
+    }
 
     std::string key() const { return address.to_string(); }
 

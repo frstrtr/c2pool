@@ -212,6 +212,7 @@
 #include <impl/dash/coin/mn_state_machine.hpp>
 #include <impl/dash/coin/historical_sml.hpp>   // authenticate_historical_snapshot
 #include <impl/dash/coin/lane_diag.hpp>        // ProgressReporter / StallWatchdog / MnSource
+#include <impl/dash/coin/arrival_timing.hpp>   // PR-0: OffEmbeddedWindow arrival/fold split (instrumentation only)
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
 #include <impl/dash/coin/vendor/smldiff.hpp>    // CSimplifiedMNListDiff
 #include <impl/dash/coin/vendor/cbtx.hpp>       // CCbTx
@@ -2860,6 +2861,10 @@ public:
         // while the header tip is itself stalled (the ondemand-mnlist freeze).
         m_snapshot_asked_at    = m_now();
         m_last_wallclock_reask = m_snapshot_asked_at;
+        // PR-0 instrumentation (record-only): the off-embedded window opens the
+        // moment the fold ask goes out. t_data_arrived/t_fold_complete/t_resumed
+        // are stamped in on_historical_snapshot(). Pure timestamp; no behaviour.
+        m_off_window.open(m_snapshot_asked_at);
         return true;
     }
 
@@ -3046,6 +3051,10 @@ public:
         }
 
         m_snapshot_pending = false;
+        // PR-0 instrumentation (record-only): the fold datum arrived on the
+        // wire. Closes the arrival span opened by begin_fold(); ignored if no
+        // window is open. Pure timestamp; the derived list is untouched.
+        m_off_window.data_arrived(m_now());
         const uint32_t h = m_snapshot_height;
         const bool on_demand = m_ondemand_pending;
 
@@ -3069,7 +3078,17 @@ public:
         if (on_demand) { finish_ondemand_fold(*sml, h); return true; }
 
         apply_fold(*sml, h);
+        // PR-0 instrumentation (record-only): derivation from the datum is done.
+        m_off_window.fold_complete(m_now());
         if (m_state != State::Bridging) return true;
+
+        // PR-0 instrumentation (record-only): the arm resumes the embedded
+        // template here — the window closes. emit_off_window_seg() prints the
+        // arrival/fold split ONLY when the default-OFF flag is armed, so an
+        // unflagged binary is byte-identical to master. No behaviour change:
+        // this is a timestamp read and a conditional log line.
+        m_off_window.resumed(m_now());
+        emit_off_window_seg(h);
 
         // Resume: the cursor is exactly at h, so the next block is h+1.
         if (m_tip_height) {
@@ -3087,6 +3106,14 @@ public:
 
     bool snapshot_pending() const { return m_snapshot_pending; }
     uint32_t folds_applied() const { return m_folds; }
+
+    /// PR-0 ARRIVAL INSTRUMENTATION (read-only). The four boundary timestamps
+    /// and the arrival/fold split of the MOST RECENT off-embedded fold window
+    /// (the getmnlistd ask -> reply -> derive -> resume round trip). A serve-
+    /// path consumer (the [EMBED-GATE-SEG]/[EMBED-GATE-ROLLUP] emit) reads this
+    /// to split off-embedded time into wire-wait vs derivation. Never gates a
+    /// decision; pure telemetry.
+    const OffEmbeddedWindow& off_embedded_window() const { return m_off_window; }
     /// LIFETIME totals across the whole span from the anchor, i.e. including
     /// whatever a previous process contributed before a resume.
     ///
@@ -3114,6 +3141,24 @@ public:
     static constexpr int64_t kStatefulReaskIntervalMs = 45000;
 
 private:
+    /// PR-0 ARRIVAL INSTRUMENTATION emit (record-only when the flag is OFF).
+    /// Prints the completed off-embedded window's arrival/fold split on the
+    /// greppable [EMBED-GATE-SEG] tag so an operator can separate wire-wait from
+    /// derivation without hand-pairing lines. Gated on the default-OFF
+    /// arrival_instr_enabled() flag: an unflagged binary emits NOTHING here and
+    /// is byte-identical to master. Reads timestamps only; never gates anything.
+    void emit_off_window_seg(uint32_t height) const
+    {
+        if (!arrival_instr_enabled()) return;
+        if (!m_off_window.split_consistent()) return;
+        LOG_WARNING << "[EMBED-GATE-SEG] h=" << height
+                    << " cause=mn-ckpt-fold"
+                    << " arrival_ms=" << m_off_window.arrival_ms()
+                    << " fold_ms="    << m_off_window.fold_ms()
+                    << " derive_ms="  << m_off_window.derive_ms()
+                    << " window_ms="  << m_off_window.window_ms();
+    }
+
     /// Keep claiming a small ring of abandoned request hashes. Bounded: this
     /// is a leak-proof guard, not a history.
     static constexpr size_t kAbandonedRing = 16;
@@ -4162,6 +4207,10 @@ public:
     // the coin-P2P pool dials past its base target while the leg is frozen.
     // Peer-selection / dial-count only; the applied list is never touched.
     int64_t  m_snapshot_asked_at{0};        // m_now() when the outstanding ask went out
+    // PR-0 ARRIVAL INSTRUMENTATION (record-only): the four boundary timestamps
+    // and arrival/fold split of the most recent off-embedded fold window. Pure
+    // telemetry — never read by a gate, never touches the derived list.
+    OffEmbeddedWindow m_off_window;
     int64_t  m_last_wallclock_reask{0};     // m_now() of the last wall-clock re-ask
     size_t   m_wallclock_reasks{0};         // telemetry: wall-clock re-asks issued
     std::function<void(bool)> m_stateful_stall_fn; // raise/clear outbound-behind
