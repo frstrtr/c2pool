@@ -354,6 +354,20 @@ public:
     }
     bool has_external_coin_lookup() const { return static_cast<bool>(m_external_coin_lookup); }
 
+    /// PR-C1 (embedded-fold-live): wire the full-history replay UTXO fold as the
+    /// LIVE serve-path input-pricing source. Consulted by compute_fee_locked ONLY
+    /// after the forward UTXO view and every in-pool parent miss -- so a tx whose
+    /// inputs predate the forward view (was permanently fee-unknown, template-
+    /// excluded) is priced from a set proven byte-equal to dashd's and becomes
+    /// fee_fold_proven. Set once at wiring time (before any template build).
+    /// Unset (default) => byte-identical to master.
+    void set_fold_coin_lookup(
+        std::function<bool(const ::core::coin::Outpoint&, ::core::coin::Coin&)> fn)
+    {
+        m_fold_coin_lookup = std::move(fn);
+    }
+    bool has_fold_coin_lookup() const { return static_cast<bool>(m_fold_coin_lookup); }
+
     PinnedTxGate pinned_tx_admissible(const MutableTransaction& tx,
                                       uint32_t next_height) const {
         // SIZE FIRST. It is the cheapest check and the only one whose failure
@@ -1312,8 +1326,22 @@ public:
                         ::core::coin::Outpoint op(vin.prevout.hash,
                                                   vin.prevout.index);
                         ::core::coin::Coin coin;
-                        if (!utxo->get_coin(op, coin)) {
-                            // Stale input: neither selected-parent nor UTXO.
+                        bool have = utxo->get_coin(op, coin);
+                        if (!have && m_fold_coin_lookup) {
+                            // PR-C1 (embedded-fold-live): the input predates the
+                            // forward view; resolve it from the full-history
+                            // replay UTXO fold (byte-proven vs dashd
+                            // kernel/coinstats.cpp) so a fold-PRICED tx is also
+                            // SELECTABLE end-to-end. The fold's Coin carries
+                            // height+coinbase, so the G3 maturity check below
+                            // stays dashd-exact. EMPTY unless --embedded-fold-live
+                            // armed it => byte-identical to master (the tx is
+                            // simply not selected, as today).
+                            have = m_fold_coin_lookup(op, coin) && !coin.is_spent();
+                        }
+                        if (!have) {
+                            // Stale input: not a selected parent, and neither the
+                            // forward UTXO view nor (when armed) the fold has it.
                             ok = false;
                             break;
                         }
@@ -1487,6 +1515,17 @@ private:
     // path where m_utxo is already read lock-free.
     std::function<bool(const ::core::coin::Outpoint&, ::core::coin::Coin&)>
                                                       m_external_coin_lookup;
+
+    // PR-C1 (embedded-fold-live): full-history replay UTXO fold view, wired as
+    // the LIVE serve-path last-source for input pricing when --embedded-fold-live
+    // is armed. EMPTY on master and whenever the flag is off, so every read of it
+    // below is skipped and fee pricing is byte-identical. When set (main_dash.cpp)
+    // it is ReplayUtxoFold::get_coin -- a set byte-proven equal to dashd's
+    // (kernel/coinstats.cpp hash_serialized_2), so a coin it resolves keeps the
+    // computed fee fold-EXACT (never overstated) and lets a tx whose inputs
+    // predate the forward view become fee_fold_proven instead of fee-unknown.
+    std::function<bool(const ::core::coin::Outpoint&, ::core::coin::Coin&)>
+                                                      m_fold_coin_lookup;
 
     /// G1: gather `txid` plus every UNSELECTED in-mempool ancestor into
     /// `out`, parents strictly before children (post-order DFS). `seen`
@@ -1799,6 +1838,22 @@ private:
                 in_sum += static_cast<uint64_t>(
                     pit->second.tx.vout[vin.prevout.index].value);
                 continue;
+            }
+            // PR-C1 (embedded-fold-live): the forward-from-start UTXO view and
+            // every in-pool parent missed this prevout -- on master that is a
+            // permanent fee-unknown (the pre-window-input class, ~20/34 of the
+            // tx-merkle divergence). Consult the full-history replay UTXO fold as
+            // the authoritative last source. EMPTY unless --embedded-fold-live
+            // armed it => this clause is skipped and pricing is byte-identical to
+            // master. When wired, the coin comes from a set proven byte-equal to
+            // dashd (kernel/coinstats.cpp hash_serialized_2), so the fee stays
+            // fold-EXACT (never overstated) and the tx earns fee_fold_proven below.
+            if (m_fold_coin_lookup) {
+                ::core::coin::Coin fc;
+                if (m_fold_coin_lookup(op, fc) && !fc.is_spent()) {
+                    in_sum += static_cast<uint64_t>(fc.value);
+                    continue;
+                }
             }
             entry.fee_known = false;
             entry.fee_fold_proven = false;

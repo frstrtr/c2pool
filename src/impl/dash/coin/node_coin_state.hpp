@@ -638,6 +638,22 @@ public:
         m_mempool.set_external_coin_lookup(std::move(fn));
     }
 
+    /// PR-C1 (embedded-fold-live): wire the full-history replay UTXO fold as the
+    /// LIVE serve-path input-pricing source (main_dash.cpp, under
+    /// --embedded-fold-live). Forwarded to the mempool, which consults it in
+    /// compute_fee_locked ONLY after the forward UTXO view and every in-pool
+    /// parent miss -- so a mempool tx whose inputs predate the forward view (was
+    /// permanently fee-unknown and template-excluded) is priced from a set proven
+    /// byte-equal to dashd's and becomes fee_fold_proven. The pin gate's own
+    /// second-source seam (set_pin_external_coin_lookup) is separately pointed at
+    /// the same fold, retiring the gettxout/--coin-rpc pin lookup. Unset
+    /// (default) => viability + fee pricing are byte-identical to master.
+    void set_fold_coin_lookup(
+        std::function<bool(const ::core::coin::Outpoint&, ::core::coin::Coin&)> fn)
+    {
+        m_mempool.set_fold_coin_lookup(std::move(fn));
+    }
+
     /// Superblock-height guard. On a Dash superblock height the coinbase MUST
     /// pay the governance/treasury (superblock) outputs; the embedded template
     /// does not compute those, so emitting a normal coinbase there is a

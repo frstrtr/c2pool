@@ -1938,3 +1938,78 @@ TEST(DashMempool, MnhfSignalUnpriceableIsFailClosed)
         << "fail-closed: an unpriceable EHF signal is WITHHELD from the template";
     EXPECT_EQ(total_fees, 0u);
 }
+
+
+// ─── PR-C1: embedded-fold-live — pre-window input pricing ────────────────────
+//
+// The LIVE serve path prices mempool txs against a forward-from-start
+// UTXOViewCache, so a tx whose inputs predate the height this node started at
+// is ABSENT from that view and stays permanently fee-unknown (the ~20/34
+// pre-window-input class of the tx-merkle divergence). PR-C1 wires the
+// full-history replay UTXO fold (byte-proven vs dashd kernel/coinstats.cpp
+// hash_serialized_2) as the authoritative last source via
+// Mempool::set_fold_coin_lookup: such a tx is now priced fold-EXACT and marked
+// fee_fold_proven, so the template selector includes it. With NO fold lookup
+// wired (default / master) the SAME tx stays fee-unknown and is withheld —
+// OFF-equivalence is byte-identical to master.
+
+TEST(DashMempool, FeeFoldLiveResolvesPreWindowInput)
+{
+    UTXOViewCache utxo(nullptr);      // forward view EMPTY: the input predates it
+    Mempool mp; mp.set_utxo(&utxo);
+
+    const uint256 prev = mint_hash(90'110);   // NOT added to the forward view
+    // The full-history fold KNOWS this coin (value 100000, mature non-coinbase).
+    mp.set_fold_coin_lookup(
+        [prev](const Outpoint& op, Coin& out) -> bool {
+            if (op.txid == prev && op.index == 0) {
+                out = Coin(100'000, {}, /*height=*/1, /*cb=*/false);
+                return true;
+            }
+            return false;
+        });
+    ASSERT_TRUE(mp.has_fold_coin_lookup());
+
+    auto tx = make_spend(prev, 0, /*out=*/90'000, /*salt=*/90'110);  // fee 10'000
+    ASSERT_TRUE(mp.add_tx(tx));
+
+    auto e = mp.get_entry(dash_txid(tx));
+    ASSERT_TRUE(e.has_value());
+    EXPECT_TRUE(e->fee_known)
+        << "pre-window input priced from the full-history fold view";
+    EXPECT_TRUE(e->fee_fold_proven)
+        << "pre-window input is now fold-PROVEN (RED on master: fee-unknown)";
+    EXPECT_EQ(e->fee, 10'000u)
+        << "fee = 100000 - 90000, fold-EXACT (never overstated)";
+
+    auto [sel, total_fees] = mp.get_sorted_txs_with_fees(1u << 20);
+    ASSERT_EQ(sel.size(), 1u)
+        << "a fold-proven tx is SELECTABLE for the template";
+    EXPECT_EQ(sel[0].fee, 10'000u);
+    EXPECT_EQ(total_fees, 10'000u);
+}
+
+TEST(DashMempool, FeeFoldLiveOffIsFeeUnknownByteIdentical)
+{
+    // OFF-equivalence: with NO fold lookup wired (default / master), the SAME
+    // pre-window-input tx stays fee-unknown and is WITHHELD from the template.
+    UTXOViewCache utxo(nullptr);
+    Mempool mp; mp.set_utxo(&utxo);
+    ASSERT_FALSE(mp.has_fold_coin_lookup());
+
+    const uint256 prev = mint_hash(90'111);   // absent from the forward view
+    auto tx = make_spend(prev, 0, /*out=*/90'000, /*salt=*/90'111);
+    ASSERT_TRUE(mp.add_tx(tx));
+
+    auto e = mp.get_entry(dash_txid(tx));
+    ASSERT_TRUE(e.has_value());
+    EXPECT_FALSE(e->fee_known)
+        << "no fold view wired => pre-window input unpriceable (master behaviour)";
+    EXPECT_FALSE(e->fee_fold_proven);
+
+    auto [sel, total_fees] = mp.get_sorted_txs_with_fees(1u << 20);
+    EXPECT_TRUE(sel.empty())
+        << "fail-closed: without the fold view the tx is WITHHELD "
+           "(byte-identical to master's exclusion discipline)";
+    EXPECT_EQ(total_fees, 0u);
+}

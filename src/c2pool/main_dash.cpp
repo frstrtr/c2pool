@@ -449,6 +449,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-tx-serve-own-set]\n"
         << "           [--embedded-fresh-datum-race] [--embedded-fresh-datum-race-k N]\n"
         << "           [--embedded-getmnlistd-tracker]\n"
+        << "           [--embedded-fold-live PATH]\n"
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
         << "           [--embedded-ingest-isdlock] [--embedded-ingest-dstx]\n"
         << "           [--embedded-proactive-rotate]\n"
@@ -992,7 +993,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // of THIS node's own dial targets — never changes WHAT is fetched
              // or how a reply is verified. OFF => dial plan byte-identical to
              // master.
-             bool embedded_asn_diversity = false)
+             bool embedded_asn_diversity = false,
+             // --embedded-fold-live PATH (PR-C1): wire the full-history replay
+             // UTXO fold at PATH as the LIVE serve-path input-pricing view.
+             // EMPTY (flag absent) => fold never opened; mempool fee pricing +
+             // pin gate byte-identical to master. Non-empty => price mempool txs
+             // whose inputs predate the forward UTXO view from a set proven
+             // byte-equal to dashd (kernel/coinstats.cpp hash_serialized_2),
+             // marking them fee_fold_proven, and retire the gettxout/--coin-rpc
+             // pin lookup. Reward-safe: fold-exact fees, never overstated.
+             const std::string& fold_live_db = std::string())
 {
     namespace io = boost::asio;
 
@@ -2222,8 +2232,41 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // deliberately -- attach() hands the lane's UTXOViewCache pointer to the
     // bundle's Mempool (set_utxo), so the lane must outlive the mempool that
     // references it (reverse destruction order at scope exit).
+    // PR-C1 (embedded-fold-live): full-history replay UTXO fold opened as the
+    // LIVE serve-path input-pricing view. Declared BEFORE node_coin_state so it
+    // outlives the mempool that captures it (reverse destruction order); the
+    // lambdas below also capture a shared_ptr copy, so the fold survives as long
+    // as any wiring holds it. EMPTY fold_live_db (flag absent) => nothing opened,
+    // fee pricing + pin gate byte-identical to master. NOTE: populating this
+    // store to the tip (the 77G cold start) is task #154, a DEPLOY prereq -- an
+    // empty/partial store simply resolves fewer inputs (fail-closed to today's
+    // fee-unknown), never a wrong value.
+    std::shared_ptr<dash::coin::replay::ReplayUtxoFold> fold_live;
     dash::coin::UtxoLane utxo_lane;
     dash::coin::NodeCoinState node_coin_state;
+    if (!fold_live_db.empty()) {
+        fold_live = std::make_shared<dash::coin::replay::ReplayUtxoFold>();
+        if (!fold_live->open(fold_live_db)) {
+            std::cout << "[run] --embedded-fold-live: FAILED to open fold store "
+                      << fold_live_db << " -- fold view NOT wired (fees + pin "
+                         "gate byte-identical to master)\n";
+            fold_live.reset();
+        } else {
+            auto fp = fold_live;
+            node_coin_state.set_fold_coin_lookup(
+                [fp](const ::core::coin::Outpoint& op,
+                     ::core::coin::Coin& out) -> bool {
+                    return fp->get_coin(op, out) && !out.is_spent();
+                });
+            std::cout << "[run] embedded-fold-live ARMED: fold store "
+                      << fold_live_db << " resume_height="
+                      << fold_live->resume_height()
+                      << " -- mempool fee pricing reads the full-history UTXO "
+                         "fold (pre-window inputs now fee_fold_proven; byte-proven "
+                         "vs dashd hash_serialized_2). Populating to tip = task "
+                         "#154 (deploy prereq).\n";
+        }
+    }
 
     // ── Mempool-tx serving switch (--embedded-serve-mempool-txs) ────────────
     // DEFAULT OFF: embedded templates carry a coinbase-only body even once the
@@ -2378,7 +2421,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // an authoritative source, so fee==0 stays COMPUTED rather than
             // assumed, and an input neither source can resolve is still
             // refused. An unreachable daemon returns false — never a guess.
-            if (rpc) {
+            if (fold_live) {
+                // PR-C1: retire the gettxout/--coin-rpc pin lookup. The pin
+                // gate's second source is now the full-history replay UTXO fold
+                // (byte-proven vs dashd kernel/coinstats.cpp), so a pinned tx
+                // whose inputs predate the forward UTXO view is admitted from an
+                // authoritative daemonless set -- value + spentness exact, fee==0
+                // stays COMPUTED, an input the fold cannot resolve is still
+                // refused (never a guess).
+                auto fp = fold_live;
+                node_coin_state.set_pin_external_coin_lookup(
+                    [fp](const ::core::coin::Outpoint& op,
+                         ::core::coin::Coin& out) -> bool {
+                        return fp->get_coin(op, out) && !out.is_spent();
+                    });
+                std::cout << "[run] pin input lookup: embedded UTXO view + "
+                             "full-history replay fold second source "
+                             "(gettxout/--coin-rpc RETIRED by --embedded-fold-live)\n";
+            } else if (rpc) {
                 dash::coin::NodeRPC* rpc_raw = rpc.get();
                 node_coin_state.set_pin_external_coin_lookup(
                     [rpc_raw](const ::core::coin::Outpoint& op,
@@ -8940,6 +9000,10 @@ int main(int argc, char** argv)
     // OFF, money/consensus path; byte-unchanged when off (nullptr null_evidence).
     bool embedded_null_arm = false;
     bool embedded_asn_diversity = false;   // PR-4 (--embedded-asn-diversity): default OFF
+    // --embedded-fold-live PATH (PR-C1): full-history replay UTXO fold store
+    // wired as the LIVE serve-path input-pricing view. EMPTY (default) => OFF,
+    // byte-identical to master. See run_node / mempool.hpp set_fold_coin_lookup.
+    std::string embedded_fold_live_db;
     // --embedded-ingest-isdlock: arm the coin-P2P MSG_ISDLOCK pull (G4
     // conflict-tx-lock feed). DEFAULT OFF — off, no getdata for inv type 31
     // and the handler decodes-and-discards (wire + template behaviour
@@ -9091,6 +9155,8 @@ int main(int argc, char** argv)
             embedded_asn_diversity = true;   // PR-4: require racing set to span >=2 ASNs
         else if (std::strcmp(argv[i], "--embedded-asn-diversity=false") == 0)
             embedded_asn_diversity = false;  // PR-4: explicit OFF (OFF-equivalence)
+        else if (std::strcmp(argv[i], "--embedded-fold-live") == 0 && i + 1 < argc)
+            embedded_fold_live_db = argv[++i];  // PR-C1: fold store for live serve-path pricing
         else if (std::strcmp(argv[i], "--embedded-ingest-isdlock") == 0)
             embedded_ingest_isdlock = true;   // G4 conflict-tx-lock feed
         else if (std::strcmp(argv[i], "--embedded-ingest-dstx") == 0)
@@ -9436,7 +9502,8 @@ int main(int argc, char** argv)
                         embedded_ingest_isdlock,       // G4 isdlock feed
                         embedded_ingest_dstx,          // W5-B DSTX feed
                         embedded_proactive_rotate,    // PR-3 proactive rotation
-                        embedded_asn_diversity);       // PR-4 ASN diversity
+                        embedded_asn_diversity,        // PR-4 ASN diversity
+                        embedded_fold_live_db);        // PR-C1 embedded-fold-live
     }
     return run_selftest();
 }
