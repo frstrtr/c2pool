@@ -97,6 +97,28 @@ inline std::string peer_network_group(const std::string& ip)
 }
 
 // ─── Peer info tracked per endpoint ──────────────────────────────────────────
+// PR-1 LATENCY-AWARE PEER SCORING (default-OFF flag).
+// When OFF, DashPeerInfo::latency_score_term() returns exactly 0, so
+// compute_score() is byte-identical to master. A process-wide relaxed
+// atomic set once at startup from --embedded-peer-latency-score and read on
+// the peer-selection thread. Arming it only reorders preference WITHIN the
+// already-eligible peer set (eligibility is decided by can_retry / group
+// caps / is_protected, never by this term); it can never add or remove an
+// eligible peer, fetch anything, or change what is derived.
+inline std::atomic<bool>& peer_latency_score_flag()
+{
+    static std::atomic<bool> g{false};
+    return g;
+}
+inline bool peer_latency_score_enabled()
+{
+    return peer_latency_score_flag().load(std::memory_order_relaxed);
+}
+inline void set_peer_latency_score_enabled(bool on)
+{
+    peer_latency_score_flag().store(on, std::memory_order_relaxed);
+}
+
 struct DashPeerInfo
 {
     enum class Source { coind, addr_crawl, manual, dns_seed, fixed_seed };
@@ -137,6 +159,66 @@ struct DashPeerInfo
     void record_delivery(DatumClass cls, int64_t latency_ms)
     {
         delivery_latency.observe(cls, latency_ms);
+    }
+
+    // PR-1 LATENCY-AWARE SCORING. A second latency source: the PeerLiveness
+    // ping/pong round-trip time (PeerLiveness measures it per peer). It is a
+    // datum-class-agnostic responsiveness signal used as the FALLBACK when the
+    // peer has not yet answered a real fetch (tip_body / mnlistdiff / qrinfo).
+    // Pure EWMA record, same class as delivery_latency; never gates anything.
+    DeliveryLatencyEwma ping_rtt;
+
+    // Feed one observed ping->pong RTT (monotonic ms) for THIS peer.
+    void record_ping_rtt(int64_t rtt_ms)
+    {
+        ping_rtt.observe(rtt_ms);
+    }
+
+    // Read accessors (telemetry / scoring input). -1 before any sample.
+    int64_t delivery_ewma_ms(DatumClass cls) const { return delivery_latency.ewma_ms(cls); }
+    int64_t ping_rtt_ewma_ms() const { return ping_rtt.ewma_ms(); }
+
+    // The single latency figure the scorer consults, in ms, or -1 if this peer
+    // has produced NO latency sample at all (=> neutral term). Preference:
+    //   1. tip_body delivery EWMA  — the live-serve datum peer selection is
+    //      ultimately optimizing the delivery of;
+    //   2. else the fastest other measured delivery class (mnlistdiff/qrinfo);
+    //   3. else the PeerLiveness ping RTT.
+    int64_t representative_latency_ms() const
+    {
+        const int64_t tip = delivery_latency.ewma_ms(DatumClass::TipBody);
+        if (tip >= 0) return tip;
+        int64_t best = -1;
+        for (size_t i = 0; i < static_cast<size_t>(DatumClass::Count); ++i) {
+            const int64_t e = delivery_latency.get(static_cast<DatumClass>(i)).ewma_ms();
+            if (e >= 0 && (best < 0 || e < best)) best = e;
+        }
+        if (best >= 0) return best;
+        return ping_rtt.ewma_ms();
+    }
+
+    // Bounds for the latency tie-breaker. Deliberately SMALLER in magnitude
+    // than the structural score signals (source +/-50, in_tried +50, age
+    // +/-50) so latency reorders peers WITHIN a preference tier rather than
+    // promoting a daemon-learned peer over an addr-crawl one on speed alone.
+    static constexpr int     kLatencyScoreMax = 25;   // clamp magnitude (points)
+    static constexpr int64_t kLatencyRefMs    = 200;  // term == 0 at this latency
+
+    // Bounded, clamped latency tie-breaker (points added to compute_score()).
+    //   OFF, or no latency sample      => 0  (byte-identical to master)
+    //   faster than kLatencyRefMs      => positive, up to +kLatencyScoreMax
+    //   slower than kLatencyRefMs      => negative, down to -kLatencyScoreMax
+    // Monotonically DECREASING in latency, so the faster deliverer ranks up.
+    // Integer arithmetic only (deterministic; the KAT locks the exact values).
+    int latency_score_term() const
+    {
+        if (!peer_latency_score_enabled()) return 0;
+        const int64_t lat = representative_latency_ms();
+        if (lat < 0) return 0;
+        int64_t term = (kLatencyRefMs - lat) * kLatencyScoreMax / kLatencyRefMs;
+        if (term >  kLatencyScoreMax) term =  kLatencyScoreMax;
+        if (term < -kLatencyScoreMax) term = -kLatencyScoreMax;
+        return static_cast<int>(term);
     }
 
     std::string key() const { return address.to_string(); }
@@ -231,6 +313,13 @@ struct DashPeerInfo
             if (std::chrono::duration_cast<std::chrono::hours>(uptime).count() < 1)
                 s += 20;
         }
+
+        // PR-1 LATENCY-AWARE SCORING (default-OFF): bounded, clamped
+        // tie-breaker that prefers the peer answering our requests fastest.
+        // OFF => term is exactly 0 => byte-identical to master. It only
+        // reorders preference within the already-eligible set; it never
+        // gates eligibility (is_protected returned 999999 above, untouched).
+        s += latency_score_term();
 
         return s;
     }
