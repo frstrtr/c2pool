@@ -97,6 +97,35 @@ static void part_a_classifier()
               "bad-txns-inputs-missingorspent + dashd-ahead -> STILL Invalid");
     }
 
+    // txn-already-known (validation.cpp:854, TX_CONFLICT, non-punishable per
+    // net_processing.cpp MaybePunishNodeForTx) while dashd is AHEAD of our serve
+    // parent: dashd found the tx's OWN outputs already in its UTXO set — it is
+    // CONFIRMED in the ahead block our still-valid fork template competed for
+    // (the h=2526495 class). GREEN: PendingPropagation, not a defect.
+    {
+        MempoolProbeTx tx;
+        tx.txid                        = "81109abf";
+        tx.depends_on_in_set_parent    = false;
+        tx.dashd_ahead_of_serve_height = true;
+        const auto r = classify_mempool_accept(tx, reject("txn-already-known"));
+        CHECK(r.verdict == MempoolAcceptVerdict::PendingPropagation,
+              "txn-already-known + dashd-ahead -> PendingPropagation");
+    }
+
+    // REWARD-SAFE FAIL-CLOSED: the SAME reason WITHOUT the ahead fact means the
+    // tx is confirmed in OUR OWN ancestry — a real double-inclusion that would
+    // cost the block. It stays Invalid (and resets the clean run). Fact-gated,
+    // widened only in the one direction the tx is provably valid on our fork.
+    {
+        MempoolProbeTx tx;
+        tx.txid                        = "already-ours";
+        tx.depends_on_in_set_parent    = false;
+        tx.dashd_ahead_of_serve_height = false;
+        const auto r = classify_mempool_accept(tx, reject("txn-already-known"));
+        CHECK(r.verdict == MempoolAcceptVerdict::Invalid,
+              "txn-already-known WITHOUT dashd-ahead -> stays Invalid");
+    }
+
     // Gate arithmetic: a PendingPropagation sample neither advances nor RESETS
     // the clean run — the whole point of the demotion-to-measurement.
     {
