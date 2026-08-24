@@ -464,6 +464,15 @@ add_test(NAME dash_fresh_datum_race_kat COMMAND dash_fresh_datum_race_kat)
 # under -DC2POOL_DASH_BLS=ON like the rest of the dash suite; no BLS symbols.
 add_executable(dash_proactive_rotation_kat dash_proactive_rotation_kat.cpp)
 add_test(NAME dash_proactive_rotation_kat COMMAND dash_proactive_rotation_kat)
+# ── KAT: PR-4 ASN / GEO DIVERSITY (dashd-cut coin-P2P racing tier) ──
+# Locks the bundled ASN-prefix group assignment (peer_asn/peer_asn_group) and
+# the race-set diversity objective (enforce_asn_diversity: top-N span >= 2 ASNs).
+# asn_diversity.hpp is pure policy (header-only, no node, no daemon, boost::asio
+# address parsing only), so this target links NOTHING and still exercises the
+# schema --embedded-asn-diversity consumes. Built under -DC2POOL_DASH_BLS=ON like
+# the rest of the dash suite; it carries no BLS symbols.
+add_executable(dash_asn_diversity_kat dash_asn_diversity_kat.cpp)
+add_test(NAME dash_asn_diversity_kat COMMAND dash_asn_diversity_kat)
 
 # Legacy applications have been archived to ../../archive/
 # - c2pool_legacy.cpp (original c2pool.cpp)

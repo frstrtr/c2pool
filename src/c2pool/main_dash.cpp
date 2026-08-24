@@ -443,6 +443,7 @@ void print_banner(const char* argv0)
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
         << "           [--external-ip ADDR]\n"
         << "           [--embedded-utxo] [--embedded-mainnet] [--embedded-null-arm] [--embedded-mn-bridge-max N]\n"
+        << "           [--embedded-asn-diversity]\n"
         << "           [--embedded-mn-bridge-no-cursor]\n"
         << "           [--embedded-utxo-immature-serve-empty] [--embedded-serve-mempool-txs]\n"
         << "           [--embedded-tx-serve-own-set]\n"
@@ -982,7 +983,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // candidate and sheds its slowest measured non-primary server so
              // the working set trends toward the fastest deliverers. Reward-safe
              // (connection-management only; every reply still self-checked).
-             bool embedded_proactive_rotate = false)
+             bool embedded_proactive_rotate = false,
+             // --embedded-asn-diversity (PR-4): DEFAULT OFF. When on, the coin
+             // peer manager reorders its already-scored, /16-group-diverse dial
+             // candidates so the fast path + its backup sit on INDEPENDENT ASNs
+             // (bundled ASN-prefix map; see asn_diversity.hpp). Pure reordering
+             // of THIS node's own dial targets — never changes WHAT is fetched
+             // or how a reply is verified. OFF => dial plan byte-identical to
+             // master.
+             bool embedded_asn_diversity = false)
 {
     namespace io = boost::asio;
 
@@ -2051,6 +2060,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             const uint16_t coin_port = testnet ? 19999 : 9999;
             dash::coin::DashPeerManagerConfig pm_cfg;
             pm_cfg.valid_ports = { coin_port };
+            // PR-4 (--embedded-asn-diversity, default OFF): when armed, the
+            // peer manager reorders its already-scored, /16-group-diverse dial
+            // candidates so the fast path + its backup sit on INDEPENDENT ASNs.
+            // OFF => the dial plan is byte-identical to master.
+            pm_cfg.asn_diversity = embedded_asn_diversity;
             // The manager BOUNDS the candidate set it hands back per call; with
             // the shipped default (3) it could never propose enough targets to
             // fill an 8-peer pool no matter how many peers it knew. Raise the
@@ -8913,6 +8927,7 @@ int main(int argc, char** argv)
     // window-open slots + template upgrade to the real commitment. DEFAULT
     // OFF, money/consensus path; byte-unchanged when off (nullptr null_evidence).
     bool embedded_null_arm = false;
+    bool embedded_asn_diversity = false;   // PR-4 (--embedded-asn-diversity): default OFF
     // --embedded-ingest-isdlock: arm the coin-P2P MSG_ISDLOCK pull (G4
     // conflict-tx-lock feed). DEFAULT OFF — off, no getdata for inv type 31
     // and the handler decodes-and-discards (wire + template behaviour
@@ -9049,6 +9064,10 @@ int main(int argc, char** argv)
                  && i + 1 < argc)
             dash::coin::set_fresh_datum_race_k(
                 static_cast<int>(std::strtol(argv[++i], nullptr, 10)));
+        else if (std::strcmp(argv[i], "--embedded-asn-diversity") == 0)
+            embedded_asn_diversity = true;   // PR-4: require racing set to span >=2 ASNs
+        else if (std::strcmp(argv[i], "--embedded-asn-diversity=false") == 0)
+            embedded_asn_diversity = false;  // PR-4: explicit OFF (OFF-equivalence)
         else if (std::strcmp(argv[i], "--embedded-ingest-isdlock") == 0)
             embedded_ingest_isdlock = true;   // G4 conflict-tx-lock feed
         else if (std::strcmp(argv[i], "--embedded-ingest-dstx") == 0)
@@ -9385,7 +9404,8 @@ int main(int argc, char** argv)
                         embedded_accrue_asset_unlocks, // #143 Variant B
                         embedded_ingest_isdlock,       // G4 isdlock feed
                         embedded_ingest_dstx,          // W5-B DSTX feed
-                        embedded_proactive_rotate);    // PR-3 proactive rotation
+                        embedded_proactive_rotate,    // PR-3 proactive rotation
+                        embedded_asn_diversity);       // PR-4 ASN diversity
     }
     return run_selftest();
 }
