@@ -331,6 +331,10 @@ target_link_libraries(c2pool-dash
                        # operator-key verify, daemonless superblock serving).
                        # Carries the C2POOL_DASH_BLS define + dashbls libs PUBLIC
                        # when the backend was found; fail-closed stub otherwise.
+    dash_scriptcheck   # PR-C4: consensus-exact CheckInputScripts over the C1 fold
+                       # view (dashcore interpreter vendored as a hidden-visibility
+                       # .so exporting only the c2pool_dash_* C API;
+                       # --embedded-fold-checkscripts, default-OFF => dormant).
     btclibs
     yaml-cpp::yaml-cpp
     nlohmann_json::nlohmann_json

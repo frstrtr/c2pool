@@ -94,3 +94,74 @@ target_include_directories(dash PRIVATE
     ${CMAKE_SOURCE_DIR}/src/btclibs
     ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(dash core pool sharechain c2pool_storage dash_x11 btclibs nlohmann_json::nlohmann_json ${Boost_LIBRARIES} ${SECP256K1_LIBRARIES})
+
+# ── PR-C4 (dashd-cut, tx-serving reward-safety) ──────────────────────────────
+# Consensus-exact CheckInputScripts over the C1 fold view. dash_scriptcheck is
+# dashcore's OWN script interpreter (src/script/interpreter.cpp + script.cpp +
+# pubkey.cpp + primitives/transaction.cpp + the crypto/uint256/util leaves it
+# needs), vendored byte-for-byte under coin/vendor/dashscript/ and compiled as a
+# HIDDEN-VISIBILITY SHARED OBJECT that exports ONLY the pure-C c2pool_dash_*
+# entry points (c2pool_scriptcheck.h). Building it as a .so with
+# -fvisibility=hidden keeps every bitcoin-derived symbol (uint256, CScript,
+# CSHA256, ...) internal to the object, so it can never ODR-collide with
+# c2pool's own btclibs copies of the same names at the c2pool-dash final link.
+# Links the system libsecp256k1 c2pool already depends on (ECDSA CHECKSIG). The
+# ONLY consumers are c2pool-dash (via the --embedded-fold-checkscripts lambda in
+# main_dash.cpp, default-OFF) and the test_dash_mempool KAT; the shared LTC
+# launcher never links it. SAFE-ADDITIVE, src/impl/dash only.
+set(_dash_scriptcheck_root ${CMAKE_CURRENT_SOURCE_DIR}/coin/vendor/dashscript)
+add_library(dash_scriptcheck SHARED
+    ${_dash_scriptcheck_root}/c2pool_scriptcheck.cpp
+    ${_dash_scriptcheck_root}/script/interpreter.cpp
+    ${_dash_scriptcheck_root}/script/script.cpp
+    ${_dash_scriptcheck_root}/script/script_error.cpp
+    ${_dash_scriptcheck_root}/script/bitcoinconsensus.cpp
+    ${_dash_scriptcheck_root}/pubkey.cpp
+    ${_dash_scriptcheck_root}/primitives/transaction.cpp
+    ${_dash_scriptcheck_root}/uint256.cpp
+    ${_dash_scriptcheck_root}/hash.cpp
+    ${_dash_scriptcheck_root}/util/strencodings.cpp
+    ${_dash_scriptcheck_root}/util/string.cpp
+    ${_dash_scriptcheck_root}/support/cleanse.cpp
+    ${_dash_scriptcheck_root}/crypto/sha256.cpp
+    ${_dash_scriptcheck_root}/crypto/sha512.cpp
+    ${_dash_scriptcheck_root}/crypto/ripemd160.cpp
+    ${_dash_scriptcheck_root}/crypto/sha1.cpp
+    ${_dash_scriptcheck_root}/crypto/hmac_sha256.cpp
+    ${_dash_scriptcheck_root}/crypto/hmac_sha512.cpp
+)
+# Isolated include root (BEFORE) so the vendored files resolve dashcore's own
+# <script/script.h>, <uint256.h>, <crypto/*>, <primitives/*> — NOT c2pool's
+# btclibs (which this target deliberately does not link). Boost include dirs are
+# added only to satisfy the directory-level force-included boost_asio_compat
+# shim; no Boost library is linked into this crypto object.
+# secp256k1 public headers: pubkey.cpp #includes <secp256k1.h> plus the module
+# headers <secp256k1_extrakeys.h>/<secp256k1_ellswift.h>/<secp256k1_recovery.h>.
+# These module headers ship only with NEWER libsecp256k1 releases, so a build
+# host whose system libsecp256k1-dev predates them (as some CI runners' packages
+# do) has the .so to link but NOT the header -> pubkey.cpp fails to compile in
+# the generic (non-BLS) config even though the BLS lane's newer host happens to
+# have them. Vendor the four self-contained public headers (from dashcore's own
+# src/secp256k1/include, the exact source the rest of the tree targets) INTO the
+# repo and put them FIRST on this target's include path so compilation is
+# independent of the system package version in EVERY config. Only ECDSA CHECKSIG
+# is on the c2pool_scriptcheck path; the ellswift/extrakeys entry points are
+# never called, and because dash_scriptcheck is a SHARED object (no
+# --no-undefined) an older runtime libsecp256k1 that lacks those symbols still
+# links. The runtime library linked below (SECP256K1_LIBRARIES) is unchanged.
+target_include_directories(dash_scriptcheck BEFORE PRIVATE
+    ${_dash_scriptcheck_root}/secp256k1/include
+    ${_dash_scriptcheck_root}
+    ${Boost_INCLUDE_DIRS})
+target_compile_definitions(dash_scriptcheck PRIVATE
+    BUILD_BITCOIN_INTERNAL DISABLE_OPTIMIZED_SHA256 HAVE_CONFIG_H
+    # EllSwift (BIP324 v2 transport) is unused by script verification. Its only entry
+    # point, secp256k1_ellswift_decode, is absent from OLDER runtime libsecp256k1 (linked
+    # by the generic CI runner), so even with the vendored header the .so fails at LINK.
+    # Excluding it drops the dependency on both the header and the runtime symbol.
+    C2POOL_SCRIPTCHECK_NO_ELLSWIFT)
+set_target_properties(dash_scriptcheck PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+    POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(dash_scriptcheck PRIVATE ${SECP256K1_LIBRARIES})
