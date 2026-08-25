@@ -649,6 +649,23 @@ std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
         return {};
     }
 
+    // ENTRY observability (#1039 "name every decline" pattern): one
+    // rate-limited log proves the serve handler was actually REACHED for an
+    // incoming sharereq, so a parse-drop in handle_message (returns before ever
+    // calling this) is field-distinguishable from "entered but produced no
+    // shares" (decode skew / empty hashes / all-misses).
+    static uint64_t serve_entry_log = 0;
+    if (serve_entry_log++ % 50 == 0)
+        LOG_INFO << "[handle_get_share] serving req from " << peer_addr.to_string()
+                 << " hashes=" << hashes.size() << " parents=" << parents;
+
+    if (hashes.empty())
+    {
+        LOG_WARNING << "[handle_get_share] EMPTY hashes from " << peer_addr.to_string()
+                    << " (decode skew or malformed sharereq)";
+        return {};
+    }
+
     parents = std::min(parents, (uint64_t)1000/hashes.size());
 	std::vector<ltc::ShareType> shares;
 	for (const auto& handle_hash : hashes)
@@ -1215,12 +1232,12 @@ void NodeImpl::readvertise_best_share()
              << " head share(s) to " << m_peers.size() << " peer(s) (ROOT-2)";
 }
 
-void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_hash)
+void NodeImpl::download_shares(peer_ptr preferred_peer, const uint256& target_hash)
 {
     // download_shares(): C++ implementation of the p2pool share-download loop.
     //
     // Key differences from old c2pool implementation:
-    // 1. RANDOM peer selection (not the reporting peer)
+    // 1. PREFER the reporting peer, random fallback (see peer selection below)
     // 2. RANDOM parent count 0-499 (not fixed 500)
     // 3. STOPS list: known heads + their 10th parents (not empty)
     // 4. Log format: "Requesting parent share XXXX from IP:PORT"
@@ -1249,12 +1266,24 @@ void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_h
         return;
     }
 
-    // p2pool: peer = random.choice(self.peers.values())
-    auto peer_it = m_peers.begin();
-    if (m_peers.size() > 1) {
-        std::advance(peer_it, core::random::random_uint256().GetLow64() % m_peers.size());
+    // Prefer the peer that REPORTED this hash (think()'s paired peer_addr, the
+    // advertiser, or the backfill-continuation peer). In small/hub topologies
+    // asking a RANDOM peer scatters sharereqs at chain-empty peers and, with
+    // per-target MAX_EMPTY_RETRIES abandonment, starves the pull of the one node
+    // that actually holds the chain. Fall back to a random peer
+    // (p2pool: peer = random.choice(self.peers.values())) when the reporter is
+    // absent/disconnected, preserving liveness. Only matters in small meshes —
+    // the large public mesh is unaffected (a random peer usually has the chain).
+    peer_ptr peer;
+    if (preferred_peer && m_connections.contains(preferred_peer->addr())) {
+        peer = preferred_peer;
+    } else {
+        auto peer_it = m_peers.begin();
+        if (m_peers.size() > 1) {
+            std::advance(peer_it, core::random::random_uint256().GetLow64() % m_peers.size());
+        }
+        peer = peer_it->second;
     }
-    auto& peer = peer_it->second;
 
     // p2pool: parents=random.randrange(500)
     uint64_t parents = core::random::random_uint256().GetLow64() % 500;
@@ -1884,13 +1913,18 @@ void NodeImpl::run_think()
             // requested again, leaving the chain stuck at <CHAIN_LENGTH.
             m_download_fail_count.clear();
 
-            // Request desired shares from random peers
+            // Request desired shares, preferring the peer that reported each
+            // hash (think()'s paired peer_addr). download_shares() resolves the
+            // reporter to its live connection and falls back to a random peer
+            // when it is gone — see the peer-selection note there. This is a
+            // convergence improvement for small/hub meshes, not a large-mesh bug.
             if (!result.desired.empty() && !m_peers.empty()) {
                 for (auto& [peer_addr, hash] : result.desired) {
-                    auto peer_it = m_peers.begin();
-                    if (m_peers.size() > 1)
-                        std::advance(peer_it, core::random::random_uint256().GetLow64() % m_peers.size());
-                    download_shares(peer_it->second, hash);
+                    peer_ptr target;
+                    auto conn_it = m_connections.find(peer_addr);
+                    if (conn_it != m_connections.end())
+                        target = conn_it->second;
+                    download_shares(target, hash);
                 }
             }
 

@@ -230,8 +230,24 @@ NodeImpl::handle_get_share(std::vector<uint256> hashes, uint64_t parents,
         return {};
     }
 
+    // ENTRY observability (#1039 "name every decline" pattern): one
+    // rate-limited log proves the serve handler was actually REACHED for an
+    // incoming sharereq. Without it, "never entered" (a parse-drop in
+    // handle_message that returns before ever calling this) is field-
+    // indistinguishable from "entered but produced no shares" (decode skew /
+    // empty hashes / all-misses) — the single missing datum when a fresh peer
+    // cannot download an established chain.
+    static uint64_t serve_entry_log = 0;
+    if (serve_entry_log++ % 50 == 0)
+        LOG_INFO << "[handle_get_share] serving req from " << peer_addr.to_string()
+                 << " hashes=" << hashes.size() << " parents=" << parents;
+
     if (hashes.empty())
+    {
+        LOG_WARNING << "[handle_get_share] EMPTY hashes from " << peer_addr.to_string()
+                    << " (decode skew or malformed sharereq)";
         return {};
+    }
 
     parents = std::min(parents, (uint64_t)1000 / hashes.size());
     std::vector<dash::ShareType> shares;
@@ -630,12 +646,24 @@ void NodeImpl::run_think()
             drain_peer_best_adverts();
             if (!result.desired.empty() && !m_peers.empty()) {
                 for (const auto& [peer_addr, hash] : result.desired) {
-                    (void)peer_addr;  // oracle: random peer, not the reporter
-                    auto peer_it = m_peers.begin();
-                    if (m_peers.size() > 1)
-                        std::advance(peer_it,
-                            core::random::random_uint256().GetLow64() % m_peers.size());
-                    download_shares(peer_it->second, hash);
+                    // Prefer the peer that REPORTED this hash (think()'s paired
+                    // peer_addr — oracle node.py download_shares carries the
+                    // (peer_addr, share_hash) pair). Discarding it and asking a
+                    // RANDOM peer is p2pool-faithful for a large mesh, but in a
+                    // small/hub topology it scatters sharereqs at chain-empty
+                    // peers; with per-target MAX_EMPTY_RETRIES abandonment that
+                    // starves the pull of the one node that actually holds the
+                    // chain (the fresh-sharechain no-sync symptom). Resolve the
+                    // reporter to its live connection; download_shares() falls
+                    // back to a random peer when it is absent/disconnected, so
+                    // liveness is preserved. Mirrors the advert-driven path
+                    // (drain_peer_best_adverts), which already targets the
+                    // advertiser.
+                    peer_ptr target;
+                    auto conn_it = m_connections.find(peer_addr);
+                    if (conn_it != m_connections.end())
+                        target = conn_it->second;
+                    download_shares(target, hash);
                 }
             }
 
