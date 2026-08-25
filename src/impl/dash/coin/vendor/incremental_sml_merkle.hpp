@@ -68,6 +68,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <set>
 #include <utility>
 #include <vector>
@@ -75,6 +76,27 @@
 namespace dash {
 namespace coin {
 namespace vendor {
+
+// PERF/TEST SEAM (task #154 delta path). Counts the SML entries the incremental
+// path had to EXAMINE — materialize a CSimplifiedMNListEntry for, sort, and
+// byte-diff. This is the per-block O(n) cost the #1297 consolidation
+// reintroduced by re-deriving the WHOLE ~4900-entry set from the fold's MN map
+// every block (replay_fold_engine.hpp compute_sml_root_incremental → update()):
+// even a pure payment-rotation block, which changes NOTHING in the SML, paid a
+// full re-materialize + std::sort + full-set diff + full-cache realloc.
+//   * update()             bumps by entries.size()  — it re-sorts and re-diffs
+//                          the entire incoming set (cold build / leaf-set change).
+//   * apply_value_changes() bumps only by the number of leaves the block
+//                          actually mutated (the O(k) delta).
+//   * a quiet block bumps NEITHER — the fold engine returns the resident cached
+//     root without calling either path.
+// Same single-io-thread discipline as the sml_leaf/node_hash counters: plain
+// uint64, no atomics.
+inline uint64_t& sml_leaves_examined_count()
+{
+    static uint64_t n = 0;
+    return n;
+}
 
 class IncrementalSmlMerkle
 {
@@ -97,6 +119,10 @@ public:
     // for every input — see the header invariant.
     uint256 update(std::vector<CSimplifiedMNListEntry> entries)
     {
+        // The full path re-sorts and re-diffs the ENTIRE incoming set — the
+        // O(n) per-block cost the delta path (apply_value_changes) avoids.
+        sml_leaves_examined_count() += entries.size();
+
         // Same total order the naive path sorts by: dashcore's memcmp over the
         // raw proRegTxHash bytes (little-endian byte order). proRegTxHash is
         // unique per MN, so this is a strict total order → deterministic.
@@ -188,6 +214,59 @@ public:
             rebuild_tree();
         }
         m_valid = true;
+        return m_root;
+    }
+
+    // DELTA PATH (task #154). Apply in-place VALUE changes to a known-small set
+    // of already-present leaves, reusing the resident sorted leaf cache AND the
+    // cached tree — WITHOUT re-materialising, re-sorting, or re-diffing the full
+    // ~4900-entry set. `changed` carries the NEW SML entries for exactly the
+    // leaves the block mutated in place: same proRegTxHash → same sorted
+    // position, value-only fields moved (confirmedHash, netInfo, pubKeyOperator,
+    // keyIDVoting, isValid, nType, platform*). The leaf SET must be unchanged;
+    // adds / removes (which shift sorted positions) still go through update().
+    //
+    // Returns the new root, byte-identical to
+    //     CSimplifiedMNList(resulting_set).CalcMerkleRoot()
+    // by the same structural guarantee update() gives — identical CalcHash(),
+    // identical merkle_pair_hash(), identical memcmp leaf order. Returns
+    // std::nullopt when the delta cannot be applied safely (cache invalid / no
+    // tree / a key is not present ⇒ the set actually changed): the caller then
+    // falls back to update() so the self-check root is never approximate.
+    std::optional<uint256> apply_value_changes(
+        const std::vector<CSimplifiedMNListEntry>& changed)
+    {
+        if (!m_valid || m_leaves.empty() || m_levels.empty())
+            return std::nullopt;
+        if (m_levels[0].size() != m_leaves.size())
+            return std::nullopt;
+
+        // Only the touched leaves are examined — the O(k) win.
+        sml_leaves_examined_count() += changed.size();
+
+        std::vector<size_t> dirty;
+        dirty.reserve(changed.size());
+        for (const auto& e : changed) {
+            // lower_bound over the resident sorted leaf cache by proRegTxHash.
+            size_t lo = 0, hi = m_leaves.size();
+            while (lo < hi) {
+                const size_t mid = lo + (hi - lo) / 2;
+                if (keycmp(m_leaves[mid].key, e.proRegTxHash) < 0) lo = mid + 1;
+                else                                              hi = mid;
+            }
+            if (lo >= m_leaves.size()
+                || keycmp(m_leaves[lo].key, e.proRegTxHash) != 0) {
+                // Key absent ⇒ the leaf SET changed, not just a value. Bail so
+                // the caller rebuilds from the full set (fail-safe, never wrong).
+                return std::nullopt;
+            }
+            m_leaves[lo].entry = e;
+            m_leaves[lo].hash  = e.CalcHash();     // bumps sml_leaf_hash_count
+            m_levels[0][lo]    = m_leaves[lo].hash;
+            dirty.push_back(lo);
+        }
+        if (!dirty.empty())
+            recompute_paths(dirty);   // O(k·log n) internal nodes only
         return m_root;
     }
 
