@@ -135,7 +135,22 @@ add_library(dash_scriptcheck SHARED
 # btclibs (which this target deliberately does not link). Boost include dirs are
 # added only to satisfy the directory-level force-included boost_asio_compat
 # shim; no Boost library is linked into this crypto object.
+# secp256k1 public headers: pubkey.cpp #includes <secp256k1.h> plus the module
+# headers <secp256k1_extrakeys.h>/<secp256k1_ellswift.h>/<secp256k1_recovery.h>.
+# These module headers ship only with NEWER libsecp256k1 releases, so a build
+# host whose system libsecp256k1-dev predates them (as some CI runners' packages
+# do) has the .so to link but NOT the header -> pubkey.cpp fails to compile in
+# the generic (non-BLS) config even though the BLS lane's newer host happens to
+# have them. Vendor the four self-contained public headers (from dashcore's own
+# src/secp256k1/include, the exact source the rest of the tree targets) INTO the
+# repo and put them FIRST on this target's include path so compilation is
+# independent of the system package version in EVERY config. Only ECDSA CHECKSIG
+# is on the c2pool_scriptcheck path; the ellswift/extrakeys entry points are
+# never called, and because dash_scriptcheck is a SHARED object (no
+# --no-undefined) an older runtime libsecp256k1 that lacks those symbols still
+# links. The runtime library linked below (SECP256K1_LIBRARIES) is unchanged.
 target_include_directories(dash_scriptcheck BEFORE PRIVATE
+    ${_dash_scriptcheck_root}/secp256k1/include
     ${_dash_scriptcheck_root}
     ${Boost_INCLUDE_DIRS})
 target_compile_definitions(dash_scriptcheck PRIVATE
