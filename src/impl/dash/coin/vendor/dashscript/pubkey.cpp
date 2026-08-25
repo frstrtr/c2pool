@@ -8,7 +8,16 @@
 #include <hash.h>
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
+// EllSwift (BIP324 v2 transport) is not part of consensus script verification and is
+// referenced nowhere in this vendored interpreter. Its only entry point,
+// secp256k1_ellswift_decode, is absent from OLDER runtime libsecp256k1 (which the
+// generic CI runner links), so a build that compiles against the vendored header still
+// fails at LINK. Exclude the include AND the two EllSwiftPubKey definitions that call it
+// via C2POOL_SCRIPTCHECK_NO_ELLSWIFT (defined for dash_scriptcheck in the CMakeLists),
+// removing the dependency on both the header and the runtime symbol in every config.
+#ifndef C2POOL_SCRIPTCHECK_NO_ELLSWIFT
 #include <secp256k1_ellswift.h>
+#endif
 #include <secp256k1_recovery.h>
 #include <span.h>
 #include <uint256.h>
@@ -258,6 +267,7 @@ bool CPubKey::Derive(CPubKey& pubkeyChild, ChainCode &ccChild, unsigned int nChi
     return true;
 }
 
+#ifndef C2POOL_SCRIPTCHECK_NO_ELLSWIFT
 EllSwiftPubKey::EllSwiftPubKey(Span<const std::byte> ellswift) noexcept
 {
     assert(ellswift.size() == SIZE);
@@ -277,6 +287,7 @@ CPubKey EllSwiftPubKey::Decode() const
 
     return CPubKey{vch_bytes.begin(), vch_bytes.end()};
 }
+#endif // C2POOL_SCRIPTCHECK_NO_ELLSWIFT
 
 void CExtPubKey::Encode(unsigned char code[BIP32_EXTKEY_SIZE]) const {
     code[0] = nDepth;

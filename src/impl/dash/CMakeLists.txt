@@ -154,7 +154,12 @@ target_include_directories(dash_scriptcheck BEFORE PRIVATE
     ${_dash_scriptcheck_root}
     ${Boost_INCLUDE_DIRS})
 target_compile_definitions(dash_scriptcheck PRIVATE
-    BUILD_BITCOIN_INTERNAL DISABLE_OPTIMIZED_SHA256 HAVE_CONFIG_H)
+    BUILD_BITCOIN_INTERNAL DISABLE_OPTIMIZED_SHA256 HAVE_CONFIG_H
+    # EllSwift (BIP324 v2 transport) is unused by script verification. Its only entry
+    # point, secp256k1_ellswift_decode, is absent from OLDER runtime libsecp256k1 (linked
+    # by the generic CI runner), so even with the vendored header the .so fails at LINK.
+    # Excluding it drops the dependency on both the header and the runtime symbol.
+    C2POOL_SCRIPTCHECK_NO_ELLSWIFT)
 set_target_properties(dash_scriptcheck PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
