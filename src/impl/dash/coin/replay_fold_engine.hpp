@@ -530,6 +530,18 @@ public:
         return sml.CalcMerkleRoot();
     }
 
+    /// Materialise the full SML entry vector from the held MN map — the O(n)
+    /// per-block cost the delta path avoids. Only the full-rebuild branches of
+    /// compute_sml_root_incremental() (cold fold, leaf-set change) call this.
+    std::vector<vendor::CSimplifiedMNListEntry> materialize_sml_entries() const
+    {
+        std::vector<vendor::CSimplifiedMNListEntry> ents;
+        ents.reserve(m_entries.size());
+        for (const auto& [protx, st] : m_entries)
+            ents.push_back(st.to_sml_entry(protx));
+        return ents;
+    }
+
     /// THE per-block hotspot, incrementalised (task #154). Same value as
     /// compute_sml_root() — byte-identical by construction — but reusing the
     /// leaf hashes and internal merkle nodes the block did not disturb, so a
@@ -543,11 +555,47 @@ public:
     /// the held list is replaced wholesale (seed()/load_snapshot() do this).
     uint256 compute_sml_root_incremental()
     {
-        std::vector<vendor::CSimplifiedMNListEntry> ents;
-        ents.reserve(m_entries.size());
-        for (const auto& [protx, st] : m_entries)
-            ents.push_back(st.to_sml_entry(protx));
-        const uint256 root = m_sml_cache.update(std::move(ents));
+        uint256 root;
+        if (!m_sml_cache.valid() || m_sml_structural) {
+            // Cold/first fold after (re)seed, or the leaf SET changed this block
+            // (ProReg add / collateral spend / collateral re-registration).
+            // Re-materialise the whole set ONCE and let update() rebuild — the
+            // rare case (adds/removes shift sorted positions). update() still
+            // reuses every unchanged leaf's cached hash.
+            root = m_sml_cache.update(materialize_sml_entries());
+        } else if (m_sml_touched.empty()) {
+            // THE OVERWHELMING MAJORITY: no SML-relevant field changed this
+            // block (payment rotation and PoSe-score decay bump ONLY the
+            // to_sml_entry-EXCLUDED nLastPaidHeight / nPoSePenalty). The root is
+            // definitionally unchanged — return the resident cached root with
+            // ZERO materialise, sort, diff, realloc or hashing. This is the
+            // dashd invariance (CalcCbTxMerkleRootMNList single-slot cache) the
+            // #1297 consolidation had, but paid for in full every block anyway.
+            root = m_sml_cache.root();
+        } else {
+            // A handful of value-only changes (confirmedHash crossings, ProUpServ
+            // / ProUpReg key & netInfo, PoSe ban/revive isValid flips). Build
+            // to_sml_entry for JUST those and patch them into the resident tree
+            // in place — O(k) materialise + O(k·log n) internal-node re-hash.
+            std::vector<vendor::CSimplifiedMNListEntry> changed;
+            changed.reserve(m_sml_touched.size());
+            for (const auto& protx : m_sml_touched) {
+                auto it = m_entries.find(protx);
+                if (it == m_entries.end()) continue;   // touched then removed ⇒
+                                                       // m_sml_structural set
+                                                       // (this branch unreached)
+                changed.push_back(it->second.to_sml_entry(protx));
+            }
+            auto delta = m_sml_cache.apply_value_changes(changed);
+            if (delta) {
+                root = *delta;
+            } else {
+                // Defensive: the delta could not be applied cleanly (a key was
+                // absent ⇒ the set actually changed). Fall back to the full
+                // rebuild so the self-check root is always exact.
+                root = m_sml_cache.update(materialize_sml_entries());
+            }
+        }
 #ifndef NDEBUG
         // Belt-and-suspenders in debug builds: the incremental root MUST equal
         // the naive full recompute at every block. (In release the fold's own
@@ -692,6 +740,10 @@ public:
             payee_script_pre = pst->scriptPayout.m_data;
         }
 
+        // task #154 delta driver: this block's SML mutations start empty.
+        m_sml_touched.clear();
+        m_sml_structural = false;
+
         // ── Pass 1: confirmedHash (specialtxman.cpp:205-218) ────────────
         // Walks every MN, BANNED INCLUDED. Confirmation compares against
         // H−1 (the prev block's height), and the recorded hash is hash(H−1)
@@ -701,6 +753,7 @@ public:
             const int32_t confs = (H - 1) - st.nRegisteredHeight;
             if (confs >= m_cfg.gates.masternode_min_confirmations) {
                 st.UpdateConfirmedHash(protx, prev_hash);
+                sml_touch(protx);   // confirmedHash IS an SML field
                 ++r.confirmed;
             }
         }
@@ -1030,6 +1083,17 @@ private:
     // it only through compute_sml_root_incremental() in cursor order, and
     // reset() on any wholesale state replacement (seed/load_snapshot).
     vendor::IncrementalSmlMerkle m_sml_cache;
+    // task #154 delta driver. Which SML-relevant leaves the CURRENT block
+    // mutated in place (m_sml_touched) and whether the leaf SET changed —
+    // add/remove (m_sml_structural). Both are reset at the top of every
+    // fold_block and consumed once by compute_sml_root_incremental() so the
+    // self-check patches only the O(k) changed leaves instead of re-deriving
+    // the whole ~4900-entry set. A missed mark can only make the incremental
+    // root DISAGREE with the naive recompute, which the committed-root compare
+    // (and the debug assert) catches — fail-closed, never a wrong served root.
+    std::vector<uint256> m_sml_touched;
+    bool                 m_sml_structural{false};
+    void sml_touch(const uint256& protx) { m_sml_touched.push_back(protx); }
     std::map<bitcoin_family::coin::TxPrevOut, uint256, ReplayOutpointLess>
         m_collateral_index;
     uint64_t    m_total_registered_count{0};
@@ -1051,6 +1115,9 @@ private:
         if (it == m_entries.end()) return;
         m_collateral_index.erase(it->second.collateralOutpoint);
         m_entries.erase(it);
+        // Leaf SET changed (collateral spend / re-registration) — the
+        // incremental self-check must take the full-rebuild path this block.
+        m_sml_structural = true;
     }
 
     /// dashd CompareByLastPaid_GetHeight (deterministicmns.cpp:157-166),
@@ -1154,6 +1221,8 @@ private:
 
         m_collateral_index[st.collateralOutpoint] = proTxHash;
         m_entries[proTxHash] = std::move(st);
+        // A new leaf shifts sorted positions — full-rebuild path this block.
+        m_sml_structural = true;
         ++m_total_registered_count;
         ++r.registered;
         if (m_cfg.debug_logs) {
@@ -1208,6 +1277,8 @@ private:
                 }
             }
         }
+        // netInfo / platform ports / isValid(revive) are SML fields.
+        sml_touch(p.proTxHash);
         ++r.updated;
         return {};
     }
@@ -1258,6 +1329,9 @@ private:
         }
         st.keyIDVoting  = p.keyIDVoting;
         st.scriptPayout = p.scriptPayout;
+        // keyIDVoting is an SML field (and the operator-key-change branch above
+        // may have reset pubKeyOperator/netInfo + flipped isValid).
+        sml_touch(p.proTxHash);
         ++r.updated;
         return {};
     }
@@ -1280,6 +1354,8 @@ private:
         st.BanIfNotBanned(H);
         st.nRevocationReason = p.nReason;
         if (!was_banned) ++r.banned;
+        // Ban flips isValid + reset clears pubKeyOperator/netInfo — SML fields.
+        sml_touch(p.proTxHash);
         ++r.revoked;
         return {};
     }
@@ -1369,6 +1445,9 @@ private:
         ++r.punished;
         if (!st.IsBanned() && st.nPoSePenalty >= max_penalty) {
             st.BanIfNotBanned(H);
+            // The ban flips isValid — the only SML-relevant effect of a punish
+            // (nPoSePenalty itself is EXCLUDED from to_sml_entry).
+            sml_touch(protx);
             ++r.banned;
             if (m_cfg.debug_logs) {
                 LOG_INFO << "[DML-FOLD] h=" << H << " MN "

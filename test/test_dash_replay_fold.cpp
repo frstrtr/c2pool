@@ -495,6 +495,47 @@ TEST(DashReplayFoldReal, Revive2516756ThenQuietSequence)
     EXPECT_EQ(eng.height(), 2516760u);
 }
 
+// task #154 delta path at the ENGINE level, on real mainnet bodies. The
+// self-check's incremental root recompute must NOT re-materialise + re-sort the
+// whole ~2971-entry SML on every block (the #1297 wall-clock regression). After
+// the one unavoidable warm-up rebuild, four real quiet bodies together examine
+// FEWER SML entries than a SINGLE full re-materialise — where the shipped code
+// examined 4*n. The folded roots stay byte-exact against the chain throughout,
+// so the speed-up costs nothing in correctness.
+TEST(DashReplayFoldReal, IncrementalSelfCheckAvoidsPerBlockFullRematerialize)
+{
+    auto fx  = parse_prestate(kDashReplayPrestate2516755);
+    auto eng = seed_from_fixture(fx);
+    const uint64_t n = eng.size();   // 2971
+
+    // Warm the cache: the first fold after a seed rebuilds from the full set
+    // (seed() dropped the diff base). This is the one unavoidable O(n).
+    ASSERT_TRUE(eng.fold_block(parse_block(kDashReplayBlock2516756), 2516756).ok);
+
+    // Four more real bodies. None registers or removes an MN (the leaf set is
+    // stable — the roots below prove it), so each takes the delta / cached-root
+    // path and examines only the leaves it actually mutated.
+    const char* seq[] = {kDashReplayBlock2516757, kDashReplayBlock2516758,
+                         kDashReplayBlock2516759, kDashReplayBlock2516760};
+    uint32_t h = 2516757;
+    const uint64_t ex0 = dash::coin::vendor::sml_leaves_examined_count();
+    for (const char* bh : seq) {
+        auto rr = eng.fold_block(parse_block(bh), h);
+        ASSERT_TRUE(rr.ok) << "h=" << h << ": " << rr.error;
+        // Byte-exact against the chain — the delta path never trades away
+        // correctness for speed.
+        EXPECT_EQ(rr.computed_root.GetHex(), kRoot2516756) << "h=" << h;
+        EXPECT_EQ(rr.registered, 0u) << "h=" << h;   // leaf set stable ⇒ non-structural
+        ++h;
+    }
+    const uint64_t examined =
+        dash::coin::vendor::sml_leaves_examined_count() - ex0;
+    EXPECT_LT(examined, n)
+        << "four blocks' delta self-check examined " << examined
+        << " SML entries — must be < one full re-materialise (n=" << n
+        << "); the shipped full path examined 4*n = " << (4 * n);
+}
+
 TEST(DashReplayFoldReal, OperatorSplitCarriedThroughFold)
 {
     auto fx  = parse_prestate(kDashReplayPrestate2516755);
@@ -1399,6 +1440,7 @@ TEST(DashReplayFoldSynthetic, SnapshotV3FailLoudPaths)
 using dash::coin::vendor::IncrementalSmlMerkle;
 using dash::coin::vendor::sml_leaf_hash_count;
 using dash::coin::vendor::sml_node_hash_count;
+using dash::coin::vendor::sml_leaves_examined_count;
 
 namespace {
 
@@ -1641,4 +1683,76 @@ TEST(DashReplayFoldIncrementalMerkle, RandomWalkAlwaysMatchesNaive)
             << "random-walk divergence at step " << stepno
             << " (op=" << op << ", size=" << state.size() << ")";
     }
+}
+
+// task #154 DELTA PATH — the fix for the #1297 wall-clock regression.
+//
+// The #1297 consolidation kept the LEAF-HASH reduction but paid a FULL per-block
+// re-materialise + std::sort + full-set diff + full-cache realloc on EVERY
+// block, including the pure-payment-rotation majority that change NOTHING in the
+// SML. apply_value_changes() drives the resident sorted cache from the O(k)
+// leaves a block actually mutated instead. This KAT proves the two things that
+// matter:
+//   (a) the delta root is BYTE-IDENTICAL to the naive full recompute (reward-
+//       safety — a fast-but-wrong root would serve a forked list); and
+//   (b) the delta path EXAMINES only the k changed leaves, where the full path
+//       (what shipped) examines all n — the O(n)→O(k) win, measured on the
+//       shared sml_leaves_examined_count() seam.
+TEST(DashReplayFoldIncrementalMerkle, DeltaPathByteIdenticalAndExaminesOnlyK)
+{
+    const uint32_t N = 300;
+    std::map<uint32_t, CSimplifiedMNListEntry> state;
+    for (uint32_t i = 0; i < N; ++i) state[i] = incmerkle_mk_entry(i, true);
+
+    auto entries_of = [&]() {
+        std::vector<CSimplifiedMNListEntry> v;
+        v.reserve(state.size());
+        for (const auto& [k, e] : state) { (void)k; v.push_back(e); }
+        return v;
+    };
+
+    IncrementalSmlMerkle cache;
+
+    // Cold build via the full path — examines all N once (unavoidable seed cost).
+    const uint64_t ex0 = sml_leaves_examined_count();
+    cache.update(entries_of());
+    EXPECT_EQ(sml_leaves_examined_count() - ex0, static_cast<uint64_t>(N))
+        << "cold build examines the whole set once";
+
+    // Mutate three leaves in place — value-only (confirmedHash / isValid), the
+    // set unchanged. This is the shape of a real change block.
+    state[10].confirmedHash = incmerkle_protx_of(900010);
+    state[20].isValid       = false;
+    state[30].confirmedHash = incmerkle_protx_of(900030);
+    const std::vector<CSimplifiedMNListEntry> changed =
+        { state[10], state[20], state[30] };
+
+    // (b) THE FULL PATH — what #1297 shipped — examines the WHOLE set again.
+    IncrementalSmlMerkle full_cache;
+    full_cache.update(entries_of());                 // its own cold build
+    const uint64_t exf0 = sml_leaves_examined_count();
+    const uint256 r_full = full_cache.update(entries_of());
+    const uint64_t full_examined = sml_leaves_examined_count() - exf0;
+    EXPECT_EQ(full_examined, static_cast<uint64_t>(N))
+        << "the shipped full path re-examines every leaf every block";
+
+    // (b) THE DELTA PATH examines ONLY the three changed leaves.
+    const uint64_t exd0 = sml_leaves_examined_count();
+    const std::optional<uint256> r_delta = cache.apply_value_changes(changed);
+    const uint64_t delta_examined = sml_leaves_examined_count() - exd0;
+    ASSERT_TRUE(r_delta.has_value()) << "a same-set value change must apply";
+    EXPECT_EQ(delta_examined, 3u) << "delta examines exactly the k changed leaves";
+    EXPECT_LT(delta_examined * 50, full_examined) << "O(k), not O(n)";
+
+    // (a) THE HARD INVARIANT — delta root == naive full recompute == full path.
+    const uint256 r_naive = CSimplifiedMNList(entries_of()).CalcMerkleRoot();
+    EXPECT_EQ(r_delta->GetHex(), r_naive.GetHex())
+        << "delta root diverged from the naive recompute — reward-path hazard";
+    EXPECT_EQ(r_full.GetHex(), r_naive.GetHex());
+
+    // FAIL-SAFE: a key not present ⇒ nullopt, so the fold falls back to the full
+    // rebuild and the self-check root is never approximate when the SET changed.
+    const std::vector<CSimplifiedMNListEntry> absent = { incmerkle_mk_entry(99999) };
+    EXPECT_FALSE(cache.apply_value_changes(absent).has_value())
+        << "an absent key must bail to the full-rebuild fallback";
 }
