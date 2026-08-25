@@ -4,6 +4,15 @@
 #include "log.hpp"
 #include <btclibs/util/strencodings.h>
 
+// Per-socket TCP liveness (keepalive + user-timeout). Linux-specific socket
+// options are guarded by __linux__; the portable boost::asio keep_alive option
+// is armed unconditionally. See Socket::init().
+#ifdef __linux__
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#endif
+
 namespace core
 {
 
@@ -76,6 +85,43 @@ void Socket::init()
     if (ec) { m_status = false; m_socket->close(); return; }
     m_addr_local = NetService(ep_local);
     m_addr       = NetService(ep_remote);
+
+    // ── Per-socket TCP liveness (pure transport; cannot corrupt protocol state).
+    // Motivation: a stateful ISP-side per-flow DPI blackhole (TSPU-class CGN on
+    // the hotel uplink) can silently wedge a flow both directions without ever
+    // sending FIN/RST. is_open() never falsifies for such a half-open drop, so
+    // a pending async_read/async_write can linger 15-30 min before anything
+    // notices — the sharechain sync stalls for that whole window.
+    //   * SO_KEEPALIVE (+ Linux 60/10/3 tuning) makes the kernel actively probe
+    //     an idle path and error the pending op when it has gone dead (~90 s).
+    //   * TCP_USER_TIMEOUT=30 s bounds how long UNACKED queued data may sit
+    //     before the kernel aborts the connection — this is the fast path for a
+    //     wedged (latched) flow: the write never ACKs, the socket errors in
+    //     ~30 s, the peer is dropped, and the download loop redials over a
+    //     FRESH connection (which gets a fresh DPI classifier budget).
+    // This runs for ALL lanes (core), which is safe: keepalive + user-timeout
+    // are liveness-only and never alter bytes on the wire. Best-effort — every
+    // option is ignore-on-unsupported so non-Linux / restricted hosts still run.
+    if (m_socket && m_socket->is_open()) {
+        boost::system::error_code kec;
+        m_socket->set_option(boost::asio::socket_base::keep_alive(true), kec); // portable (asio)
+        if (kec)
+            LOG_DEBUG_OTHER << "Socket::init: SO_KEEPALIVE set failed: " << kec.message();
+#ifdef __linux__
+        const int fd = m_socket->native_handle();
+        int idle  = 60;   // seconds idle before first keepalive probe
+        int intvl = 10;   // seconds between probes
+        int cnt   = 3;    // failed probes before the connection is dropped (~90 s)
+        ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
+        ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+        ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
+        // Abort a flow whose queued data stays unacknowledged for 30 s — the
+        // DPI-latch fast path. Ignore-on-unsupported (older kernels).
+        unsigned int usr_timeout_ms = 30000;
+        ::setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &usr_timeout_ms, sizeof(usr_timeout_ms));
+        LOG_TRACE << "Socket::init: TCP liveness armed (keepalive 60/10/3, user_timeout=30s)";
+#endif
+    }
 
     // start for reading socket data
     read();

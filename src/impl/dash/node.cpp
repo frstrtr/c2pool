@@ -250,6 +250,20 @@ NodeImpl::handle_get_share(std::vector<uint256> hashes, uint64_t parents,
     }
 
     parents = std::min(parents, (uint64_t)1000 / hashes.size());
+
+    // DPI-latch mitigation (DASH lane only). A stateful ISP-side per-flow DPI
+    // blackhole (TSPU-class CGN on the hotel uplink) silently drops ALL packets
+    // both directions once a single outbound-initiated TCP flow to the foreign
+    // hoster accumulates ~13-16 KB of payload that does not classify as a known
+    // protocol. c2pool's binary p2p sharereply is emitted as ONE async_write,
+    // so a large backfill (e.g. 109 shares ~= 103 KB) wedges at ~12 KB and no
+    // shares are ever parsed -> sync never advances. Capping parents at 8 keeps
+    // every message_sharereply at <= ~9 shares (~8.6 KB), safely under the
+    // latch budget, so even an un-updated requester peer receives a reply that
+    // fits. Per-coin isolation: this clamp is DASH-local; ltc/doge/btc/dgb/bch
+    // are untouched.
+    parents = std::min<uint64_t>(parents, pool::download::DASH_PARENTS_SERVE_CAP);
+
     std::vector<dash::ShareType> shares;
     for (const auto& handle_hash : hashes)
     {
@@ -753,9 +767,12 @@ void NodeImpl::download_shares(peer_ptr peer, const uint256& target_hash)
         peer = peer_it->second;
     }
 
-    // p2pool: parents=random.randrange(500)
+    // p2pool: parents=random.randrange(500). DASH lane uses a SMALL range
+    // (DASH_PARENTS_RANGE=12) instead of the shared PARENTS_RANGE=500 so every
+    // ask stays under the ISP DPI-latch budget (see share_download.hpp). This
+    // is DASH-local — ltc/doge/btc/dgb keep PARENTS_RANGE (per-coin isolation).
     const uint64_t parents =
-        core::random::random_uint256().GetLow64() % pool::download::PARENTS_RANGE;
+        core::random::random_uint256().GetLow64() % pool::download::DASH_PARENTS_RANGE;
 
     // stops need a tracker read — try_to_lock per the architectural rule (the
     // IO thread NEVER blocks on m_tracker_mutex). If think() holds it, skip;

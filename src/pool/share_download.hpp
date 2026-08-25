@@ -30,8 +30,25 @@ namespace pool::download
 {
 
 // oracle node.py download loop: parents=random.randrange(500) — a RANDOM chunk
-// size per request, NOT a fixed 500 (mirrors ltc node.cpp:1010).
+// size per request, NOT a fixed 500 (mirrors ltc node.cpp:1010). Shared default
+// for ltc/doge/btc/dgb/bch — do NOT retune (per-coin isolation invariant).
 inline constexpr uint64_t PARENTS_RANGE = 500;
+
+// DPI-latch mitigation — DASH lane ONLY (do NOT apply to PARENTS_RANGE above).
+// A stateful ISP-side per-flow DPI blackhole (TSPU-class CGN on the hotel
+// uplink) silently blackholes a single outbound TCP flow once it accumulates
+// ~13-16 KB of payload that does not classify as a known protocol; c2pool
+// sends a whole backfill reply in ONE async_write, so a large reply wedges and
+// no shares are parsed. Two DASH-local caps keep every reply under the latch:
+//   * SERVE cap  — the server clamps its reply to <= this many parents so even
+//     an un-updated requester gets a reply that fits (<= ~8.6 KB at 8 shares).
+//   * PARENTS_RANGE (requester) — our own asks draw parents from [0, 12), so a
+//     freshly-updated requester keeps each round-trip small.
+// The DPI budget is CUMULATIVE per flow, so the connection is recycled every
+// ~1-2 replies; that is EXPECTED and by design (each fresh handshake gets a
+// fresh classifier budget). ltc/doge/btc/dgb/bch keep PARENTS_RANGE=500.
+inline constexpr uint64_t DASH_PARENTS_SERVE_CAP = 8;
+inline constexpr uint64_t DASH_PARENTS_RANGE     = 12;
 
 // oracle: stops list truncated [:100] (node.py download loop; ltc:1035-1039).
 inline constexpr std::size_t STOPS_CAP = 100;
