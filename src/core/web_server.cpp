@@ -3598,7 +3598,16 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
         if (blk.time_to_find > 0 && blk.expected_time > 0) {
             blk.luck = blk.expected_time / blk.time_to_find * 100.0;
         }
-        m_found_blocks.insert(m_found_blocks.begin(), blk);
+        // Keep found-blocks ordered newest-first by chain height (canonical
+        // chain order). Height is monotonic on-chain, so it is immune to the
+        // block-header timestamp skew that can reverse a same-day cluster
+        // relative to height; ts only breaks ties at equal height.
+        m_found_blocks.push_back(blk);
+        std::sort(m_found_blocks.begin(), m_found_blocks.end(),
+            [](const FoundBlock& a, const FoundBlock& b) {
+                if (a.height != b.height) return a.height > b.height;
+                return a.ts > b.ts;
+            });
     }
 
     // Persist to LevelDB (Layer +2 — never pruned)
@@ -3661,9 +3670,12 @@ void MiningInterface::load_persisted_found_blocks()
                 m_found_blocks.push_back(std::move(blk));
         }
 
-        // Sort newest first
+        // Sort newest-first by chain height (canonical, monotonic on-chain);
+        // ts only breaks ties. Sorting by ts alone reversed same-day clusters
+        // whose header timestamps disagree with height.
         std::sort(m_found_blocks.begin(), m_found_blocks.end(),
             [](const FoundBlock& a, const FoundBlock& b) {
+                if (a.height != b.height) return a.height > b.height;
                 return a.ts > b.ts;
             });
 
