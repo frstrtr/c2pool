@@ -664,6 +664,17 @@ public:
         m_mempool.set_fold_at_tip_gate(std::move(fn));
     }
 
+    /// PR-C4 (embedded-fold-checkscripts): forward the consensus-exact
+    /// CheckInputScripts callback (dashcore VerifyScript over the at-tip fold
+    /// view) to the mempool template selector. Wired in main_dash.cpp ONLY under
+    /// --embedded-fold-checkscripts (which itself requires --embedded-fold-live).
+    /// Unset (default) => the selector runs no script check and template
+    /// selection is byte-identical to master.
+    void set_script_check(dash::coin::Mempool::ScriptCheckFn fn)
+    {
+        m_mempool.set_script_check(std::move(fn));
+    }
+
     /// Superblock-height guard. On a Dash superblock height the coinbase MUST
     /// pay the governance/treasury (superblock) outputs; the embedded template
     /// does not compute those, so emitting a normal coinbase there is a

@@ -65,6 +65,7 @@
 #include <impl/dash/coin/coin_p2p_magic.hpp>      // dash::coin::select_coin_p2p_magic — E5 --coin-p2p-magic override (regtest ARM A dial)
 #include <impl/dash/coin/node_coin_state.hpp>  // dash::coin::NodeCoinState (embedded work bundle)
 #include <impl/dash/coin/fold_live_controller.hpp>  // dash::coin::FoldLiveController (PR-C1 live tip-tracking fold)
+#include <impl/dash/coin/vendor/dashscript/c2pool_scriptcheck.h>  // PR-C4 consensus-exact CheckInputScripts C API
 #include <impl/dash/coin/arm_resolution.hpp>   // dash::coin::resolve_embedded_arm (#738 arm decision, one place)
 #include <impl/dash/coin/embedded_startup_invariant.hpp>  // C-startup-invariant: embedded fresh-gate => body-first serve tip
 #include <impl/dash/coin/dkg_window.hpp>       // dash::coin::is_dkg_commitment_window (BLOCKER-1 guard)
@@ -460,6 +461,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-fresh-datum-race] [--embedded-fresh-datum-race-k N]\n"
         << "           [--embedded-getmnlistd-tracker]\n"
         << "           [--embedded-fold-live PATH] [--embedded-fold-live-expect HASH]\n"
+        << "           [--embedded-fold-checkscripts]\n"
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
         << "           [--embedded-ingest-isdlock] [--embedded-ingest-dstx]\n"
         << "           [--embedded-proactive-rotate]\n"
@@ -1018,7 +1020,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // (at its cursor height) before it may feed any serving
              // decision. EMPTY => the fold refuses to arm (fail-closed,
              // byte-identical to master). See replay_utxo_fold.hpp:84-86.
-             const std::string& fold_live_expect = std::string())
+             const std::string& fold_live_expect = std::string(),
+             // --embedded-fold-checkscripts (PR-C4): run dashcore's own
+             // consensus-exact VerifyScript over every served mempool tx
+             // input, resolving the coin scriptPubKey from the SAME at-tip
+             // fold view C1 prices from, and EXCLUDE (fail-closed) any tx
+             // whose scriptSig does not satisfy it. Requires the fold to be
+             // armed (fold_live_db). DEFAULT false => no check, byte-
+             // identical to master.
+             bool embedded_fold_checkscripts = false)
 {
     namespace io = boost::asio;
 
@@ -5628,6 +5638,28 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 [ctl, hc, hash_at]() -> bool {
                     return ctl->at_tip(hc->height(), hash_at);
                 });
+
+            // PR-C4 (embedded-fold-checkscripts): wire dashcore's consensus-exact
+            // VerifyScript as the per-input serve-path script gate. Armed ONLY
+            // when --embedded-fold-checkscripts is set (and the fold is live --
+            // this block only runs when fold_live_ctl exists). The mempool
+            // resolves each input's coin scriptPubKey from the at-tip fold and
+            // calls this to confirm the scriptSig satisfies it; any failure drops
+            // the tx from the template (fail-closed). Unset => the selector runs
+            // no check (byte-identical to master). Reward-safe: can only DROP.
+            if (embedded_fold_checkscripts) {
+                node_coin_state.set_script_check(
+                    [](const std::vector<uint8_t>& tx_bytes, uint32_t nIn,
+                       const std::vector<uint8_t>& spk, uint32_t flags) -> bool {
+                        return c2pool_dash_verify_input(
+                                   spk.data(), (unsigned)spk.size(),
+                                   tx_bytes.data(), (unsigned)tx_bytes.size(),
+                                   nIn, flags) == 1;
+                    });
+                std::cout << "[run] embedded-fold-checkscripts ARMED: consensus-exact "
+                             "CheckInputScripts (dashcore VerifyScript) over every served "
+                             "mempool-tx input against the at-tip fold; fail-closed exclude\n";
+            }
             node_coin_state.set_pin_external_coin_lookup(
                 [ctl, hc, hash_at, rpc_pin_lookup](
                     const ::core::coin::Outpoint& op,
@@ -9136,6 +9168,7 @@ int main(int argc, char** argv)
     // byte-identical to master. See run_node / mempool.hpp set_fold_coin_lookup.
     std::string embedded_fold_live_db;
     std::string embedded_fold_live_expect;   // PR-C1: --embedded-fold-live-expect (store verify)
+    bool embedded_fold_checkscripts = false; // PR-C4: --embedded-fold-checkscripts
     // --embedded-ingest-isdlock: arm the coin-P2P MSG_ISDLOCK pull (G4
     // conflict-tx-lock feed). DEFAULT OFF — off, no getdata for inv type 31
     // and the handler decodes-and-discards (wire + template behaviour
@@ -9291,6 +9324,8 @@ int main(int argc, char** argv)
             embedded_fold_live_db = argv[++i];  // PR-C1: fold store for live serve-path pricing
         else if (std::strcmp(argv[i], "--embedded-fold-live-expect") == 0 && i + 1 < argc)
             embedded_fold_live_expect = argv[++i];  // PR-C1: store hash_serialized_2 verify (D)
+        else if (std::strcmp(argv[i], "--embedded-fold-checkscripts") == 0)
+            embedded_fold_checkscripts = true;  // PR-C4: consensus-exact input-script check on the served template
         else if (std::strcmp(argv[i], "--embedded-ingest-isdlock") == 0)
             embedded_ingest_isdlock = true;   // G4 conflict-tx-lock feed
         else if (std::strcmp(argv[i], "--embedded-ingest-dstx") == 0)
@@ -9640,7 +9675,8 @@ int main(int argc, char** argv)
                         embedded_proactive_rotate,    // PR-3 proactive rotation
                         embedded_asn_diversity,        // PR-4 ASN diversity
                         embedded_fold_live_db,         // PR-C1 embedded-fold-live
-                        embedded_fold_live_expect);    // PR-C1 store-verify hash
+                        embedded_fold_live_expect,     // PR-C1 store-verify hash
+                        embedded_fold_checkscripts);   // PR-C4 input-script check
     }
     return run_selftest();
 }

@@ -644,10 +644,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # actually built and run. Header-only over mempool_validity_gate.hpp +
     # nlohmann/json; no new SCC dependency, no new build.yml --target (#769).
     add_executable(test_dash_mempool test_dash_mempool.cpp test_dash_replay_utxo_fold.cpp
-        test_dash_mempool_validity_gate.cpp)
+        test_dash_mempool_validity_gate.cpp
+        test_dash_checkinputscripts.cpp)   # PR-C4: consensus-exact CheckInputScripts KAT
     target_link_libraries(test_dash_mempool PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
+        dash_scriptcheck ${SECP256K1_LIBRARIES}   # PR-C4: dashcore VerifyScript .so + secp256k1 (KAT signs a real P2PKH spend)
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}
     )

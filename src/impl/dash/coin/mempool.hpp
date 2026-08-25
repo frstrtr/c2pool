@@ -177,6 +177,16 @@ struct FeeKey {
 
 class Mempool {
 public:
+    // PR-C4 (embedded-fold-checkscripts): consensus-exact per-input script
+    // verifier callback type. Args: (serialized tx bytes, input index, the
+    // referenced coin scriptPubKey bytes, DASH consensus script flags). Returns
+    // true iff the input scriptSig satisfies the scriptPubKey. Backed by
+    // dash_scriptcheck.so (dashcore VerifyScript). POD-only so this header needs
+    // no dashcore include.
+    using ScriptCheckFn = std::function<bool(const std::vector<uint8_t>& tx_bytes,
+                                             uint32_t nIn,
+                                             const std::vector<uint8_t>& script_pubkey,
+                                             uint32_t script_flags)>;
     static constexpr size_t DEFAULT_MAX_BYTES   = 300ULL * 1024 * 1024;
     static constexpr time_t DEFAULT_EXPIRY_SECS = 14 * 24 * 3600;
 
@@ -382,6 +392,23 @@ public:
         m_fold_at_tip_gate = std::move(fn);
     }
     bool has_fold_at_tip_gate() const { return static_cast<bool>(m_fold_at_tip_gate); }
+
+    // PR-C4 (embedded-fold-checkscripts): wire a consensus-exact
+    // CheckInputScripts callback over the SAME at-tip fold view C1 prices from.
+    // For each candidate served/admitted mempool tx, the template selector runs
+    // this over EVERY input -- resolving the referenced coin's scriptPubKey from
+    // our own UTXO view / in-pool parent / the at-tip fold -- and EXCLUDES the tx
+    // (fail-closed, whole package dropped) if any input's scriptSig does not
+    // satisfy it, or the coin cannot be resolved at-tip. The callback is
+    // dashcore's own VerifyScript (dash_scriptcheck.so, byte-identical
+    // interpreter + secp256k1 ECDSA); flags are GetBlockScriptFlags at the
+    // serving tip height (script_flags_for_height). Set once at wiring time
+    // (main_dash.cpp) ONLY under --embedded-fold-checkscripts. UNSET (default)
+    // => the selector skips the check entirely and is byte-identical to master.
+    // Reward-safe: a script check can only DROP a tx from the template (lose its
+    // fee), never inflate value or admit an invalid tx.
+    void set_script_check(ScriptCheckFn fn) { m_script_check = std::move(fn); }
+    bool has_script_check() const { return static_cast<bool>(m_script_check); }
 
     PinnedTxGate pinned_tx_admissible(const MutableTransaction& tx,
                                       uint32_t next_height) const {
@@ -1257,6 +1284,38 @@ public:
                 // force-priced DSTX (fee_known, fee_fold_proven==false) drops
                 // its WHOLE package here — never packed, never a lost block.
                 if (!e->fee_fold_proven) { ok = false; break; }
+
+                // PR-C4 (embedded-fold-checkscripts): consensus-exact
+                // CheckInputScripts over the fold view. Runs ONLY when the
+                // callback is wired (--embedded-fold-checkscripts); UNSET =>
+                // this block is skipped and selection is byte-identical to
+                // master. For each input, resolve the referenced coin's
+                // scriptPubKey from the SAME at-tip sources C1 prices from and
+                // run dashcore's own VerifyScript with GetBlockScriptFlags at
+                // the serving tip height. ANY input whose script fails to
+                // verify, or whose coin cannot be resolved at-tip, drops the
+                // WHOLE package (fail-closed) -- the tx is never emitted. A DIP2
+                // input-free special tx (type-9 asset unlock) has no scripts to
+                // check and passes this block unchanged.
+                if (m_script_check && !e->tx.vin.empty()) {
+                    const uint32_t sflags = script_flags_for_height(next_height);
+                    std::vector<uint8_t> tx_bytes;
+                    {
+                        auto ps = ::pack(e->tx);
+                        auto sp = ps.get_span();
+                        const auto* b = reinterpret_cast<const uint8_t*>(sp.data());
+                        tx_bytes.assign(b, b + sp.size());
+                    }
+                    bool scripts_ok = true;
+                    for (uint32_t vi = 0; vi < e->tx.vin.size(); ++vi) {
+                        ::core::coin::Outpoint op(e->tx.vin[vi].prevout.hash,
+                                                 e->tx.vin[vi].prevout.index);
+                        std::vector<uint8_t> spk;
+                        if (!resolve_input_spk_locked(op, spk)) { scripts_ok = false; break; }
+                        if (!m_script_check(tx_bytes, vi, spk, sflags)) { scripts_ok = false; break; }
+                    }
+                    if (!scripts_ok) { ok = false; break; }
+                }
                 if (exclude_special && e->tx.type != 0) { ok = false; break; }
 
                 // ── dashd TestPackageTransactions (node/miner.cpp:374-391),
@@ -1566,6 +1625,67 @@ private:
     // set_fold_at_tip_gate). EMPTY on master / when the flag is off (fold_active
     // then depends only on m_fold_coin_lookup, itself empty => never consulted).
     std::function<bool()>                             m_fold_at_tip_gate;
+
+    // PR-C4 (embedded-fold-checkscripts): consensus-exact input-script verifier
+    // over the at-tip fold view. EMPTY on master / when the flag is off (the
+    // selector then never calls it => byte-identical pricing AND selection).
+    ScriptCheckFn                                     m_script_check;
+
+    // PR-C4: DASH consensus script-verify flag bits. Values are dashcore's
+    // SCRIPT_VERIFY_* (script/interpreter.h) == dashconsensus_SCRIPT_FLAGS_*
+    // (script/bitcoinconsensus.h); the dash_scriptcheck wrapper static_asserts
+    // this mapping. Kept here so the header carries no dashcore dependency.
+    static constexpr uint32_t kScriptVerifyP2SH      = (1u << 0);
+    static constexpr uint32_t kScriptVerifyDERSIG    = (1u << 2);
+    static constexpr uint32_t kScriptVerifyNULLDUMMY = (1u << 4);
+    static constexpr uint32_t kScriptVerifyCLTV      = (1u << 9);
+    static constexpr uint32_t kScriptVerifyCSV       = (1u << 10);
+
+    // PR-C4: dashd GetBlockScriptFlags (validation.cpp:2231) for the block being
+    // connected, ported with DASH mainnet buried-deployment heights
+    // (chainparams.cpp CMainParams): P2SH is ALWAYS active on Dash chains;
+    // DeploymentActiveAt(pindex, DEPLOYMENT_*) for a buried deployment is
+    // pindex.nHeight >= <Height>, and the served block sits at next_height:
+    //   BIP66/DERSIG     >= 245817
+    //   BIP65/CLTV       >= 619382
+    //   BIP112/CSV       >= 622944
+    //   BIP147/NULLDUMMY >= 939456
+    // next_height==0 marks a legacy/test caller that never serves a template;
+    // every buried deployment is long-active on today's mainnet tip, so 0 maps
+    // to the full set (stricter can only reject a truly-invalid script, never a
+    // valid one at the live tip). The flags MUST match dashd exactly at the
+    // height: this gate can only DROP a tx, so the sole risk is a false reject
+    // of a valid tx (a lost fee, never a lost block).
+    static uint32_t script_flags_for_height(uint32_t next_height) {
+        uint32_t f = kScriptVerifyP2SH;
+        if (next_height == 0 || next_height >= 245817) f |= kScriptVerifyDERSIG;
+        if (next_height == 0 || next_height >= 619382) f |= kScriptVerifyCLTV;
+        if (next_height == 0 || next_height >= 622944) f |= kScriptVerifyCSV;
+        if (next_height == 0 || next_height >= 939456) f |= kScriptVerifyNULLDUMMY;
+        return f;
+    }
+
+    // PR-C4: resolve the scriptPubKey of a referenced coin using the SAME source
+    // priority as compute_fee_locked -- our forward UTXO view, then an in-pool
+    // parent output (CPFP), then the at-tip replay fold (fold_resolve, which is
+    // gated by the C1b at-tip guard). Returns false when no at-tip source can
+    // vouch for the coin => the caller fails closed (excludes the tx). Caller
+    // holds m_mutex.
+    bool resolve_input_spk_locked(const ::core::coin::Outpoint& op,
+                                  std::vector<uint8_t>& spk_out) const {
+        auto* utxo = m_utxo.load();
+        ::core::coin::Coin coin;
+        if (utxo && utxo->get_coin(op, coin) && !coin.is_spent()) {
+            spk_out = coin.scriptPubKey.m_data; return true;
+        }
+        auto pit = m_pool.find(op.txid);
+        if (pit != m_pool.end() && op.index < pit->second.tx.vout.size()) {
+            spk_out = pit->second.tx.vout[op.index].scriptPubKey.m_data; return true;
+        }
+        ::core::coin::Coin fc;
+        if (fold_resolve(op, fc)) { spk_out = fc.scriptPubKey.m_data; return true; }
+        return false;
+    }
 
     /// G1: gather `txid` plus every UNSELECTED in-mempool ancestor into
     /// `out`, parents strictly before children (post-order DFS). `seen`
