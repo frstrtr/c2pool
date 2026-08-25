@@ -202,7 +202,7 @@ TEST(DashConnectModePrefix, WirePrefix_NetAware_MainnetVsTestnet) {
     const bool saved = SharechainConfig::is_testnet;
 
     SharechainConfig::is_testnet = false;
-    EXPECT_EQ(SharechainConfig::prefix_hex(), std::string("3b3e1286f446b891"));
+    EXPECT_EQ(SharechainConfig::prefix_hex(), std::string("8d8516bac9edd280"));  // c2pool mainnet chain (was p2pool 3b3e1286f446b891)
     auto main_bytes = ParseHexBytes(SharechainConfig::prefix_hex());
     EXPECT_EQ(main_bytes.size(), size_t(8));
 

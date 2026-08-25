@@ -1314,8 +1314,10 @@ TEST(DashConformanceNetworkParams, MainnetMatchesP2poolDashOracle) {
     EXPECT_EQ(dash::SharechainConfig::TARGET_LOOKBEHIND, 100u);
     EXPECT_EQ(dash::SharechainConfig::SPREAD, 10u);
     EXPECT_EQ(dash::SharechainConfig::MINIMUM_PROTOCOL_VERSION, 1700u);
-    EXPECT_EQ(dash::SharechainConfig::identifier_hex(), std::string("7242ef345e1bed6b"));
-    EXPECT_EQ(dash::SharechainConfig::prefix_hex(),     std::string("3b3e1286f446b891"));
+    // 2026-08-25: mainnet uses c2pool's OWN sharechain identity (distinct from the legacy p2pool-dash
+    // chain). Testnet (below) still tracks the p2pool oracle. Old p2pool: 7242ef345e1bed6b / 3b3e1286f446b891.
+    EXPECT_EQ(dash::SharechainConfig::identifier_hex(), std::string("ac2785363c0180b8"));
+    EXPECT_EQ(dash::SharechainConfig::prefix_hex(),     std::string("8d8516bac9edd280"));
     uint256 expect_max;
     expect_max.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
     EXPECT_EQ(dash::SharechainConfig::max_target(), expect_max);    // 0xFFFF * 2**208

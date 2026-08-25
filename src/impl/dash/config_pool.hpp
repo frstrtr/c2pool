@@ -80,8 +80,14 @@ struct SharechainConfig
     static uint32_t real_chain_length() { return is_testnet ? TESTNET_REAL_CHAIN_LENGTH : REAL_CHAIN_LENGTH; }
 
     // ISOLATION PRIMITIVES — per-coin AND per-instance, never unified cross-coin.
-    static inline const std::string IDENTIFIER_HEX         = "7242ef345e1bed6b";
-    static inline const std::string PREFIX_HEX             = "3b3e1286f446b891";
+    // 2026-08-25: c2pool moved to its OWN sharechain identity, distinct from the inherited legacy
+    // p2pool-dash chain. Identifier + prefix are the sharechain's network isolation keys — nodes
+    // with different values form disjoint sharechains and reject each other, so this cleanly
+    // separates the c2pool sharechain from the old p2pool one. Old values kept commented below.
+    //   OLD (legacy p2pool-dash identity):
+    //     IDENTIFIER_HEX = "7242ef345e1bed6b";  PREFIX_HEX = "3b3e1286f446b891";
+    static inline const std::string IDENTIFIER_HEX         = "ac2785363c0180b8";  // c2pool sharechain
+    static inline const std::string PREFIX_HEX             = "8d8516bac9edd280";  // c2pool sharechain
     static inline const std::string TESTNET_IDENTIFIER_HEX = "b6deb1e543fe2427";
     static inline const std::string TESTNET_PREFIX_HEX     = "198b644f6821e3b3";
 
