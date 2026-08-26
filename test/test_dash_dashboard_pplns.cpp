@@ -260,37 +260,86 @@ TEST(DashDashboardPplns, PoolWideViewOmitsTheFinderFeeLikeLtcDoes)
     EXPECT_GT(sum_values(with_finder.payouts), sum_values(pool.payouts));
 }
 
-// ── KAT 5: an unbound template source yields nothing, not a guess ───────────
-TEST(DashDashboardPplns, UnboundTemplateSourceYieldsAnHonestEmpty)
+// ── KAT 5: no template -> the pool-wide view falls back to the best share ────
+// This is the fix. On a fully daemonless node with ZERO local miners nothing
+// ever pumps the work-source template cache (the stratum work-serving paths are
+// the only producers), so TemplateSource::peek() is permanently null there and
+// the pool-wide /current_payouts, /current_merged_payouts and /pplns/current
+// used to render `{}` over a full sharechain window. p2pool has no such coupling
+// (get_expected_payouts takes subsidy as a parameter, data.py:3273), so the
+// pool-wide split must derive from the sharechain alone. It now snapshots the
+// block params off the BEST SHARE's own recorded fields.
+TEST(DashDashboardPplns, NoTemplateFallsBackToBestShareSnapshot)
 {
     PplnsHarness h(40);
-    dash::dashboard::TemplateSource tmpl;   // never bound
-
+    dash::dashboard::TemplateSource tmpl;   // never bound — the zero-miner node
     EXPECT_EQ(tmpl.peek(), nullptr);
-    auto v = dash::dashboard::pplns_payouts_current(
-        h.node.tracker().chain, h.params, h.tip, tmpl, /*testnet=*/false);
-    EXPECT_FALSE(v.ok);
-    EXPECT_TRUE(v.payouts.empty())
-        << "no template must mean no claim about what is owed";
 
-    // Bound -> answers. This is the whole difference between the shipped
-    // behaviour and this change.
+    auto snap = dash::dashboard::pplns_payouts_current(
+        h.node.tracker().chain, h.params, h.tip, tmpl, /*testnet=*/false);
+
+    ASSERT_TRUE(snap.ok) << "a full sharechain with no live template must still "
+                            "render the pool-wide split — this is the zero-miner "
+                            "dashboard, and {} here IS the bug";
+    EXPECT_FALSE(snap.payouts.empty());
+
+    // The snapshot uses the best SHARE's own recorded reward decomposition
+    // (subsidy, masternode + burn payments), NOT a fabricated one.
+    EXPECT_EQ(snap.subsidy,        P_SUBSIDY);
+    EXPECT_EQ(snap.payments_total, P_MN_PAY + P_BURN_PAY);
+    EXPECT_EQ(snap.worker_payout,  P_SUBSIDY - P_MN_PAY - P_BURN_PAY);
+
+    // Pool-wide contract, identical to the live-template path: masternode payee
+    // excluded, finder placeholder dropped, three miners split ~98% of the
+    // worker payout (the missing 2% is the unknown finder's reserve).
+    EXPECT_FALSE(snap.payouts.contains(p_addr(0xc0)));
+    EXPECT_FALSE(snap.payouts.contains(
+        core::script_to_address(dash::pubkey_hash_to_script2(uint160()), "", 76, 16)));
+    EXPECT_GE(snap.recipients, 3);
+    const double worker = static_cast<double>(snap.worker_payout) / 1e8;
+    EXPECT_NEAR(sum_values(snap.payouts), worker * 0.98, worker * 0.001);
+
+    // Every rendered key is a DASH address, never a Bitcoin '1'.
+    for (const auto& [addr, amt] : snap.payouts.items()) {
+        (void)amt;
+        EXPECT_TRUE(!addr.empty() && (addr[0] == 'X' || addr[0] == '7'))
+            << "non-DASH address rendering: " << addr;
+    }
+
+    // A LIVE template takes strict precedence over the snapshot: bind one whose
+    // reward differs (single masternode payment, no burn) and the view switches
+    // to it — nodes WITH miners are unchanged by this fallback.
     auto wd = std::make_shared<dash::coin::DashWorkData>();
-    wd->m_coinbase_value = P_SUBSIDY;
-    wd->m_bits           = P_BLOCK_BITS;
+    wd->m_coinbase_value  = P_SUBSIDY;
+    wd->m_bits            = P_BLOCK_BITS;
     wd->m_packed_payments = {{p_addr(0xc0), P_MN_PAY}};
     tmpl.bind([wd]() -> std::shared_ptr<const dash::coin::DashWorkData> { return wd; });
 
-    auto v2 = dash::dashboard::pplns_payouts_current(
+    auto live = dash::dashboard::pplns_payouts_current(
         h.node.tracker().chain, h.params, h.tip, tmpl, false);
-    ASSERT_TRUE(v2.ok);
-    EXPECT_EQ(v2.worker_payout, P_SUBSIDY - P_MN_PAY);
-    EXPECT_GE(v2.recipients, 3);
+    ASSERT_TRUE(live.ok);
+    EXPECT_EQ(live.worker_payout, P_SUBSIDY - P_MN_PAY)
+        << "a bound template must win over the best-share snapshot";
+}
 
-    // NEGATIVE CONTROL: this is what /current_payouts served before — an
-    // object that passes every "is it valid JSON" check and renders nothing.
-    const nlohmann::json shipped = nlohmann::json::object();
-    EXPECT_TRUE(shipped.is_object());
-    EXPECT_TRUE(shipped.empty());
-    EXPECT_FALSE(v2.payouts.empty());
+// ── KAT 6: an empty sharechain still yields nothing (p2pool's one guard) ─────
+// The fallback must NOT invent payouts when there is no share to snapshot — the
+// post-restart empty-chain case stays `{}` exactly as get_expected_payouts does.
+TEST(DashDashboardPplns, NoTemplateAndNoSharesStaysEmpty)
+{
+    // A single genesis share: present, but too short for a window (no
+    // grandparent), so pplns_weights_for misses — the snapshot must degrade to
+    // empty, never a fabricated row.
+    PplnsHarness cold(1);
+    dash::dashboard::TemplateSource tmpl;   // never bound
+    auto v = dash::dashboard::pplns_payouts_current(
+        cold.node.tracker().chain, cold.params, cold.tip, tmpl, /*testnet=*/false);
+    EXPECT_FALSE(v.ok);
+    EXPECT_TRUE(v.payouts.empty());
+
+    // A null best-share hash (a genuinely empty chain) is the same honest empty.
+    auto none = dash::dashboard::pplns_payouts_current(
+        cold.node.tracker().chain, cold.params, uint256::ZERO, tmpl, false);
+    EXPECT_FALSE(none.ok);
+    EXPECT_TRUE(none.payouts.empty());
 }

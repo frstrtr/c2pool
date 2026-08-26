@@ -242,9 +242,33 @@ inline PplnsView pplns_payouts_for_share(ChainT& chain,
 }
 
 // ── Pool-wide convenience wrapper ───────────────────────────────────────────
-// "What would a block found RIGHT NOW pay?" — the live GBT template's reward
-// and masternode payment set, split over the window anchored on the node's
-// current best share. Finder fee omitted (see the header note).
+// "What would a block found RIGHT NOW pay?" — the pool-wide PPLNS split over the
+// window anchored on the node's current best share. Finder fee omitted (see the
+// header note).
+//
+// Two param sources, in strict precedence:
+//   1. LIVE TEMPLATE (preferred): the GBT template's reward + masternode payment
+//      set. This is the freshest possible answer — the exact split a block found
+//      now would pay — and is what a node WITH miners (a stratum session pumped
+//      the template cache) always takes.
+//   2. BEST-SHARE SNAPSHOT (fallback): when no template is cached — a fully
+//      daemonless node with ZERO local miners never pumps the template cache, so
+//      tmpl.peek() is permanently null there — derive the block params from the
+//      BEST SHARE's own recorded fields (m_subsidy, m_min_header.m_bits,
+//      m_packed_payments), exactly as pplns_payouts_for_share reads them for the
+//      per-share view. The window walk (pplns_weights_for) and the allocation
+//      (compute_dash_payouts) are identical; only the subsidy/bits/payee source
+//      differs. This is p2pool parity: get_expected_payouts (data.py:3273) takes
+//      subsidy + block_target as PARAMETERS and its only empty guard is a
+//      missing best share — there is no live-template coupling. The pool-wide
+//      PPLNS view therefore renders from the sharechain alone, with no local
+//      hashrate, which is the whole point of the dashboard on a bootstrap node.
+//
+// The snapshot subsidy/payees are the best SHARE's epoch, so on a reward-
+// reduction boundary or a masternode-payee rotation they lag the next block by
+// at most one federation share; acceptable for a DISPLAY view and never fed back
+// into any mint/coinbase path. Empty best share -> {} (the one legitimate p2pool
+// empty guard) is retained.
 template <typename ChainT>
 inline PplnsView pplns_payouts_current(ChainT& chain,
                                        const core::CoinParams& params,
@@ -252,12 +276,35 @@ inline PplnsView pplns_payouts_current(ChainT& chain,
                                        const TemplateSource& tmpl,
                                        bool testnet)
 {
-    auto t = tmpl.peek();
-    if (!t || t->m_coinbase_value == 0)
-        return {};   // no template -> no claim about what is owed
-    return pplns_payouts_at(chain, params, best_share_hash, t->m_bits,
-                            t->m_coinbase_value, t->m_packed_payments,
-                            uint160(), /*drop_finder_output=*/true, testnet);
+    // 1. Live template — the fresh, preferred source (nodes WITH miners).
+    if (auto t = tmpl.peek(); t && t->m_coinbase_value != 0)
+        return pplns_payouts_at(chain, params, best_share_hash, t->m_bits,
+                                t->m_coinbase_value, t->m_packed_payments,
+                                uint160(), /*drop_finder_output=*/true, testnet);
+
+    // 2. Best-share snapshot — no template cached (zero-local-miner node). Read
+    //    the block params the best share itself committed to and split over the
+    //    SAME window (anchored on best_share_hash). Read-only: the best share's
+    //    bytes are untouched; nothing here can change a served coinbase.
+    if (best_share_hash.IsNull() || !chain.contains(best_share_hash))
+        return {};   // empty sharechain — p2pool's one legitimate empty guard
+
+    uint32_t block_bits = 0;
+    uint64_t subsidy    = 0;
+    std::vector<dash::coin::PackedPayment> payments;
+    chain.get_share(best_share_hash).invoke([&](auto* obj) {
+        block_bits = obj->m_min_header.m_bits;
+        subsidy    = obj->m_subsidy;
+        payments.reserve(obj->m_packed_payments.size());
+        for (const auto& p : obj->m_packed_payments)
+            payments.push_back({p.m_payee, p.m_amount});
+    });
+    if (subsidy == 0)
+        return {};   // share carried no recorded reward — no honest claim
+
+    return pplns_payouts_at(chain, params, best_share_hash, block_bits, subsidy,
+                            payments, uint160(), /*drop_finder_output=*/true,
+                            testnet);
 }
 
 } // namespace dashboard
