@@ -243,6 +243,19 @@ inline nlohmann::json build_window(TrackerT& tracker, const ViewContext& ctx)
 // ── Delta ───────────────────────────────────────────────────────────────────
 // Only the shares NEWER than `since_hash` (which the client already holds),
 // capped at ctx.delta_max_shares. Port of main_ltc.cpp:3946.
+//
+// FORK-SWITCH RESYNC (explorer SSE fade-by-age, task #112). The walk starts at
+// the current tallest head and stops when it reaches `since_hash`, the client's
+// held tip. When `since_hash` is NON-EMPTY yet the walk NEVER reaches it — the
+// client's tip was orphaned by a share-chain reorg, or the client fell more than
+// one window behind — the returned shares do NOT connect onto the client window.
+// The client (delta.ts §5.3 / realtime.ts applyDelta) already knows how to
+// handle this: `fork_switch:true` drops the stale window and rebuilds from the
+// authoritative set. The server simply never emitted the flag, so the client
+// instead prepended-and-deduped, keeping the orphaned shares forever while the
+// combined length crept past its cap — silently evicting the OLDEST good shares
+// and making them "fade out by age". Emitting the flag closes that hole. An
+// empty `since_hash` (cold client) is a legitimate full walk, never a fork.
 template <typename TrackerT>
 inline nlohmann::json build_delta(TrackerT& tracker, const std::string& since_hash,
                                   const ViewContext& ctx)
@@ -257,6 +270,7 @@ inline nlohmann::json build_delta(TrackerT& tracker, const std::string& since_ha
 
     nlohmann::json shares_arr = nlohmann::json::array();
     int count = 0;
+    bool found_since = false;
 
     if (!best.IsNull()) {
         const int walk = std::min(static_cast<int>(chain.get_height(best)),
@@ -266,8 +280,10 @@ inline nlohmann::json build_delta(TrackerT& tracker, const std::string& since_ha
                 (void)data;
                 const std::string full  = hash.GetHex();
                 const std::string short_h = full.substr(0, 16);
-                if (short_h == since_hash || full == since_hash)
+                if (short_h == since_hash || full == since_hash) {
+                    found_since = true;
                     break;   // reached what the client already has
+                }
                 shares_arr.push_back(share_cell(chain, verified, hash, count, ctx));
                 if (++count >= ctx.delta_max_shares) break;
             }
@@ -276,15 +292,21 @@ inline nlohmann::json build_delta(TrackerT& tracker, const std::string& since_ha
         }
     }
 
+    // The client held a tip we could not re-derive from the current best chain:
+    // signal a resync rather than let it splice a disconnected delta.
+    const bool fork_switch =
+        !since_hash.empty() && !best.IsNull() && !found_since;
+
     nlohmann::json blocks_arr = nlohmann::json::array();
     for (const auto& sh : ctx.found_block_short_hashes)
         blocks_arr.push_back(sh);
 
-    result["shares"] = std::move(shares_arr);
-    result["count"]  = count;
-    result["tip"]    = best.IsNull() ? "" : best.GetHex().substr(0, 16);
-    result["heads"]  = heads_array(chain);
-    result["blocks"] = std::move(blocks_arr);
+    result["shares"]      = std::move(shares_arr);
+    result["count"]       = count;
+    result["tip"]         = best.IsNull() ? "" : best.GetHex().substr(0, 16);
+    result["heads"]       = heads_array(chain);
+    result["blocks"]      = std::move(blocks_arr);
+    result["fork_switch"] = fork_switch;
     return result;
 }
 
