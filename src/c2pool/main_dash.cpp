@@ -60,6 +60,7 @@
 #include <impl/dash/coin/coin_peer_manager.hpp> // dash::coin::DashCoinPeerManager — DASH-ISOLATED scored/diverse peer discovery (--coin-p2p-discover; network-standalone gate)
 #include <impl/dash/coin/chain_seeds.hpp>  // dash::coin::dash_dns_seeds / dash_fixed_seeds — DASH mainnet/testnet seed bootstrap
 #include <impl/dash/coin/won_block_dispatch.hpp> // dash::coin::broadcast_won_block — S8 dual-path won-block dispatcher (embedded P2P primary + submitblock RPC backup)
+#include <impl/dash/coin/pool_rate_head_select.hpp> // dash::select_pool_rate_head — dashboard pool-rate head selection (verified head, else tallest raw head; zero-local-miner graph fix)
 #include <impl/dash/coin/reconstruct_won_block.hpp> // dash::coin::reconstruct_won_block — distributed won-block: rebuild full block from a won share for re-broadcast
 #include <impl/dash/coin/zmq_tip_notify.hpp> // dash::coin::TipHashDedup / ZmqHashblockSubscriber — dashd ZMQ hashblock INSTANT tip-notify (opt-in, hardening on the #770 poll)
 #include <impl/dash/coin/coin_p2p_magic.hpp>      // dash::coin::select_coin_p2p_magic — E5 --coin-p2p-magic override (regtest ARM A dial)
@@ -1826,11 +1827,50 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // m_pool_hashrate_fn is read exclusively by web_server REST handlers.
             mi->set_pool_hashrate_fn([node_ptr]() -> double {
                 static double s_last_good = 0.0;
+                // Verified best-share head, queried WITHOUT the tracker guard
+                // held: best_share_hash()/elect_best_share takes the tracker
+                // lock itself, so nesting it under read_tracker() would
+                // recursively shared-lock the same mutex.
                 auto best = node_ptr->best_share_hash();
-                if (best.IsNull()) return s_last_good;
                 auto guard = node_ptr->read_tracker();
                 if (!guard) return s_last_good;
-                if (!guard->chain.contains(best)) return s_last_good;
+                // ── ZERO-LOCAL-MINER / BOOTSTRAP FALLBACK ─────────────────
+                // With no local mint the VERIFIED chain has no heads, so
+                // best_share_hash() is null even though peers have filled the
+                // RAW sharechain (the contabo / dash.voidbind.com relay case:
+                // a node carrying the whole pool's shares but running zero
+                // rigs). p2pool's pool-rate graph is fed unconditionally from
+                // the tracker every 5s regardless of local miners (web.py
+                // add_point / get_stale_counts), so mirror that: when there is
+                // no verified head, derive the pool hashrate from the tallest
+                // RAW chain head. This makes the pool-rate graph reflect the
+                // whole sharechain's hashing effort instead of reading 0.
+                //
+                // Display-only: m_pool_hashrate_fn is read exclusively by the
+                // web_server REST handlers (pool_hash_rate / pool_rates series
+                // and /global_stats). The vardiff retarget runs on the VERIFIED
+                // chain over TARGET_LOOKBEHIND (data.py:137,140) and never
+                // reads this hook, so consensus/reward are untouched.
+                //
+                // Head selection is the pure dash::select_pool_rate_head SSOT
+                // (coin/pool_rate_head_select.hpp, KAT test_dash_pool_rate_head_select):
+                // verified head verbatim when present, else the tallest raw head.
+                const bool best_in_chain =
+                    !best.IsNull() && guard->chain.contains(best);
+                if (!best_in_chain) {
+                    std::vector<dash::RawChainHead> raw_heads;
+                    for (const auto& [head_hash, tail_hash] :
+                             guard->chain.get_heads()) {
+                        (void)tail_hash;
+                        raw_heads.push_back(
+                            {head_hash, static_cast<int32_t>(
+                                            guard->chain.get_height(head_hash))});
+                    }
+                    best = dash::select_pool_rate_head(uint256::ZERO, false,
+                                                       raw_heads);
+                }
+                if (best.IsNull() || !guard->chain.contains(best))
+                    return s_last_good;
                 int height = guard->chain.get_height(best);
                 if (height < 3) return s_last_good;
                 const int display_lookbehind =

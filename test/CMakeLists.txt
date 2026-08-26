@@ -341,7 +341,15 @@ if (BUILD_TESTING AND GTest_FOUND)
     # weight ring buffer (compute_v36_weights), decay table, donation split,
     # window slides. PoW-independent consensus core; socket-free, chain-free.
     # Mirrors the test_dash_conformance link set.
-    add_executable(test_dash_share_tracker test_dash_share_tracker.cpp test_dash_share_remove_owns_data.cpp)
+    # test_dash_pool_rate_head_select.cpp: the dashboard pool-rate HEAD-SELECTION
+    # KAT (coin/pool_rate_head_select.hpp) -- verified best-share head verbatim
+    # when present, else the tallest RAW chain head so the pool-rate graph
+    # populates on a node running ZERO local miners (contabo/dash.voidbind.com
+    # bootstrap). FOLDED in as a second TU on this already-allowlisted target
+    # rather than a standalone executable: a fresh target would need a build.yml
+    # --target edit and would trip CI's NOT_BUILT sentinel until it had one
+    # (#143/#883/#893). Header-only pure function -- needs no extra link deps.
+    add_executable(test_dash_share_tracker test_dash_share_tracker.cpp test_dash_share_remove_owns_data.cpp test_dash_pool_rate_head_select.cpp)
     target_link_libraries(test_dash_share_tracker PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
