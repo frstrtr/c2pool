@@ -34,6 +34,7 @@
 #include <c2pool/payout/payout_manager.hpp>
 #include <c2pool/hashrate/tracker.hpp>
 #include <core/address_utils.hpp>
+#include <core/graph_history.hpp>
 
 // Forward declaration for merged mining integration
 namespace c2pool { namespace merged { class MergedMiningManager; } }
@@ -124,6 +125,7 @@ class MiningInterface : public jsonrpccxx::JsonRpc2Server,
 {
 public:
     MiningInterface(bool testnet = false, std::shared_ptr<IMiningNode> node = nullptr, Blockchain blockchain = Blockchain::LITECOIN);
+    ~MiningInterface();
 
     // Core mining methods that miners expect
     nlohmann::json getwork(const std::string& request_id = "");
@@ -1684,7 +1686,46 @@ public:
     void save_stat_log();
     /// Load stat log from disk. Called once at startup.
     void load_stat_log();
+    /// True once the binned graph views are loaded/seeded and answering the
+    /// long horizons. Until then week/month/year serve from the flat fallback.
+    bool graph_views_ready() const { return m_views_ready.load(std::memory_order_acquire); }
 private:
+    // ── G4: year-scale binned graph history (p2pool graph.py port) ───────────
+    // A coin-generic binned history DB (core::graph) that backs the long-horizon
+    // graph views (last_week / last_month / last_year). last_hour / last_day are
+    // still served from the flat m_stat_log above — the 60s samples are denser
+    // than useful there and binning would only introduce null gaps. Fed one
+    // datum per 60s update_stat_log tick; persisted to <stat_log_path>.views on
+    // the existing save cadence; seeded from the flat log on first upgrade.
+    core::graph::HistoryDatabase m_history;
+    mutable std::mutex m_history_mutex;
+    // Guards the crossover: while false, week/month/year fall back to the flat
+    // path (never worse than today). Set true once bins are loaded/seeded.
+    std::atomic<bool> m_views_ready{false};
+    // Background seed thread (used when the .views file is absent/corrupt/geometry-
+    // mismatched and all views must be replayed from the flat log). Joined in the
+    // destructor. Long views answer from the flat fallback until it completes.
+    std::thread m_views_seed_thread;
+    std::atomic<bool> m_views_seed_stop{false};
+    double m_views_watermark{0.0};  // last binned datum time (persisted)
+
+    std::string graph_views_path() const {
+        return m_stat_log_path.empty() ? std::string()
+                                       : m_stat_log_path + ".views";
+    }
+    // The stream schema (~21 streams). Coin-generic; identical for every coin.
+    static std::vector<std::pair<std::string, core::graph::DataStreamDescription>>
+        graph_stream_descriptions();
+    // Fold one flat StatLogEntry into every binned stream. Caller holds
+    // m_history_mutex.
+    void feed_history_entry(const StatLogEntry& e);
+    // Serve one long view from the bins ([] if unknown source / empty).
+    nlohmann::json graph_view_data(const std::string& source, const std::string& view);
+    // Persistence + one-time seed/replay migration for the .views sidecar.
+    void save_graph_views();
+    void load_graph_views();   // called at the tail of load_stat_log
+    void seed_graph_views_from_flat();  // background replay of the whole flat log
+public:
 
     // Network difficulty history for /network_difficulty
     struct NetDiffSample { double ts; double difficulty; std::string source; };
