@@ -629,6 +629,30 @@ public:
         return j;
     }
 
+    /// Thread-safe readiness snapshot for the SERVE PATH (work_source.cpp).
+    /// TRUE only when a dashd testmempoolaccept oracle is bound AND the mempool
+    /// validity gate has accrued its sustained clean window (open()).
+    ///
+    /// The tx-serve-own-set referee consults this so that serving OUR OWN valid
+    /// tx set -- dropping the dashd-tx-merkle PARITY backstop -- cannot begin
+    /// until the SELECTOR has been PROVEN dashd-acceptable over the window.
+    /// This is the direct runtime answer to the field finding at h=2526403:
+    /// our fee_fold_proven selection can still offer transactions dashd rejects
+    /// (the already-mined / stale-UTXO-view class), and the internal-
+    /// consistency referee shares a UTXO view with the selector, so it cannot
+    /// independently catch that class. Only dashd's external view (this gate,
+    /// or the parity backstop) can. Requiring open() here keeps the parity
+    /// backstop in force until the gate demonstrates the class is gone.
+    ///
+    /// Returns false when no oracle is bound: the gate cannot be proven without
+    /// dashd, so it fail-closes. (A post-proof PURE-daemonless node runs with
+    /// no shadow-compare object at all; the caller bypasses the coupling only
+    /// when the probe is absent, never when it is present-but-empty.)
+    bool validity_gate_open() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return static_cast<bool>(accept_) && validity_.open();
+    }
+
 private:
     void worker_loop() {
         for (;;) {

@@ -425,6 +425,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-utxo] [--embedded-mainnet] [--embedded-null-arm] [--embedded-mn-bridge-max N]\n"
         << "           [--embedded-mn-bridge-no-cursor]\n"
         << "           [--embedded-utxo-immature-serve-empty] [--embedded-serve-mempool-txs]\n"
+        << "           [--embedded-tx-serve-own-set]\n"
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
         << "           [--embedded-ingest-isdlock] [--embedded-ingest-dstx]\n"
         << "           [--pin-local-tx-hex FILE]  (zero-fee self-mined tx, e.g. donation consolidation)\n"
@@ -806,6 +807,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // body path (G1-G4 guards, mempool.hpp) only enters block
              // production when the operator explicitly arms it.
              bool embedded_serve_mempool_txs = false,
+             // --embedded-tx-serve-own-set: when a served embedded
+             // template's mempool selection diverges from dashd's, serve
+             // OUR OWN internally-consistent valid set instead of falling
+             // back to dashd on tx-merkle difference. DEFAULT OFF. MUST NOT
+             // be armed until the [MEMPOOL-VALIDITY] gate has reached
+             // open() (576 clean heights) in a dashd-oracle soak -- the
+             // internal-consistency referee shares the selector's UTXO view
+             // and cannot alone catch the already-mined/stale-view class
+             // (h=2526403). When --embedded-shadow-compare is also on, the
+             // own-set path auto-fail-closes until that gate is open.
+             bool embedded_tx_serve_own_set = false,
              // --embedded-shadow-compare: OBSERVE-only serve-vs-dashd block-
              // template field diff (diagnostic; NOT a serve gate). Off the hot
              // path (worker-thread dashd fetch). Default false; only meaningful
@@ -2806,6 +2818,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // consulted, i.e. during an actual embedded outage.
     const bool xcheck_wanted = (testnet || embedded_mainnet);
     work_source->set_gbt_xcheck(xcheck_wanted && static_cast<bool>(rpc));
+    // --embedded-tx-serve-own-set: serve own valid tx set on a divergent
+    // mempool selection instead of the dashd-parity swap (DEFAULT OFF).
+    work_source->set_tx_serve_own_set(embedded_tx_serve_own_set);
+    std::cout << "[DASH-STRATUM-GBT] tx-serve own-set referee: "
+              << (embedded_tx_serve_own_set
+                      ? "ON (--embedded-tx-serve-own-set: divergent-but-valid"
+                        " mempool set served as own; validity-gate-coupled"
+                        " when shadow-compare is bound)"
+                      : "OFF (dashd-parity backstop on any tx-merkle divergence)")
+              << std::endl;
     // Pin splice on the xcheck-SWAPPED arm (default OFF). Announce the state
     // either way: with it off the donation still misses every swapped
     // template -- it just no longer does so silently.
@@ -9243,6 +9265,7 @@ int main(int argc, char** argv)
     // (mempool_validity_gate.hpp) reports zero transactions refused by dashd's
     // testmempoolaccept over its sustained window.
     bool embedded_serve_mempool_txs = false;
+    bool embedded_tx_serve_own_set = false;  // --embedded-tx-serve-own-set, default OFF
     bool embedded_accrue_asset_locks = false;  // #107 PHASE 2, default OFF
     bool embedded_accrue_asset_unlocks = false;  // #143 Variant B (type-9), default OFF
     // --embedded-creditpool-publish-at-serve-tip: publish the derived credit
@@ -9372,6 +9395,8 @@ int main(int argc, char** argv)
             embedded_utxo_immature_serve_empty = true;
         else if (std::strcmp(argv[i], "--embedded-serve-mempool-txs") == 0)
             embedded_serve_mempool_txs = true;
+        else if (std::strcmp(argv[i], "--embedded-tx-serve-own-set") == 0)
+            embedded_tx_serve_own_set = true;
         else if (std::strcmp(argv[i], "--embedded-accrue-asset-locks") == 0)
             embedded_accrue_asset_locks = true;   // #107 PHASE 2
         else if (std::strcmp(argv[i], "--embedded-accrue-asset-unlocks") == 0)
@@ -9686,6 +9711,7 @@ int main(int argc, char** argv)
                         oracle_class_coverage, coin_p2p_peers, bestcl_policy,
                         embedded_utxo_immature_serve_empty,
                         embedded_serve_mempool_txs,
+                        embedded_tx_serve_own_set,
                         embedded_shadow_compare,
                         embedded_mempool_ingest,
                         pin_local_tx_hex_path,

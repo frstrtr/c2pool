@@ -363,6 +363,24 @@ public:
     /// independent seed-height + pre-emit gates.
     void set_gbt_xcheck(bool v) { gbt_xcheck_ = v; }
 
+    /// TX-SERVE-OWN-SET referee (--embedded-tx-serve-own-set). DEFAULT OFF.
+    ///
+    /// When OFF (default, and the shipped posture): a divergent-from-dashd
+    /// mempool tx selection SWAPS to dashd's template exactly as before
+    /// (cause gbt-xcheck-txmerkle-mismatch) -- byte-identical to today.
+    ///
+    /// When ON: on a tx-merkle divergence the arm runs the INTERNAL-
+    /// CONSISTENCY referee (tx_serve_referee.hpp) instead of the dashd-parity
+    /// backstop. If the embedded template is internally consistent (coinbase
+    /// fee-exact, every served tx fee_fold_proven, no intra-set double-spend)
+    /// AND -- when a shadow-compare validity probe is bound -- the mempool
+    /// validity gate is currently open(), c2pool SERVES ITS OWN valid set (the
+    /// divergence is logged as a shadow, not a fallback). Otherwise it fail-
+    /// closes to the dashd template. The validity-gate coupling is the runtime
+    /// guard against the already-mined / stale-UTXO-view class the referee
+    /// cannot catch alone (h=2526403 field finding); see set_shadow_compare.
+    void set_tx_serve_own_set(bool v) { tx_serve_own_set_ = v; }
+
     /// PIN SPLICE ON THE XCHECK-SWAPPED ARM (--pin-splice-xcheck-arm).
     /// DEFAULT OFF -- this is the money path.
     ///
@@ -724,6 +742,10 @@ private:
     bool is_testnet_{false};
     bool embedded_mainnet_{false};   // gate-lift opt-in: daemonless embedded arm on mainnet
     bool gbt_xcheck_{false};         // reward-safety backstop: cross-check embedded creditPool vs dashd
+    bool tx_serve_own_set_{false};   // --embedded-tx-serve-own-set: serve own valid tx set instead of dashd-parity swap (DEFAULT OFF)
+    // Observability for the own-set referee (lock-free; published in embedded_arm_status_json).
+    mutable std::atomic<uint64_t> tx_serve_own_set_serves_{0};      // divergent set served as own (referee passed)
+    mutable std::atomic<uint64_t> tx_serve_own_set_failclose_{0};   // divergent set fail-closed to dashd (referee/gate refused)
     bool pin_splice_xcheck_arm_{false};  // money path: splice pins onto an xcheck-SWAPPED template (default OFF)
     bool pin_splice_block_budget_{false};  // money path: ENFORCE the block-size budget (changes served bytes; default OFF)
 
