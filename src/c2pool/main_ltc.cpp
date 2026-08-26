@@ -2024,6 +2024,15 @@ int main(int argc, char* argv[]) {
                             rec.check_count = blk.check_count;
                             rec.confirmations = blk.confirmations;
                             rec.last_checked = static_cast<uint64_t>(std::time(nullptr));
+                            // #159: persist dashboard-enrichment fields so a
+                            // restored row keeps its full detail after a restart.
+                            rec.finder_address = blk.miner;
+                            rec.reward_satoshis = blk.subsidy;
+                            rec.network_difficulty = blk.network_difficulty;
+                            rec.share_difficulty = blk.share_difficulty;
+                            rec.pool_hashrate = blk.pool_hashrate;
+                            rec.share_hash = blk.share_hash;
+                            rec.authorship = static_cast<uint8_t>(blk.authorship);
                             return fblk_store->store(rec);
                         },
                         [fblk_store, fblk_leveldb]() -> std::vector<MI::FoundBlock> {
@@ -2039,6 +2048,14 @@ int main(int argc, char* argv[]) {
                                 blk.check_count = rec.check_count;
                                 blk.chain = rec.chain;
                                 blk.confirmations = rec.confirmations;
+                                // #159: restore enrichment (v1 records => 0).
+                                blk.miner = rec.finder_address;
+                                blk.subsidy = rec.reward_satoshis;
+                                blk.network_difficulty = rec.network_difficulty;
+                                blk.share_difficulty = rec.share_difficulty;
+                                blk.pool_hashrate = rec.pool_hashrate;
+                                blk.share_hash = rec.share_hash;
+                                blk.authorship = static_cast<MI::BlockAuthorship>(rec.authorship);
                                 result.push_back(std::move(blk));
                             }
                             return result;
@@ -7131,6 +7148,12 @@ int main(int argc, char* argv[]) {
                         return entry ? entry->header.m_timestamp : 0;
                     });
             }
+
+            // #159 (G2): re-verify any found block that was still pending at the
+            // last shutdown. The verify callback + io_context are wired above,
+            // so a restored pending row now gets confirm/orphan checks instead
+            // of staying "pending" on the dashboard forever.
+            web_server.get_mining_interface()->reverify_pending_found_blocks();
 
             // Load persisted merged blocks into mm_manager BEFORE block scan.
             {

@@ -3645,6 +3645,39 @@ void MiningInterface::set_found_block_persistence(block_store_fn_t persist_fn, b
     m_load_blocks_fn = std::move(load_fn);
 }
 
+void MiningInterface::recompute_found_block_luck_locked()
+{
+    // CALLER HOLDS m_blocks_mutex. Reconstruct the DERIVED fields
+    // (time_to_find, expected_time, luck) that record_found_block computes at
+    // record time but that are NOT persisted, so a restored history keeps its
+    // luck trend instead of emitting null for every row. Only fills fields
+    // still at 0 — never clobbers a value that is already present. Inputs that
+    // are genuinely unknown (e.g. a v1 record with pool_hashrate==0) leave luck
+    // at 0, which rest_luck_stats renders as null rather than a fabricated 0%.
+    // The list is kept sorted newest-first by height, so the previous (older)
+    // block on the same chain is the NEXT same-chain element.
+    for (size_t i = 0; i < m_found_blocks.size(); ++i) {
+        auto& blk = m_found_blocks[i];
+        if (blk.time_to_find <= 0.0) {
+            for (size_t j = i + 1; j < m_found_blocks.size(); ++j) {
+                if (m_found_blocks[j].chain == blk.chain) {
+                    blk.time_to_find = static_cast<double>(blk.ts)
+                                     - static_cast<double>(m_found_blocks[j].ts);
+                    break;
+                }
+            }
+        }
+        if (blk.expected_time <= 0.0 && blk.network_difficulty > 0.0
+            && blk.pool_hashrate > 0.0) {
+            blk.expected_time =
+                blk.network_difficulty * 4294967296.0 / blk.pool_hashrate;
+        }
+        if (blk.luck <= 0.0 && blk.time_to_find > 0.0 && blk.expected_time > 0.0) {
+            blk.luck = blk.expected_time / blk.time_to_find * 100.0;
+        }
+    }
+}
+
 void MiningInterface::load_persisted_found_blocks()
 {
     if (!m_load_blocks_fn) return;
@@ -3679,11 +3712,33 @@ void MiningInterface::load_persisted_found_blocks()
                 return a.ts > b.ts;
             });
 
+        // #159 (G3): reconstruct the derived luck series for the restored rows.
+        recompute_found_block_luck_locked();
+
         LOG_INFO << "[Pool] Loaded " << blocks.size() << " found blocks from persistent storage";
     }
     catch (const std::exception& e) {
         LOG_WARNING << "[Pool] Failed to load found blocks: " << e.what();
     }
+}
+
+void MiningInterface::reverify_pending_found_blocks()
+{
+    // Snapshot the pending hashes under the lock, then schedule outside it —
+    // schedule_block_verification takes m_blocks_mutex itself.
+    std::vector<std::string> pending;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        for (const auto& blk : m_found_blocks) {
+            if (blk.status == BlockStatus::pending && !blk.hash.empty())
+                pending.push_back(blk.hash);
+        }
+    }
+    if (pending.empty()) return;
+    for (const auto& hash : pending)
+        schedule_block_verification(hash);
+    LOG_INFO << "[Pool] Scheduled re-verification for " << pending.size()
+             << " restored pending found block(s)";
 }
 
 void MiningInterface::backfill_block_fields(block_diff_lookup_fn diff_fn, block_ts_lookup_fn ts_fn)
@@ -3706,6 +3761,10 @@ void MiningInterface::backfill_block_fields(block_diff_lookup_fn diff_fn, block_
         LOG_INFO << "[Pool] Backfilled network_difficulty on " << diff_filled << " found block(s)";
     if (ts_filled > 0)
         LOG_INFO << "[Pool] Backfilled timestamp on " << ts_filled << " found block(s)";
+    // #159 (G3/G5): a backfilled network_difficulty or timestamp is an input to
+    // the luck series, so recompute the derived fields now that they are known.
+    if (diff_filled > 0 || ts_filled > 0)
+        recompute_found_block_luck_locked();
 }
 
 void MiningInterface::set_merged_block_store(std::shared_ptr<void> store) { m_merged_block_store = std::move(store); }
