@@ -191,6 +191,15 @@ protected:
     // to protect the best chains from head pruning (p2pool node.py:363).
     std::vector<uint256> m_last_top5_heads;
 
+    // Restart-reorg supersede hint from the last think()/clean cycle
+    // (ShareTracker::compute_supersede_hint). When active it names a genuine
+    // higher-work fork the node is converging onto after a warm restart; used
+    // by clean_tracker() to exempt the converging challenger segment from
+    // stale-head eating and tail-dropping so its verification is not thrown
+    // away and restarted every ~300s (which would re-create the original
+    // stuck-on-persisted-head latch). Inactive on a healthy node.
+    ltc::SupersedeHint m_supersede_hint;
+
     // Buffer of newly verified share hashes, flushed to LevelDB periodically
     std::vector<uint256> m_verified_flush_buf;
 

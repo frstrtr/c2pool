@@ -18,7 +18,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # measurement that justifies it, and that an all-pass window logs no blocked
     # line and actually activates. Same folding rule: into the existing
     # allowlisted target.
-    add_executable(share_test share_test.cpp f11_donation_invariance_test.cpp emergency_decay_overflow_test.cpp wirecompat_runtime_test.cpp desired_version_tally_test.cpp auto_ratchet_sim_test.cpp auto_ratchet_tail_guard_test.cpp auto_ratchet_blocked_by_test.cpp chain_walk_window_test.cpp doge_template_underfill_test.cpp broadcast_tx_completeness_test.cpp broadcast_lock_discipline_test.cpp compact_block_merkle_test.cpp share_remove_owns_data_test.cpp share_message_unpack_bounds_test.cpp)
+    add_executable(share_test share_test.cpp f11_donation_invariance_test.cpp emergency_decay_overflow_test.cpp wirecompat_runtime_test.cpp desired_version_tally_test.cpp auto_ratchet_sim_test.cpp auto_ratchet_tail_guard_test.cpp auto_ratchet_blocked_by_test.cpp chain_walk_window_test.cpp doge_template_underfill_test.cpp broadcast_tx_completeness_test.cpp broadcast_lock_discipline_test.cpp compact_block_merkle_test.cpp share_remove_owns_data_test.cpp share_message_unpack_bounds_test.cpp restart_reorg_supersede_test.cpp)
     target_link_libraries(share_test PRIVATE
         GTest::gtest_main GTest::gtest
         core ltc
