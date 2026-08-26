@@ -3958,7 +3958,7 @@
                 
                 // Store only 10 most recent blocks for table display
                 // (graph chart fetches recent_blocks separately and gets full history)
-                window.allBlocks = blocks.slice(0, 10);
+                window.allBlocks = blocks.slice().sort(function(a,b){var ha=(a.height!=null?a.height:a.number)||0,hb=(b.height!=null?b.height:b.number)||0;return hb-ha;}).slice(0, 10);
                 window.blocksDisplayCount = Math.min(10, window.allBlocks.length);
                 
                 // Function to render blocks
@@ -4135,7 +4135,7 @@
                 d3.select('#merged_blocks tbody').selectAll('tr').remove();
                 
                 // Store only 10 most recent merged blocks for table display
-                window.allMergedBlocks = blocks.slice(0, 10);
+                window.allMergedBlocks = blocks.slice().sort(function(a,b){var ha=(a.height!=null?a.height:a.number)||0,hb=(b.height!=null?b.height:b.number)||0;return hb-ha;}).slice(0, 10);
                 window.mergedBlocksDisplayCount = Math.min(10, window.allMergedBlocks.length);
                 
                 // Block explorer URLs for different merged mining chains
