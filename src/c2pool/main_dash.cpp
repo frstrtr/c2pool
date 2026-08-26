@@ -131,7 +131,8 @@
 #include <impl/dash/stratum/tip_refresh.hpp>   // dash::stratum::fire_share_tip_refresh — bump + notify_all + dashboard refresh
 #include <impl/dash/local_mint_ledger.hpp>     // dash::mint::LocalMintLedger — display-only local orphan/sibling gauge
 #include <impl/dash/share_messages.hpp>        // dash::validate_message_data — operator message-blob validation (EMIT side, mirrors main_ltc.cpp)
-#include <c2pool/storage/found_block_store.hpp>  // FoundBlockStore/Record + LevelDBStore (persistence, main_ltc parity)
+#include <c2pool/storage/found_block_store.hpp>  // FoundBlockStore/Record + LevelDBStore + MergedBlockStore (persistence, main_ltc parity)
+#include <c2pool/storage/the_checkpoint.hpp>   // TheCheckpointStore — #159 (G9) DASH parity wiring (inert until merged mining)
 #include <core/web_server.hpp>                 // core::WebServer — the EXISTING c2pool dashboard (same wiring main_ltc.cpp uses)
 #include <impl/dash/enhanced_node.hpp>         // dash::EnhancedDashNode — core::IMiningNode the WebServer ctor takes
 #include <impl/dash/share_messages.hpp>        // dash::unpack_share_messages — signed transitional-blob DISPLAY+VERIFY feed
@@ -1343,6 +1344,81 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 );
                 mi->load_persisted_found_blocks();
                 LOG_INFO << "[Pool] DASH found-block persistence enabled at " << fblk_db_path;
+
+                // #159 (G6): seed the network-difficulty series from the restored
+                // found-block rows so the long-horizon diff curve is rebuildable
+                // even from a wiped stat/.views file. Display-only, crash-safe.
+                mi->seed_netdiff_history_from_found_blocks();
+
+                // #159 (G9): DASH merged-block + THE-checkpoint parity wiring,
+                // mirrored from main_ltc.cpp and sharing the same found-blocks
+                // LevelDB. INERT until merged mining lands on DASH:
+                //   * MergedBlockStore has no DASH writer (its only writers are
+                //     LTC's DOGE paths), so it stays an empty store — merged-block
+                //     endpoints simply serve nothing.
+                //   * The checkpoint READ fns (latest/all/verify) are wired, but
+                //     the create_fn is deliberately LEFT UNSET (defaults to {}),
+                //     so no DASH THE-checkpoints are ever written. Core invokes
+                //     the create_fn on every found block, so wiring it live would
+                //     start writing immediately — that is a behaviour change, not
+                //     inert wiring, and is intentionally deferred until merged
+                //     mining (enabling it later is a one-line addition).
+                {
+                    auto mblk_store =
+                        std::make_shared<c2pool::storage::MergedBlockStore>(*fblk_leveldb);
+                    mi->set_merged_block_store(mblk_store);
+                    LOG_INFO << "[Pool] DASH merged block persistence enabled ("
+                             << mblk_store->count() << " stored, inert until merged mining)";
+
+                    auto the_store =
+                        std::make_shared<c2pool::storage::TheCheckpointStore>(*fblk_leveldb);
+                    mi->set_checkpoint_fns(
+                        [the_store]() -> nlohmann::json {
+                            for (const auto& chain : {"tDASH", "DASH"}) {
+                                auto cp = the_store->get_latest(chain);
+                                if (cp.has_value()) {
+                                    return nlohmann::json{
+                                        {"chain", cp->chain}, {"block_height", cp->block_height},
+                                        {"block_hash", cp->block_hash},
+                                        {"the_state_root", cp->the_state_root.GetHex()},
+                                        {"sharechain_height", cp->sharechain_height},
+                                        {"miner_count", cp->miner_count},
+                                        {"hashrate_class", cp->hashrate_class},
+                                        {"timestamp", cp->timestamp},
+                                        {"status", cp->status == 1 ? "verified" : "pending"}
+                                    };
+                                }
+                            }
+                            return nlohmann::json{{"status", "no checkpoints"}};
+                        },
+                        [the_store]() -> nlohmann::json {
+                            auto all = the_store->load_all();
+                            nlohmann::json arr = nlohmann::json::array();
+                            for (const auto& cp : all) {
+                                arr.push_back({
+                                    {"chain", cp.chain}, {"block_height", cp.block_height},
+                                    {"block_hash", cp.block_hash},
+                                    {"the_state_root", cp.the_state_root.GetHex()},
+                                    {"sharechain_height", cp.sharechain_height},
+                                    {"miner_count", cp.miner_count},
+                                    {"timestamp", cp.timestamp},
+                                    {"status", cp.status == 1 ? "verified" : (cp.status == 2 ? "mismatch" : "pending")}
+                                });
+                            }
+                            return arr;
+                        },
+                        [](const uint256&, uint32_t) -> bool { return true; }
+                        // create_fn intentionally omitted — see comment above.
+                    );
+                    // Startup housekeeping: prune checkpoints whose blocks were
+                    // orphaned (a no-op on the empty DASH store today).
+                    size_t pruned = the_store->prune_unverified();
+                    if (pruned > 0)
+                        LOG_INFO << "[THE] Pruned " << pruned
+                                 << " unverified DASH checkpoints from previous runs";
+                    LOG_INFO << "[THE] DASH checkpoint store: " << the_store->count()
+                             << " verified (read-only until merged mining)";
+                }
             } else {
                 LOG_WARNING << "[Pool] DASH found-block persistence DISABLED (LevelDB open failed at "
                             << fblk_db_path << ")";

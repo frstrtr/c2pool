@@ -3732,6 +3732,79 @@ void MiningInterface::load_persisted_found_blocks()
     }
 }
 
+void MiningInterface::seed_netdiff_history_from_found_blocks()
+{
+    // #159 (G6): p2pool keeps a block-sampled network-difficulty series seeded
+    // from block history at load. c2pool's found-block rows persist (ts,
+    // network_difficulty) after #1351, so the diff curve is reconstructable even
+    // from a wiped stat/.views file. Display-only; every step degrades to a
+    // no-op on missing/empty data and never throws out of the function.
+    try {
+        // Snapshot (ts, nd) under the blocks lock, then release it before taking
+        // any other lock (no nested lock-order coupling).
+        std::vector<std::pair<double, double>> samples;  // (ts, nd), ascending
+        {
+            std::lock_guard<std::mutex> lock(m_blocks_mutex);
+            samples.reserve(m_found_blocks.size());
+            for (const auto& b : m_found_blocks) {
+                const double ts = static_cast<double>(b.ts);
+                if (ts > 0.0 && b.network_difficulty > 0.0)
+                    samples.emplace_back(ts, b.network_difficulty);
+            }
+        }
+        if (samples.empty()) return;
+        std::sort(samples.begin(), samples.end(),
+                  [](const std::pair<double, double>& a,
+                     const std::pair<double, double>& b) {
+                      return a.first < b.first;
+                  });
+
+        // (1) Rebuild the volatile block-sampled series unconditionally — it is
+        // fully volatile (never persisted), so a wiped process starts empty and
+        // this is the only source until live add_netdiff_sample() calls append.
+        {
+            std::lock_guard<std::mutex> lock(m_netdiff_mutex);
+            std::vector<NetDiffSample> seeded;
+            seeded.reserve(samples.size() + m_netdiff_history.size());
+            for (const auto& s : samples)
+                seeded.push_back({s.first, s.second, "block-restore"});
+            // Defensive: preserve anything the live path already recorded
+            // (normally none this early in startup), restored samples first.
+            if (!m_netdiff_history.empty())
+                seeded.insert(seeded.end(), m_netdiff_history.begin(),
+                              m_netdiff_history.end());
+            if (seeded.size() > 2000)
+                seeded.erase(seeded.begin(), seeded.end() - 2000);
+            m_netdiff_history = std::move(seeded);
+        }
+
+        // (2) Fold pre-flat-window rows into the binned 'network_difficulty'
+        // stream — but ONLY when the views were freshly seeded this boot (so a
+        // healthy .views sidecar is never double-counted across restarts), and
+        // ONLY for rows older than the earliest flat stat_log entry (the dense
+        // 60s samples already cover the recent window). DataView::add_datum
+        // handles out-of-order/too-old timestamps safely, and the concurrent
+        // background flat-seed thread locks m_history_mutex per datum too.
+        if (!m_views_freshly_seeded.load(std::memory_order_acquire)) return;
+        double earliest_flat = 0.0;
+        {
+            std::lock_guard<std::mutex> lock(m_stat_log_mutex);
+            if (!m_stat_log.empty()) earliest_flat = m_stat_log.front().time;
+        }
+        {
+            std::lock_guard<std::mutex> hlock(m_history_mutex);
+            for (const auto& s : samples) {
+                if (earliest_flat > 0.0 && s.first >= earliest_flat) continue;
+                m_history.add_scalar("network_difficulty", s.first, s.second);
+            }
+        }
+        LOG_INFO << "[NetDiffSeed] Seeded network-difficulty series from "
+                 << samples.size() << " found-block row(s)";
+    } catch (const std::exception& ex) {
+        LOG_WARNING << "[NetDiffSeed] Failed: " << ex.what();
+    }
+}
+
 void MiningInterface::reverify_pending_found_blocks()
 {
     // Snapshot the pending hashes under the lock, then schedule outside it —
@@ -7258,6 +7331,12 @@ void MiningInterface::record_share_difficulty(double difficulty, const std::stri
     m_hashrate_ring.record(miner, difficulty,
         static_cast<int64_t>(std::time(nullptr)));
 
+    // #159 (G8): count accepted local shares for the per-interval 'shares'
+    // series that update_stat_log diffs into the /web/log graph. This is the
+    // per-accepted-share choke point (it already feeds the ring + best-diff);
+    // display/telemetry only, touches no share/consensus/reward path.
+    m_stat_shares_cum.fetch_add(1, std::memory_order_relaxed);
+
     // Snapshot the latest real share difficulty for the share-difficulty trend
     // line (fallback for coins whose sharechain stats omit min_difficulty).
     // This is the true vardiff target, not an approximation.
@@ -7333,6 +7412,7 @@ void MiningInterface::update_stat_log()
     // connected_miners = raw stratum TCP connections.
     entry.local_hash_rates = nlohmann::json::object();
     entry.local_dead_hash_rates = nlohmann::json::object();
+    uint64_t cur_stale_cum = 0;  // #159 (G8): cumulative per-worker stale count
     {
         auto workers = effective_stratum_workers();
         entry.connected_count = static_cast<int>(workers.size());  // raw TCP connections
@@ -7341,6 +7421,7 @@ void MiningInterface::update_stat_log()
             std::string combo = w.username;
             if (!w.worker_name.empty()) combo += "." + w.worker_name;
             worker_combos.insert(combo);
+            cur_stale_cum += w.stale;  // sum the same per-worker counters getstats sums
         }
         // Hash-rate series: source from the RateMonitor (windowed, p2pool-correct
         // get_local_rates), NOT the per-session WorkerInfo.hashrate estimate. The
@@ -7365,8 +7446,23 @@ void MiningInterface::update_stat_log()
         entry.worker_count = static_cast<int>(worker_combos.size());
     }
 
-    entry.shares = 0;
-    entry.stale_shares = 0;
+    // #159 (G8): real per-interval share / stale-share counters (were hardcoded
+    // to 0, persisting 31 days of a dead series). 'shares' diffs the cumulative
+    // accepted-share counter; 'stale_shares' diffs the summed per-worker stale
+    // counter. Both clamp to 0 because the cumulative sources can DROP between
+    // ticks (worker stale counts vanish when a stratum session unregisters).
+    // Deviation from p2pool (documented): p2pool's /web/log stores cumulative
+    // get_stale_counts values; c2pool's own frontend is the only consumer, so a
+    // per-interval delta is the more useful series here.
+    {
+        uint64_t cur_shares_cum = m_stat_shares_cum.load(std::memory_order_relaxed);
+        entry.shares = (cur_shares_cum >= m_stat_shares_prev)
+                           ? (cur_shares_cum - m_stat_shares_prev) : 0;
+        entry.stale_shares = (cur_stale_cum >= m_stat_stale_prev)
+                                 ? (cur_stale_cum - m_stat_stale_prev) : 0;
+        m_stat_shares_prev = cur_shares_cum;
+        m_stat_stale_prev = cur_stale_cum;
+    }
 
     // Current payout
     entry.current_payout = 0.0;
@@ -7849,6 +7945,12 @@ void MiningInterface::load_graph_views()
         do_full_seed = true;
     }
 
+    // #159 (G6): record whether the binned DB was seeded fresh this boot. When
+    // a healthy .views sidecar was adopted (do_full_seed == false), the
+    // found-block network_difficulty fold must be skipped so persisted gauge
+    // bins are never double-counted across restarts.
+    m_views_freshly_seeded.store(do_full_seed, std::memory_order_release);
+
     if (do_full_seed) {
         // Fresh, correctly-shaped empty views; seed on a background thread.
         {
@@ -7976,6 +8078,48 @@ void MiningInterface::load_stat_log()
         LOG_WARNING << "[StatLog] Load failed: " << ex.what();
       }
     }();
+
+    // #159 (G7): rehydrate the per-miner HashrateRing from the restored stat_log
+    // lhr (per-address H/s, 60s cadence) so the per-miner sparkline is not blank
+    // for ~1h after a restart. The ring stores raw shares; the aggregate rate it
+    // reports is sum(difficulty)*2^32/elapsed, so a 60s sample at rate `hps`
+    // reconstructs to a synthetic difficulty of hps*dt/2^32 — restoring both the
+    // aggregate number and the bucketed shape. Display-only; fully crash-safe
+    // (any parse issue on a single field is skipped, never throws out).
+    try {
+        std::vector<StatLogEntry> recent;
+        {
+            std::lock_guard<std::mutex> lock(m_stat_log_mutex);
+            const double cutoff =
+                static_cast<double>(std::time(nullptr)) - HashrateRing::kWindowSec;
+            for (const auto& e : m_stat_log)          // chronological (append order)
+                if (e.time > cutoff) recent.push_back(e);
+        }
+        double prev_t = 0.0;
+        for (const auto& e : recent) {
+            // dt to the previous sample, clamped to [1,300]s; default 60 for the
+            // first sample in the window (matches the update_stat_log cadence).
+            double dt = (prev_t > 0.0) ? (e.time - prev_t) : 60.0;
+            if (dt < 1.0) dt = 1.0;
+            if (dt > 300.0) dt = 300.0;
+            prev_t = e.time;
+            if (!e.local_hash_rates.is_object()) continue;
+            for (auto it = e.local_hash_rates.begin();
+                 it != e.local_hash_rates.end(); ++it) {
+                if (!it.value().is_number()) continue;
+                const double hps = it.value().get<double>();
+                if (!(hps > 0.0)) continue;
+                const double diff =
+                    hps * dt / HashrateRing::kHashesPerDifficultyShare;
+                if (diff > 0.0)
+                    m_hashrate_ring.record(it.key(), diff,
+                                           static_cast<int64_t>(e.time));
+            }
+        }
+    } catch (const std::exception& ex) {
+        LOG_WARNING << "[StatLog] Ring rehydrate failed: " << ex.what();
+    }
+
     load_best_share_all_time();
 
     // G4: load (or seed) the binned graph views. Runs AFTER the flat log is in

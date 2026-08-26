@@ -991,6 +991,16 @@ public:
     /// Load persisted found blocks from storage (call once after persistence is set)
     void load_persisted_found_blocks();
 
+    /// #159 (G6): rebuild the network-difficulty series from persisted
+    /// found-block rows so the long-horizon diff curve is reconstructable even
+    /// after a wiped stat/.views file. Rebuilds the volatile block-sampled
+    /// m_netdiff_history unconditionally, and folds pre-flat-window rows into
+    /// the binned 'network_difficulty' stream ONLY when the views were freshly
+    /// seeded this boot (idempotent across restarts with a healthy .views
+    /// sidecar). Display-only; crash-safe (empty/missing source degrades to a
+    /// no-op). Call AFTER load_persisted_found_blocks so the rows are in memory.
+    void seed_netdiff_history_from_found_blocks();
+
     /// #159 (G2): schedule confirm/orphan verification for every restored row
     /// still marked pending. load_persisted_found_blocks() only rebuilds the
     /// rows; without this a row that was pending at shutdown stays "pending"
@@ -1650,6 +1660,17 @@ private:
     // share-difficulty trend line. 0 == no shares seen yet (honest-absent).
     std::atomic<double> m_recent_share_difficulty{0.0};
 
+    // #159 (G8): cumulative count of accepted local shares, incremented once
+    // per accepted share in record_share_difficulty. update_stat_log diffs it
+    // against m_stat_shares_prev to fill the per-interval 'shares' series that
+    // was previously hardcoded to 0 (dead p2pool-compatible /web/log graph).
+    // Display/telemetry only — never read by any share/consensus/reward path.
+    std::atomic<uint64_t> m_stat_shares_cum{0};
+    // Prev-cumulative snapshots for the per-interval diff (only touched from
+    // update_stat_log, which runs single-threaded on the stat-log timer).
+    uint64_t m_stat_shares_prev{0};
+    uint64_t m_stat_stale_prev{0};
+
     // Stat log for /web/log JSON endpoint (rolling 24h window)
     struct StatLogEntry {
         double time;
@@ -1702,6 +1723,10 @@ private:
     // Guards the crossover: while false, week/month/year fall back to the flat
     // path (never worse than today). Set true once bins are loaded/seeded.
     std::atomic<bool> m_views_ready{false};
+    // #159 (G6): true when load_graph_views seeded the binned DB fresh this boot
+    // (no usable .views sidecar). Gates the found-block network_difficulty fold
+    // so a healthy sidecar is never double-counted across restarts.
+    std::atomic<bool> m_views_freshly_seeded{false};
     // Background seed thread (used when the .views file is absent/corrupt/geometry-
     // mismatched and all views must be replayed from the flat log). Joined in the
     // destructor. Long views answer from the flat fallback until it completes.
