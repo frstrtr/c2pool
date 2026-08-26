@@ -7046,7 +7046,16 @@ nlohmann::json MiningInterface::rest_web_graph_data(const std::string& source, c
             val["dead"] = 0.0;
             result.push_back({entry.time, val, bin_width, 0});
         }
-        else if (source == "pool_hash_rate") {
+        else if (source == "pool_hash_rate" || source == "pool_rate") {
+            // "pool_rate" (singular) is an alias of the "pool_hash_rate" scalar.
+            // Both emit entry.pool_hash_rate, which the periodic sampler
+            // (update_stat_log :7212) fills from m_pool_hashrate_fn -- on DASH
+            // the #1349 estimator that anchors on dash::select_pool_rate_head,
+            // so this series is NON-ZERO on a live node with 0 local miners
+            // (peers-filled raw sharechain). Without this branch the singular
+            // name fell through to the catch-all and fabricated a flat-zero
+            // line on ANY node in ANY state (instrument-lied), masquerading as
+            // a dead graph regardless of real pool hashrate.
             result.push_back({entry.time, entry.pool_hash_rate, bin_width, 0});
         }
         else if (source == "pool_stale_prop") {
@@ -7118,7 +7127,15 @@ nlohmann::json MiningInterface::rest_web_graph_data(const std::string& source, c
             result.push_back({entry.time, entry.share_difficulty, bin_width, 0});
         }
         else {
-            result.push_back({entry.time, 0.0, bin_width, 0});
+            // Honest-absent: an UNKNOWN source name emits NOTHING rather than a
+            // fabricated zero bucket. The old `push_back({time, 0.0, ...})` made
+            // every unrecognised series (e.g. a mistyped "pool_rate" before the
+            // alias above) return one all-zero point per stat_log entry, which
+            // reads identically to a genuinely dead graph on a healthy node --
+            // an instrument that cannot be distinguished from the failure it is
+            // meant to detect. Skipping yields an empty array the frontend
+            // renders as "no data" instead of a false flat-zero trend.
+            continue;
         }
     }
     return result;
