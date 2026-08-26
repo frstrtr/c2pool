@@ -20,6 +20,17 @@
 /// have served looks like <X>". A [SHADOW] MISMATCH is DIAGNOSTIC EVIDENCE, not
 /// proof of a bad served block (see the SEMANTIC note below).
 ///
+/// ══ ZERO SAMPLES IS NOT A CLEAN RESULT ══════════════════════════════════════
+/// The probe is SERVE-TRIGGERED, so it measures nothing at all when nothing is
+/// served. In the August DASH soak that state lasted 12 h — no miner was on the
+/// node's stratum, on_serve never fired — and the honest a=0 was read by every
+/// consumer as "fine". Two things therefore report the state POSITIVELY rather
+/// than as an absence of output: an unconditional `shadow-attempts` count with a
+/// `status` of NO-SAMPLES/OK in the stats JSON, and a periodic
+/// `[SHADOW] HEARTBEAT ... status=NO-SAMPLES` line for log-scraping monitors
+/// that cannot be changed from this repo. Nothing measured is never nothing
+/// wrong.
+///
 /// ══ HOT-PATH DISCIPLINE (hard invariant) ════════════════════════════════════
 /// The dashd oracle fetch is ALWAYS off the miner-facing path. on_serve() only
 /// ENQUEUES a copy of the just-resolved template (coalescing to the newest) and
@@ -78,6 +89,8 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -283,6 +296,22 @@ struct ShadowOutcome {
 /// monitor/dashboard can read, plus a per-field breakdown keyed
 /// "shadow-mismatch-<field>".
 struct ShadowCounters {
+    /// EVERY processed sample, unconditionally — the DENOMINATOR the verdict
+    /// tallies below are numerators of.
+    ///
+    /// ⚠ THE AUGUST DASH SOAK LESSON. Without this field a reader of the
+    /// counters cannot tell "the probe measured and found nothing wrong" from
+    /// "the probe measured NOTHING". Both render as all-zeros: the verdict
+    /// tallies are each conditional (a non-served Mismatch carrying only
+    /// non-commitment field diffs bumps no top-level counter at all), so
+    /// zero-everywhere was a reachable state under real traffic as well as
+    /// under total starvation. During the soak the embedded shadow-compare
+    /// produced zero samples for 12 h — no miner was on the node's stratum, so
+    /// the serve path never fired and on_serve was never called — and every
+    /// consumer read the honest a=0 as "fine". Zero attempts means NOTHING WAS
+    /// MEASURED; it is never a health claim. Same reasoning as the ABSENT-not-0
+    /// `behind` field in serve_staleness.hpp.
+    uint64_t shadow_attempts{0};
     uint64_t shadow_match{0};
     uint64_t shadow_no_oracle{0};
     uint64_t shadow_served_mismatch{0};
@@ -293,6 +322,10 @@ struct ShadowCounters {
     std::map<std::string, uint64_t> shadow_mismatch_by_field;   // field -> count
 
     void apply(const ShadowOutcome& o) {
+        // Unconditional, and deliberately BEFORE the switch: this counts
+        // MEASUREMENTS, not verdicts. Every kind — including the ones that
+        // bump nothing else — advances it.
+        shadow_attempts++;
         switch (o.kind) {
         case ShadowOutcome::Kind::NoOracle: shadow_no_oracle++; break;
         case ShadowOutcome::Kind::Match:    shadow_match++;     break;
@@ -312,6 +345,7 @@ struct ShadowCounters {
     }
     nlohmann::json to_json() const {
         nlohmann::json j;
+        j["shadow-attempts"]        = shadow_attempts;
         j["shadow-match"]           = shadow_match;
         j["shadow-no-oracle"]       = shadow_no_oracle;
         j["shadow-served-mismatch"] = shadow_served_mismatch;
@@ -607,6 +641,11 @@ public:
     /// samples serves; a skipped intermediate is a coverage gap, never a wrong
     /// count). Safe to call whether the resolved arm was Embedded or fallback.
     void on_serve(WorkSource source, const DashWorkData& served) {
+        // Counted BEFORE the coalescing store, so it tallies serves OFFERED,
+        // not serves that survived coalescing: an enqueue count that shrank
+        // with the queue could not distinguish "no serve arrived" from "serves
+        // arrived and were merged".
+        serves_enqueued_.fetch_add(1, std::memory_order_relaxed);
         {
             std::lock_guard<std::mutex> lk(q_mu_);
             pending_ = std::make_pair(source, served);   // copy
@@ -619,6 +658,22 @@ public:
         nlohmann::json j = counters_.to_json();
         j["mode"] = "embedded-shadow-compare";
         j["note"] = "diagnostic only — NOT a serve gate";
+        // THE ZERO-ATTEMPTS GUARD. A consumer must not have to know that the
+        // verdict tallies are conditional in order to avoid reading an
+        // all-zero counter block as good news. Zero attempts is reported as a
+        // named STATE, not as a set of zeros: nothing was measured, which is
+        // never the same claim as nothing is wrong (August DASH soak — see
+        // ShadowCounters::shadow_attempts).
+        j["status"] = counters_.shadow_attempts ? "OK" : "NO-SAMPLES";
+        // How many serves REACHED the probe, which the attempts count cannot
+        // tell you: enqueue and processing are distinct stages (on_serve
+        // coalesces to the newest pending job). serves-enqueued == 0 with the
+        // probe armed is serve STARVATION — nothing was handed to us — while a
+        // non-zero enqueue count against zero attempts would instead point at
+        // the worker. That distinction is the whole 12 h diagnosis.
+        j["shadow-serves-enqueued"] =
+            serves_enqueued_.load(std::memory_order_relaxed);
+        j["armed-since-s"] = armed_since_s();
         // The serve-FLAG readiness verdict. Still not a serve gate: it decides
         // whether --embedded-serve-mempool-txs MAY be armed, never what is
         // served at this instant.
@@ -662,20 +717,83 @@ public:
 
 private:
     void worker_loop() {
+        auto last_heartbeat = std::chrono::steady_clock::now();
         for (;;) {
             std::pair<WorkSource, DashWorkData> job;
+            bool have_job = false;
             {
                 std::unique_lock<std::mutex> lk(q_mu_);
-                q_cv_.wait(lk, [this] { return stop_ || pending_.has_value(); });
+                // wait_FOR, not wait: the heartbeat below must still fire when
+                // nothing is ever enqueued — which is exactly the state it
+                // exists to make visible. A timed wake with no job is the
+                // normal case on a starved node, not an error.
+                q_cv_.wait_for(lk, kHeartbeatInterval,
+                               [this] { return stop_ || pending_.has_value(); });
                 if (stop_ && !pending_.has_value()) return;
-                job = std::move(*pending_);
-                pending_.reset();
+                if (pending_.has_value()) {
+                    job = std::move(*pending_);
+                    pending_.reset();
+                    have_job = true;
+                }
             }
-            try { process(job.first, job.second); }
-            catch (const std::exception& e) {
-                LOG_WARNING << "[SHADOW] worker exception: " << e.what();
+            if (have_job) {
+                try { process(job.first, job.second); }
+                catch (const std::exception& e) {
+                    LOG_WARNING << "[SHADOW] worker exception: " << e.what();
+                }
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_heartbeat >= kHeartbeatInterval) {
+                last_heartbeat = now;
+                log_heartbeat();
             }
         }
+    }
+
+    /// The LOG-STREAM half of the zero-attempts guard, and the half that
+    /// matters to a monitor nobody in this repo can change.
+    ///
+    /// stats_json() only answers something that ASKS. The external soak
+    /// guardian log-scrapes [SHADOW] lines, and a starved probe emits no
+    /// [SHADOW] line at all — an absence indistinguishable from a healthy,
+    /// quiet node. This line is emitted on a fixed cadence whether or not
+    /// anything was sampled, so starvation acquires a POSITIVE signature in
+    /// the log stream (`status=NO-SAMPLES`) instead of being expressed as
+    /// silence. Nothing outside this process has to change to see it.
+    void log_heartbeat() const {
+        uint64_t attempts = 0;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            attempts = counters_.shadow_attempts;
+        }
+        const uint64_t enqueued = serves_enqueued_.load(std::memory_order_relaxed);
+        std::string l = "[SHADOW] HEARTBEAT armed_since="
+                      + std::to_string(armed_since_s())
+                      + "s serves_enqueued=" + std::to_string(enqueued)
+                      + " samples=" + std::to_string(attempts)
+                      + " status=" + (attempts ? "OK" : "NO-SAMPLES");
+        if (attempts == 0) {
+            // Which stage is starved is the whole diagnosis, so the line says
+            // it rather than leaving the reader to infer it from two numbers.
+            l += enqueued == 0
+                     ? " — no serve has reached the probe: SERVE STARVATION"
+                       " (nothing is asking this node for a template — e.g. no"
+                       " miner on the stratum). NOTHING WAS MEASURED; this is"
+                       " not a clean result"
+                     : " — serves reached the probe but no sample completed."
+                       " NOTHING WAS MEASURED; this is not a clean result";
+            LOG_WARNING << l;
+        } else {
+            LOG_INFO << l;
+        }
+    }
+
+    /// Wall-clock seconds since the probe was ARMED. An age, not a timestamp:
+    /// "armed 43200 s ago with 0 samples" survives a log paste, an absolute
+    /// steady-clock reading does not (same reasoning as serve_staleness.hpp).
+    int64_t armed_since_s() const {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::steady_clock::now() - armed_at_).count();
     }
 
     void process(WorkSource source, const DashWorkData& served) {
@@ -758,8 +876,19 @@ private:
         }
     }
 
+    /// Heartbeat cadence. Deliberately the same 300 s as ServeGateJournal's
+    /// stuck-arm heartbeat (serve_gate_journal.hpp) — slow enough to cost
+    /// nothing, dense enough that ANY window of the journal names the state.
+    static constexpr std::chrono::seconds kHeartbeatInterval{300};
+
     OracleFn oracle_;
     AcceptFn accept_;
+
+    /// Armed at construction; both are read outside mu_ (an age and an atomic
+    /// tally), so a heartbeat never contends with the compare path.
+    const std::chrono::steady_clock::time_point armed_at_{
+        std::chrono::steady_clock::now()};
+    std::atomic<uint64_t> serves_enqueued_{0};
 
     mutable std::mutex mu_;          // guards counters_ + validity_
     ShadowCounters     counters_;
