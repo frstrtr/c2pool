@@ -41,6 +41,7 @@
 
 #include <core/factory.hpp>
 #include <core/netaddress.hpp>
+#include <core/pack.hpp>
 #include <core/packet.hpp>
 #include <core/socket.hpp>
 #include <core/uint256.hpp>
@@ -53,6 +54,7 @@
 #include <cstring>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -109,10 +111,16 @@ struct LoopbackPair
     std::unique_ptr<tcp::socket> theirs;
     std::unique_ptr<tcp::socket> ours;
 
-    LoopbackPair()
+    // bind_addr defaults to the loopback HOST address (127.0.0.1). A test that
+    // needs a source the Legacy self-probe treats as ROUTABLE binds to another
+    // 127.0.0.0/8 address (e.g. 127.0.0.2): still loopback at the OS level, so it
+    // is bindable without privilege, but NOT the string the self-probe compares
+    // against — so the accepted peer presents a non-"127.0.0.1" source and the
+    // handler takes the else (routable) arm. See the #925 case below.
+    explicit LoopbackPair(const std::string& bind_addr = "127.0.0.1")
     {
         acceptor = std::make_unique<tcp::acceptor>(
-            ioc_peer, tcp::endpoint(boost::asio::ip::make_address("127.0.0.1"), 0));
+            ioc_peer, tcp::endpoint(boost::asio::ip::make_address(bind_addr), 0));
         acceptor->listen();
 
         ours = std::make_unique<tcp::socket>(ioc_node);
@@ -458,4 +466,88 @@ TEST(DashAddrme, LoopbackAddrmeIsNotRecordedAsARoutablePeer)
     EXPECT_NE(find_frame(frames, "addrme"), nullptr)
         << "canonical relays the addrme onward so a peer that CAN see our "
            "public address answers it (p2p.py:282-283)";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. #925: BYTE-IDENTITY for a ROUTABLE (non-loopback-HOST) source — the
+//    routable-sender case code review set as a merge gate for #915 but which
+//    landed (67a76bb9) WITHOUT it. Every case above drives a 127.0.0.1 loopback
+//    source and pins the SELF-PROBE (if) arm. This one drives the ELSE arm.
+//
+//    Why it establishes the constant flip was byte-identical for routable
+//    senders: the self-probe is one string compare against a hardcoded host
+//    constant. For ANY source that is not that constant, the OLD "127.0.0.0" and
+//    the NEW "127.0.0.1" fail the compare IDENTICALLY and fall to the SAME else
+//    arm — so the routable path is invariant under the change. 127.0.0.2 is the
+//    smallest real, bindable stand-in for that whole equivalence class: it equals
+//    neither constant, so a genuinely accepted socket presents it and the handler
+//    takes the routable path under both constants alike. What is pinned here is
+//    the else-arm CONTRACT — got_addr records the endpoint+services verbatim and
+//    the record is gossiped onward as an `addrs` (never `addrme`) carrying the
+//    identical bytes — decoded from the frame the node actually put on the wire,
+//    not from a re-implementation. This is the routable half of the loopback
+//    golden in case 4; together they pin both arms of the self-probe.
+//
+//    Same probabilistic-relay note as case 4: got_addr in the else arm is
+//    UNCONDITIONAL so a single iteration decides the record; the loop only forces
+//    the 0.8 relay so the on-wire addrs frame is observable.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST(DashAddrme, RoutableSourceIsRecordedAndRelayedWithByteIdenticalFields)
+{
+    constexpr std::uint16_t kAdvertisedPort = 8999;                    // canonical p2pool-dash port
+    constexpr std::uint64_t kServices       = 0xA5A5'0000'1234'5678ull; // distinctive, non-zero
+
+    LoopbackPair pair("127.0.0.2");   // routable to the self-probe; loopback to the OS
+    StubCommunicator stub;
+
+    ProbeLegacy legacy;
+    auto peer = make_socket_peer(pair, stub);
+    ASSERT_EQ(peer->addr().address(), "127.0.0.2")
+        << "the source must be a non-loopback-HOST address to reach the else arm";
+    ASSERT_NE(peer->addr().address(), "127.0.0.1");   // would divert to the self-probe arm
+
+    // The else arm records and relays the peer's NEGOTIATED services verbatim, so
+    // fix them to a known sentinel to make the byte assertion exact.
+    peer->m_other_services = kServices;
+    peer->m_nonce = 0x5555'6666'7777'8888ull;
+    legacy.peers()[peer->m_nonce] = peer;   // relay target (also the source)
+
+    const NetService routable_record{std::string("127.0.0.2"), kAdvertisedPort};
+    ASSERT_FALSE(legacy.addrs().check(routable_record))
+        << "precondition: the store must not already carry this record";
+
+    IoThread io(pair.ioc_node);
+    for (int i = 0; i < 32; ++i)
+    {
+        auto raw = dash::message_addrme::make_raw(kAdvertisedPort);
+        legacy.handle(dash::message_addrme::make(raw->m_data), peer);
+    }
+    const auto frames = read_frames(*pair.theirs, std::chrono::milliseconds(300));
+    io.stop(pair.ioc_node);
+
+    // (1) got_addr is UNCONDITIONAL in the else arm: the routable endpoint is
+    //     recorded keyed on host:port, carrying the peer's services byte-for-byte.
+    ASSERT_TRUE(legacy.addrs().check(routable_record))
+        << "#925: a routable addrme must be recorded as a peer via the else arm";
+    EXPECT_EQ(legacy.addrs().get(routable_record).m_service, kServices)
+        << "#925: the recorded services must be the peer's, unchanged";
+
+    // (2) The else arm gossips that record onward as an `addrs` message — NOT an
+    //     `addrme` (that is the self-probe arm). Decode the exact frame the node
+    //     wrote and assert its single record's endpoint + services are identical.
+    EXPECT_EQ(find_frame(frames, "addrme"), nullptr)
+        << "#925: addrme relay belongs to the self-probe arm; a routable source "
+           "must not take it";
+    const Frame* addrs = find_frame(frames, "addrs");
+    ASSERT_NE(addrs, nullptr)
+        << "#925: the else arm relays the routable record in an addrs message";
+
+    PackStream ps{std::span<const std::byte>(addrs->payload)};
+    auto parsed = dash::message_addrs::make(ps);
+    ASSERT_EQ(parsed->m_addrs.size(), 1u)
+        << "the relay carries exactly the one record the handler built";
+    EXPECT_EQ(parsed->m_addrs[0].m_endpoint.address(), "127.0.0.2");
+    EXPECT_EQ(parsed->m_addrs[0].m_endpoint.port(), kAdvertisedPort);
+    EXPECT_EQ(parsed->m_addrs[0].m_services, kServices)
+        << "#925: relayed services must equal the peer's negotiated services";
 }
