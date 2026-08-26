@@ -62,6 +62,16 @@ MiningInterface::MiningInterface(bool testnet, std::shared_ptr<IMiningNode> node
     setup_methods();
 }
 
+MiningInterface::~MiningInterface()
+{
+    // Stop and join the background graph-view seed thread (if it is still
+    // replaying the flat log). Never blocks shutdown for long: the flag is
+    // checked between entries.
+    m_views_seed_stop.store(true, std::memory_order_relaxed);
+    if (m_views_seed_thread.joinable())
+        m_views_seed_thread.join();
+}
+
 void MiningInterface::setup_methods()
 {
     // Core mining methods - explicitly cast to MethodHandle
@@ -7083,6 +7093,19 @@ nlohmann::json MiningInterface::rest_web_graph_data(const std::string& source, c
     // data_to_lines() in graphs.html parses this format.
     nlohmann::json result = nlohmann::json::array();
 
+    // G4 dispatch: the long horizons (week/month/year) answer from the binned
+    // history DB when it is ready, dropping the payload from thousands of flat
+    // samples to ~300 bin points. last_hour/last_day stay on the flat path
+    // below unchanged. If the binned view is not ready yet (still seeding) or is
+    // empty, fall through to the flat path — never worse than today.
+    if ((view == "last_week" || view == "last_month" || view == "last_year")
+        && m_views_ready.load(std::memory_order_acquire)) {
+        nlohmann::json binned = graph_view_data(source, view);
+        if (binned.is_array() && !binned.empty())
+            return binned;
+        // else: fall through to the flat path (honest-absent / not-yet-filled)
+    }
+
     std::lock_guard<std::mutex> lock(m_stat_log_mutex);
     auto now = std::time(nullptr);
     double window = 3600.0;
@@ -7544,6 +7567,300 @@ void MiningInterface::update_stat_log()
         while (!m_stat_log.empty() && m_stat_log.front().time < cutoff)
             m_stat_log.erase(m_stat_log.begin());
     }
+
+    // G4: fan the fresh entry into the binned history DB (last_week/month/year).
+    // Done AFTER releasing m_stat_log_mutex so the two locks never couple. The
+    // history DB has its own mutex. One datum per 60s tick — no new timer.
+    {
+        std::lock_guard<std::mutex> hlock(m_history_mutex);
+        feed_history_entry(entry);
+        m_views_watermark = entry.time;
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// G4: year-scale binned graph history (p2pool util/graph.py port)
+// ════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// nlohmann {key: number} object -> std::map<string,double>, skipping non-numbers.
+std::map<std::string, double> json_obj_to_map(const nlohmann::json& j)
+{
+    std::map<std::string, double> out;
+    if (j.is_object())
+        for (auto it = j.begin(); it != j.end(); ++it)
+            if (it.value().is_number())
+                out[it.key()] = it.value().get<double>();
+    return out;
+}
+
+double json_obj_sum(const nlohmann::json& j)
+{
+    double s = 0.0;
+    if (j.is_object())
+        for (auto& [k, v] : j.items())
+            if (v.is_number()) s += v.get<double>();
+    return s;
+}
+
+}  // namespace
+
+std::vector<std::pair<std::string, core::graph::DataStreamDescription>>
+MiningInterface::graph_stream_descriptions()
+{
+    using core::graph::DataViewDescription;
+    using core::graph::DataStreamDescription;
+
+    // The five p2pool horizons. last_hour/last_day are maintained in the DB for
+    // completeness but SERVED from the flat log; last_week/month/year are served
+    // from these bins. last_year = 365.25d / 300 bins (p2pool-exact).
+    const std::vector<std::pair<std::string, DataViewDescription>> views = {
+        {"last_hour",  DataViewDescription(150, 60.0 * 60.0)},
+        {"last_day",   DataViewDescription(300, 60.0 * 60.0 * 24.0)},
+        {"last_week",  DataViewDescription(300, 60.0 * 60.0 * 24.0 * 7.0)},
+        {"last_month", DataViewDescription(300, 60.0 * 60.0 * 24.0 * 30.0)},
+        {"last_year",  DataViewDescription(300, 60.0 * 60.0 * 24.0 * 365.25)},
+    };
+
+    // Every c2pool stream is a GAUGE (deliberate deviation from p2pool — the
+    // datums are pre-computed H/s rates sampled at 60s, so a bin holds their
+    // MEAN, not total/bin_width). See graph_history.hpp.
+    auto scalar = [&]() {
+        DataStreamDescription d;
+        d.dataview_descriptions = views;
+        d.is_gauge = true;
+        d.multivalues = false;
+        return d;
+    };
+    // Per-address multivalue streams are capped (review #1): p2pool's
+    // multivalues_keep=10000 makes month/year unbounded on a large pool. Cap at
+    // 200 keys with an "other" squash key. The per-address YEAR payout story
+    // (open question #14) is DEFERRED — it would reinflate exactly this bound.
+    auto multi = [&](bool undefined0, bool capped) {
+        DataStreamDescription d;
+        d.dataview_descriptions = views;
+        d.is_gauge = true;
+        d.multivalues = true;
+        d.multivalue_undefined_means_0 = undefined0;
+        if (capped) {
+            d.multivalues_keep = 200;
+            d.has_squash_key = true;
+            d.multivalues_squash_key = "other";
+        } else {
+            d.multivalues_keep = 20;  // fixed-key streams (peers, traffic): 2 keys
+        }
+        return d;
+    };
+
+    return {
+        {"pool_rates",              multi(/*undefined0=*/true,  /*capped=*/false)},
+        {"pool_hash_rate",          scalar()},
+        {"pool_stale_prop",         scalar()},
+        {"local_hash_rate",         scalar()},
+        {"local_dead_hash_rate",    scalar()},
+        {"local_share_hash_rates",  multi(true,  true)},
+        {"miner_hash_rates",        multi(false, true)},
+        {"miner_dead_hash_rates",   multi(false, true)},
+        {"current_payout",          scalar()},
+        {"current_payouts",         multi(false, true)},
+        {"merged_current_payouts",  multi(false, true)},
+        {"peers",                   multi(false, false)},
+        {"desired_version_rates",   multi(true,  true)},
+        {"worker_count",            scalar()},
+        {"unique_miner_count",      scalar()},
+        {"connected_miners",        scalar()},
+        {"traffic_rate",            multi(false, false)},
+        {"getwork_latency",         scalar()},
+        {"memory_usage",            scalar()},
+        {"network_difficulty",      scalar()},
+        {"share_difficulty",        scalar()},
+    };
+}
+
+void MiningInterface::feed_history_entry(const StatLogEntry& e)
+{
+    // Caller holds m_history_mutex.
+    const double t = e.time;
+
+    // pool_rates — SAME derivation the flat path uses at rest_web_graph_data:
+    // good = phr*(1-stale), orphan = phr*stale, dead = 0.
+    m_history.add_multi("pool_rates", t, {
+        {"good",   e.pool_hash_rate * (1.0 - e.pool_stale_prop)},
+        {"orphan", e.pool_hash_rate * e.pool_stale_prop},
+        {"dead",   0.0},
+    });
+
+    m_history.add_scalar("pool_hash_rate",       t, e.pool_hash_rate);
+    m_history.add_scalar("pool_stale_prop",      t, e.pool_stale_prop);
+    m_history.add_scalar("local_hash_rate",      t, json_obj_sum(e.local_hash_rates));
+    m_history.add_scalar("local_dead_hash_rate", t, json_obj_sum(e.local_dead_hash_rates));
+
+    m_history.add_multi("local_share_hash_rates", t, json_obj_to_map(e.local_hash_rates));
+    m_history.add_multi("miner_hash_rates",       t, json_obj_to_map(e.local_hash_rates));
+    m_history.add_multi("miner_dead_hash_rates",  t, json_obj_to_map(e.local_dead_hash_rates));
+
+    m_history.add_scalar("current_payout",        t, e.current_payout);
+    m_history.add_multi("current_payouts",        t, json_obj_to_map(e.current_payouts));
+    m_history.add_multi("merged_current_payouts", t, json_obj_to_map(e.merged_current_payouts));
+    m_history.add_multi("peers",                  t, json_obj_to_map(e.peers));
+    m_history.add_multi("desired_version_rates",  t, json_obj_to_map(e.desired_versions));
+
+    m_history.add_scalar("worker_count",       t, static_cast<double>(e.worker_count));
+    m_history.add_scalar("unique_miner_count", t, static_cast<double>(e.miner_count));
+    m_history.add_scalar("connected_miners",   t, static_cast<double>(e.connected_count));
+    m_history.add_multi ("traffic_rate",       t, json_obj_to_map(e.traffic));
+    m_history.add_scalar("getwork_latency",    t, e.work_latency);
+    m_history.add_scalar("memory_usage",       t, e.memory_usage);
+    m_history.add_scalar("network_difficulty", t, e.network_difficulty);
+    m_history.add_scalar("share_difficulty",   t, e.share_difficulty);
+}
+
+nlohmann::json MiningInterface::graph_view_data(const std::string& source,
+                                                const std::string& view)
+{
+    // "pool_rate" (singular) is an alias of the "pool_hash_rate" scalar, kept
+    // for wire compatibility exactly as the flat path does.
+    const std::string src = (source == "pool_rate") ? "pool_hash_rate" : source;
+    std::lock_guard<std::mutex> hlock(m_history_mutex);
+    const auto* stream = m_history.stream(src);
+    if (!stream) return nlohmann::json::array();  // honest-absent unknown source
+    const auto* dv = stream->view(view);
+    if (!dv) return nlohmann::json::array();
+    return dv->get_data(stream->desc, static_cast<double>(std::time(nullptr)));
+}
+
+void MiningInterface::save_graph_views()
+{
+    const std::string path = graph_views_path();
+    if (path.empty()) return;
+    try {
+        nlohmann::json out;
+        {
+            std::lock_guard<std::mutex> hlock(m_history_mutex);
+            // Only persist once the views carry data — a half-seeded DB would
+            // store a watermark ahead of its bins and mislead the next replay.
+            if (!m_views_ready.load(std::memory_order_acquire)) return;
+            out["version"] = 1;
+            out["watermark"] = m_views_watermark;
+            out["data"] = m_history.to_obj();
+        }
+        const std::string tmp = path + ".new";
+        { std::ofstream f(tmp, std::ios::trunc); f << out.dump(); }
+        std::filesystem::rename(tmp, path);
+    } catch (const std::exception& ex) {
+        LOG_WARNING << "[GraphViews] Save failed: " << ex.what();
+    }
+}
+
+void MiningInterface::seed_graph_views_from_flat()
+{
+    // Replay the WHOLE flat log into empty views (the upgrade / corrupt-recovery
+    // path). Runs on a background thread so a live money node never blocks
+    // startup on the ~44k-entry x ~21-stream replay; week/month/year answer from
+    // the flat fallback until this completes. Any throw leaves the views empty
+    // (m_views_ready stays false) → permanent flat fallback, which is safe.
+    try {
+        std::vector<StatLogEntry> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stat_log_mutex);
+            snapshot = m_stat_log;   // chronological (append order)
+        }
+        double last_t = 0.0;
+        for (const auto& e : snapshot) {
+            if (m_views_seed_stop.load(std::memory_order_relaxed)) return;
+            std::lock_guard<std::mutex> hlock(m_history_mutex);
+            feed_history_entry(e);
+            last_t = e.time;
+        }
+        {
+            std::lock_guard<std::mutex> hlock(m_history_mutex);
+            if (last_t > m_views_watermark) m_views_watermark = last_t;
+        }
+        m_views_ready.store(true, std::memory_order_release);
+        LOG_INFO << "[GraphViews] Seeded binned views from " << snapshot.size()
+                 << " flat entries";
+    } catch (const std::exception& ex) {
+        LOG_WARNING << "[GraphViews] Seed failed (serving long views from flat "
+                       "fallback): " << ex.what();
+    }
+}
+
+void MiningInterface::load_graph_views()
+{
+    // Fully guarded (review #4): ANY failure — missing / parse error / version
+    // mismatch / geometry mismatch — degrades to seed-from-flat, and if seeding
+    // itself throws the views stay empty and week/month/year serve from the flat
+    // fallback. Never aborts load_stat_log, never crashes startup.
+    const std::string path = graph_views_path();
+    if (path.empty()) return;
+
+    // Always (re)build the schema so the compiled geometry is authoritative.
+    const auto descs = graph_stream_descriptions();
+
+    bool do_full_seed = true;   // default: no usable sidecar → seed from flat
+    try {
+        std::ifstream f(path);
+        if (f) {
+            std::string content((std::istreambuf_iterator<char>(f)),
+                                std::istreambuf_iterator<char>());
+            if (!content.empty()) {
+                auto obj = nlohmann::json::parse(content);  // throws on corrupt
+                int version = obj.is_object() ? obj.value("version", 0) : 0;
+                if (version == 1 && obj.contains("data")) {
+                    bool needs_reseed = false;
+                    auto db = core::graph::HistoryDatabase::from_obj(
+                        descs, obj["data"], needs_reseed);
+                    if (!needs_reseed) {
+                        // Clean load: adopt the bins, then incrementally replay
+                        // the flat tail strictly newer than the stored watermark
+                        // (covers a crash between the flat and .views saves).
+                        double watermark = obj.value("watermark", 0.0);
+                        std::vector<StatLogEntry> tail;
+                        {
+                            std::lock_guard<std::mutex> lock(m_stat_log_mutex);
+                            for (const auto& e : m_stat_log)
+                                if (e.time > watermark) tail.push_back(e);
+                        }
+                        {
+                            std::lock_guard<std::mutex> hlock(m_history_mutex);
+                            m_history = std::move(db);
+                            m_views_watermark = watermark;
+                            for (const auto& e : tail) {
+                                feed_history_entry(e);
+                                if (e.time > m_views_watermark)
+                                    m_views_watermark = e.time;
+                            }
+                        }
+                        m_views_ready.store(true, std::memory_order_release);
+                        do_full_seed = false;
+                        LOG_INFO << "[GraphViews] Loaded bins (watermark "
+                                 << static_cast<long long>(watermark) << ", replayed "
+                                 << tail.size() << " tail entries)";
+                    }
+                    // needs_reseed (missing view / wrong geometry) falls through
+                    // to the full seed below with fresh, correctly-shaped views.
+                }
+            }
+        }
+    } catch (const std::exception& ex) {
+        LOG_WARNING << "[GraphViews] Sidecar load failed, seeding from flat: "
+                    << ex.what();
+        do_full_seed = true;
+    }
+
+    if (do_full_seed) {
+        // Fresh, correctly-shaped empty views; seed on a background thread.
+        {
+            std::lock_guard<std::mutex> hlock(m_history_mutex);
+            m_history = core::graph::HistoryDatabase::create(descs);
+            m_views_watermark = 0.0;
+        }
+        m_views_ready.store(false, std::memory_order_release);
+        if (m_views_seed_thread.joinable()) m_views_seed_thread.join();
+        m_views_seed_stop.store(false, std::memory_order_relaxed);
+        m_views_seed_thread = std::thread([this]() { seed_graph_views_from_flat(); });
+    }
 }
 
 void MiningInterface::save_stat_log()
@@ -7598,12 +7915,23 @@ void MiningInterface::save_stat_log()
     } catch (const std::exception& ex) {
         LOG_WARNING << "[StatLog] Save failed: " << ex.what();
     }
+
+    // G4: persist the binned views AFTER the flat file (review-mandated order).
+    // The stored watermark can then never exceed the flat file's newest entry,
+    // so the strict t>watermark replay on load is provably double-count-free and
+    // the crash window is bounded to flat-newer-than-views (absorbed by replay).
+    save_graph_views();
 }
 
 void MiningInterface::load_stat_log()
 {
     if (m_stat_log_path.empty()) return;
-    try {
+    // Flat-log load is wrapped in an IIFE so its early returns (missing/empty/
+    // malformed file) skip ONLY the flat parse — load_best_share_all_time and
+    // load_graph_views below must always run, including on a first boot where no
+    // flat file exists yet (that is exactly when the views seed themselves).
+    [&]() {
+      try {
         std::ifstream f(m_stat_log_path);
         if (!f) return;
         std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
@@ -7644,10 +7972,17 @@ void MiningInterface::load_stat_log()
             m_stat_log.push_back(std::move(e));
         }
         LOG_INFO << "[StatLog] Loaded " << m_stat_log.size() << " entries from " << m_stat_log_path;
-    } catch (const std::exception& ex) {
+      } catch (const std::exception& ex) {
         LOG_WARNING << "[StatLog] Load failed: " << ex.what();
-    }
+      }
+    }();
     load_best_share_all_time();
+
+    // G4: load (or seed) the binned graph views. Runs AFTER the flat log is in
+    // memory so the seed/replay migration can read m_stat_log. Fully guarded:
+    // any failure degrades to serving week/month/year from the flat fallback and
+    // never aborts load_stat_log or crashes startup.
+    load_graph_views();
 }
 
 // ── ALL-TIME best share: survives restarts ──────────────────────────────

@@ -26,6 +26,9 @@
 
 #include <cstdio>
 #include <string>
+#include <chrono>
+#include <fstream>
+#include <thread>
 
 using core::MiningInterface;
 
@@ -627,4 +630,198 @@ TEST(FoundBlockAuthorship, EnrichmentRaisesAuthorshipAndNeverLowersIt)
     EXPECT_EQ(find_block(mi.rest_recent_blocks(), h2)["found_by"].get<std::string>(),
               "this_node")
         << "a later, less informed call must not downgrade a known finder";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 8. G4: year-scale binned graph history (#159)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// These extend the persistence round-trip (case 6) to the new <path>.views
+// sidecar: a clean save/reload serves the long horizons from the bins, the
+// pool_rates served dict keeps its exact {good,orphan,dead} shape with no
+// leaked 'null' counter, and a missing / corrupt / truncated sidecar degrades
+// to the flat fallback without ever crashing load or startup.
+
+namespace {
+
+// Poll until the binned views finish loading/seeding (background thread), with
+// a generous bound so slow CI never flakes. Returns true if ready in time.
+bool wait_views_ready(const MiningInterface& mi, int timeout_ms = 5000)
+{
+    for (int waited = 0; waited < timeout_ms; waited += 20) {
+        if (mi.graph_views_ready()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return mi.graph_views_ready();
+}
+
+// The week view's bin width == 604800/300 == 2016 s; the flat path hardcodes
+// 300.0 for d[2]. Reading the width tells us WHICH path served the request.
+constexpr double kWeekBinWidth = 604800.0 / 300.0;  // 2016.0
+
+}  // namespace
+
+TEST(DashboardData, GraphViewsSidecarRoundTrip)
+{
+    const std::string path = "/tmp/c2pool_test_g4_views.json";
+    std::remove(path.c_str());
+    std::remove((path + ".views").c_str());
+    std::remove((path + ".best.json").c_str());
+
+    {
+        MiningInterface mi(false, nullptr, c2pool::address::Blockchain::DASH);
+        mi.set_pool_hashrate_fn([]() { return 1234.0; });
+        mi.set_stat_log_path(path);
+        mi.load_stat_log();               // empty flat -> schema built + seeded
+        ASSERT_TRUE(wait_views_ready(mi));
+        for (int i = 0; i < 5; ++i) mi.update_stat_log();  // fan into the bins
+        mi.save_stat_log();               // writes flat FIRST, then .views
+    }
+
+    // The sidecar exists on disk.
+    { std::ifstream f(path + ".views"); ASSERT_TRUE(f.good()); }
+
+    // Reload: a clean load must adopt the bins (no reseed) and serve week from
+    // them — provable by the bin width in d[2].
+    MiningInterface mi2(false, nullptr, c2pool::address::Blockchain::DASH);
+    mi2.set_stat_log_path(path);
+    mi2.load_stat_log();
+    ASSERT_TRUE(wait_views_ready(mi2));
+
+    auto week = mi2.rest_web_graph_data("pool_hash_rate", "last_week");
+    ASSERT_TRUE(week.is_array());
+    ASSERT_FALSE(week.empty());
+    // The bin path's newest bin is partial, so its width is < the full 2016 s
+    // bin width but is NEVER the flat path's hardcoded 300.0 — that difference
+    // is the proof the request was answered from the bins.
+    const double wk_w = week.back()[2].get<double>();
+    EXPECT_NE(wk_w, 300.0) << "week must be served from the bins, not the flat 300s path";
+    EXPECT_GT(wk_w, 0.0);
+    EXPECT_LE(wk_w, kWeekBinWidth + 1e-6);
+
+    // last_hour stays on the flat path (unchanged), width == 300.
+    auto hour = mi2.rest_web_graph_data("pool_hash_rate", "last_hour");
+    ASSERT_TRUE(hour.is_array());
+    if (!hour.empty())
+        EXPECT_NEAR(hour.back()[2].get<double>(), 300.0, 1e-6)
+            << "last_hour must keep the flat path unchanged";
+
+    std::remove(path.c_str());
+    std::remove((path + ".views").c_str());
+    std::remove((path + ".best.json").c_str());
+}
+
+// The served pool_rates dict keeps EXACTLY {good,orphan,dead}; the internal
+// 'null' sample-counter key must never leak (dashboard.html sums d[1]['null']
+// into DOA — review-mandated served-dict hygiene).
+TEST(DashboardData, GraphViewsPoolRatesServedShapeHasNoNullKey)
+{
+    const std::string path = "/tmp/c2pool_test_g4_poolrates.json";
+    std::remove(path.c_str());
+    std::remove((path + ".views").c_str());
+    std::remove((path + ".best.json").c_str());
+
+    MiningInterface mi(false, nullptr, c2pool::address::Blockchain::DASH);
+    mi.set_pool_hashrate_fn([]() { return 5000.0; });
+    mi.set_stat_log_path(path);
+    mi.load_stat_log();
+    ASSERT_TRUE(wait_views_ready(mi));
+    for (int i = 0; i < 4; ++i) mi.update_stat_log();
+
+    auto week = mi.rest_web_graph_data("pool_rates", "last_week");
+    ASSERT_TRUE(week.is_array());
+    ASSERT_FALSE(week.empty());
+    const double wk_w = week.back()[2].get<double>();
+    EXPECT_NE(wk_w, 300.0);            // from bins, not the flat 300s path
+    EXPECT_LE(wk_w, kWeekBinWidth + 1e-6);
+    const auto& val = week.back()[1];
+    ASSERT_TRUE(val.is_object());
+    EXPECT_TRUE(val.contains("good"));
+    EXPECT_TRUE(val.contains("orphan"));
+    EXPECT_TRUE(val.contains("dead"));
+    EXPECT_FALSE(val.contains("null")) << "the sample-counter key must not leak";
+
+    std::remove(path.c_str());
+    std::remove((path + ".views").c_str());
+    std::remove((path + ".best.json").c_str());
+}
+
+// A corrupt sidecar must NOT crash load_stat_log and must NOT block the flat
+// file from loading; the node degrades to reseed-from-flat and keeps serving.
+TEST(DashboardData, GraphViewsCorruptSidecarDegradesToFlatSeed)
+{
+    const std::string path = "/tmp/c2pool_test_g4_corrupt.json";
+    std::remove(path.c_str());
+    std::remove((path + ".views").c_str());
+    std::remove((path + ".best.json").c_str());
+
+    // First, produce a valid flat log with a few entries.
+    {
+        MiningInterface mi(false, nullptr, c2pool::address::Blockchain::DASH);
+        mi.set_pool_hashrate_fn([]() { return 42.0; });
+        mi.set_stat_log_path(path);
+        mi.load_stat_log();
+        ASSERT_TRUE(wait_views_ready(mi));
+        for (int i = 0; i < 3; ++i) mi.update_stat_log();
+        mi.save_stat_log();
+    }
+    // Now corrupt the sidecar (valid flat file still present).
+    { std::ofstream f(path + ".views", std::ios::trunc); f << "{ this is not json"; }
+
+    MiningInterface mi2(false, nullptr, c2pool::address::Blockchain::DASH);
+    mi2.set_stat_log_path(path);
+    ASSERT_NO_THROW(mi2.load_stat_log());   // must not crash on the corrupt file
+    ASSERT_TRUE(wait_views_ready(mi2));     // seeded from the flat log instead
+    // Still serves week (from the reseeded bins).
+    auto week = mi2.rest_web_graph_data("pool_hash_rate", "last_week");
+    EXPECT_TRUE(week.is_array());
+
+    std::remove(path.c_str());
+    std::remove((path + ".views").c_str());
+    std::remove((path + ".best.json").c_str());
+}
+
+// A truncated sidecar (partial JSON) is tolerated the same way; and a totally
+// absent sidecar on an existing flat log is the ordinary upgrade path.
+TEST(DashboardData, GraphViewsTruncatedAndMissingSidecarTolerated)
+{
+    const std::string path = "/tmp/c2pool_test_g4_trunc.json";
+    std::remove(path.c_str());
+    std::remove((path + ".views").c_str());
+    std::remove((path + ".best.json").c_str());
+
+    {
+        MiningInterface mi(false, nullptr, c2pool::address::Blockchain::DASH);
+        mi.set_pool_hashrate_fn([]() { return 7.0; });
+        mi.set_stat_log_path(path);
+        mi.load_stat_log();
+        ASSERT_TRUE(wait_views_ready(mi));
+        for (int i = 0; i < 3; ++i) mi.update_stat_log();
+        mi.save_stat_log();
+    }
+    // Truncate the sidecar to a partial object.
+    {
+        std::ifstream in(path + ".views");
+        std::string s((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        std::ofstream out(path + ".views", std::ios::trunc);
+        out << s.substr(0, s.size() / 2);   // half a JSON document
+    }
+    MiningInterface mi2(false, nullptr, c2pool::address::Blockchain::DASH);
+    mi2.set_stat_log_path(path);
+    ASSERT_NO_THROW(mi2.load_stat_log());
+    EXPECT_TRUE(wait_views_ready(mi2));
+
+    // Absent sidecar: the classic first-boot-after-upgrade path. The flat 31d
+    // history seeds the week/month/year views.
+    std::remove((path + ".views").c_str());
+    MiningInterface mi3(false, nullptr, c2pool::address::Blockchain::DASH);
+    mi3.set_stat_log_path(path);
+    ASSERT_NO_THROW(mi3.load_stat_log());
+    EXPECT_TRUE(wait_views_ready(mi3));
+    auto year = mi3.rest_web_graph_data("pool_hash_rate", "last_year");
+    EXPECT_TRUE(year.is_array());   // seeded from the flat log, serves
+
+    std::remove(path.c_str());
+    std::remove((path + ".views").c_str());
+    std::remove((path + ".best.json").c_str());
 }
