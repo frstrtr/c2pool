@@ -56,9 +56,12 @@
 //   * only after `min_quiet` seconds of no SML progress (well above a normal
 //     round trip, well below a block interval);
 //   * geometric backoff between attempts;
-//   * at most `max_attempts` per stuck (tip, sml) pair — after that we wait for
-//     the next block exactly as today, so a genuinely unreachable peer sees the
-//     same traffic it sees now plus a bounded constant;
+//   * geometric backoff for the first `max_attempts` tries, then the interval
+//     is CLAMPED and the re-ask CONTINUES at that clamped cadence for as long
+//     as the pair stays stuck — so a genuinely unreachable peer sees a bounded
+//     ~1 request per clamp-interval, never a burst, but an 18-min block gap can
+//     no longer strand the arm on the dashd fallback with healthy peers idle
+//     (the armed-once-never-re-armed failure the old hard stop caused);
 //   * any observed SML progress, or a tip change, resets everything.
 
 #include <cstdint>
@@ -80,8 +83,12 @@ public:
         int64_t  min_quiet_sec{20};
         /// Multiplier applied to the wait after each attempt.
         int64_t  backoff_mult{2};
-        /// Hard cap per stuck (tip, sml) pair. After this we go quiet and let
-        /// the next tip change do what it does today.
+        /// Backoff CLAMP for a stuck (tip, sml) pair. The re-ask interval
+        /// grows geometrically for the first max_attempts tries and then
+        /// stays pinned at that interval; the watchdog keeps re-asking at that
+        /// clamped cadence for as long as the pair stays stuck (a stalled
+        /// chain never changes the pair), because going silent forever here is
+        /// the 18-min-wedge bug. Any SML progress or tip change resets it.
         uint32_t max_attempts{3};
     };
 
@@ -127,11 +134,22 @@ public:
             return std::nullopt;   // never retry on the FIRST sighting
         }
 
-        if (m_attempts >= m_cfg.max_attempts) return std::nullopt;
-
-        // Wait: min_quiet before the first attempt, then geometric backoff.
+        // Wait: min_quiet before the first attempt, then geometric backoff,
+        // CLAMPED at the max_attempts-th interval. Past the cap the interval
+        // stops GROWING but the re-request never STOPS. Going silent forever
+        // for a stuck (tip, sml) pair is the 18-min-wedge bug: while the chain
+        // is stalled the pair never changes, so a hard stop left the embedded
+        // arm on the dashd fallback with healthy peers idle until the NEXT
+        // block, and across an 18-min block gap that is an 18-min hole (the
+        // armed-once-never-re-armed class). A retry clamped at the cap cadence
+        // bounds the traffic to one request per
+        // ~(min_quiet * backoff_mult^max_attempts) seconds, keeps rotating
+        // peers through the caller's re-ask, and still resets the instant the
+        // SML makes progress or the tip moves.
+        const uint32_t steps =
+            (m_attempts < m_cfg.max_attempts) ? m_attempts : m_cfg.max_attempts;
         int64_t wait = m_cfg.min_quiet_sec;
-        for (uint32_t i = 0; i < m_attempts; ++i) wait *= m_cfg.backoff_mult;
+        for (uint32_t i = 0; i < steps; ++i) wait *= m_cfg.backoff_mult;
         const int64_t since = (m_last_try >= 0) ? m_last_try : m_since_sec;
         if (now_sec - since < wait) return std::nullopt;
 
