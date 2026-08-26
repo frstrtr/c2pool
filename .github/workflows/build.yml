@@ -182,7 +182,9 @@ jobs:
       - name: Boost sentinel
         run: |
           cmake --build build_ci --target boost_sentinel -j8
-          ctest --test-dir build_ci -R '^boost_sentinel$' --output-on-failure
+          # --no-tests=error: the sentinel must actually RUN; if the target
+          # ever fails to register, an empty selection cannot pass as green.
+          ctest --test-dir build_ci -R '^boost_sentinel$' --output-on-failure --no-tests=error
 
       - name: Build
         # shell: bash => bash -o pipefail. WITHOUT it the default shell is
@@ -618,7 +620,10 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=0:check_initialization_order=1:strict_string_checks=1:abort_on_error=0
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=0
-        run: ctest --output-on-failure -j8 --exclude-regex "LiveTest\."
+        # --no-tests=error: per-binary zero-test floor. If the exclude ever
+        # swallows every case (or the tests fail to register), ctest REDs
+        # instead of greening over an empty run.
+        run: ctest --output-on-failure --no-tests=error -j8 --exclude-regex "LiveTest\."
 
       - name: Upload sanitizer test results on failure
         if: failure()
@@ -789,7 +794,10 @@ jobs:
 
       - name: Run BCH tests
         working-directory: build_bch
-        run: ctest --output-on-failure -j8 -R "^bch_"
+        # --no-tests=error: per-binary zero-test floor. A `-R "^bch_"` that
+        # selects nothing (targets renamed / failed to register) must RED,
+        # not green over an empty selection.
+        run: ctest --output-on-failure --no-tests=error -j8 -R "^bch_"
 
       - name: Upload test results on failure
         if: failure()
@@ -944,7 +952,10 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=0:check_initialization_order=1:strict_string_checks=1:abort_on_error=0
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=0
-        run: ctest --output-on-failure -j8 -R "^bch_"
+        # --no-tests=error: per-binary zero-test floor. A `-R "^bch_"` that
+        # selects nothing (targets renamed / failed to register) must RED,
+        # not green over an empty selection.
+        run: ctest --output-on-failure --no-tests=error -j8 -R "^bch_"
 
       - name: Upload sanitizer test results on failure
         if: failure()
@@ -1757,7 +1768,10 @@ jobs:
 
       - name: Run BLS KATs
         working-directory: build_dash_bls
-        run: ctest --output-on-failure -j8 -R 'DashBlsVerify|DashQuorumMembers|DashQuorumMemberSource|DashGovVoteBLS|DashChainLockVerify|DashIsdlockBls'
+        # --no-tests=error: per-binary zero-test floor. These KATs live behind
+        # #ifdef C2POOL_DASH_BLS, so a stub build makes the selector match zero
+        # -- RED here, belt to the explicit per-name assertion in the next step.
+        run: ctest --output-on-failure --no-tests=error -j8 -R 'DashBlsVerify|DashQuorumMembers|DashQuorumMemberSource|DashGovVoteBLS|DashChainLockVerify|DashIsdlockBls'
 
       # LEG 3: the BLS-ONLY cases actually ran. Each of these is inside
       # #ifdef C2POOL_DASH_BLS, so on a stub build they do not fail -- they
