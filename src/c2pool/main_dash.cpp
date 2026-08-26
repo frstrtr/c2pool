@@ -1701,13 +1701,36 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 mi->set_current_payouts_fn(current_pplns);
 
                 mi->set_sharechain_window_fn(
-                    [node_ptr, view_ctx, current_pplns]() -> nlohmann::json {
+                    [node_ptr, view_ctx, current_pplns, mi]() -> nlohmann::json {
                         auto cur = current_pplns();          // takes + releases the guard
                         auto guard = node_ptr->read_tracker();
                         if (!guard) return nlohmann::json::object();
                         auto w = dash::dashboard::build_window(*guard, view_ctx());
                         if (cur.is_object() && !cur.empty())
                             w["pplns_current"] = std::move(cur);
+                        // Per-share PPLNS overlay for the sharechain-explorer
+                        // hover — parity with LTC (main_ltc.cpp:3945-3951).
+                        // cache_pplns_at_tip() populates m_pplns_per_tip on
+                        // every DASH best-share change (through the
+                        // fire_share_tip_refresh -> trigger_work_refresh_debounced
+                        // -> execute_debounced_work_refresh pump, web_server.cpp:8686),
+                        // keyed by the SAME 16-hex short hash build_window emits
+                        // as each share's "h". Cache-hit only, exactly like LTC:
+                        // entries accumulate as tips advance; a share not yet
+                        // cached simply isn't in the map and the front-end
+                        // (dashboard.html getPPLNSForShare) falls back to
+                        // pplns_current. Read-only: no share bytes, coinbase,
+                        // payee or PPLNS math is touched here.
+                        if (mi && w.contains("shares") && w["shares"].is_array()) {
+                            nlohmann::json pplns_map = nlohmann::json::object();
+                            for (const auto& s : w["shares"]) {
+                                if (!s.contains("h")) continue;
+                                std::string sh = s["h"].get<std::string>();
+                                auto p = mi->get_pplns_for_tip(sh);
+                                if (!p.empty()) pplns_map[sh] = std::move(p);
+                            }
+                            if (!pplns_map.empty()) w["pplns"] = std::move(pplns_map);
+                        }
                         return w;
                     });
                 // The grid IS the sharechain — refresh it on tip change, not on
@@ -1715,10 +1738,26 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 mi->mark_last_cache_tip_driven();
 
                 mi->set_sharechain_delta_fn(
-                    [node_ptr, view_ctx](const std::string& since_hash) -> nlohmann::json {
+                    [node_ptr, view_ctx, mi](const std::string& since_hash) -> nlohmann::json {
                         auto guard = node_ptr->read_tracker();
                         if (!guard) return nlohmann::json::object();
-                        return dash::dashboard::build_delta(*guard, since_hash, view_ctx());
+                        auto d = dash::dashboard::build_delta(*guard, since_hash, view_ctx());
+                        // Per-share PPLNS overlay on the incremental path so a
+                        // client that stays connected keeps getting per-share
+                        // payout data for newly-arrived shares — parity with LTC
+                        // delta (main_ltc.cpp:4116-4122). Same m_pplns_per_tip
+                        // cache, same 16-hex "h" key, cache-hit only.
+                        if (mi && d.contains("shares") && d["shares"].is_array()) {
+                            nlohmann::json pplns_map = nlohmann::json::object();
+                            for (const auto& s : d["shares"]) {
+                                if (!s.contains("h")) continue;
+                                std::string sh = s["h"].get<std::string>();
+                                auto p = mi->get_pplns_for_tip(sh);
+                                if (!p.empty()) pplns_map[sh] = std::move(p);
+                            }
+                            if (!pplns_map.empty()) d["pplns"] = std::move(pplns_map);
+                        }
+                        return d;
                     });
 
                 // Individual share page + THE PPLNS VIEW FOR THAT SHARE.
