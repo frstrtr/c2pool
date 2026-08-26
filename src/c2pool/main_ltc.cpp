@@ -294,6 +294,33 @@ using Blockchain = c2pool::address::Blockchain;
 using Network = c2pool::address::Network;
 using NodeOwnerAddressSource = c2pool::payout::NodeOwnerPayoutConfig::AddressSource;
 
+// Block-explorer detail row for one discovered merged (aux, e.g. DOGE) block.
+// The sharechain list endpoints historically emitted doge_blocks[] as bare
+// 16-char parent-hash strings, so the block explorer could mark that an aux
+// block was found on a parent block but could show ZERO block-level detail for
+// it (issue #946). Every field below already lives in the in-memory
+// DiscoveredMergedBlock; this just surfaces it. Field names match the per-hash
+// /block/<hash> detail endpoint (symbol/height/block_hash/reward/miner) so the
+// front-end reads one shape everywhere. Emitted ADDITIVELY as doge_blocks_detail
+// alongside the unchanged doge_blocks[] string array, so existing fork-marker
+// consumers (dashboard.html dogeSet, explorer realtime.ts string filter) keep
+// working untouched. Display only; no submission/target/payout logic here.
+static nlohmann::json doge_block_detail_json(const c2pool::merged::DiscoveredMergedBlock& db)
+{
+    nlohmann::json o;
+    o["symbol"]        = db.symbol;
+    o["height"]        = db.height;
+    o["block_hash"]    = db.block_hash;
+    o["parent_hash"]   = db.parent_hash;
+    o["parent_height"] = db.parent_height;
+    o["timestamp"]     = db.timestamp;
+    o["reward"]        = static_cast<double>(db.coinbase_value) / 1e8;  // satoshis -> coin
+    o["miner"]         = db.miner;
+    o["is_local"]      = db.is_local;
+    o["accepted"]      = db.accepted;
+    return o;
+}
+
 // Global signal handling
 static bool g_shutdown_requested = false;
 
@@ -3872,14 +3899,18 @@ int main(int argc, char* argv[]) {
                     }
                 }
 
-                // DOGE discovered blocks — keyed by parent (LTC) block hash
+                // DOGE discovered blocks — keyed by parent (LTC) block hash.
+                // doge_arr keeps the legacy 16-char marker strings; doge_detail
+                // carries the full block-level detail additively (issue #946).
                 nlohmann::json doge_arr = nlohmann::json::array();
+                nlohmann::json doge_detail = nlohmann::json::array();
                 if (mi) {
                     auto* mm = mi->get_mm_manager();
                     if (mm) {
                         for (const auto& db : mm->get_discovered_blocks()) {
                             if (!db.parent_hash.empty())
                                 doge_arr.push_back(db.parent_hash.substr(0, 16));
+                            doge_detail.push_back(doge_block_detail_json(db));
                         }
                     }
                 }
@@ -3888,6 +3919,7 @@ int main(int argc, char* argv[]) {
                 result["heads"] = std::move(heads_arr);
                 result["blocks"] = std::move(blocks_arr);
                 result["doge_blocks"] = std::move(doge_arr);
+                result["doge_blocks_detail"] = std::move(doge_detail);
                 result["total"] = static_cast<int>(chain.size());
                 // Include per-share PPLNS + current as fallback
                 if (mi) {
@@ -4044,10 +4076,13 @@ int main(int argc, char* argv[]) {
                         if (!fb.share_hash.empty()) blocks_arr.push_back(fb.share_hash.substr(0, 16));
                 }
                 nlohmann::json doge_arr = nlohmann::json::array();
+                nlohmann::json doge_detail = nlohmann::json::array();
                 if (mi) {
                     auto* mm = mi->get_mm_manager();
-                    if (mm) for (const auto& db : mm->get_discovered_blocks())
+                    if (mm) for (const auto& db : mm->get_discovered_blocks()) {
                         if (!db.parent_hash.empty()) doge_arr.push_back(db.parent_hash.substr(0, 16));
+                        doge_detail.push_back(doge_block_detail_json(db));
+                    }
                 }
 
                 result["shares"] = std::move(shares_arr);
@@ -4056,6 +4091,7 @@ int main(int argc, char* argv[]) {
                 result["heads"] = std::move(heads_arr);
                 result["blocks"] = std::move(blocks_arr);
                 result["doge_blocks"] = std::move(doge_arr);
+                result["doge_blocks_detail"] = std::move(doge_detail);
 
                 // Include per-share PPLNS snapshots from server cache
                 // Each share's tip had a unique PPLNS computed at arrival time
