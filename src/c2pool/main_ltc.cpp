@@ -2064,6 +2064,11 @@ int main(int argc, char* argv[]) {
                     mi->load_persisted_found_blocks();
                     LOG_INFO << "[Pool] Found block persistence enabled at " << fblk_db_path;
 
+                    // #159 (G6): seed the network-difficulty series from restored
+                    // found-block rows so the long-horizon diff curve is
+                    // rebuildable from a wiped stat/.views file. Display-only.
+                    mi->seed_netdiff_history_from_found_blocks();
+
                     // Merged block persistence (shares same LevelDB)
                     auto mblk_store = std::make_shared<c2pool::storage::MergedBlockStore>(*fblk_leveldb);
                     mi->set_merged_block_store(mblk_store);
