@@ -263,6 +263,40 @@ TEST(DashDashboardViews, DeltaHonoursItsSafetyCap)
     EXPECT_EQ(d["shares"].size(), 5u);
 }
 
+// ── KAT 4b: a `since` the walk can't re-derive resyncs, not silently drifts ──
+// Explorer SSE fade-by-age (task #112). When the client's held tip is orphaned
+// by a reorg (or the client is more than a window behind), walking back from the
+// current best never reaches `since_hash`. Emitting fork_switch tells the client
+// to rebuild from the authoritative set; without it the client spliced a
+// disconnected delta, kept the orphaned shares, and evicted good ones by cap.
+TEST(DashDashboardViews, DeltaSignalsForkSwitchWhenSinceIsNotOnTheBestChain)
+{
+    ChainHarness h(12);
+    auto ctx = h.ctx();
+
+    // Normal cases carry the flag explicitly false — never a spurious resync.
+    auto at_tip = dash::dashboard::build_delta(h.node.tracker(),
+                                               h.tip.GetHex().substr(0, 16), ctx);
+    ASSERT_TRUE(at_tip.contains("fork_switch"));
+    EXPECT_FALSE(at_tip["fork_switch"].get<bool>());
+
+    const std::string behind = view_hash(8).GetHex().substr(0, 16);
+    auto d_behind = dash::dashboard::build_delta(h.node.tracker(), behind, ctx);
+    EXPECT_FALSE(d_behind["fork_switch"].get<bool>());
+
+    // Cold client (empty since) is a legitimate full walk, not a fork.
+    auto cold = dash::dashboard::build_delta(h.node.tracker(), "", ctx);
+    EXPECT_FALSE(cold["fork_switch"].get<bool>());
+
+    // An orphaned / unknown tip the chain has never held -> resync. The walk
+    // still returns the current window so the client can rebuild from it.
+    const std::string orphan = view_hash(0x777).GetHex().substr(0, 16);
+    auto d_fork = dash::dashboard::build_delta(h.node.tracker(), orphan, ctx);
+    EXPECT_TRUE(d_fork["fork_switch"].get<bool>());
+    EXPECT_EQ(d_fork["count"].get<int>(), 12);
+    EXPECT_EQ(d_fork["shares"].size(), 12u);
+}
+
 // ── KAT 5: the individual share page ────────────────────────────────────────
 TEST(DashDashboardViews, ShareDetailAnswersForAShareInTheTracker)
 {
