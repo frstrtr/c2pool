@@ -26,13 +26,26 @@ struct FoundBlockRecord {
     std::string finder_address;     // miner who found the block (if known)
     uint64_t    reward_satoshis{0}; // coinbase reward amount (if known)
     uint256     the_state_root;     // THE commitment embedded in coinbase scriptSig
+    // --- v2 dashboard-enrichment fields (issue #159) ---
+    // Persisted from the in-memory FoundBlock so a restored row keeps its
+    // difficulties, pool hashrate, winning-share hash and authorship instead of
+    // decaying to a bare skeleton after a restart. Doubles are stored as their
+    // IEEE-754 bit pattern (uint64) to match the existing little-endian memcpy
+    // read path — no dependency on operator<< double serialization.
+    double      network_difficulty{0.0}; // network difficulty at time of find
+    double      share_difficulty{0.0};   // winning share difficulty
+    double      pool_hashrate{0.0};      // pool hashrate at time of find
+    std::string share_hash;              // hash of the share that found the block
+    uint8_t     authorship{0};           // BlockAuthorship: 0=unknown, 1=peer, 2=this node
 
     // Serialize to bytes for LevelDB storage
     std::vector<uint8_t> serialize() const
     {
         PackStream ps;
-        // Version byte for future extensibility
-        uint8_t version = 1;
+        // Version byte. v2 appends the enrichment tail after the v1 body; a v1
+        // reader stops at reward_satoshis and a v2 reader that meets a v1 record
+        // simply leaves the new fields at their defaults (read-compat).
+        uint8_t version = 2;
         ps << version;
         // Chain as length-prefixed string
         uint8_t chain_len = static_cast<uint8_t>(std::min(chain.size(), size_t(255)));
@@ -57,6 +70,21 @@ struct FoundBlockRecord {
             ps.write(std::span<const std::byte>(
                 reinterpret_cast<const std::byte*>(finder_address.data()), addr_len));
         ps << reward_satoshis;
+        // --- v2 tail ---
+        auto put_double = [&ps](double d) {
+            uint64_t bits;
+            std::memcpy(&bits, &d, sizeof(bits));
+            ps << bits;
+        };
+        put_double(network_difficulty);
+        put_double(share_difficulty);
+        put_double(pool_hashrate);
+        uint8_t sh_len = static_cast<uint8_t>(std::min(share_hash.size(), size_t(255)));
+        ps << sh_len;
+        if (sh_len > 0)
+            ps.write(std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(share_hash.data()), sh_len));
+        ps << authorship;
 
         auto span = ps.get_span();
         return {reinterpret_cast<const uint8_t*>(span.data()),
@@ -95,7 +123,7 @@ struct FoundBlockRecord {
         };
 
         uint8_t version = read_u8();
-        if (version != 1) return rec; // unknown version
+        if (version != 1 && version != 2) return rec; // unknown version
 
         uint8_t chain_len = read_u8();
         rec.chain = read_str(chain_len);
@@ -110,6 +138,25 @@ struct FoundBlockRecord {
         uint8_t addr_len = read_u8();
         rec.finder_address = read_str(addr_len);
         rec.reward_satoshis = read_u64();
+
+        // --- v2 enrichment tail (absent on v1 records) ---
+        // Every read is bounds-checked (read_* return 0/"" past end), so a
+        // truncated or partially-written v2 record degrades to defaults for the
+        // missing fields rather than throwing — load stays crash-safe.
+        if (version >= 2) {
+            auto get_double = [&]() -> double {
+                uint64_t bits = read_u64();
+                double d;
+                std::memcpy(&d, &bits, sizeof(d));
+                return d;
+            };
+            rec.network_difficulty = get_double();
+            rec.share_difficulty = get_double();
+            rec.pool_hashrate = get_double();
+            uint8_t sh_len = read_u8();
+            rec.share_hash = read_str(sh_len);
+            rec.authorship = read_u8();
+        }
 
         return rec;
     }

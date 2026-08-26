@@ -1303,6 +1303,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         rec.check_count = blk.check_count;
                         rec.confirmations = blk.confirmations;
                         rec.last_checked = static_cast<uint64_t>(std::time(nullptr));
+                        // #159: persist the dashboard-enrichment fields so a
+                        // restored row keeps miner/reward/difficulties/hashrate/
+                        // share-hash/authorship instead of a bare skeleton.
+                        rec.finder_address = blk.miner;
+                        rec.reward_satoshis = blk.subsidy;
+                        rec.network_difficulty = blk.network_difficulty;
+                        rec.share_difficulty = blk.share_difficulty;
+                        rec.pool_hashrate = blk.pool_hashrate;
+                        rec.share_hash = blk.share_hash;
+                        rec.authorship = static_cast<uint8_t>(blk.authorship);
                         return fblk_store->store(rec);
                     },
                     [fblk_store, fblk_leveldb]() -> std::vector<MI::FoundBlock> {
@@ -1318,6 +1328,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             blk.check_count = rec.check_count;
                             blk.chain = rec.chain;
                             blk.confirmations = rec.confirmations;
+                            // #159: restore enrichment (v1 records leave these at 0).
+                            blk.miner = rec.finder_address;
+                            blk.subsidy = rec.reward_satoshis;
+                            blk.network_difficulty = rec.network_difficulty;
+                            blk.share_difficulty = rec.share_difficulty;
+                            blk.pool_hashrate = rec.pool_hashrate;
+                            blk.share_hash = rec.share_hash;
+                            blk.authorship = static_cast<MI::BlockAuthorship>(rec.authorship);
                             result.push_back(std::move(blk));
                         }
                         return result;
@@ -8415,6 +8433,39 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                      "(daemonless header-chain verdict"
                   << (rpc ? " + dashd getblockheader fallback" : "")
                   << ")\n";
+
+        // #159 (G5): backfill network_difficulty + timestamp on restored found
+        // blocks from the embedded DASH header chain (parity with main_ltc.cpp).
+        // A v1 record — or any row recorded before the enrichment fields
+        // existed — carries network_difficulty=0, which is one of the two luck
+        // inputs; the exact value comes from the block header's nBits. Purely
+        // daemonless: reads only our own SPV header store, no dashd. Runs before
+        // the re-verify pass so the recomputed luck series uses the filled
+        // difficulty. backfill_block_fields internally re-derives the luck trend.
+        if (header_chain) {
+            auto* hc = header_chain.get();
+            cache_mi->backfill_block_fields(
+                [hc](const std::string& block_hash_hex) -> double {
+                    uint256 h;
+                    h.SetHex(block_hash_hex);
+                    auto e = hc->get_header(h);
+                    if (!e) return 0.0;
+                    return chain::target_to_difficulty(
+                        chain::bits_to_target(e->header.m_bits));
+                },
+                [hc](const std::string& block_hash_hex) -> uint32_t {
+                    uint256 h;
+                    h.SetHex(block_hash_hex);
+                    auto e = hc->get_header(h);
+                    return e ? e->header.m_timestamp : 0;
+                });
+        }
+
+        // #159 (G2): the verifier + io_context are now live, so drive a
+        // confirm/orphan pass over any found block that was still pending when
+        // this node last shut down. Without it a restored pending row never
+        // gets re-checked and stays "pending" on the dashboard forever.
+        cache_mi->reverify_pending_found_blocks();
     }
 
     // ════════════════════════════════════════════════════════════════════════

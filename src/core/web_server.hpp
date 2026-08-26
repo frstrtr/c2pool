@@ -989,11 +989,29 @@ public:
     /// Load persisted found blocks from storage (call once after persistence is set)
     void load_persisted_found_blocks();
 
+    /// #159 (G2): schedule confirm/orphan verification for every restored row
+    /// still marked pending. load_persisted_found_blocks() only rebuilds the
+    /// rows; without this a row that was pending at shutdown stays "pending"
+    /// forever because the live verification schedulers only fire on freshly
+    /// recorded blocks. Call once AFTER the block-verify callback and io_context
+    /// are wired. Safe to call with no verifier/io_context (it no-ops per row).
+    void reverify_pending_found_blocks();
+
     /// Backfill network_difficulty on loaded blocks using a block hash → difficulty lookup.
     /// Called after embedded header chain is available.
     using block_diff_lookup_fn = std::function<double(const std::string& block_hash)>;
     using block_ts_lookup_fn = std::function<uint32_t(const std::string& block_hash)>;
     void backfill_block_fields(block_diff_lookup_fn diff_fn, block_ts_lookup_fn ts_fn);
+
+private:
+    /// #159 (G3): recompute the DERIVED found-block fields (time_to_find,
+    /// expected_time, luck) that are never persisted, from the height-ordered
+    /// timestamps + network_difficulty + pool_hashrate that ARE restored. Only
+    /// fills fields still at 0 so it never clobbers a live-computed value.
+    /// CALLER MUST HOLD m_blocks_mutex. Coin-generic; run at load and again
+    /// after backfill_block_fields fills a previously-missing network_difficulty.
+    void recompute_found_block_luck_locked();
+public:
 
     /// Merged block persistence — opaque store pointer, cast in .cpp.
     void set_merged_block_store(std::shared_ptr<void> store);
