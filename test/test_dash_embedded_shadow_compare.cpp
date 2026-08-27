@@ -711,3 +711,88 @@ TEST(DashShadowCompare, CandidateOursOnlyIsMeasuredAndReportedInformational) {
     EXPECT_FALSE(has_line_with(o.log_lines,
                                "do NOT enable --embedded-serve-mempool-txs"));
 }
+
+// ═════════════════════════════════════════════════════════════════════════
+// ZERO SAMPLES IS NOT A CLEAN RESULT — the August DASH soak guard.
+//
+// The probe is serve-triggered, so it measures nothing when nothing is
+// served. On the soak that lasted 12 h (no miner on the node's stratum, so
+// the serve path never fired and on_serve was never called) and the honest
+// a=0 was read by every consumer as "fine". These pin the two surfaces that
+// make the state report itself POSITIVELY: an unconditional attempts count,
+// and a named status that says NOTHING WAS MEASURED rather than a block of
+// zeros that reads like health.
+// ═════════════════════════════════════════════════════════════════════════
+
+// Every processed sample advances shadow_attempts — including the verdict
+// that advances NO other top-level counter. A non-served Mismatch whose only
+// divergence is a non-commitment field bumps shadow_mismatch_by_field and
+// nothing else, so before this counter existed the tallies could read
+// all-zero under real traffic, not merely under starvation.
+TEST(DashShadowCompare, AttemptsCountsEverySampleIncludingCounterlessVerdicts) {
+    auto emb_cb  = make_cbtx(2500000, /*mn_seed=*/1, /*q_seed=*/100);
+    auto dref_cb = make_cbtx(2500001, /*mn_seed=*/1, /*q_seed=*/100);
+    auto emb  = make_wd(2500000, emb_cb,  "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    // Fallback arm + a non-commitment (cbtx_height) divergence only.
+    auto dref = make_wd(2500000, dref_cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+
+    const auto o = shadow_evaluate(WorkSource::DashdFallback, emb, dref);
+    ASSERT_EQ(o.kind, ShadowOutcome::Kind::Mismatch);
+    EXPECT_FALSE(o.served_mismatch);
+
+    ShadowCounters c;
+    EXPECT_EQ(c.shadow_attempts, 0u);
+    c.apply(o);
+    // The top-level verdict tallies are all still zero — which is exactly the
+    // reading that must not be mistaken for "the probe never ran".
+    EXPECT_EQ(c.shadow_match, 0u);
+    EXPECT_EQ(c.shadow_no_oracle, 0u);
+    EXPECT_EQ(c.shadow_served_mismatch, 0u);
+    EXPECT_EQ(c.shadow_match_modulo_mempool_protx, 0u);
+    EXPECT_EQ(c.shadow_attempts, 1u);
+    EXPECT_EQ(c.to_json()["shadow-attempts"], 1u);
+}
+
+// A fresh probe that has been handed nothing reports NO-SAMPLES, not OK: an
+// all-zero counter block is a statement about MEASUREMENT, never about health.
+TEST(DashShadowCompare, FreshProbeWithNoSamplesReportsNoSamplesStatus) {
+    EmbeddedShadowCompare probe(
+        []() -> std::optional<DashWorkData> { return std::nullopt; });
+
+    const auto j = probe.stats_json();
+    EXPECT_EQ(j["status"], "NO-SAMPLES");
+    EXPECT_EQ(j["shadow-attempts"], 0u);
+    // Zero serves REACHED the probe: the starvation signature (nothing asked
+    // this node for a template) as distinct from a stuck worker.
+    EXPECT_EQ(j["shadow-serves-enqueued"], 0u);
+}
+
+// One processed sample flips the status to OK and the attempts count off zero
+// — the other half of the guard: NO-SAMPLES must be a transient of an unused
+// probe, not a permanent label.
+TEST(DashShadowCompare, StatusFlipsToOkAfterOneProcessedSample) {
+    auto cb     = make_cbtx(2500000);
+    auto served = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+    auto dref   = make_wd(2500000, cb, "yMNaddrAAAAAAAAAAAAAAAAAAAAA");
+
+    EmbeddedShadowCompare probe(
+        [dref]() -> std::optional<DashWorkData> { return dref; });
+    ASSERT_EQ(probe.stats_json()["status"], "NO-SAMPLES");
+
+    probe.on_serve(WorkSource::Embedded, served);
+
+    bool fired = false;
+    for (int i = 0; i < 200 && !fired; ++i) {
+        if (probe.stats_json().value("shadow-attempts", 0u) >= 1u) fired = true;
+        else std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(fired);
+
+    const auto j = probe.stats_json();
+    EXPECT_EQ(j["status"], "OK");
+    EXPECT_GE(j["shadow-attempts"].get<uint64_t>(), 1u);
+    EXPECT_GE(j["shadow-serves-enqueued"].get<uint64_t>(), 1u);
+    // The sample itself matched — status is about measurement having HAPPENED,
+    // and is reported alongside the verdict tallies, never instead of them.
+    EXPECT_EQ(j["shadow-match"], 1u);
+}
