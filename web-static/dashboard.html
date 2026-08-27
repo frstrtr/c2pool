@@ -2418,7 +2418,7 @@
             var label, color;
             if (by === 'this_node')            { label = 'This node'; color = '#00ff88'; }
             else if (by === 'sharechain_peer') { label = 'Pool peer'; color = '#00d4ff'; }
-            else                               { label = 'Unknown';   color = '#888888'; }
+            else                               { label = '—';         color = '#888888'; }
             var s = 'Found by: <b style="color:' + color + '">' + label + '</b><br/>';
             if (b && b.miner) {
                 var addr = String(b.miner);
