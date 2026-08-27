@@ -31,6 +31,7 @@
 // on the wire; share bytes, minting and payout are untouched.
 // ---------------------------------------------------------------------------
 
+#include <algorithm>
 #include <cstddef>
 #include <iostream>
 #include <map>
@@ -75,6 +76,21 @@ std::vector<uint256> walk(const std::vector<uint256>& chain_tip_first,
     for (const auto& hash : chain_tip_first) {
         if (marked.count(hash))
             break;
+        to_send.push_back(hash);
+    }
+    return to_send;
+}
+
+// The tip-first walk readvertise_best_share() performs (#885), verbatim in its
+// essentials: it does NOT consult the de-dup set, so a head share already in
+// m_shared_share_hashes is still re-pushed. It skips only peer-REJECTED hashes.
+std::vector<uint256> readvertise_walk(const std::vector<uint256>& chain_tip_first,
+                                      const std::set<uint256>& rejected)
+{
+    std::vector<uint256> to_send;
+    for (const auto& hash : chain_tip_first) {
+        if (rejected.count(hash))
+            continue;   // never re-broadcast a peer-rejected share
         to_send.push_back(hash);
     }
     return to_send;
@@ -200,6 +216,46 @@ int run_share_broadcast_gate_checks()
             check(marked.size() == 2u, "shipped ordering marks after a real send");
             check(walk(chain, marked).empty(), "shipped ordering then de-dups");
         }
+    }
+
+    // -- #885: readvertise_best_share re-pushes a head share the de-dup set
+    //          would otherwise mask, where broadcast_share's walk breaks --------
+    // A peer that handshook while our verified chain was empty never called
+    // download_shares(); it must be re-served the tip. But the tip's parents
+    // were already accepted by an EARLIER peer, so they sit in m_shared_share_hashes.
+    // broadcast_share's walk breaks on the first such hash and never reaches the
+    // tip; readvertise_best_share ignores the de-dup set and re-pushes the window.
+    {
+        const std::vector<uint256> chain{S3, S2, S1};   // S3 is the tip
+        const std::set<uint256> marked{S2, S1};         // parents already shared
+
+        // broadcast_share delegate (pre-#885 readvertise_best): breaks at S2,
+        // so the tip S3 is re-pushed but nothing behind it — and if the TIP
+        // itself were already marked the walk would yield NOTHING.
+        const std::set<uint256> marked_incl_tip{S3, S2, S1};
+        check(walk(chain, marked_incl_tip).empty(),
+              "#885 broadcast_share walk strands an all-marked head (documents the gap)");
+        check(walk(chain, marked).size() == 1u,
+              "#885 broadcast_share walk breaks on the first shared parent");
+
+        // readvertise_best_share (the fix): de-dup set is ignored entirely, so
+        // the full tip window is re-pushed regardless of prior sharing.
+        const std::set<uint256> no_rejects;
+        auto readv = readvertise_walk(chain, no_rejects);
+        check(readv.size() == 3u,
+              "#885 readvertise walk re-pushes the whole window ignoring the de-dup set");
+        if (readv.size() == 3u) {
+            check(readv[0] == S3, "#885 readvertise walk starts at the tip");
+            check(readv[2] == S1, "#885 readvertise walk reaches the shared parents");
+        }
+
+        // ...but a peer-REJECTED share is still never re-broadcast.
+        const std::set<uint256> rejected{S2};
+        auto readv_rej = readvertise_walk(chain, rejected);
+        check(readv_rej.size() == 2u,
+              "#885 readvertise walk still skips a peer-rejected share");
+        check(std::find(readv_rej.begin(), readv_rej.end(), S2) == readv_rej.end(),
+              "#885 readvertise walk excludes the rejected hash");
     }
 
     if (g_failures == 0)
