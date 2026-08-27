@@ -391,6 +391,13 @@ void NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
                     {
                         share.ACTION({
                             obj->m_hash = share_init_verify(*obj, *m_tracker.m_params, true);
+                            // Carry the PoW result WITH the share: the
+                            // thread_local scratch set here (verify pool)
+                            // is invisible to the compute thread that runs
+                            // attempt_verify() later. Without this, peer
+                            // shares meeting the block target were never
+                            // reported (block-found + merged callbacks).
+                            obj->m_pow_hash = g_last_pow_hash;
                         });
                     }
                     catch (const std::exception&)

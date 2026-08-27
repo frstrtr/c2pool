@@ -32,6 +32,18 @@ struct BaseShare
     hash_t m_hash{};
     hash_t m_prev_hash{};
 
+    // Transient (NEVER serialized): PoW hash computed by share_init_verify()
+    // when the share was received (phase 1 on the verify pool) or created
+    // locally. Carries the PoW result WITH the share across threads —
+    // the thread_local scratch (g_last_pow_hash / g_last_init_is_block) set
+    // on a verify-pool worker is invisible to the compute thread that later
+    // runs attempt_verify() with check_pow=false, which silently dropped
+    // every peer-found block (parent-chain AND merged/aux) from the
+    // found-blocks store. Null when PoW has not been computed for this
+    // in-memory instance (e.g. shares loaded from LevelDB with a cached
+    // index pow_hash).
+    hash_t m_pow_hash{};
+
     constexpr static bool check_version(int threshold_version)
     {
         return version >= threshold_version;

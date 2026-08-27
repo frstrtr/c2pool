@@ -491,6 +491,14 @@ inline thread_local uint256 g_last_pow_hash;  // SHA256d hash of the share heade
 template <typename ShareT>
 uint256 share_init_verify(const ShareT& share, bool check_pow = true)
 {
+    // Reset the per-thread scratch UNCONDITIONALLY so a check_pow=false call
+    // can never leave a STALE pow_hash/is_block from a previously verified
+    // share on this thread. Callers must treat a null g_last_pow_hash after
+    // this call as "PoW not computed here" and fall back to the value carried
+    // on the share (m_pow_hash) or the chain index.
+    g_last_init_is_block = false;
+    g_last_pow_hash = uint256();
+
     // --- Basic validation ---
     if (share.m_coinbase.size() < 2 || share.m_coinbase.size() > 100)
         throw std::invalid_argument("bad coinbase size");
@@ -3241,6 +3249,9 @@ uint256 create_local_share(
                 // Expected: most stratum pseudoshares don't meet share target
                 return uint256();
             }
+            // Carry the PoW result on the share itself (transient field) so
+            // attempt_verify() can run block/merged detection on any thread.
+            share.m_pow_hash = pow_hash;
             LOG_INFO << "[Pool] REAL SHARE CREATED! pow=" << pow_hash.GetHex().substr(0, 16)
                      << " target=" << target.GetHex().substr(0, 16)
                      << " diff=" << chain::target_to_difficulty(target);
