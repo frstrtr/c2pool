@@ -537,3 +537,132 @@ TEST(DashCoinbaseMarker, MintAndBlockCoinbaseScriptSigsAgree) {
         EXPECT_EQ(hex(block_sig), hex(mint_sig)) << "testnet=" << testnet;
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (20) #960 ZERO-PKH GUARD — the ownerless finder slice must not be burned.
+//
+// REPRODUCER (pre-fix, on master): an ownerless stratum session — one whose
+// login carried no P2PKH script, so work_source.cpp build_connection_coinbase
+// leaves finder_pkh zero and comments "No usable miner script: all-to-donation"
+// — still reached step 4 of compute_dash_payouts, which unconditionally did
+//
+//     amounts[pubkey_hash_to_script2(0x0000…0000)] += worker_payout / 50
+//
+// emitting a 25-byte P2PKH output over an all-zero hash160. No key hashes to
+// zero, so the 2% block-finder fee was DESTROYED. p2pool-dash credits the same
+// work to the node operator's own pubkey hash and destroys nothing; burning is
+// strictly worse than either crediting or donating.
+//
+// The guard suppresses the finder output when the pubkey hash is null, so the
+// slice falls to the step-5 donation remainder — the "all-to-donation" outcome
+// the serving code already documents. Pinned on BOTH sharechain arms, because
+// the burn happened on both: cold (no PPLNS window) and warm (window pays
+// normally, only the finder slice burns).
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// The unspendable script the pre-fix code emitted for a zero finder hash.
+std::vector<unsigned char> burn_script() {
+    return dash::pubkey_hash_to_script2(uint160());
+}
+
+bool has_script(const std::vector<dash::coinbase::MinerPayout>& outs,
+                const std::vector<unsigned char>& s) {
+    for (const auto& o : outs)
+        if (o.script == s) return true;
+    return false;
+}
+
+uint64_t amount_of(const std::vector<dash::coinbase::MinerPayout>& outs,
+                   const std::vector<unsigned char>& s) {
+    uint64_t total = 0;
+    for (const auto& o : outs)
+        if (o.script == s) total += o.amount;
+    return total;
+}
+
+}  // namespace
+
+// (20a) COLD sharechain (empty weights): every satoshi goes to the donation
+//       tail; no burn output at all.
+TEST(DashCoinbaseZeroFinderGuard, ColdChainOwnerlessWorkPaysDonationNotBurn) {
+    auto params = dash::make_coin_params(true);
+    ASSERT_LT(params.current_share_version, 36u)
+        << "this KAT pins the PRE-v36 arm, the one DASH actually runs";
+
+    const uint64_t subsidy = 5000000000ull;   // 50 DASH, no GBT payments
+    uint160 zero_finder;                      // ownerless: no P2PKH login script
+    ASSERT_TRUE(zero_finder.IsNull());
+
+    auto outs = dash::coinbase::compute_dash_payouts(
+        subsidy, /*payments=*/{}, zero_finder,
+        /*weights=*/{}, /*total_weight=*/0, params);
+
+    // The burn output is GONE (pre-fix it held subsidy/50 = 100000000 sat).
+    EXPECT_FALSE(has_script(outs, burn_script()))
+        << "finder slice emitted to P2PKH(0x00..00) — unspendable burn";
+
+    // Only the always-emitted donation line survives, holding the whole
+    // worker payout including the slice that used to burn.
+    ASSERT_EQ(outs.size(), 1u);
+    EXPECT_EQ(outs[0].script, dash::DONATION_SCRIPT);
+    EXPECT_EQ(outs[0].amount, subsidy);
+
+    uint64_t sum = 0; for (const auto& o : outs) sum += o.amount;
+    EXPECT_EQ(sum, subsidy) << "worker_payout conservation (data.py invariant)";
+}
+
+// (20b) WARM sharechain: the PPLNS window still pays its miners exactly as
+//       before; only the finder slice moves from the burn script to donation.
+TEST(DashCoinbaseZeroFinderGuard, WarmChainOwnerlessFinderSliceFallsToDonation) {
+    auto params = dash::make_coin_params(true);
+
+    std::vector<unsigned char> hA(20, 0x11);
+    const auto scriptA = dash::pubkey_hash_to_script2(uint160(hA));
+    std::map<std::vector<unsigned char>, uint64_t> weights;
+    weights[scriptA] = 100;
+
+    const uint64_t subsidy = 5000000000ull;
+    uint160 zero_finder;
+
+    auto outs = dash::coinbase::compute_dash_payouts(
+        subsidy, /*payments=*/{}, zero_finder, weights,
+        /*total_weight=*/100, params);
+
+    EXPECT_FALSE(has_script(outs, burn_script()));
+
+    // The window miner is UNTOUCHED by the guard: pre-v36 pays 49/50 of the
+    // worker payout across the weight set.
+    EXPECT_EQ(amount_of(outs, scriptA), subsidy / 50 * 49);
+
+    // The 2% the pre-fix code burned now sits in the donation tail.
+    EXPECT_EQ(amount_of(outs, dash::DONATION_SCRIPT), subsidy - subsidy / 50 * 49);
+    EXPECT_GE(amount_of(outs, dash::DONATION_SCRIPT), subsidy / 50);
+
+    uint64_t sum = 0; for (const auto& o : outs) sum += o.amount;
+    EXPECT_EQ(sum, subsidy);
+}
+
+// (20c) NON-REGRESSION: a real (non-zero) finder hash still collects the
+//       pre-v36 2%. The guard must fire on the zero sentinel ONLY — this is
+//       the case that carries every ordinary owned session's money.
+TEST(DashCoinbaseZeroFinderGuard, RealFinderStillCollectsTwoPercent) {
+    auto params = dash::make_coin_params(true);
+
+    std::vector<unsigned char> finder_h(20, 0x07);
+    const uint160 finder(finder_h);
+    ASSERT_FALSE(finder.IsNull());
+    const auto finder_script = dash::pubkey_hash_to_script2(finder);
+
+    const uint64_t subsidy = 5000000000ull;
+    auto outs = dash::coinbase::compute_dash_payouts(
+        subsidy, /*payments=*/{}, finder,
+        /*weights=*/{}, /*total_weight=*/0, params);
+
+    ASSERT_EQ(outs.size(), 2u);                       // finder + donation
+    EXPECT_EQ(outs[0].script, finder_script);
+    EXPECT_EQ(outs[0].amount, subsidy / 50);          // the 2% block-finder fee
+    EXPECT_EQ(outs[1].script, dash::DONATION_SCRIPT);
+    EXPECT_EQ(outs[1].amount, subsidy - subsidy / 50);
+}
