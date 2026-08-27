@@ -71,21 +71,21 @@ inline const char* ratchet_state_str(RatchetState s)
 // ---------------------------------------------------------------------------
 enum class RatchetBlocker : uint8_t
 {
-    NONE           = 0,  // all four conditions met — activation proceeds
-    WINDOW_FILL    = 1,  // (1) total < chain_length
-    VOTE_PCT       = 2,  // (2) vote_pct < ACTIVATION_THRESHOLD
-    TAIL_WORK      = 3,  // (3) oldest 10% carries < SWITCH_THRESHOLD% of WORK signalling
-    SELF_VOTE_ONLY = 4   // (4) distinct non-self YES-vote authors < MIN_DISTINCT_NONSELF_AUTHORS
+    NONE          = 0,  // all four conditions met — activation proceeds
+    WINDOW_FILL   = 1,  // (1) total < chain_length
+    VOTE_PCT      = 2,  // (2) vote_pct < ACTIVATION_THRESHOLD
+    TAIL_WORK     = 3,  // (3) oldest 10% carries < SWITCH_THRESHOLD% of WORK signalling
+    SINGLE_ORIGIN = 4   // (4) distinct YES-vote origins < MIN_DISTINCT_ORIGINS
 };
 
 inline const char* ratchet_blocker_str(RatchetBlocker b)
 {
     switch (b) {
-    case RatchetBlocker::NONE:           return "none";
-    case RatchetBlocker::WINDOW_FILL:    return "window-fill";
-    case RatchetBlocker::VOTE_PCT:       return "vote-pct";
-    case RatchetBlocker::TAIL_WORK:      return "tail-work";
-    case RatchetBlocker::SELF_VOTE_ONLY: return "self-vote-only";
+    case RatchetBlocker::NONE:          return "none";
+    case RatchetBlocker::WINDOW_FILL:   return "window-fill";
+    case RatchetBlocker::VOTE_PCT:      return "vote-pct";
+    case RatchetBlocker::TAIL_WORK:     return "tail-work";
+    case RatchetBlocker::SINGLE_ORIGIN: return "single-origin";
     }
     return "unknown";
 }
@@ -106,14 +106,30 @@ public:
     static constexpr int DEACTIVATION_THRESHOLD = 50;  // % below which to revert
     static constexpr int CONFIRMATION_MULTIPLIER = 2;  // confirm after 2x CHAIN_LENGTH
     static constexpr int SWITCH_THRESHOLD = 60;        // % required for format switch in validation
-    // Mode-2 self-vote guard (07-28): minimum number of DISTINCT non-self
-    // share authors whose YES-votes must back a 95% window before the ratchet
-    // may ACTIVATE. Closes the second false-activation mode — a pool mining
-    // ALONE driving its own desired_version to 95% and ratcheting itself into
-    // V36 with zero external consent. 1 = "at least one externally-originated
-    // yes-vote": the tightest bar that still permits the intended 2-node prod
-    // crossing (voidbind + G2 dest), while rejecting a 100%-self window.
-    static constexpr int MIN_DISTINCT_NONSELF_AUTHORS = 1;
+    // Distinct-origin precondition (#920, extends #930's mode-2 guard):
+    // minimum number of DISTINCT origins whose YES-votes must back a 95% window
+    // before the ratchet may ACTIVATE. An "origin" is the self node (all locally
+    // minted YES-votes collapse to ONE origin) plus each distinct non-self
+    // peer_addr among the received YES-votes.
+    //
+    // #930 required only >= 1 distinct NON-self author, which still let a window
+    // whose YES-votes ALL trace to a SINGLE origin activate the ratchet alone:
+    //   - a 100%-self window (contabo "72.25% on a ~100%-self window" incident)
+    //     — closed by #930; and
+    //   - a supermajority authored by ONE entity and injected through a SINGLE
+    //     peer connection, arriving with one non-self peer_addr — NOT closed by
+    //     #930, because one distinct non-self author cleared its bar of 1.
+    // Counting self as an origin and requiring >= 2 distinct origins closes BOTH:
+    // no single author/origin (local or one relay) can reach the threshold alone.
+    //
+    // 2 = the tightest bar that still permits the intended 2-node prod crossing
+    // (voidbind + G2 dest): each node sees its own YES-votes (self origin) plus
+    // the peer's relayed YES-votes (one non-self origin) = 2 distinct origins.
+    // LIMITATION (unchanged from #930): origins are counted by transient
+    // reception address, so a determined single operator holding N addresses can
+    // still simulate N origins. This raises the floor from 1 to 2; it is not a
+    // sybil-proof identity check.
+    static constexpr int MIN_DISTINCT_ORIGINS = 2;
 
     explicit AutoRatchet(const std::string& state_file_path = "",
                          int64_t target_version = 36)
@@ -135,7 +151,7 @@ public:
     ///   3. tail-work       oldest 10% of the window carries >= SWITCH_THRESHOLD
     ///                      (60) percent of WORK signalling the target (WEIGHT,
     ///                      not head-count)
-    ///   4. self-vote-only  distinct_nonself_authors >= MIN_DISTINCT_NONSELF_AUTHORS
+    ///   4. single-origin   distinct_origins >= MIN_DISTINCT_ORIGINS
     ///
     /// Returns NONE when all four hold. `tail` is a tri-state: NOT_MEASURED is
     /// treated as blocking on (3), which is unreachable from the live caller
@@ -144,13 +160,13 @@ public:
     static RatchetBlocker first_unmet(bool full_window,
                                       int vote_pct,
                                       RatchetTail tail,
-                                      int distinct_nonself_authors)
+                                      int distinct_origins)
     {
         if (!full_window)                             return RatchetBlocker::WINDOW_FILL;
         if (vote_pct < ACTIVATION_THRESHOLD)          return RatchetBlocker::VOTE_PCT;
         if (tail != RatchetTail::PASS)                return RatchetBlocker::TAIL_WORK;
-        if (distinct_nonself_authors < MIN_DISTINCT_NONSELF_AUTHORS)
-            return RatchetBlocker::SELF_VOTE_ONLY;
+        if (distinct_origins < MIN_DISTINCT_ORIGINS)
+            return RatchetBlocker::SINGLE_ORIGIN;
         return RatchetBlocker::NONE;
     }
 
@@ -187,13 +203,16 @@ public:
         int32_t target_shares = 0;  // shares actually IN target format
         int32_t total = 0;
 
-        // Mode-2 self-vote guard: distinct NON-SELF origins among the YES-votes
-        // in the activation window. "self" reuses node.cpp's canonical is_local
+        // Distinct-origin precondition: distinct origins among the YES-votes in
+        // the activation window. "self" reuses node.cpp's canonical is_local
         // test — a locally minted share carries peer_addr == NetService{"0.0.0.0",0}
         // or the default NetService{}; a network share carries the relaying peer.
         // peer_addr is transient reception metadata, NOT part of the share hash,
         // so reading it here is consensus-neutral (see the ACTIVATE branch note).
+        // All local YES-votes collapse to ONE self origin; each distinct non-self
+        // peer_addr is one more. The gate below requires >= MIN_DISTINCT_ORIGINS.
         std::set<NetService> nonself_voting_authors;
+        bool self_yes_present = false;
 
         // OBSERVABILITY: depth (distance from the tip, 0 = tip) of the SHALLOWEST
         // — i.e. newest — share in the sample that does NOT signal the target.
@@ -210,7 +229,9 @@ public:
                     ++target_votes;
                     const bool is_local = (obj->peer_addr == NetService{"0.0.0.0", 0} ||
                                            obj->peer_addr == NetService{});
-                    if (!is_local)
+                    if (is_local)
+                        self_yes_present = true;
+                    else
                         nonself_voting_authors.insert(obj->peer_addr);
                 }
                 else if (newest_nonsignal_depth < 0) {
@@ -243,8 +264,11 @@ public:
             RatchetTail tail_state = RatchetTail::NOT_MEASURED;
             int tail_pct = -1;          // -1 => not measured => printed as n/a
             int32_t eta_shares = -1;    // -1 => not computable => omitted
-            const int distinct_nonself_authors_obs =
-                static_cast<int>(nonself_voting_authors.size());
+            // Distinct origins = self (one origin if any local YES-vote) + each
+            // distinct non-self peer_addr among the YES-votes.
+            const int distinct_origins_obs =
+                static_cast<int>(nonself_voting_authors.size()) +
+                (self_yes_present ? 1 : 0);
 
             if (full_window && vote_pct >= ACTIVATION_THRESHOLD)
             {
@@ -281,14 +305,16 @@ public:
                 // Canonical: counts.get(VERSION,0) < sum(counts)*60//100
                 bool tail_ok = !(tail_target * uint32_t(100) < tail_total * uint32_t(SWITCH_THRESHOLD));
 
-                // --- Mode-2 self-vote guard (07-28) ------------------------
-                // Refuse to ACTIVATE on a self-authored window. The 07-14 guard
-                // closed mode 1 (absence counted as a vote); this closes mode 2:
-                // a pool mining ALONE can drive its own desired_version to 95%
-                // and ratchet itself into V36 with ZERO external consent (the
-                // contabo "72.25% on a ~100%-self window" incident). Require the
-                // 95% YES-votes to originate from >= MIN_DISTINCT_NONSELF_AUTHORS
-                // distinct non-self peers.
+                // --- Distinct-origin precondition (#920, extends #930) ------
+                // Refuse to ACTIVATE on a window whose YES-votes all trace to a
+                // SINGLE origin. #930's mode-2 guard closed the 100%-self case
+                // (the contabo "72.25% on a ~100%-self window" incident) by
+                // requiring >= 1 distinct NON-self author, but left the general
+                // hole open: a supermajority authored by ONE entity and injected
+                // through a SINGLE peer connection arrives with one non-self
+                // peer_addr and cleared that bar of 1. Count self as one origin
+                // and require >= MIN_DISTINCT_ORIGINS (2) distinct origins, so no
+                // single author/origin — local or one relay — activates alone.
                 //
                 // CONSENSUS-NEUTRAL: reads peer_addr (transient reception
                 // metadata, never serialized into the share hash) and only gates
@@ -299,10 +325,12 @@ public:
                 // mint, never change the validity or work of any existing share.
                 //
                 // FAIL-SAFE: after a restart mid-VOTING, reconstructed shares may
-                // carry an empty peer_addr and transiently understate external
-                // authors — that DELAYS activation, never causes a false one.
-                const int distinct_nonself_authors = static_cast<int>(nonself_voting_authors.size());
-                const bool multi_party = distinct_nonself_authors >= MIN_DISTINCT_NONSELF_AUTHORS;
+                // carry an empty peer_addr and transiently understate distinct
+                // origins — that DELAYS activation, never causes a false one.
+                const int distinct_origins =
+                    static_cast<int>(nonself_voting_authors.size()) +
+                    (self_yes_present ? 1 : 0);
+                const bool multi_origin = distinct_origins >= MIN_DISTINCT_ORIGINS;
 
                 // --- OBSERVABILITY ONLY from here to the `if (!tail_ok)` ------
                 tail_state = tail_ok ? RatchetTail::PASS : RatchetTail::FAIL;
@@ -350,7 +378,7 @@ public:
                 if (!tail_ok) {
                     // Don't transition yet — explained by the single line below.
                 }
-                else if (!multi_party) {
+                else if (!multi_origin) {
                     // Don't transition yet — explained by the single line below.
                 }
                 else
@@ -391,9 +419,9 @@ public:
             if (state_ == RatchetState::VOTING)
             {
                 const RatchetBlocker blocker = first_unmet(
-                    full_window, vote_pct, tail_state, distinct_nonself_authors_obs);
+                    full_window, vote_pct, tail_state, distinct_origins_obs);
                 log_voting_block(blocker, total, chain_length, vote_pct, tail_pct,
-                                 distinct_nonself_authors_obs, eta_shares);
+                                 distinct_origins_obs, eta_shares);
             }
         }
         else if (state_ == RatchetState::ACTIVATED)
@@ -503,7 +531,7 @@ private:
     void log_voting_block(RatchetBlocker blocker,
                           int32_t total, uint32_t chain_length,
                           int vote_pct, int tail_pct,
-                          int distinct_nonself_authors,
+                          int distinct_origins,
                           int32_t eta_shares)
     {
         if (blocker == RatchetBlocker::NONE) {
@@ -529,8 +557,8 @@ private:
         if (tail_pct < 0) line << "n/a";              // NOT measured — never "0"
         else              line << tail_pct << "%";
         line << " (need " << SWITCH_THRESHOLD << ")"
-             << " nonself_authors=" << distinct_nonself_authors
-             << " (need " << MIN_DISTINCT_NONSELF_AUTHORS << ")";
+             << " distinct_origins=" << distinct_origins
+             << " (need " << MIN_DISTINCT_ORIGINS << ")";
 
         // ETA is emitted ONLY for the tail guard, and only when derivable.
         if (blocker == RatchetBlocker::TAIL_WORK && eta_shares > 0) {
