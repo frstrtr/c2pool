@@ -2985,8 +2985,8 @@ int main(int argc, char* argv[]) {
                         auto lookbehind = std::min(height - 1, display_lookbehind);
                         auto aps = guard->get_pool_attempts_per_second(best, lookbehind, false);
                         double hr = static_cast<double>(aps.GetLow64());
-                        if (hr > 0) s_last_good = hr;
-                        return s_last_good;
+                        if (hr > 0) { s_last_good = hr; s_last_good_ts = now_s; }
+                        return held();
                     });
                 // pool_hashrate is derived from the sharechain tip — move off
                 // the 1 Hz periodic timer onto the tip-change signal, same
