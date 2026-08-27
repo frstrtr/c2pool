@@ -2535,6 +2535,25 @@ nlohmann::json MiningInterface::rest_fee()
     return m_pool_fee_percent;
 }
 
+std::string MiningInterface::block_explorer_prefix() const
+{
+    // Operator override wins on every coin (same source rest_web_currency_info
+    // advertises as block_explorer_url_prefix), so a node configured for chainz
+    // or any other explorer links found blocks through it.
+    if (!m_custom_block_explorer.empty())
+        return m_custom_block_explorer;
+    switch (m_blockchain) {
+    case Blockchain::LITECOIN:
+        return m_testnet ? "https://blockchair.com/litecoin/testnet/block/"
+                         : "https://blockchair.com/litecoin/block/";
+    case Blockchain::BITCOIN:  return "https://blockchair.com/bitcoin/block/";
+    case Blockchain::DOGECOIN: return "https://blockchair.com/dogecoin/block/";
+    case Blockchain::DASH:     return "https://blockchair.com/dash/block/";
+    case Blockchain::DIGIBYTE: return "https://blockchair.com/digibyte/block/";
+    default:                   return "";   // unknown coin -> caller emits null
+    }
+}
+
 nlohmann::json MiningInterface::rest_recent_blocks()
 {
     static const char* status_str[] = {"pending", "confirmed", "orphaned", "stale"};
@@ -2565,6 +2584,24 @@ nlohmann::json MiningInterface::rest_recent_blocks()
         double d = chain::target_to_difficulty(h);   // diff1 / hash
         return d > 0.0 ? nlohmann::json(d) : nlohmann::json(nullptr);
     };
+
+    // #57 oracle parity: coin-generic block-explorer deep link (chainz-style),
+    // block reward in whole coins, luck-provenance sample counts, and a
+    // first-row pool luck aggregate. All DISPLAY-ONLY and honest-null (#942):
+    // an unmeasured value is null, never a fabricated 0.
+    const std::string explorer_prefix = block_explorer_prefix();
+    auto explorer_url = [&](const std::string& hash_hex) -> nlohmann::json {
+        if (explorer_prefix.empty() || hash_hex.empty())
+            return nlohmann::json(nullptr);
+        return nlohmann::json(explorer_prefix + hash_hex);
+    };
+    // Pool luck aggregate, accumulated over the rows as we build them. c2pool
+    // derives each block's luck from ONE network-difficulty and ONE pool-
+    // hashrate reading sampled at find time -- it does not interval-average
+    // between blocks the way the p2pool-dash oracle does -- so every computed
+    // luck is honestly the "single_hashrate" method and is approximate.
+    double luck_sum = 0.0;
+    uint64_t luck_count = 0;
 
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
     for (const auto& b : m_found_blocks) {
@@ -2599,6 +2636,22 @@ nlohmann::json MiningInterface::rest_recent_blocks()
         auto num_or_null = [](double v) {
             return v > 0.0 ? nlohmann::json(v) : nlohmann::json(nullptr);
         };
+        // A luck value exists only on a row we hold locally that actually
+        // computed one (time_to_find>0 && luck>0). Those rows feed both the
+        // per-row luck_approximate flag and the first-row pool aggregate below.
+        const bool luck_present = have_local_record && b.luck > 0.0
+                                  && b.time_to_find > 0.0;
+        if (luck_present) { luck_sum += b.luck; ++luck_count; }
+        // block_reward: the raw-duff subsidy expressed in whole coins, kept
+        // ALONGSIDE the existing integer `subsidy` field. 1e8 base units per
+        // coin holds for every lane this build serves (DASH/LTC/DOGE/BTC/DGB).
+        nlohmann::json block_reward = b.subsidy != 0
+            ? nlohmann::json(static_cast<double>(b.subsidy) / 1e8)
+            : nlohmann::json(nullptr);
+        // Sample-count provenance. c2pool derives luck from ONE difficulty and
+        // ONE hashrate reading captured at find time, so the "average used" is
+        // that single value and the sample count is 1 when present, 0 when the
+        // input was never measured (honest-null, #942).
         arr.push_back({
             {"ts", b.ts},
             {"hash", b.hash},
@@ -2629,8 +2682,43 @@ nlohmann::json MiningInterface::rest_recent_blocks()
             {"expected_time", have_local_record ? num_or_null(b.expected_time) : nlohmann::json(nullptr)},
             {"time_to_find", have_local_record ? num_or_null(b.time_to_find) : nlohmann::json(nullptr)},
             {"luck", have_local_record ? num_or_null(b.luck) : nlohmann::json(nullptr)},
-            {"luck_method", method}
+            {"luck_method", method},
+            // #57 oracle-parity residual fields (all DISPLAY-ONLY, honest-null):
+            {"block_reward", block_reward},
+            {"explorer_url", explorer_url(b.hash)},
+            {"from_history", b.from_history},
+            // The luck value is a single-sample approximation whenever it
+            // exists; null (not false) when no luck was computed, so the UI
+            // renders '-' rather than claiming a precise measurement.
+            {"luck_approximate", luck_present ? nlohmann::json(true)
+                                              : nlohmann::json(nullptr)},
+            {"avg_hashrate_used", num_or_null(b.pool_hashrate)},
+            {"hashrate_samples_used", b.pool_hashrate > 0.0 ? 1 : 0},
+            {"avg_difficulty_used", num_or_null(b.network_difficulty)},
+            {"diff_samples_used", b.network_difficulty > 0.0 ? 1 : 0}
         });
+    }
+
+    // First-row pool luck aggregate (#57), mirroring the oracle shape: the
+    // summary keys ride on arr[0] so a consumer reads them without a second
+    // request. Every c2pool luck is the single-hashrate method (approximate),
+    // never the interval-averaged method the oracle labels accurate/simple_avg
+    // -- reporting it as anything else would fabricate a measurement we did not
+    // make. Empty counts and a null average when nothing was computed.
+    if (!arr.empty()) {
+        arr[0]["blocks_for_luck"]            = luck_count;
+        arr[0]["pool_avg_luck"]              = luck_count > 0
+            ? nlohmann::json(luck_sum / static_cast<double>(luck_count))
+            : nlohmann::json(nullptr);
+        arr[0]["accurate_luck_count"]        = 0;
+        arr[0]["approximate_luck_count"]     = luck_count;
+        arr[0]["time_weighted_luck_count"]   = 0;
+        arr[0]["simple_avg_luck_count"]      = 0;
+        arr[0]["single_hashrate_luck_count"] = luck_count;
+        arr[0]["luck_note"] =
+            "Luck derived from network difficulty and pool hashrate sampled at "
+            "block-find time (single sample per block, approximate; not "
+            "interval-averaged between blocks).";
     }
     return arr;
 }
@@ -3709,8 +3797,12 @@ void MiningInterface::load_persisted_found_blocks()
                     break;
                 }
             }
-            if (!exists)
+            if (!exists) {
+                // Provenance for the dashboard (#57): a block that arrives via
+                // the load path is, by definition, from persisted history.
+                blk.from_history = true;
                 m_found_blocks.push_back(std::move(blk));
+            }
         }
 
         // Sort newest-first by chain height (canonical, monotonic on-chain);
