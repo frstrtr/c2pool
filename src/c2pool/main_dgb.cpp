@@ -45,6 +45,8 @@
 #include <impl/dgb/coin/mempool_ingest.hpp>
 #include <impl/dgb/stratum/work_source.hpp>
 #include <impl/dgb/coin/work_ref_hash.hpp>      // make_work_ref_hash_params (ref preimage SSOT)
+#include <impl/dgb/coin/coinbase_scriptsig.hpp>   // build_coinbase_scriptsig (BIP34 height + /c2pool-dgb/ tag, #902)
+#include <impl/dgb/run_loop_mint.hpp>              // parse_min_header_80 + create_local_share reference (#884/#294)
 #include <impl/dgb/conn_pplns_producer.hpp>        // make_conn_pplns_inputs (ref-hash bind SSOT)
 #include <impl/dgb/coin/pplns_weight_walk.hpp>   // compute_pplns_weight_walk (PPLNS step-1 SSOT)
 #include <core/target_utils.hpp>                 // chain::bits_to_target / target_to_average_attempts
@@ -74,6 +76,8 @@
 #include <atomic>
 #include <algorithm>
 #include <functional>
+#include <mutex>
+#include <shared_mutex>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -820,7 +824,7 @@ int run_node(const core::CoinParams& params, bool testnet,
     {
         auto& pplns_tracker = p2p_node.tracker();
         work_source->set_pplns_inputs_fn(
-            [&pplns_tracker, &p2p_node, &params](
+            [&pplns_tracker, &p2p_node, &params, &header_chain](
                 const uint256& prev_share_hash,
                 const std::string& /*extranonce1_hex*/,
                 const std::vector<unsigned char>& payout_script,
@@ -923,6 +927,18 @@ int run_node(const core::CoinParams& params, bool testnet,
                     ? params.subsidy_func(absheight)
                     : 0;
 
+                // #902 -- production coinbase scriptSig: [BIP34 height push]
+                // [/c2pool-dgb/ tag]. Built from the coin block the next share
+                // sits on (header_chain.next_block_height()). Before this the
+                // scriptSig was EMPTY on the production path: no BIP34 height
+                // (=> bad-cb-height on any won block) and no pool tag. The SAME
+                // bytes feed BOTH the ref preimage (rin.coinbase_scriptSig, so
+                // the committed ref_hash matches) AND the emitted connection
+                // coinbase (ain.coinbase_script) -- a single SSOT so the two can
+                // never diverge and self-reject our own shares (#901 finding).
+                const std::vector<unsigned char> coinbase_scriptsig =
+                    dgb::coin::build_coinbase_scriptsig(header_chain.next_block_height());
+
                 // REF half -- assemble the ref preimage via the SSOT and hash it
                 // through the verifier primitive. V36/V35 split owned by
                 // compute_ref_hash_for_work().
@@ -930,6 +946,7 @@ int run_node(const core::CoinParams& params, bool testnet,
                 rin.share_version   = 36;
                 rin.desired_version = 36;
                 rin.prev_share      = prev_share_hash;
+                rin.coinbase_scriptSig = coinbase_scriptsig;  // #902: commit the BIP34+tag scriptSig
                 rin.share_nonce     = 0;            // share commitment nonce (not block)
                 rin.payout_script   = payout_script;
                 rin.subsidy         = subsidy;
@@ -956,10 +973,113 @@ int run_node(const core::CoinParams& params, bool testnet,
                 ain.total_weight    = walk.total_weight;
                 ain.subsidy         = subsidy;
                 ain.use_v36_pplns   = use_v36_pplns;
+                ain.coinbase_script = coinbase_scriptsig;  // #902: same BIP34+tag scriptSig as the ref preimage
                 ain.donation_script = dgb::PoolConfig::get_donation_script(/*share_version=*/36);
                 ain.ref_params      = dgb::coin::make_work_ref_hash_params(rin, params);
                 return dgb::make_conn_pplns_inputs(ain, params);
             });
+    }
+
+    // -- #884 sharechain WRITE path: bind the worker->mint seam ----------------
+    //
+    // Until now main_dgb never called set_mint_share_fn, so DGBWorkSource::
+    // try_mint_share() hit the null-fn branch (work_source.cpp) on EVERY share
+    // that met the share target -- a DGB node could relay peer shares but never
+    // record a locally-mined one, contributed zero hashrate to its own
+    // sharechain, and (the serious part, #888) its won blocks were invisible to
+    // every p2pool peer, which detect pool blocks by watching the sharechain for
+    // a share meeting the block target. broadcast_share / notify_local_share
+    // were zero-caller dead code. This binding lights that path up.
+    //
+    // The seam is invoked from mining_submit on the Stratum IO thread with ZERO
+    // locks held (asio handler -> process_message -> mining_submit -> mint), so
+    // taking the tracker lock here is safe. On the WonBlock arm the block is
+    // ALREADY dispatched before this runs (work_source.cpp), so nothing here can
+    // delay or endanger the block submit -- a decline only forfeits sharechain
+    // credit, never the block.
+    //
+    // Version pin (v36): the producer seam above freezes the connection coinbase
+    // at share_version=36 (make_conn_pplns_inputs hardcodes 36 / use_v36_pplns),
+    // so the mint MUST reconstruct at v36 too or the rebuilt gentx would not
+    // match the coinbase the miner hashed and create_local_share would decline.
+    // This is why we call create_local_share directly with 36 rather than the
+    // AutoRatchet adapter (dgb_select_mint_versions, run_loop_mint.hpp), whose
+    // baseline is 35 (auto_ratchet_wire.hpp) and would diverge from the producer.
+    // Aligning the producer onto the ratchet is a separate consensus decision.
+    // Every other field mirrors the producer exactly: donation=50, no merged
+    // addrs (standalone DGB parent), segwit_active=false (the producer emits a
+    // non-segwit coinbase), so the reconstruction is byte-identical when the
+    // sharechain tip has not moved between template build and submit; if it has,
+    // create_local_share returns null (a correctly-declined stale share).
+    {
+        work_source->set_mint_share_fn(
+            [&p2p_node, &params](
+                const dgb::stratum::DGBWorkSource::MintShareInputs& in) -> uint256
+            {
+                // in.coinbase_bytes is the coinbase scriptSig (BIP34 height +
+                // /c2pool-dgb/ tag) -- share.m_coinbase is the scriptSig, bounded
+                // 2..100B by share_init_verify, NOT the full coinbase tx.
+                auto min_header = dgb::parse_min_header_80(in.header_bytes);
+                if (!min_header) {
+                    LOG_WARNING << "[DGB-MINT] malformed 80-byte header -- share "
+                                   "NOT recorded (fail-closed)";
+                    return uint256();
+                }
+                BaseScript coinbase;
+                coinbase.m_data = in.coinbase_bytes;
+
+                // Exclusive tracker lock, non-blocking: defer to the next
+                // submission if the compute thread is mid-think() rather than
+                // block the Stratum IO thread. Released BEFORE broadcast_share /
+                // notify_local_share, which take their own locks / post to io.
+                std::unique_lock<std::shared_mutex> lk(
+                    p2p_node.tracker_mutex(), std::try_to_lock);
+                if (!lk.owns_lock()) {
+                    LOG_INFO << "[DGB-MINT] tracker busy -- share deferred "
+                                "(retry on next submission)";
+                    return uint256();
+                }
+
+                uint256 share_hash;
+                try {
+                    share_hash = dgb::create_local_share(
+                        p2p_node.tracker(), params, *min_header, coinbase,
+                        in.subsidy, in.prev_share, in.merkle_branches,
+                        in.payout_script,
+                        /*donation=*/50,
+                        std::vector<dgb::MergedAddressEntry>{},
+                        dgb::StaleInfo::none,
+                        /*segwit_active=*/false,  // producer emits non-segwit coinbase
+                        std::string{},            // witness_commitment_hex
+                        std::vector<unsigned char>{},  // message_data
+                        std::vector<unsigned char>{},  // actual_coinbase_bytes
+                        uint256(),                // witness_root
+                        0u, 0u,                   // override_max_bits / override_bits
+                        0u, uint128(), uint256(), 0u, uint256(),
+                        /*has_frozen=*/false,
+                        std::vector<uint256>{}, uint256(),
+                        std::vector<unsigned char>{},
+                        /*share_version=*/36, /*desired_version=*/36);
+                } catch (const std::exception& e) {
+                    LOG_WARNING << "[DGB-MINT] create_local_share threw: " << e.what();
+                    return uint256();
+                }
+
+                lk.unlock();
+
+                if (!share_hash.IsNull()) {
+                    p2p_node.broadcast_share(share_hash);
+                    p2p_node.notify_local_share(share_hash);
+                    LOG_INFO << "[DGB-MINT] share "
+                             << share_hash.GetHex().substr(0, 16)
+                             << " minted onto the sharechain + broadcast (prev="
+                             << in.prev_share.GetHex().substr(0, 16) << ")";
+                }
+                return share_hash;
+            });
+        std::cout << "[DGB] sharechain mint seam BOUND (set_mint_share_fn -> "
+                     "create_local_share v36 -> broadcast_share + "
+                     "notify_local_share)" << std::endl;
     }
 
     // -- --redistribute: node-local payout policy (Redistribute V2, #307) ------

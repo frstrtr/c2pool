@@ -103,6 +103,41 @@ inline uint256 merkle_pair(const uint256& left, const uint256& right) {
                 std::span<const uint8_t>(right.data(), 32));
 }
 
+// Extract the coinbase scriptSig from a reconstructed coinbase TRANSACTION.
+// The mint seam (create_local_share) stores the scriptSig in share.m_coinbase,
+// which share_init_verify bounds to 2..100 bytes -- so the mint MUST be handed
+// the scriptSig, NOT the full gentx. Coinbase tx layout (gentx_coinbase.hpp):
+//   version(4) | vin_count(1=0x01) | prev_hash(32) | prev_idx(4) |
+//   scriptSig(varint len + bytes) | sequence(4) | ...
+// so the scriptSig length varint sits at fixed offset 41. The 8-byte extranonce
+// lands in the OP_RETURN nonce slot near the tail (connection_coinbase.hpp),
+// never in the scriptSig, so the bytes recovered here are exactly the scriptSig
+// the producer froze at template time -- which is what keeps the mint's
+// recomputed ref_hash equal to the one the miner's coinbase committed to.
+inline std::vector<unsigned char>
+extract_coinbase_scriptsig(const std::vector<uint8_t>& coinbase_tx) {
+    constexpr size_t kScriptOffset = 4 + 1 + 32 + 4;  // = 41
+    if (coinbase_tx.size() < kScriptOffset + 1)
+        return {};  // truncated -> empty (fail-closed; mint declines on size<2)
+    size_t off = kScriptOffset;
+    uint64_t len = coinbase_tx[off++];
+    // A coinbase scriptSig is consensus-capped at 100 bytes, so its length is
+    // always a single-byte varint (< 0xfd). Handle the wider markers only to
+    // stay well-formed against a malformed buffer.
+    if (len == 0xfd) {
+        if (off + 2 > coinbase_tx.size()) return {};
+        len = static_cast<uint64_t>(coinbase_tx[off])
+            | (static_cast<uint64_t>(coinbase_tx[off + 1]) << 8);
+        off += 2;
+    } else if (len >= 0xfe) {
+        return {};  // implausible for a coinbase scriptSig -> fail-closed
+    }
+    if (off + len > coinbase_tx.size())
+        return {};  // length overruns the buffer -> fail-closed
+    return std::vector<unsigned char>(coinbase_tx.begin() + off,
+                                      coinbase_tx.begin() + off + len);
+}
+
 } // namespace
 
 DGBWorkSource::DGBWorkSource(c2pool::dgb::HeaderChain&     chain,
@@ -556,7 +591,13 @@ nlohmann::json DGBWorkSource::mining_submit(
                                     : "[DGB-STRATUM-SHARE]";
         MintShareInputs in;
         in.header_bytes    = header;
-        in.coinbase_bytes  = coinbase;
+        // #884/#902: hand the mint the coinbase SCRIPTSIG (share.m_coinbase is
+        // the scriptSig, bounded 2..100B by share_init_verify), extracted from
+        // the reconstructed coinbase tx -- NOT the full gentx `coinbase`, which
+        // is >100B and would make create_local_share throw "bad coinbase size".
+        // Recovering it from the tx (rather than re-deriving) guarantees it is
+        // byte-identical to the scriptSig the producer froze into the template.
+        in.coinbase_bytes  = extract_coinbase_scriptsig(coinbase);
         in.subsidy         = job->subsidy;
         in.prev_share      = job->prev_share_hash;
         in.merkle_branches = branch_hashes;
