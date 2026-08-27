@@ -825,3 +825,112 @@ TEST(DashboardData, GraphViewsTruncatedAndMissingSidecarTolerated)
     std::remove((path + ".views").c_str());
     std::remove((path + ".best.json").c_str());
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 8. /recent_blocks oracle-parity residual fields (#57)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// The dashboard's miner view (miner.html) reads block.explorer_url and
+// block.block_reward directly, and other consumers expect the p2pool-dash
+// oracle's luck-provenance shape. Those fields were absent from the backend
+// until this change, so the links were dead and the reward column blank. The
+// values must be honest: block_reward in whole coins alongside the raw-duff
+// subsidy, a coin-generic explorer deep link, single-sample luck provenance,
+// and a first-row pool luck aggregate that never claims an accurate method
+// c2pool did not use.
+TEST(DashboardData, RecentBlocksCarriesOracleParityResidualFields)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    wire_dash_template(mi);
+
+    const std::string h1 =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+    const std::string h2 =
+        "2222222222222222222222222222222222222222222222222222222222222222";
+    // Two blocks 2 s apart -> the newer row computes a luck (single-hashrate).
+    mi.record_found_block(2516911, uint256S(h1), 1785955172, "DASH",
+                          "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", h1,
+                          0.0, 240228.0, 0.0, 0);
+    mi.record_found_block(2516914, uint256S(h2), 1785955174, "DASH",
+                          "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", h2,
+                          0.0, 240228.0, 0.0, 0);
+
+    auto arr = mi.rest_recent_blocks();
+    auto blk = find_block(arr, h2);
+    ASSERT_TRUE(blk.is_object());
+
+    // block_reward: the template coinbasevalue (177109977 duff) in whole coins,
+    // present ALONGSIDE the untouched integer subsidy.
+    EXPECT_EQ(blk["subsidy"].get<uint64_t>(), 177109977u);
+    ASSERT_TRUE(blk["block_reward"].is_number());
+    EXPECT_DOUBLE_EQ(blk["block_reward"].get<double>(), 1.77109977);
+
+    // explorer_url: coin-generic DASH-first-class block deep link.
+    ASSERT_TRUE(blk["explorer_url"].is_string());
+    EXPECT_EQ(blk["explorer_url"].get<std::string>(),
+              "https://blockchair.com/dash/block/" + h2);
+
+    // from_history: recorded live this session, so false (never persisted).
+    ASSERT_TRUE(blk["from_history"].is_boolean());
+    EXPECT_FALSE(blk["from_history"].get<bool>());
+
+    // Single-sample luck provenance on a row that computed a luck.
+    EXPECT_TRUE(blk["luck_approximate"].get<bool>());
+    ASSERT_TRUE(blk["avg_hashrate_used"].is_number());
+    EXPECT_DOUBLE_EQ(blk["avg_hashrate_used"].get<double>(), 4294967296.0);
+    EXPECT_EQ(blk["hashrate_samples_used"].get<int>(), 1);
+    ASSERT_TRUE(blk["avg_difficulty_used"].is_number());
+    EXPECT_DOUBLE_EQ(blk["avg_difficulty_used"].get<double>(), 1.0);
+    EXPECT_EQ(blk["diff_samples_used"].get<int>(), 1);
+
+    // First-row pool luck aggregate: the array is newest-first, so arr[0] is
+    // h2 and carries the summary keys. One computed luck (50%), classified
+    // honestly as single_hashrate/approximate -- never accurate/simple_avg.
+    ASSERT_FALSE(arr.empty());
+    const auto& agg = arr[0];
+    ASSERT_TRUE(agg["pool_avg_luck"].is_number());
+    EXPECT_DOUBLE_EQ(agg["pool_avg_luck"].get<double>(), 50.0);
+    EXPECT_EQ(agg["blocks_for_luck"].get<uint64_t>(), 1u);
+    EXPECT_EQ(agg["single_hashrate_luck_count"].get<uint64_t>(), 1u);
+    EXPECT_EQ(agg["approximate_luck_count"].get<uint64_t>(), 1u);
+    EXPECT_EQ(agg["accurate_luck_count"].get<uint64_t>(), 0u);
+    EXPECT_EQ(agg["simple_avg_luck_count"].get<uint64_t>(), 0u);
+    EXPECT_EQ(agg["time_weighted_luck_count"].get<uint64_t>(), 0u);
+    EXPECT_TRUE(agg["luck_note"].is_string());
+}
+
+// Honest-null on the residual fields: an unmeasured row emits null, never a
+// fabricated 0 or a dead link. A single first block has no luck, so
+// luck_approximate is null and the pool aggregate reports zero contributors
+// with a null average.
+TEST(DashboardData, RecentBlocksResidualFieldsHonorHonestNull)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    // NO template wired and caller passes 0 subsidy: reward is unmeasured.
+    const std::string h =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    mi.record_found_block(2516911, uint256S(h), 1785955172, "DASH",
+                          "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", h,
+                          0.0, 0.0, 0.0, 0);
+
+    auto arr = mi.rest_recent_blocks();
+    auto blk = find_block(arr, h);
+    ASSERT_TRUE(blk.is_object());
+
+    EXPECT_TRUE(blk["block_reward"].is_null())
+        << "an unmeasured subsidy is null, never 0.0";
+    EXPECT_TRUE(blk["luck_approximate"].is_null())
+        << "no luck computed -> the approximate flag is null, not false";
+    EXPECT_TRUE(blk["avg_difficulty_used"].is_null());
+    EXPECT_EQ(blk["diff_samples_used"].get<int>(), 0);
+    // The explorer link is still a real DASH deep link (hash is known).
+    EXPECT_EQ(blk["explorer_url"].get<std::string>(),
+              "https://blockchair.com/dash/block/" + h);
+
+    ASSERT_FALSE(arr.empty());
+    EXPECT_TRUE(arr[0]["pool_avg_luck"].is_null());
+    EXPECT_EQ(arr[0]["blocks_for_luck"].get<uint64_t>(), 0u);
+    EXPECT_EQ(arr[0]["single_hashrate_luck_count"].get<uint64_t>(), 0u);
+}

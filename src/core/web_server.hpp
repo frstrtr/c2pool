@@ -154,6 +154,10 @@ public:
     nlohmann::json rest_users();
     nlohmann::json rest_fee();
     nlohmann::json rest_recent_blocks();
+    // Coin-generic block-explorer URL prefix (block deep link, DASH first-class).
+    // Honors an operator custom explorer, else the per-coin default; empty when
+    // the coin is unknown so callers emit null rather than a wrong-coin link.
+    std::string block_explorer_prefix() const;
 
     // THE checkpoint endpoints
     nlohmann::json rest_checkpoint();    // latest verified checkpoint
@@ -817,6 +821,12 @@ public:
         // and the log states it in words. Unlabelled stays `unknown`, which
         // the log reports as unknown rather than guessing.
         BlockAuthorship authorship{BlockAuthorship::unknown};
+        // Provenance for the dashboard (#57 oracle parity). true when this row
+        // was restored from persistent storage at startup rather than recorded
+        // live this session. DISPLAY-ONLY, never persisted (a restored row is
+        // by definition from history), so it stays last in the struct and out
+        // of every positional aggregate-init above.
+        bool from_history{false};
     };
 
     // Block acceptance verification: schedule async checks at +10s, +30s, +120s.
