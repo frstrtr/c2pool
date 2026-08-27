@@ -746,6 +746,39 @@ public:
         return hint;
     }
 
+    // -- Restart-reorg liveness: challenger-first Phase-2 scheduling --
+    // The challenger segment's VERIFIED frontier is short, so it sorts LOW in
+    // the work-descending Phase-2 head order. Left there, a shorter non-
+    // challenger verified head that outranks it by verified work can spend the
+    // whole normal per-tick verify budget first and trip the outer per-head
+    // budget gate, breaking the loop before the challenger's iteration is ever
+    // entered — so its bounded elevated pool is never drawn and the higher-work
+    // fork can never verify to CHAIN_LENGTH (the stuck-on-persisted-head bug).
+    // Moving the challenger-segment heads to the FRONT (stable_partition, so the
+    // work-descending order is preserved within each group) guarantees the
+    // challenger is reached every tick regardless of non-challenger contention.
+    // Challenger identity is the segment-last (shared missing parent), matched
+    // by chain.get_last so it survives the frontier advancing tick to tick —
+    // exactly the Phase-2 is_challenger test. Pure read over chain (get_last);
+    // no mutation, no PoW. Inactive supersede => predicate is always false =>
+    // stable_partition is a no-op and the healthy-node order is byte-identical.
+    // Returns the number of challenger heads moved to the front (priority prefix
+    // length). Selection (Phase 3/4 argmax) is untouched — this only orders the
+    // Phase-2 verify sweep so the challenger's elevated budget is actually drawn.
+    size_t prioritize_challenger_heads(
+        std::vector<std::pair<uint256, uint256>>& heads,
+        const SupersedeHint& supersede)
+    {
+        if (!supersede.active)
+            return 0;
+        auto is_challenger_head = [&](const std::pair<uint256, uint256>& hv) -> bool {
+            try { return chain.get_last(hv.first) == supersede.target_segment_last; }
+            catch (...) { return false; }
+        };
+        auto mid = std::stable_partition(heads.begin(), heads.end(), is_challenger_head);
+        return static_cast<size_t>(std::distance(heads.begin(), mid));
+    }
+
     // -- Best-chain selection with verification and punishment --
     // bootstrap_mode: when true, removes verification budget limit so the
     // entire chain is verified in one call.  Used during initial sync when
@@ -1033,9 +1066,37 @@ public:
                 auto wb = verified.contains(b.first) ? verified.get_work(b.first) : uint288{};
                 return wa > wb;  // highest work first
             });
+        // Restart-reorg liveness: move challenger-segment heads to the FRONT of
+        // the work-descending order so a shorter non-challenger head that
+        // outranks the challenger by verified work can never spend the normal
+        // budget and trip the outer per-head gate before the challenger's
+        // iteration is entered (which would leave its elevated pool undrawn this
+        // tick — the starvation the fix closes). No-op when supersede is
+        // inactive: the healthy-node order is byte-identical.
+        prioritize_challenger_heads(sorted_vheads, supersede);
         for (auto& [head_hash, tail_hash] : sorted_vheads)
         {
-            if (budget_remaining <= 0) {
+            // Restart-reorg: is this verified head the frontier of the challenger
+            // segment named by the hint? Matched by segment identity (the shared
+            // missing-parent), so it survives the frontier advancing tick to tick.
+            // Hoisted above the per-head budget gate so the gate can be
+            // elevated-budget-aware (below).
+            bool is_challenger = false;
+            if (supersede.active) {
+                try {
+                    is_challenger = (chain.get_last(head_hash) == supersede.target_segment_last);
+                } catch (...) { is_challenger = false; }
+            }
+
+            // Per-head budget gate. The normal budget bounds work per tick; only
+            // a challenger head may additionally draw the bounded elevated pool.
+            // Do NOT break while THIS head is a challenger that can still draw
+            // elevated budget — challengers are ordered first, so once a budget-
+            // spent non-challenger head is reached, no challenger remains behind
+            // it and stopping is correct. When supersede is inactive is_challenger
+            // is always false, so this reduces to the original `budget_remaining
+            // <= 0` break (healthy-node path byte-identical).
+            if (budget_remaining <= 0 && !(is_challenger && elevated_remaining > 0)) {
                 m_think_needs_continue = true;
                 break;
             }
@@ -1056,15 +1117,7 @@ public:
 
             auto [last_height, last_last_hash] = chain.get_height_and_last(last_hash);
 
-            // Restart-reorg: is this verified head the frontier of the challenger
-            // segment named by the hint? Matched by segment identity (the shared
-            // missing-parent), so it survives the frontier advancing tick to tick.
-            bool is_challenger = false;
-            if (supersede.active) {
-                try {
-                    is_challenger = (chain.get_last(head_hash) == supersede.target_segment_last);
-                } catch (...) { is_challenger = false; }
-            }
+            // (is_challenger computed above, before the per-head budget gate.)
 
             // Bounded backfill window: request as many shares as the chain is
             // short of CHAIN_LENGTH (want), capped by how many the rooted peer
