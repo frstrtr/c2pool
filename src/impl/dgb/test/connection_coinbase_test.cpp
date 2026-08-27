@@ -18,6 +18,7 @@
 
 #include <gtest/gtest.h>
 #include <impl/dgb/coin/connection_coinbase.hpp>
+#include <impl/dgb/coin/coinbase_scriptsig.hpp>   // #902 build_coinbase_scriptsig KAT
 #include <impl/dgb/coin/last_txout_nonce.hpp>
 #include <c2pool/merged/merged_mining.hpp>  // core SSOT: build_auxpow_commitment
 
@@ -312,6 +313,47 @@ TEST(LastTxoutNonceSsot, DrawsAreDistinct) {
     std::set<uint64_t> seen;
     for (int i = 0; i < N; ++i) seen.insert(dgb::make_last_txout_nonce());
     EXPECT_EQ(seen.size(), static_cast<size_t>(N));
+}
+
+// ── #902 production coinbase scriptSig: BIP34 height push + /c2pool-dgb/ tag ──
+//
+// Pins dgb::coin::build_coinbase_scriptsig (coin/coinbase_scriptsig.hpp), the
+// SSOT main_dgb feeds into BOTH the ref preimage (WorkRefHashInputs
+// ::coinbase_scriptSig) and the emitted connection coinbase
+// (ConnPplnsAssemblyInputs::coinbase_script). Expected bytes are hand-computed:
+//   [OP_PUSHBYTES_n][height LE, sign-safe] || [len] || "/c2pool-dgb/"
+// so a byte drift on either the BIP34 encoding or the tag is caught before it
+// reaches a mainnet coinbase (an empty/short height push is a bad-cb-height
+// block loss -- exactly what #902 exists to stop).
+TEST(CoinbaseScriptSig, Bip34HeightPushMinimallyEncoded) {
+    using dgb::coin::bip34_height_push;
+    // 1 byte: height 1 -> push 1 byte 0x01.
+    EXPECT_EQ(tohex(bip34_height_push(1)), "0101");
+    // Sign-bit safety: 0x80 has the high bit set, so it needs a zero pad ->
+    // push 2 bytes 80 00 (NOT a bare 1-byte 0x80, which parses as negative).
+    EXPECT_EQ(tohex(bip34_height_push(0x80)), "028000");
+    // 21,000,000 = 0x01406F40 -> LE 40 6F 40 01, high byte 0x01 (bit clear) ->
+    // push 4 bytes.
+    EXPECT_EQ(tohex(bip34_height_push(21000000)), "04406f4001");
+}
+
+TEST(CoinbaseScriptSig, FullScriptSigPinsHeightAndTag) {
+    using dgb::coin::build_coinbase_scriptsig;
+    // "/c2pool-dgb/" = 12 bytes -> push opcode 0x0c, then the ASCII tag.
+    const std::string kTagHex = "0c2f6332706f6f6c2d6467622f";  // 0x0c || "/c2pool-dgb/"
+
+    // height 1: 01 01 || <tag>
+    EXPECT_EQ(tohex(build_coinbase_scriptsig(1)), "0101" + kTagHex);
+    // height 21,000,000: 04 40 6f 40 01 || <tag>
+    EXPECT_EQ(tohex(build_coinbase_scriptsig(21000000)), "04406f4001" + kTagHex);
+
+    // Structural invariants share_init_verify relies on: 2 <= size <= 100, and
+    // the tag is literally present as the trailing bytes.
+    auto s = build_coinbase_scriptsig(21000000);
+    EXPECT_GE(s.size(), size_t{2});
+    EXPECT_LE(s.size(), size_t{100});
+    std::string tail(s.end() - 12, s.end());
+    EXPECT_EQ(tail, "/c2pool-dgb/");
 }
 
 } // namespace
