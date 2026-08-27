@@ -16,7 +16,7 @@
 //   2  vote-pct        vote_pct >= ACTIVATION_THRESHOLD (95)
 //   3  tail-work       oldest 10% of the window carries >= SWITCH_THRESHOLD (60)
 //                      percent of WORK signalling the target (WEIGHT, not count)
-//   4  self-vote-only  distinct_nonself_authors >= MIN_DISTINCT_NONSELF_AUTHORS
+//   4  single-origin   distinct_origins >= MIN_DISTINCT_ORIGINS (2)
 //
 // Two layers, both driving REAL production code — no lifted oracle, no replica:
 //
@@ -107,19 +107,21 @@ TEST(LTC_RatchetBlockedBy, A_TailWorkIsNamedWhenTailGuardFails)
               RatchetBlocker::TAIL_WORK);
 }
 
-TEST(LTC_RatchetBlockedBy, A_SelfVoteOnlyIsNamedWhenWindowIsSelfAuthored)
+TEST(LTC_RatchetBlockedBy, A_SingleOriginIsNamedWhenWindowIsSingleOrigin)
 {
+    // Below the distinct-origin threshold — a window whose YES-votes all trace
+    // to one origin (0 or 1 distinct origins, < MIN_DISTINCT_ORIGINS=2).
     EXPECT_EQ(AutoRatchet::first_unmet(true, 100, RatchetTail::PASS,
-                                       AutoRatchet::MIN_DISTINCT_NONSELF_AUTHORS - 1),
-              RatchetBlocker::SELF_VOTE_ONLY);
-    EXPECT_STREQ(ltc::ratchet_blocker_str(RatchetBlocker::SELF_VOTE_ONLY), "self-vote-only");
+                                       AutoRatchet::MIN_DISTINCT_ORIGINS - 1),
+              RatchetBlocker::SINGLE_ORIGIN);
+    EXPECT_STREQ(ltc::ratchet_blocker_str(RatchetBlocker::SINGLE_ORIGIN), "single-origin");
 }
 
 TEST(LTC_RatchetBlockedBy, A_NoneWhenAllFourConditionsHold)
 {
     EXPECT_EQ(AutoRatchet::first_unmet(true, AutoRatchet::ACTIVATION_THRESHOLD,
                                        RatchetTail::PASS,
-                                       AutoRatchet::MIN_DISTINCT_NONSELF_AUTHORS),
+                                       AutoRatchet::MIN_DISTINCT_ORIGINS),
               RatchetBlocker::NONE);
 }
 
@@ -135,8 +137,11 @@ TEST(LTC_RatchetBlockedBy, A_PrecedenceNamesTheFirstUnmetNotAList)
     EXPECT_EQ(AutoRatchet::first_unmet(true, 100, RatchetTail::FAIL, 0),
               RatchetBlocker::TAIL_WORK);
     EXPECT_EQ(AutoRatchet::first_unmet(true, 100, RatchetTail::PASS, 0),
-              RatchetBlocker::SELF_VOTE_ONLY);
+              RatchetBlocker::SINGLE_ORIGIN);
+    // One distinct origin still fails the >= 2 bar (the #920 hole #930 left open).
     EXPECT_EQ(AutoRatchet::first_unmet(true, 100, RatchetTail::PASS, 1),
+              RatchetBlocker::SINGLE_ORIGIN);
+    EXPECT_EQ(AutoRatchet::first_unmet(true, 100, RatchetTail::PASS, 2),
               RatchetBlocker::NONE);
 }
 
@@ -186,6 +191,7 @@ struct ChainSpec
     int32_t count       = 0;
     int32_t old_prefix  = 0;    // number of oldest shares voting TARGET-1
     bool    external    = true; // give YES-voters a non-local peer_addr
+    int32_t ext_origins = 1;    // distinct non-self peer_addrs among YES-voters
 };
 
 // Build a resolved ltc::ShareTracker of uniform-work V36-format shares.
@@ -210,8 +216,14 @@ uint256 build_chain(ltc::ShareTracker& tracker, const ChainSpec& spec, size_t sa
                                         : static_cast<uint64_t>(TARGET_VERSION - 1);
         sh->m_bits     = 0x1e0ffff0;
         sh->m_max_bits = 0x1e0ffff0;
-        if (signals && spec.external)
-            sh->peer_addr = NetService{"203.0.113.7", 9333};
+        if (signals && spec.external) {
+            // Spread YES-voters across `ext_origins` distinct non-self addresses
+            // so a window can carry one origin (the #920 single-relay hole) or
+            // several (the genuine multi-party crossing).
+            const int32_t origins = spec.ext_origins > 0 ? spec.ext_origins : 1;
+            const int octet = 7 + static_cast<int>(i % origins);
+            sh->peer_addr = NetService{"203.0.113." + std::to_string(octet), 9333};
+        }
         ltc::ShareType st;
         st = sh;
         tracker.add(st);
@@ -314,11 +326,12 @@ TEST_F(RatchetExplainLine, B_TailWork_NamedWithMeasuredTailAndEta)
     EXPECT_EQ(ar.state(), RatchetState::VOTING);
 }
 
-TEST_F(RatchetExplainLine, B_SelfVoteOnly_NamedOnAFullySelfAuthoredWindow)
+TEST_F(RatchetExplainLine, B_SingleOrigin_NamedOnAFullySelfAuthoredWindow)
 {
     // 100% YES by count AND by tail work, but every YES-vote is locally minted
-    // (default peer_addr), so the mode-2 guard holds. The tail WAS measured and
-    // passed, so it must report 100%, not `n/a`.
+    // (default peer_addr), so the window carries ONE origin (self) — below the
+    // distinct-origin bar of 2. The tail WAS measured and passed, so it must
+    // report 100%, not `n/a`. (This is the case #930 already closed.)
     ltc::ShareTracker tracker;
     ChainSpec spec; spec.count = 400; spec.old_prefix = 0; spec.external = false;
     auto tip = build_chain(tracker, spec, 4);
@@ -326,21 +339,45 @@ TEST_F(RatchetExplainLine, B_SelfVoteOnly_NamedOnAFullySelfAuthoredWindow)
     AutoRatchet ar("", TARGET_VERSION);
     const std::string out = evaluate(ar, tracker, tip);
 
-    EXPECT_NE(out.find("blocked-by=self-vote-only"), std::string::npos) << out;
+    EXPECT_NE(out.find("blocked-by=single-origin"), std::string::npos) << out;
     EXPECT_NE(out.find("vote=100% (need 95)"), std::string::npos) << out;
     EXPECT_NE(out.find("tail10%work=100% (need 60)"), std::string::npos) << out;
-    EXPECT_NE(out.find("nonself_authors=0 (need 1)"), std::string::npos) << out;
+    EXPECT_NE(out.find("distinct_origins=1 (need 2)"), std::string::npos) << out;
     EXPECT_EQ(out.find("eta_shares"), std::string::npos) << out;
+    EXPECT_EQ(ar.state(), RatchetState::VOTING);
+}
+
+TEST_F(RatchetExplainLine, B_SingleOrigin_NamedWhenAllYesVotesTraceToOneExternalPeer)
+{
+    // #920 CORE — the hole #930 left open. 100% YES by count AND by tail work,
+    // every YES-vote is EXTERNAL, but they all relay from a SINGLE non-self
+    // peer_addr. #930's bar of 1 distinct non-self author was cleared; the
+    // distinct-origin bar of 2 is NOT. A supermajority tracing to one origin
+    // must not ratchet the node into V36 alone.
+    ltc::ShareTracker tracker;
+    ChainSpec spec; spec.count = 400; spec.old_prefix = 0;
+    spec.external = true; spec.ext_origins = 1;   // one distinct external origin
+    auto tip = build_chain(tracker, spec, 8);
+
+    AutoRatchet ar("", TARGET_VERSION);
+    const std::string out = evaluate(ar, tracker, tip);
+
+    EXPECT_NE(out.find("blocked-by=single-origin"), std::string::npos) << out;
+    EXPECT_NE(out.find("vote=100% (need 95)"), std::string::npos) << out;
+    EXPECT_NE(out.find("tail10%work=100% (need 60)"), std::string::npos) << out;
+    EXPECT_NE(out.find("distinct_origins=1 (need 2)"), std::string::npos) << out;
     EXPECT_EQ(ar.state(), RatchetState::VOTING);
 }
 
 // --- NEGATIVE TWIN ---------------------------------------------------------
 TEST_F(RatchetExplainLine, B_AllFourPass_NoBlockedLineAndItActivates)
 {
-    // Same 400-share window, 100% YES, tail 100% by work, and the YES-votes
-    // carry an EXTERNAL peer_addr. All four conditions hold.
+    // Same 400-share window, 100% YES, tail 100% by work, and the YES-votes are
+    // spread across TWO distinct external origins. All four conditions hold —
+    // including the distinct-origin precondition (2 >= 2).
     ltc::ShareTracker tracker;
-    ChainSpec spec; spec.count = 400; spec.old_prefix = 0; spec.external = true;
+    ChainSpec spec; spec.count = 400; spec.old_prefix = 0;
+    spec.external = true; spec.ext_origins = 2;   // two distinct external origins
     auto tip = build_chain(tracker, spec, 5);
 
     AutoRatchet ar("", TARGET_VERSION);

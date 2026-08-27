@@ -101,7 +101,7 @@ TEST(LTC_AutoRatchetSim, ThresholdsMatchCanonical)
     EXPECT_EQ(AutoRatchet::DEACTIVATION_THRESHOLD,  50);
     EXPECT_EQ(AutoRatchet::CONFIRMATION_MULTIPLIER,  2);
     EXPECT_EQ(AutoRatchet::SWITCH_THRESHOLD,        60);
-    EXPECT_EQ(AutoRatchet::MIN_DISTINCT_NONSELF_AUTHORS, 1);
+    EXPECT_EQ(AutoRatchet::MIN_DISTINCT_ORIGINS, 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -239,44 +239,55 @@ TEST(LTC_AutoRatchetSim, C4_FreshNodeMintsBaselineOnBootstrap)
 }
 
 // ---------------------------------------------------------------------------
-// C5 — mode-2 self-vote guard (07-28). Closes the SECOND false-activation mode
-// (the 07-14 guard closed the first, absence-as-vote): a pool mining ALONE can
-// drive its own desired_version to 95% and ratchet itself into V36 with ZERO
-// external consent (the contabo "72.25% on a ~100%-self window" incident). The
-// live guard (auto_ratchet.hpp ACTIVATE branch) additionally requires
-//   distinct_nonself_authors >= MIN_DISTINCT_NONSELF_AUTHORS
-// where a non-self author is a YES-voting share whose peer_addr is not local.
-// Inline replica (same discipline as inline_tail_ok for the work gate) so the
-// KAT pins the guard WITHOUT building an 8640-share tracker.
+// C5 — distinct-origin precondition (#920, extends #930's mode-2 guard). The
+// mode-2 guard closed the 100%-self case (a pool mining ALONE ratcheting itself
+// into V36 with ZERO external consent — the contabo "72.25% on a ~100%-self
+// window" incident) by requiring >= 1 distinct NON-self author. #920 closes the
+// GENERAL hole it left: a supermajority authored by ONE entity and injected
+// through a SINGLE peer arrives with one non-self peer_addr and cleared that bar
+// of 1. The live guard (auto_ratchet.hpp ACTIVATE branch) now requires
+//   distinct_origins >= MIN_DISTINCT_ORIGINS
+// where distinct_origins = self (one origin if any local YES-vote) + each
+// distinct non-self peer_addr among the YES-votes. Inline replica (same
+// discipline as inline_tail_ok for the work gate) so the KAT pins the guard
+// WITHOUT building an 8640-share tracker.
 // ---------------------------------------------------------------------------
 namespace {
 bool effective_activation_guarded(int votes, int total,
                                   const uint288& w_target, const uint288& w_total,
-                                  int distinct_nonself_authors)
+                                  int distinct_origins)
 {
     return effective_activation(votes, total, w_target, w_total) &&
-           distinct_nonself_authors >= AutoRatchet::MIN_DISTINCT_NONSELF_AUTHORS;
+           distinct_origins >= AutoRatchet::MIN_DISTINCT_ORIGINS;
 }
 } // namespace
 
 TEST(LTC_AutoRatchetSim, C5_SelfAuthoredWindowDoesNotActivate)
 {
     // 100% self-authored: every YES-vote was locally minted, so the window
-    // carries ZERO distinct non-self origins. The count gate (95%) and the
-    // work gate (100%) BOTH fire, yet the ratchet must hold.
+    // carries ONE origin (self) and no non-self origin. The count gate (95%) and
+    // the work gate (100%) BOTH fire, yet the ratchet must hold: 1 < 2.
     EXPECT_TRUE (effective_activation(100, 100, uint288(100), uint288(100)));
-    EXPECT_FALSE(effective_activation_guarded(100, 100, uint288(100), uint288(100), /*non-self*/ 0));
+    EXPECT_FALSE(effective_activation_guarded(100, 100, uint288(100), uint288(100), /*origins*/ 1));
+}
+
+TEST(LTC_AutoRatchetSim, C5_SingleExternalOriginDoesNotActivate)
+{
+    // #920 CORE: a supermajority that all traces to a SINGLE origin — e.g. one
+    // entity injecting through one peer, or a lone self miner — must NOT ratchet
+    // alone. One distinct origin cleared #930's bar of 1; it fails the >= 2 bar.
+    EXPECT_FALSE(effective_activation_guarded(100, 100, uint288(100), uint288(100), /*origins*/ 1));
 }
 
 TEST(LTC_AutoRatchetSim, C5_MixedWindowActivates)
 {
-    // Mixed window at >= threshold WITH external consent: >= 1 distinct non-self
-    // origin backs the 95%/60% window, so activation is permitted. This is the
-    // intended 2-node prod crossing (voidbind + G2 dest) shape.
-    EXPECT_TRUE(effective_activation_guarded(95, 100, uint288(95), uint288(100), /*non-self*/ 1));
-    EXPECT_TRUE(effective_activation_guarded(100, 100, uint288(100), uint288(100), /*non-self*/ 3));
+    // >= 2 distinct origins back the 95%/60% window, so activation is permitted.
+    // This is the intended 2-node prod crossing (voidbind + G2 dest) shape: each
+    // node sees its own YES-votes (self origin) plus the peer's (one non-self).
+    EXPECT_TRUE(effective_activation_guarded(95, 100, uint288(95), uint288(100), /*origins*/ 2));
+    EXPECT_TRUE(effective_activation_guarded(100, 100, uint288(100), uint288(100), /*origins*/ 4));
 
-    // Guard is orthogonal to the work gate: external consent cannot rescue a
+    // Guard is orthogonal to the work gate: multiple origins cannot rescue a
     // window that fails the 60%-by-work accept gate (mint<->accept coupling).
-    EXPECT_FALSE(effective_activation_guarded(95, 100, uint288(1), uint288(100), /*non-self*/ 5));
+    EXPECT_FALSE(effective_activation_guarded(95, 100, uint288(1), uint288(100), /*origins*/ 6));
 }
