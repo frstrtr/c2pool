@@ -1769,6 +1769,17 @@ public:
     double m_last_netdiff_sampled{0.0};  // dedup: skip if unchanged
     void add_netdiff_sample(double difficulty, const std::string& source);
 
+    // Push a live network difficulty into the cache atomic + the sample history
+    // from a coin-tip source that does NOT run refresh_work(). refresh_work()
+    // (the RPC/getblocktemplate work path, web_server.cpp ~1590) is the only
+    // place that populates m_network_difficulty on the LTC family; a daemonless
+    // DASH node never runs it, so netdiff stays 0 -> found-block rows carry a
+    // null network_difficulty -> the dashboard's drawDiffRatioBars gate skips
+    // the block trails, luck reads null, the netdiff graph is flat 0. This lets
+    // the embedded coin-tip follower feed the same atomic those consumers read.
+    // Display/telemetry only -- never drives coinbase or consensus. (#57)
+    void update_network_difficulty(double difficulty, const std::string& source);
+
     // ── Stratum worker session tracking ──────────────────────────────────
 public:
     using WorkerInfo = core::stratum::WorkerInfo;

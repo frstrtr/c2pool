@@ -1960,13 +1960,34 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // m_pool_hashrate_fn is read exclusively by web_server REST handlers.
             mi->set_pool_hashrate_fn([node_ptr]() -> double {
                 static double s_last_good = 0.0;
+                // ── STALENESS BOUND (#57 flat-plateau fix) ────────────────
+                // The last-good latch below is what keeps the graph smooth over
+                // transient tracker lock contention. Unbounded, it also turns a
+                // FROZEN estimator (e.g. a stuck verified-best election on a
+                // zero-local-mint relay) into a permanent flat rectangle: the
+                // value carried forward forever, zero variance for hours. Bound
+                // it -- if no fresh hr>0 has been produced for >10 min the latch
+                // is poisoned, so publish 0 and let update_stat_log BREAK the
+                // line instead of fabricating a plateau. Display-only.
+                static int64_t s_last_good_ts = 0;
+                const int64_t now_s =
+                    std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+                constexpr int64_t kStaleSeconds = 600;  // 10 min
+                auto held = [&]() -> double {
+                    if (s_last_good_ts != 0 &&
+                        now_s - s_last_good_ts > kStaleSeconds)
+                        return 0.0;
+                    return s_last_good;
+                };
                 // Verified best-share head, queried WITHOUT the tracker guard
                 // held: best_share_hash()/elect_best_share takes the tracker
                 // lock itself, so nesting it under read_tracker() would
                 // recursively shared-lock the same mutex.
                 auto best = node_ptr->best_share_hash();
                 auto guard = node_ptr->read_tracker();
-                if (!guard) return s_last_good;
+                if (!guard) return held();
                 // ── ZERO-LOCAL-MINER / BOOTSTRAP FALLBACK ─────────────────
                 // With no local mint the VERIFIED chain has no heads, so
                 // best_share_hash() is null even though peers have filled the
@@ -1987,32 +2008,38 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 //
                 // Head selection is the pure dash::select_pool_rate_head SSOT
                 // (coin/pool_rate_head_select.hpp, KAT test_dash_pool_rate_head_select):
-                // verified head verbatim when present, else the tallest raw head.
+                // the verified head verbatim ONLY when present AND FRESH (not
+                // out-heighted by the raw tip); else the tallest raw head. Always
+                // gather the raw heads so the freshness check has the raw tip to
+                // compare the verified election against.
                 const bool best_in_chain =
                     !best.IsNull() && guard->chain.contains(best);
-                if (!best_in_chain) {
-                    std::vector<dash::RawChainHead> raw_heads;
-                    for (const auto& [head_hash, tail_hash] :
-                             guard->chain.get_heads()) {
-                        (void)tail_hash;
-                        raw_heads.push_back(
-                            {head_hash, static_cast<int32_t>(
-                                            guard->chain.get_height(head_hash))});
-                    }
-                    best = dash::select_pool_rate_head(uint256::ZERO, false,
-                                                       raw_heads);
+                const int32_t verified_height =
+                    best_in_chain
+                        ? static_cast<int32_t>(guard->chain.get_height(best))
+                        : -1;
+                std::vector<dash::RawChainHead> raw_heads;
+                for (const auto& [head_hash, tail_hash] :
+                         guard->chain.get_heads()) {
+                    (void)tail_hash;
+                    raw_heads.push_back(
+                        {head_hash, static_cast<int32_t>(
+                                        guard->chain.get_height(head_hash))});
                 }
+                best = dash::select_pool_rate_head(
+                    best_in_chain ? best : uint256::ZERO, best_in_chain,
+                    verified_height, raw_heads);
                 if (best.IsNull() || !guard->chain.contains(best))
-                    return s_last_good;
+                    return held();
                 int height = guard->chain.get_height(best);
-                if (height < 3) return s_last_good;
+                if (height < 3) return held();
                 const int display_lookbehind =
                     3600 / static_cast<int>(dash::SharechainConfig::share_period());
                 auto lookbehind = std::min(height - 1, display_lookbehind);
                 auto aps = guard->get_pool_attempts_per_second(best, lookbehind, false);
                 double hr = static_cast<double>(aps.GetLow64());
-                if (hr > 0) s_last_good = hr;
-                return s_last_good;
+                if (hr > 0) { s_last_good = hr; s_last_good_ts = now_s; }
+                return held();
             });
 
             // ── REAL best-share hash ──────────────────────────────────────
@@ -3943,10 +3970,32 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     auto think_timer = std::make_shared<io::steady_timer>(ioc);
     auto think_tick =
         std::make_shared<std::function<void(const boost::system::error_code&)>>();
-    *think_tick = [&p2p_node, think_timer, think_tick](
-                      const boost::system::error_code& ec) {
+    // ── #57 NETWORK-DIFFICULTY FEED (daemonless block-trail fix) ──────────
+    // The RPC work path (web_server.cpp refresh_work, ~1590) is the ONLY place
+    // the LTC family populates MiningInterface::m_network_difficulty; a
+    // daemonless DASH node never runs it, and set_coin_work_fn is only wired
+    // under --stratum, so on a zero-rig relay netdiff stays 0. That nulls the
+    // network_difficulty on every found-block row, which makes the dashboard's
+    // drawDiffRatioBars gate skip the LTC-style block trails and makes luck read
+    // '-'. Push the SERVED template's netdiff into the atomic on every think
+    // tick (unconditional, runs regardless of --stratum) so record_found_block's
+    // existing <=0 fallback stamps new rows, luck computes, trails draw and the
+    // netdiff graph comes alive -- no frontend change, coin-generic render path.
+    // Display/telemetry only; peek_template() is a non-fetching peek.
+    core::MiningInterface* netdiff_mi =
+        web_server ? web_server->get_mining_interface() : nullptr;
+    auto* netdiff_wsrc = work_source.get();
+    *think_tick = [&p2p_node, think_timer, think_tick, netdiff_mi,
+                   netdiff_wsrc](const boost::system::error_code& ec) {
         if (ec) return;   // cancelled at shutdown
         p2p_node.clean_tracker();
+        if (netdiff_mi && netdiff_wsrc) {
+            if (auto t = netdiff_wsrc->peek_template(); t && t->m_bits != 0) {
+                double nd = chain::target_to_difficulty(
+                    dash::coin::target_from_nbits(t->m_bits));
+                if (nd > 0.0) netdiff_mi->update_network_difficulty(nd, "tip");
+            }
+        }
         think_timer->expires_after(std::chrono::seconds(15));
         think_timer->async_wait(*think_tick);
     };
