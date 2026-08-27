@@ -65,10 +65,20 @@ add_library(btclibs STATIC ${sources}) #${SOURCE} ${HEADER})
 # UNCHANGED and stays the authority -- a miscompiled SIMD transform can only
 # make a root mismatch and hard-stop, never silently mis-fold. This swaps only
 # the primitive underneath ~70% of fold-thread CPU (its scalar form).
-target_compile_definitions(btclibs PRIVATE USE_ASM ENABLE_SSE41 ENABLE_AVX2 ENABLE_SHANI)
-set_source_files_properties(crypto/sha256_sse41.cpp PROPERTIES COMPILE_OPTIONS "-msse4.1")
-set_source_files_properties(crypto/sha256_avx2.cpp  PROPERTIES COMPILE_OPTIONS "-mavx2")
-set_source_files_properties(crypto/sha256_shani.cpp PROPERTIES COMPILE_OPTIONS "-msse4;-msha")
+# GCC/Clang only: the optimized TUs use GNU-syntax __attribute__((always_inline))
+# and GCC-style -msse4.1/-mavx2/-msha flags. MSVC ignores those flags (warning
+# D9002) but still opens the ENABLE_* #ifdef gates, then fails to compile the
+# GNU attribute (C2182). Leave the ENABLE_* macros undefined on MSVC so the three
+# SIMD TUs compile to empty (their bodies are fully #ifdef-wrapped) and
+# SHA256AutoDetect falls back to the scalar transform -- the proven pre-SIMD path,
+# self-checked by CSHA256::SelfTest and the fold merkle byte-compare. No behavior
+# change on the fleet's Linux build hosts.
+if(NOT MSVC)
+    target_compile_definitions(btclibs PRIVATE USE_ASM ENABLE_SSE41 ENABLE_AVX2 ENABLE_SHANI)
+    set_source_files_properties(crypto/sha256_sse41.cpp PROPERTIES COMPILE_OPTIONS "-msse4.1")
+    set_source_files_properties(crypto/sha256_avx2.cpp  PROPERTIES COMPILE_OPTIONS "-mavx2")
+    set_source_files_properties(crypto/sha256_shani.cpp PROPERTIES COMPILE_OPTIONS "-msse4;-msha")
+endif()
 # ---------------------------------------------------------------------------
 target_include_directories(btclibs PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} util crypto compat)
 
