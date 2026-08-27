@@ -1710,6 +1710,35 @@ private:
     std::vector<StatLogEntry> m_stat_log;
     mutable std::mutex m_stat_log_mutex;
     std::string m_stat_log_path;  // persistence file path (empty = no persistence)
+
+    // ── Frozen-estimator graph-store guard ───────────────────────────────────
+    // A live pool-rate estimator recomputed every 60 s tick over a sliding
+    // share window essentially never yields the same bit-identical nonzero
+    // double for many consecutive ticks (empirical ceiling on live data: 4).
+    // A long identical run means the estimator upstream is FROZEN (e.g. a
+    // stale latched anchor carried forward by a last-good latch); recording it
+    // bakes a fake flat plateau into the persisted graph_db that survives
+    // restarts — the estimator-side staleness bound stops NEW pollution but
+    // cannot clean what a frozen value already wrote. After
+    // kMaxIdenticalPoolRateRun consecutive bit-identical nonzero samples
+    // (~10 min at the 60 s cadence, matching the estimator-side 600 s
+    // staleness bound) the sample is recorded honest-absent 0.0 so the graph
+    // BREAKS instead of extending a fabricated rectangle. Display-only:
+    // nothing here feeds vardiff/consensus. Accessed only from the
+    // single-threaded stat-log timer (update_stat_log) and startup load.
+    static constexpr int kMaxIdenticalPoolRateRun = 10;
+    double m_phr_freeze_last{0.0};   // last RAW estimator value seen
+    int m_phr_freeze_run{0};         // consecutive bit-identical raw samples
+    bool m_phr_freeze_logged{false}; // one warning per freeze episode
+    // Load-time self-heal for stores polluted BEFORE the ingest guard existed:
+    // zero pool_hash_rate (and the desired_versions derived from it) across any
+    // persisted run longer than the ingest guard could ever write. Caller holds
+    // m_stat_log_mutex. Returns the number of entries sanitized.
+    std::size_t sanitize_frozen_pool_rate_runs();
+    // Set when the sanitizer changed entries; load_graph_views then discards
+    // the .views sidecar (its bins still carry the plateau) and re-seeds from
+    // the sanitized flat log.
+    bool m_flat_sanitized_on_load{false};
 public:
     /// Set persistence path for stat log (call before start)
     void set_stat_log_path(const std::string& path) { m_stat_log_path = path; }

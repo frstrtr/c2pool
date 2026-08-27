@@ -73,7 +73,14 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # idempotency, per-view geometry-mismatch reseed, and corrupt/missing
     # tolerance. Same fold-into-core_test reasoning as every TU here (a new
     # add_executable is the #769 "Not Run" trap).
-    add_executable(core_test pack_test.cpp events_test.cpp chain_test.cpp packet_test.cpp block_broadcast_test.cpp broadcast_convergence_matrix_test.cpp core_merkle_branches_test.cpp version_gate_test.cpp filesystem_test.cpp web_server_submitblock_test.cpp web_server_current_payouts_test.cpp web_server_local_hashps_test.cpp web_server_relay_block_test.cpp web_server_dashboard_data_test.cpp graph_history_test.cpp known_txs_eviction_test.cpp tx_advertiser_test.cpp socket_write_queue_test.cpp known_txs_backing_test.cpp random_choice_guard_test.cpp p2p_message_stats_test.cpp netaddress_resolution_test.cpp coin_addrman_test.cpp)
+    # web_server_frozen_pool_rate_guard_test.cpp: the frozen-estimator
+    # graph-store guard (dash.voidbind.com 48.96 TH/s rectangle). Pins the
+    # ingest cap (a bit-identical nonzero pool rate is recorded for at most
+    # kMaxIdenticalPoolRateRun samples, then honest-absent 0), verbatim
+    # recording of a live/varying estimator, and the load-time purge of
+    # pre-guard plateau runs plus their derived desired_versions. Same
+    # fold-into-core_test reasoning as every TU here.
+    add_executable(core_test pack_test.cpp events_test.cpp chain_test.cpp packet_test.cpp block_broadcast_test.cpp broadcast_convergence_matrix_test.cpp core_merkle_branches_test.cpp version_gate_test.cpp filesystem_test.cpp web_server_submitblock_test.cpp web_server_current_payouts_test.cpp web_server_local_hashps_test.cpp web_server_relay_block_test.cpp web_server_dashboard_data_test.cpp web_server_frozen_pool_rate_guard_test.cpp graph_history_test.cpp known_txs_eviction_test.cpp tx_advertiser_test.cpp socket_write_queue_test.cpp known_txs_backing_test.cpp random_choice_guard_test.cpp p2p_message_stats_test.cpp netaddress_resolution_test.cpp coin_addrman_test.cpp)
     target_compile_definitions(core_test PRIVATE C2POOL_SRC_ROOT="${CMAKE_SOURCE_DIR}/src")
     target_link_libraries(core_test PRIVATE GTest::gtest_main core c2pool_merged_mining GTest::gtest)
     target_link_libraries(core_test PRIVATE c2pool_payout c2pool_hashrate ltc_coin)  # OBJECT-lib SCC direct-naming (#22/#39)

@@ -7496,6 +7496,33 @@ void MiningInterface::update_stat_log()
     // Pool hash rate — use p2pool-correct callback (safe, runs on ioc thread)
     entry.pool_hash_rate = m_pool_hashrate_fn ? m_pool_hashrate_fn() : 0.0;
 
+    // ── Frozen-estimator ingest guard (see header) ───────────────────────────
+    // Runs BEFORE desired_versions is derived below (dv[ver] = phr * pct), so
+    // zeroing a frozen sample here keeps the derived series clean too. The
+    // frozen 48.96 TH/s rectangle on dash.voidbind.com was exactly this: a
+    // stuck estimator value recorded verbatim for 15 h and persisted, still
+    // rendering after the estimator itself was fixed.
+    {
+        const double raw_phr = entry.pool_hash_rate;
+        if (raw_phr != 0.0 && raw_phr == m_phr_freeze_last) {
+            ++m_phr_freeze_run;
+        } else {
+            m_phr_freeze_last = raw_phr;
+            m_phr_freeze_run = 1;
+            m_phr_freeze_logged = false;
+        }
+        if (raw_phr != 0.0 && m_phr_freeze_run > kMaxIdenticalPoolRateRun) {
+            if (!m_phr_freeze_logged) {
+                LOG_WARNING << "[StatLog] pool_hash_rate frozen at " << raw_phr
+                            << " for " << m_phr_freeze_run
+                            << " consecutive samples — recording honest-absent 0"
+                               " until it moves (frozen-estimator guard)";
+                m_phr_freeze_logged = true;
+            }
+            entry.pool_hash_rate = 0.0;
+        }
+    }
+
     // Periodic network difficulty sample for graph
     double cur_diff = m_network_difficulty.load(std::memory_order_relaxed);
     if (cur_diff > 0)
@@ -8002,7 +8029,14 @@ void MiningInterface::load_graph_views()
     const auto descs = graph_stream_descriptions();
 
     bool do_full_seed = true;   // default: no usable sidecar → seed from flat
-    try {
+    if (m_flat_sanitized_on_load) {
+        // The flat log was purged of frozen-plateau runs on load; the sidecar
+        // bins were folded from the POLLUTED flat log and still carry the
+        // plateau, so adopting them would resurrect it on the long horizons.
+        // Discard the sidecar and re-seed everything from the clean flat log.
+        LOG_INFO << "[GraphViews] Flat log sanitized on load — discarding "
+                    "sidecar bins and re-seeding from the clean flat log";
+    } else try {
         std::ifstream f(path);
         if (f) {
             std::string content((std::istreambuf_iterator<char>(f)),
@@ -8132,6 +8166,40 @@ void MiningInterface::save_stat_log()
     save_graph_views();
 }
 
+std::size_t MiningInterface::sanitize_frozen_pool_rate_runs()
+{
+    // Caller holds m_stat_log_mutex. Zero pool_hash_rate across any run of
+    // MORE THAN kMaxIdenticalPoolRateRun consecutive bit-identical nonzero
+    // samples — the ingest guard caps new runs at exactly the threshold, so a
+    // longer persisted run can only be pre-guard frozen-estimator pollution
+    // (live data's legitimate identical-run ceiling is 4 at the 60 s cadence).
+    // desired_versions is derived from the frozen value (dv[ver] = phr * pct),
+    // so every numeric dv in a sanitized entry is fabricated too — zero it.
+    std::size_t changed = 0;
+    const std::size_t n = m_stat_log.size();
+    std::size_t i = 0;
+    while (i < n) {
+        const double v = m_stat_log[i].pool_hash_rate;
+        std::size_t j = i + 1;
+        if (v != 0.0) {
+            while (j < n && m_stat_log[j].pool_hash_rate == v) ++j;
+            if (j - i > static_cast<std::size_t>(kMaxIdenticalPoolRateRun)) {
+                for (std::size_t k = i; k < j; ++k) {
+                    auto& e = m_stat_log[k];
+                    e.pool_hash_rate = 0.0;
+                    if (e.desired_versions.is_object())
+                        for (auto& kv : e.desired_versions.items())
+                            if (kv.value().is_number())
+                                kv.value() = 0.0;
+                    ++changed;
+                }
+            }
+        }
+        i = j;
+    }
+    return changed;
+}
+
 void MiningInterface::load_stat_log()
 {
     if (m_stat_log_path.empty()) return;
@@ -8179,6 +8247,17 @@ void MiningInterface::load_stat_log()
             e.network_difficulty = j.value("nd", 0.0);
             e.share_difficulty = j.value("sd", 0.0);
             m_stat_log.push_back(std::move(e));
+        }
+        // ── Load-time frozen-run sanitizer (see header) ──────────────────────
+        // Self-heals stores polluted before the ingest guard existed: the guard
+        // caps NEW identical runs at exactly kMaxIdenticalPoolRateRun, so any
+        // longer persisted run can only be pre-guard pollution.
+        const std::size_t sanitized = sanitize_frozen_pool_rate_runs();
+        if (sanitized > 0) {
+            m_flat_sanitized_on_load = true;
+            LOG_WARNING << "[StatLog] Sanitized " << sanitized
+                        << " frozen pool_hash_rate samples on load "
+                           "(frozen-estimator plateau purge)";
         }
         LOG_INFO << "[StatLog] Loaded " << m_stat_log.size() << " entries from " << m_stat_log_path;
       } catch (const std::exception& ex) {
