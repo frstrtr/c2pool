@@ -4331,10 +4331,15 @@ int main(int argc, char* argv[]) {
                              << " miner=" << miner_addr.substr(0,16)
                              << " height=" << height;
 
+                    // sharechain_peer: this hook fires for ANY verified share
+                    // meeting the block target. For our own find the submit
+                    // path records this_node and authorship only climbs, so
+                    // labelling peer here can never downgrade a local record.
                     mi->record_found_block(
                         height, block_hash, s->m_min_header.m_timestamp,
                         is_testnet ? "tLTC" : "LTC",
-                        miner_addr, share_hash.GetHex(), net_diff, share_diff, pool_hr, 0);
+                        miner_addr, share_hash.GetHex(), net_diff, share_diff, pool_hr, 0,
+                        core::MiningInterface::BlockAuthorship::sharechain_peer);
                     mi->schedule_block_verification(block_hash.GetHex());
                 });
             };

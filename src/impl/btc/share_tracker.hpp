@@ -516,14 +516,33 @@ public:
         // Success — clear any previous fail count
         m_verify_fail_count.erase(share_hash);
 
-        // Cache pow_hash on the index (for restart block scan — avoids recomputing scrypt)
-        if (!g_last_pow_hash.IsNull()) {
-            auto* idx = chain.get_index(share_hash);
-            if (idx) idx->pow_hash = g_last_pow_hash;
-        }
+        // Resolve this share's PoW hash WITHOUT trusting thread_locals across
+        // threads. Priority:
+        //   1. m_pow_hash carried on the share — set during phase-1 reception
+        //      (verify pool) or local creation; survives thread hops;
+        //   2. g_last_pow_hash IF verify_share() above just recomputed PoW on
+        //      THIS thread (share_init_verify resets it on entry, so non-null
+        //      here always refers to THIS share);
+        //   3. idx->pow_hash cached from LevelDB metadata at startup load.
+        // The old code read only the thread_local: phase-1 PoW runs on
+        // verify-pool workers while attempt_verify runs on the compute thread,
+        // so peer shares that met the block target NEVER fired m_on_block_found
+        // (or the merged check) — peer-found blocks were invisible to the
+        // found-blocks store and the dashboard.
+        auto& share_var = chain.get_share(share_hash);
+        auto* idx = chain.get_index(share_hash);
+        uint256 pow_hash;
+        share_var.invoke([&](auto* s) { pow_hash = s->m_pow_hash; });
+        if (pow_hash.IsNull())
+            pow_hash = g_last_pow_hash;
+        if (pow_hash.IsNull() && idx)
+            pow_hash = idx->pow_hash;
+
+        // Cache pow_hash on the index (for restart block scan — avoids recomputing PoW)
+        if (idx && !pow_hash.IsNull())
+            idx->pow_hash = pow_hash;
 
         // Add to verified chain
-        auto& share_var = chain.get_share(share_hash);
         if (!verified.contains(share_hash))
             verified.add(share_var);
 
@@ -531,13 +550,20 @@ public:
         if (m_on_share_verified)
             m_on_share_verified(share_hash);
 
-        // Block detection: if share_init_verify flagged this share as a block solution,
-        // fire the callback. Matches p2pool's tracker.verified.added watcher (node.py:289).
-        if (m_on_block_found && g_last_init_is_block) {
-            g_last_init_is_block = false;
-            auto* idx = chain.get_index(share_hash);
-            if (idx) idx->is_block_solution = true;
-            m_on_block_found(share_hash);
+        // Block detection: derive from the share's PoW hash vs the BLOCK target
+        // (min_header.m_bits from GBT — far harder than the share target), not
+        // from a cross-thread flag. Matches p2pool's tracker.verified.added
+        // watcher (node.py:289) — detects blocks from ANY pool participant.
+        if (m_on_block_found && !pow_hash.IsNull()) {
+            bool is_block = false;
+            share_var.invoke([&](auto* s) {
+                uint256 block_target = chain::bits_to_target(s->m_min_header.m_bits);
+                is_block = !block_target.IsNull() && pow_hash <= block_target;
+            });
+            if (is_block) {
+                if (idx) idx->is_block_solution = true;
+                m_on_block_found(share_hash);
+            }
         }
 
         // Report share difficulty for best-share dashboard tracking
@@ -557,9 +583,10 @@ public:
 
         // Merged block detection: check ALL verified shares against DOGE target.
         // A share can meet the DOGE target without meeting the LTC target
-        // (DOGE difficulty is much lower). The pow_hash was cached by share_init_verify.
-        if (m_on_merged_block_check && !g_last_pow_hash.IsNull()) {
-            m_on_merged_block_check(share_hash, g_last_pow_hash);
+        // (DOGE difficulty is much lower). Uses the resolved pow_hash above —
+        // NOT the thread_local, which is unset on the compute thread.
+        if (m_on_merged_block_check && !pow_hash.IsNull()) {
+            m_on_merged_block_check(share_hash, pow_hash);
         }
 
         // Naughty propagation: if parent is naughty, increment (up to 6 generations)
