@@ -2406,6 +2406,31 @@
             return d3.format('.2f')(d) + ' P';
         }
 
+        // Coin-generic finder attribution for a /recent_blocks row (#901).
+        // `found_by` is the pool-wide authorship the endpoint emits from its
+        // sharechain-derived pool leg:
+        //   this_node       -> our own template won the block
+        //   sharechain_peer -> another pool node's template won it
+        //   unknown/absent  -> a coin lane that has not labelled its find sites
+        // Display only: this reads the served value and never gates any logic.
+        function block_found_by_html(b) {
+            var by = b && b.found_by;
+            var label, color;
+            if (by === 'this_node')            { label = 'This node'; color = '#00ff88'; }
+            else if (by === 'sharechain_peer') { label = 'Pool peer'; color = '#00d4ff'; }
+            else                               { label = 'Unknown';   color = '#888888'; }
+            var s = 'Found by: <b style="color:' + color + '">' + label + '</b><br/>';
+            if (b && b.miner) {
+                var addr = String(b.miner);
+                var shortAddr = addr.length > 22
+                    ? addr.substr(0, 12) + '…' + addr.substr(addr.length - 6)
+                    : addr;
+                s += 'Miner: <b style="color:#c9c9e3" title="' + addr + '">'
+                   + shortAddr + '</b><br/>';
+            }
+            return s;
+        }
+
         // Format percentage with big integer + small decimal parts
         // Format percentage with big bold integer + smaller decimal
         function format_pct_fancy(pct) {
@@ -7833,6 +7858,7 @@
                                 else if (diffRatio >= 2) s += ' <span style="color:#00ff88">★</span>';
                                 s += '<br/>';
                             }
+                            s += block_found_by_html(b);
                             s += 'Status: <b style="color:' + (b.status === 'confirmed' ? '#00ff88' : '#ffc107') + '">' + (b.status || 'unknown') + '</b>';
                             return s;
                         }
@@ -7974,6 +8000,7 @@
                                 else if (diffRatio >= 2) s += ' <span style="color:#00ff88">★</span>';
                                 s += '<br/>';
                             }
+                            s += block_found_by_html(b);
                             s += 'Status: <b style="color:' + (b.status === 'confirmed' ? '#00ff88' : '#ffc107') + '">' + (b.status || 'unknown') + '</b>';
                             return s;
                         }
@@ -8516,6 +8543,7 @@
                                 else if (diffRatio >= 2) s += ' <span style="color:#00ff88">★</span>';
                                 s += '<br/>';
                             }
+                            s += block_found_by_html(b);
                             s += 'Status: <b style="color:' + (b.status === 'confirmed' ? '#00ff88' : '#ffc107') + '">' + (b.status || 'unknown') + '</b>';
                             return s;
                         }
@@ -8669,6 +8697,7 @@
                                 else if (diffRatio >= 2) s += ' <span style="color:#00ff88">★</span>';
                                 s += '<br/>';
                             }
+                            s += block_found_by_html(b);
                             s += 'Status: <b style="color:' + (b.status === 'confirmed' ? '#00ff88' : '#ffc107') + '">' + (b.status || 'unknown') + '</b>';
                             return s;
                         }
