@@ -150,23 +150,14 @@
     }
 
     // ── Boot: open QWebChannel, grab bridges, start the Explorer ────
-    function onChannelReady(channel) {
-      const bridge = channel.objects.sharechain;
-      if (!bridge) {
-        setStatus('no sharechain bridge', 'err');
-        log('error', 'QWebChannel did not expose sharechain');
-        return;
-      }
-      const transport = new QtTransport(bridge);
-      const coinBridge = channel.objects.coin;       // optional — step 9 adds
-      const myAddress = coinBridge && coinBridge.myAddress
-        ? coinBridge.myAddress
-        : undefined;
-
+    function startExplorer(transport, shareVersion) {
       const rt = createRealtime({
         canvas,
         transport,
-        userContext: { myAddress, shareVersion: 36 },
+        // shareVersion drives own-share classification/highlighting; it
+        // comes from the active coin's CoinDescriptor so the Explorer is
+        // coin-generic instead of pinned to a compile-time value.
+        userContext: { myAddress: undefined, shareVersion },
         containerWidth:  () => wrap.clientWidth,
         containerHeight: () => wrap.clientHeight,
         minCellSize: 4,   // default maxCellSize (120) kicks in
@@ -178,7 +169,7 @@
       });
       rt.start().then(() => {
         setStatus('connected');
-        log('info', 'Explorer started via QtTransport');
+        log('info', 'Explorer started via QtTransport', { shareVersion });
         window.__explorerQt = rt;
       }).catch((err) => {
         setStatus('failed to start', 'err');
@@ -188,6 +179,36 @@
       window.addEventListener('beforeunload', () => {
         try { rt.stop(); } catch {}
       });
+    }
+
+    function onChannelReady(channel) {
+      const bridge = channel.objects.sharechain;
+      if (!bridge) {
+        setStatus('no sharechain bridge', 'err');
+        log('error', 'QWebChannel did not expose sharechain');
+        return;
+      }
+      const transport = new QtTransport(bridge);
+      const coinBridge = channel.objects.coin;       // optional
+      const boot = (shareVersion) => {
+        const v = (typeof shareVersion === 'number' && shareVersion > 0)
+          ? shareVersion : 36;   // 36 = historical default
+        startExplorer(transport, v);
+      };
+      // Read the active coin's shareVersion from CoinBridge. QWebChannel
+      // invokables resolve asynchronously; fall back to the default when
+      // the bridge is absent or errors. A profile/coin switch re-boots
+      // this page (PageEmbedded::reload), so a boot-time read rebinds.
+      if (coinBridge && typeof coinBridge.currentCoinDescriptor === 'function') {
+        try {
+          coinBridge.currentCoinDescriptor(
+            (desc) => boot(desc && desc.shareVersion));
+        } catch (e) {
+          boot(undefined);
+        }
+      } else {
+        boot(undefined);
+      }
     }
 
     if (typeof QWebChannel !== 'function') {

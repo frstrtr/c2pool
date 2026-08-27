@@ -37,6 +37,15 @@ SharechainBridge::SharechainBridge(ApiClient* api, QObject* parent)
     reconnectTimer_ = new QTimer(this);
     reconnectTimer_->setSingleShot(true);
     connect(reconnectTimer_, &QTimer::timeout, this, &SharechainBridge::onReconnectTimer);
+    // A base-URL change means the active coin/daemon switched. The tip
+    // SSE socket is bound to whatever base URL was current at
+    // openStream() time, so reconnect it against the new daemon —
+    // otherwise both embedded views keep refetching off the previous
+    // coin's tip events until the old TCP connection happens to drop.
+    if (api_ != nullptr) {
+        connect(api_, &ApiClient::baseUrlChanged,
+                this, &SharechainBridge::restartStream);
+    }
 }
 
 SharechainBridge::~SharechainBridge()
@@ -134,6 +143,26 @@ void SharechainBridge::stopStream()
         stream_ = nullptr;
     }
     streamBuffer_.clear();
+}
+
+void SharechainBridge::restartStream()
+{
+    // Only act when a stream was actually requested; a switch made
+    // while no view is streaming needs nothing.
+    if (!streamRequested_) return;
+    if (reconnectTimer_ != nullptr) reconnectTimer_->stop();
+    if (stream_ != nullptr) {
+        stream_->abort();
+        stream_->deleteLater();
+        stream_ = nullptr;
+    }
+    streamBuffer_.clear();
+    reconnectAttempts_ = 0;
+    openStream();
+    // Tell the JS side to treat this as a reconnect so it refetches a
+    // fresh window rather than sending the old coin's delta cursor to
+    // the new coin's /sharechain/delta.
+    emit tipReconnected();
 }
 
 // ── Internals ────────────────────────────────────────────────────────

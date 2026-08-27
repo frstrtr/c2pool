@@ -257,6 +257,18 @@ MainWindow::MainWindow(SettingsStore* settings, QWidget* parent)
                     baseUrlEdit_->setText(url);
                     api_.setBaseUrl(url);
                 }
+                // A profile switch can change the active coin. The
+                // embedded Explorer / PPLNS bundles read their
+                // CoinDescriptor from CoinBridge at boot only, so
+                // re-boot them here — after api_.setBaseUrl above so the
+                // reloaded pages open their SSE / fetches against the new
+                // coin's daemon. Without this a DASH<->LTC switch leaves
+                // the previous coin's version badges, address-explorer
+                // links and merged-chain rows showing. Display-only —
+                // no reward/consensus/template surface is touched.
+                sharechainPage_->reload();
+                pplnsPage_->reload();
+                miningPage_->reloadEmbed();
                 reloadProfileCombo();
                 statusLabel_->setText(tr("Profile: %1").arg(newActive));
                 refreshCurrentPage();
