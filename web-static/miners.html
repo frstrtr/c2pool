@@ -553,6 +553,7 @@
                             <th>Block Height</th>
                             <th>Block Hash</th>
                             <th>Miner</th>
+                            <th title="Pool-wide finder attribution (#901): this node vs a sharechain peer">Found by</th>
                             <th>Luck</th>
                             <th>Status</th>
                         </tr>
@@ -1108,7 +1109,26 @@
                     minerLink.title = minerAddr;
                     tdMiner.appendChild(minerLink);
                     tr.appendChild(tdMiner);
-                    
+
+                    // Found by (coin-generic pool-wide authorship, #901).
+                    // Reads the endpoint's found_by field: this_node when our
+                    // template won, sharechain_peer when another pool node's
+                    // share (minted onto the sharechain) won. Display only.
+                    var tdFoundBy = document.createElement('td');
+                    tdFoundBy.style.fontWeight = 'bold';
+                    var fb = block.found_by;
+                    if (fb === 'this_node') {
+                        tdFoundBy.textContent = 'This node';
+                        tdFoundBy.style.color = '#28a745';
+                    } else if (fb === 'sharechain_peer') {
+                        tdFoundBy.textContent = 'Pool peer';
+                        tdFoundBy.style.color = '#0d6efd';
+                    } else {
+                        tdFoundBy.textContent = '—';
+                        tdFoundBy.style.color = '#888';
+                    }
+                    tr.appendChild(tdFoundBy);
+
                     // Luck
                     var tdLuck = document.createElement('td');
                     if (block.luck) {

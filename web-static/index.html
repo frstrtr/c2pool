@@ -450,6 +450,21 @@
                             if (block.status === 'orphaned') return '✗ Orphaned';
                             return '⏳ Pending';
                         });
+                    // Found by (coin-generic pool-wide authorship, #901):
+                    // this_node when our template won, sharechain_peer when
+                    // another pool node's minted share won. Display only.
+                    tr.append('td')
+                        .style('font-weight', 'bold')
+                        .style('color', function(block){
+                            if (block.found_by === 'this_node') return '#28a745';
+                            if (block.found_by === 'sharechain_peer') return '#0d6efd';
+                            return '#888';
+                        })
+                        .text(function(block){
+                            if (block.found_by === 'this_node') return 'This node';
+                            if (block.found_by === 'sharechain_peer') return 'Pool peer';
+                            return '—';
+                        });
                 });
                 
                 // Merged mining blocks
@@ -627,7 +642,7 @@
         <h2>Blocks found recently:</h2>
         <p>Note that blocks may have been orphaned from the P2Pool chain and so not be here.</p>
         <table border="1" id="blocks">
-            <tr><th>time</th><th>number</th><th>hash/explorer link</th><th>share</th><th>luck</th><th>status</th></tr>
+            <tr><th>time</th><th>number</th><th>hash/explorer link</th><th>share</th><th>luck</th><th>status</th><th>found by</th></tr>
         </table>
         
         <div id="merged_blocks_section" style="display:none;">
