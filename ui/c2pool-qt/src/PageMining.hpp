@@ -34,6 +34,11 @@ public:
      *  PplnsBridge — no action needed here. */
     void refresh(ApiClient* api);
 
+    /** Re-boot the embedded PPLNS View surface so it re-reads the
+     *  active coin descriptor from CoinBridge on a profile/coin
+     *  switch. No-op when no embed was wired. GUI-only. */
+    void reloadEmbed();
+
 private slots:
     void onStartMining();
     void onStopMining();

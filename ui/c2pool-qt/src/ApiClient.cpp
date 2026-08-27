@@ -16,10 +16,15 @@ ApiClient::ApiClient(QObject* parent)
 
 void ApiClient::setBaseUrl(const QString& baseUrl)
 {
-    baseUrl_ = baseUrl.trimmed();
-    if (baseUrl_.endsWith('/')) {
-        baseUrl_.chop(1);
+    QString normalized = baseUrl.trimmed();
+    if (normalized.endsWith('/')) {
+        normalized.chop(1);
     }
+    if (normalized == baseUrl_) {
+        return;
+    }
+    baseUrl_ = normalized;
+    emit baseUrlChanged(baseUrl_);
 }
 
 QString ApiClient::baseUrl() const

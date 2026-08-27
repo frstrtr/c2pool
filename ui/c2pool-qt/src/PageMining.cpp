@@ -100,6 +100,13 @@ PageMining::PageMining(QList<QObject*> embedBridges, QWidget* parent)
     connect(unbanButton_, &QPushButton::clicked, this, &PageMining::onUnbanMiner);
 }
 
+void PageMining::reloadEmbed()
+{
+    if (pplnsEmbed_ != nullptr) {
+        pplnsEmbed_->reload();
+    }
+}
+
 void PageMining::refresh(ApiClient* api)
 {
     api_ = api;

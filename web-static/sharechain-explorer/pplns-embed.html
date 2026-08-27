@@ -63,9 +63,14 @@
       descriptorForCoin,
     } from './dist/pplns-view.js';
 
-    // Coin identity for this node's dashboard. The Qt host injects
-    // window.__C2POOL_COIN__ from the node's config; a ?coin= query param is
-    // a manual override; absent both we fall back to LTC (historical default).
+    // Coin identity for this node's dashboard. Preference order:
+    //   1. the CoinBridge descriptor (channel.objects.coin) — the
+    //      authoritative active-coin/profile value under c2pool-qt,
+    //      resolved asynchronously in onChannelReady;
+    //   2. window.__C2POOL_COIN__ injected by a non-Qt host;
+    //   3. a ?coin= query-param override;
+    //   4. LTC (historical default).
+    // resolveCoin() covers 2–4; the bridge (1) is applied at boot.
     function resolveCoin() {
       if (typeof window.__C2POOL_COIN__ === 'string' && window.__C2POOL_COIN__) {
         return window.__C2POOL_COIN__;
@@ -75,6 +80,19 @@
         if (q) return q;
       } catch (e) { /* no location in some embed hosts */ }
       return 'LTC';
+    }
+
+    // The CoinBridge descriptor's `symbol` is the chain name
+    // (e.g. "litecoin", "dash"); map it to the ticker the PPLNS
+    // descriptor registry keys on. Unknown chains fall through to the
+    // raw value — descriptorForCoin() upper-cases and falls back to LTC.
+    const CHAIN_TO_TICKER = {
+      litecoin: 'LTC', bitcoin: 'BTC', dogecoin: 'DOGE',
+      digibyte: 'DGB', dash: 'DASH', bitcoincash: 'BCH',
+    };
+    function symbolFromDescriptor(desc) {
+      if (!desc || typeof desc.symbol !== 'string' || !desc.symbol) return null;
+      return CHAIN_TO_TICKER[desc.symbol.toLowerCase()] || desc.symbol;
     }
 
     const statusEl = document.getElementById('status');
@@ -162,39 +180,62 @@
     }
 
     // ── Boot ─────────────────────────────────────────────────────────
+    function startPplnsView(transport, coinSymbol) {
+      const ctrl = PplnsView.init({
+        container: tree,
+        transport,
+        coin: descriptorForCoin(coinSymbol),
+        showVersionBadge: true,
+        showHashrate: true,
+        showMerged: true,
+      });
+      ctrl.on('ready', () => {
+        setStatus('connected');
+        log('info', 'PPLNS View started via QtPplnsTransport',
+            { coin: coinSymbol });
+      });
+      ctrl.on('error', (err) => {
+        setStatus('error', 'err');
+        log('error', err.message || String(err), { type: err.type });
+      });
+      window.__pplnsQt = ctrl;
+      window.addEventListener('beforeunload', () => {
+        try { ctrl.destroy(); } catch {}
+      });
+    }
+
     function onChannelReady(channel) {
       const pplnsBridge = channel.objects.pplns;
       const shareBridge = channel.objects.sharechain;
+      const coinBridge  = channel.objects.coin;
       if (!pplnsBridge) {
         setStatus('no pplns bridge', 'err');
         log('error', 'QWebChannel did not expose pplns');
         return;
       }
       const transport = new QtPplnsTransport(pplnsBridge, shareBridge);
-      try {
-        const ctrl = PplnsView.init({
-          container: tree,
-          transport,
-          coin: descriptorForCoin(resolveCoin()),
-          showVersionBadge: true,
-          showHashrate: true,
-          showMerged: true,
-        });
-        ctrl.on('ready', () => {
-          setStatus('connected');
-          log('info', 'PPLNS View started via QtPplnsTransport');
-        });
-        ctrl.on('error', (err) => {
-          setStatus('error', 'err');
-          log('error', err.message || String(err), { type: err.type });
-        });
-        window.__pplnsQt = ctrl;
-        window.addEventListener('beforeunload', () => {
-          try { ctrl.destroy(); } catch {}
-        });
-      } catch (err) {
-        setStatus('failed to start', 'err');
-        log('error', String(err && err.message ? err.message : err));
+      const boot = (symbol) => {
+        try {
+          startPplnsView(transport, symbol || resolveCoin());
+        } catch (err) {
+          setStatus('failed to start', 'err');
+          log('error', String(err && err.message ? err.message : err));
+        }
+      };
+      // Prefer the authoritative active-coin descriptor from CoinBridge.
+      // QWebChannel invokables resolve asynchronously; fall back to
+      // resolveCoin() when the bridge is absent (non-Qt host) or errors.
+      // A profile/coin switch re-boots this page (PageEmbedded::reload),
+      // so reading the descriptor at boot is sufficient to rebind — no
+      // separate coinChanged handler is needed.
+      if (coinBridge && typeof coinBridge.currentCoinDescriptor === 'function') {
+        try {
+          coinBridge.currentCoinDescriptor((desc) => boot(symbolFromDescriptor(desc)));
+        } catch (e) {
+          boot(null);
+        }
+      } else {
+        boot(null);
       }
     }
 

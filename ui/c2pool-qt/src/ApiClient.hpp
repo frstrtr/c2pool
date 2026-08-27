@@ -29,6 +29,14 @@ public:
 signals:
     void connectionStateChanged(const QString& state);
     void requestFailed(const QString& message);
+    /** Emitted when setBaseUrl() actually changes the target daemon
+     *  (e.g. an active-coin/profile switch). Consumers that hold a
+     *  long-lived connection keyed on the base URL — notably the
+     *  SharechainBridge SSE tip stream — reconnect against the new
+     *  daemon so a coin switch does not keep streaming the old coin's
+     *  tips. Request/response ops re-read baseUrl() per call and need
+     *  no signal. */
+    void baseUrlChanged(const QString& baseUrl);
 
 private:
     QString makeUrl(const QString& path) const;

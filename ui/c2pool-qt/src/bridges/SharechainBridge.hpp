@@ -86,6 +86,14 @@ private:
     /** Build the stream request + connect signals. Called both by
      *  startStream() and onReconnectTimer(). */
     void openStream();
+    /** Tear down the live SSE socket and immediately reopen it against
+     *  the current base URL. Wired to ApiClient::baseUrlChanged so an
+     *  active-coin/profile switch does not keep streaming the previous
+     *  coin's tips (the stream URL is fixed at openStream() time). A
+     *  no-op when no stream was requested. Emits tipReconnected so the
+     *  JS side re-syncs from a full window instead of a stale delta
+     *  cursor keyed to the old coin. */
+    void restartStream();
     /** Schedule the next reconnect attempt with exponential backoff. */
     void scheduleReconnect();
     /** Parse buffered SSE bytes; emit tipChanged for each complete
