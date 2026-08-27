@@ -12,9 +12,13 @@
 // Oracle (mirrors node.hpp advertised_best_share()'s raw-head walk + p2pool
 // web.py add_point() feeding the graph off the shared chain regardless of any
 // local miner):
-//   1. verified head present (non-null AND in chain) -> use it verbatim
-//   2. else -> tallest raw head, ties keep first-seen at max (h > best_height)
-//   3. no raw heads -> null (caller holds last-good, never a spurious 0)
+//   1. verified head present (non-null AND in chain) AND FRESH (the tallest raw
+//      head does not out-height it by more than stale_tolerance) -> verbatim
+//   2. verified head present but STALE (raw tip more than tolerance taller, i.e.
+//      the election froze) -> tallest raw head (the flat-plateau fix)
+//   3. else (no/absent verified head) -> tallest raw head, ties keep first-seen
+//      at max (h > best_height)
+//   4. no raw heads -> null (caller holds last-good, never a spurious 0)
 //
 // All expectations are hand-derived from that oracle, not produced by calling
 // the helper under test, so the KAT is non-circular.
@@ -44,54 +48,89 @@ uint256 h(uint32_t n) {
     return x;
 }
 
-// ---- (1) verified head present -> used verbatim -------------------------
+// ---- (1) verified head present + FRESH -> used verbatim -----------------
 
-TEST(DashPoolRateHead, VerifiedHeadUsedWhenPresent) {
-    // Verified head is non-null and in chain: returned as-is, raw heads ignored
-    // even if a raw head is taller.
+TEST(DashPoolRateHead, VerifiedHeadUsedWhenPresentAndFresh) {
+    // Verified head is non-null, in chain, and NOT out-heighted by the raw tip
+    // (its height 900 == the tallest raw head): returned as-is.
     std::vector<RawChainHead> raw = {{h(10), 500}, {h(11), 900}};
-    EXPECT_EQ(select_pool_rate_head(h(7), /*in_chain=*/true, raw), h(7));
+    EXPECT_EQ(select_pool_rate_head(h(7), /*in_chain=*/true,
+                                    /*verified_height=*/900, raw),
+              h(7));
+}
+
+TEST(DashPoolRateHead, VerifiedHeadWithinToleranceIsKept) {
+    // Raw tip only 2 shares taller than the verified election (899 vs the
+    // default tolerance 2): still within slack, so the verified head is kept.
+    std::vector<RawChainHead> raw = {{h(11), 901}};
+    EXPECT_EQ(select_pool_rate_head(h(7), /*in_chain=*/true,
+                                    /*verified_height=*/899, raw),
+              h(7));
+}
+
+TEST(DashPoolRateHead, VerifiedTallerThanRawIsKept) {
+    // Verified election ahead of the raw heads: kept, never regressed to a
+    // shorter raw head.
+    std::vector<RawChainHead> raw = {{h(11), 800}};
+    EXPECT_EQ(select_pool_rate_head(h(7), /*in_chain=*/true,
+                                    /*verified_height=*/1000, raw),
+              h(7));
+}
+
+// ---- (2) FROZEN verified election (the flat-plateau bug) ----------------
+
+TEST(DashPoolRateHead, StaleVerifiedOverriddenByTallerRaw) {
+    // THE dash.voidbind.com FLAT-PLATEAU CASE: the verified best-share election
+    // froze at height 100 while peers advanced the RAW chain to 900. 900 > 100+2
+    // so the verified head is stale -> anchor on the advancing raw head (h(11)),
+    // not the frozen verified head (h(7)). This is what unfreezes the graph.
+    std::vector<RawChainHead> raw = {{h(10), 500}, {h(11), 900}};
+    EXPECT_EQ(select_pool_rate_head(h(7), /*in_chain=*/true,
+                                    /*verified_height=*/100, raw),
+              h(11));
 }
 
 TEST(DashPoolRateHead, VerifiedHeadNotInChainTriggersFallback) {
     // Non-null verified head but NOT in the chain (stale/pruned): fall back to
     // the tallest raw head.
     std::vector<RawChainHead> raw = {{h(10), 500}, {h(11), 900}};
-    EXPECT_EQ(select_pool_rate_head(h(7), /*in_chain=*/false, raw), h(11));
+    EXPECT_EQ(select_pool_rate_head(h(7), /*in_chain=*/false,
+                                    /*verified_height=*/-1, raw),
+              h(11));
 }
 
-// ---- (2) zero-local-miner fallback: tallest raw head --------------------
+// ---- (3) zero-local-miner fallback: tallest raw head --------------------
 
 TEST(DashPoolRateHead, NullVerifiedPicksTallestRawHead) {
     // The bootstrap case: no verified head, peers filled the raw chain. Pick the
     // tallest raw head (900 > 500 > 100).
     std::vector<RawChainHead> raw = {{h(1), 100}, {h(2), 900}, {h(3), 500}};
-    EXPECT_EQ(select_pool_rate_head(uint256::ZERO, false, raw), h(2));
+    EXPECT_EQ(select_pool_rate_head(uint256::ZERO, false, -1, raw), h(2));
 }
 
 TEST(DashPoolRateHead, TieKeepsFirstSeenAtMaxHeight) {
     // Equal heights -> strictly-greater comparison keeps the FIRST at that max
     // (h(5), not h(9)), matching advertised_best_share()'s walk.
     std::vector<RawChainHead> raw = {{h(5), 800}, {h(9), 800}};
-    EXPECT_EQ(select_pool_rate_head(uint256::ZERO, false, raw), h(5));
+    EXPECT_EQ(select_pool_rate_head(uint256::ZERO, false, -1, raw), h(5));
 }
 
 TEST(DashPoolRateHead, NullHashRawHeadsAreSkipped) {
     // A null-hash raw head is not selectable even if it sorts "first".
     std::vector<RawChainHead> raw = {{uint256::ZERO, 999}, {h(4), 300}};
-    EXPECT_EQ(select_pool_rate_head(uint256::ZERO, false, raw), h(4));
+    EXPECT_EQ(select_pool_rate_head(uint256::ZERO, false, -1, raw), h(4));
 }
 
-// ---- (3) empty tracker -> null (caller holds last-good) -----------------
+// ---- (4) empty tracker -> null (caller holds last-good) -----------------
 
 TEST(DashPoolRateHead, NoHeadsReturnsNull) {
     std::vector<RawChainHead> raw;
-    EXPECT_TRUE(select_pool_rate_head(uint256::ZERO, false, raw).IsNull());
+    EXPECT_TRUE(select_pool_rate_head(uint256::ZERO, false, -1, raw).IsNull());
 }
 
 TEST(DashPoolRateHead, NullVerifiedAndOnlyNullRawHeadsReturnsNull) {
     std::vector<RawChainHead> raw = {{uint256::ZERO, 5}, {uint256::ZERO, 9}};
-    EXPECT_TRUE(select_pool_rate_head(uint256::ZERO, false, raw).IsNull());
+    EXPECT_TRUE(select_pool_rate_head(uint256::ZERO, false, -1, raw).IsNull());
 }
 
 }  // namespace

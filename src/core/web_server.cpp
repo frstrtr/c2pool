@@ -7064,6 +7064,21 @@ void MiningInterface::add_netdiff_sample(double difficulty, const std::string& s
         m_netdiff_history.erase(m_netdiff_history.begin());
 }
 
+void MiningInterface::update_network_difficulty(double difficulty, const std::string& source)
+{
+    // Mirror of the refresh_work() network-difficulty commit (web_server.cpp
+    // ~1590) for coin-tip sources that never run refresh_work() (daemonless
+    // DASH). Store the atomic every consumer reads (/global_stats,
+    // record_found_block's netdiff fallback, attempts_to_block) and append a
+    // graph sample. add_netdiff_sample() already dedups & bounds the history.
+    if (difficulty <= 0.0) return;
+    m_network_difficulty.store(difficulty, std::memory_order_relaxed);
+    if (m_on_network_difficulty_fn) {
+        try { m_on_network_difficulty_fn(difficulty); } catch (...) {}
+    }
+    add_netdiff_sample(difficulty, source);
+}
+
 nlohmann::json MiningInterface::rest_network_difficulty()
 {
     nlohmann::json arr = nlohmann::json::array();

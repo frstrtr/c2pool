@@ -2946,13 +2946,34 @@ int main(int argc, char* argv[]) {
                 web_server.get_mining_interface()->set_pool_hashrate_fn(
                     [&p2p_node]() -> double {
                         static double s_last_good = 0.0;
+                        // ── STALENESS BOUND (#57) ─────────────────────────
+                        // The last-good latch smooths transient tracker lock
+                        // contention, but unbounded it also turns a frozen
+                        // estimator into a permanent flat plateau (the DASH
+                        // dash.voidbind.com symptom). Bound it: if no fresh
+                        // hr>0 for >10 min, publish 0 so the chart breaks the
+                        // line instead of holding a stuck value forever.
+                        // Display-only; the retarget never reads this hook.
+                        static int64_t s_last_good_ts = 0;
+                        const int64_t now_s =
+                            std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::steady_clock::now()
+                                    .time_since_epoch())
+                                .count();
+                        constexpr int64_t kStaleSeconds = 600;  // 10 min
+                        auto held = [&]() -> double {
+                            if (s_last_good_ts != 0 &&
+                                now_s - s_last_good_ts > kStaleSeconds)
+                                return 0.0;
+                            return s_last_good;
+                        };
                         auto best = p2p_node->best_share_hash();
-                        if (best.IsNull()) return s_last_good;
+                        if (best.IsNull()) return held();
                         auto guard = p2p_node->read_tracker();
-                        if (!guard) return s_last_good;
-                        if (!guard->chain.contains(best)) return s_last_good;
+                        if (!guard) return held();
+                        if (!guard->chain.contains(best)) return held();
                         int height = guard->chain.get_height(best);
-                        if (height < 3) return s_last_good;
+                        if (height < 3) return held();
                         // DISPLAY LOOKBEHIND (#864): p2pool web.py get_global_stats()
                         // averages the gauge over ONE HOUR of shares --
                         // min(height, 3600//SHARE_PERIOD) -- not TARGET_LOOKBEHIND.
@@ -2964,8 +2985,8 @@ int main(int argc, char* argv[]) {
                         auto lookbehind = std::min(height - 1, display_lookbehind);
                         auto aps = guard->get_pool_attempts_per_second(best, lookbehind, false);
                         double hr = static_cast<double>(aps.GetLow64());
-                        if (hr > 0) s_last_good = hr;
-                        return s_last_good;
+                        if (hr > 0) { s_last_good = hr; s_last_good_ts = now_s; }
+                        return held();
                     });
                 // pool_hashrate is derived from the sharechain tip — move off
                 // the 1 Hz periodic timer onto the tip-change signal, same
