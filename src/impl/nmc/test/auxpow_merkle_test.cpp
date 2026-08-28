@@ -765,28 +765,36 @@ TEST(NmcP1eActivationGate, AuxPowBelowActivationIsPremature)
               HeaderChain::AdmitResult::ADMIT);
 }
 
-TEST(NmcP1eActivationGate, AuxPowRequiredAtAndAfterActivation)
+TEST(NmcP1eActivationGate, AuxPowOptionalAtAndAfterActivation)
 {
+    // D1 (issue #980): AuxPoW is OPTIONAL post-activation in Namecoin — 14 real
+    // plain (non-merge-mined) blocks exist in 19200..20000. A plain header at/after
+    // activation ADMITs at the gate (its own PoW is enforced later in
+    // connect_locked); an auxpow header ADMITs too (its proof is checked in
+    // add_auxpow_header). The old mandatory REJECT_MISSING_AUXPOW is retired.
     HeaderChain chain_(params_activation(19200));
-    // exactly at the activation height the AuxPow becomes mandatory.
     EXPECT_EQ(chain_.check_activation_gate(19200, /*has_auxpow=*/false),
-              HeaderChain::AdmitResult::REJECT_MISSING_AUXPOW);
+              HeaderChain::AdmitResult::ADMIT);
     EXPECT_EQ(chain_.check_activation_gate(19200, /*has_auxpow=*/true),
               HeaderChain::AdmitResult::ADMIT);
     // and well past it.
     EXPECT_EQ(chain_.check_activation_gate(250000, /*has_auxpow=*/true),
+              HeaderChain::AdmitResult::ADMIT);
+    EXPECT_EQ(chain_.check_activation_gate(250000, /*has_auxpow=*/false),
               HeaderChain::AdmitResult::ADMIT);
 }
 
 TEST(NmcP1eActivationGate, ActivationBoundaryIsInclusive)
 {
     HeaderChain chain_(params_activation(19200));
-    // height == activation-1 is still pre-activation (MM not yet required);
-    // height == activation flips MM to mandatory.
+    // Below activation a PLAIN header ADMITs and an AuxPoW header is PREMATURE;
+    // at/after activation BOTH ADMIT at the gate (D1 optional-auxpow semantics).
     EXPECT_EQ(chain_.check_activation_gate(19199, /*has_auxpow=*/false),
               HeaderChain::AdmitResult::ADMIT);
+    EXPECT_EQ(chain_.check_activation_gate(19199, /*has_auxpow=*/true),
+              HeaderChain::AdmitResult::REJECT_PREMATURE_AUXPOW);
     EXPECT_EQ(chain_.check_activation_gate(19200, /*has_auxpow=*/false),
-              HeaderChain::AdmitResult::REJECT_MISSING_AUXPOW);
+              HeaderChain::AdmitResult::ADMIT);
 }
 
 // ---------------------------------------------------------------------------
@@ -1925,26 +1933,45 @@ TEST(NmcMergedMiningMagicConformance, ProductionConstantMatchesAuxpowReference)
 
 TEST(NmcMergedMiningMagicConformance, ScannerBindsToExactlyThePinnedMagic)
 {
-    // A canonical single-slot marker the scanner accepts (mirrors the golden
-    // fixture above), then a copy whose magic final byte is flipped by one bit.
+    // D2 (issue #980): scan_mm_commitment now honours the legacy no-magic
+    // back-compat branch (reversed chain-root within the first 20 bytes). So a
+    // one-byte magic drift no longer makes an EARLY-root commitment vanish — it
+    // simply falls through to the legacy branch. To keep guarding the pinned
+    // magic constant, place the root LATE (offset > 20): only the magic-present
+    // path can bind a late root, so drifting the magic must reject.
     uint256 root = root_ascending(0x01);
     const unsigned h = 0; const int32_t cid = 1; const uint32_t nonce = 0x12345678u;
-    std::vector<unsigned char> good = mm_script(root_reversed(root), 1u << h, nonce);
+    std::vector<unsigned char> good;
+    good.insert(good.end(), 24, 0x00);                    // 24-byte extranonce filler
+    good.insert(good.end(), nmc::coin::MM_HEADER_MAGIC,
+                            nmc::coin::MM_HEADER_MAGIC + 4);
+    auto rr = root_reversed(root);
+    good.insert(good.end(), rr.begin(), rr.end());        // root at offset 28 (> 20)
+    put_le32(good, 1u << h);
+    put_le32(good, nonce);
     const uint32_t slot = aux_expected_index(nonce, cid, h);
+    // Magic present immediately before the (late) root -> binds via magic path.
     ASSERT_EQ(scan_mm_commitment(good, root, h, cid, slot), MMScan::MATCH);
 
-    // Locate the production magic inside the framed script and corrupt ONE byte.
+    // Corrupt ONE magic byte. The marker is undetectable, and because the root
+    // sits PAST the 20-byte legacy window the D2 no-magic branch cannot bind it
+    // either -> MISMATCH (root present but too late for back-compat). This still
+    // catches a production magic-constant edit on live coinbases.
     auto it = std::search(good.begin(), good.end(),
                           nmc::coin::MM_HEADER_MAGIC,
                           nmc::coin::MM_HEADER_MAGIC + 4);
     ASSERT_NE(it, good.end());
     std::vector<unsigned char> drifted = good;
     drifted[(it - good.begin()) + 3] ^= 0x01;             // 0x6d -> 0x6c
-    // A one-byte drift makes the marker UNDETECTABLE: the scanner reports ABSENT
-    // (staged-leg posture), not a malformed MISMATCH -- i.e. the commitment
-    // vanishes from the parent coinbase entirely. This is exactly the silent
-    // failure mode a production-constant edit would cause on live coinbases.
-    EXPECT_EQ(scan_mm_commitment(drifted, root, h, cid, slot), MMScan::ABSENT);
+    EXPECT_EQ(scan_mm_commitment(drifted, root, h, cid, slot), MMScan::MISMATCH);
+
+    // And a companion legacy-form assertion (D2 direct): magic ABSENT but the
+    // root within the first 20 bytes + valid size/nonce/slot -> MATCH.
+    std::vector<unsigned char> legacy = {0x03, 0x11, 0x22, 0x33};  // 4-byte prefix
+    legacy.insert(legacy.end(), rr.begin(), rr.end());             // root at offset 4
+    put_le32(legacy, 1u << h);
+    put_le32(legacy, nonce);
+    EXPECT_EQ(scan_mm_commitment(legacy, root, h, cid, slot), MMScan::MATCH);
 }
 
 } // namespace

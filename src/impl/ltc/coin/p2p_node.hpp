@@ -97,6 +97,14 @@ private:
     // the standard 80+1 byte parser.  Used for DOGE AuxPoW extended headers.
     using RawHeadersParser = std::function<std::vector<BlockHeaderType>(const uint8_t*, size_t)>;
     RawHeadersParser m_raw_headers_parser;
+    // Raw headers SINK: if set, receives the raw 'headers' payload bytes and
+    // short-circuits the standard handler entirely (both the 80+1 parse and the
+    // BIP130 body getdata). Additive and OPTIONAL — only the NMC lane sets it, so
+    // it is provably dead for DOGE/DGB/LTC/BTC. Unlike m_raw_headers_parser (which
+    // still yields ltc BlockHeaderType and drops any AuxPoW), the sink carries the
+    // raw bytes onward so an NMC-local parser can recover the AuxPoW proof.
+    using RawHeadersSink = std::function<void(const uint8_t*, size_t)>;
+    RawHeadersSink m_raw_headers_sink;
     // Raw block parser: if set, re-parses DOGE AuxPoW full blocks from raw P2P bytes.
     using RawBlockParser = std::function<BlockType(const uint8_t*, size_t)>;
     RawBlockParser m_raw_block_parser;
@@ -274,6 +282,11 @@ public:
     void set_on_peer_height(PeerHeightCallback cb) { m_on_peer_height = std::move(cb); }
     /// Set custom raw headers parser (for DOGE AuxPoW extended headers).
     void set_raw_headers_parser(RawHeadersParser p) { m_raw_headers_parser = std::move(p); }
+    /// Set a raw headers SINK (for NMC AuxPoW header-feed). When set, the 'headers'
+    /// handler forwards the raw payload bytes and returns immediately — the standard
+    /// 80+1 parse and BIP130 body getdata are skipped. Additive; unset for every
+    /// other chain, so their handler flow is byte-identical.
+    void set_raw_headers_sink(RawHeadersSink s) { m_raw_headers_sink = std::move(s); }
 
     /// Set custom raw block parser (for DOGE AuxPoW full blocks).
     void set_raw_block_parser(RawBlockParser p) { m_raw_block_parser = std::move(p); }
@@ -650,6 +663,18 @@ private:
 
     ADD_P2P_HANDLER(headers)
     {
+        // NMC AuxPoW header-feed sink: consume the raw 'headers' payload and
+        // short-circuit. m_raw_payload is saved in core/message.hpp before the
+        // standard parse (even on parse success), so both bulk-sync batches AND
+        // post-sendheaders single-header announces flow through here. The early
+        // return is deliberate — NMC SPV wants neither the AuxPoW-garbaging 80-byte
+        // parse nor the BIP130 body getdata. Dead for every chain that never calls
+        // set_raw_headers_sink (DOGE/DGB/LTC/BTC).
+        if (m_raw_headers_sink && !msg->m_raw_payload.empty()) {
+            m_raw_headers_sink(msg->m_raw_payload.data(), msg->m_raw_payload.size());
+            return;
+        }
+
         std::vector<BlockHeaderType> vheaders;
 
         // When a raw parser is set (DOGE AuxPoW), always prefer it over the

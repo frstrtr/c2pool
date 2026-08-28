@@ -220,13 +220,17 @@ enum class MMScan {
 ///   * the next 4 LE bytes are the tree size and MUST equal 2^height;
 ///   * the following 4 LE bytes are the nonce, and chain_index MUST equal
 ///     aux_expected_index(nonce, chain_id, height).
-/// Returns ABSENT when the magic is absent entirely — the staged-leg posture
+/// Returns ABSENT only when the commitment is entirely absent — no MM magic AND
+/// no reversed chain-root anywhere in the script — the staged-leg posture
 /// (mirrors the null-parent-header gate in step 3): step 2 cannot be asserted off
 /// a fixture carrying no marker, and the proof never upgrades to VALID regardless.
-/// NOTE (constant-pinning): the legacy no-magic "root in the first 20 bytes"
-/// back-compat branch of the reference is intentionally NOT honoured — post-
-/// activation Namecoin merge-mining always carries the magic; the final
-/// endianness/layout cross-check happens against a live namecoind at pinning.
+/// D2 (issue #980): the legacy no-magic "root in the first 20 bytes" back-compat
+/// branch of the reference is now honoured. 170/787 real Namecoin auxpow blocks in
+/// 19200..20000 (first h19414) carry NO 0xfabe6d6d magic and instead place the
+/// reversed chain-root within the first 20 bytes of the parent coinbase scriptSig
+/// (followed by LE size==2^height and nonce, chain_index==expected slot); without
+/// this branch live sync wedges at h19414. The magic-present path is byte-identical
+/// to before. Byte-faithful port of Namecoin/Bitcoin auxpow.cpp CAuxPow::check.
 /// chain_merkle_root is taken by value (base_uint::begin() is non-const).
 inline MMScan scan_mm_commitment(const std::vector<unsigned char>& script,
                                  uint256 chain_merkle_root,
@@ -234,14 +238,6 @@ inline MMScan scan_mm_commitment(const std::vector<unsigned char>& script,
                                  int32_t expected_chain_id,
                                  uint32_t chain_index) {
     const unsigned char* magic = MM_HEADER_MAGIC;
-    auto magic_it = std::search(script.begin(), script.end(), magic, magic + 4);
-    if (magic_it == script.end())
-        return MMScan::ABSENT;  // staged: no commitment to bind against yet
-
-    // Replay guard: exactly one MM header may appear (the reference rejects a
-    // second so one parent block cannot smuggle two commitments for one chain).
-    if (std::search(magic_it + 4, script.end(), magic, magic + 4) != script.end())
-        return MMScan::MISMATCH;
 
     // The chain-merkle root is committed reversed (big-endian display order).
     const unsigned char* rb =
@@ -249,23 +245,50 @@ inline MMScan scan_mm_commitment(const std::vector<unsigned char>& script,
     std::vector<unsigned char> root_be(rb, rb + uint256::BYTES);
     std::reverse(root_be.begin(), root_be.end());
 
-    auto root_pos = magic_it + 4;
-    if (static_cast<size_t>(script.end() - root_pos) < root_be.size())
-        return MMScan::MISMATCH;  // truncated before the root
-    if (!std::equal(root_be.begin(), root_be.end(), root_pos))
-        return MMScan::MISMATCH;  // magic present but commits a different root
+    // Common tail: read the 4-byte LE tree size + 4-byte LE nonce that follow the
+    // reversed root at `root_pos`, and bind size==2^height and slot==expected.
+    auto validate_tail =
+        [&](std::vector<unsigned char>::const_iterator root_pos) -> MMScan {
+        auto pc = root_pos + static_cast<std::ptrdiff_t>(root_be.size());
+        if (script.end() - pc < 8)
+            return MMScan::MISMATCH;  // missing the 4-byte size + 4-byte nonce
+        uint32_t n_size  = read_le32(&*pc);
+        uint32_t n_nonce = read_le32(&*(pc + 4));
+        if (n_size != (1u << chain_height))
+            return MMScan::MISMATCH;  // tree size disagrees with the branch depth
+        if (chain_index != aux_expected_index(n_nonce, expected_chain_id, chain_height))
+            return MMScan::MISMATCH;  // chain sits in the wrong deterministic slot
+        return MMScan::MATCH;
+    };
 
-    auto pc = root_pos + static_cast<std::ptrdiff_t>(root_be.size());
-    if (script.end() - pc < 8)
-        return MMScan::MISMATCH;  // missing the 4-byte size + 4-byte nonce
-    uint32_t n_size  = read_le32(&*pc);
-    uint32_t n_nonce = read_le32(&*(pc + 4));
-    if (n_size != (1u << chain_height))
-        return MMScan::MISMATCH;  // tree size disagrees with the branch depth
-    if (chain_index != aux_expected_index(n_nonce, expected_chain_id, chain_height))
-        return MMScan::MISMATCH;  // chain sits in the wrong deterministic slot
+    auto magic_it = std::search(script.begin(), script.end(), magic, magic + 4);
+    if (magic_it != script.end()) {
+        // ── magic-present path (byte-identical to the pre-D2 behaviour) ──
+        // Replay guard: exactly one MM header may appear (the reference rejects a
+        // second so one parent block cannot smuggle two commitments for one chain).
+        if (std::search(magic_it + 4, script.end(), magic, magic + 4) != script.end())
+            return MMScan::MISMATCH;
 
-    return MMScan::MATCH;
+        auto root_pos = magic_it + 4;
+        if (static_cast<size_t>(script.end() - root_pos) < root_be.size())
+            return MMScan::MISMATCH;  // truncated before the root
+        if (!std::equal(root_be.begin(), root_be.end(), root_pos))
+            return MMScan::MISMATCH;  // magic present but commits a different root
+        return validate_tail(root_pos);
+    }
+
+    // ── D2 legacy no-magic back-compat branch ──
+    // No merged-mining magic in the scriptSig. Search for the reversed chain-root
+    // directly; the reference requires it to start within the first 20 bytes
+    // (8-12 bytes are enough for extraNonce + nBits ahead of it). Absent the root
+    // there is nothing to bind — staged posture (preserves the ABSENT contract).
+    auto root_pos = std::search(script.begin(), script.end(),
+                                root_be.begin(), root_be.end());
+    if (root_pos == script.end())
+        return MMScan::ABSENT;  // no commitment to bind against yet
+    if (root_pos - script.begin() > 20)
+        return MMScan::MISMATCH;  // present but not early enough (back-compat rule)
+    return validate_tail(root_pos);
 }
 
 /// Build side -- the inverse of scan_mm_commitment(). Emit the canonical
@@ -1112,8 +1135,13 @@ public:
         if (!m_params.is_auxpow_active(height))
             return has_auxpow ? AdmitResult::REJECT_PREMATURE_AUXPOW
                               : AdmitResult::ADMIT;
-        return has_auxpow ? AdmitResult::ADMIT
-                          : AdmitResult::REJECT_MISSING_AUXPOW;
+        // D1 (issue #980): AuxPoW is OPTIONAL post-activation in Namecoin. A plain
+        // (non-merge-mined) header at/after activation is admissible provided it
+        // clears its OWN proof-of-work (enforced in connect_locked); an auxpow
+        // header is admissible once its four-leg proof verifies. Either way the
+        // gate ADMITs. The old mandatory REJECT_MISSING_AUXPOW wedged live sync at
+        // h19204 — there are 14 real plain post-activation blocks in 19200..20000.
+        return AdmitResult::ADMIT;
     }
 
     /// Add a header that carries a merge-mining AuxPow proof.
@@ -1194,6 +1222,12 @@ public:
 
     const NMCChainParams& params() const { return m_params; }
 
+    /// L2 support: record the connected peer's advertised chain height. Feeds
+    /// sync-progress logging only (no consensus). Mirror of
+    /// doge::coin::HeaderChain::set_peer_tip_height.
+    void set_peer_tip_height(uint32_t h) { m_peer_tip_height.store(h); }
+    uint32_t peer_tip_height() const { return m_peer_tip_height.load(); }
+
 private:
     // P1e storage leg: shared in-memory connect path for plain and merge-mined
     // headers. Caller holds m_mutex. Derives the connected height from the
@@ -1235,12 +1269,32 @@ private:
                             << height << ")";
                 return false;
             case AdmitResult::REJECT_MISSING_AUXPOW:
+                // D1: no longer produced by check_activation_gate (plain post-
+                // activation is admissible on own-PoW, enforced below). Kept for
+                // switch totality / ABI compatibility.
                 LOG_WARNING << "[EMB-NMC] reject header " << bh.ToString()
                             << ": AuxPow required at/after activation (height "
                             << height << ")";
                 return false;
             case AdmitResult::REJECT_UNPINNED:
                 return false;                   // activation unpinned: refuse to build
+        }
+
+        // D1 (issue #980): a PLAIN header (no AuxPoW) at/after activation must
+        // demonstrate its OWN proof-of-work — Namecoin still allows non-merge-mined
+        // blocks post-activation, and connect_locked does no other PoW validation,
+        // so without this a peer could feed unbacked plain post-activation headers.
+        // AuxPoW headers are already gated by check_proof (verify_auxpow_header)
+        // BEFORE connect. Plain headers below activation keep the pre-D1 behaviour
+        // (own-PoW not enforced here) so the synthetic sub-activation storage KATs,
+        // which seed placeholder-bits headers, stay valid.
+        if (!has_auxpow && m_params.is_auxpow_active(height)) {
+            if (pow_hash(header) > chain::bits_to_target(header.m_bits)) {
+                LOG_WARNING << "[EMB-NMC] reject plain header " << bh.ToString()
+                            << ": own PoW does not clear target (height "
+                            << height << ")";
+                return false;
+            }
         }
 
         IndexEntry e;
@@ -1396,6 +1450,7 @@ private:
     uint256        m_tip;            // null until first accepted header
     uint32_t       m_tip_height{0};
     uint256        m_best_work;
+    std::atomic<uint32_t> m_peer_tip_height{0};  // L2: peer-advertised height (log only)
 
     // Wired so far: AuxPow verification (P1d), the in-memory connect /
     // cumulative-work / fork-choice path (P1e), and LevelDB persistence +
