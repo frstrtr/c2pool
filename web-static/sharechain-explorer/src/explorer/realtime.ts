@@ -211,6 +211,11 @@ export class RealtimeOrchestrator {
     };
   private readonly anim: AnimationController;
   private window: WindowSnapshot<ShareForClassify> = { shares: [] };
+  /** Effective window cap. Seeded from config.windowSize but adopted
+   *  from the server's `window_size` on every window/delta fetch —
+   *  matching the inline dashboard.html path, so cap-overflow eviction
+   *  detection agrees with server truth rather than a static default. */
+  private _windowSize: number;
   private subscription: StreamSubscription | null = null;
   private abort: AbortController | null = null;
   private _started = false;
@@ -252,6 +257,7 @@ export class RealtimeOrchestrator {
     };
     this.anim = createAnimationController();
     this._effectiveUserContext = { ...config.userContext };
+    this._windowSize = this.config.windowSize;
   }
 
   async start(): Promise<void> {
@@ -449,12 +455,25 @@ export class RealtimeOrchestrator {
 
   private async rebuildWindow(): Promise<void> {
     try {
+      // Capture the pre-fetch window so we can animate the age-out /
+      // resync eviction (dying track) exactly as the inline
+      // liveRefresh() -> _animate3D(dying) reference did. The Phase B
+      // extraction replaced that with an unconditional anim.reset(),
+      // which silently dropped the evicted set with no render.
+      const oldShares = this.window.shares;
+      const oldLayout = this._currentLayout ?? this.updateLayout();
       const signal = this.abort?.signal;
       const opts: RequestOptions = signal !== undefined ? { signal } : {};
       const raw = await this.config.transport.fetchWindow(opts);
       const shares = this.extractShares(raw);
       const tip = shares.length > 0 ? this.config.hashOf(shares[0]!) : undefined;
       const meta = this.extractMeta(raw);
+      // Adopt the server's window cap (server truth) so cap-overflow
+      // eviction detection agrees with the backend, not a static default.
+      if (raw !== null && typeof raw === 'object') {
+        const ws = (raw as { window_size?: unknown }).window_size;
+        if (typeof ws === 'number' && ws > 0) this._windowSize = ws;
+      }
       // Adopt server-provided my_address when the caller didn't supply
       // one — matches inline dashboard.html's behaviour so "mine"
       // colouring works out-of-the-box.
@@ -476,10 +495,84 @@ export class RealtimeOrchestrator {
       };
       this._lastAppliedTip = tip ?? null;
       this._statsCache = null;  // invalidate cache for new window
-      this.anim.reset();
+      this.animateRebuildDiff(oldShares, oldLayout, shares);
     } catch (err) {
       this.emitError(err);
     }
+  }
+
+  /** Animate the transition from a previous full window to a freshly
+   *  fetched one (used by cold-start refresh, operator refresh(), and
+   *  fork-switch reorgs). Direct port of the inline liveRefresh() ->
+   *  _animate3D(dying) semantics: shares present in `oldShares` but not
+   *  the new window play the animator's dying track (rise/hold/dissolve
+   *  + ash); genuinely new shares play the born track. Cold start (no
+   *  previous window) and bulk changes (>= skipAnimationThreshold)
+   *  fall back to a silent reset, matching the inline newCount>=100
+   *  branch. */
+  private animateRebuildDiff(
+    oldShares: readonly ShareForClassify[],
+    oldLayout: GridLayout,
+    newShares: readonly ShareForClassify[],
+  ): void {
+    if (oldShares.length === 0) { this.anim.reset(); return; }
+    const oldSet = new Set(oldShares.map((s) => this.config.hashOf(s)));
+    const newSet = new Set(newShares.map((s) => this.config.hashOf(s)));
+    const evictedHashes: string[] = [];
+    for (const h of oldSet) if (!newSet.has(h)) evictedHashes.push(h);
+    const addedHashes: string[] = [];
+    for (const h of newSet) if (!oldSet.has(h)) addedHashes.push(h);
+    if (evictedHashes.length === 0 && addedHashes.length === 0) {
+      this.anim.reset();
+      return;
+    }
+    const threshold = this.config.skipAnimationThreshold;
+    if (evictedHashes.length >= threshold || addedHashes.length >= threshold) {
+      // Bulk refresh — skip animation and render the new static state.
+      this.anim.reset();
+      return;
+    }
+    const newLayout = this.updateLayout();
+    const pplnsOf = this.buildPplnsOf(oldShares, newShares);
+    const plan = buildAnimationPlan({
+      oldShares,
+      newShares,
+      addedHashes,
+      evictedHashes,
+      oldLayout,
+      newLayout,
+      userContext: this._effectiveUserContext,
+      palette: this.config.palette,
+      hashOf: this.config.hashOf,
+      fast: this.config.fastAnimation,
+      ...(pplnsOf ? { pplnsOf } : {}),
+      primaryBlockHashes: new Set(this.window.primaryBlocks ?? []),
+      dogeBlockHashes:    new Set(this.window.dogeBlocks ?? []),
+      ...(this.window.tip !== undefined ? { tipHash: this.window.tip } : {}),
+    });
+    // A full rebuild replaces the window wholesale, so start a fresh
+    // animation rather than queueing behind a prior plan.
+    this.anim.start(plan, this.nowMs());
+    this._hasQueued = false;
+  }
+
+  /** Per-share PPLNS weight fraction across the union of two share
+   *  sets, used for dying/born card "X.XXX%" text. Returns undefined
+   *  when no share carries a usable difficulty (cards then show "--").
+   *  Reference dashboard.html:4921-4951 + bitsToDifficulty (:5875). */
+  private buildPplnsOf(
+    a: readonly ShareForClassify[],
+    b: readonly ShareForClassify[],
+  ): ((s: ShareForClassify) => number) | undefined {
+    const diffOf = (s: ShareForClassify): number => {
+      const bits = (s as unknown as { b?: number }).b;
+      return typeof bits === 'number' ? bitsToDifficulty(bits) : 0;
+    };
+    let totalDiff = 0;
+    for (const s of a) totalDiff += diffOf(s);
+    for (const s of b) totalDiff += diffOf(s);
+    if (!(totalDiff > 0)) return undefined;
+    return (s: ShareForClassify): number => diffOf(s) / totalDiff;
   }
 
   /** Capture optional top-level metadata from window / delta
@@ -597,9 +690,31 @@ export class RealtimeOrchestrator {
 
   private applyDelta(raw: unknown): void {
     const delta = this.normaliseDelta(raw);
+    // Adopt the server's window cap (server truth) before merging, so
+    // cap-overflow eviction detection uses the backend's window_size
+    // rather than a static default — mirrors the inline path.
+    if (delta.window_size !== undefined && delta.window_size > 0) {
+      this._windowSize = delta.window_size;
+    }
+    const merge = mergeDelta(this.window, delta, { windowSize: this._windowSize });
+
+    if (merge.forkSwitch) {
+      // Reorg. The fork_switch delta is server-capped (≈200 shares), so
+      // merging it in place would shrink the window; instead re-fetch
+      // the full window. rebuildWindow() now diffs the previous window
+      // against the fresh one and plays the animator's dying track for
+      // the evicted set — restoring the proven inline
+      // liveRefresh() -> _animate3D(dying) behaviour the Phase B
+      // extraction dropped (it early-returned to a silent rebuild that
+      // discarded the evicted set mergeDelta computes for this case).
+      // Leave this.window as the true pre-reorg window until
+      // rebuildWindow captures it as `oldShares`.
+      void this.rebuildWindow();
+      return;
+    }
+
     const oldShares = this.window.shares;
     const oldLayout = this._currentLayout ?? this.updateLayout();
-    const merge = mergeDelta(this.window, delta, { windowSize: this.config.windowSize });
 
     // Swap state. Re-capture any top-level meta from the delta body
     // (chain_length + block lists + pplns — spec §5.3 keeps them
@@ -659,12 +774,6 @@ export class RealtimeOrchestrator {
     this._lastAppliedTip = newTip ?? null;
     this._statsCache = null;  // invalidate cache after merge
 
-    if (merge.forkSwitch) {
-      // Can't smoothly animate a reorg — full refresh.
-      void this.rebuildWindow();
-      return;
-    }
-
     if (merge.added.length === 0 && merge.evicted.length === 0) {
       // Tip advance with no window-visible change — skip animation.
       return;
@@ -678,21 +787,9 @@ export class RealtimeOrchestrator {
     }
 
     const newLayout = this.updateLayout();
-    // Compute per-share PPLNS weight fraction across the union of old
-    // and new shares so dying/born card text reads "X.XXX%" (reference
-    // dashboard.html:4921-4923 / 4941-4951). Uses difficulty derived
-    // from the share's compact-bits field `b` (reference
-    // `bitsToDifficulty`, :5875).
-    const diffOf = (s: ShareForClassify): number => {
-      const b = (s as unknown as { b?: number }).b;
-      return typeof b === 'number' ? bitsToDifficulty(b) : 0;
-    };
-    let totalDiff = 0;
-    for (const s of oldShares)            totalDiff += diffOf(s);
-    for (const s of this.window.shares)   totalDiff += diffOf(s);
-    const pplnsOf = totalDiff > 0
-      ? (s: ShareForClassify): number => diffOf(s) / totalDiff
-      : undefined;
+    // Per-share PPLNS weight fraction across the union of old and new
+    // shares so dying/born card text reads "X.XXX%".
+    const pplnsOf = this.buildPplnsOf(oldShares, this.window.shares);
 
     const plan = buildAnimationPlan({
       oldShares,
