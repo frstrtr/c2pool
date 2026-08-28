@@ -78,6 +78,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -303,7 +304,13 @@ int main(int argc, char* argv[])
         }
     }
 
-    if (bitcoind_host.empty() || bitcoind_port == 0)
+    // The external-bitcoind endpoint is only mandatory when NOT running the
+    // network-standalone arm. --coin-p2p-discover stands up an embedded
+    // BtcCoinPeerManager (DNS/fixed/HTTP-seeded coin-network peer discovery)
+    // that streams headers with no external bitcoind, so exempt it from the
+    // usage-exit. When neither is supplied the binary has no coin source and
+    // must still print usage and exit.
+    if (!coin_p2p_discover && (bitcoind_host.empty() || bitcoind_port == 0))
     {
         print_usage();
         return 1;
@@ -697,17 +704,27 @@ int main(int argc, char* argv[])
             }
         });
 
-    LOG_INFO << "[BTC] Connecting to bitcoind...";
-    coin_node.start_p2p(NetService(bitcoind_host, bitcoind_port));
+    // ── External-bitcoind P2P arm ────────────────────────────────────────────
+    // Dials the operator-supplied bitcoind and drives header sync + block relay
+    // through it. GUARDED on a non-empty --bitcoind: when running purely via
+    // --coin-p2p-discover (network-standalone, no external bitcoind) this arm is
+    // skipped and the embedded coin-network peer source below becomes the header
+    // origin. Behaviour is byte-identical to before this guard when --bitcoind
+    // is supplied (with or without --coin-p2p-discover also armed).
+    if (!bitcoind_host.empty())
+    {
+        LOG_INFO << "[BTC] Connecting to bitcoind...";
+        coin_node.start_p2p(NetService(bitcoind_host, bitcoind_port));
 
-    // Phase 10c: pull the peer mempool on connect (BIP 35) so TemplateBuilder
-    // produces POPULATED blocks. Without this the new_tx subscription above only
-    // sees txs announced via inv AFTER connect; txs already resident in the
-    // bitcoind mempool at connect time (e.g. a seeded regtest mempool) are never
-    // requested, leaving coinbase-only templates. Mirrors main_dgb. Peer must
-    // advertise NODE_BLOOM (regtest: -peerbloomfilters=1) or the request is
-    // skipped (logged) to avoid a disconnect; normal inv relay still applies.
-    coin_node.enable_mempool_request();
+        // Phase 10c: pull the peer mempool on connect (BIP 35) so TemplateBuilder
+        // produces POPULATED blocks. Without this the new_tx subscription above only
+        // sees txs announced via inv AFTER connect; txs already resident in the
+        // bitcoind mempool at connect time (e.g. a seeded regtest mempool) are never
+        // requested, leaving coinbase-only templates. Mirrors main_dgb. Peer must
+        // advertise NODE_BLOOM (regtest: -peerbloomfilters=1) or the request is
+        // skipped (logged) to avoid a disconnect; normal inv relay still applies.
+        coin_node.enable_mempool_request();
+    }
 
     // ── BTC coin-network peer discovery (--coin-p2p-discover) ────────────────
     // BTC-ISOLATED, self-contained peer manager (per-coin isolation fence; a
@@ -745,6 +762,71 @@ int main(int argc, char* argv[])
                  << "port=" << coin_port
                  << " peers=" << pm_stats.total
                  << " groups=" << pm_stats.unique_groups;
+
+        // ── Network-standalone header source ────────────────────────────────
+        // With no external bitcoind, the coin-network peer manager is the ONLY
+        // header origin. It banks scored peer ADDRESSES but does not itself hold
+        // a header-streaming connection, so dial one discovered peer through the
+        // same NodeP2P broadcaster the external arm uses: the initial-getheaders
+        // timer and new_headers callback (both keyed on coin_node) are then fed
+        // by this peer exactly as they would be by an external bitcoind, and the
+        // header tip advances from genesis. A self-rescheduling failover timer
+        // re-dials a fresh candidate while the version/verack handshake has not
+        // completed (or has since dropped), so a dead first pick — or a peer
+        // that later disconnects — does not wedge header sync. When --bitcoind
+        // is ALSO supplied the external arm already owns coin_node, so this
+        // standalone dial is skipped and behaviour is unchanged.
+        if (bitcoind_host.empty()) {
+            coin_node.enable_mempool_request();
+            // Peers already dialed/attempted this run — passed to
+            // get_peers_to_connect() as the "connected" exclusion set so each
+            // failover draws the NEXT best-scored peer instead of re-picking a
+            // dead one; cleared to re-sweep once the banked set is exhausted.
+            auto standalone_tried = std::make_shared<std::set<std::string>>();
+            auto dial_standalone_peer =
+                [&coin_node, &coin_peer_mgr, standalone_tried]() -> bool {
+                    auto cands = coin_peer_mgr->get_peers_to_connect(*standalone_tried);
+                    if (cands.empty()) {
+                        standalone_tried->clear();
+                        cands = coin_peer_mgr->get_peers_to_connect(*standalone_tried);
+                    }
+                    if (cands.empty()) {
+                        LOG_WARNING << "[BTC] standalone header source: no coin peers to dial yet";
+                        return false;
+                    }
+                    const auto& ep = cands.front();
+                    standalone_tried->insert(ep.to_string());
+                    LOG_INFO << "[BTC] standalone header source: dialing coin peer "
+                             << ep.to_string() << " (no external bitcoind)";
+                    coin_node.start_p2p(ep.to_net_service());
+                    return true;
+                };
+            // Initial dial now so the 3s initial-getheaders timer finds a peer.
+            dial_standalone_peer();
+            // Failover: every 25s, if we are not currently handshaked with a
+            // coin peer, dial the next candidate. Weak self-ref avoids a
+            // shared_ptr cycle (mirrors the B5 warn timer below).
+            auto standalone_dial_timer =
+                std::make_shared<boost::asio::steady_timer>(ioc);
+            auto schedule_standalone_dial = std::make_shared<std::function<void()>>();
+            std::weak_ptr<std::function<void()>> weak_dial = schedule_standalone_dial;
+            *schedule_standalone_dial =
+                [standalone_dial_timer, weak_dial, &coin_node, dial_standalone_peer]() {
+                    standalone_dial_timer->expires_after(std::chrono::seconds(25));
+                    standalone_dial_timer->async_wait(
+                        [standalone_dial_timer, weak_dial, &coin_node, dial_standalone_peer]
+                        (const boost::system::error_code& ec) {
+                            if (ec) return;
+                            if (!coin_node.is_handshake_complete()) {
+                                LOG_INFO << "[BTC] standalone header source: no live coin peer "
+                                            "(handshake incomplete) — failing over to next candidate";
+                                dial_standalone_peer();
+                            }
+                            if (auto self = weak_dial.lock()) (*self)();
+                        });
+                };
+            (*schedule_standalone_dial)();
+        }
     }
 
     // Drive initial header sync. Per BTC protocol, NodeP2P's verack handler
