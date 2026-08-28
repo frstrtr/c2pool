@@ -2542,6 +2542,15 @@ std::string MiningInterface::block_explorer_prefix() const
     // or any other explorer links found blocks through it.
     if (!m_custom_block_explorer.empty())
         return m_custom_block_explorer;
+    // Label-keyed coins that share a Blockchain enum value (BCH on BITCOIN;
+    // NMC AuxPoW) resolve from the coin label so a BCH node does not emit
+    // Bitcoin's block explorer. Enum-native coins never match these labels.
+    {
+        std::string label = m_coin_label;
+        for (auto& ch : label) if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 32);
+        if (label == "BCH") return "https://blockchair.com/bitcoin-cash/block/";
+        if (label == "NMC") return "https://nmc.tokenview.io/en/blockdetail/";
+    }
     switch (m_blockchain) {
     case Blockchain::LITECOIN:
         return m_testnet ? "https://blockchair.com/litecoin/testnet/block/"
@@ -2549,7 +2558,9 @@ std::string MiningInterface::block_explorer_prefix() const
     case Blockchain::BITCOIN:  return "https://blockchair.com/bitcoin/block/";
     case Blockchain::DOGECOIN: return "https://blockchair.com/dogecoin/block/";
     case Blockchain::DASH:     return "https://blockchair.com/dash/block/";
-    case Blockchain::DIGIBYTE: return "https://blockchair.com/digibyte/block/";
+    // Blockchair does not list DigiByte; digiexplorer.info is the live DGB
+    // explorer (matches rest_web_currency_info + classify.ts + c2pool-qt).
+    case Blockchain::DIGIBYTE: return "https://digiexplorer.info/block/";
     default:                   return "";   // unknown coin -> caller emits null
     }
 }
@@ -4670,6 +4681,48 @@ nlohmann::json MiningInterface::rest_web_currency_info()
 {
     nlohmann::json result = nlohmann::json::object();
 
+    // Label-keyed coins that share a Blockchain enum value with another chain
+    // resolve their identity from the configured coin label, NOT the enum:
+    //   - BCH runs on Blockchain::BITCOIN + set_coin_label("BCH") (it has no
+    //     dedicated enum entry — see src/impl/bch/pool_entrypoint.hpp), so the
+    //     BITCOIN switch case below would otherwise advertise Bitcoin's
+    //     symbol/name/explorer on a Bitcoin-Cash node.
+    //   - NMC is an AuxPoW child (no primary binary); handled here for
+    //     completeness / operator custom deployments.
+    // Enum-native coins (LTC/BTC/DOGE/DASH/DGB) never match these labels, so
+    // they fall through to the switch UNCHANGED (byte-identical behaviour).
+    std::string coin_label_uc = m_coin_label;
+    for (auto& ch : coin_label_uc)
+        if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 32);
+    if (coin_label_uc == "BCH") {
+        result["symbol"] = "BCH";
+        result["name"] = "Bitcoin Cash";
+        result["block_period"] = 600;  // 10 min average (SHA256d)
+        if (!m_custom_address_explorer.empty()) {
+            result["address_explorer_url_prefix"] = m_custom_address_explorer;
+            result["block_explorer_url_prefix"]   = m_custom_block_explorer;
+            result["tx_explorer_url_prefix"]      = m_custom_tx_explorer;
+        } else {
+            result["address_explorer_url_prefix"] = "https://blockchair.com/bitcoin-cash/address/";
+            result["block_explorer_url_prefix"]   = "https://blockchair.com/bitcoin-cash/block/";
+            result["tx_explorer_url_prefix"]      = "https://blockchair.com/bitcoin-cash/transaction/";
+        }
+    } else if (coin_label_uc == "NMC") {
+        result["symbol"] = "NMC";
+        result["name"] = "Namecoin";
+        result["block_period"] = 600;  // 10 min average (SHA256d AuxPoW under BTC)
+        if (!m_custom_address_explorer.empty()) {
+            result["address_explorer_url_prefix"] = m_custom_address_explorer;
+            result["block_explorer_url_prefix"]   = m_custom_block_explorer;
+            result["tx_explorer_url_prefix"]      = m_custom_tx_explorer;
+        } else {
+            // Blockchair does not list Namecoin; Tokenview is a live NMC explorer
+            // (namecoin.org "Blockchain Explorers"). Operator-verifiable value.
+            result["address_explorer_url_prefix"] = "https://nmc.tokenview.io/en/address/";
+            result["block_explorer_url_prefix"]   = "https://nmc.tokenview.io/en/blockdetail/";
+            result["tx_explorer_url_prefix"]      = "https://nmc.tokenview.io/en/tx/";
+        }
+    } else
     switch (m_blockchain) {
     case Blockchain::LITECOIN:
         result["symbol"] = "LTC";
@@ -4750,9 +4803,14 @@ nlohmann::json MiningInterface::rest_web_currency_info()
             result["block_explorer_url_prefix"]   = m_custom_block_explorer;
             result["tx_explorer_url_prefix"]      = m_custom_tx_explorer;
         } else {
-            result["address_explorer_url_prefix"] = "https://blockchair.com/digibyte/address/";
-            result["block_explorer_url_prefix"]   = "https://blockchair.com/digibyte/block/";
-            result["tx_explorer_url_prefix"]      = "https://blockchair.com/digibyte/transaction/";
+            // Blockchair does NOT list DigiByte (blockchair.com/digibyte/* are
+            // dead links); digiexplorer.info is the live DGB explorer and is
+            // already what the bundled explorer (classify.ts) and c2pool-qt
+            // (CoinBridge) use — align the server so all three agree. Note the
+            // path segment is /tx/ (digiexplorer), not /transaction/ (blockchair).
+            result["address_explorer_url_prefix"] = "https://digiexplorer.info/address/";
+            result["block_explorer_url_prefix"]   = "https://digiexplorer.info/block/";
+            result["tx_explorer_url_prefix"]      = "https://digiexplorer.info/tx/";
         }
         break;
     default:
@@ -4802,15 +4860,33 @@ nlohmann::json MiningInterface::rest_web_currency_info()
     // RIGHT explorer, never the primary coin's. Sourced from live MM state —
     // never hardcoded per node.
     {
-        auto blockchair_slug = [](const std::string& sym) -> std::string {
-            if (sym == "LTC")  return "litecoin";
-            if (sym == "DOGE") return "dogecoin";
-            if (sym == "BTC")  return "bitcoin";
-            if (sym == "DASH") return "dash";
-            if (sym == "DGB")  return "digibyte";
-            if (sym == "BCH")  return "bitcoin-cash";
-            if (sym == "NMC")  return "namecoin";
-            return "";
+        // Per-coin {address,block,tx} explorer prefixes. Blockchair covers the
+        // SHA256d/scrypt/X11 majors, but does NOT list DigiByte or Namecoin —
+        // those use their own explorers with chain-correct path segments
+        // (digiexplorer uses /tx/, not blockchair's /transaction/). Returns an
+        // empty object when no public explorer is known -> no link rendered.
+        auto explorer_prefixes = [](const std::string& sym) -> nlohmann::json {
+            auto bc = [](const char* slug) {
+                std::string base = std::string("https://blockchair.com/") + slug + "/";
+                return nlohmann::json{
+                    {"address_explorer_url_prefix", base + "address/"},
+                    {"block_explorer_url_prefix",   base + "block/"},
+                    {"tx_explorer_url_prefix",      base + "transaction/"}};
+            };
+            if (sym == "LTC")  return bc("litecoin");
+            if (sym == "DOGE") return bc("dogecoin");
+            if (sym == "BTC")  return bc("bitcoin");
+            if (sym == "DASH") return bc("dash");
+            if (sym == "BCH")  return bc("bitcoin-cash");
+            if (sym == "DGB")  return nlohmann::json{
+                {"address_explorer_url_prefix", "https://digiexplorer.info/address/"},
+                {"block_explorer_url_prefix",   "https://digiexplorer.info/block/"},
+                {"tx_explorer_url_prefix",      "https://digiexplorer.info/tx/"}};
+            if (sym == "NMC")  return nlohmann::json{
+                {"address_explorer_url_prefix", "https://nmc.tokenview.io/en/address/"},
+                {"block_explorer_url_prefix",   "https://nmc.tokenview.io/en/blockdetail/"},
+                {"tx_explorer_url_prefix",      "https://nmc.tokenview.io/en/tx/"}};
+            return nlohmann::json::object();
         };
         nlohmann::json coins = nlohmann::json::array();
         // Primary coin: reuse the prefixes already resolved above so we never
@@ -4834,12 +4910,11 @@ nlohmann::json MiningInterface::rest_web_currency_info()
                 nlohmann::json c = {{"symbol", ci.symbol}, {"merged", true}};
                 c["current_height"] = ci.current_height;
                 if (!ci.current_tip.empty()) c["current_tip"] = ci.current_tip;
-                std::string slug = blockchair_slug(ci.symbol);
-                if (!slug.empty()) {
-                    std::string base = "https://blockchair.com/" + slug + "/";
-                    c["address_explorer_url_prefix"] = base + "address/";
-                    c["block_explorer_url_prefix"]   = base + "block/";
-                    c["tx_explorer_url_prefix"]      = base + "transaction/";
+                nlohmann::json ex = explorer_prefixes(ci.symbol);
+                if (!ex.empty()) {
+                    c["address_explorer_url_prefix"] = ex["address_explorer_url_prefix"];
+                    c["block_explorer_url_prefix"]   = ex["block_explorer_url_prefix"];
+                    c["tx_explorer_url_prefix"]      = ex["tx_explorer_url_prefix"];
                 }
                 coins.push_back(c);
             }

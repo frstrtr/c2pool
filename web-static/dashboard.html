@@ -2955,6 +2955,36 @@
                 legendNative: 'V36 (others)', legendSignaling: 'V36 signaling',
                 legendStale: 'V35 only'
             },
+            // BTC/BCH/DGB/DOGE run the SAME V35->V36 AutoRatchet family as LTC
+            // (src/impl/btc/auto_ratchet.hpp, dgb/auto_ratchet_tail_guard.hpp,
+            // bch/donation_consensus.hpp "share_version >= 36"). They previously
+            // rendered LTC's legend only by DEGRADING to SHARE_VERSION_DESCRIPTORS.LTC;
+            // declaring them explicitly makes the identity intentional so a
+            // BTC/BCH/DGB/DOGE-active dashboard keys its OWN descriptor.
+            BTC: {
+                threshold: 36, signaling: true,
+                statNative: 'V36 Native', statSignaling: 'V36 Signaling',
+                legendNative: 'V36 (others)', legendSignaling: 'V36 signaling',
+                legendStale: 'V35 only'
+            },
+            BCH: {
+                threshold: 36, signaling: true,
+                statNative: 'V36 Native', statSignaling: 'V36 Signaling',
+                legendNative: 'V36 (others)', legendSignaling: 'V36 signaling',
+                legendStale: 'V35 only'
+            },
+            DGB: {
+                threshold: 36, signaling: true,
+                statNative: 'V36 Native', statSignaling: 'V36 Signaling',
+                legendNative: 'V36 (others)', legendSignaling: 'V36 signaling',
+                legendStale: 'V35 only'
+            },
+            DOGE: {
+                threshold: 36, signaling: true,
+                statNative: 'V36 Native', statSignaling: 'V36 Signaling',
+                legendNative: 'V36 (others)', legendSignaling: 'V36 signaling',
+                legendStale: 'V35 only'
+            },
             DASH: {
                 threshold: 16, signaling: false,
                 statNative: 'V16 Current', statSignaling: null,

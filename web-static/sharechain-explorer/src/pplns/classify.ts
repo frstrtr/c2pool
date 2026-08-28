@@ -116,6 +116,28 @@ export const BCH_COIN_PPLNS_DESCRIPTOR: CoinPplnsDescriptor = {
   addressExplorer: 'https://blockchair.com/bitcoin-cash/address/',
 };
 
+// DOGE as a PRIMARY node (scrypt, aux-of-LTC that can also run stand-alone).
+// It rides the LTC-family V35->V36 sharechain, so it reuses LTC_VERSION_BADGES;
+// it declares NO merged child of its own. Without this entry a DOGE-primary
+// node degrades to GENERIC and renders no DOGE address explorer.
+export const DOGE_COIN_PPLNS_DESCRIPTOR: CoinPplnsDescriptor = {
+  mergedChains: [],
+  versionBadges: LTC_VERSION_BADGES,
+  formatHashrate: formatHashrate,
+  addressExplorer: 'https://blockchair.com/dogecoin/address/',
+};
+
+// NMC (SHA256d AuxPoW child under BTC). No primary c2pool binary today, but a
+// registry entry keeps a merged-NMC display from degrading to GENERIC (no
+// address explorer). Blockchair does not list Namecoin; Tokenview is a live
+// NMC explorer (namecoin.org "Blockchain Explorers").
+export const NMC_COIN_PPLNS_DESCRIPTOR: CoinPplnsDescriptor = {
+  mergedChains: [],
+  versionBadges: STANDALONE_VERSION_BADGES,
+  formatHashrate: formatHashrate,
+  addressExplorer: 'https://nmc.tokenview.io/en/address/',
+};
+
 // Fallback for a coin that is specified but not in the registry: NEVER
 // resurrect LTC's DOGE row. A truly unknown coin has no declared merged
 // child, so it degrades to an empty-mergedChains descriptor.
@@ -153,6 +175,8 @@ export const COIN_PPLNS_DESCRIPTORS: Readonly<Record<string, CoinPplnsDescriptor
     BTC:  BTC_COIN_PPLNS_DESCRIPTOR,
     DGB:  DGB_COIN_PPLNS_DESCRIPTOR,
     BCH:  BCH_COIN_PPLNS_DESCRIPTOR,
+    DOGE: DOGE_COIN_PPLNS_DESCRIPTOR,
+    NMC:  NMC_COIN_PPLNS_DESCRIPTOR,
   });
 
 export function descriptorForCoin(
