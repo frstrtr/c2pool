@@ -452,7 +452,16 @@ export function buildAnimationPlan(input: AnimationInput): AnimationPlan {
 
     // ═══ WAVE (phase 2) ═══
     for (const entry of waveList) {
-      const oldPos = cellPosition(input.oldLayout, entry.oldIndex);
+      // Derive the wave's OLD grid coordinates from the share's old INDEX
+      // in the POST-delta (new) layout rather than the pre-delta layout.
+      // When the delta changes the column count or cell size, reading the
+      // old layout paints the wave in a grid incongruent with the new
+      // canvas — every position that exists only in the new layout (e.g.
+      // an entire new last column) is left unpainted (black). Recomputing
+      // from the index in the new layout keeps every pre-wave / mid-slide
+      // frame congruent with the canvas. Identity when the layout is
+      // unchanged (oldLayout.cols === newLayout.cols).
+      const oldPos = cellPosition(input.newLayout, entry.oldIndex);
       const newPos = cellPosition(input.newLayout, entry.newIndex);
       if (oldPos === null || newPos === null) continue;
       const distFromTail = shareCountMinus1 - entry.newIndex;
@@ -633,6 +642,20 @@ export function buildAnimationPlan(input: AnimationInput): AnimationPlan {
         });
         continue;
       }
+
+      // Always paint the destination grid cell first so the new share's
+      // head cell is never black while the birth ceremony (coalesce /
+      // hold / land) plays out below it. The ceremony overlays draw on
+      // top at bFinalX/bFinalY. Mirrors dashboard.html.
+      cells.push({
+        shareHash: entry.hash,
+        track: 'born',
+        x: dstPos.x,
+        y: dstPos.y,
+        size: cs,
+        color: applyAlpha(meta.finalColor, 1),
+        alpha: 1,
+      });
 
       if (bt < 0.35) {
         // COALESCE: particles gather into a growing core

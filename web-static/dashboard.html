@@ -5543,6 +5543,7 @@
                     var s = self.shares[i];
                     self._oldPositions[s.H || s.h] = {
                         x: ml + col * step, y: row * step,
+                        idx: i,
                         color: self.getColor(s),
                         miner: s.m || '',
                         diff: s.b ? self.bitsToDifficulty(s.b) : 0
@@ -5754,6 +5755,22 @@
                     ctx.fillStyle = '#0d0d1a';
                     ctx.fillRect(0, 0, cssW, cssH);
 
+                    // ═══ SETTLED BASE LAYER ═══
+                    // Paint every share at its FINAL grid position first, so
+                    // no cell is ever background-black during the animation.
+                    // The wave / born / dying flourishes draw on top of this
+                    // congruent all-green grid. Without it, cells that are only
+                    // mid-transit (the pre-wave tail rows the window grew into,
+                    // and cells vacated during the tail→head slide) read as
+                    // black holes until the wave reaches them. Identity to the
+                    // settled render() when the animation is idle.
+                    ctx.globalAlpha = 1;
+                    for (var _bi = 0; _bi < animTotal; _bi++) {
+                        var _bp = newPos[_bi];
+                        ctx.fillStyle = animColors[_bi];
+                        ctx.fillRect(_bp.x, _bp.y, cs, cs);
+                    }
+
                     // ═══ PHASE 2+3: Smooth wave tail→head + new shares ═══
                     var p2elapsed = elapsed - phase2Start;
                     var totalShares = animTotal;
@@ -5790,11 +5807,19 @@
                             // Birth position: below destination, shifted 1 row down for shadow clearance
                             var bFinalY = Math.min(dst.y + step * 8, cssH * 0.5);
 
+                            // Always paint the destination grid cell first so
+                            // the new share's head cell is never black while the
+                            // birth ceremony (coalesce/hold/land) plays out
+                            // below it. The coalesce/hold branches set
+                            // globalAlpha=0 to skip the generic draw, which
+                            // otherwise left the destination cell unpainted
+                            // (black) for the whole fly-in.
+                            ctx.globalAlpha = 1;
+                            ctx.fillStyle = animColors[i];
+                            ctx.fillRect(dst.x, dst.y, cs, cs);
+
                             if (bt <= 0) {
-                                // Birth not started yet — draw at destination to prevent gaps
-                                ctx.globalAlpha = 1;
-                                ctx.fillStyle = animColors[i];
-                                ctx.fillRect(dst.x, dst.y, cs, cs);
+                                // Birth not started yet — destination already painted above
                                 continue;
                             }
                             if (bt < 0.35) {
@@ -5895,6 +5920,24 @@
                             var ease = 1 - Math.pow(1 - shareT, 3);
 
                             var old = animOldPos[share.H || share.h];
+                            // Derive the share's OLD grid coordinates from its
+                            // stored index using the POST-refit layout (cols/
+                            // step just recomputed above). The stored old.x/
+                            // old.y were snapshotted with the PRE-delta layout;
+                            // when the delta changes the column count or cell
+                            // size, reading them paints the wave in a grid that
+                            // is incongruent with the new canvas — every
+                            // position that exists only in the new layout (e.g.
+                            // an entire new last column) is left unpainted
+                            // (black). Recomputing from the index keeps the
+                            // pre-wave frame congruent with the new canvas.
+                            var ox, oy;
+                            if (old && typeof old.idx === 'number') {
+                                ox = ml + (old.idx % cols) * step;
+                                oy = Math.floor(old.idx / cols) * step;
+                            } else if (old) {
+                                ox = old.x; oy = old.y;
+                            }
                             if (old && shareT > 0 && shareT < 1) {
                                 var liftA, slideA, landA;
                                 if (ease < 0.2) {
@@ -5906,11 +5949,11 @@
                                 }
                                 var pop = liftA * (1 - landA);
                                 scale = 1 + 0.35 * pop;
-                                x = old.x + (dst.x - old.x) * slideA;
-                                y = old.y + (dst.y - old.y) * slideA;
+                                x = ox + (dst.x - ox) * slideA;
+                                y = oy + (dst.y - oy) * slideA;
                                 shadowAlpha = 0.35 * pop;
                             } else if (old && shareT <= 0) {
-                                x = old.x; y = old.y; scale = 1; shadowAlpha = 0;
+                                x = ox; y = oy; scale = 1; shadowAlpha = 0;
                             } else {
                                 x = dst.x; y = dst.y; scale = 1; shadowAlpha = 0;
                             }
@@ -9154,6 +9197,7 @@
                     // window below windowSize and suppress the cap trim.
                     defrag._oldPositions[s.H || s.h] = {
                         x: ml + col * step, y: row * step,
+                        idx: i,
                         color: defrag.getColor(s),
                         miner: s.m || '',
                         diff: s.b ? defrag.bitsToDifficulty(s.b) : 0
@@ -9199,6 +9243,17 @@
                         });
                     }
                 }
+
+                // Advance the tip cursor from the payload. The immediate
+                // fetch fired by toggleRealTime() passes the pre-toggle tip as
+                // `since` but never records the tip it received, so the first
+                // SSE push (whose hash differs from the stale cursor) re-issued
+                // delta?since=<same old tip> and re-animated the ENTIRE first
+                // delta a second time as newborn shares. Recording the fetched
+                // tip here makes that SSE message a no-op (or fetch only the
+                // genuinely new shares).
+                if (delta.tip) _rtTipHash = delta.tip;
+                else if (defrag.shares.length > 0) _rtTipHash = defrag.shares[0].h;
 
                 // Animate
                 var newCount = newShares.length;

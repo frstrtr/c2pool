@@ -205,19 +205,23 @@ test('born LAND shrinks from bornScale to 1x; HOLD stays at bornScale', () => {
     bornScale: 5,
   }));
   const base = LAYOUT.cellSize;
+  // Each born share now also paints a flat destination base cell (size
+  // = cellSize) so its head slot is never black while the fly-in plays;
+  // the *ceremony* cell is the larger one, so select by max size.
+  const ceremonyCell = (t: number) =>
+    plan.frameAt(t).cells
+      .filter((x) => x.shareHash === 'n')
+      .sort((a, b) => b.size - a.size)[0];
   // HOLD window: bt in [0.35, 0.65). Sample at 0.5.
-  const hold = plan.frameAt(plan.phase3Start + plan.phase3Dur * 0.5)
-    .cells.find((x) => x.shareHash === 'n');
+  const hold = ceremonyCell(plan.phase3Start + plan.phase3Dur * 0.5);
   assert.ok(hold);
   assert.ok(Math.abs(hold!.size - base * 5) < 0.01);
   // LAND entry (bt=0.66): scale still near bornScale.
-  const landStart = plan.frameAt(plan.phase3Start + plan.phase3Dur * 0.66)
-    .cells.find((x) => x.shareHash === 'n');
+  const landStart = ceremonyCell(plan.phase3Start + plan.phase3Dur * 0.66);
   assert.ok(landStart);
   assert.ok(landStart!.size > base * 4);
   // LAND end (bt=1.0): scale = 1.
-  const end = plan.frameAt(plan.phase3Start + plan.phase3Dur)
-    .cells.find((x) => x.shareHash === 'n');
+  const end = ceremonyCell(plan.phase3Start + plan.phase3Dur);
   assert.ok(end);
   assert.ok(Math.abs(end!.size - base) < 0.5);
 });
