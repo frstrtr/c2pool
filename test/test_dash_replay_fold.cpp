@@ -1761,6 +1761,8 @@ TEST(DashReplayFoldIncrementalMerkle, DeltaPathByteIdenticalAndExaminesOnlyK)
     const std::vector<CSimplifiedMNListEntry> absent = { incmerkle_mk_entry(99999) };
     EXPECT_FALSE(cache.apply_value_changes(absent).has_value())
         << "an absent key must bail to the full-rebuild fallback";
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // DIP3-GENESIS payee cross-check gate (dashd DeploymentDIP0003Enforced parity).
 //
