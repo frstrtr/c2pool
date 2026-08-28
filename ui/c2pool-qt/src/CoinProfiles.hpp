@@ -80,6 +80,16 @@ struct CoinProfile {
 
     bool masternodePayee;   ///< coin pays a masternode/founder split (DASH) — surfaced as a note
     bool experimental;      ///< PerCoinRun binary still stabilising (DGB/BCH) — surfaced as a note
+
+    // Base58 address version bytes (P2PKH / P2SH, mainnet / testnet), used by
+    // AddressValidator to reject a wrong-coin payout address in the UI. Values
+    // mirror the node's impl/<coin>/params.hpp base58Prefixes and CoinBridge's
+    // JS descriptor table. DASH cross-checked vs dashpay/dash chainparams.cpp
+    // (mainnet 76/16, testnet 140/19).
+    int p2pkhVersionMainnet;
+    int p2shVersionMainnet;
+    int p2pkhVersionTestnet;
+    int p2shVersionTestnet;
 };
 
 /// Ordered profile table. Order drives the chain combo. DASH is first-class.
@@ -92,19 +102,22 @@ inline const CoinProfile* coinProfiles(int& countOut)
          CliFamily::LegacyUnified, "",
          9332, 19332,
          "", "", "", "", false, true,
-         0, 0, false, false},
+         0, 0, false, false,
+         48, 50, 111, 58},
         {"bitcoin", "Bitcoin", "c2pool", "bitcoind", "SHA-256d",
          "1… / bc1… (P2PKH/bech32)",
          CliFamily::LegacyUnified, "",
          8332, 18332,
          "", "", "", "", false, true,
-         0, 0, false, false},
+         0, 0, false, false,
+         0, 5, 111, 196},
         {"dogecoin", "Dogecoin", "c2pool", "dogecoind", "Scrypt (AuxPoW)",
          "D… (P2PKH)",
          CliFamily::LegacyUnified, "",
          22555, 44555,
          "", "", "", "", false, true,
-         0, 0, false, false},
+         0, 0, false, false,
+         30, 22, 113, 196},
 
         // ── PerCoinRun: dedicated per-coin binaries ──────────────────────────
         // DASH — X11, masternode-payee coin, dashd parent. Default launch is
@@ -115,7 +128,8 @@ inline const CoinProfile* coinProfiles(int& countOut)
          9998, 19998,
          "--coin-rpc", "--coin-rpc-auth", "~/.dashcore/dash.conf",
          "--listen", /*testnet*/ true, /*webPort*/ true,
-         3333, 8080, /*masternode*/ true, /*experimental*/ false},
+         3333, 8080, /*masternode*/ true, /*experimental*/ false,
+         76, 16, 140, 19},
 
         // DigiByte — multi-algo (Scrypt here), digibyted parent. No --testnet
         // flag (mainnet/regtest only) and no --web-port on this binary.
@@ -125,7 +139,8 @@ inline const CoinProfile* coinProfiles(int& countOut)
          14024, 14025,
          "--coin-rpc", "--coin-rpc-auth", "~/.digibyte/digibyte.conf",
          "--sharechain-port", /*testnet*/ false, /*webPort*/ false,
-         5022, 0, /*masternode*/ false, /*experimental*/ true},
+         5022, 0, /*masternode*/ false, /*experimental*/ true,
+         30, 63, 126, 140},
 
         // Bitcoin Cash — BCHN parent. Uses `--pool`, creds via --rpc-conf
         // (no --coin-rpc endpoint override), --p2p-port for the sharechain.
@@ -135,7 +150,8 @@ inline const CoinProfile* coinProfiles(int& countOut)
          8332, 18332,
          "", "--rpc-conf", "~/.bitcoin/bitcoin.conf",
          "--p2p-port", /*testnet*/ true, /*webPort*/ false,
-         3333, 0, /*masternode*/ false, /*experimental*/ true},
+         3333, 0, /*masternode*/ false, /*experimental*/ true,
+         0, 5, 111, 196},
     };
     countOut = static_cast<int>(sizeof(kProfiles) / sizeof(kProfiles[0]));
     return kProfiles;

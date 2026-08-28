@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "PageLaunch.hpp"
 
+#include "AddressValidator.hpp"
 #include "CoinProfiles.hpp"
 #include "LaunchCommand.hpp"
 #include "SettingsStore.hpp"
@@ -281,6 +282,14 @@ void PageLaunch::setupUi()
         addressEdit_->setPlaceholderText("payout address for the selected coin");
         addressEdit_->setToolTip("--address / --solo-address  (YOUR mining payout address)");
         form->addRow("Payout address:", addressEdit_);
+
+        // Inline address-flavor status (QP-B). Hidden until it has something
+        // to say; turns red for a positively-identified wrong-coin address
+        // (which launch() then refuses to start).
+        addressStatusLabel_ = new QLabel;
+        addressStatusLabel_->setWordWrap(true);
+        addressStatusLabel_->setVisible(false);
+        form->addRow("", addressStatusLabel_);
 
         autoDetectWalletCheck_ = new QCheckBox("Auto-detect wallet address");
         autoDetectWalletCheck_->setChecked(true);
@@ -589,9 +598,16 @@ void PageLaunch::setupUi()
         vbox->addWidget(g);
     }
 
+    // Live address-flavor validation (QP-B). Re-check whenever the address,
+    // the node-owner address, the coin, or the testnet flag changes.
+    connect(addressEdit_,        &QLineEdit::textChanged, this, &PageLaunch::validateAddressField);
+    connect(nodeOwnerAddrEdit_,  &QLineEdit::textChanged, this, &PageLaunch::validateAddressField);
+    connect(testnetCheck_,       &QCheckBox::toggled,     this, &PageLaunch::validateAddressField);
+
     vbox->addStretch();
     onBuildPreview();  // initial preview
     emitApiBaseUrlChanged();
+    validateAddressField();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -844,6 +860,7 @@ void PageLaunch::updateNetworkDefaults()
     applyProfileUi();
     onBuildPreview();
     emitApiBaseUrlChanged();
+    validateAddressField();
 }
 
 void PageLaunch::applyProfileUi()
@@ -904,6 +921,56 @@ void PageLaunch::emitApiBaseUrlChanged()
     emit apiBaseUrlChanged(suggestedApiBaseUrl());
 }
 
+void PageLaunch::validateAddressField()
+{
+    if (addressStatusLabel_ == nullptr) return;
+
+    const QString chain   = currentChain();
+    const bool    testnet = testnetCheck_ && testnetCheck_->isChecked();
+
+    // The payout address is the money-critical field; the node-owner address
+    // (fee payout) is checked too. Surface the payout verdict first.
+    const c2pool_qt::AddressCheck payout =
+        c2pool_qt::validatePayoutAddress(addressEdit_->text(), chain, testnet);
+    const c2pool_qt::AddressCheck owner =
+        c2pool_qt::validatePayoutAddress(
+            nodeOwnerAddrEdit_ ? nodeOwnerAddrEdit_->text() : QString(),
+            chain, testnet);
+
+    // Choose the message to show: a hard wrong-coin block wins; then an
+    // advisory (unknown version); otherwise clear.
+    auto pick = [](const c2pool_qt::AddressCheck& c) {
+        return c.verdict == c2pool_qt::AddressVerdict::WrongCoin
+            || c.verdict == c2pool_qt::AddressVerdict::UnknownVersion;
+    };
+
+    QString text;
+    bool blocking = false;
+    if (payout.blocksLaunch()) {
+        text = QStringLiteral("Payout address: %1").arg(payout.message);
+        blocking = true;
+    } else if (owner.blocksLaunch()) {
+        text = QStringLiteral("Node owner address: %1").arg(owner.message);
+        blocking = true;
+    } else if (pick(payout)) {
+        text = QStringLiteral("Payout address: %1").arg(payout.message);
+    } else if (pick(owner)) {
+        text = QStringLiteral("Node owner address: %1").arg(owner.message);
+    }
+
+    if (text.isEmpty()) {
+        addressStatusLabel_->clear();
+        addressStatusLabel_->setVisible(false);
+        return;
+    }
+    addressStatusLabel_->setText((blocking ? QStringLiteral("⛔ ")   // ⛔
+                                           : QStringLiteral("⚠ "))  // ⚠
+                                 + text);
+    addressStatusLabel_->setStyleSheet(blocking ? "color: #b04020;"
+                                                : "color: #a06000;");
+    addressStatusLabel_->setVisible(true);
+}
+
 void PageLaunch::addMergedRow()
 {
     const int row = mergedTable_->rowCount();
@@ -934,6 +1001,28 @@ void PageLaunch::launch()
         emit daemonStateChanged("Daemon: already running", "color: #b04020;");
         return;
     }
+    // ── QP-B: refuse to launch with a wrong-coin payout/node-owner address ──
+    // Only a positively-identified other-coin base58 address blocks; bech32/
+    // cashaddr/unknown-version addresses pass through (advisory only) so a
+    // valid launch is never stopped by a flavor we do not model.
+    const QString chain = currentChain();
+    const bool testnet = testnetCheck_ && testnetCheck_->isChecked();
+    const c2pool_qt::AddressCheck payoutCheck =
+        c2pool_qt::validatePayoutAddress(addressEdit_->text(), chain, testnet);
+    const c2pool_qt::AddressCheck ownerCheck =
+        c2pool_qt::validatePayoutAddress(
+            nodeOwnerAddrEdit_ ? nodeOwnerAddrEdit_->text() : QString(),
+            chain, testnet);
+    if (payoutCheck.blocksLaunch() || ownerCheck.blocksLaunch()) {
+        validateAddressField();
+        const c2pool_qt::AddressCheck& bad =
+            payoutCheck.blocksLaunch() ? payoutCheck : ownerCheck;
+        emit daemonStateChanged(
+            QStringLiteral("Daemon: refused — %1").arg(bad.message),
+            "color: #b04020;");
+        return;
+    }
+
     onBuildPreview();
     const QString cmd = buildCommand();
     if (cmd.trimmed().isEmpty()) {

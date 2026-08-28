@@ -81,6 +81,10 @@ private slots:
     void removeSelectedMergedRow();
     void updateNetworkDefaults();
     void emitApiBaseUrlChanged();
+    /// Re-check the payout / node-owner address fields against the active
+    /// coin and refresh the inline status label. Advisory except for a
+    /// positively-identified wrong-coin address, which launch() blocks.
+    void validateAddressField();
 
 private:
     void setupUi();
@@ -134,6 +138,7 @@ private:
 
     // ── Payout & Fees ───────────────────────────────────────────────────────
     QLineEdit*     addressEdit_;
+    QLabel*        addressStatusLabel_{nullptr}; ///< inline wrong-coin / advisory notice
     QCheckBox*     autoDetectWalletCheck_; ///< --auto-detect-wallet (default on)
     QDoubleSpinBox* feeSpinBox_;        ///< -f / --fee (node-owner fee %)
     QDoubleSpinBox* giveAuthorSpinBox_; ///< --give-author (dev donation %)
