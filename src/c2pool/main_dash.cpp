@@ -68,6 +68,7 @@
 #include <impl/dash/coin/fold_live_controller.hpp>  // dash::coin::FoldLiveController (PR-C1 live tip-tracking fold)
 #include <impl/dash/coin/vendor/dashscript/c2pool_scriptcheck.h>  // PR-C4 consensus-exact CheckInputScripts C API
 #include <impl/dash/coin/arm_resolution.hpp>   // dash::coin::resolve_embedded_arm (#738 arm decision, one place)
+#include <impl/dash/coin/good_citizen_defaults.hpp>   // dash::coin::resolve_good_citizen_tx_serve — daemonless FULL-MEMPOOL default
 #include <impl/dash/coin/embedded_startup_invariant.hpp>  // C-startup-invariant: embedded fresh-gate => body-first serve tip
 #include <impl/dash/coin/dkg_window.hpp>       // dash::coin::is_dkg_commitment_window (BLOCKER-1 guard)
 #include <impl/dash/coin/dkg_commitments.hpp>  // E1: build_daemonless_qc_plan (serve DKG windows daemonlessly)
@@ -468,8 +469,10 @@ void print_banner(const char* argv0)
         << "           [--embedded-utxo] [--embedded-mainnet] [--embedded-null-arm] [--embedded-mn-bridge-max N]\n"
         << "           [--embedded-asn-diversity]\n"
         << "           [--embedded-mn-bridge-no-cursor]\n"
-        << "           [--embedded-utxo-immature-serve-empty] [--embedded-serve-mempool-txs]\n"
-        << "           [--embedded-tx-serve-own-set]\n"
+        << "           [--embedded-utxo-immature-serve-empty] [--embedded-serve-mempool-txs[=false]]\n"
+        << "           [--embedded-tx-serve-own-set[=false]]\n"
+        << "             (mempool serving levers default ON when NO dashd arm is given —\n"
+        << "              daemonless nodes serve the FULL mempool; =false opts out)\n"
         << "           [--embedded-fresh-datum-race] [--embedded-fresh-datum-race-k N]\n"
         << "           [--embedded-getmnlistd-tracker]\n"
         << "           [--embedded-fold-live PATH] [--embedded-fold-live-expect HASH]\n"
@@ -10190,15 +10193,24 @@ int main(int argc, char** argv)
     // body instead -- consensus-valid, fees exactly 0, nothing to overstate
     // (see NodeCoinState::set_utxo_immature_policy).
     bool embedded_utxo_immature_serve_empty = false;
-    // --embedded-serve-mempool-txs: OPT-IN fee-carrying embedded templates.
-    // Default OFF = coinbase-only serving (values exact, fees forgone); the
-    // mempool-tx body path with its G1-G4 guards (mempool.hpp; audit
-    // DASH_CONNECTBLOCK_REJECT_SURFACE_AUDIT.md) arms only on explicit
-    // operator decision, and only once the MEMPOOL VALIDITY GATE
-    // (mempool_validity_gate.hpp) reports zero transactions refused by dashd's
-    // testmempoolaccept over its sustained window.
+    // --embedded-serve-mempool-txs: fee-carrying embedded templates.
+    // Posture-dependent default (good_citizen_defaults.hpp): on a dashd-ARMED
+    // node it stays OFF — there the gbt cross-check/fallback serves dashd's
+    // full template, so tx fullness is already provided and existing
+    // deployments keep their served bytes. On a DAEMONLESS node (no
+    // --coin-rpc / --coin-rpc-auth / --submit-block) it defaults ON together
+    // with its companion levers: SERVE THE FULL MEMPOOL is the good-citizen
+    // baseline — a daemonless pool that wins with a coinbase-only template
+    // mines a block that processes zero DASH transactions. The mempool-tx
+    // body path carries its G1-G4 guards (mempool.hpp; audit
+    // DASH_CONNECTBLOCK_REJECT_SURFACE_AUDIT.md) unconditionally once armed,
+    // and the serve-time internal-consistency referee (tx_serve_referee.hpp)
+    // self-validates every fee-carrying template with zero dashd calls.
+    // Explicit opt-out: --embedded-serve-mempool-txs=false.
     bool embedded_serve_mempool_txs = false;
-    bool embedded_tx_serve_own_set = false;  // --embedded-tx-serve-own-set, default OFF
+    bool embedded_serve_mempool_txs_off = false;  // --embedded-serve-mempool-txs=false
+    bool embedded_tx_serve_own_set = false;  // --embedded-tx-serve-own-set; daemonless default ON
+    bool embedded_tx_serve_own_set_off = false;   // --embedded-tx-serve-own-set=false
     bool embedded_accrue_asset_locks = false;  // #107 PHASE 2, default OFF
     bool embedded_accrue_asset_unlocks = false;  // #143 Variant B (type-9), default OFF
     // --embedded-creditpool-publish-at-serve-tip: publish the derived credit
@@ -10217,8 +10229,11 @@ int main(int argc, char** argv)
     // the [MEMPOOL-VALIDITY] series says it is safe: ZERO transactions that
     // dashd's testmempoolaccept refuses, over a sustained window
     // (mempool_validity_gate.hpp). NOT the [SHADOW-TXSET] ours_only number --
-    // that is a coverage statistic and gates nothing.
+    // that is a coverage statistic and gates nothing. DAEMONLESS default ON
+    // (good_citizen_defaults.hpp): without the pull the mempool never fills
+    // and full-mempool serving is vacuously coinbase-only.
     bool embedded_mempool_ingest = false;
+    bool embedded_mempool_ingest_off = false;     // --embedded-mempool-ingest=false
     // --embedded-null-arm (#127): optimistic null commitment at fresh
     // window-open slots + template upgrade to the real commitment. DEFAULT
     // OFF, money/consensus path; byte-unchanged when off (nullptr null_evidence).
@@ -10234,12 +10249,18 @@ int main(int argc, char** argv)
     // conflict-tx-lock feed). DEFAULT OFF — off, no getdata for inv type 31
     // and the handler decodes-and-discards (wire + template behaviour
     // byte-identical); on, every isdlock is still individually BLS-gated
-    // before Mempool::add_islock (fail-closed at every hop).
+    // before Mempool::add_islock (fail-closed at every hop). DAEMONLESS
+    // default ON (good_citizen_defaults.hpp) — the IS mining hold self-gates
+    // on feed liveness, so the feed only ADDS safety.
     bool embedded_ingest_isdlock = false;
+    bool embedded_ingest_isdlock_off = false;     // --embedded-ingest-isdlock=false
     // --embedded-ingest-dstx (W5-B): arm the CoinJoin DSTX lane (getdata
     // pull + BLS-verified zero-fee admission with dashd's +0.1 COIN
-    // prioritisation delta). DEFAULT OFF — wire and templates byte-identical.
+    // prioritisation delta). Dashd-armed default OFF — wire and templates
+    // byte-identical. DAEMONLESS default ON (good_citizen_defaults.hpp):
+    // without it CoinJoin txs are structurally excluded from served blocks.
     bool embedded_ingest_dstx = false;
+    bool embedded_ingest_dstx_off = false;        // --embedded-ingest-dstx=false
     // --embedded-proactive-rotate (PR-3): LOW-RATE proactive coin-P2P peer
     // rotation. DEFAULT OFF — the coin client keeps its stall-only rotation,
     // byte-identical to master.
@@ -10345,14 +10366,20 @@ int main(int argc, char** argv)
             embedded_utxo_immature_serve_empty = true;
         else if (std::strcmp(argv[i], "--embedded-serve-mempool-txs") == 0)
             embedded_serve_mempool_txs = true;
+        else if (std::strcmp(argv[i], "--embedded-serve-mempool-txs=false") == 0)
+            embedded_serve_mempool_txs_off = true;  // good-citizen opt-out
         else if (std::strcmp(argv[i], "--embedded-tx-serve-own-set") == 0)
             embedded_tx_serve_own_set = true;
+        else if (std::strcmp(argv[i], "--embedded-tx-serve-own-set=false") == 0)
+            embedded_tx_serve_own_set_off = true;   // good-citizen opt-out
         else if (std::strcmp(argv[i], "--embedded-accrue-asset-locks") == 0)
             embedded_accrue_asset_locks = true;   // #107 PHASE 2
         else if (std::strcmp(argv[i], "--embedded-accrue-asset-unlocks") == 0)
             embedded_accrue_asset_unlocks = true; // #143 Variant B (type-9)
         else if (std::strcmp(argv[i], "--embedded-mempool-ingest") == 0)
             embedded_mempool_ingest = true;
+        else if (std::strcmp(argv[i], "--embedded-mempool-ingest=false") == 0)
+            embedded_mempool_ingest_off = true;     // good-citizen opt-out
         else if (std::strcmp(argv[i], "--embedded-null-arm") == 0)
             embedded_null_arm = true;   // #127
         else if (std::strcmp(argv[i], "--embedded-null-arm=false") == 0)
@@ -10395,8 +10422,12 @@ int main(int argc, char** argv)
             embedded_fold_checkscripts = true;  // PR-C4: consensus-exact input-script check on the served template
         else if (std::strcmp(argv[i], "--embedded-ingest-isdlock") == 0)
             embedded_ingest_isdlock = true;   // G4 conflict-tx-lock feed
+        else if (std::strcmp(argv[i], "--embedded-ingest-isdlock=false") == 0)
+            embedded_ingest_isdlock_off = true;     // good-citizen opt-out
         else if (std::strcmp(argv[i], "--embedded-ingest-dstx") == 0)
             embedded_ingest_dstx = true;      // W5-B CoinJoin DSTX feed
+        else if (std::strcmp(argv[i], "--embedded-ingest-dstx=false") == 0)
+            embedded_ingest_dstx_off = true;        // good-citizen opt-out
         else if (std::strcmp(argv[i], "--embedded-proactive-rotate") == 0)
             embedded_proactive_rotate = true; // PR-3 proactive peer rotation
         // PR-1 LATENCY-AWARE PEER SCORING. Wire the CLI flag to the existing
@@ -10722,6 +10753,59 @@ int main(int argc, char** argv)
                       << " conflicts with web dashboard port, moving dashboard to "
                       << (stratum_port + 1) << "\n";
             web_port = static_cast<uint16_t>(stratum_port + 1);
+        }
+        // ── GOOD-CITIZEN DEFAULT: daemonless nodes SERVE THE FULL MEMPOOL ──
+        // The operator-declared posture decides: with no dashd arm requested
+        // (--coin-rpc / --coin-rpc-auth / --submit-block all absent) the
+        // embedded builder is the only template source, and a coinbase-only
+        // default means the pool mines blocks that process zero DASH
+        // transactions — a bad network citizen. Resolve the five mempool-
+        // serving levers through the pure, KAT-tested resolver
+        // (good_citizen_defaults.hpp): daemonless => not-spelled-out levers
+        // default ON (serving + the serve-time self-validation referee are
+        // armed TOGETHER, never apart); dashd-armed => byte-identical to the
+        // requested flags. --<flag>=false is the explicit opt-out either way.
+        {
+            const bool daemonless_posture = rpc_endpoint.empty()
+                                         && rpc_conf_path.empty()
+                                         && submit_hex.empty();
+            const dash::coin::TxServeResolution txr =
+                dash::coin::resolve_good_citizen_tx_serve(
+                    daemonless_posture,
+                    dash::coin::TxServeLevers{
+                        {embedded_serve_mempool_txs, embedded_serve_mempool_txs_off},
+                        {embedded_tx_serve_own_set,  embedded_tx_serve_own_set_off},
+                        {embedded_mempool_ingest,    embedded_mempool_ingest_off},
+                        {embedded_ingest_isdlock,    embedded_ingest_isdlock_off},
+                        {embedded_ingest_dstx,       embedded_ingest_dstx_off}});
+            embedded_serve_mempool_txs = txr.serve_mempool_txs;
+            embedded_tx_serve_own_set  = txr.tx_serve_own_set;
+            embedded_mempool_ingest    = txr.mempool_ingest;
+            embedded_ingest_isdlock    = txr.ingest_isdlock;
+            embedded_ingest_dstx       = txr.ingest_dstx;
+            if (txr.defaulted_any)
+                std::cout << "[run] good-citizen default (daemonless posture): "
+                             "FULL-MEMPOOL tx-serving armed"
+                             " serve-mempool-txs="
+                          << (txr.serve_mempool_txs ? "on" : "off")
+                          << " tx-serve-own-set="
+                          << (txr.tx_serve_own_set ? "on" : "off")
+                          << " mempool-ingest="
+                          << (txr.mempool_ingest ? "on" : "off")
+                          << " ingest-isdlock="
+                          << (txr.ingest_isdlock ? "on" : "off")
+                          << " ingest-dstx="
+                          << (txr.ingest_dstx ? "on" : "off")
+                          << " (opt-out: --embedded-serve-mempool-txs=false "
+                             "et al.)\n";
+            if (txr.unsafe_serve_without_referee)
+                std::cout << "[run] WARNING: --embedded-tx-serve-own-set=false"
+                             " with mempool-tx serving ON in the daemonless"
+                             " posture DISARMS the serve-time self-validation"
+                             " referee (tx_serve_referee.hpp) — fee-carrying"
+                             " templates will serve with no serve-time"
+                             " cross-check. Not a supported production"
+                             " configuration.\n";
         }
         return run_node(testnet, rpc_endpoint, rpc_conf_path, submit_hex, peer,
                         stratum_host, stratum_port, web_host, web_port,

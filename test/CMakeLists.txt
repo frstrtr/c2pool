@@ -308,7 +308,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     # DASH serve-gate journal per-cause time KAT (h=2518004 count-vs-time trap):
     # pure, header-only policy object; no socket/ltc/pool dependency. Mirrors
     # the test_dash_min_protocol_gate link set.
-    add_executable(test_dash_serve_gate_journal test_dash_serve_gate_journal.cpp test_dash_serve_gate_ledger.cpp)
+    # test_dash_good_citizen_defaults.cpp rides this allowlisted binary on
+    # purpose: build.yml's fixed --target allowlist cannot gain a new exe
+    # without workflow scope, and a gtest source compiled into an already-
+    # allowlisted binary is built AND run by CI (no NOT_BUILT hole). The
+    # resolver under test is pure/header-only (good_citizen_defaults.hpp) and
+    # needs exactly this link set.
+    add_executable(test_dash_serve_gate_journal test_dash_serve_gate_journal.cpp test_dash_serve_gate_ledger.cpp test_dash_good_citizen_defaults.cpp)
     target_link_libraries(test_dash_serve_gate_journal PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
