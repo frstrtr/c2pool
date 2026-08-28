@@ -5789,6 +5789,16 @@
                                     if (_blT < 1) continue; // in transit — leave the cell black
                                 }
                             }
+                        } else {
+                            // Born share: leave its destination cell #0d0d1a
+                            // black until the born ceremony has LANDED it
+                            // (bt >= 1). Same phase3Start/phase3Dur/150 stagger
+                            // as the wave loop below, so the base layer never
+                            // pre-paints the head cell green before the fly-in
+                            // lands. _bi is the born index here (dst=newPos[_bi]).
+                            var _boS = _bi * 150 / phase3Dur;
+                            var _boT = Math.max(0, Math.min(1, ((elapsed - phase3Start) / phase3Dur - _boS) / (1 - _boS)));
+                            if (_boT < 1) continue; // born share not yet landed — leave dst #0d0d1a
                         }
                         ctx.fillStyle = animColors[_bi];
                         ctx.fillRect(_bp.x, _bp.y, cs, cs);
@@ -5830,16 +5840,18 @@
                             // Birth position: below destination, shifted 1 row down for shadow clearance
                             var bFinalY = Math.min(dst.y + step * 8, cssH * 0.5);
 
-                            // Always paint the destination grid cell first so
-                            // the new share's head cell is never black while the
-                            // birth ceremony (coalesce/hold/land) plays out
-                            // below it. The coalesce/hold branches set
-                            // globalAlpha=0 to skip the generic draw, which
-                            // otherwise left the destination cell unpainted
-                            // (black) for the whole fly-in.
-                            ctx.globalAlpha = 1;
-                            ctx.fillStyle = animColors[i];
-                            ctx.fillRect(dst.x, dst.y, cs, cs);
+                            // Paint the destination grid cell ONLY once the born
+                            // share has landed (bt >= 1). Before landing the cell
+                            // must stay #0d0d1a black (placeholder), then the born
+                            // ceremony's LAND square (bt in [~0.88,1]) covers the
+                            // cell and hands over seamlessly to this settled paint
+                            // at bt >= 1 — no black flash after land, no green flash
+                            // before it.
+                            if (bt >= 1) {
+                                ctx.globalAlpha = 1;
+                                ctx.fillStyle = animColors[i];
+                                ctx.fillRect(dst.x, dst.y, cs, cs);
+                            }
 
                             if (bt <= 0) {
                                 // Birth not started yet — destination already painted above
