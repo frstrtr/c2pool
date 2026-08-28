@@ -1735,6 +1735,16 @@ int main(int argc, char* argv[])
         mi->set_io_context(&ioc);
         web_server->set_stratum_port(stratum_port);
 
+        // Cross-coin dashboard parity: serve the shared refined web-static
+        // dashboard over --http (btc.voidbind, same UI as LTC/DASH). This lane
+        // passes a NULL IMiningNode, so refresh_work() never fills
+        // m_cached_template and the readiness gate (http_session.cpp) would
+        // redirect every .html to loading.html forever; mark the dashboard
+        // always-ready (mirror main_dash.cpp) and point static serving at
+        // web-static so "/" resolves. Display-only — no share/reward/consensus.
+        mi->set_dashboard_always_ready(true);
+        web_server->set_dashboard_dir("web-static");
+
         // D-BTC dashboard feeds (integrator 2026-08-03): mirror of D-BCH
         // (PR #1055) into the live MiningInterface the H-STATS.944 seam already
         // stood up with a NULL IMiningNode + zero feeds (so /api rendered empty).

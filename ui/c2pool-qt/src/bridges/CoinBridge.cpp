@@ -61,6 +61,14 @@ constexpr CoinConstants kKnownCoins[] = {
      "https://blockchair.com/bitcoin-cash/block/",
      "https://blockexplorer.one/bitcoin-cash/testnet/blockHash/",
      36, 8640},
+    // namecoin — SHA-256d AuxPoW child of BTC (no stand-alone launch row in
+    // CoinProfiles.hpp; present here so a merged-NMC descriptor resolves a real
+    // coin instead of degrading to LTC). mainnet PUBKEY 52 (N…) / SCRIPT 13,
+    // testnet PUBKEY 111 / SCRIPT 196. Blockchair has no NMC; Tokenview is live.
+    {"namecoin",  "Namecoin",  52, 13, 111, 196,
+     "https://nmc.tokenview.io/en/blockdetail/",
+     "https://nmc.tokenview.io/en/blockdetail/",
+     36, 8640},
 };
 
 const CoinConstants* findCoin(const QString& chain)

@@ -1393,6 +1393,15 @@ int run_node(const core::CoinParams& params, bool testnet,
         mi->set_io_context(&ioc);
         web_server->set_stratum_port(stratum_port);
 
+        // Cross-coin dashboard parity: serve the shared refined web-static
+        // dashboard over --http (same UI as LTC/DASH). NULL IMiningNode here
+        // means refresh_work() never fills m_cached_template, so the readiness
+        // gate (http_session.cpp) would redirect .html to loading.html forever;
+        // mark the dashboard always-ready (mirror main_dash.cpp) and point
+        // static serving at web-static. Display-only — no share/reward/consensus.
+        mi->set_dashboard_always_ready(true);
+        web_server->set_dashboard_dir("web-static");
+
         // ── D-DGB dashboard data hooks (extend the #1051 WebServer seam) ──
         // Isolation: every source is a main_dgb-scope handle; NO src/core edit.
         // (1) embedded DGB daemon peers — the coin-network peer set discovery
