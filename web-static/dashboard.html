@@ -5755,18 +5755,41 @@
                     ctx.fillStyle = '#0d0d1a';
                     ctx.fillRect(0, 0, cssW, cssH);
 
-                    // ═══ SETTLED BASE LAYER ═══
-                    // Paint every share at its FINAL grid position first, so
-                    // no cell is ever background-black during the animation.
-                    // The wave / born / dying flourishes draw on top of this
-                    // congruent all-green grid. Without it, cells that are only
-                    // mid-transit (the pre-wave tail rows the window grew into,
-                    // and cells vacated during the tail→head slide) read as
-                    // black holes until the wave reaches them. Identity to the
-                    // settled render() when the animation is idle.
+                    // ═══ SETTLED BASE LAYER (landed cells only) ═══
+                    // Paint a share at its FINAL grid position only once it can
+                    // no longer be mid-transit: new shares (their destination
+                    // cell is owned by the born ceremony and pre-painted in the
+                    // wave loop), shares with no recorded old position (the
+                    // wave loop draws them at dst from frame one), shares whose
+                    // old and new grid cells coincide, and shares whose slide
+                    // has LANDED (same stagger maths as the wave loop below).
+                    // Shares still waiting to slide are painted by the wave
+                    // loop at their OLD cell, and mid-slide shares at the
+                    // interpolated cell — so a cell being vacated during the
+                    // conveyor shift reveals the #0d0d1a background (the
+                    // visible black edge of the shift), while no genuinely
+                    // settled cell is ever black. Identity to the settled
+                    // render() when the animation is idle.
                     ctx.globalAlpha = 1;
+                    var _blP2e = elapsed - phase2Start;
                     for (var _bi = 0; _bi < animTotal; _bi++) {
                         var _bp = newPos[_bi];
+                        if (_bi >= newCount) {
+                            var _blS = animShares[_bi];
+                            var _blO = animOldPos[_blS.H || _blS.h];
+                            if (_blO) {
+                                var _blOx, _blOy;
+                                if (typeof _blO.idx === 'number') {
+                                    _blOx = ml + (_blO.idx % cols) * step;
+                                    _blOy = Math.floor(_blO.idx / cols) * step;
+                                } else { _blOx = _blO.x; _blOy = _blO.y; }
+                                if (_blOx !== _bp.x || _blOy !== _bp.y) {
+                                    var _blFr = (animTotal - 1 - _bi) / (animTotal - newCount);
+                                    var _blT = Math.max(0, Math.min(1, (_blP2e - _blFr * phase2Dur * 0.7) / 600));
+                                    if (_blT < 1) continue; // in transit — leave the cell black
+                                }
+                            }
+                        }
                         ctx.fillStyle = animColors[_bi];
                         ctx.fillRect(_bp.x, _bp.y, cs, cs);
                     }
