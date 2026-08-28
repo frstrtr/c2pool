@@ -39,6 +39,8 @@
 #include <gtest/gtest.h>
 
 #include <impl/dash/coin/mn_checkpoint.hpp>       // parse_mn_checkpoint (DUT)
+#include <impl/dash/coin/mn_checkpoint_dump.hpp>  // emit_mn_checkpoint_dump / write_mn_checkpoint_inc (DUT)
+#include <impl/dash/coin/replay_fold_engine.hpp>  // DmlFoldEngine / ReplayMNState (dump source)
 #include <impl/dash/coin/mn_checkpoint_lane.hpp>  // MnCheckpointLane (DUT)
 #include <impl/dash/coin/mn_bridge_cursor.hpp>    // MnBridgeCursorStore (DUT, #91)
 #include <impl/dash/coin/vendor/providertx.hpp>   // CProUpServTx (revival leg)
@@ -58,6 +60,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -343,6 +346,232 @@ TEST(DashMnCheckpoint, CheckpointSetIsFieldIdenticalToRpcSeed)
         EXPECT_EQ(ck.collateralOutpoint.hash, rpc_mn.collateralOutpoint.hash);
         EXPECT_EQ(ck.collateralOutpoint.index, rpc_mn.collateralOutpoint.index);
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 2b. THE SELF-DERIVED DUMP round trip (dashd-cut, operator decision
+//     2026-08-17). A DmlFoldEngine's registered set is serialized by
+//     mn_checkpoint_dump.hpp to the checkpoint payload, and that payload
+//     parses back through parse_mn_checkpoint() FIELD-IDENTICAL to the
+//     ReplayMNState it came from — the replay-dumped analog of
+//     CheckpointSetIsFieldIdenticalToRpcSeed. No dashd, no RPC, no snapshot:
+//     the source is the fold's own state.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace {
+
+using dash::coin::replay::DmlFoldEngine;
+using dash::coin::replay::ReplayMNState;
+using dash::coin::replay::FoldConfig;
+
+uint160 u160_of(uint8_t b)
+{
+    std::vector<unsigned char> v(20, b);
+    return uint160(v);
+}
+
+// A P2PKH scriptPubKey over a 20-byte hash160 filled with `b`.
+std::vector<unsigned char> p2pkh(uint8_t b)
+{
+    std::vector<unsigned char> s{0x76, 0xa9, 0x14};
+    s.insert(s.end(), 20, b);
+    s.push_back(0x88);
+    s.push_back(0xac);
+    return s;
+}
+
+ReplayMNState make_replay_mn(uint8_t seed, uint8_t type, int32_t reg,
+                             int32_t last_paid, int32_t revived, int32_t ban,
+                             uint16_t opreward, bool op_payout)
+{
+    ReplayMNState st;
+    st.nType   = type;
+    st.nVersion = (type == dash::coin::vendor::MnType::EVO) ? 2 : 1;
+    // Unique collateral outpoint per MN (the parser's dup-guard).
+    const char* hx = "0123456789abcdef";
+    std::string chash(62, '0');
+    chash.push_back(hx[(seed >> 4) & 0xf]);
+    chash.push_back(hx[seed & 0xf]);
+    st.collateralOutpoint.hash  = uint256S(chash);
+    st.collateralOutpoint.index = seed;
+    st.nOperatorReward   = opreward;
+    st.nRegisteredHeight = reg;
+    st.nLastPaidHeight   = last_paid;
+    st.nPoSeRevivedHeight = revived;
+    st.nPoSeBanHeight    = ban;
+    st.nConsecutivePayments = 0;
+    st.keyIDOwner  = u160_of(static_cast<uint8_t>(0x10 + seed));
+    st.keyIDVoting = u160_of(static_cast<uint8_t>(0x20 + seed));
+    st.pubKeyOperator.fill(static_cast<uint8_t>(0x30 + seed));
+    st.scriptPayout.m_data = p2pkh(static_cast<uint8_t>(0x40 + seed));
+    if (op_payout)
+        st.scriptOperatorPayout.m_data = p2pkh(static_cast<uint8_t>(0x50 + seed));
+    return st;
+}
+
+int32_t clamp0(int32_t v) { return v > 0 ? v : 0; }
+
+} // namespace
+
+TEST(DashMnCheckpointDump, ReplayDumpedSetRoundTripsFieldIdenticalToParser)
+{
+    // Three masternodes whose proTxHash DISPLAY order differs from the
+    // std::map<uint256> INTERNAL (memcmp-LE) order, so the emitter's re-sort
+    // by display hex is actually exercised (not a no-op on map order).
+    const uint256 pA = uint256S(std::string(64, '1'));            // display 11..11
+    const uint256 pB = uint256S(std::string(64, '2'));            // display 22..22
+    const uint256 pC = uint256S(std::string(62, '0') + "ff");     // display 00..ff
+    // display ascending:  pC < pA < pB
+    // internal ascending: pA < pB < pC  (reversed bytes) — different.
+
+    std::vector<std::pair<uint256, ReplayMNState>> entries;
+    // Regular, never banned (NEVER sentinel), no operator payout, reward 0.
+    entries.emplace_back(pA, make_replay_mn(
+        1, dash::coin::vendor::MnType::REGULAR, 1028500, 2500001,
+        ReplayMNState::NEVER, ReplayMNState::NEVER, 0, /*op_payout=*/false));
+    // Evo, PoSe-banned, operator reward + operator payout, revived earlier.
+    entries.emplace_back(pB, make_replay_mn(
+        2, dash::coin::vendor::MnType::EVO, 1500000, 2400000,
+        2450000, 2490000, 500, /*op_payout=*/true));
+    // Regular, never paid (nLastPaidHeight 0), never banned.
+    entries.emplace_back(pC, make_replay_mn(
+        3, dash::coin::vendor::MnType::REGULAR, 2000000, 0,
+        ReplayMNState::NEVER, ReplayMNState::NEVER, 0, /*op_payout=*/false));
+
+    FoldConfig fcfg;
+    fcfg.enabled = true;
+    DmlFoldEngine engine(fcfg);
+    const uint32_t H = 2522504;
+    const uint256 Hhash = uint256S(std::string(62, '0') + "aa");
+    // seed() is the same API the anchor prestate loader uses; it takes a COPY.
+    auto seed_copy = entries;
+    engine.seed(std::move(seed_copy), entries.size(), H, Hhash, "mainnet");
+
+    // ── DUMP ────────────────────────────────────────────────────────────
+    auto dump = dash::coin::emit_mn_checkpoint_dump(
+        engine, "self-derived from chain via c2pool --replay-bulk at H=2522504",
+        "2026-08-17T00:00:00Z");
+    ASSERT_TRUE(dump.ok) << dump.error;
+    EXPECT_EQ(dump.count, 3u);
+    EXPECT_EQ(dump.height, H);
+
+    // The .inc line order is proTxHash DISPLAY hex ascending (pC, pA, pB),
+    // NOT the engine's internal map order (pA, pB, pC).
+    const size_t iC = dump.payload.find("mn " + pC.GetHex());
+    const size_t iA = dump.payload.find("mn " + pA.GetHex());
+    const size_t iB = dump.payload.find("mn " + pB.GetHex());
+    ASSERT_NE(iC, std::string::npos);
+    ASSERT_NE(iA, std::string::npos);
+    ASSERT_NE(iB, std::string::npos);
+    EXPECT_LT(iC, iA) << "dump must sort by DISPLAY hex, not map order";
+    EXPECT_LT(iA, iB);
+
+    // The digest the payload declares is the one the shared function recomputes.
+    EXPECT_EQ(dash::coin::mn_checkpoint_digest(dump.payload), dump.digest);
+    EXPECT_NE(dump.payload.find("digest " + dump.digest), std::string::npos);
+    EXPECT_NE(dump.payload.find(
+        "source self-derived from chain via c2pool --replay-bulk at H=2522504"),
+        std::string::npos);
+
+    // Determinism: dumping the same engine again is byte-identical.
+    auto dump2 = dash::coin::emit_mn_checkpoint_dump(
+        engine, "self-derived from chain via c2pool --replay-bulk at H=2522504",
+        "2026-08-17T00:00:00Z");
+    ASSERT_TRUE(dump2.ok) << dump2.error;
+    EXPECT_EQ(dump.payload, dump2.payload);
+    EXPECT_EQ(dump.inc, dump2.inc);
+
+    // ── PARSE the dump back through the RUNTIME parser ──────────────────
+    MnCheckpoint cp = parse_mn_checkpoint(dump.payload, "mainnet");
+    ASSERT_TRUE(cp.ok) << cp.error;
+    EXPECT_FALSE(cp.unpinned);
+    EXPECT_EQ(cp.height, H);
+    EXPECT_EQ(cp.blockhash, Hhash);
+    ASSERT_EQ(cp.entries.size(), 3u);
+
+    // ── FIELD-IDENTICAL to the source ReplayMNState ─────────────────────
+    std::map<uint256, MNState> parsed(cp.entries.begin(), cp.entries.end());
+    for (const auto& [protx, src] : entries) {
+        auto it = parsed.find(protx);
+        ASSERT_NE(it, parsed.end()) << "dump lost MN " << protx.GetHex();
+        const MNState& got = it->second;
+
+        // THE payee keystone — verbatim ProRegTx bytes survive the round trip.
+        EXPECT_EQ(got.scriptPayout.m_data, src.scriptPayout.m_data)
+            << "PAYEE MISMATCH for " << protx.GetHex();
+        EXPECT_EQ(got.scriptOperatorPayout.m_data, src.scriptOperatorPayout.m_data);
+
+        // Heights: dashd -1/NEVER and negatives clamp to 0, else verbatim.
+        EXPECT_EQ(got.nRegisteredHeight,  (uint32_t)clamp0(src.nRegisteredHeight));
+        EXPECT_EQ(got.nLastPaidHeight,    (uint32_t)clamp0(src.nLastPaidHeight));
+        EXPECT_EQ(got.nPoSeRevivedHeight, (uint32_t)clamp0(src.nPoSeRevivedHeight));
+        EXPECT_EQ(got.nPoSeBanHeight,     (uint32_t)clamp0(src.nPoSeBanHeight));
+
+        EXPECT_EQ((uint16_t)got.nType, src.nType);
+        EXPECT_EQ(got.nVersion, src.nVersion);
+        EXPECT_EQ(got.nOperatorReward, src.nOperatorReward);
+        EXPECT_EQ(got.nRevocationReason, src.nRevocationReason);
+
+        // CKeyIDs / BLS pubkey — forward-byte columns, not GetHex()-reversed.
+        EXPECT_EQ(got.keyIDOwner, src.keyIDOwner)
+            << "keyIDOwner byte-order regression for " << protx.GetHex();
+        EXPECT_EQ(got.keyIDVoting, src.keyIDVoting);
+        EXPECT_EQ(got.pubKeyOperator, src.pubKeyOperator);
+
+        EXPECT_EQ(got.collateralOutpoint.hash, src.collateralOutpoint.hash);
+        EXPECT_EQ(got.collateralOutpoint.index, src.collateralOutpoint.index);
+
+        // isValid is DERIVED as (poseBanHeight == 0) — banned MNs come back
+        // present-but-INELIGIBLE (registered-not-valid).
+        EXPECT_EQ(got.isValid, !src.IsBanned())
+            << "registered-not-valid projection wrong for " << protx.GetHex();
+    }
+
+    // The banned Evo MN is PRESENT (registered set), not filtered out.
+    EXPECT_EQ(parsed.at(pB).isValid, false);
+    EXPECT_GT(parsed.at(pB).nPoSeBanHeight, 0u);
+
+    // ── write_mn_checkpoint_inc self-verifies + writes a real .inc file ──
+    const std::string path = "/tmp/c2pool_dump_kat_"
+        + std::to_string(getpid()) + ".inc";
+    std::string werr;
+    ASSERT_TRUE(dash::coin::write_mn_checkpoint_inc(
+        engine, path, "self-derived from chain via c2pool --replay-bulk at H=2522504",
+        "2026-08-17T00:00:00Z", werr)) << werr;
+    std::ifstream in(path);
+    std::string incfile((std::istreambuf_iterator<char>(in)),
+                        std::istreambuf_iterator<char>());
+    EXPECT_EQ(incfile, dump.inc);
+    EXPECT_NE(incfile.find("Self-derived from chain by c2pool --replay-bulk"),
+              std::string::npos);
+    std::remove(path.c_str());
+}
+
+TEST(DashMnCheckpointDump, EmptyEngineAndPayeelessRefuse)
+{
+    FoldConfig fcfg;
+    fcfg.enabled = true;
+
+    // Empty fold — refuse rather than write an empty anchor.
+    DmlFoldEngine empty(fcfg);
+    empty.seed({}, 0, 2522504, uint256S(std::string(62, '0') + "aa"), "mainnet");
+    auto d0 = dash::coin::emit_mn_checkpoint_dump(empty, "src", "gen");
+    EXPECT_FALSE(d0.ok);
+    EXPECT_NE(d0.error.find("0 registered"), std::string::npos);
+
+    // A registered MN with an empty scriptPayout — fail closed, never emit a
+    // payee-less line the runtime parser would reject anyway.
+    DmlFoldEngine e(fcfg);
+    ReplayMNState bad = make_replay_mn(
+        7, dash::coin::vendor::MnType::REGULAR, 2000000, 2500000,
+        ReplayMNState::NEVER, ReplayMNState::NEVER, 0, false);
+    bad.scriptPayout.m_data.clear();
+    std::vector<std::pair<uint256, ReplayMNState>> one;
+    one.emplace_back(uint256S(std::string(64, '3')), bad);
+    e.seed(std::move(one), 1, 2522504,
+           uint256S(std::string(62, '0') + "aa"), "mainnet");
+    auto d1 = dash::coin::emit_mn_checkpoint_dump(e, "src", "gen");
+    EXPECT_FALSE(d1.ok);
+    EXPECT_NE(d1.error.find("scriptPayout"), std::string::npos);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

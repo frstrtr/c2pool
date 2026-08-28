@@ -666,6 +666,12 @@ static FoldConfig synth_cfg()
     FoldConfig cfg;
     cfg.enabled = true;
     cfg.gates.dip0003_height = 1;
+    // Synthetic vectors model the ENFORCED regime (their coinbases pay the
+    // projected payee via make_block(&eng)); keep the payee cross-check ON so
+    // the existing payee-axis assertions still bind. The DIP3-genesis window
+    // (activation<h<enforcement) is exercised explicitly by the
+    // PreEnforcementPayeeCheck suite, which lowers dip0003_enforcement_height.
+    cfg.gates.dip0003_enforcement_height = 1;
     cfg.gates.v19_height     = 1;
     cfg.gates.mn_rr_height   = 1;
     return cfg;
@@ -1755,4 +1761,118 @@ TEST(DashReplayFoldIncrementalMerkle, DeltaPathByteIdenticalAndExaminesOnlyK)
     const std::vector<CSimplifiedMNListEntry> absent = { incmerkle_mk_entry(99999) };
     EXPECT_FALSE(cache.apply_value_changes(absent).has_value())
         << "an absent key must bail to the full-rebuild fallback";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DIP3-GENESIS payee cross-check gate (dashd DeploymentDIP0003Enforced parity).
+//
+// The deterministic MN list is BUILT from DIP3 ACTIVATION (h=1028160) but the
+// coinbase paying GetMNPayee(list) is only ENFORCED from DIP0003EnforcementHeight
+// (mainnet 1047200). In the [activation, enforcement) window dashd's own
+// consensus rule CMNPaymentsProcessor::IsTransactionValid (masternode/
+// payments.cpp:114) returns valid WITHOUT checking the det payee — the coinbase
+// pays the LEGACY masternode winner, not the det projection. So the fold's payee
+// cross-check must not run there, or it false-poisons a byte-correct fold — the
+// observed h=1028163 divergence: merkleRootMNList MATCHED, projection sound, the
+// coinbase simply pays the legacy winner (which drifts from the det order once
+// more than a couple of MNs are registered).
+//
+// This is the ONE property the payee gate changes: the SAME state + SAME
+// payment-block (coinbase pays nobody) POISONS when the height is at/above
+// enforcement (RED — the check is still strict where dashd enforces it) and
+// FOLDS THROUGH when the height is below enforcement (GREEN — the DIP3-genesis
+// window no longer false-poisons). The merkleRootMNList SET self-check runs in
+// BOTH arms regardless.
+namespace {
+// Two MNs registered at h=101; both configs are identical except the enforcement
+// height, so the only variable is the gate under test.
+struct PayeeGateFixture {
+    DmlFoldEngine eng;
+    uint256       payment_root;   // SML root after the reg block (unchanged by pay)
+    uint256       reg_hash;       // block hash the payment block builds on
+    explicit PayeeGateFixture(int32_t enforcement_height)
+        : eng(make_cfg(enforcement_height))
+    {
+        eng.seed({}, /*total_registered=*/0, /*height=*/100, raw256(9));
+        auto p1  = make_proreg(1);
+        auto p2  = make_proreg(2);
+        auto tx1 = make_special_tx(1, p1, 1);
+        auto tx2 = make_special_tx(1, p2, 2);
+        const uint256 mn1 = tx_hash_of(tx1), mn2 = tx_hash_of(tx2);
+        payment_root = root_of({expected_entry_of(p1, mn1),
+                                expected_entry_of(p2, mn2)});
+        auto reg_blk = make_block(101, raw256(9), payment_root, {tx1, tx2});
+        auto rr = eng.fold_block(reg_blk, 101);
+        EXPECT_TRUE(rr.ok) << "register fold must succeed: " << rr.error;
+        EXPECT_EQ(rr.registered, 2u);
+    }
+    static FoldConfig make_cfg(int32_t enforcement_height)
+    {
+        FoldConfig cfg;
+        cfg.enabled = true;
+        cfg.gates.dip0003_height             = 1;
+        cfg.gates.dip0003_enforcement_height = enforcement_height;
+        // v19/mn_rr far out (classic payee path); confirmations far out so no
+        // confirmedHash mutation at h=102 keeps the SML root stable across the
+        // payment fold.
+        cfg.gates.v19_height                 = 100000000;
+        cfg.gates.mn_rr_height               = 100000000;
+        cfg.gates.masternode_min_confirmations = 100000000;
+        return cfg;
+    }
+};
+} // namespace
+
+// GREEN: h=102 is BELOW enforcement (103). A payment block whose coinbase pays
+// NOBODY folds THROUGH — dashd does not commit the det payee to the coinbase
+// there. The SET self-check still ran (root matched); the payee axis is derived
+// and self-consistent (nLastPaidHeight bumped on the projection).
+TEST(DashReplayFoldPreEnforcement, BelowEnforcementPayeeMismatchFoldsThrough)
+{
+    PayeeGateFixture fx(/*enforcement_height=*/103);  // 102 < 103 ⇒ pre-enforcement
+    ASSERT_TRUE(fx.eng.project_payee(102).has_value())
+        << "a payee must be projected (else the test proves nothing)";
+    auto pay_blk = make_block(102, raw256(9), fx.payment_root,
+                              /*special_txs=*/{}, /*pay_from=*/nullptr);
+    auto r = fx.eng.fold_block(pay_blk, 102);
+    ASSERT_TRUE(r.ok) << "pre-enforcement payee mismatch must NOT poison (dashd "
+                         "IsTransactionValid skips the check below enforcement): "
+                      << r.error;
+    EXPECT_TRUE(r.payee.has_value());
+    EXPECT_TRUE(r.payee_check_preenforcement_skipped)
+        << "the skip must be recorded, not silently absent";
+    EXPECT_FALSE(r.payee_paid_verified);
+    EXPECT_EQ(r.computed_root, r.committed_root);   // SET self-check still bound
+    EXPECT_TRUE(r.payee_marked);                    // nLastPaidHeight still bumped
+}
+
+// RED: the SAME state + SAME payment block, but h=102 is AT enforcement (102).
+// The coinbase pays nobody, so the strict payee cross-check fires and POISONS —
+// exactly as it must at tip, where dashd enforces the det payee. This proves the
+// gate is scoped to the genesis window, not a blanket disable of the check.
+TEST(DashReplayFoldPreEnforcement, AtEnforcementPayeeMismatchStillPoisons)
+{
+    PayeeGateFixture fx(/*enforcement_height=*/102);  // 102 >= 102 ⇒ enforced
+    ASSERT_TRUE(fx.eng.project_payee(102).has_value());
+    auto pay_blk = make_block(102, raw256(9), fx.payment_root,
+                              /*special_txs=*/{}, /*pay_from=*/nullptr);
+    auto r = fx.eng.fold_block(pay_blk, 102);
+    ASSERT_FALSE(r.ok) << "at/after enforcement a payee mismatch MUST poison";
+    EXPECT_NE(r.error.find("PAYEE MISMATCH"), std::string::npos) << r.error;
+    EXPECT_FALSE(r.payee_check_preenforcement_skipped);
+}
+
+// Control: when the pre-enforcement block DOES pay the projected payee (the
+// common case, since legacy and det winners coincide while the set is tiny),
+// the fold succeeds and the skip flag is NOT set — the check simply passed.
+TEST(DashReplayFoldPreEnforcement, BelowEnforcementPayeePaidIsNotFlaggedSkipped)
+{
+    PayeeGateFixture fx(/*enforcement_height=*/103);
+    auto pay_blk = make_block(102, raw256(9), fx.payment_root,
+                              /*special_txs=*/{}, /*pay_from=*/&fx.eng);
+    auto r = fx.eng.fold_block(pay_blk, 102);
+    ASSERT_TRUE(r.ok) << r.error;
+    // Below enforcement the check is skipped regardless of whether the coinbase
+    // happens to pay the projection; the flag reflects the GATE, not the match.
+    EXPECT_TRUE(r.payee_check_preenforcement_skipped);
 }

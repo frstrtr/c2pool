@@ -153,6 +153,24 @@ public:
         m_post_fold = std::move(h);
     }
 
+    /// ── The self-derived checkpoint DUMP seam (mn_checkpoint_dump.hpp) ────
+    /// A ONE-SHOT hook that fires exactly once, right after the successful
+    /// fold whose cursor first REACHES `target_height`. Deliberately SEPARATE
+    /// from set_post_fold so it never contends with the W4 quorum seam (which
+    /// owns post_fold): a --dump-mn-checkpoint run also needs --replay-fold-
+    /// quorums, so both must coexist. The hook receives the engine at H so it
+    /// can serialize the registered set it just proved (each block up to and
+    /// including H self-checked against its own committed merkleRootMNList).
+    /// The fold is strictly forward-contiguous (+1/block), so height == H
+    /// happens at most once; the m_dumped latch guarantees at-most-once even
+    /// if a later re-offer of H arrives.
+    void set_dump_hook(uint32_t target_height,
+                       std::function<void(const DmlFoldEngine&, uint32_t)> h)
+    {
+        m_dump_target = target_height;
+        m_dump_hook   = std::move(h);
+    }
+
     /// ── The diff-store seam (mn_diff_store.hpp) ──────────────────────────
     /// Invoked for every block whose fold COMPLETED — i.e. after the root
     /// self-check passed and the counters above were credited. This is the
@@ -250,6 +268,15 @@ public:
         if (m_post_fold) m_post_fold(height);
         if (m_diff_sink) m_diff_sink(height, hash, block, r);
 
+        // One-shot self-derived checkpoint dump AT the target height. Runs
+        // after post_fold/diff_sink so the diff store has recorded H too. Only
+        // ever fires on a fold that reached H through the byte-exact root
+        // chain above — a diverged/poisoned fold returns before this point.
+        if (m_dump_hook && !m_dumped && height == m_dump_target) {
+            m_dumped = true;
+            m_dump_hook(m_engine, height);
+        }
+
         if (m_utxo_sink && !m_utxo_sink(height, hash, block)) {
             // Tier-B is a DECORATION: its failure is reported but must never
             // invalidate the Tier-A root chain that already passed here.
@@ -325,6 +352,9 @@ private:
     BlockHook         m_pre_fold;
     std::function<void(uint32_t)> m_post_fold;
     DiffSink          m_diff_sink;
+    uint32_t          m_dump_target{0};
+    bool              m_dumped{false};
+    std::function<void(const DmlFoldEngine&, uint32_t)> m_dump_hook;
     uint32_t          m_progress_every;
     FoldConsumerStats m_stats;
     std::chrono::steady_clock::time_point m_started;

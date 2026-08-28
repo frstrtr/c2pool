@@ -105,8 +105,10 @@
 #include <impl/dash/coin/fold_fee_source.hpp>    // W5-A: graduated fold → mempool fee pricing (--embedded-utxo-fold-fees)
 #include <impl/dash/coin/replay_prestate.hpp>    // W5: anchor prestate loader (--replay-fold-prestate)
 #include <impl/dash/coin/mnlist_seed.hpp>        // OPTIONAL V20 getmnlistdiff seed (--replay-mnlist-seed-*, #154 escape hatch)
+#include <impl/dash/coin/mn_checkpoint_dump.hpp> // self-derived MN-set checkpoint dump (--dump-mn-checkpoint)
 #include <impl/dash/coin/replay_fold_consumer.hpp> // W5: bulk lane -> W1 DML fold + per-block root check
 #include <impl/dash/coin/replay_quorum_bridge.hpp> // SEAM: W4 quorum lane <-> W1 MembersFn
+#include <impl/dash/coin/historical_sml.hpp> // authenticate_historical_snapshot (DIP-4 R3, straddle-seed)
 #include <impl/dash/coin/replay_payee_publish.hpp> // SEAM: W1 fold -> the PAYEE queue that gates serving
 #include <impl/dash/coin/mn_diff_store.hpp>      // dashd evodb dmn_D4/dmn_S3 port: per-block MN list diffs + snapshots
 #include <impl/dash/coin/mn_gap_repair.hpp>      // payee-queue gap-repair seam (maintainer + checkpoint bridge)
@@ -268,6 +270,13 @@ bool g_mn_bridge_no_cursor = false;
 bool        g_replay_bulk = false;            // --replay-bulk: arm the lane
 std::string g_replay_bulk_capture_dir;        // --replay-bulk-capture DIR (implies --replay-bulk)
 uint32_t    g_replay_bulk_start = 0;          // --replay-bulk-start H (0 = network default: mainnet DIP3 1028160)
+// ── DASHD-CUT: self-derived MN-set checkpoint dump (--dump-mn-checkpoint H FILE) ─
+// When the --replay-bulk DML fold's cursor reaches H, serialize its REGISTERED
+// masternode set to the checkpoint .inc at FILE — SELF-DERIVED from the fold's
+// own root-checked ReplayMNState, no dashd RPC, no trusted protx snapshot
+// (operator decision 2026-08-17). One-shot; the fold is unaffected otherwise.
+uint32_t    g_dump_mn_checkpoint_height = 0;  // 0 = off
+std::string g_dump_mn_checkpoint_file;
 
 // ── W5 INTEGRATION: drive the W1 DML fold from the W2 bulk lane ───────────
 // --replay-fold-prestate FILE seeds the W1 fold engine from a full-state
@@ -481,6 +490,7 @@ void print_banner(const char* argv0)
         << "           [--replay-fold-qsnapshot FILE] [--replay-fold-worklists FILE]\n"
         << "           [--replay-mnlist-seed-height H --replay-mnlist-seed-source getmnlistdiff --replay-mnlist-seed-file FILE]\n"
         << "           [--replay-mined-commitment-index] [--embedded-mined-commitment-index]\n"
+        << "           [--dump-mn-checkpoint H FILE]\n"
         << "           [--embedded-no-dashd-mn-seed [--embedded-fold-only-proof]]\n"
         << "           [--oracle-graduation-blocks N] [--oracle-class-coverage K]\n"
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
@@ -648,6 +658,11 @@ void print_banner(const char* argv0)
         << "        caches raw bodies into append-only segment files (fleet re-fold\n"
         << "        cache; implies --replay-bulk). --replay-bulk-start H overrides\n"
         << "        the first fetched height (default: mainnet DIP3 1028160).\n"
+        << "        --dump-mn-checkpoint H FILE serializes the --replay-fold DML\n"
+        << "        set at height H to the checkpoint .inc at FILE, SELF-DERIVED\n"
+        << "        from the fold's own root-checked state (no dashd RPC, no\n"
+        << "        protx snapshot; registered-not-valid; reuses the runtime\n"
+        << "        parser field order + digest, self-verifies before writing).\n"
         << "        --external-ip ADDR (alias --stratum-advertise / --public-host)\n"
         << "        overrides the miner-facing host shown in the dashboard Stratum\n"
         << "        URL -- for NAT / port-mapped nodes whose outbound IP is not the\n"
@@ -4173,6 +4188,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // root+payee-checked per-block commit it needs. Seeded at the same anchor
     // the bridge stands on; sinks MnDiffWriter::on_folded off ITS OWN commit.
     std::unique_ptr<dash::coin::replay::DmlFoldEngine>         mn_bridge_fold_engine;
+    // DASHD-CUT ARM (resolver wiring): the parallel store engine, like the
+    // main replay-fold path, needs the W4 quorum-member resolver or its fold
+    // FAILS CLOSED at the first punishing qfcommit (llmqType=5 @ h=2513130,
+    // ~130 past the anchor) and the store caps there. Stand up a SECOND
+    // QuorumReplayEngine + ReplayQuorumBridge whose ctor installs
+    // set_members_fn onto mn_bridge_fold_engine, seeded at the SAME anchor.
+    std::unique_ptr<dash::coin::replay::QuorumReplayEngine>    mn_bridge_quorum_engine;
+    std::unique_ptr<dash::coin::replay::ReplayQuorumBridge>    mn_bridge_quorum_bridge;
     // PR-2 FORWARD: dashd's mined-commitment store, fed from the same replayed
     // bodies. shared_ptr because the qc-plan lambda (installed far above, on
     // the serve path) captures it by value and must see it appear later — it
@@ -7102,7 +7125,23 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // matches, the store COVERS heights and the ban-state probe /
             // on-demand fold source 0-RTT/uncapped from it.
             if (mn_ckpt_lane && header_chain && ckpt.ok
-                && !mn_diff_store) {
+                && !mn_diff_store
+                // UAF FIX (yield to the deep replay-fold): the cold MN-CKPT
+                // store-bridge and the W5 replay-fold arm (main_dash.cpp ~7288)
+                // both drive the SINGLE mn_diff_store/mn_diff_writer, but they
+                // are MUTUALLY EXCLUSIVE by design -- this block's own header
+                // comment names it "the COLD MN-CKPT bridge path (no
+                // --replay-bulk / --replay-fold-prestate)". The guard never
+                // actually enforced that: this arm runs FIRST (cold bridge),
+                // creates store/writer A and installs set_on_anchor_snapshot()
+                // whose lambda captures raw w=mn_diff_writer.get(); the later W5
+                // make_unique then FREES writer A behind that lambda's back, and
+                // the historical-snapshot callback dereferences the freed writer
+                // -> MnDiffWriter::arm()->save_snapshot() UAF (SIGSEGV/SIGBUS).
+                // When --replay-fold-prestate is set the deep replay owns the
+                // store; the cold bridge YIELDS. Normal cold start (no prestate)
+                // is UNCHANGED -- this predicate is true there.
+                && g_replay_fold_prestate.empty()) {
                 namespace rp = dash::coin::replay;
                 mn_diff_store = std::make_unique<rp::MnDiffStore>(
                     (core::filesystem::config_path() / net_subdir
@@ -7147,9 +7186,78 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         std::make_unique<rp::DmlFoldEngine>(fcfg);
                     mn_diff_writer = std::make_unique<rp::MnDiffWriter>(
                         *mn_diff_store, *mn_bridge_fold_engine);
+
+                    // ── RESOLVER WIRING (the fix) ────────────────────────
+                    // The parallel store engine, like the main replay-fold
+                    // path, needs the W4 quorum-member resolver or its fold
+                    // fails closed at the first punishing qfcommit (llmqType=5
+                    // @ h=2513130, only ~130 past the anchor): "no quorum-
+                    // member resolver is installed -- PoSe punishes cannot be
+                    // folded, failing closed". That cap is why the store
+                    // covered only ~130 heights and the bridge fell back to the
+                    // capped network getmnlistd probe (payee-desync).
+                    //
+                    // Mirror the main-path --replay-fold-quorums seam: a SECOND
+                    // QuorumReplayEngine seeded at the SAME full-state anchor and
+                    // a SECOND ReplayQuorumBridge whose ctor installs
+                    // set_members_fn onto mn_bridge_fold_engine. The engine
+                    // self-DERIVES rotated + non-rotated member sets from the
+                    // SAME replayed blocks the store folds (dashd
+                    // CalcQuorumMembers / GetAllQuorumMembers analog),
+                    // self-checked vs each block's committed merkleRootQuorums --
+                    // no qrinfo/P2P dependency. The fold then applies dashd
+                    // HandleQuorumCommitment PoSe-punishes (already ported in
+                    // replay_fold_engine.hpp) so the folded list re-hashes to the
+                    // committed merkleRootMNList PAST the qfcommit and the store
+                    // COVERS heights to tip. A WRONG member set -> root mismatch
+                    // -> the writer's own root self-check REFUSES the row -> store
+                    // stays empty -> callers fall through to the network path
+                    // (reward-safe by construction).
+                    {
+                        namespace rq = dash::coin::replay;
+                        rq::QuorumReplayConfig qcfg;
+                        qcfg.enabled = true;
+                        qcfg.network = testnet
+                            ? dash::coin::LlmqNetwork::Testnet
+                            : dash::coin::LlmqNetwork::Mainnet;
+                        if (testnet) qcfg.v20_floor = 905'100u;
+                        mn_bridge_quorum_engine =
+                            std::make_unique<rq::QuorumReplayEngine>(qcfg);
+                        mn_bridge_quorum_engine->seed_cursor(
+                            ckpt.height, ckpt.blockhash);
+                        rq::QuorumBridgeConfig bcfg;
+                        bcfg.network = qcfg.network;
+                        mn_bridge_quorum_bridge =
+                            std::make_unique<rq::ReplayQuorumBridge>(
+                                *mn_bridge_fold_engine,
+                                *mn_bridge_quorum_engine, bcfg);
+                        // Pre-anchor height->hash from the PoW-verified header
+                        // chain: a commitment mined just after the anchor whose
+                        // quorum BASE predates it still resolves instead of
+                        // failing the lane on an unknown base (mirrors the main
+                        // path's back = 3*576 + 64 window).
+                        size_t qseeded = 0;
+                        const uint32_t qback = 3u * 576u + 64u;
+                        for (uint32_t hh = (ckpt.height > qback
+                                                ? ckpt.height - qback : 1);
+                             hh < ckpt.height; ++hh) {
+                            auto he = header_chain->get_header_by_height(hh);
+                            if (!he) continue;
+                            mn_bridge_quorum_bridge->seed_block_hash(hh, he->hash);
+                            ++qseeded;
+                        }
+                        LOG_INFO << "[MN-DIFF-DB] store-engine quorum resolver"
+                                    " WIRED: second QuorumReplayEngine seeded at"
+                                    " anchor h=" << ckpt.height
+                                 << " (" << qseeded << " pre-anchor header"
+                                    " hashes); set_members_fn installed on the"
+                                    " parallel DML engine -- prime_at_anchor"
+                                    " deferred to the anchor snapshot seed.";
+                    }
                     mn_ckpt_lane->set_on_anchor_snapshot(
                         [eng = mn_bridge_fold_engine.get(),
                          w   = mn_diff_writer.get(),
+                         qbr = mn_bridge_quorum_bridge.get(),
                          anchor = ckpt, net = net_name](
                             const dash::coin::vendor::CSimplifiedMNList& asml,
                             uint32_t /*anchor_h*/) {
@@ -7274,6 +7382,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                        " inert, callers unchanged.";
                                 return;
                             }
+                            // Resolver lane: retain the anchor MN list in the
+                            // quorum bridge's window now that the fold engine is
+                            // seeded (m_dml.height()==anchor), so rotated member
+                            // derivation has its base list. Mirrors the main path.
+                            if (qbr) qbr->prime_at_anchor();
                             LOG_INFO
                                 << "[MN-DIFF-DB] FULL-STATE anchor seed OK: "
                                 << with_facets << " MNs seeded root-fields from the"
@@ -7288,40 +7401,523 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                    " on-demand fold source 0-RTT/uncapped from it.";
                         });
 
-                    // THE WRITE FEED: every block the bridge folds CLEANLY is
-                    // handed to the parallel engine; only its OWN root-checked
-                    // commit sinks the writer. A once-latched poison log names
-                    // the reality when a partial anchor cannot reproduce roots.
+                    // ── DIP-24 ROTATED-QUORUM STRADDLE BOOTSTRAP (getqrinfo) ─────
+                    // The store engine is seeded at the anchor with ZERO
+                    // pre-anchor quarter snapshots (only pre-anchor header
+                    // hashes, above). The FIRST rotated (DIP-24, llmqType=5)
+                    // cycle mined AFTER the anchor has a base B0 whose three
+                    // quarter predecessors (B0-C/2C/3C) all sit BELOW the
+                    // anchor, so the engine's self_contained_from is beyond it
+                    // and it cannot self-derive that cycle's member set from
+                    // the replayed post-anchor stream alone. Its first punishing
+                    // qfcommit then hits fold_qfcommit with "resolver has no
+                    // member set", the parallel fold fails closed only ~a
+                    // window past the anchor, the store caps, and the payee lane
+                    // falls to the capped network probe (the #149-class payee
+                    // desync). FIX (dashd DIP-24 CGetQuorumRotationInfo /
+                    // BuildQuorumSnapshot, the companion to the #1261 full-SML
+                    // seed): fetch getqrinfo(B0) once at cold arm, DIP-4/merkle
+                    // authenticate the returned quarter snapshots + work lists
+                    // against the committed roots, and seed them so cycle B0 is
+                    // derivable. A WRONG snapshot -> wrong members -> folded root
+                    // mismatch -> the writer's own root self-check REFUSES the
+                    // row -> store empty -> callers fall through (reward-safe by
+                    // construction; never a bad mint).
+                    struct StoreStraddleSeed {
+                        bool     armed{false};
+                        bool     sent{false};
+                        bool     landed{false};
+                        bool     exhausted{false};
+                        uint8_t  llmq_type{5};
+                        uint32_t C{0};
+                        uint32_t cycle_base{0};     // B0 = first rotated cycle base > anchor
+                        uint32_t first_need_h{0};   // hold straddle blocks at/after this height
+                        uint32_t last_send_h{0};
+                        uint256  cycle_base_hash;
+                        std::vector<std::pair<uint32_t, dash::coin::BlockType>> hold;
+                        // Pre-anchor header backfill (cold fast-start): leg (b)
+                        // of the getqrinfo snapshot auth needs the FULL headers
+                        // of the three rotated work blocks, all BELOW the anchor
+                        // and absent from the lone-anchor cold chain. One-shot
+                        // backward getheaders installs the span DOWN from the
+                        // trusted anchor before the seed can authenticate.
+                        bool     backfill_sent{false};
+                        uint256  anchor_hash;      // trusted downward-link root
+                        uint32_t anchor_height{0};
+                    };
+                    auto sseed = std::make_shared<StoreStraddleSeed>();
+                    {
+                        const uint32_t anchor_h = ckpt.height;
+                        for (const auto& pv : dash::coin::enabled_llmqs(
+                                 testnet ? dash::coin::LlmqNetwork::Testnet
+                                         : dash::coin::LlmqNetwork::Mainnet)) {
+                            if (!pv.use_rotation || pv.dkg_interval == 0) continue;
+                            sseed->llmq_type   = pv.type;
+                            sseed->C           = pv.dkg_interval;
+                            sseed->cycle_base  = ((anchor_h / pv.dkg_interval) + 1u)
+                                                 * pv.dkg_interval;
+                            // Hold from the cycle base itself (conservative): the
+                            // engine derives cycle B0's members no later than the
+                            // block that carries B0's first punishing qfcommit, and
+                            // no earlier than observing B0; gating at the base is
+                            // correct for both and costs at most a few dozen buffered
+                            // blocks in the rare case the reply is slow.
+                            sseed->first_need_h = sseed->cycle_base;
+                            sseed->anchor_hash  = ckpt.blockhash;
+                            sseed->anchor_height= anchor_h;
+                            sseed->armed        = true;
+                            break;   // one rotated type on mainnet (type 5)
+                        }
+                        if (sseed->armed)
+                            LOG_INFO << "[MN-DIFF-DB] store-engine rotated-quorum"
+                                        " bootstrap ARMED: getqrinfo(cycle_base h="
+                                     << sseed->cycle_base << ", type="
+                                     << int(sseed->llmq_type) << ", C=" << sseed->C
+                                     << ") will seed the pre-anchor quarter"
+                                        " snapshots+work-lists for the cycle that"
+                                        " STRADDLES anchor h=" << anchor_h
+                                     << " (its H-C/2C/3C predecessors are all below"
+                                        " the anchor; the store engine cannot"
+                                        " self-derive them).";
+                    }
+
+                    // ── PRE-ANCHOR HEADER BACKFILL INSTALLER ─────────────────
+                    // The one-shot backward getheaders issued by the qrinfo
+                    // consumer below (when the work-block headers leg (b) needs
+                    // are absent at cold fast-start) returns a `headers` batch
+                    // spanning [h-4C .. anchor]. It arrives on the new_headers
+                    // event, where the forward add_headers path orphan-rejects
+                    // every pre-anchor header (parent not held). This installer
+                    // instead links them DOWN from the trusted anchor via
+                    // HeaderChain::install_preanchor_span (X11 prev-hash chain +
+                    // PoW, reward-safe), then re-drives getqrinfo so leg (b)
+                    // authenticates promptly. Self-guarding: it no-ops unless the
+                    // backfill was issued and not yet landed, and a batch that
+                    // does not reach the anchor installs nothing.
+                    if (sseed->armed) {
+                        coin_feed_subs.push_back(
+                            coin_state.new_headers.subscribe(
+                                [sseed, hc = header_chain.get(),
+                                 cp = coin_p2p.get()](
+                                    const std::vector<dash::coin::BlockHeaderType>&
+                                        batch) {
+                                    if (!sseed->armed || sseed->landed) return;
+                                    if (!sseed->backfill_sent) return;
+                                    if (batch.empty()) return;
+                                    const size_t n = hc->install_preanchor_span(
+                                        sseed->anchor_hash, batch);
+                                    if (n == 0) return;
+                                    // Re-drive getqrinfo now that the pre-anchor
+                                    // work-block headers are held → leg (b)
+                                    // authenticates on the next reply.
+                                    if (cp && !sseed->cycle_base_hash.IsNull())
+                                        cp->send_getqrinfo(
+                                            {}, sseed->cycle_base_hash,
+                                            /*extra=*/true);
+                                }));
+                    }
+
+                    // The shared per-block fold drive. Both the live feed and the
+                    // held-block drain call THIS, so a block folded from the hold
+                    // buffer takes the exact same observe/fold/after_fold/writer
+                    // path as a live one.
+                    auto feed = std::make_shared<
+                        std::function<void(const dash::coin::BlockType&, uint32_t)>>();
+                    *feed = [eng = mn_bridge_fold_engine.get(),
+                             w   = mn_diff_writer.get(),
+                             qbr = mn_bridge_quorum_bridge.get(),
+                             logged = std::make_shared<bool>(false)](
+                                const dash::coin::BlockType& blk, uint32_t h) {
+                        if (eng->poisoned()) return;
+                        if (eng->size() == 0) return;   // seed deferred to the anchor fold
+                        const uint256 bh = rp::DmlFoldEngine::block_header_hash(blk);
+                        if (qbr) qbr->observe(h, bh, blk);
+                        const auto fr = eng->fold_block(blk, h);
+                        if (qbr) qbr->after_fold(h);
+                        if (fr.ok) { w->on_folded(h, bh, blk, fr); return; }
+                        if (!*logged) {
+                            *logged = true;
+                            LOG_WARNING
+                                << "[MN-DIFF-DB] cold-bridge parallel fold could"
+                                   " not extend the store at h=" << h << " ("
+                                << fr.error << "). The store keeps only heights up"
+                                   " to here; every height above REPAIR-REFUSES and"
+                                   " the probe/on-demand paths fall through to the"
+                                   " network unchanged (reward-safe).";
+                        }
+                    };
+
+                    // The qrinfo reply consumer: authenticate the straddle-cycle
+                    // snapshots + work lists and seed them into the store engine.
+                    // Additive (coexists with the serve-path consumer at
+                    // main_dash.cpp:4446); it filters by the reply's H so only OUR
+                    // getqrinfo(B0) reply is consumed.
+                    if (coin_p2p && sseed->armed) {
+                        coin_p2p->add_qrinfo_consumer(
+                            [sseed, feed,
+                             qbr = mn_bridge_quorum_bridge.get(),
+                             hc  = header_chain.get(),
+                             cp  = coin_p2p.get(),
+                             anchor_h = ckpt.height, net = net_name](
+                                const dash::coin::vendor::CQuorumRotationInfo& info) {
+                                if (!sseed->armed || sseed->landed) return;
+                                namespace v  = dash::coin::vendor;
+                                namespace rq = dash::coin::replay;
+                                // Bind: OUR reply's mnListDiffH sits at B0-8.
+                                v::CCbTx hcb;
+                                if (info.mnListDiffH.cbTx.type != 5
+                                    || !v::parse_cbtx(
+                                           info.mnListDiffH.cbTx.extra_payload, hcb)
+                                    || hcb.nHeight < 0) return;
+                                if (static_cast<uint32_t>(hcb.nHeight)
+                                    != sseed->cycle_base - 8u) return;   // not ours
+
+                                // ── PRE-ANCHOR HEADER BACKFILL GATE ──────────
+                                // leg (b) below needs the FULL headers of the
+                                // three rotated work blocks (h-C/2C/3C), all
+                                // BELOW the fast-start anchor. At cold start the
+                                // header chain holds only the anchor, so the auth
+                                // fails closed 'block header not held'. Fetch the
+                                // pre-anchor span (once) and install it DOWN from
+                                // the trusted anchor BEFORE authenticating.
+                                {
+                                    const uint256 wh_c  =
+                                        info.mnListDiffAtHMinusC.blockHash;
+                                    const uint256 wh_2c =
+                                        info.mnListDiffAtHMinus2C.blockHash;
+                                    const uint256 wh_3c =
+                                        info.mnListDiffAtHMinus3C.blockHash;
+                                    if (!hc->has_header(wh_c)
+                                        || !hc->has_header(wh_2c)
+                                        || !hc->has_header(wh_3c)) {
+                                        // getheaders replies START at locator+1,
+                                        // so to INCLUDE the deepest work block
+                                        // (h-3C) the locator is seeded one rotated
+                                        // cycle DEEPER — the h-4C block from the
+                                        // extraShare leg. That hash is used ONLY
+                                        // as a locator; it is never trusted (a bad
+                                        // one yields no downward linkage from the
+                                        // anchor → zero installs → fail closed).
+                                        if (!sseed->backfill_sent && cp
+                                            && info.extraShare
+                                            && info.mnListDiffAtHMinus4C) {
+                                            const uint256 loc =
+                                                info.mnListDiffAtHMinus4C->blockHash;
+                                            const std::string peer =
+                                                cp->primary_peer_key();
+                                            if (!peer.empty()
+                                                && cp->send_getheaders_to(
+                                                       peer, 70230, {loc},
+                                                       sseed->anchor_hash)) {
+                                                sseed->backfill_sent = true;
+                                                LOG_INFO << "[MN-DIFF-DB] pre-anchor"
+                                                    " header BACKFILL issued:"
+                                                    " getheaders locator=h-4C "
+                                                    << loc.GetHex().substr(0, 16)
+                                                    << " stop=anchor "
+                                                    << sseed->anchor_hash.GetHex()
+                                                           .substr(0, 16)
+                                                    << " — installs the h-C/2C/3C"
+                                                       " work-block headers leg (b)"
+                                                       " needs; getqrinfo retries"
+                                                       " once the span lands.";
+                                            }
+                                        } else if (!info.extraShare
+                                                   || !info.mnListDiffAtHMinus4C) {
+                                            LOG_WARNING << "[MN-DIFF-DB] getqrinfo"
+                                                " reply lacks the h-4C extraShare"
+                                                " leg — cannot seed a locator below"
+                                                " the deepest work block; rotated"
+                                                " bootstrap fails closed"
+                                                " (reward-safe), retry.";
+                                        }
+                                        return;   // headers absent → fail closed
+                                    }
+                                }
+                                dash::coin::MerkleRootOfHashFn mroot =
+                                    [hc](const uint256& b)
+                                        -> std::optional<uint256> {
+                                        if (auto e = hc->get_header(b))
+                                            return e->header.m_merkle_root;
+                                        return std::nullopt;
+                                    };
+                                const v::CSimplifiedMNListDiff* diffs[3] = {
+                                    &info.mnListDiffAtHMinusC,
+                                    &info.mnListDiffAtHMinus2C,
+                                    &info.mnListDiffAtHMinus3C };
+                                const v::CQuorumSnapshot* snaps[3] = {
+                                    &info.quorumSnapshotAtHMinusC,
+                                    &info.quorumSnapshotAtHMinus2C,
+                                    &info.quorumSnapshotAtHMinus3C };
+                                rq::QSnapshotSeed qs;  qs.network = net;
+                                rq::WorkListSeed  wl;  wl.network = net;
+                                wl.llmq_type  = sseed->llmq_type;
+                                wl.cycle_base = sseed->cycle_base;
+                                wl.interval   = sseed->C;
+                                for (size_t i = 0; i < 3; ++i) {
+                                    const uint32_t cyc = sseed->cycle_base
+                                        - static_cast<uint32_t>(i + 1) * sseed->C;
+                                    const uint32_t work_h = cyc - 8u;
+                                    // A qrinfo cycle diff is a FULL list (applied
+                                    // onto empty); a delete means it is not.
+                                    if (!diffs[i]->deletedMNs.empty()) {
+                                        LOG_WARNING << "[MN-DIFF-DB] getqrinfo cycle"
+                                                       " diff " << i << " is not a"
+                                                       " full list (deletes) — rotated"
+                                                       " bootstrap fails closed, retry.";
+                                        return;
+                                    }
+                                    v::CCbTx cbtx;
+                                    auto sml = dash::coin::authenticate_historical_snapshot(
+                                        *diffs[i], work_h, mroot, cbtx, "MN-DIFF-DB-QR");
+                                    if (!sml) {
+                                        LOG_WARNING << "[MN-DIFF-DB] getqrinfo cycle"
+                                                       " diff " << i << " DIP-4 auth"
+                                                       " FAILED at work h=" << work_h
+                                                    << " — rotated bootstrap fails"
+                                                       " closed, retry.";
+                                        return;
+                                    }
+                                    rq::QSnapshotSeedEntry se;
+                                    se.llmq_type  = sseed->llmq_type;
+                                    se.cycle_base = cyc;
+                                    se.snapshot   = *snaps[i];
+                                    qs.entries.push_back(std::move(se));
+                                    rq::WorkListSeedEntry we;
+                                    we.work_height = work_h;
+                                    we.cycle_base  = cyc;
+                                    we.block_hash  = diffs[i]->blockHash;
+                                    if (cbtx.nVersion >= v::CCbTx::VERSION_CLSIG_AND_BALANCE
+                                        && cbtx.has_best_cl_signature()) {
+                                        we.has_cl = true;
+                                        std::memcpy(we.cl_sig.data(),
+                                                    cbtx.bestCLSignature.data(),
+                                                    we.cl_sig.size());
+                                    }
+                                    we.entries.reserve(sml->mnList.size());
+                                    for (const auto& e : sml->mnList) {
+                                        rq::QuorumMnEntry qe;
+                                        qe.proTxHash      = e.proRegTxHash;
+                                        qe.confirmedHash  = e.confirmedHash;
+                                        qe.is_valid       = e.isValid;
+                                        qe.n_type         = e.nType;
+                                        qe.has_collateral = false;
+                                        we.entries.push_back(std::move(qe));
+                                    }
+                                    wl.works.push_back(std::move(we));
+                                }
+                                qs.ok = true;  wl.ok = true;
+                                std::string e1, e2;
+                                const bool ok1 = qbr->seed_snapshots(qs, anchor_h, e1);
+                                const bool ok2 = qbr->seed_work_lists(wl, anchor_h, e2);
+                                if (!ok1 || !ok2) {
+                                    LOG_ERROR << "[MN-DIFF-DB] getqrinfo rotated"
+                                                 " bootstrap seed REJECTED (snapshots: "
+                                              << (ok1 ? "ok" : e1) << "; work-lists: "
+                                              << (ok2 ? "ok" : e2) << ") — store engine"
+                                                 " stays without the straddle snapshots;"
+                                                 " callers fall through (reward-safe).";
+                                    return;
+                                }
+                                sseed->landed = true;
+                                LOG_INFO << "[MN-DIFF-DB] getqrinfo rotated bootstrap"
+                                            " SEEDED: " << qs.entries.size()
+                                         << " pre-anchor quarter snapshots + "
+                                         << wl.works.size() << " work-lists for cycle"
+                                            " base h=" << sseed->cycle_base << " (type "
+                                         << int(sseed->llmq_type) << "); cycle "
+                                         << sseed->cycle_base << " is now derivable —"
+                                            " fold_qfcommit past the anchor resolves its"
+                                            " member set and the store extends toward"
+                                            " tip.";
+                                // ── ASSEMBLE + KEY the straddle cycle NOW ────
+                                // The seed made the cycle DERIVABLE (snapshots +
+                                // work-lists present); this drives dashd's
+                                // ComputeQuorumMembersByQuarterRotation over them
+                                // (the engine's compute_rotation_cycle, verbatim)
+                                // and registers the ordered member set keyed by
+                                // (llmqType, cycle_base+quorumIndex) — the exact
+                                // key fold_qfcommit's m_members_fn(type,quorumHash)
+                                // resolves a commitment quorumHash to. Done BEFORE
+                                // draining the held blocks so the qfcommit at
+                                // cycle_base+mining_window_start (the height the
+                                // store used to cap at) resolves its member set
+                                // and the fold folds THROUGH toward tip.
+                                {
+                                    auto dr = qbr->derive_members_for_cycle(
+                                        sseed->llmq_type, sseed->cycle_base);
+                                    if (dr.ok)
+                                        LOG_INFO << "[MN-DIFF-DB] straddle cycle"
+                                                    " base h=" << sseed->cycle_base
+                                                 << " (type "
+                                                 << int(sseed->llmq_type)
+                                                 << ") rotated member sets"
+                                                    " ASSEMBLED + KEYED: "
+                                                 << dr.member_sets << "/"
+                                                 << dr.expected_sets
+                                                 << " quorumIndex lists (quorum"
+                                                    " size " << dr.quorum_size
+                                                 << ") — fold_qfcommit resolves"
+                                                    " past the anchor.";
+                                    else
+                                        LOG_WARNING << "[MN-DIFF-DB] straddle cycle"
+                                                       " base h="
+                                                    << sseed->cycle_base
+                                                    << " (type "
+                                                    << int(sseed->llmq_type)
+                                                    << ") member assembly"
+                                                       " INCOMPLETE ("
+                                                    << dr.member_sets << "/"
+                                                    << dr.expected_sets << "): "
+                                                    << dr.skip_reason
+                                                    << " — store will cap at the"
+                                                       " cycle's first punishing"
+                                                       " qfcommit; callers fall"
+                                                       " through (reward-safe).";
+                                }
+                                if (!sseed->hold.empty()) {
+                                    for (auto& pr : sseed->hold)
+                                        (*feed)(pr.second, pr.first);
+                                    sseed->hold.clear();
+                                }
+                            });
+                    }
+
+                    // THE WRITE FEED: the SAME shared drive as the hold-buffer
+                    // drain (feed), wrapped by the rotated-quorum ORDERING GATE.
+                    // getqrinfo(B0) is a P2P round-trip that races the parallel
+                    // fold advancing from the anchor; a straddle block folded
+                    // BEFORE its snapshots are seeded fails closed and POISONS
+                    // the engine. So: issue the fetch once a body-serving peer is
+                    // certainly up, HOLD straddle blocks until the seed lands
+                    // (then drain them in order), and — reward-safe fallback — if
+                    // the reply never arrives within a bounded hold, cap the store
+                    // below the straddle and let callers fall through unchanged
+                    // rather than poison.
                     mn_ckpt_lane->set_on_block_applied(
-                        [eng = mn_bridge_fold_engine.get(),
-                         w   = mn_diff_writer.get(),
-                         logged = std::make_shared<bool>(false)](
+                        [sseed, feed, cp = coin_p2p.get(),
+                         hc = header_chain.get()](
                             const dash::coin::BlockType& blk, uint32_t h) {
-                            if (eng->poisoned()) return;
-                            if (eng->size() == 0) return;   // seed deferred to the anchor fold; nothing to fold yet
-                            const uint256 bh =
-                                rp::DmlFoldEngine::block_header_hash(blk);
-                            const auto fr = eng->fold_block(blk, h);
-                            if (fr.ok) {
-                                w->on_folded(h, bh, blk, fr);
-                                return;
+                            // Lazy one-shot getqrinfo(B0): fire on the first folded
+                            // block, when headers are synced and a body-serving
+                            // peer exists.
+                            if (sseed->armed && !sseed->sent) {
+                                if (auto he = hc->get_header_by_height(
+                                        sseed->cycle_base)) {
+                                    sseed->cycle_base_hash = he->hash;
+                                    // extra=true: the reply must carry the h-4C
+                                    // leg, whose blockHash seeds a getheaders
+                                    // locator BELOW the deepest work block so the
+                                    // pre-anchor backfill span includes h-3C.
+                                    if (cp) cp->send_getqrinfo(
+                                        {}, he->hash, /*extra=*/true);
+                                    sseed->sent        = true;
+                                    sseed->last_send_h = h;
+                                    LOG_INFO << "[MN-DIFF-DB] getqrinfo issued for"
+                                                " straddling cycle base h="
+                                             << sseed->cycle_base
+                                             << " — bootstrap the store engine's"
+                                                " rotated member derivation across"
+                                                " the anchor.";
+                                }
                             }
-                            if (!*logged) {
-                                *logged = true;
-                                LOG_WARNING
-                                    << "[MN-DIFF-DB] cold-bridge parallel fold"
-                                       " could not extend the store at h=" << h
-                                    << " (" << fr.error << "). The store keeps"
-                                       " only its anchor row; every height above"
-                                       " REPAIR-REFUSES and the probe/on-demand"
-                                       " paths fall through to the network"
-                                       " unchanged (reward-safe). With the"
-                                       " full-state anchor seed this is NOT the"
-                                       " expected cold-bridge state: it means the"
-                                       " parallel fold diverged from a committed"
-                                       " cbTx root at this height.";
+                            // Seed landed while blocks were held -> drain first.
+                            if (sseed->landed && !sseed->hold.empty()) {
+                                for (auto& pr : sseed->hold)
+                                    (*feed)(pr.second, pr.first);
+                                sseed->hold.clear();
                             }
+                            // Hold blocks that would ask the resolver for the
+                            // straddling cycle before its snapshots are seeded.
+                            if (sseed->armed && !sseed->landed
+                                && h >= sseed->first_need_h) {
+                                if (sseed->exhausted) return;   // gave up: never fold unseeded
+                                constexpr size_t kHoldCap = 2000;
+                                if (sseed->hold.size() < kHoldCap) {
+                                    sseed->hold.emplace_back(h, blk);
+                                    if (sseed->sent
+                                        && h >= sseed->last_send_h + 24u) {
+                                        if (auto he = hc->get_header_by_height(
+                                                sseed->cycle_base)) {
+                                            if (cp) cp->send_getqrinfo(
+                                                {}, he->hash, /*extra=*/true);
+                                            sseed->last_send_h = h;
+                                        }
+                                    }
+                                } else {
+                                    sseed->exhausted = true;
+                                    sseed->hold.clear();
+                                    LOG_WARNING
+                                        << "[MN-DIFF-DB] getqrinfo straddle seed did"
+                                           " not arrive before the hold cap at h="
+                                        << h << "; store caps below the straddling"
+                                           " cycle and callers fall through to the"
+                                           " network path (reward-safe, no bad mint).";
+                                }
+                                return;   // do not fold a straddle block unseeded
+                            }
+                            (*feed)(blk, h);
                         });
+
+                    // ── DASHD-CUT: self-derived MN-set checkpoint DUMP off the
+                    // MN-CKPT BRIDGE (task #154, the #1 dashd-cut pacing item).
+                    // The bridge SEEDS from the baked checkpoint and forward-
+                    // folds block-by-block (apply_block == dashd
+                    // BuildNewListFromBlock parity) to H in MINUTES over the
+                    // coin-P2P feed — no --replay-bulk, no --replay-fold-prestate,
+                    // no dashd. When it reaches H the hook serializes the bridge's
+                    // OWN payout-bearing set (MnStateMachine::entries()) to FILE.
+                    // SELF-DERIVED: every field comes from the bridge's own fold
+                    // (scriptPayout verbatim from the ProRegTx it replayed;
+                    // nLastPaidHeight from the payee bookkeeping it keeps), never
+                    // a dashd protx snapshot and never getmnlistdiff (which is
+                    // payout-stripped). The write self-verifies through
+                    // parse_mn_checkpoint() so it can never emit a file the
+                    // runtime cold-start would refuse. This is the exact analog
+                    // of the replay-fold consumer's set_dump_hook install (the
+                    // --replay-fold-prestate arm); the two are mutually exclusive
+                    // by the g_replay_fold_prestate predicate this block already
+                    // stands under.
+                    if (g_dump_mn_checkpoint_height != 0) {
+                        const uint32_t    dump_h    = g_dump_mn_checkpoint_height;
+                        const std::string dump_file = g_dump_mn_checkpoint_file;
+                        const std::string net       = net_name;
+                        mn_ckpt_lane->set_dump_hook(
+                            dump_h,
+                            [dump_file, net](const dash::coin::MnStateMachine& machine,
+                                             uint32_t reached,
+                                             const uint256& blockhash) {
+                                const std::string source =
+                                    "self-derived from chain via c2pool MN-CKPT"
+                                    " bridge at H=" + std::to_string(reached)
+                                    + " (blockhash " + blockhash.GetHex() + ")";
+                                const std::string generated =
+                                    dash::coin::mn_dump_detail::iso8601_utc_now();
+                                std::string err;
+                                if (dash::coin::write_mn_checkpoint_inc(
+                                        machine.entries(), reached, blockhash,
+                                        net, dump_file, source, generated, err)) {
+                                    std::cout << "[run] --dump-mn-checkpoint"
+                                                 " (BRIDGE): WROTE "
+                                              << machine.size() << " registered"
+                                                 " masternodes at h=" << reached
+                                              << " to " << dump_file
+                                              << " (self-derived via the MN-CKPT"
+                                                 " bridge, no dashd) — verified"
+                                                 " through parse_mn_checkpoint()\n";
+                                } else {
+                                    std::cerr << "[run] --dump-mn-checkpoint"
+                                                 " (BRIDGE) FAILED at h="
+                                              << reached << ": " << err << "\n";
+                                }
+                            });
+                        std::cout << "[run] --dump-mn-checkpoint ARMED on the"
+                                     " MN-CKPT BRIDGE: the bridge will serialize"
+                                     " its registered MN set at h=" << dump_h
+                                  << " to " << dump_file
+                                  << " (self-derived from chain via the baked-"
+                                     "checkpoint fold; no dashd RPC)\n";
+                    }
 
                     // THE READ SEAM: the 0-RTT gap-repair the SOURCE callers
                     // use, reconstructed from the store and cross-checked at
@@ -7607,6 +8203,52 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // carries a payout script. A fold that diverged, is poisoned,
                 // or is behind the tip can never become the authoritative
                 // snapshot, and the refusal names which condition blocked.
+                // ── DASHD-CUT: self-derived MN-set checkpoint DUMP ────────
+                // One-shot: when the fold cursor reaches H, serialize the
+                // registered set to FILE (mn_checkpoint_dump.hpp). SELF-DERIVED
+                // — every field comes from the fold's own root-checked
+                // ReplayMNState (scriptPayout verbatim from the ProRegTx it
+                // replayed; nLastPaidHeight from the payee bookkeeping it
+                // keeps), never a dashd protx snapshot. Serve-inert: it only
+                // reads the engine and writes one file. The write self-verifies
+                // through parse_mn_checkpoint() so it can never emit a file the
+                // runtime cold-start would refuse.
+                if (g_dump_mn_checkpoint_height != 0 && replay_fold_consumer) {
+                    const uint32_t dump_h = g_dump_mn_checkpoint_height;
+                    const std::string dump_file = g_dump_mn_checkpoint_file;
+                    replay_fold_consumer->set_dump_hook(
+                        dump_h,
+                        [dump_file, dump_h](const rp::DmlFoldEngine& eng,
+                                            uint32_t reached) {
+                            const std::string source =
+                                "self-derived from chain via c2pool"
+                                " --replay-bulk at H=" + std::to_string(reached)
+                                + " (blockhash " + eng.block_hash().GetHex()
+                                + ")";
+                            const std::string generated =
+                                dash::coin::mn_dump_detail::iso8601_utc_now();
+                            std::string err;
+                            if (dash::coin::write_mn_checkpoint_inc(
+                                    eng, dump_file, source, generated, err)) {
+                                std::cout << "[run] --dump-mn-checkpoint: WROTE "
+                                          << eng.size() << " registered"
+                                             " masternodes at h=" << reached
+                                          << " to " << dump_file
+                                          << " (self-derived, no dashd) —"
+                                             " verified through"
+                                             " parse_mn_checkpoint()\n";
+                            } else {
+                                std::cerr << "[run] --dump-mn-checkpoint FAILED"
+                                             " at h=" << reached << ": " << err
+                                          << "\n";
+                            }
+                        });
+                    std::cout << "[run] --dump-mn-checkpoint ARMED: the fold will"
+                                 " serialize its registered MN set at h="
+                              << dump_h << " to " << dump_file
+                              << " (self-derived from chain; no dashd RPC)\n";
+                }
+
                 if (replay_fold_consumer) {
                     replay_payee_pub =
                         std::make_unique<rp::ReplayPayeePublisher>(
@@ -7715,7 +8357,22 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // the store is simply absent and both repair callers keep
                 // their historical wipe/demote fail-closed behavior — the
                 // store is an accelerator, never consensus-required.
-                if (replay_fold_consumer) {
+                if (replay_fold_consumer && mn_diff_store) {
+                    // DEFENSIVE (named fail-closed, not a clobber): the cold
+                    // MN-CKPT store-bridge (main_dash.cpp ~6182) must have YIELDED
+                    // when a prestate is configured. If it did not, a make_unique
+                    // here would FREE the cold bridge's live MnDiffWriter while
+                    // its set_on_anchor_snapshot lambda still holds it raw -> UAF.
+                    // Refuse instead. The deep replay then folds WITHOUT the
+                    // accelerator store (reward-safe: the store is never
+                    // consensus-required, only a gap-repair accelerator).
+                    LOG_ERROR << "[MN-DIFF-DB] INVARIANT VIOLATED: cold-bridge"
+                                 " store present while arming the W5 deep-replay"
+                                 " store -- refusing to clobber a live writer"
+                                 " (would UAF the cold-bridge anchor lambda);"
+                                 " W5 accelerator store DISABLED (reward-safe).";
+                }
+                if (replay_fold_consumer && !mn_diff_store) {
                     mn_diff_store = std::make_unique<rp::MnDiffStore>(
                         (core::filesystem::config_path() / net_subdir
                             / "dash_mn_diff_db").string());
@@ -9804,6 +10461,13 @@ int main(int argc, char** argv)
         else if (std::strcmp(argv[i], "--replay-bulk-start") == 0 && i + 1 < argc)
             g_replay_bulk_start = static_cast<uint32_t>(
                 std::strtoul(argv[++i], nullptr, 10));
+        // DASHD-CUT: dump the fold's registered MN set at H to a checkpoint
+        // .inc (self-derived; no dashd). Takes two args: H and FILE.
+        else if (std::strcmp(argv[i], "--dump-mn-checkpoint") == 0 && i + 2 < argc) {
+            g_dump_mn_checkpoint_height = static_cast<uint32_t>(
+                std::strtoul(argv[++i], nullptr, 10));
+            g_dump_mn_checkpoint_file = argv[++i];
+        }
         // W5: anchor-seeded DML fold driven by the bulk lane.
         else if (std::strcmp(argv[i], "--replay-fold-prestate") == 0 && i + 1 < argc) {
             g_replay_fold_prestate = argv[++i];
