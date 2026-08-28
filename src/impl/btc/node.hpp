@@ -417,7 +417,10 @@ public:
     /// connected peers.  Invoked when think()/clean updates the best share so a
     /// peer that completed the version handshake before we had any shares (when
     /// our advert was ZERO) still learns our head and pulls via download_shares.
-    void readvertise_best();
+    /// Walks the head WITHOUT consulting the m_shared_share_hashes de-dup set
+    /// (ltc/dgb pattern), so a head share already accepted by another peer is
+    /// still re-pushed to a freshly-handshook one (ROOT-2, issue #885).
+    void readvertise_best_share();
 
     /// Start downloading shares from a peer, beginning at `target_hash`.
     /// Recursively fetches parents until the chain is connected or CHAIN_LENGTH reached.

@@ -2273,15 +2273,32 @@ core::stratum::CoinbaseResult DASHWorkSource::build_connection_coinbase(
         uint160 finder_pkh;   // zero unless the payout script is P2PKH
         const bool have_pkh = p2pkh_pubkey_hash(payout_script, finder_pkh);
 
+        // OWNERLESS SESSION ALARM (#960). The old warning sat inside the
+        // genesis branch below, so a pool with a WARM sharechain served an
+        // ownerless miner in complete silence -- and that is precisely the
+        // case where money moved: the PPLNS window paid normally while the
+        // 2% block-finder slice went to a zero pubkey hash. Warn on BOTH
+        // arms, rate-limited the way the producer-degrade line above is, so
+        // the operator sees the misconfiguration BEFORE a block is found
+        // rather than after. Log-only: it changes no output.
+        if (!have_pkh) {
+            static int ownerless_log = 0;
+            if (ownerless_log++ % 50 == 0)
+                LOG_WARNING << "[DASH-STRATUM] OWNERLESS session: payout script is "
+                            << (payout_script.empty()
+                                    ? std::string("EMPTY")
+                                    : (std::to_string(payout_script.size())
+                                       + "B non-P2PKH"))
+                            << " -- no finder output is emitted, the whole worker "
+                               "payout routes to the donation tail, and this job "
+                               "mints NO sharechain credit (authorize with a "
+                               "P2PKH DASH address as the stratum username)";
+        }
+
         if (weights.empty() || total_weight == 0) {
             if (have_pkh) {
                 weights[payout_script] = 1;
                 total_weight = 1;
-            } else if (!payout_script.empty()) {
-                LOG_WARNING << "[DASH-STRATUM] payout script is not P2PKH ("
-                            << payout_script.size() << "B) -- genesis coinbase "
-                               "routes worker payout to the donation tail "
-                               "(authorize with a P2PKH DASH address)";
             }
             // No usable miner script: all-to-donation (still a valid block).
         }

@@ -46,8 +46,16 @@ export interface AnimationInput {
   newLayout: GridLayout;
   userContext: UserContext;
   palette: Readonly<ColorPalette>;
-  /** Short-hash accessor — `share.h` in the spec contract. */
+  /** Short-hash accessor — `share.h` in the spec contract. Used to
+   *  cross-reference server-provided sets keyed by the short hash
+   *  (blocks / doge blocks / tip). */
   hashOf: (share: ShareForClassify) => string;
+  /** Position + dedup identity accessor. Prefers the FULL hash so DASH
+   *  shares (whose 16-hex short collides within a window) are counted
+   *  distinctly and evicted correctly. `addedHashes` / `evictedHashes`
+   *  MUST be produced with this same accessor. Defaults to `hashOf`,
+   *  keeping single-key callers (LTC) byte-identical. */
+  keyOf?: (share: ShareForClassify) => string;
   /** 'fast' mode uses shorter wave phase (§6 "fast-mode"). */
   fast?: boolean;
   /** Card scale for dying shares (cs * dyingScale). Default 5. The
@@ -331,17 +339,22 @@ export function buildAnimationPlan(input: AnimationInput): AnimationPlan {
   const bornScale  = input.bornScale  ?? BORN_SCALE_DEFAULT;
   const minerOf    = input.minerOf    ?? ((s) => s.m);
   const pplnsOf    = input.pplnsOf;
+  // Position + dedup identity. Defaults to hashOf so single-key callers
+  // (LTC) are byte-identical; DASH passes a full-hash keyOf so colliding
+  // shorts don't alias distinct shares in the index maps below (which are
+  // matched against addedHashes/evictedHashes produced with the same key).
+  const keyOf      = input.keyOf      ?? input.hashOf;
 
-  // Build indices.
+  // Build indices, keyed on the position/dedup identity.
   const newIndexByHash = new Map<string, number>();
   for (let i = 0; i < input.newShares.length; i++) {
     const s = input.newShares[i];
-    if (s !== undefined) newIndexByHash.set(input.hashOf(s), i);
+    if (s !== undefined) newIndexByHash.set(keyOf(s), i);
   }
   const oldIndexByHash = new Map<string, number>();
   for (let i = 0; i < input.oldShares.length; i++) {
     const s = input.oldShares[i];
-    if (s !== undefined) oldIndexByHash.set(input.hashOf(s), i);
+    if (s !== undefined) oldIndexByHash.set(keyOf(s), i);
   }
 
   const addedSet   = new Set(input.addedHashes);
@@ -439,7 +452,16 @@ export function buildAnimationPlan(input: AnimationInput): AnimationPlan {
 
     // ═══ WAVE (phase 2) ═══
     for (const entry of waveList) {
-      const oldPos = cellPosition(input.oldLayout, entry.oldIndex);
+      // Derive the wave's OLD grid coordinates from the share's old INDEX
+      // in the POST-delta (new) layout rather than the pre-delta layout.
+      // When the delta changes the column count or cell size, reading the
+      // old layout paints the wave in a grid incongruent with the new
+      // canvas — every position that exists only in the new layout (e.g.
+      // an entire new last column) is left unpainted (black). Recomputing
+      // from the index in the new layout keeps every pre-wave / mid-slide
+      // frame congruent with the canvas. Identity when the layout is
+      // unchanged (oldLayout.cols === newLayout.cols).
+      const oldPos = cellPosition(input.newLayout, entry.oldIndex);
       const newPos = cellPosition(input.newLayout, entry.newIndex);
       if (oldPos === null || newPos === null) continue;
       const distFromTail = shareCountMinus1 - entry.newIndex;
@@ -457,9 +479,14 @@ export function buildAnimationPlan(input: AnimationInput): AnimationPlan {
       const xCentre = lerp(oldPos.x, newPos.x, slideA) + baseSize / 2;
       const yCentre = lerp(oldPos.y, newPos.y, slideA) + baseSize / 2;
       let color = colorForHash(entry.hash, input.newShares, newIndexByHash);
-      const isLtc = input.primaryBlockHashes?.has(entry.hash) ?? false;
-      const isDoge = input.dogeBlockHashes?.has(entry.hash) ?? false;
-      const isTip = input.tipHash !== undefined && input.tipHash === entry.hash;
+      // Block / doge / tip sets are keyed by the SHORT hash (server truth),
+      // while entry.hash is the position/dedup key (full hash on DASH), so
+      // resolve the share and cross-reference on its short hash.
+      const waveShare = shareByHash(entry.hash, input.newShares, newIndexByHash);
+      const waveShort = waveShare ? input.hashOf(waveShare) : entry.hash;
+      const isLtc = input.primaryBlockHashes?.has(waveShort) ?? false;
+      const isDoge = input.dogeBlockHashes?.has(waveShort) ?? false;
+      const isTip = input.tipHash !== undefined && input.tipHash === waveShort;
       let stroke: { color: string; lineWidth: number } | undefined;
       if (isLtc && isDoge) {
         color = '#ff8000';              // twin orange fill
@@ -615,6 +642,20 @@ export function buildAnimationPlan(input: AnimationInput): AnimationPlan {
         });
         continue;
       }
+
+      // Always paint the destination grid cell first so the new share's
+      // head cell is never black while the birth ceremony (coalesce /
+      // hold / land) plays out below it. The ceremony overlays draw on
+      // top at bFinalX/bFinalY. Mirrors dashboard.html.
+      cells.push({
+        shareHash: entry.hash,
+        track: 'born',
+        x: dstPos.x,
+        y: dstPos.y,
+        size: cs,
+        color: applyAlpha(meta.finalColor, 1),
+        alpha: 1,
+      });
 
       if (bt < 0.35) {
         // COALESCE: particles gather into a growing core

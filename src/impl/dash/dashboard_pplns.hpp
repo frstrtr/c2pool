@@ -39,7 +39,12 @@
 // Finder fee: compute_dash_payouts credits the pre-v36 2% block-finder fee to
 // the caller-supplied pubkey hash. A pool-wide "current payouts" view has no
 // finder (the next block's winner is unknown), so it is computed with a ZERO
-// pubkey hash and that one output is then dropped. This matches LTC exactly —
+// pubkey hash and the 2% slice is then held OUT of the rendered split. Since
+// #1369 a zero pubkey hash emits no finder output at all (it used to emit an
+// unspendable P2PKH(0x00..00) burn); the allocator sweeps the slice into the
+// donation tail instead, so pplns_payouts_at subtracts it back out of the
+// donation before rendering (see the guard at the render loop). Either way the
+// pool-wide view sums to ~98% of the worker payout. This matches LTC exactly —
 // share_tracker.hpp:2058 documents get_v35_expected_payouts as "amounts WITHOUT
 // finder fee — caller adds subsidy/200", and main_ltc.cpp's pplns_fn returns it
 // unmodified for the pre-v36 arm. The per-share view has a real finder (the
@@ -194,6 +199,32 @@ inline PplnsView pplns_payouts_at(
         else
             view.payouts[addr] = amt;
     };
+
+    // #1369 follow-up (money-path DISPLAY parity). Before #1369 an ownerless
+    // coinbase (zero finder pubkey hash) still emitted a P2PKH(0x00..00) burn
+    // output carrying the pre-v36 2% block-finder slice, and this pool-wide
+    // view dropped exactly that zero-pkh output (the `add` lambda's
+    // finder_script match), so it summed to ~98% of worker_payout — the LTC
+    // contract in the header note (finder fee omitted; the next block's winner
+    // is unknown). #1369 stopped the burn: compute_dash_payouts now emits NO
+    // zero-pkh output and step 5's remainder sweeps the slice into the donation
+    // tail instead, so there is nothing left for the drop to match and the view
+    // sums to the full 100%. Subtract the swept slice back out of the donation
+    // here so the rendered pool-wide split is byte-for-byte the pre-#1369
+    // number. This fires ONLY on the zero-finder pool-wide arm; the per-share
+    // view (real, non-null finder — drop_finder_output=false) and the v36 arm
+    // (no finder fee at all) are untouched. Display only: no mint/serve/coinbase
+    // path reads this view.
+    if (drop_finder_output && finder_pubkey_hash.IsNull()
+        && !core::version_gate::is_v36_active(params.current_share_version)
+        && !outs.empty()) {
+        const uint64_t finder_slice = view.worker_payout / 50;  // == coinbase_builder step 4
+        dash::coinbase::MinerPayout& donation = outs.back();
+        const std::vector<unsigned char> donation_script(
+            dash::DONATION_SCRIPT.begin(), dash::DONATION_SCRIPT.end());
+        if (donation.script == donation_script && donation.amount >= finder_slice)
+            donation.amount -= finder_slice;
+    }
 
     for (size_t i = 0; i < n_workers; ++i)
         add(outs[i]);

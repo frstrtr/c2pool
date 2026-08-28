@@ -77,6 +77,43 @@ test('dedup: duplicates within a single delta collapse', () => {
   assert.deepEqual(r.shares.map((x) => x.h), ['a', 'b', 'c']);
 });
 
+// ── Full-hash collision (DASH) ───────────────────────────────────
+// DASH share hashes carry many leading zero nibbles, so two distinct
+// shares can share the same 16-hex short. mergeDelta must dedup on the
+// FULL hash (H) so colliding-short shares are BOTH kept and BOTH count
+// toward the window cap — otherwise the client window collapses below
+// windowSize, the trim never fires and the tail dying animation is lost.
+
+test('collision: two shares with same short but distinct H both survive merge', () => {
+  const shortHex = '0000000000000abc';           // identical 16-hex short
+  const a = s(shortHex, { H: shortHex + 'aaaa' });
+  const b = s(shortHex, { H: shortHex + 'bbbb' });
+  const r = mergeDelta({ shares: [] }, { shares: [a, b] }, { windowSize: 100 });
+  assert.equal(r.shares.length, 2);               // NOT collapsed to 1
+  assert.deepEqual(
+    r.shares.map((x) => (x as DeltaShare).H),
+    [shortHex + 'aaaa', shortHex + 'bbbb'],
+  );
+});
+
+test('collision: colliding-short shares each count toward the cap', () => {
+  const shortHex = '0000000000000abc';
+  const a = s(shortHex, { H: shortHex + 'aaaa' });
+  const b = s(shortHex, { H: shortHex + 'bbbb' });
+  // Window already full with two distinct-H shares. A genuinely new
+  // share at cap must evict exactly the tail — proving the collision
+  // pair occupies two slots, not one.
+  const current = { shares: [a, b], tip: shortHex };
+  const c = s('1111111111111111', { H: '1111111111111111cccc' });
+  const r = mergeDelta(current, { shares: [c] }, { windowSize: 2 });
+  assert.equal(r.shares.length, 2);
+  assert.deepEqual(
+    r.shares.map((x) => (x as DeltaShare).H),
+    ['1111111111111111cccc', shortHex + 'aaaa'],
+  );
+  assert.deepEqual(r.evicted, [shortHex + 'bbbb']);  // full hash of the tail
+});
+
 // ── Window cap / eviction ────────────────────────────────────────
 
 test('evicts oldest when prepend pushes past windowSize', () => {

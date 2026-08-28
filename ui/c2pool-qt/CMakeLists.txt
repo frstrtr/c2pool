@@ -16,6 +16,7 @@ project(c2pool_qt LANGUAGES CXX)
 # Install on Debian/Ubuntu via:
 #   sudo apt install qt6-webengine-dev qt6-webchannel-dev
 find_package(Qt6 6.2 REQUIRED COMPONENTS
+    Core
     Widgets
     Network
     WebEngineCore
@@ -163,6 +164,19 @@ if(C2POOL_QT_BUILD_TESTS)
     target_include_directories(c2pool-qt_test_reward_safe_launch PRIVATE src)
     add_test(NAME reward_safe_launch
              COMMAND c2pool-qt_test_reward_safe_launch)
+
+    # ── QP-B address-flavor gate ─────────────────────────────────────────
+    # Proves a wrong-coin base58 payout address (e.g. a DASH 'X…' address in
+    # a Litecoin profile) is rejected, while bech32/cashaddr/unknown flavors
+    # pass through unjudged. AddressValidator is Qt-Core only (QString +
+    # QCryptographicHash), so this links Qt6::Core and runs headless.
+    add_executable(c2pool-qt_test_address_validator
+        test/test_address_validator.cpp
+    )
+    target_include_directories(c2pool-qt_test_address_validator PRIVATE src)
+    target_link_libraries(c2pool-qt_test_address_validator PRIVATE Qt6::Core)
+    add_test(NAME address_validator
+             COMMAND c2pool-qt_test_address_validator)
 
     # ── Teardown leak/crash gate (issue #852) ────────────────────────────
     # The embedded-view host tore itself down via deregisterObject(nullptr),

@@ -224,12 +224,15 @@ test('born: coalesces near bornFinalY then lands at the new grid slot', () => {
   const born = fStart.cells.filter((c) => c.track === 'born');
   assert.equal(born.length, 1);
   assert.equal(born[0]?.alpha, 1);
-  // Mid-coalesce (bt≈0.2): cell is at bornFinalY (below destination
-  // row) during particle gather — reference :5046-5047.
+  // Mid-coalesce (bt≈0.2): a flat destination base cell is now painted
+  // at the head row (y≈0) so the slot is never black, while the coalesce
+  // core rises below it at bornFinalY — reference :5046-5047.
   const fCoalesce = plan.frameAt(plan.phase3Start + plan.phase3Dur * 0.2);
-  const coalesceCell = fCoalesce.cells.find((c) => c.shareHash === 'new0');
-  assert.ok(coalesceCell);
-  assert.ok(coalesceCell!.y > 1, 'coalesce core should not be at dst row');
+  const bornCoalesce = fCoalesce.cells.filter((c) => c.track === 'born');
+  const dstBase = bornCoalesce.find((c) => c.y <= 1);
+  const core = bornCoalesce.find((c) => c.y > 1);
+  assert.ok(dstBase, 'destination base cell should be painted at the dst row');
+  assert.ok(core, 'coalesce core should be below the dst row');
   // End of phase3: cell landed at destination (y≈0).
   const fLanded = plan.frameAt(plan.phase3Start + plan.phase3Dur);
   const landed = fLanded.cells.filter((c) => c.track === 'born');
