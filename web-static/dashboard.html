@@ -6719,6 +6719,16 @@
                 // tooltip read "% LTC".
                 var _pplnsSym = ((typeof currency_info !== 'undefined'
                                   && currency_info.symbol) || 'COIN').toUpperCase();
+                // Merged-child symbol from currency_info (per-node truthful).
+                // Set ONLY for coins that actually merge-mine a child chain
+                // (today: LTC -> DOGE). Standalone coins (DASH/BTC/DGB/BCH)
+                // leave merged_child_symbol absent, so the per-miner merged
+                // row/tooltip line below must not render at all — never a
+                // hardcoded 'DOGE'. The merged accumulation and every cell/
+                // tooltip that mentions the child are gated on this.
+                var _mergedSym = ((typeof currency_info !== 'undefined'
+                                   && currency_info.merged_child_symbol) || '').toUpperCase();
+                var _hasMerged = !!_mergedSym;
                 var pl = document.getElementById('pplns-loading');
                 if (pl) pl.style.display = 'none';
                 var grid = document.getElementById('pplns-main-grid');
@@ -6733,9 +6743,9 @@
                     var ltcAmt = typeof p === 'number' ? p : (p.amount || 0);
                     total += ltcAmt;
                     var dogeAmt = 0, dogeAddr = '';
-                    if (p.merged) {
+                    if (_hasMerged && p.merged) {
                         p.merged.forEach(function(m) {
-                            if (m.symbol === 'DOGE') { dogeAmt += m.amount || 0; dogeAddr = m.address || ''; }
+                            if ((m.symbol || '').toUpperCase() === _mergedSym) { dogeAmt += m.amount || 0; dogeAddr = m.address || ''; }
                         });
                     }
                     dogeTotal += dogeAmt;
@@ -6816,28 +6826,34 @@
                         el.textContent = (r.pct * 100).toFixed(1) + (r.w > 60 ? '% ' + _pplnsSym : '%');
                         cell.appendChild(el);
                     }
-                    // DOGE %
-                    if (r.w > 35 && r.h > 28) {
+                    // Merged-child % (e.g. DOGE on LTC). Render ONLY when this
+                    // coin actually declares a merged child in currency_info
+                    // (merged_child_symbol). Standalone coins (DASH/BTC/DGB/BCH)
+                    // set no merged child, so this row is suppressed entirely —
+                    // it must never show a hardcoded 'NO DOGE' on a coin that
+                    // does not merge-mine DOGE.
+                    if (_hasMerged && r.w > 35 && r.h > 28) {
                         var el = document.createElement('div');
                         el.className = 'pm-doge';
                         el.style.fontSize = Math.max(8, fitPct * 0.8) + 'px';
                         if (isV35Only) {
-                            // V35-only miner — structurally excluded from DOGE
-                            // by the transitional-phase signaling gate. Red.
+                            // V35-only miner — structurally excluded from the
+                            // merged child by the transitional-phase signaling
+                            // gate. Red.
                             el.style.color = '#ff6b6b';
-                            el.textContent = r.w > 50 ? 'NO DOGE' : 'V35';
+                            el.textContent = r.w > 50 ? ('NO ' + _mergedSym) : 'V35';
                         } else {
-                            // V36 native or V35 signaling V36 — in the DOGE
+                            // V36 native or V35 signaling V36 — in the merged
                             // class via auto-convert. Show current %; gold
                             // even at 0% so transient fetch-race states don't
-                            // read as "missing DOGE". (A V36-signaling share
-                            // in the best chain always contributes non-zero
-                            // merged weight; 0% only appears briefly if the
-                            // /current_merged_payouts cache is refreshing.)
+                            // read as "missing" the child. (A V36-signaling
+                            // share in the best chain always contributes
+                            // non-zero merged weight; 0% only appears briefly
+                            // if the /current_merged_payouts cache is refreshing.)
                             el.style.color = '#ffd700';
                             var dp = (hasDoge && dogeTotal > 0)
                                 ? (r.doge / dogeTotal * 100).toFixed(1) : '0.0';
-                            el.textContent = dp + (r.w > 60 ? '% DOGE' : '% D');
+                            el.textContent = dp + (r.w > 60 ? ('% ' + _mergedSym) : ('% ' + _mergedSym.charAt(0)));
                         }
                         cell.appendChild(el);
                     }
@@ -6902,23 +6918,28 @@
                             var verLine = '';
                             if (mv.ver) {
                                 if (mv.dv && mv.dv !== mv.ver) verLine = '<div style="color:#4dd0e1;font-weight:600">V'+mv.ver+' \u2192 V'+mv.dv+'</div>';
-                                else if (isV35Only) verLine = '<div style="color:#ff6b6b;font-weight:700">V'+mv.ver+' ONLY \u2014 missing DOGE!</div>';
+                                else if (isV35Only) verLine = '<div style="color:#ff6b6b;font-weight:700">V'+mv.ver+' ONLY' + (_hasMerged ? (' \u2014 missing ' + _mergedSym + '!') : '') + '</div>';
                                 else verLine = '<div style="color:var(--success)">V'+mv.ver+'</div>';
                             }
+                            // Merged-child tooltip line — only for coins that
+                            // declare a merged child (LTC->DOGE). Suppressed on
+                            // standalone coins so no spurious 'DOGE' text shows.
                             var dogeLine = '';
-                            if (hasDoge) {
-                                var dp2 = dogeTotal > 0 ? (r.doge / dogeTotal * 100).toFixed(2) : '0';
-                                dogeLine = '<div style="color:#ffd700;font-weight:700">' + dp2 + '% \u2014 ' + r.doge.toFixed(2) + ' DOGE</div>';
-                                if (r.dogeAddr) {
-                                    dogeLine += '<div style="color:var(--text-muted);font-size:0.78em;font-family:Monaco,Consolas,monospace">\u2192 ' + r.dogeAddr + '</div>';
+                            if (_hasMerged) {
+                                if (hasDoge) {
+                                    var dp2 = dogeTotal > 0 ? (r.doge / dogeTotal * 100).toFixed(2) : '0';
+                                    dogeLine = '<div style="color:#ffd700;font-weight:700">' + dp2 + '% \u2014 ' + r.doge.toFixed(2) + ' ' + _mergedSym + '</div>';
+                                    if (r.dogeAddr) {
+                                        dogeLine += '<div style="color:var(--text-muted);font-size:0.78em;font-family:Monaco,Consolas,monospace">\u2192 ' + r.dogeAddr + '</div>';
+                                    }
+                                } else if (isV35Only) {
+                                    dogeLine = '<div style="color:#ff6b6b;font-weight:600">0 ' + _mergedSym + ' \u2014 upgrade to V36!</div>';
+                                } else {
+                                    // V36-signaling but 0 merged in current cache —
+                                    // transient (merged-payouts cache refreshing
+                                    // after a new tip). Next poll resolves it.
+                                    dogeLine = '<div style="color:#ffd700;font-weight:600">0% ' + _mergedSym + ' (pending next tip)</div>';
                                 }
-                            } else if (isV35Only) {
-                                dogeLine = '<div style="color:#ff6b6b;font-weight:600">0 DOGE \u2014 upgrade to V36!</div>';
-                            } else {
-                                // V36-signaling but 0 DOGE in current cache —
-                                // transient (merged-payouts cache refreshing
-                                // after a new tip). Next poll resolves it.
-                                dogeLine = '<div style="color:#ffd700;font-weight:600">0% DOGE (pending next tip)</div>';
                             }
                             var hrLine = '';
                             var mHr = defrag.minerHashrates ? defrag.minerHashrates[r.addr] : 0;
