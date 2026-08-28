@@ -1189,28 +1189,59 @@ uint256 NodeImpl::advertised_best_share()
     return uint256::ZERO;
 }
 
-// ROOT-2 re-advert. Unlike ltc/dgb (which have a dedicated readvertise that
-// bypasses the de-dup set), this delegates to broadcast_share, so the walk still
-// breaks on the first hash already in m_shared_share_hashes.
-//
-// Interaction with the F2 marking change: marking is now a strict SUBSET of what
-// the pre-fix code marked (only hashes a peer actually accepted). The walk breaks
-// later or in the same place, never earlier, so this re-advert re-pushes a
-// superset of what it used to — monotonically better, no regression. It is
-// strictly better in the case that motivated ROOT-2: head shares minted while no
-// peer was connected are no longer marked, so a peer that handshook during the
-// empty window now receives them. It does NOT fully close ROOT-2 here — head
-// shares already accepted by some OTHER peer stay marked and the walk still
-// breaks, exactly as before. Closing that needs the ltc/dgb-style de-dup-bypass
-// readvertise; pre-existing gap, out of scope for this change.
-void NodeImpl::readvertise_best()
+void NodeImpl::readvertise_best_share()
 {
-    if (m_peers.empty())
+    // ROOT-2 re-advertisement.  A peer that finished its version handshake
+    // while our verified chain was empty got a NULL best_share and never
+    // called download_shares(); broadcast_share() may not wake it either, because
+    // its walk breaks on the first hash already in m_shared_share_hashes.  Here
+    // we re-push the tip walk to every peer WITHOUT consulting the de-dup set.
+    // Advertise-only: never affects local work creation.
+    //
+    // This is the ltc/dgb-style de-dup-bypass re-advert (ltc/node.cpp,
+    // dgb/node.cpp).  The prior BTC readvertise_best() delegated to
+    // broadcast_share, whose walk breaks on the first hash already in
+    // m_shared_share_hashes, so a head share already accepted by some OTHER peer
+    // stayed masked and the re-advert never reached a freshly-handshook peer.
+    // Walking the head directly closes that gap.
+    uint256 head = advertised_best_share();
+    if (head.IsNull() || head == uint256::ZERO)
         return;
-    uint256 adv = advertised_best_share();
-    if (adv.IsNull() || adv == uint256::ZERO)
+
+    // Same try_to_lock discipline as broadcast_share (node.hpp:67): never block
+    // the IO thread on the tracker mutex.  If think() holds it now, the next
+    // trigger (best-change or the timer) retries.
+    std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::try_to_lock);
+    if (!lock.owns_lock())
         return;
-    broadcast_share(adv);
+
+    if (!m_chain || !m_chain->contains(head))
+        return;
+
+    std::vector<uint256> to_send;
+    int32_t height = m_chain->get_height(head);
+    int32_t walk = std::min(height, 5);
+    for (auto [hash, data] : m_chain->get_chain(head, walk)) {
+        if (m_rejected_share_hashes.count(hash))
+            continue; // never re-broadcast peer-rejected shares
+        to_send.push_back(hash);
+    }
+    if (to_send.empty())
+        return;
+
+    // Advertise-only path: deliberately ignores the de-dup set, so nothing is
+    // marked here.  Record only what was ACTUALLY written (F2) — a share the
+    // tx-completeness gate withheld must not be blamed for a later peer drop,
+    // which would mark it rejected and make the walk above `continue` past it
+    // forever.
+    auto now = std::chrono::steady_clock::now();
+    for (auto& [nonce, peer] : m_peers) {
+        std::vector<uint256> sent = send_shares(peer, to_send);
+        if (!sent.empty())
+            m_last_broadcast_to[peer->addr()] = {sent, now};
+    }
+    LOG_INFO << "[readvertise] re-pushed " << to_send.size()
+             << " head share(s) to " << m_peers.size() << " peer(s) (ROOT-2)";
 }
 
 void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_hash)
@@ -1971,7 +2002,7 @@ void NodeImpl::run_think()
                 // Root-2: re-advertise our new head.  A peer that handshook
                 // before we had a chain saw a ZERO advert and never issued
                 // download_shares -- re-announce so it pulls our shares now.
-                readvertise_best();
+                readvertise_best_share();
             } else if (result.best.IsNull()) {
                 LOG_WARNING << "[ASYNC-THINK] IO-phase: result.best is NULL — verified_tails="
                             << m_tracker.verified.get_tails().size()
@@ -1988,7 +2019,7 @@ void NodeImpl::run_think()
                 m_verified_was_empty = false;
                 if (!m_readvert_timer)
                     m_readvert_timer = std::make_unique<core::Timer>(m_context, false);
-                m_readvert_timer->start(10, [this]() { readvertise_best(); });
+                m_readvert_timer->start(10, [this]() { readvertise_best_share(); });
                 LOG_INFO << "[readvertise] verified chain populated — scheduled "
                             "10s re-advert (ROOT-2)";
             }
@@ -2497,7 +2528,7 @@ void NodeImpl::clean_tracker()
         if (clean_best_changed && m_on_best_share_changed) {
             LOG_INFO << "[CLEAN] IO-phase: work refresh (best changed)";
             m_on_best_share_changed();
-            readvertise_best();   // root-2: re-announce new head to peers
+            readvertise_best_share();   // root-2: re-announce new head to peers
         }
         drain_pending_adds();
         m_think_running.store(false);
