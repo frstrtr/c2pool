@@ -27,6 +27,7 @@
 /// reach. The dashd RPC arm is NEVER removed -- it is the always-reachable
 /// safety path and the [GBT-XCHECK] cross-check whenever the bundle is not live.
 
+#include <atomic>                                // std::atomic (dashboard netdiff publish)
 #include <impl/dash/coin/node_coin_state.hpp>    // NodeCoinState
 #include <impl/dash/coin/sml_resync_watchdog.hpp> // SmlResyncWatchdog (bounded getmnlistd re-request)
 #include <impl/dash/coin/governance_store.hpp>   // GovernanceStore (daemonless superblock)
@@ -540,6 +541,13 @@ public:
     /// reconstruct them. Read-only; nothing here is consulted by a gate.
     bool     have_tip() const { return m_have_tip; }
     bool     have_mn()  const { return m_have_mn; }
+    /// DASHBOARD ONLY: last published header-tip work bits (0 = never published
+    /// a real tip). Thread-safe read for the web/think thread; the value is
+    /// written only from republish() on the coin-p2p io thread. Never gates
+    /// anything — feeds the daemonless network-difficulty graph.
+    uint32_t published_bits_for_next() const {
+        return m_published_bits_for_next.load(std::memory_order_relaxed);
+    }
     uint32_t mn_snapshot_height() const { return m_mn_snapshot_height; }
     bool     mn_needs_reseed_latched() const { return m_mn_needs_reseed; }
     /// Is the CURRENT payee queue backed by a lane that needs no daemon?
@@ -2452,6 +2460,15 @@ private:
             m_state.set_tip(m_prev_height, m_prev_hash, m_bits_for_next,
                             m_mtp_at_tip, m_address_version, m_address_p2sh_version,
                             m_curtime, m_version);
+        // DASHBOARD ONLY: publish the header-tip work bits for the daemonless
+        // network-difficulty graph feed. Runs on the coin-p2p io thread; the
+        // web/think thread reads it via published_bits_for_next() (atomic). Does
+        // NOT touch NodeCoinState, so it respects the #1134 no-off-io-read rule.
+        // Store only a real value: m_have_tip present and bits != 0. Absence is
+        // never written, so the feed can never fabricate a difficulty.
+        if (m_have_tip && m_bits_for_next != 0)
+            m_published_bits_for_next.store(m_bits_for_next,
+                                            std::memory_order_relaxed);
     }
 
     void demote() {
@@ -2552,6 +2569,12 @@ private:
     uint8_t  m_address_p2sh_version{0};
     uint32_t m_curtime{0};
     uint32_t m_version{0};
+
+    // DASHBOARD ONLY: header-tip work bits mirrored for the web/think thread's
+    // network-difficulty graph feed. Written from republish() (coin-p2p io
+    // thread), read via published_bits_for_next(). Atomic so the cross-thread
+    // read needs no lock and never touches NodeCoinState (#1134 rule).
+    std::atomic<uint32_t> m_published_bits_for_next{0};
 
     // HEADER-TIP stash (body-first split). Always written by on_new_tip;
     // promoted into the serve slots immediately (header-first) or on the tip

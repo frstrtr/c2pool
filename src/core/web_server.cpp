@@ -7580,6 +7580,19 @@ void MiningInterface::update_stat_log()
         entry.worker_count = static_cast<int>(worker_combos.size());
     }
 
+    // unique_miner_count fallback for the daemonless relay: with 0 local stratum
+    // workers the local registry is empty, but the pool still has miners — the
+    // distinct sharechain payout addresses. Use the SAME count /global_stats
+    // reports as unique_miners (shares_by_miner.size()) so the graph matches the
+    // live card. Only when the local registry is genuinely empty; a hotel node
+    // with local rigs keeps its byte-identical local count. connected_miners /
+    // worker_count / local_hash_rate stay local-scoped (0 is the truth there).
+    if (entry.miner_count == 0 && m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        if (sc.contains("shares_by_miner") && sc["shares_by_miner"].is_object())
+            entry.miner_count = static_cast<int>(sc["shares_by_miner"].size());
+    }
+
     // #159 (G8): real per-interval share / stale-share counters (were hardcoded
     // to 0, persisting 31 days of a dead series). 'shares' diffs the cumulative
     // accepted-share counter; 'stale_shares' diffs the summed per-worker stale
@@ -7942,7 +7955,14 @@ void MiningInterface::feed_history_entry(const StatLogEntry& e)
     m_history.add_multi ("traffic_rate",       t, json_obj_to_map(e.traffic));
     m_history.add_scalar("getwork_latency",    t, e.work_latency);
     m_history.add_scalar("memory_usage",       t, e.memory_usage);
-    m_history.add_scalar("network_difficulty", t, e.network_difficulty);
+    // FAIL-SAFE: network_difficulty is honest-absent (not 0) when no work source
+    // has populated m_network_difficulty yet — e.g. a daemonless relay before the
+    // header follower publishes its first tip. Persisting a literal 0 here painted
+    // ~6 days of false zeros on the daemonless canary's netdiff graph. Skip the
+    // sample entirely on absence: no datum in the bin, never a fabricated 0. A
+    // real feed (LTC, or DASH once the follower is live) always has nd>0 here.
+    if (e.network_difficulty > 0.0)
+        m_history.add_scalar("network_difficulty", t, e.network_difficulty);
     m_history.add_scalar("share_difficulty",   t, e.share_difficulty);
 }
 
