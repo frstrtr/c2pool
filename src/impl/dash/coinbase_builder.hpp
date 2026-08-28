@@ -140,8 +140,35 @@ inline std::vector<MinerPayout> compute_dash_payouts(
     }
 
     // 4. (pre-v36 only) 2% block-finder fee to the share creator.
+    //
+    // ZERO-PKH GUARD (#960, money path). A zero miner_pubkey_hash is not a
+    // miner -- it is the sentinel every caller of this function already uses
+    // to mean "this coinbase has no finder":
+    //   * work_source.cpp build_connection_coinbase, ownerless stratum
+    //     session whose login carried no P2PKH script -- its own comment
+    //     reads "No usable miner script: all-to-donation";
+    //   * main_dash.cpp --mine-block with no --payout-pubkey-hash
+    //     ("uint160 payout_pkh;   // default all-zero");
+    //   * main_dash.cpp embedded-oracle proposal coinbase
+    //     ("uint160 zero_pkh;   // pool-only coinbase (no finder)");
+    //   * main_dash.cpp --regtest-force-won-block
+    //     ("uint160 payout_pkh;   // all-zero placeholder finder").
+    // Paying the slice anyway emitted P2PKH(0x0000...0000) -- an output no
+    // key can ever spend. The 2% was BURNED, not credited: strictly worse
+    // than p2pool-dash, which credits ownerless work to the node operator
+    // and destroys nothing. Suppressing the output lets step 5 sweep the
+    // slice into the donation tail, which is exactly what all four call
+    // sites above already claim to do.
+    //
+    // NOT consensus-visible. Every path that MINTS or VERIFIES a share
+    // derives the finder script from the share's own m_pubkey_hash through
+    // share_producer.hpp build_gentx / share_check.hpp, never through this
+    // function; and the mint fail-closes on a non-P2PKH payout script
+    // (share_producer_bind.hpp pubkey_hash_from_p2pkh returns nullopt), so a
+    // minted share cannot carry a zero pubkey hash in the first place.
+    // compute_dash_payouts only shapes coinbases that no share commits to.
     auto this_script = dash::pubkey_hash_to_script2(miner_pubkey_hash);
-    if (!v36)
+    if (!v36 && !miner_pubkey_hash.IsNull())
         amounts[this_script] = amounts[this_script] + (worker_payout / 50);
 
     // 5. amounts[DONATION] += worker_payout - Σamounts  (remainder incl. rounding).
