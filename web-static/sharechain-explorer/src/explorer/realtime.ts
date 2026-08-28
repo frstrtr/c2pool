@@ -244,6 +244,10 @@ export class RealtimeOrchestrator {
       userContext: config.userContext,
       palette: config.palette ?? LTC_COLOR_PALETTE,
       windowSize: config.windowSize ?? 4320,
+      // `hashOf` is the SHORT-hash accessor — the identity used to
+      // cross-reference server-provided sets that are keyed by the 16-hex
+      // short hash (block/doge/tip). Position + dedup identity keys on the
+      // FULL hash instead; see `keyOf` below.
       hashOf: config.hashOf ?? ((s) => (s as unknown as { h: string }).h),
       containerWidth: config.containerWidth,
       skipAnimationThreshold: config.skipAnimationThreshold ?? SKIP_ANIMATION_NEW_COUNT_THRESHOLD,
@@ -258,6 +262,19 @@ export class RealtimeOrchestrator {
     this.anim = createAnimationController();
     this._effectiveUserContext = { ...config.userContext };
     this._windowSize = this.config.windowSize;
+  }
+
+  /** Position + dedup identity key. Prefers the FULL 64-hex hash (H),
+   *  falling back to the configured short-hash accessor. DASH share
+   *  hashes carry ~11-12 leading zero nibbles, so the 16-hex short has
+   *  only ~20 bits of entropy and collides within a single window;
+   *  keying eviction/position on the short would collapse the client
+   *  window below windowSize and suppress the tail dying animation.
+   *  On coins with no short collisions (LTC) H resolves the same share
+   *  as h, so this is byte-identical there. */
+  private keyOf(s: ShareForClassify): string {
+    const full = (s as unknown as { H?: string }).H;
+    return full ?? this.config.hashOf(s);
   }
 
   async start(): Promise<void> {
@@ -516,8 +533,8 @@ export class RealtimeOrchestrator {
     newShares: readonly ShareForClassify[],
   ): void {
     if (oldShares.length === 0) { this.anim.reset(); return; }
-    const oldSet = new Set(oldShares.map((s) => this.config.hashOf(s)));
-    const newSet = new Set(newShares.map((s) => this.config.hashOf(s)));
+    const oldSet = new Set(oldShares.map((s) => this.keyOf(s)));
+    const newSet = new Set(newShares.map((s) => this.keyOf(s)));
     const evictedHashes: string[] = [];
     for (const h of oldSet) if (!newSet.has(h)) evictedHashes.push(h);
     const addedHashes: string[] = [];
@@ -544,6 +561,7 @@ export class RealtimeOrchestrator {
       userContext: this._effectiveUserContext,
       palette: this.config.palette,
       hashOf: this.config.hashOf,
+      keyOf: (s) => this.keyOf(s),
       fast: this.config.fastAnimation,
       ...(pplnsOf ? { pplnsOf } : {}),
       primaryBlockHashes: new Set(this.window.primaryBlocks ?? []),
@@ -794,13 +812,14 @@ export class RealtimeOrchestrator {
     const plan = buildAnimationPlan({
       oldShares,
       newShares: this.window.shares,
-      addedHashes: merge.added.map((s) => this.config.hashOf(s)),
+      addedHashes: merge.added.map((s) => this.keyOf(s)),
       evictedHashes: [...merge.evicted],
       oldLayout,
       newLayout,
       userContext: this._effectiveUserContext,
       palette: this.config.palette,
       hashOf: this.config.hashOf,
+      keyOf: (s) => this.keyOf(s),
       fast: this.config.fastAnimation,
       ...(pplnsOf ? { pplnsOf } : {}),
       primaryBlockHashes: new Set(this.window.primaryBlocks ?? []),

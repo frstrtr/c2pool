@@ -5541,7 +5541,7 @@
                     var col = i % self.cols;
                     var row = Math.floor(i / self.cols);
                     var s = self.shares[i];
-                    self._oldPositions[s.h] = {
+                    self._oldPositions[s.H || s.h] = {
                         x: ml + col * step, y: row * step,
                         color: self.getColor(s),
                         miner: s.m || '',
@@ -5632,7 +5632,7 @@
                 // Collect dying shares (old tail pushed off the chain)
                 var dying = [];
                 var newHashSet = {};
-                self.shares.forEach(function(s) { newHashSet[s.h] = true; });
+                self.shares.forEach(function(s) { newHashSet[s.H || s.h] = true; });
                 for (var h in self._oldPositions) {
                     if (!newHashSet[h]) {
                         var op = self._oldPositions[h];
@@ -5894,7 +5894,7 @@
                             var shareT = Math.max(0, Math.min(1, (p2elapsed - shareStart) / 600));
                             var ease = 1 - Math.pow(1 - shareT, 3);
 
-                            var old = animOldPos[share.h];
+                            var old = animOldPos[share.H || share.h];
                             if (old && shareT > 0 && shareT < 1) {
                                 var liftA, slideA, landA;
                                 if (ease < 0.2) {
@@ -9125,7 +9125,13 @@
                     var s = defrag.shares[i];
                     var col = i % defrag.cols;
                     var row = Math.floor(i / defrag.cols);
-                    defrag._oldPositions[s.h] = {
+                    // Key on the FULL 64-hex hash (fallback to short) so the
+                    // dedup/eviction accounting stays count-exact. DASH share
+                    // hashes carry ~11-12 leading zero nibbles, so the 16-hex
+                    // short has only ~20 bits of entropy and collides within a
+                    // 4320-entry window — short keys would collapse the client
+                    // window below windowSize and suppress the cap trim.
+                    defrag._oldPositions[s.H || s.h] = {
                         x: ml + col * step, y: row * step,
                         color: defrag.getColor(s),
                         miner: s.m || '',
@@ -9138,8 +9144,9 @@
                 var merged = newShares.concat(defrag.shares);
                 var seen = {};
                 merged = merged.filter(function(s) {
-                    if (seen[s.h]) return false;
-                    seen[s.h] = true;
+                    var k = s.H || s.h;
+                    if (seen[k]) return false;
+                    seen[k] = true;
                     return true;
                 });
                 if (merged.length > defrag.windowSize)
