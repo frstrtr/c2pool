@@ -837,7 +837,8 @@ public:
     void set_block_verify_fn(block_verify_fn_t fn);
     void set_io_context(boost::asio::io_context* ctx) { m_context = ctx;
         m_main_thread_id = std::this_thread::get_id();
-        LOG_INFO << "MiningInterface::set_io_context this=" << this << " ctx=" << ctx; }
+        LOG_INFO << "MiningInterface::set_io_context this=" << this << " ctx=" << ctx;
+        start_cache_refresh_pump(); }
 
     /// Thread-safe cached callback entry.  Main thread computes + publishes;
     /// HTTP thread reads a shared_ptr snapshot (mutex-guarded for portability).
@@ -1050,6 +1051,24 @@ public:
     // running=true top-level flag.
     void set_coin_peer_info_fn(coin_peer_info_fn fn) { m_coin_peer_info_fn = thread_safe_wrap(std::move(fn)); }
 
+    // Embedded coin header-sync status provider (dashboard telemetry ONLY).
+    // Wired at standup by EACH coin lane (main_btc / main_dash / main_ltc /
+    // main_dgb + bch pool_entrypoint) so /broadcaster_status can report the
+    // REAL embedded coin header-chain sync state coin-generically -- the coin
+    // header tip, NOT the sharechain height. Provider contract (JSON object,
+    // every field optional; omit rather than fabricate):
+    //   { "header_height": <embedded coin header-chain tip height>,
+    //     "target_height": <best network-tip estimate, e.g. best peer
+    //                       startingheight / advertised tip>,
+    //     "synced":        <bool, the lane's own verdict (optional)>,
+    //     "peers": [ {addr?, subver?, startingheight, conntime?, connected}.. ] }
+    // rest_broadcaster_status() merges the snapshot ADDITIVELY as
+    // header_height / current_height / target_height / sync_percent / synced /
+    // syncing / connected_peers (last_broadcast + running are untouched), and
+    // rest_node_topology() enriches the primary coin row from the same
+    // provider. Display-only: no share-validity / reward / consensus reads.
+    void set_coin_sync_status_fn(coin_peer_info_fn fn) { m_coin_sync_status_fn = thread_safe_wrap(std::move(fn)); }
+
     // Callback fired whenever a block submission is attempted.
     // Arguments: header hex (first 80 bytes), stale_info (none=accepted, orphan=stale prev, doa=daemon rejected).
     void set_on_block_submitted(std::function<void(const std::string& header_hex, int stale_info)> fn);
@@ -1138,6 +1157,31 @@ private:
     std::vector<std::function<void()>> m_cache_refresh_fns; // populated by thread_safe_wrap
     std::vector<std::function<void()>> m_tip_cache_refresh_fns; // opted in via mark_last_cache_tip_driven()
     std::atomic<int64_t>               m_last_tip_refresh_ts{0};
+    // Self-scheduling RCU-cache pump. Every zero-arg thread_safe_wrap() provider
+    // (peers, topology, and the coin header-sync feed) publishes its snapshot on
+    // the io/main thread here so the HTTP thread reads a warm cache instead of the
+    // CacheEntry default (a null json). main_dash/main_ltc already drive
+    // refresh_http_caches() from their own timers; BTC/DGB/BCH did NOT, which left
+    // any wrapped provider cold on those lanes (the header-sync fields never
+    // surfaced on /broadcaster_status). Starting the pump from set_io_context()
+    // makes the behaviour coin-generic: armed exactly when a lane stands up its
+    // dashboard (the only caller of set_io_context), redundant-but-harmless where
+    // a lane also pumps manually. Display/telemetry only.
+    std::unique_ptr<boost::asio::steady_timer> m_cache_refresh_timer;
+    void start_cache_refresh_pump() {
+        if (!m_context || m_cache_refresh_timer) return;   // once, dashboard lanes only
+        m_cache_refresh_timer = std::make_unique<boost::asio::steady_timer>(*m_context);
+        arm_cache_refresh_pump();
+    }
+    void arm_cache_refresh_pump() {
+        if (!m_cache_refresh_timer) return;
+        m_cache_refresh_timer->expires_after(std::chrono::seconds(2));
+        m_cache_refresh_timer->async_wait([this](const boost::system::error_code& ec) {
+            if (ec) return;   // cancelled at shutdown (timer destroyed with `this`)
+            refresh_http_caches();
+            arm_cache_refresh_pump();
+        });
+    }
     std::atomic<bool>       m_work_valid{false};
     std::atomic<uint64_t>   m_work_generation{0};       // incremented on each refresh_work()
     std::atomic<int64_t>    m_last_work_update_time{0}; // monotonic seconds since epoch
@@ -1348,6 +1392,11 @@ private:
     coin_peer_info_fn m_ltc_peer_info_fn;
     coin_peer_info_fn m_doge_peer_info_fn;
     coin_peer_info_fn m_coin_peer_info_fn;
+    coin_peer_info_fn m_coin_sync_status_fn;  // embedded coin header-sync provider
+    // Merge the header-sync provider snapshot into a /broadcaster_status
+    // response (additive fields only; running/last_broadcast untouched).
+    // No-op when the provider is unwired or throws.
+    void augment_with_coin_sync_status(nlohmann::json& result);
     block_verify_fn_t m_block_verify_fn;  // default (parent chain)
     std::map<std::string, block_verify_fn_t> m_chain_verify_fns; // per-chain
     void verify_found_block(size_t index);

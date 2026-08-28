@@ -7253,6 +7253,28 @@ int main(int argc, char* argv[]) {
                 web_server.get_mining_interface()->set_ltc_peer_info_fn(
                     [bcaster = embedded_broadcaster.get()]() { return bcaster->get_peer_info(); });
             }
+            // Embedded coin header-sync provider (dashboard telemetry only):
+            // feeds /broadcaster_status header_height/current_height/
+            // target_height/sync_percent + connected_peers[].startingheight so
+            // the dashboard sync cards render the REAL LTC header-chain tip --
+            // never the sharechain height. header_height = embedded LTC
+            // HeaderChain tip; the target derives from the broadcaster peers'
+            // version-advertised startingheight (get_peer_info carries it and
+            // the core merge takes the max over connected peers). Raw captures
+            // match the set_ltc_peer_info_fn / backfill hooks beside this:
+            // both objects are function-scope and outlive ioc.run().
+            if (embedded_chain || embedded_broadcaster) {
+                web_server.get_mining_interface()->set_coin_sync_status_fn(
+                    [hc = embedded_chain.get(),
+                     bcaster = embedded_broadcaster.get()]() -> nlohmann::json {
+                        nlohmann::json s = nlohmann::json::object();
+                        s["header_height"] = hc ? hc->height() : 0;
+                        s["target_height"] = 0;  // derived from peers by the merge
+                        s["peers"] = bcaster ? bcaster->get_peer_info()
+                                             : nlohmann::json::array();
+                        return s;
+                    });
+            }
             {
                 auto it = merged_broadcasters.find(98);  // DOGE
                 if (it != merged_broadcasters.end()) {

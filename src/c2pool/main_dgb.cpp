@@ -1475,6 +1475,35 @@ int run_node(const core::CoinParams& params, bool testnet,
             return r;
         });
 
+        // Embedded coin header-sync provider (dashboard telemetry only):
+        // feeds /broadcaster_status header_height/current_height/
+        // target_height/sync_percent + connected_peers[].startingheight so
+        // the dashboard sync cards render the REAL DGB header-chain tip --
+        // never the sharechain height. header_height = embedded HeaderChain
+        // absolute tip (checkpoint-aware numbering); the target/peer row
+        // come from the single embedded coin P2P peer's version metadata
+        // (empty until --coin-daemon arms it). Captures are main-scope
+        // objects that outlive ioc.run(); all reads display-only.
+        mi->set_coin_sync_status_fn([&header_chain, &coin_p2p]() -> nlohmann::json {
+            nlohmann::json s = nlohmann::json::object();
+            const uint32_t hh = header_chain.tip_height().value_or(0);
+            uint32_t th = 0;
+            nlohmann::json peers = nlohmann::json::array();
+            if (coin_p2p && coin_p2p->peer_version() > 0) {
+                th = coin_p2p->peer_start_height();
+                peers.push_back({
+                    {"subver", coin_p2p->peer_subver()},
+                    {"startingheight", th},
+                    {"conntime", coin_p2p->peer_uptime_sec()},
+                    {"connected", true},
+                });
+            }
+            s["header_height"] = hh;
+            s["target_height"] = th;
+            s["peers"] = std::move(peers);
+            return s;
+        });
+
         // (4) scrypt pool stats — sharechain length feeds getinfo poolshares.
         mi->set_sharechain_stats_fn([&p2p_node]() {
             nlohmann::json r = nlohmann::json::object();

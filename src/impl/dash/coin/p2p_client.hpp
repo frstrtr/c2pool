@@ -1298,6 +1298,27 @@ public:
         for (const auto& p : m_pool) out.push_back(p->age_sec());
         return out;
     }
+    /// One-call per-peer snapshot for DISPLAY-ONLY consumers (the dashboard
+    /// header-sync provider). A single walk over m_pool so addr/subver/
+    /// start_height/age describe the SAME peer set — zipping the individual
+    /// vector accessors could interleave with a pool mutation between calls.
+    /// No pool state is touched.
+    struct PeerBrief {
+        std::string addr;          // key (addr:port)
+        std::string subver;        // version-message user agent
+        uint32_t    start_height;  // peer-advertised chain height at connect
+        int64_t     age_sec;       // connection age
+        bool        handshaked;    // version/verack complete
+    };
+    std::vector<PeerBrief> peer_briefs() const
+    {
+        std::vector<PeerBrief> out;
+        out.reserve(m_pool.size());
+        for (const auto& p : m_pool)
+            out.push_back(PeerBrief{p->key, p->subver, p->start_height,
+                                    p->age_sec(), p->handshake.complete()});
+        return out;
+    }
     uint64_t sessions_started() const { return m_sessions_started; }
     uint64_t sessions_lost() const { return m_sessions_lost; }
     const InvDedup& inv_dedup() const { return m_inv_dedup; }

@@ -5315,8 +5315,42 @@ nlohmann::json MiningInterface::rest_node_topology()
     // D0.2 auto-detect below when unset, so the endpoint is always truthful.
     if (m_node_topology_fn) {
         auto t = m_node_topology_fn();
-        if (!t.is_null())
+        if (!t.is_null()) {
+            // Normalize a flat single-coin emit ({"coin": ...} with no coins
+            // array -- the BTC/BCH lane shape) into the {coins:[...]} wrapper
+            // the dashboard's renderNodeTopology() requires; a flat emit was
+            // previously invisible to the card. Display-shape only.
+            if (!t.contains("coins") && t.contains("coin")) {
+                nlohmann::json wrapped = nlohmann::json::object();
+                wrapped["node_symbol"]   = t.value("coin", std::string{});
+                wrapped["auto_detected"] = false;
+                if (!t.contains("primary")) t["primary"] = true;
+                wrapped["coins"] = nlohmann::json::array({std::move(t)});
+                t = std::move(wrapped);
+            }
+            // Enrich the primary coin row with the embedded header-sync
+            // provider fields (header_height/target_height/sync_percent/
+            // synced) when the lane's topology emit does not already carry
+            // them -- the same coin-generic source /broadcaster_status uses.
+            // Additive: rows that already publish header_height (DASH) are
+            // untouched, and with no provider nothing is fabricated.
+            if (m_coin_sync_status_fn && t.contains("coins") && t["coins"].is_array()) {
+                nlohmann::json sync = nlohmann::json::object();
+                augment_with_coin_sync_status(sync);
+                if (sync.value("target_height", 0ull) > 0) {
+                    for (auto& c : t["coins"]) {
+                        if (!c.is_object() || c.contains("header_height")) continue;
+                        // The provider describes the node's PRIMARY coin chain.
+                        if (!c.value("primary", false) && t["coins"].size() > 1) continue;
+                        c["header_height"] = sync["header_height"];
+                        c["target_height"] = sync["target_height"];
+                        c["sync_percent"]  = sync["sync_percent"];
+                        if (!c.contains("synced")) c["synced"] = sync["synced"];
+                    }
+                }
+            }
             return t;
+        }
     }
 
     auto upper = [](std::string str) {
@@ -7055,6 +7089,71 @@ nlohmann::json MiningInterface::rest_discovered_merged_blocks()
     return arr;
 }
 
+// ── Embedded coin header-sync merge (dashboard telemetry only) ──────────────
+// Folds the per-lane coin header-sync provider snapshot into a
+// /broadcaster_status response so the dashboard's "embedded daemon REAL sync"
+// card (header_height/target_height/sync_percent + synced flag) and the
+// "Header Sync %" stat card (current_height vs max connected-peer
+// startingheight) render real values instead of blanks. STRICTLY ADDITIVE:
+// pre-existing keys (running, last_broadcast, peers, chains, ...) are never
+// overwritten, so every current consumer keeps its exact contract.
+//   header_height / current_height = the embedded coin header-chain TIP (the
+//     real coin header chain the node syncs -- NOT the sharechain height).
+//   target_height = the lane's best network-tip estimate, raised to the max
+//     startingheight among the provider's connected peers; 0 when unknown.
+//   sync_percent  = clamp(100 * header_height / target_height, 0..100);
+//     100 when the target is unknown but the lane says synced, else 0.
+//   synced        = the lane's verdict when it states one, else header within
+//     2 blocks of a known target. syncing = !synced.
+//   connected_peers = the provider's peer list (carries startingheight so the
+//     dashboard can compute max itself); mirrored into "peers" only when no
+//     other source populated that key.
+void MiningInterface::augment_with_coin_sync_status(nlohmann::json& result)
+{
+    if (!m_coin_sync_status_fn) return;
+    nlohmann::json s;
+    try { s = m_coin_sync_status_fn(); } catch (...) { return; }
+    if (!s.is_object()) return;
+
+    const uint64_t header_height = s.value("header_height", 0ull);
+    uint64_t target_height = s.value("target_height", 0ull);
+
+    nlohmann::json peers = nlohmann::json::array();
+    if (s.contains("peers") && s["peers"].is_array()) {
+        peers = s["peers"];
+        for (const auto& p : peers) {
+            if (!p.is_object() || !p.value("connected", true)) continue;
+            const uint64_t sh = p.value("startingheight", 0ull);
+            if (sh > target_height) target_height = sh;
+        }
+    }
+
+    bool synced;
+    double sync_percent;
+    if (target_height > 0) {
+        sync_percent = 100.0 * static_cast<double>(header_height)
+                             / static_cast<double>(target_height);
+        if (sync_percent > 100.0) sync_percent = 100.0;
+        if (sync_percent < 0.0)   sync_percent = 0.0;
+        synced = (header_height + 2 >= target_height);
+    } else {
+        synced = s.value("synced", false);
+        sync_percent = synced ? 100.0 : 0.0;
+    }
+    // The lane's own verdict, when it states one, wins over the heuristic.
+    if (s.contains("synced") && s["synced"].is_boolean())
+        synced = s["synced"].get<bool>();
+
+    if (!result.contains("header_height"))   result["header_height"]   = header_height;
+    if (!result.contains("current_height"))  result["current_height"]  = header_height;
+    if (!result.contains("target_height"))   result["target_height"]   = target_height;
+    if (!result.contains("sync_percent"))    result["sync_percent"]    = sync_percent;
+    if (!result.contains("synced"))          result["synced"]          = synced;
+    if (!result.contains("syncing"))         result["syncing"]         = !synced;
+    if (!result.contains("connected_peers")) result["connected_peers"] = peers;
+    if (!result.contains("peers") && !peers.empty()) result["peers"] = peers;
+}
+
 nlohmann::json MiningInterface::rest_broadcaster_status()
 {
     nlohmann::json result = nlohmann::json::object();
@@ -7067,6 +7166,7 @@ nlohmann::json MiningInterface::rest_broadcaster_status()
         result["total_blocks_found"] = m_mm_manager->get_total_blocks();
         if (m_ltc_peer_info_fn)
             result["peers"] = m_ltc_peer_info_fn();
+        augment_with_coin_sync_status(result);
         return result;
     }
 
@@ -7085,11 +7185,27 @@ nlohmann::json MiningInterface::rest_broadcaster_status()
         result["enabled"] = true;
         result["peers"] = std::move(peers);
         result["total_blocks_found"] = 0;  // no coin-side found-block counter yet
+        augment_with_coin_sync_status(result);
         return result;
     }
 
+    // Fallback path. The historical {last_broadcast, running} pair stays --
+    // the header-sync fields ride ADDITIVELY beside it. When the sync
+    // provider reports at least one CONNECTED coin peer the embedded node IS
+    // relaying, so running mirrors the coin_peer_info_fn semantics above
+    // (running == any_connected); with no provider or no peers it remains
+    // false, byte-identical to the old emit.
     result["running"] = false;
     result["last_broadcast"] = nullptr;
+    augment_with_coin_sync_status(result);
+    if (result.contains("connected_peers") && result["connected_peers"].is_array()) {
+        for (const auto& p : result["connected_peers"]) {
+            if (p.is_object() && p.value("connected", false)) {
+                result["running"] = true;
+                break;
+            }
+        }
+    }
     return result;
 }
 
