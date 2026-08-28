@@ -4099,14 +4099,32 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     core::MiningInterface* netdiff_mi =
         web_server ? web_server->get_mining_interface() : nullptr;
     auto* netdiff_wsrc = work_source.get();
+    // Daemonless netdiff source: the embedded header follower. peek_template()
+    // is null on a zero-rig relay (no stratum work demand ever sources a
+    // template), so the netdiff graph / luck / attempts_to_block stayed 0 on
+    // the fully-daemonless canary. The maintainer publishes the header-tip work
+    // bits on every tip advance with NO template and NO stratum; fall back to
+    // it here. Set AFTER the maintainer is constructed below (stays null and
+    // harmless until then); read by-reference so the tick sees it once live.
+    dash::coin::CoinStateMaintainer* netdiff_maintainer = nullptr;
     *think_tick = [&p2p_node, think_timer, think_tick, netdiff_mi,
-                   netdiff_wsrc](const boost::system::error_code& ec) {
+                   netdiff_wsrc, &netdiff_maintainer]
+                  (const boost::system::error_code& ec) {
         if (ec) return;   // cancelled at shutdown
         p2p_node.clean_tracker();
-        if (netdiff_mi && netdiff_wsrc) {
-            if (auto t = netdiff_wsrc->peek_template(); t && t->m_bits != 0) {
+        if (netdiff_mi) {
+            // Prefer the served template (carries the live block bits when a
+            // rig is present); else the header follower's published bits.
+            uint32_t bits = 0;
+            if (netdiff_wsrc) {
+                if (auto t = netdiff_wsrc->peek_template(); t && t->m_bits != 0)
+                    bits = t->m_bits;
+            }
+            if (bits == 0 && netdiff_maintainer)
+                bits = netdiff_maintainer->published_bits_for_next();
+            if (bits != 0) {
                 double nd = chain::target_to_difficulty(
-                    dash::coin::target_from_nbits(t->m_bits));
+                    dash::coin::target_from_nbits(bits));
                 if (nd > 0.0) netdiff_mi->update_network_difficulty(nd, "tip");
             }
         }
@@ -4348,6 +4366,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         }
 
         maintainer = std::make_unique<dash::coin::CoinStateMaintainer>(node_coin_state);
+        // Let the 15s netdiff think-tick read the header follower's published
+        // work bits when no stratum template exists (daemonless zero-rig relay).
+        // Display/telemetry only; the tick is cancelled before teardown, so the
+        // maintainer always outlives every read.
+        netdiff_maintainer = maintainer.get();
         mn_ckpt_lane = std::make_unique<dash::coin::MnCheckpointLane>();
         mn_ckpt_lane->set_max_bridge_blocks(g_mn_bridge_max_blocks);
 
