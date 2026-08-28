@@ -3,10 +3,13 @@
 
 #include <impl/ltc/config_coin.hpp>
 #include <impl/ltc/coin/p2p_messages.hpp>
+#include <impl/ltc/coin/p2p_node.hpp>
+#include <impl/ltc/coin/node_interface.hpp>
 #include <c2pool/merged/coin_peer_manager.hpp>
 #include <c2pool/merged/coin_broadcaster.hpp>
 
 #include <core/pack.hpp>
+#include <core/message.hpp>
 
 #include <boost/asio.hpp>
 #include <set>
@@ -931,6 +934,100 @@ TEST(PeerManagerConfig, ConfigAccessor)
 
     EXPECT_TRUE(pm.config().disable_discovery);
     EXPECT_EQ(pm.config().max_peers, 42);
+}
+
+// ─── #980 shared-seam preservation LOCKs (DOGE/DGB) ──────────────────────────
+// The NMC AuxPoW header-feed adds an OPTIONAL RawHeadersSink to the SHARED
+// NodeP2P/CoinBroadcaster 'headers' path. These locks prove the addition did not
+// shift DOGE/DGB/LTC/BTC behaviour: DOGE sets only the raw parser, DGB/LTC/BTC set
+// neither, so the sink branch is provably dead for them.
+
+// Build a plain (non-AuxPoW) DOGE/LTC 'headers' payload: CompactSize count, then
+// each entry = 80-byte base header + tx_count(0). No m_peer is exercised.
+static PackStream build_plain_headers_payload(int n)
+{
+    PackStream ps;
+    WriteCompactSize(ps, static_cast<uint64_t>(n));
+    for (int i = 0; i < n; ++i) {
+        ltc::coin::BlockHeaderType h{};
+        h.m_version = 1;                 // no 0x100 AuxPoW flag
+        h.m_previous_block.SetNull();
+        h.m_merkle_root.SetNull();
+        h.m_timestamp = 1300000000u + i;
+        h.m_bits = 0x1d00ffffu;
+        h.m_nonce = static_cast<uint32_t>(i);
+        ::Serialize(ps, h);              // 80-byte base header
+        WriteCompactSize(ps, 0);         // tx_count — always 0 in 'headers'
+    }
+    return ps;
+}
+
+// Headless NodeP2P dispatch harness. Driving handle(RawMessage) with a parser or
+// sink set exercises ONLY the parser/sink branches — never the standard no-parser
+// path, which would deref a null m_peer (UB) on this headless node.
+using NodeP2PBcast = ltc::coin::p2p::NodeP2P<c2pool::merged::BroadcasterConfig>;
+
+// LOCK B Case 1 — DOGE config (parser set, sink UNSET): the raw parser is used and
+// new_headers fires; the sink is never consulted. Byte-identical to pre-seam DOGE.
+TEST(NmcSeamDogePreservation, ParserSetSinkUnsetUsesParser)
+{
+    boost::asio::io_context ioc;
+    std::vector<std::byte> prefix(4, std::byte{0});
+    c2pool::merged::BroadcasterConfig cfg(prefix, NetService("127.0.0.1", 22556));
+    ltc::interfaces::Node node_iface;
+    NodeP2PBcast node(&ioc, &node_iface, &cfg, "DOGE");
+
+    bool parser_called = false;
+    bool new_headers_fired = false;
+    node.set_raw_headers_parser(
+        [&](const uint8_t*, size_t) {
+            parser_called = true;
+            // Return >3 headers so the BIP130 getdata (which needs m_peer) is skipped.
+            std::vector<ltc::coin::BlockHeaderType> v(5);
+            return v;
+        });
+    auto sub = node_iface.new_headers.subscribe(
+        [&](const std::vector<ltc::coin::BlockHeaderType>&) { new_headers_fired = true; });
+
+    auto ps = build_plain_headers_payload(5);
+    auto rmsg = std::make_unique<RawMessage>("headers", std::move(ps));
+    node.handle(std::move(rmsg), NetService("127.0.0.1", 22556));
+
+    EXPECT_TRUE(parser_called);
+    EXPECT_TRUE(new_headers_fired);
+}
+
+// LOCK B Case 2 — NMC config (sink set): the raw sink receives the exact payload
+// bytes and the handler short-circuits — the parser and new_headers do NOT fire.
+TEST(NmcSeamDogePreservation, SinkSetShortCircuitsAndCarriesBytes)
+{
+    boost::asio::io_context ioc;
+    std::vector<std::byte> prefix(4, std::byte{0});
+    c2pool::merged::BroadcasterConfig cfg(prefix, NetService("127.0.0.1", 8334));
+    ltc::interfaces::Node node_iface;
+    NodeP2PBcast node(&ioc, &node_iface, &cfg, "NMC");
+
+    bool parser_called = false;
+    bool new_headers_fired = false;
+    std::vector<uint8_t> sink_bytes;
+    node.set_raw_headers_parser(
+        [&](const uint8_t*, size_t) { parser_called = true;
+            return std::vector<ltc::coin::BlockHeaderType>(5); });
+    node.set_raw_headers_sink(
+        [&](const uint8_t* d, size_t n) { sink_bytes.assign(d, d + n); });
+    auto sub = node_iface.new_headers.subscribe(
+        [&](const std::vector<ltc::coin::BlockHeaderType>&) { new_headers_fired = true; });
+
+    auto ps = build_plain_headers_payload(5);
+    std::vector<uint8_t> expect(
+        reinterpret_cast<const uint8_t*>(ps.data()),
+        reinterpret_cast<const uint8_t*>(ps.data()) + ps.size());
+    auto rmsg = std::make_unique<RawMessage>("headers", std::move(ps));
+    node.handle(std::move(rmsg), NetService("127.0.0.1", 8334));
+
+    EXPECT_EQ(sink_bytes, expect);       // sink carried the exact payload bytes
+    EXPECT_FALSE(parser_called);          // sink short-circuits before the parser
+    EXPECT_FALSE(new_headers_fired);      // and before new_headers
 }
 
 int main(int argc, char** argv)

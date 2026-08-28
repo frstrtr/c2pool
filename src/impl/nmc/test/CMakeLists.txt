@@ -126,6 +126,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(nmc_fallback_path_conformance_test PRIVATE
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
 
+    # #980: embedded AuxPoW header-feed golden KAT. Feeds a CAPTURED real-mainnet
+    # 'headers' batch (with AuxPoW) through parse_nmc_headers_message + HeaderChain
+    # admission and asserts the tip crosses activation (plain post-activation D1 +
+    # legacy no-magic auxpow D2) and is_synced() flips on a fresh synthetic tip.
+    # Same SCC as the sibling tests (core + nmc_coin for the out-of-line
+    # MutableTransaction ctor). MUST be listed in the build.yml --target allowlist
+    # (both :219 and :611) or it becomes a NOT_BUILT sentinel that reds master.
+    add_executable(nmc_header_sync_golden_test nmc_header_sync_golden_test.cpp)
+    target_link_libraries(nmc_header_sync_golden_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core nlohmann_json::nlohmann_json)
+    target_link_libraries(nmc_header_sync_golden_test PRIVATE
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
+    target_link_libraries(nmc_header_sync_golden_test PRIVATE nmc_coin)
+
     include(GoogleTest)
     include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
     gtest_add_tests(nmc_auxpow_merkle_test "" AUTO)
@@ -137,4 +152,5 @@ if (BUILD_TESTING AND GTest_FOUND)
     gtest_add_tests(nmc_block_broadcast_test "" AUTO)
     gtest_add_tests(nmc_host_dualpath_test "" AUTO)
     gtest_add_tests(nmc_fallback_path_conformance_test "" AUTO)
+    gtest_add_tests(nmc_header_sync_golden_test "" AUTO)
 endif()

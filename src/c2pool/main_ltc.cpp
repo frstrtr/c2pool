@@ -265,6 +265,9 @@ static void segfault_handler(int sig) {
 #include <impl/doge/coin/auxpow_header.hpp>
 // 2b-ii: embedded NMC merged-mining backend (host activation)
 #include <impl/nmc/coin/aux_chain_embedded.hpp>
+// #980: embedded NMC P2P AuxPoW header-feed (seeds + wire parser)
+#include <impl/nmc/coin/chain_seeds.hpp>
+#include <impl/nmc/coin/headers_wire.hpp>
 // DGB's own embedded merged-mining backend (DC seam, -DAUX_DOGE=ON).
 // Header is fully wrapped in #ifdef AUX_DOGE -> compiles to nothing when off.
 #include <impl/dgb/coin/aux_chain_embedded.hpp>
@@ -798,6 +801,11 @@ int main(int argc, char* argv[]) {
         }
         if (symbol == "BTC" || symbol == "btc") {
             return testnet ? ParseHexBytes("0b110907") : ParseHexBytes("f9beb4d9");
+        }
+        if (symbol == "NMC" || symbol == "nmc") {
+            // SSOT: NMCChainParams::p2p_magic (header_chain.hpp; KAT auxpow_wire_test.cpp).
+            // mainnet f9 be b4 fe / testnet3 fa bf b5 fe (namecoin-core chainparams.cpp).
+            return testnet ? ParseHexBytes("fabfb5fe") : ParseHexBytes("f9beb4fe");
         }
         if (symbol == "DGB" || symbol == "dgb") {
             return testnet ? ParseHexBytes("fdc8bddd") : ParseHexBytes("fac3b6da");
@@ -1670,6 +1678,7 @@ int main(int argc, char* argv[]) {
             auto hb_ltc_mempool  = std::make_shared<std::atomic<int64_t>>(0);
             auto hb_doge_sync    = std::make_shared<std::atomic<int64_t>>(0);
             auto hb_doge_mempool = std::make_shared<std::atomic<int64_t>>(0);
+            auto hb_nmc_sync     = std::make_shared<std::atomic<int64_t>>(0);
             auto hb_think        = std::make_shared<std::atomic<int64_t>>(0);
             auto hb_monitor      = std::make_shared<std::atomic<int64_t>>(0);
 
@@ -5585,6 +5594,8 @@ int main(int argc, char* argv[]) {
                                 pm_cfg.valid_ports = {9333, 19335};
                             } else if (cfg.symbol == "BTC" || cfg.symbol == "btc") {
                                 pm_cfg.valid_ports = {8333, 18333};
+                            } else if (cfg.symbol == "NMC" || cfg.symbol == "nmc") {
+                                pm_cfg.valid_ports = {8334, 18334};
                             }
                             // Validate the P2P address via PeerEndpoint.
                             // In embedded mode with no daemon, p2p_address is empty —
@@ -5617,6 +5628,14 @@ int main(int argc, char* argv[]) {
                                     ltc::coin::ltc_fixed_seeds(settings->m_testnet));
                                 broadcaster->peer_manager().set_http_peer_seeds(
                                     {{"voidbind.com", 8080}});
+                            } else if (cfg.symbol == "NMC" || cfg.symbol == "nmc") {
+                                // #980: NMC DNS seeds are dead — live dialing works
+                                // via nmc_fixed_seeds only (2/7 handshake-verified:
+                                // 23.106.38.114:8334, 23.19.112.151:8334). No HTTP seeds.
+                                broadcaster->peer_manager().set_dns_seeds(
+                                    nmc::coin::nmc_dns_seeds(settings->m_testnet));
+                                broadcaster->peer_manager().set_fixed_seeds(
+                                    nmc::coin::nmc_fixed_seeds(settings->m_testnet));
                             }
 
                             // Wire getpeerinfo bootstrap from the aux chain RPC
@@ -6108,6 +6127,89 @@ int main(int argc, char* argv[]) {
                                 doge_mempool_timer->expires_after(std::chrono::minutes(5));
                                 doge_mempool_timer->async_wait(*doge_mempool_fn);
                                 LOG_INFO << "[EMB-DOGE] Mempool expiration timer started (5m interval)";
+                            }
+
+                            // #980: NMC embedded header sync via P2P AuxPoW feed.
+                            // Aux-only (no UTXO/mempool/full-block wiring). The join
+                            // point is set_raw_headers_sink — NOT set_raw_headers_parser
+                            // (which is 80-byte-only and drops the AuxPoW proof, so it
+                            // is structurally insufficient for a chain that has been
+                            // AuxPoW since 2014). Mirrors the DOGE header-sync block.
+                            if (cfg.symbol == "NMC" && nmc_chain) {
+                                auto nmc_hdr_pool = std::make_shared<boost::asio::thread_pool>(1);
+                                auto* bcaster_ptr = broadcaster.get();
+                                auto* nc = nmc_chain.get();
+
+                                // Peer-height (sync-progress logging only, no consensus)
+                                broadcaster->set_on_peer_height(
+                                    [nc](uint32_t h) {
+                                        nc->set_peer_tip_height(h);
+                                        LOG_INFO << "NMC peer reports height " << h;
+                                    });
+
+                                // The AuxPoW-carrying join point: the raw 'headers'
+                                // sink hands us the payload bytes with the AuxPoW proof
+                                // INTACT; parse to (header, optional<AuxPow>) and admit
+                                // via add_auxpow_header (proof-verified) / add_header
+                                // (own-PoW). Serialized on a 1-thread pool (mirror DOGE).
+                                broadcaster->set_raw_headers_sink(
+                                    [nc, nmc_hdr_pool, bcaster_ptr, &ioc](
+                                        const std::string& /*peer*/,
+                                        const uint8_t* d, size_t n) {
+                                        auto payload = std::make_shared<std::vector<uint8_t>>(d, d + n);
+                                        boost::asio::post(*nmc_hdr_pool,
+                                            [payload, nc, bcaster_ptr, &ioc]() {
+                                                auto parsed = nmc::coin::parse_nmc_headers_message(
+                                                    payload->data(), payload->size());
+                                                int acc = 0;
+                                                uint256 last_hash;
+                                                for (auto& wh : parsed) {
+                                                    bool ok = wh.auxpow
+                                                        ? nc->add_auxpow_header(wh.header, *wh.auxpow)
+                                                        : nc->add_header(wh.header);
+                                                    if (ok) ++acc;
+                                                    last_hash = nmc::coin::block_hash(wh.header);
+                                                }
+                                                if (acc > 0)
+                                                    LOG_INFO << "[EMB-NMC] admitted " << acc << "/"
+                                                             << parsed.size() << " headers, height="
+                                                             << nc->height();
+                                                bool full_batch = (parsed.size() >= 2000);
+                                                if (acc > 0 || full_batch) {
+                                                    boost::asio::post(ioc,
+                                                        [acc, last_hash, nc, bcaster_ptr]() {
+                                                          try {
+                                                            if (acc > 0 && !last_hash.IsNull())
+                                                                bcaster_ptr->request_headers({last_hash}, uint256::ZERO);
+                                                            else
+                                                                bcaster_ptr->request_headers(nc->get_locator(), uint256::ZERO);
+                                                          } catch (const std::exception& e) {
+                                                            LOG_WARNING << "[EMB-NMC] post-process: " << e.what();
+                                                          }
+                                                        });
+                                                }
+                                            });
+                                    });
+
+                                // Periodic getheaders sync timer (5s unsynced / 60s synced)
+                                auto nmc_sync_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+                                auto nmc_sync_timer = std::make_shared<boost::asio::steady_timer>(ioc);
+                                *nmc_sync_fn = [nmc_sync_fn, nmc_sync_timer, now_ms, hb_nmc_sync,
+                                                nc, bcaster_ptr](boost::system::error_code ec) {
+                                    if (ec) return;
+                                    hb_nmc_sync->store(now_ms());
+                                    int interval = nc->is_synced() ? 60 : 5;
+                                    nmc_sync_timer->expires_after(std::chrono::seconds(interval));
+                                    nmc_sync_timer->async_wait(*nmc_sync_fn);
+                                    try {
+                                        bcaster_ptr->request_headers(nc->get_locator(), uint256::ZERO);
+                                    } catch (const std::exception& e) {
+                                        LOG_WARNING << "[EMB-NMC] Header sync error: " << e.what();
+                                    }
+                                };
+                                nmc_sync_timer->expires_after(std::chrono::seconds(10));
+                                nmc_sync_timer->async_wait(*nmc_sync_fn);
+                                LOG_INFO << "NMC embedded header sync wired via P2P (AuxPoW admission)";
                             }
 
                             broadcaster->start();
@@ -7343,7 +7445,7 @@ int main(int argc, char* argv[]) {
             auto watchdog_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
             *watchdog_fn = [watchdog_timer, watchdog_fn, now_ms,
                             hb_think, hb_monitor, hb_ltc_sync, hb_ltc_mempool,
-                            hb_doge_sync, hb_doge_mempool](boost::system::error_code ec) {
+                            hb_doge_sync, hb_doge_mempool, hb_nmc_sync](boost::system::error_code ec) {
                 if (ec) return;
                 watchdog_timer->expires_after(std::chrono::seconds(30));
                 watchdog_timer->async_wait(*watchdog_fn);
@@ -7366,6 +7468,7 @@ int main(int argc, char* argv[]) {
                     check("ltc_mempool",  hb_ltc_mempool->load(),  300);
                     check("doge_sync",    hb_doge_sync->load(),    60);
                     check("doge_mempool", hb_doge_mempool->load(), 300);
+                    check("nmc_sync",     hb_nmc_sync->load(),     60);
                     LOG_INFO << "[WATCHDOG] alive tick=" << tick;
                 }
             };
@@ -7394,7 +7497,7 @@ int main(int argc, char* argv[]) {
             // External watchdog thread — independent of io_context
             std::thread ext_watchdog([hb_ioc, now_ms,
                                       hb_think, hb_monitor, hb_ltc_sync, hb_ltc_mempool,
-                                      hb_doge_sync, hb_doge_mempool,
+                                      hb_doge_sync, hb_doge_mempool, hb_nmc_sync,
                                       rss_limit_mb]() {
                 constexpr int CHECK_SEC = 10;
                 constexpr int FREEZE_SEC = 30;
@@ -7469,6 +7572,7 @@ int main(int argc, char* argv[]) {
                         dump_hb("ltc_mempool", hb_ltc_mempool->load());
                         dump_hb("doge_sync", hb_doge_sync->load());
                         dump_hb("doge_mempool", hb_doge_mempool->load());
+                        dump_hb("nmc_sync", hb_nmc_sync->load());
 
                         // Write to persistent crash log
                         char freeze_msg[256];

@@ -161,6 +161,14 @@ public:
     using RawHeadersParser = std::function<std::vector<ltc::coin::BlockHeaderType>(const uint8_t*, size_t)>;
     void set_raw_headers_parser(RawHeadersParser p) { m_raw_headers_parser = std::move(p); }
 
+    // Set a raw headers SINK for AuxPoW header-feed chains (NMC). Applied to every
+    // peer connection. When set, each peer's 'headers' handler forwards the raw
+    // payload (tagged with the peer key) instead of running the standard parse.
+    // Additive and OPTIONAL — only NMC sets it, so DOGE/DGB/LTC/BTC connect_peer
+    // wiring below is provably skipped for them.
+    using RawHeadersSink = std::function<void(const std::string& peer, const uint8_t*, size_t)>;
+    void set_raw_headers_sink(RawHeadersSink s) { m_raw_headers_sink = std::move(s); }
+
     // Set custom raw block parser for AuxPoW chains (DOGE).
     // Applied to every new peer connection.
     using RawBlockParser = std::function<ltc::coin::BlockType(const uint8_t*, size_t)>;
@@ -497,6 +505,14 @@ private:
             if (m_raw_headers_parser) {
                 peer->node_p2p.set_raw_headers_parser(m_raw_headers_parser);
             }
+            // Wire AuxPoW raw headers SINK (NMC) — carries the raw 'headers' bytes
+            // (tagged with the peer key) so the AuxPoW proof survives to the chain.
+            if (m_raw_headers_sink) {
+                peer->node_p2p.set_raw_headers_sink(
+                    [this, pk = key](const uint8_t* d, size_t n) {
+                        m_raw_headers_sink(pk, d, n);
+                    });
+            }
             // Wire AuxPoW raw block parser (DOGE)
             if (m_raw_block_parser) {
                 peer->node_p2p.set_raw_block_parser(m_raw_block_parser);
@@ -602,6 +618,7 @@ private:
     FullBlockCallback    m_on_full_block;
     PeerHeightCallback   m_on_peer_height;
     RawHeadersParser     m_raw_headers_parser;
+    RawHeadersSink       m_raw_headers_sink;        // NMC AuxPoW header-feed (optional)
     RawBlockParser       m_raw_block_parser;
     bool                 m_request_mempool{false};  // BIP 35 mempool sync
 };
