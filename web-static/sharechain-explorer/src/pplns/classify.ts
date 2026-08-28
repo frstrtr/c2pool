@@ -73,6 +73,58 @@ export const DASH_COIN_PPLNS_DESCRIPTOR: CoinPplnsDescriptor = {
   addressExplorer: 'https://blockchair.com/dash/address/',
 };
 
+// ── Stand-alone coins with NO merged child ───────────────────────────
+// BTC/DGB/BCH mine no auxiliary chain that feeds back into their PPLNS
+// payouts. DGB is scrypt and could in principle merge-mine DOGE, but this
+// fork rejected the DOGE header-feed at the AuxPoW gate (NMC #980), so DGB
+// declares no merged child like the others. These exist so the registry
+// resolves them to an EMPTY-mergedChains descriptor instead of falling
+// back to the DOGE-bearing LTC descriptor and rendering a spurious DOGE
+// row on a coin that has no merged mining.
+
+// A minimal, coin-agnostic badge config for stand-alone coins that have
+// no active version-signaling boundary. Purely cosmetic; never implies a
+// merged child.
+export const STANDALONE_VERSION_BADGES: VersionBadgeConfig = {
+  palette: Object.freeze({
+    known:   { label: 'OK', color: '#66bb6a', severity: 'ok' },
+    unknown: { label: '?',  color: '#555577', severity: 'muted' },
+  }),
+  classify(miner: Pick<PplnsMiner, 'version' | 'desiredVersion'>): string {
+    return typeof miner.version === 'number' ? 'known' : 'unknown';
+  },
+};
+
+export const BTC_COIN_PPLNS_DESCRIPTOR: CoinPplnsDescriptor = {
+  mergedChains: [],
+  versionBadges: STANDALONE_VERSION_BADGES,
+  formatHashrate: formatHashrate,
+  addressExplorer: 'https://blockchair.com/bitcoin/address/',
+};
+
+export const DGB_COIN_PPLNS_DESCRIPTOR: CoinPplnsDescriptor = {
+  mergedChains: [],
+  versionBadges: STANDALONE_VERSION_BADGES,
+  formatHashrate: formatHashrate,
+  addressExplorer: 'https://digiexplorer.info/address/',
+};
+
+export const BCH_COIN_PPLNS_DESCRIPTOR: CoinPplnsDescriptor = {
+  mergedChains: [],
+  versionBadges: STANDALONE_VERSION_BADGES,
+  formatHashrate: formatHashrate,
+  addressExplorer: 'https://blockchair.com/bitcoin-cash/address/',
+};
+
+// Fallback for a coin that is specified but not in the registry: NEVER
+// resurrect LTC's DOGE row. A truly unknown coin has no declared merged
+// child, so it degrades to an empty-mergedChains descriptor.
+export const GENERIC_COIN_PPLNS_DESCRIPTOR: CoinPplnsDescriptor = {
+  mergedChains: [],
+  versionBadges: STANDALONE_VERSION_BADGES,
+  formatHashrate: formatHashrate,
+};
+
 /** Default hashrate formatter: pick unit so the mantissa is ∈ [1,1000).
  *  Caps at P (petahash). Returns "0" for non-positive input. */
 export function formatHashrate(hps: number): string {
@@ -98,13 +150,22 @@ export const COIN_PPLNS_DESCRIPTORS: Readonly<Record<string, CoinPplnsDescriptor
   Object.freeze({
     LTC:  LTC_COIN_PPLNS_DESCRIPTOR,
     DASH: DASH_COIN_PPLNS_DESCRIPTOR,
+    BTC:  BTC_COIN_PPLNS_DESCRIPTOR,
+    DGB:  DGB_COIN_PPLNS_DESCRIPTOR,
+    BCH:  BCH_COIN_PPLNS_DESCRIPTOR,
   });
 
 export function descriptorForCoin(
   coin: string | null | undefined,
 ): CoinPplnsDescriptor {
   if (typeof coin !== "string" || coin.length === 0) {
+    // No coin resolvable at all: keep the historical LTC default so the
+    // primary LTC deployment (which may omit an explicit coin) still shows
+    // its DOGE row.
     return LTC_COIN_PPLNS_DESCRIPTOR;
   }
-  return COIN_PPLNS_DESCRIPTORS[coin.toUpperCase()] ?? LTC_COIN_PPLNS_DESCRIPTOR;
+  // A specified coin that is not registered degrades to a NON-merged
+  // generic descriptor — never the DOGE-bearing LTC one — so an unknown
+  // coin cannot resurrect the DOGE row.
+  return COIN_PPLNS_DESCRIPTORS[coin.toUpperCase()] ?? GENERIC_COIN_PPLNS_DESCRIPTOR;
 }
