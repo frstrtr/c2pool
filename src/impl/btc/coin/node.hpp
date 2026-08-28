@@ -216,6 +216,11 @@ public:
 
     bool has_p2p() const { return m_p2p != nullptr; }
 
+    /// Expose the embedded P2P driver for DISPLAY-ONLY reads (dashboard
+    /// header-sync provider: peer subver/startingheight/uptime). Mirrors the
+    /// BCH node.hpp p2p() accessor. May be null when no P2P sink is armed.
+    NodeP2P<config_t>* p2p() { return m_p2p.get(); }
+
     /// Send getheaders to drive header sync (BIP 31).
     /// Locator should be hashes from chain tip back to genesis (sparsely);
     /// for an empty chain pass {genesis_hash}. Stop = uint256::ZERO means

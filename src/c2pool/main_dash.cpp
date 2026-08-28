@@ -4363,6 +4363,39 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         {"testnet", testnet},
                         {"coins", nlohmann::json::array({c})}};
                 });
+
+            // Embedded coin header-sync provider (dashboard telemetry only):
+            // feeds /broadcaster_status header_height/current_height/
+            // target_height/sync_percent + connected_peers[].startingheight so
+            // the dashboard sync cards render the REAL DASH header-chain tip --
+            // never the sharechain height. header_height = embedded HeaderChain
+            // tip; target_height = the pool's monotone best peer-advertised
+            // height, raised by per-peer startingheight. Same lifetime contract
+            // as the topology hook directly above: web_server is reset() after
+            // ioc.run() returns, BEFORE header_chain / coin_p2p unwind.
+            web_server->get_mining_interface()->set_coin_sync_status_fn(
+                [hc = header_chain.get(), cp = coin_p2p.get()]() -> nlohmann::json {
+                    nlohmann::json s = nlohmann::json::object();
+                    const uint32_t hh = hc ? hc->height() : 0;
+                    uint32_t th = cp ? cp->best_peer_height() : 0;
+                    nlohmann::json peers = nlohmann::json::array();
+                    if (cp) {
+                        for (const auto& pb : cp->peer_briefs()) {
+                            if (pb.start_height > th) th = pb.start_height;
+                            peers.push_back({
+                                {"addr", pb.addr},
+                                {"subver", pb.subver},
+                                {"startingheight", pb.start_height},
+                                {"conntime", pb.age_sec},
+                                {"connected", pb.handshaked},
+                            });
+                        }
+                    }
+                    s["header_height"] = hh;
+                    s["target_height"] = th;
+                    s["peers"] = std::move(peers);
+                    return s;
+                });
         }
 
         maintainer = std::make_unique<dash::coin::CoinStateMaintainer>(node_coin_state);

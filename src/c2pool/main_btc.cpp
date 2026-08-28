@@ -1974,6 +1974,36 @@ int main(int argc, char* argv[])
             };
         });
 
+        // Embedded coin header-sync provider (dashboard telemetry only):
+        // feeds /broadcaster_status header_height/current_height/
+        // target_height/sync_percent + connected_peers[].startingheight so
+        // the dashboard sync cards render the REAL BTC header-chain tip --
+        // never the sharechain height. Sources: the embedded HeaderChain tip
+        // + its version-advertised peer tip, plus the single embedded P2P
+        // peer's startingheight. Captured objects are main-scope and outlive
+        // ioc.run(); all reads are display-only.
+        mi->set_coin_sync_status_fn([&header_chain, &coin_node]() -> nlohmann::json {
+            nlohmann::json s = nlohmann::json::object();
+            const uint32_t hh = header_chain.height();
+            uint32_t th = header_chain.peer_tip_height();
+            nlohmann::json peers = nlohmann::json::array();
+            auto* p2p = coin_node.p2p();
+            if (p2p != nullptr && p2p->peer_version() > 0) {
+                const uint32_t sh = p2p->peer_start_height();
+                if (sh > th) th = sh;
+                peers.push_back({
+                    {"subver", p2p->peer_subver()},
+                    {"startingheight", sh},
+                    {"conntime", p2p->peer_uptime_sec()},
+                    {"connected", true},
+                });
+            }
+            s["header_height"] = hh;
+            s["target_height"] = th;
+            s["peers"] = std::move(peers);
+            return s;
+        });
+
         // ── #995/#1155 BTC found-block record + chain-sourced confirm/orphan ─
         // Wire the won-block reporter slot (declared above, fired by
         // make_on_block_found AFTER both broadcast arms) to record_found_block +

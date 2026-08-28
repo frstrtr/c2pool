@@ -669,6 +669,36 @@ public:
         };
     }
 
+    /// Embedded coin header-sync snapshot for the core::WebServer
+    /// /broadcaster_status merge (MiningInterface::set_coin_sync_status_fn).
+    /// Display-only, same read set as dashboard_topology(): header_height =
+    /// the embedded BCH HeaderChain tip (never the sharechain height),
+    /// target_height = the peer-advertised tip raised by the single embedded
+    /// peer's startingheight, peers = that peer's version metadata (BCH's
+    /// embedded transport is single-peer -- 0-or-1 rows, never a fabricated
+    /// getpeerinfo table).
+    nlohmann::json sync_status() {
+        const uint32_t hh = ibd_synced_height();
+        uint32_t th = m_chain.peer_tip_height();
+        nlohmann::json peers = nlohmann::json::array();
+        auto* p2p = m_node.p2p();
+        if (p2p != nullptr && p2p->peer_version() > 0) {
+            const uint32_t sh = p2p->peer_start_height();
+            if (sh > th) th = sh;
+            peers.push_back({
+                {"subver", p2p->peer_subver()},
+                {"startingheight", sh},
+                {"conntime", p2p->peer_uptime_sec()},
+                {"connected", true},
+            });
+        }
+        nlohmann::json s = nlohmann::json::object();
+        s["header_height"] = hh;
+        s["target_height"] = th;
+        s["peers"] = std::move(peers);
+        return s;
+    }
+
 private:
     /// Populate the three converged seed tiers (idempotent). Mirrors the DGB
     /// tier-3 wire (main_dgb.cpp): DNS (tier 1) + fixed (tier 2) from

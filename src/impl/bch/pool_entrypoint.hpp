@@ -693,6 +693,10 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
         // reads are display-only (lock-free snapshots / atomics).
         //   /api/node_topology -- BCHN embedded daemon peers + synced height.
         mi->set_node_topology_fn([&daemon]() { return daemon.dashboard_topology(); });
+        //   /broadcaster_status header-sync fields -- the embedded BCH
+        //   header-chain tip + single-peer startingheight (display-only; the
+        //   core merge computes sync_percent/synced/connected_peers from it).
+        mi->set_coin_sync_status_fn([&daemon]() { return daemon.sync_status(); });
         //   share-peers -- the pool node sharechain P2P peer snapshot.
         mi->set_peer_info_fn([&node]() { return node.get_peer_info_json(); });
         //   pool hashrate -- lock-free tracker snapshot published by think().
