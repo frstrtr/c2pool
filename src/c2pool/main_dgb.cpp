@@ -1474,6 +1474,197 @@ int run_node(const core::CoinParams& params, bool testnet,
             return r;
         });
 
+        // (4b) sharechain window — the dashboard defragmenter grid. Mirrors the
+        //      proven ltc wiring (main_ltc.cpp set_sharechain_window_fn) so the
+        //      shared web-static explorer renders a real DGB share window instead
+        //      of an empty stub. Coin-specific bits: dgb::PoolConfig, the
+        //      dgb::get_share_script + dgb::dgb_script_to_address helpers, and the
+        //      value p2p_node handle (ltc uses a pointer). No src/core edit; no
+        //      DOGE merged-mining leg (DGB is a standalone scrypt lane).
+        mi->set_sharechain_window_fn([&p2p_node, mi]() -> nlohmann::json {
+            auto guard = p2p_node.read_tracker();
+            if (!guard) return nlohmann::json::object();
+
+            nlohmann::json result;
+            auto& chain = guard->chain;
+            auto& verified = guard->verified;
+            bool testnet = dgb::PoolConfig::is_testnet;
+            (void)testnet;
+
+            // Tallest chain head (not verified best) so the grid stays current
+            // during sync.
+            uint256 best;
+            int32_t best_height = -1;
+            for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
+                auto h = chain.get_height(head_hash);
+                if (h > best_height) { best = head_hash; best_height = h; }
+            }
+
+            result["best_hash"] = best.IsNull() ? "" : best.GetHex();
+            result["chain_length"] = static_cast<int>(chain.size());
+            result["window_size"] = static_cast<int>(dgb::PoolConfig::chain_length());
+
+            // Local payout address so the frontend can mark "mine" shares.
+            std::string local_addr;
+            if (mi && !mi->get_payout_address().empty()) {
+                auto script = core::address_to_script(mi->get_payout_address());
+                if (!script.empty())
+                    local_addr = dgb::dgb_script_to_address(script);
+            }
+            result["my_address"] = local_addr;
+
+            // Node fee address for marking pool-fee shares.
+            std::string fee_addr;
+            if (mi) {
+                std::string fee_h160 = mi->get_node_fee_hash160();
+                if (!fee_h160.empty())
+                    fee_addr = fee_h160;
+            }
+            result["fee_hash160"] = fee_addr;
+
+            nlohmann::json shares_arr = nlohmann::json::array();
+
+            if (!best.IsNull()) {
+                int height = chain.get_height(best);
+                int walk = std::min(height, static_cast<int>(dgb::PoolConfig::chain_length()));
+                if (walk > 0) {
+                    try {
+                        int pos = 0;
+                        auto view = chain.get_chain(best, walk);
+                        for (auto [hash, data] : view) {
+                            nlohmann::json s;
+                            s["h"] = hash.GetHex().substr(0, 16);
+                            s["H"] = hash.GetHex();
+                            s["p"] = pos++;
+                            s["v"] = verified.contains(hash) ? 1 : 0;
+
+                            auto* idx = chain.get_index(hash);
+                            if (idx && idx->is_block_solution)
+                                s["blk"] = 1;
+
+                            data.share.invoke([&](auto* obj) {
+                                s["t"] = obj->m_timestamp;
+                                s["V"] = obj->version;
+                                s["s"] = static_cast<int>(obj->m_stale_info);
+                                s["b"] = obj->m_bits;
+                                s["a"] = obj->m_absheight;
+                                s["dv"] = obj->m_desired_version;
+
+                                auto script = dgb::get_share_script(obj);
+                                std::string addr = dgb::dgb_script_to_address(script);
+                                s["m"] = addr.empty() ? HexStr(script) : addr;
+
+                                // Longest printable ASCII run from the coinbase.
+                                if (!obj->m_coinbase.m_data.empty()) {
+                                    std::string best_run;
+                                    std::string cur_run;
+                                    for (auto c : obj->m_coinbase.m_data) {
+                                        if (c >= 32 && c <= 126) {
+                                            cur_run += static_cast<char>(c);
+                                        } else {
+                                            if (cur_run.size() > best_run.size())
+                                                best_run = cur_run;
+                                            cur_run.clear();
+                                        }
+                                    }
+                                    if (cur_run.size() > best_run.size())
+                                        best_run = cur_run;
+                                    bool has_letter = false;
+                                    for (auto c : best_run) {
+                                        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
+                                        { has_letter = true; break; }
+                                    }
+                                    if (best_run.size() >= 10 && has_letter) {
+                                        if (best_run.size() > 48) best_run.resize(48);
+                                        s["cb"] = best_run;
+                                    }
+                                }
+
+                                // Pool-fee share: compare hash160 with fee address.
+                                if (!fee_addr.empty() && script.size() >= 22) {
+                                    int off = -1;
+                                    if (script.size() == 25 && script[0] == 0x76) off = 3;
+                                    else if (script.size() == 22 && script[0] == 0x00) off = 2;
+                                    else if (script.size() == 23 && script[0] == 0xa9) off = 2;
+                                    if (off >= 0) {
+                                        std::string h160 = HexStr(std::vector<unsigned char>(
+                                            script.begin() + off, script.begin() + off + 20));
+                                        if (h160 == fee_addr)
+                                            s["fee"] = 1;
+                                    }
+                                }
+                            });
+
+                            shares_arr.push_back(std::move(s));
+                        }
+                    } catch (...) {
+                        // partial results on chain inconsistency
+                    }
+                }
+            }
+
+            // Heads for fork marking.
+            nlohmann::json heads_arr = nlohmann::json::array();
+            for (auto& [hh, _] : chain.get_heads()) {
+                heads_arr.push_back(hh.GetHex().substr(0, 16));
+            }
+
+            // Found blocks — is_block_solution flag above, plus persisted share
+            // hashes for blocks found before restart.
+            nlohmann::json blocks_arr = nlohmann::json::array();
+            if (mi) {
+                for (const auto& fb : mi->get_found_blocks()) {
+                    if (!fb.share_hash.empty())
+                        blocks_arr.push_back(fb.share_hash.substr(0, 16));
+                }
+            }
+
+            result["shares"] = std::move(shares_arr);
+            result["heads"] = std::move(heads_arr);
+            result["blocks"] = std::move(blocks_arr);
+            result["total"] = static_cast<int>(chain.size());
+
+            // Per-share PPLNS + current as fallback.
+            if (mi) {
+                result["pplns_current"] = mi->rest_current_payouts();
+                nlohmann::json pplns_map = nlohmann::json::object();
+                for (const auto& s : result["shares"]) {
+                    std::string sh = s["h"].get<std::string>();
+                    auto p = mi->get_pplns_for_tip(sh);
+                    if (!p.empty()) pplns_map[sh] = std::move(p);
+                }
+                if (!pplns_map.empty()) result["pplns"] = std::move(pplns_map);
+            }
+            return result;
+        });
+        // Window data is the dashboard grid — tip-sensitive; refresh on tip change.
+        mi->mark_last_cache_tip_driven();
+
+        // (4c) lightweight tip endpoint for RealTime polling. Returns nullopt
+        //      while the sharechain is still bootstrapping. Mirrors ltc.
+        mi->set_sharechain_tip_fn(
+            [&p2p_node]() -> std::optional<core::SharechainTip> {
+                auto guard = p2p_node.read_tracker();
+                if (!guard)
+                    return std::nullopt;
+                auto& chain = guard->chain;
+                uint256 best;
+                int32_t best_height = -1;
+                for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
+                    auto h = chain.get_height(head_hash);
+                    if (h > best_height) { best = head_hash; best_height = h; }
+                }
+                if (best.IsNull() && chain.size() == 0)
+                    return std::nullopt;
+                core::SharechainTip t;
+                t.hash   = best.IsNull() ? "" : best.GetHex().substr(0, 16);
+                t.height = best_height;
+                t.total  = static_cast<int>(chain.size());
+                return t;
+            });
+        // The tip endpoint IS the sharechain tip — fire on tip change.
+        mi->mark_last_cache_tip_driven();
+
         // (5) pool hashrate — attempts/s over the target-lookbehind window off
         //     the verified best share (SSOT: node.cpp L4 pool-hashrate line).
         //     Guards to 0 when the window cannot form (no best / height<=2).
