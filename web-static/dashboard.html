@@ -2084,7 +2084,7 @@
                         <thead>
                             <tr>
                                 <th>Address</th>
-                                <th style="text-align: center" title="Share version / desired version from sharechain">V36?</th>
+                                <th style="text-align: center" id="payouts-version-th" title="Share version / desired version from sharechain">V36?</th>
                                 <th style="text-align: right">Amount</th>
                             </tr>
                         </thead>
@@ -3000,6 +3000,24 @@
         // currency_info resolves. Read by defrag.updateStats for the
         // native/signaling version thresholds.
         window.__shareVersionDescriptor = SHARE_VERSION_DESCRIPTORS.LTC;
+        // Coin-aware native-version cutoff for the explorer cell colors,
+        // payouts version column and PPLNS treemap bands (LTC family=36,
+        // DASH=16). Reads the live descriptor so every band classification
+        // follows the ACTIVE coin instead of a compile-time 36.
+        function explorerVersionThreshold() {
+            var d = window.__shareVersionDescriptor;
+            return (d && d.threshold) || 36;
+        }
+        // Stale-version cell title. The LTC family keeps its historical
+        // "no DOGE!" hint (a below-threshold share misses the merged child);
+        // a coin without a merged child (DASH/BTC/DGB/BCH) gets a neutral
+        // "below V<thr>" hint — never a DOGE mention.
+        function staleVersionTitle(ver) {
+            var mc = (typeof currency_info !== 'undefined' && currency_info
+                      && currency_info.merged_child_symbol) || '';
+            return mc ? 'V' + ver + ' only — no ' + mc + '!'
+                      : 'V' + ver + ' — below V' + explorerVersionThreshold();
+        }
         
         // Load currency info first
         d3.json('../web/currency_info', function(info) {
@@ -3057,6 +3075,9 @@
                 var li2 = document.getElementById('legend-signaling-item');
                 if (li2) li2.style.display = 'none';
             }
+            // Payouts version-column header follows the coin threshold too
+            // (LTC family keeps "V36?", DASH renders "V16?").
+            setText('payouts-version-th', 'V' + vdesc.threshold + '?');
 
             d3.select('#parent_chain_peers_title').text(chainName);
             if (info && info.block_period) {
@@ -4591,12 +4612,13 @@
                 if (link.empty()) return;
                 var addr = link.attr('title') || link.text();
                 var mv = getMinerVersion(addr);
-                if (mv.ver >= 36) {
+                var vthr = explorerVersionThreshold();
+                if (mv.ver >= vthr) {
                     v36Cell.html('<span style="color:#28a745;font-weight:700" title="V' + mv.ver + '">✓</span>');
-                } else if (mv.dv >= 36) {
+                } else if (mv.dv >= vthr) {
                     v36Cell.html('<span style="color:#0097a7;font-weight:700" title="V' + mv.ver + ' signaling V' + mv.dv + '">⇧</span>');
                 } else if (mv.ver > 0) {
-                    v36Cell.html('<span style="color:#dc3545;font-weight:700" title="V' + mv.ver + ' only — no DOGE!">✗</span>');
+                    v36Cell.html('<span style="color:#dc3545;font-weight:700" title="' + staleVersionTitle(mv.ver) + '">✗</span>');
                 }
             });
         }
@@ -4628,18 +4650,19 @@
                     .attr('class', 'hash-link')
                     .attr('href', currency_info.address_explorer_url_prefix + addr)
                     .attr('target', '_blank')
-                    .attr('title', 'LTC: ' + addr)
+                    .attr('title', (((typeof currency_info !== 'undefined' && currency_info.symbol) || 'LTC')) + ': ' + addr)
                     .text(addr);
 
-                // V36 column — look up miner version from defrag share data
+                // Version column — look up miner version from defrag share data
                 var v36Td = mainRow.append('td').style('text-align', 'center');
                 var minerVer = getMinerVersion(addr);
-                if (minerVer.ver >= 36) {
+                var verThr = explorerVersionThreshold();
+                if (minerVer.ver >= verThr) {
                     v36Td.html('<span style="color:#28a745;font-weight:700" title="V' + minerVer.ver + '">✓</span>');
-                } else if (minerVer.dv >= 36) {
+                } else if (minerVer.dv >= verThr) {
                     v36Td.html('<span style="color:#0097a7;font-weight:700" title="V' + minerVer.ver + ' signaling V' + minerVer.dv + '">⇧</span>');
                 } else if (minerVer.ver > 0) {
-                    v36Td.html('<span style="color:#dc3545;font-weight:700" title="V' + minerVer.ver + ' only — no DOGE!">✗</span>');
+                    v36Td.html('<span style="color:#dc3545;font-weight:700" title="' + staleVersionTitle(minerVer.ver) + '">✗</span>');
                 } else {
                     v36Td.text('-');
                 }
@@ -4874,15 +4897,16 @@
                     .attr('target', '_blank')
                     .attr('title', addr)
                     .text(addr);
-                // V36 column
+                // Version column
                 var v36Td = tr.append('td').style('text-align', 'center');
                 var mv = getMinerVersion(addr);
-                if (mv.ver >= 36) {
+                var vThr = explorerVersionThreshold();
+                if (mv.ver >= vThr) {
                     v36Td.html('<span style="color:#28a745;font-weight:700" title="V' + mv.ver + '">✓</span>');
-                } else if (mv.dv >= 36) {
+                } else if (mv.dv >= vThr) {
                     v36Td.html('<span style="color:#0097a7;font-weight:700" title="V' + mv.ver + ' signaling V' + mv.dv + '">⇧</span>');
                 } else if (mv.ver > 0) {
-                    v36Td.html('<span style="color:#dc3545;font-weight:700" title="V' + mv.ver + ' only — no DOGE!">✗</span>');
+                    v36Td.html('<span style="color:#dc3545;font-weight:700" title="' + staleVersionTitle(mv.ver) + '">✗</span>');
                 } else {
                     v36Td.text('-');
                 }
@@ -6265,8 +6289,14 @@
                 if (share.fee) return '#9c27b0';
 
                 var isMine = this.myAddress && share.m === this.myAddress;
-                var isV36Native = share.V >= 36;
-                var isV36Signal = !isV36Native && share.dv && share.dv >= 36;
+                // Coin-aware native cutoff (LTC=36, DASH=16). A literal 36
+                // here painted every DASH V16 share as the dim "below"
+                // band. The signaling tier only exists for coins with a
+                // pending upgrade boundary (descriptor.signaling).
+                var vdesc = window.__shareVersionDescriptor || {};
+                var vthr = vdesc.threshold || 36;
+                var isV36Native = share.V >= vthr;
+                var isV36Signal = vdesc.signaling && !isV36Native && share.dv && share.dv >= vthr;
 
                 if (isV36Native) {
                     // V36 native — brightest: cyan-green / bright blue
@@ -6371,7 +6401,8 @@
                 // Tags
                 var tags = [];
                 if (share.fee) tags.push('<span style="color:#9c27b0;font-weight:700">Node Fee</span>');
-                if (share.dv && share.dv >= 36 && share.V < 36) tags.push('<span style="color:#0097a7;font-weight:600">Signals V' + share.dv + '</span>');
+                var tagThr = explorerVersionThreshold();
+                if (share.dv && share.dv >= tagThr && share.V < tagThr) tags.push('<span style="color:#0097a7;font-weight:600">Signals V' + share.dv + '</span>');
 
                 var html =
                     '<div class="tt-hash">' + share.h + '</div>' +
@@ -6991,7 +7022,10 @@
 
                 rects.forEach(function(r) {
                     var mv = getMinerVersion(r.addr);
-                    var isV35Only = mv.ver && mv.ver < 36 && (!mv.dv || mv.dv < 36);
+                    // Coin-aware version band (LTC=36, DASH=16) — a literal
+                    // 36 dimmed every DASH V16 miner cell as "V35 only".
+                    var tmThr = explorerVersionThreshold();
+                    var isV35Only = mv.ver && mv.ver < tmThr && (!mv.dv || mv.dv < tmThr);
                     var hasDoge = r.doge > 0;
                     var hue = defrag.addrHue(r.addr);
 
