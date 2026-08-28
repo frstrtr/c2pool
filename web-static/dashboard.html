@@ -2293,11 +2293,11 @@
                             <span class="value" id="defrag-fee" style="color:#9c27b0">-</span>
                         </div>
                         <div class="defrag-stat-row">
-                            <span class="label">V36 Native</span>
+                            <span class="label" id="stat-native-label">V36 Native</span>
                             <span class="value" id="defrag-v36native" style="color:#00e676">-</span>
                         </div>
-                        <div class="defrag-stat-row">
-                            <span class="label">V36 Signaling</span>
+                        <div class="defrag-stat-row" id="stat-signaling-row">
+                            <span class="label" id="stat-signaling-label">V36 Signaling</span>
                             <span class="value" id="defrag-v36sig" style="color:#0097a7">-</span>
                         </div>
                         <div class="defrag-stat-row">
@@ -2314,15 +2314,15 @@
                         </div>
                         <div class="legend-item">
                             <div class="legend-swatch" style="background:#00e676"></div>
-                            <span>V36 (others)</span>
+                            <span id="legend-native-label">V36 (others)</span>
                         </div>
-                        <div class="legend-item">
+                        <div class="legend-item" id="legend-signaling-item">
                             <div class="legend-swatch" style="background:#26c6da"></div>
-                            <span>V36 signaling</span>
+                            <span id="legend-signaling-label">V36 signaling</span>
                         </div>
                         <div class="legend-item">
                             <div class="legend-swatch" style="background:#2e7d32"></div>
-                            <span>V35 only</span>
+                            <span id="legend-stale-label">V35 only</span>
                         </div>
                         <div class="legend-item">
                             <div class="legend-swatch" style="background:#555577"></div>
@@ -2342,13 +2342,13 @@
                         </div>
                         <div class="legend-item">
                             <div class="legend-swatch" style="background:#28a745;border:2px solid #ffd700;box-shadow:0 0 3px rgba(255,215,0,0.5)"></div>
-                            <span style="color:#0070dd;font-weight:600">LTC block</span>
+                            <span style="color:#0070dd;font-weight:600"><span class="symbol-small">COIN</span> block</span>
                         </div>
                         <div class="legend-item merged-child-hint">
                             <div class="legend-swatch" style="background:#28a745;border:2px solid #00e5ff"></div>
                             <span style="color:#a335ee;font-weight:600"><span class="merged-child-symbol-hint">DOGE</span> block</span>
                         </div>
-                        <div class="legend-item">
+                        <div class="legend-item merged-child-hint">
                             <div class="legend-swatch" style="background:linear-gradient(135deg,#ff8000,#cc6600);border:2px solid #ffaa00;box-shadow:0 0 6px rgba(255,128,0,0.5)"></div>
                             <span style="color:#ff8000;font-weight:600">Twin block</span>
                         </div>
@@ -2936,10 +2936,49 @@
         window.currency_info = currency_info;
         var parentBlockPeriodMs = 150000; // default, updated from currency_info
         window.parentBlockPeriodMs = parentBlockPeriodMs;
+
+        // Coin-generic share-version descriptor for the Sharechain Explorer
+        // legend + stats. The V35/V36 scheme is LTC-specific; each coin
+        // advertises its own current/stale version badges. This inline map
+        // mirrors COIN_PPLNS_DESCRIPTORS[symbol].versionBadges from the
+        // bundle (sharechain-explorer/src/pplns/classify.ts) so the inline
+        // renderer and the bundled one classify identically. `threshold`
+        // is the native-version cutoff; `signaling` is false for coins with
+        // no pending version-upgrade boundary (DASH today), which hides the
+        // signaling stat-row + legend entry entirely. Unknown coins fall
+        // back to the LTC descriptor (historical default), matching
+        // descriptorForCoin's degrade-to-prior-behaviour rule.
+        var SHARE_VERSION_DESCRIPTORS = {
+            LTC: {
+                threshold: 36, signaling: true,
+                statNative: 'V36 Native', statSignaling: 'V36 Signaling',
+                legendNative: 'V36 (others)', legendSignaling: 'V36 signaling',
+                legendStale: 'V35 only'
+            },
+            DASH: {
+                threshold: 16, signaling: false,
+                statNative: 'V16 Current', statSignaling: null,
+                legendNative: 'V16 (others)', legendSignaling: null,
+                legendStale: 'Below V16'
+            }
+        };
+        function shareVersionDescriptor(sym) {
+            return SHARE_VERSION_DESCRIPTORS[(sym || '').toUpperCase()]
+                || SHARE_VERSION_DESCRIPTORS.LTC;
+        }
+        // Effective descriptor for the active coin; defaults to LTC until
+        // currency_info resolves. Read by defrag.updateStats for the
+        // native/signaling version thresholds.
+        window.__shareVersionDescriptor = SHARE_VERSION_DESCRIPTORS.LTC;
         
         // Load currency info first
         d3.json('../web/currency_info', function(info) {
             currency_info = info || {};
+            // Re-point the global at the resolved payload so the bundled
+            // Explorer (a separate module scope) reads live currency_info
+            // — symbol/merged_child_symbol/my_address — instead of the
+            // empty placeholder it was seeded with.
+            window.currency_info = currency_info;
             var sym = (info && info.symbol) || 'COIN';
             var chainName = (info && info.name) || sym;
             d3.selectAll('.symbol-small').text(sym);
@@ -2960,6 +2999,35 @@
             } else {
                 d3.selectAll('.merged-child-hint').style('display', 'none');
             }
+
+            // Coin-generic Explorer share-version legend + stat labels.
+            // Drives the native/signaling/stale entries off the coin's own
+            // version descriptor so a coin without LTC's V35->V36 crossing
+            // (e.g. DASH's V16 tip) never renders LTC's version scheme.
+            var vdesc = shareVersionDescriptor(sym);
+            window.__shareVersionDescriptor = vdesc;
+            function setText(id, txt) {
+                var el = document.getElementById(id);
+                if (el && typeof txt === 'string') el.textContent = txt;
+            }
+            setText('stat-native-label', vdesc.statNative);
+            setText('legend-native-label', vdesc.legendNative);
+            setText('legend-stale-label', vdesc.legendStale);
+            if (vdesc.signaling) {
+                setText('stat-signaling-label', vdesc.statSignaling);
+                setText('legend-signaling-label', vdesc.legendSignaling);
+                var sr = document.getElementById('stat-signaling-row');
+                if (sr) sr.style.display = '';
+                var li = document.getElementById('legend-signaling-item');
+                if (li) li.style.display = '';
+            } else {
+                // No pending version boundary — hide signaling stat + legend.
+                var sr2 = document.getElementById('stat-signaling-row');
+                if (sr2) sr2.style.display = 'none';
+                var li2 = document.getElementById('legend-signaling-item');
+                if (li2) li2.style.display = 'none';
+            }
+
             d3.select('#parent_chain_peers_title').text(chainName);
             if (info && info.block_period) {
                 parentBlockPeriodMs = info.block_period * 1000;
@@ -5473,7 +5541,7 @@
                     var col = i % self.cols;
                     var row = Math.floor(i / self.cols);
                     var s = self.shares[i];
-                    self._oldPositions[s.h] = {
+                    self._oldPositions[s.H || s.h] = {
                         x: ml + col * step, y: row * step,
                         color: self.getColor(s),
                         miner: s.m || '',
@@ -5564,7 +5632,7 @@
                 // Collect dying shares (old tail pushed off the chain)
                 var dying = [];
                 var newHashSet = {};
-                self.shares.forEach(function(s) { newHashSet[s.h] = true; });
+                self.shares.forEach(function(s) { newHashSet[s.H || s.h] = true; });
                 for (var h in self._oldPositions) {
                     if (!newHashSet[h]) {
                         var op = self._oldPositions[h];
@@ -5826,7 +5894,7 @@
                             var shareT = Math.max(0, Math.min(1, (p2elapsed - shareStart) / 600));
                             var ease = 1 - Math.pow(1 - shareT, 3);
 
-                            var old = animOldPos[share.h];
+                            var old = animOldPos[share.H || share.h];
                             if (old && shareT > 0 && shareT < 1) {
                                 var liftA, slideA, landA;
                                 if (ease < 0.2) {
@@ -6564,14 +6632,17 @@
                 var mine = 0, stale = 0, dead = 0, verified = 0, fee = 0, v36sig = 0, v36native = 0;
                 var ltcBlocks = 0, dogeBlocks = 0;
                 var self = this;
+                // Native-version threshold is coin-specific (LTC=36, DASH=16);
+                // read it from the active coin's share-version descriptor.
+                var vthr = (window.__shareVersionDescriptor && window.__shareVersionDescriptor.threshold) || 36;
                 shares.forEach(function(s) {
                     if (self.myAddress && s.m === self.myAddress) mine++;
                     if (s.s === 1) stale++;
                     if (s.s === 2) dead++;
                     if (s.v) verified++;
                     if (s.fee) fee++;
-                    if (s.V >= 36) v36native++;
-                    else if (s.dv && s.dv >= 36) v36sig++;
+                    if (s.V >= vthr) v36native++;
+                    else if (s.dv && s.dv >= vthr) v36sig++;
                     if (s.blk || self.blockSet[s.h]) ltcBlocks++;
                     if (self.dogeSet[s.h]) dogeBlocks++;
                 });
@@ -6582,7 +6653,17 @@
                 document.getElementById('defrag-dead').textContent = dead;
                 document.getElementById('defrag-verified').textContent = verified;
                 document.getElementById('defrag-chain-len').textContent = data.chain_length || '-';
-                document.getElementById('defrag-blocks').textContent = ltcBlocks + ' LTC / ' + dogeBlocks + ' DOGE';
+                // Coin-generic "Blocks Found": "<n> <SYMBOL>", appending the
+                // merged child ("/ <m> <CHILD>") only when the backend
+                // advertises a merged_child_symbol (LTC->DOGE). DASH/BTC/DGB
+                // have none, so no "/ 0 DOGE" tail leaks onto them.
+                var ci = currency_info || {};
+                var psym = ci.symbol || 'COIN';
+                var blocksText = ltcBlocks + ' ' + psym;
+                if (ci.merged_child_symbol) {
+                    blocksText += ' / ' + dogeBlocks + ' ' + ci.merged_child_symbol;
+                }
+                document.getElementById('defrag-blocks').textContent = blocksText;
                 document.getElementById('defrag-fee').textContent = fee;
                 document.getElementById('defrag-v36native').textContent = v36native;
                 document.getElementById('defrag-v36sig').textContent = v36sig;
@@ -9031,6 +9112,26 @@
                     return;
                 }
 
+                // Fork switch (sharechain reorg). A plain prepend-dedup
+                // splice would stitch a disconnected delta onto the old
+                // window and silently drop the shares that aged off the
+                // reorganized chain — they never reach the dying-share
+                // (_animate3D) render. Route to the proven animated full
+                // refresh instead: liveRefresh() re-fetches the whole
+                // window, diffs it against _oldPositions, and plays the
+                // rise/hold/dissolve + ash pipeline for evicted shares.
+                // (Server emits fork_switch on reorg since the task-#112
+                // fix; the inline path previously ignored it entirely.)
+                if (delta.fork_switch) {
+                    defrag.liveRefresh();
+                    if (_rtPendingSince !== null) {
+                        var nextF = _rtPendingSince;
+                        _rtPendingSince = null;
+                        _rtFetchDelta(nextF);
+                    }
+                    return;
+                }
+
                 // Don't mutate data during animation — defer to completion
                 if (defrag._animRunning) {
                     defrag._animDeferred = true;
@@ -9045,7 +9146,13 @@
                     var s = defrag.shares[i];
                     var col = i % defrag.cols;
                     var row = Math.floor(i / defrag.cols);
-                    defrag._oldPositions[s.h] = {
+                    // Key on the FULL 64-hex hash (fallback to short) so the
+                    // dedup/eviction accounting stays count-exact. DASH share
+                    // hashes carry ~11-12 leading zero nibbles, so the 16-hex
+                    // short has only ~20 bits of entropy and collides within a
+                    // 4320-entry window — short keys would collapse the client
+                    // window below windowSize and suppress the cap trim.
+                    defrag._oldPositions[s.H || s.h] = {
                         x: ml + col * step, y: row * step,
                         color: defrag.getColor(s),
                         miner: s.m || '',
@@ -9058,8 +9165,9 @@
                 var merged = newShares.concat(defrag.shares);
                 var seen = {};
                 merged = merged.filter(function(s) {
-                    if (seen[s.h]) return false;
-                    seen[s.h] = true;
+                    var k = s.H || s.h;
+                    if (seen[k]) return false;
+                    seen[k] = true;
                     return true;
                 });
                 if (merged.length > defrag.windowSize)
@@ -9143,7 +9251,12 @@
                         transport: transport,
                         userContext: {
                             myAddress: (window.currency_info && window.currency_info.my_address) || undefined,
-                            shareVersion: 36,
+                            // Native-version threshold is coin-specific (LTC=36,
+                            // DASH=16). Read it from the coin's share-version
+                            // descriptor resolved from currency_info, so the
+                            // bundled Explorer classifies versions per the
+                            // active coin instead of a compile-time LTC value.
+                            shareVersion: (window.__shareVersionDescriptor && window.__shareVersionDescriptor.threshold) || 36,
                         },
                         containerWidth:  function() { return wrap.clientWidth; },
                         containerHeight: function() { return wrap.clientHeight; },
@@ -9289,7 +9402,18 @@
                         if (statEls.fee)       statEls.fee.textContent       = String(s.fee);
                         if (statEls.v36native) statEls.v36native.textContent = String(s.v36native);
                         if (statEls.v36sig)    statEls.v36sig.textContent    = String(s.v36signaling);
-                        if (statEls.blocks)    statEls.blocks.textContent    = s.primaryBlocks + ' LTC / ' + s.dogeBlocks + ' DOGE';
+                        if (statEls.blocks) {
+                            // Coin-generic "Blocks Found": "<n> <SYMBOL>",
+                            // appending "/ <m> <CHILD>" only for a merged
+                            // parent (LTC->DOGE), never on DASH/BTC/DGB.
+                            var bci = window.currency_info || {};
+                            var bsym = bci.symbol || 'COIN';
+                            var bt = s.primaryBlocks + ' ' + bsym;
+                            if (bci.merged_child_symbol) {
+                                bt += ' / ' + s.dogeBlocks + ' ' + bci.merged_child_symbol;
+                            }
+                            statEls.blocks.textContent = bt;
+                        }
                     }
                     window.addEventListener('beforeunload', function() {
                         if (statTimer !== null) clearInterval(statTimer);
